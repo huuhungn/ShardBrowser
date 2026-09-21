@@ -35,6 +35,18 @@ pub struct ProxyEntry {
 }
 
 impl ProxyEntry {
+    /// Two entries are the same proxy only when the whole connection tuple
+    /// matches. The password is part of it: with some providers it carries the
+    /// session or the routing, so the same host/port/user with a different
+    /// password is a different exit.
+    fn same_connection(&self, other: &ProxyEntry) -> bool {
+        self.kind == other.kind
+            && self.host == other.host
+            && self.port == other.port
+            && self.username == other.username
+            && self.password == other.password
+    }
+
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port` for ShardX.
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
@@ -94,15 +106,10 @@ pub fn upsert(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     Ok(entry)
 }
 
-/// Upsert that reuses an entry with the same kind/host/port/username.
+/// Upsert that reuses an entry with the same connection tuple.
 pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     let mut s = load()?;
-    if let Some(existing) = s.proxies.iter().find(|p| {
-        p.kind == entry.kind
-            && p.host == entry.host
-            && p.port == entry.port
-            && p.username == entry.username
-    }) {
+    if let Some(existing) = s.proxies.iter().find(|p| p.same_connection(&entry)) {
         return Ok(existing.clone());
     }
     if entry.id.is_empty() {
@@ -299,24 +306,28 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
     })
 }
 
-/// Save many entries; returns count actually persisted (deduped on host:port:user).
-pub fn bulk_save(entries: Vec<ProxyEntry>) -> Result<usize> {
-    let mut store_data = load()?;
+/// Append the entries that are not already present; returns how many landed.
+/// Split out of `bulk_save` so the rule can be tested without a store on disk.
+fn append_new(existing: &mut Vec<ProxyEntry>, incoming: Vec<ProxyEntry>) -> usize {
     let mut added = 0usize;
-    for mut e in entries {
-        let dup = store_data
-            .proxies
-            .iter()
-            .any(|x| x.host == e.host && x.port == e.port && x.username == e.username);
-        if dup {
+    for mut e in incoming {
+        if existing.iter().any(|x| x.same_connection(&e)) {
             continue;
         }
         if e.id.is_empty() {
             e.id = uuid::Uuid::new_v4().to_string();
         }
-        store_data.proxies.push(e);
+        existing.push(e);
         added += 1;
     }
+    added
+}
+
+/// Save many entries; returns count actually persisted. Same duplicate rule as
+/// `upsert_dedup`, so a bulk import and an API add agree about what is a copy.
+pub fn bulk_save(entries: Vec<ProxyEntry>) -> Result<usize> {
+    let mut store_data = load()?;
+    let added = append_new(&mut store_data.proxies, entries);
     save(&store_data)?;
     Ok(added)
 }
@@ -936,5 +947,58 @@ pub fn country_to_timezone(cc: &str) -> &'static str {
         "SA" => "Asia/Riyadh",
         "AE" => "Asia/Dubai",
         _ => "UTC",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(user: &str, pass: &str) -> ProxyEntry {
+        ProxyEntry {
+            id: String::new(),
+            name: format!("{user}@proxy.example.com"),
+            kind: ProxyKind::Socks5,
+            host: "proxy.example.com".into(),
+            port: 1080,
+            username: user.into(),
+            password: pass.into(),
+            country: String::new(),
+            notes: String::new(),
+        }
+    }
+
+    /// #72: the password carries the session with some providers, so two
+    /// entries that differ only there are two proxies, not one.
+    #[test]
+    fn a_different_password_is_a_different_proxy() {
+        let mut store = Vec::new();
+        let added = append_new(&mut store, vec![entry("user", "pass-a"), entry("user", "pass-b")]);
+        assert_eq!(added, 2);
+        assert_eq!(store.len(), 2);
+        assert_ne!(store[0].id, store[1].id);
+    }
+
+    /// The other half: an exact copy is still skipped.
+    #[test]
+    fn an_identical_entry_is_still_skipped() {
+        let mut store = Vec::new();
+        assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 1);
+        assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 0);
+        assert_eq!(store.len(), 1);
+    }
+
+    /// `bulk_save` used to ignore `kind`, so an HTTP and a SOCKS5 entry on one
+    /// endpoint collapsed into whichever was imported first.
+    #[test]
+    fn the_scheme_is_part_of_the_identity() {
+        let socks = entry("user", "pass");
+        let mut http = entry("user", "pass");
+        http.kind = ProxyKind::Http;
+        assert!(!socks.same_connection(&http));
+
+        let mut store = Vec::new();
+        assert_eq!(append_new(&mut store, vec![socks.clone(), http]), 2);
+        assert_eq!(append_new(&mut store, vec![socks]), 0);
     }
 }

@@ -879,7 +879,7 @@
   "proxyBulkImporter.back": "← 返回",
   "proxyBulkImporter.cancel": "取消",
   "proxyBulkImporter.defaultTypeLabel": "默认类型（某一行没写协议时使用）",
-  "proxyBulkImporter.duplicatesNote": "保存时会跳过重复项（host:port:user 相同）。",
+  "proxyBulkImporter.duplicatesNote": "保存时会跳过重复项（协议、host:port、用户名和密码都相同）。",
   "proxyBulkImporter.failed": "失败",
   "proxyBulkImporter.importCount": "导入 {n} 个",
   "proxyBulkImporter.importedMany": "已导入 {n} 个代理",

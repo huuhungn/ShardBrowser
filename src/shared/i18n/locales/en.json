@@ -879,7 +879,7 @@
   "proxyBulkImporter.back": "← Back",
   "proxyBulkImporter.cancel": "Cancel",
   "proxyBulkImporter.defaultTypeLabel": "Default type (used when a line has no scheme)",
-  "proxyBulkImporter.duplicatesNote": "Duplicates (same host:port:user) are skipped on save.",
+  "proxyBulkImporter.duplicatesNote": "Duplicates (same scheme, host:port, user and password) are skipped on save.",
   "proxyBulkImporter.failed": "Failed",
   "proxyBulkImporter.importCount": "Import {n}",
   "proxyBulkImporter.importedMany": "Imported {n} proxies",
