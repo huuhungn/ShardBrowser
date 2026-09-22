@@ -6,6 +6,7 @@ import Badge from "../../shared/ui/Badge";
 import { DeleteIcon, NavTrashIcon, RestoreIcon } from "../../shared/icons";
 import { daysUntil, fmtBytes, fmtTs } from "../../shared/lib/utils";
 import { useTrash } from "../../entities/trash";
+import { useT } from "../../shared/i18n";
 
 export function TrashPage() {
   const init = useTrash((s) => s.init);
@@ -15,6 +16,7 @@ export function TrashPage() {
   const purge = useTrash((s) => s.purge);
   const empty = useTrash((s) => s.empty);
 
+  const t = useT();
   const reload = useTrash((s) => s.reload);
   useEffect(() => { init(); }, [init]);
   // A profile deleted or restored through the API belongs in this list.
@@ -22,15 +24,13 @@ export function TrashPage() {
 
   return (
     <section className="flex flex-col">
-      <Topbar crumbs={["System", "Trash"]} />
+      <Topbar crumbs={[t("nav.system"), t("trash.title")]} />
 
       <div className="mb-3.5 flex items-end justify-between gap-4">
         <div>
-          <h1 className="m-0 text-title-h5 text-text-strong-950">Trash</h1>
+          <h1 className="m-0 text-title-h5 text-text-strong-950">{t("trash.title")}</h1>
           <p className="m-0 mt-1 max-w-[70ch] text-paragraph-xs text-text-soft-400">
-            A deleted profile waits here for seven days. What is kept is the account —
-            cookies, logins, site storage, preferences — not the caches, so a profile
-            that took a gigabyte comes back as a few megabytes.
+            {t("trash.intro")}
           </p>
         </div>
         {items.length > 0 && (
@@ -39,7 +39,7 @@ export function TrashPage() {
             leftIcon={<DeleteIcon className="size-4" />}
             onClick={empty}
           >
-            Empty trash
+            {t("trash.empty")}
           </Button>
         )}
       </div>
@@ -47,10 +47,10 @@ export function TrashPage() {
       <div className="overflow-hidden rounded-12 bg-bg-white-0 shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
         {items.length > 0 && (
           <div className="grid grid-cols-[1fr_120px_150px_120px_180px] items-center gap-3 border-b border-stroke-soft-200 bg-bg-weak-50 px-4 py-2 text-subheading-2xs text-text-soft-400">
-            <div>Name</div>
-            <div>Folder</div>
-            <div>Deleted</div>
-            <div>Size</div>
+            <div>{t("trash.col.name")}</div>
+            <div>{t("trash.col.folder")}</div>
+            <div>{t("trash.col.deleted")}</div>
+            <div>{t("trash.col.size")}</div>
             <div />
           </div>
         )}
@@ -71,7 +71,7 @@ export function TrashPage() {
               <div className="flex items-center gap-1.5">
                 <span className="text-paragraph-xs text-text-soft-400">{fmtTs(`@${e.deleted_at}`)}</span>
                 <Badge color={left <= 1 ? "error" : "gray"} variant="filled" size="small">
-                  {left === 0 ? "today" : `${left}d`}
+                  {left === 0 ? t("trash.today") : t("trash.daysLeft", { n: String(left) })}
                 </Badge>
               </div>
               <div className="text-paragraph-xs text-text-sub-600">{fmtBytes(e.size_bytes)}</div>
@@ -82,14 +82,14 @@ export function TrashPage() {
                   leftIcon={<RestoreIcon className="size-3.5" />}
                   onClick={() => restore(e)}
                 >
-                  Restore
+                  {t("trash.restore")}
                 </Button>
                 <Button
                   variant="error" mode="ghost" size="2xsmall"
                   leftIcon={<DeleteIcon className="size-3.5" />}
                   onClick={() => purge(e)}
                 >
-                  Delete
+                  {t("trash.delete")}
                 </Button>
               </div>
             </div>
@@ -100,9 +100,9 @@ export function TrashPage() {
             <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
               <NavTrashIcon className="size-6" />
             </div>
-            <h3 className="m-0 text-label-sm text-text-strong-950">The trash is empty</h3>
+            <h3 className="m-0 text-label-sm text-text-strong-950">{t("trash.none.title")}</h3>
             <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-              Deleted profiles land here and stay restorable for seven days.
+              {t("trash.none.body")}
             </p>
           </div>
         )}

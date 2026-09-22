@@ -7,6 +7,8 @@ import { CSSelect } from "../../shared/ui/CSSelect";
 import { AddIcon, DeleteIcon, NavBookmarksIcon } from "../../shared/icons";
 import { useBookmarks, emptyBookmark, type Bookmark } from "../../entities/bookmark";
 import { useFolders, useProfile } from "../../entities/profile";
+import { useT } from "../../shared/i18n";
+import { Rich } from "../../shared/i18n/Rich";
 
 function Editor({ initial, folders, onClose }: {
   initial: Bookmark;
@@ -14,45 +16,44 @@ function Editor({ initial, folders, onClose }: {
   onClose: () => void;
 }) {
   const [b, setB] = useState(initial);
+  const t = useT();
   const save = useBookmarks((s) => s.save);
   return (
     <DialogModal
       open
       onClose={onClose}
-      title={initial.id ? "Edit bookmark" : "New bookmark"}
-      confirmLabel="Save"
+      title={initial.id ? t("bookmarks.editTitle") : t("bookmarks.newTitle")}
+      confirmLabel={t("common.save")}
       onConfirm={() => save(b)}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex w-[420px] flex-col gap-3 py-4">
         <Field
-          label="URL"
+          label={t("bookmarks.url")}
           value={b.url}
           onChange={(v) => setB({ ...b, url: v })}
           placeholder="facebook.com/ads/manager"
           mono
         />
         <Field
-          label="Title"
+          label={t("bookmarks.titleField")}
           value={b.title}
           onChange={(v) => setB({ ...b, title: v })}
-          placeholder="Blank uses the address itself"
+          placeholder={t("bookmarks.titlePlaceholder")}
         />
         <CSSelect
-          title="Folder"
+          title={t("bookmarks.folder")}
           value={b.folder}
           onChange={(v) => setB({ ...b, folder: v })}
           isSearchable={folders.length > 8}
           options={[
-            { value: "", label: "Every profile" },
+            { value: "", label: t("bookmarks.everyProfile") },
             ...folders.map((f) => ({ value: f, label: f })),
           ]}
         />
         <p className="m-0 text-paragraph-xs text-text-soft-400">
-          Appears in the bookmarks bar of every profile in that folder, in a folder
-          called <strong>ShardX</strong>, from their next launch. The operator's own
-          bookmarks are left alone.
+          <Rich text={t("bookmarks.editorNote")} />
         </p>
       </div>
     </DialogModal>
@@ -74,6 +75,7 @@ export function BookmarksPage() {
   const folders = useFolders();
   const profiles = useProfile((s) => s.profiles);
 
+  const t = useT();
   const reload = useBookmarks((s) => s.reload);
   useEffect(() => { init(); initProfiles(); }, [init, initProfiles]);
   useStoreChanged(reload);
@@ -91,37 +93,37 @@ export function BookmarksPage() {
     f === "" ? profiles.length : profiles.filter((p) => p.folder === f).length;
 
   const tabs = [
-    { id: "all", label: "All" },
-    { id: "__any__", label: "Every profile" },
+    { id: "all", label: t("bookmarks.tab.all") },
+    { id: "__any__", label: t("bookmarks.everyProfile") },
     ...folders.map((f) => ({ id: f, label: f })),
   ];
 
   return (
     <section className="flex flex-col">
-      <Topbar crumbs={["Library", "Bookmarks"]} search={search} onSearch={setSearch} />
+      <Topbar crumbs={[t("nav.library"), t("bookmarks.title")]} search={search} onSearch={setSearch} />
 
       <div className="mb-3.5 flex items-end justify-between gap-4">
         <div className="flex min-w-0 flex-1 flex-col gap-3.5">
           <div>
-            <h1 className="m-0 text-title-h5 text-text-strong-950">Bookmarks</h1>
+            <h1 className="m-0 text-title-h5 text-text-strong-950">{t("bookmarks.title")}</h1>
             <p className="m-0 mt-1 max-w-[70ch] text-paragraph-xs text-text-soft-400">
-              A site bound to a folder shows up in every profile in that folder.
+              {t("bookmarks.intro")}
             </p>
           </div>
           <div className="flex flex-wrap gap-1.5">
-            {tabs.map((t) => (
+            {tabs.map((tab) => (
               <button
-                key={t.id}
+                key={tab.id}
                 type="button"
-                onClick={() => setFolder(t.id)}
+                onClick={() => setFolder(tab.id)}
                 className={cn(
                   "rounded-6 px-2.5 py-1 text-label-xs ring-1 ring-inset transition-colors",
-                  folder === t.id
+                  folder === tab.id
                     ? "bg-primary-alpha-10 text-primary-base ring-primary-alpha-24"
                     : "text-text-sub-600 ring-stroke-soft-200 hover:bg-bg-weak-50",
                 )}
               >
-                {t.label}
+                {tab.label}
               </button>
             ))}
           </div>
@@ -131,7 +133,7 @@ export function BookmarksPage() {
           leftIcon={<AddIcon className="size-4" />}
           onClick={() => setEditing(emptyBookmark(folder === "all" || folder === "__any__" ? "" : folder))}
         >
-          New bookmark
+          {t("bookmarks.new")}
         </Button>
       </div>
 
@@ -144,7 +146,7 @@ export function BookmarksPage() {
             <div
               className="min-w-0 cursor-pointer truncate text-label-xs text-text-strong-950 transition-colors hover:text-primary-base"
               onClick={() => setEditing(b)}
-              title="Edit"
+              title={t("common.edit")}
             >
               {b.title || b.url}
             </div>
@@ -153,8 +155,11 @@ export function BookmarksPage() {
             </div>
             <div className="truncate text-paragraph-xs text-text-sub-600">
               {b.folder
-                ? `${b.folder} · ${countIn(b.folder)} profile${countIn(b.folder) === 1 ? "" : "s"}`
-                : `Every profile · ${profiles.length}`}
+                ? `${b.folder} · ${t(
+                    countIn(b.folder) === 1 ? "bookmarks.profileCountOne" : "bookmarks.profileCountMany",
+                    { n: String(countIn(b.folder)) },
+                  )}`
+                : `${t("bookmarks.everyProfile")} · ${profiles.length}`}
             </div>
             <div className="flex justify-end">
               <Button
@@ -162,7 +167,7 @@ export function BookmarksPage() {
                 leftIcon={<DeleteIcon className="size-3.5" />}
                 onClick={() => remove(b)}
               >
-                Delete
+                {t("common.delete")}
               </Button>
             </div>
           </div>
@@ -173,11 +178,10 @@ export function BookmarksPage() {
               <NavBookmarksIcon className="size-6" />
             </div>
             <h3 className="m-0 text-label-sm text-text-strong-950">
-              {items.length === 0 ? "No bookmarks yet" : "Nothing in this folder"}
+              {items.length === 0 ? t("bookmarks.none.title") : t("bookmarks.none.inFolder")}
             </h3>
             <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-              Add a site and bind it to a folder; every profile in that folder picks
-              it up on its next launch.
+              {t("bookmarks.none.body")}
             </p>
           </div>
         )}

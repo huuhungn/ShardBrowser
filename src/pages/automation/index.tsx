@@ -20,10 +20,12 @@ import {
   type RunReport,
 } from "../../entities/automation";
 import { useProfile } from "../../entities/profile";
+import { useT } from "../../shared/i18n";
 
 type ParamSpec = {
   key: string;
-  label: string;
+  /** A key in locales/, not the English text: the box label is translated. */
+  labelKey: string;
   placeholder: string;
   /** Numbers are stored as JSON numbers; the runner rejects a string here. */
   numeric?: boolean;
@@ -37,96 +39,96 @@ type ParamSpec = {
  * silently ignore, so this list is deliberately narrow.
  */
 const PARAMS: Record<string, ParamSpec[]> = {
-  navigate: [{ key: "url", label: "URL", placeholder: "https://example.com" }],
-  wait: [{ key: "ms", label: "Milliseconds", placeholder: "1000", numeric: true }],
-  waitForSelector: [{ key: "selector", label: "Selector", placeholder: "#login" }],
-  click: [{ key: "selector", label: "Selector", placeholder: "button[type=submit]" }],
+  navigate: [{ key: "url", labelKey: "automation.param.url", placeholder: "https://example.com" }],
+  wait: [{ key: "ms", labelKey: "automation.param.milliseconds", placeholder: "1000", numeric: true }],
+  waitForSelector: [{ key: "selector", labelKey: "automation.param.selector", placeholder: "#login" }],
+  click: [{ key: "selector", labelKey: "automation.param.selector", placeholder: "button[type=submit]" }],
   type: [
-    { key: "selector", label: "Selector", placeholder: "input[name=email]" },
-    { key: "text", label: "Text", placeholder: "hello or {{var}}" },
+    { key: "selector", labelKey: "automation.param.selector", placeholder: "input[name=email]" },
+    { key: "text", labelKey: "automation.param.text", placeholder: "hello or {{var}}" },
   ],
   setVariable: [
-    { key: "name", label: "Variable", placeholder: "token" },
-    { key: "value", label: "Value", placeholder: "abc or {{other}}" },
+    { key: "name", labelKey: "automation.param.variable", placeholder: "token" },
+    { key: "value", labelKey: "automation.param.value", placeholder: "abc or {{other}}" },
   ],
   readText: [
-    { key: "selector", label: "Selector", placeholder: ".price" },
-    { key: "into", label: "Store in variable", placeholder: "price" },
+    { key: "selector", labelKey: "automation.param.selector", placeholder: ".price" },
+    { key: "into", labelKey: "automation.param.storeInVariable", placeholder: "price" },
   ],
   assert: [
-    { key: "selector", label: "Selector", placeholder: ".welcome" },
-    { key: "expected", label: "Must contain", placeholder: "Signed in" },
+    { key: "selector", labelKey: "automation.param.selector", placeholder: ".welcome" },
+    { key: "expected", labelKey: "automation.param.mustContain", placeholder: "Signed in" },
   ],
   evaluate: [
-    { key: "script", label: "Script", placeholder: "document.title" },
+    { key: "script", labelKey: "automation.param.script", placeholder: "document.title" },
     // A script may not interpolate a value that came from outside the project;
     // this is where such a value goes instead, arriving as an argument.
-    { key: "with", label: "Pass variables in", placeholder: '["price"]' },
-    { key: "into", label: "Store in variable", placeholder: "title" },
+    { key: "with", labelKey: "automation.param.passVariablesIn", placeholder: '["price"]' },
+    { key: "into", labelKey: "automation.param.storeInVariable", placeholder: "title" },
   ],
   recordTraffic: [],
-  stopTraffic: [{ key: "into", label: "Store count in", placeholder: "requests" }],
+  stopTraffic: [{ key: "into", labelKey: "automation.param.storeCountIn", placeholder: "requests" }],
   assertRequest: [
-    { key: "urlContains", label: "URL contains", placeholder: "/api/login" },
-    { key: "mustSucceed", label: "Require one to have succeeded", placeholder: "", boolean: true },
-    { key: "into", label: "Store count in", placeholder: "hits" },
+    { key: "urlContains", labelKey: "automation.param.urlContains", placeholder: "/api/login" },
+    { key: "mustSucceed", labelKey: "automation.param.requireOneToHaveSucceeded", placeholder: "", boolean: true },
+    { key: "into", labelKey: "automation.param.storeCountIn", placeholder: "hits" },
   ],
   httpOpen: [],
   httpRequest: [
-    { key: "url", label: "URL", placeholder: "https://api.example.com/v1/me" },
-    { key: "method", label: "Method", placeholder: "GET" },
-    { key: "body", label: "Body", placeholder: '{"name":"{{who}}"}' },
+    { key: "url", labelKey: "automation.param.url", placeholder: "https://api.example.com/v1/me" },
+    { key: "method", labelKey: "automation.param.method", placeholder: "GET" },
+    { key: "body", labelKey: "automation.param.body", placeholder: '{"name":"{{who}}"}' },
     {
       key: "headers",
-      label: "Headers",
+      labelKey: "automation.param.headers",
       placeholder: '{"Authorization":"Bearer {{token}}"}',
     },
-    { key: "mustSucceed", label: "Require a 2xx reply", placeholder: "", boolean: true },
-    { key: "into", label: "Store body in", placeholder: "response" },
-    { key: "statusInto", label: "Store status in", placeholder: "code" },
+    { key: "mustSucceed", labelKey: "automation.param.requireA2xxReply", placeholder: "", boolean: true },
+    { key: "into", labelKey: "automation.param.storeBodyIn", placeholder: "response" },
+    { key: "statusInto", labelKey: "automation.param.storeStatusIn", placeholder: "code" },
   ],
   httpClose: [],
   readFile: [
-    { key: "path", label: "File", placeholder: "accounts.txt" },
-    { key: "into", label: "Store in variable", placeholder: "accounts" },
+    { key: "path", labelKey: "automation.param.file", placeholder: "accounts.txt" },
+    { key: "into", labelKey: "automation.param.storeInVariable", placeholder: "accounts" },
   ],
   writeFile: [
-    { key: "path", label: "File", placeholder: "out/result.txt" },
-    { key: "contents", label: "Contents", placeholder: "{{response}}" },
+    { key: "path", labelKey: "automation.param.file", placeholder: "out/result.txt" },
+    { key: "contents", labelKey: "automation.param.contents", placeholder: "{{response}}" },
   ],
   appendFile: [
-    { key: "path", label: "File", placeholder: "out/run.log" },
-    { key: "contents", label: "Contents", placeholder: "{{who}} done\n" },
+    { key: "path", labelKey: "automation.param.file", placeholder: "out/run.log" },
+    { key: "contents", labelKey: "automation.param.contents", placeholder: "{{who}} done\n" },
   ],
   fileExists: [
-    { key: "path", label: "File", placeholder: "out/result.txt" },
-    { key: "mustExist", label: "Fail the run when missing", placeholder: "", boolean: true },
-    { key: "into", label: "Store in variable", placeholder: "found" },
+    { key: "path", labelKey: "automation.param.file", placeholder: "out/result.txt" },
+    { key: "mustExist", labelKey: "automation.param.failTheRunWhenMissing", placeholder: "", boolean: true },
+    { key: "into", labelKey: "automation.param.storeInVariable", placeholder: "found" },
   ],
-  deleteFile: [{ key: "path", label: "File", placeholder: "out/result.txt" }],
+  deleteFile: [{ key: "path", labelKey: "automation.param.file", placeholder: "out/result.txt" }],
   dbExecute: [
-    { key: "database", label: "Database", placeholder: "work.db" },
+    { key: "database", labelKey: "automation.param.database", placeholder: "work.db" },
     {
       key: "sql",
-      label: "Statement",
+      labelKey: "automation.param.statement",
       placeholder: "insert into seen (name) values (?)",
     },
-    { key: "params", label: "Parameters", placeholder: '["{{who}}"]' },
-    { key: "into", label: "Store row count in", placeholder: "changed" },
+    { key: "params", labelKey: "automation.param.parameters", placeholder: '["{{who}}"]' },
+    { key: "into", labelKey: "automation.param.storeRowCountIn", placeholder: "changed" },
   ],
   dbQuery: [
-    { key: "database", label: "Database", placeholder: "work.db" },
+    { key: "database", labelKey: "automation.param.database", placeholder: "work.db" },
     {
       key: "sql",
-      label: "Query",
+      labelKey: "automation.param.query",
       placeholder: "select name from seen where done = ?",
     },
-    { key: "params", label: "Parameters", placeholder: "[0]" },
-    { key: "into", label: "Store rows in", placeholder: "rows" },
-    { key: "countInto", label: "Store count in", placeholder: "found" },
-    { key: "firstColumn", label: "First row column", placeholder: "name" },
-    { key: "firstInto", label: "Store first value in", placeholder: "next" },
-    { key: "minRows", label: "Require at least", placeholder: "1", numeric: true },
+    { key: "params", labelKey: "automation.param.parameters", placeholder: "[0]" },
+    { key: "into", labelKey: "automation.param.storeRowsIn", placeholder: "rows" },
+    { key: "countInto", labelKey: "automation.param.storeCountIn", placeholder: "found" },
+    { key: "firstColumn", labelKey: "automation.param.firstRowColumn", placeholder: "name" },
+    { key: "firstInto", labelKey: "automation.param.storeFirstValueIn", placeholder: "next" },
+    { key: "minRows", labelKey: "automation.param.requireAtLeast", placeholder: "1", numeric: true },
   ],
 };
 
@@ -156,6 +158,7 @@ function BlockRow({
   onMove: (dir: -1 | 1) => void;
   onRemove: () => void;
 }) {
+  const t = useT();
   const fields = PARAMS[block.kind] ?? [];
   return (
     <div className="border-t border-stroke-soft-200 px-4 py-3 first:border-t-0">
@@ -188,11 +191,11 @@ function BlockRow({
                       onChange({ ...block, params: next });
                     }}
                   />
-                  {f.label}
+                  {t(f.labelKey)}
                 </label>
               ) : (
                 <Field
-                  label={f.label}
+                  label={t(f.labelKey)}
                   value={str(block.params[f.key])}
                   placeholder={f.placeholder}
                   onChange={(v) => {
@@ -208,7 +211,7 @@ function BlockRow({
           ))}
           {fields.length === 0 && (
             <span className="self-center text-paragraph-xs text-text-soft-400">
-              No parameters
+              {t("automation.noParams")}
             </span>
           )}
         </div>
@@ -249,8 +252,8 @@ function BlockRow({
             value={block.on_fail === "next" ? "next" : "stop"}
             onChange={(v) => onChange({ ...block, on_fail: v === "next" ? "next" : "stop" })}
             options={[
-              { value: "stop", label: "Stop the run" },
-              { value: "next", label: "Carry on" },
+              { value: "stop", label: t("automation.param.stopTheRun") },
+              { value: "next", label: t("automation.param.carryOn") },
             ]}
           />
         </div>
@@ -260,11 +263,12 @@ function BlockRow({
 }
 
 function RunPanel({ report }: { report: RunReport }) {
+  const t = useT();
   return (
     <div className="mt-4 overflow-hidden rounded-12 bg-bg-white-0 ring-1 ring-inset ring-stroke-soft-200">
       <div className="flex items-center justify-between border-b border-stroke-soft-200 px-4 py-2.5">
         <span className="text-label-xs text-text-strong-950">
-          Last run · {report.ok ? "passed" : "failed"} · {report.ms} ms
+          {t("automation.run.last")} · {t(report.ok ? "automation.run.passed" : "automation.run.failed")} · {report.ms} ms
         </span>
         {report.stopped_because && (
           <span className="text-paragraph-xs text-error-base">
@@ -290,7 +294,7 @@ function RunPanel({ report }: { report: RunReport }) {
               (s.outcome === "skipped" || s.outcome === "stopped") && "text-text-soft-400",
             )}
           >
-            {s.outcome}
+            {t(`automation.outcome.${s.outcome}`)}
           </span>
           <span className="text-right text-paragraph-xs text-text-soft-400">{s.ms} ms</span>
         </div>
@@ -317,6 +321,7 @@ function Editor({ project }: { project: Project }) {
   const setRunProfile = useAutomation((s) => s.setRunProfile);
   const profiles = useProfile((s) => s.profiles);
 
+  const t = useT();
   const setBlocks = (blocks: Block[]) => patch({ blocks });
 
   return (
@@ -324,37 +329,37 @@ function Editor({ project }: { project: Project }) {
       <div className="flex items-end gap-3">
         <div className="w-[280px]">
           <Field
-            label="Name"
+            label={t("automation.name")}
             value={project.name}
-            placeholder="Warm up accounts"
+            placeholder={t("automation.namePlaceholder")}
             onChange={(v) => patch({ name: v })}
           />
         </div>
         <div className="min-w-0 flex-1">
           <Field
-            label="Notes"
+            label={t("automation.notes")}
             value={project.notes}
-            placeholder="What this project is for"
+            placeholder={t("automation.notesPlaceholder")}
             onChange={(v) => patch({ notes: v })}
           />
         </div>
         <Button variant="neutral" mode="stroke" size="small" onClick={() => setEditing(null)}>
-          Close
+          {t("automation.close")}
         </Button>
         <Button variant="primary" mode="filled" size="small" onClick={() => save(project)}>
-          Save
+          {t("common.save")}
         </Button>
       </div>
 
       <div className="flex items-end gap-3 rounded-12 bg-bg-weak-50 px-4 py-3">
         <div className="w-[280px]">
           <CSSelect
-            title="Run against"
+            title={t("automation.runAgainst")}
             value={runProfile}
             onChange={setRunProfile}
             isSearchable={profiles.length > 8}
             options={[
-              { value: "", label: "Pick a running profile" },
+              { value: "", label: t("automation.param.pickARunningProfile") },
               ...profiles.map((p) => ({ value: p.id, label: p.name })),
             ]}
           />
@@ -365,11 +370,10 @@ function Editor({ project }: { project: Project }) {
           leftIcon={<PlayIcon className="size-4" />}
           onClick={() => run(project)}
         >
-          {running ? "Running…" : "Run"}
+          {running ? t("automation.running") : t("automation.run")}
         </Button>
         <p className="m-0 flex-1 text-paragraph-xs text-text-soft-400">
-          The profile has to be running already — the runner attaches to it and never
-          starts a browser on its own. Save before running; runs read the stored copy.
+          {t("automation.runHelp")}
         </p>
       </div>
 
@@ -395,7 +399,7 @@ function Editor({ project }: { project: Project }) {
         ))}
         {project.blocks.length === 0 && (
           <div className="px-4 py-8 text-center text-paragraph-sm text-text-sub-600">
-            No blocks yet. Add the first step below.
+            {t("automation.noBlocks")}
           </div>
         )}
       </div>
@@ -406,7 +410,7 @@ function Editor({ project }: { project: Project }) {
           leftIcon={<AddIcon className="size-4" />}
           onClick={() => setBlocks([...project.blocks, emptyBlock()])}
         >
-          Add block
+          {t("automation.addBlock")}
         </Button>
       </div>
 
@@ -429,6 +433,7 @@ export function AutomationPage() {
   useEffect(() => { init(); initProfiles(); }, [init, initProfiles]);
   useStoreChanged(reload);
 
+  const t = useT();
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return items;
@@ -440,7 +445,7 @@ export function AutomationPage() {
   return (
     <>
       <Topbar
-        crumbs={["Automation"]}
+        crumbs={[t("automation.title")]}
         search={editing ? undefined : search}
         onSearch={editing ? undefined : setSearch}
       />
@@ -451,14 +456,14 @@ export function AutomationPage() {
           <>
             <div className="flex items-center justify-between">
               <p className="m-0 text-paragraph-sm text-text-sub-600">
-                Scripted runs that drive a profile that is already open.
+                {t("automation.intro")}
               </p>
               <Button
                 variant="primary" mode="filled" size="small"
                 leftIcon={<AddIcon className="size-4" />}
                 onClick={() => setEditing(emptyProject())}
               >
-                New project
+                {t("automation.newProject")}
               </Button>
             </div>
 
@@ -471,15 +476,15 @@ export function AutomationPage() {
                   <div
                     className="min-w-0 cursor-pointer truncate text-label-xs text-text-strong-950 transition-colors hover:text-primary-base"
                     onClick={() => setEditing(p)}
-                    title="Edit"
+                    title={t("common.edit")}
                   >
-                    {p.name || "Untitled project"}
+                    {p.name || t("automation.untitled")}
                   </div>
                   <div className="min-w-0 truncate text-paragraph-xs text-text-sub-600">
                     {p.notes}
                   </div>
                   <div className="text-paragraph-xs text-text-sub-600">
-                    {p.blocks.length} block{p.blocks.length === 1 ? "" : "s"}
+                    {t(p.blocks.length === 1 ? "automation.blockOne" : "automation.blockMany", { n: String(p.blocks.length) })}
                   </div>
                   <div className="flex justify-end">
                     <Button
@@ -496,11 +501,10 @@ export function AutomationPage() {
                     <NavAutomationIcon className="size-6" />
                   </div>
                   <h3 className="m-0 text-label-sm text-text-strong-950">
-                    {items.length === 0 ? "No projects yet" : "Nothing matches"}
+                    {items.length === 0 ? t("automation.none.title") : t("automation.none.noMatch")}
                   </h3>
                   <p className="m-0 max-w-[460px] text-paragraph-sm text-text-sub-600">
-                    Build a sequence of steps — open a page, wait, click, type — and run
-                    it against a profile you already have open.
+                    {t("automation.none.body")}
                   </p>
                 </div>
               )}

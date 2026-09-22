@@ -128,3 +128,57 @@ test("every locale in the folder is registered in the store", () => {
     );
   }
 });
+
+// A screen that still holds its English inline is invisible to every check
+// above: the locale files agree with each other perfectly while the page
+// renders English to a Vietnamese reader. So read the pages themselves and
+// fail on a sentence that never became a key.
+//
+// The rule is narrow on purpose — a JSX text node, or a label/title/placeholder
+// attribute, that reads like a sentence rather than an identifier. A className
+// or an icon name has no business here and would only teach people to add
+// exceptions until the test means nothing.
+const pagesDir = join(here, "..", "src", "pages");
+
+/** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
+function englishInSource(src) {
+  const found = [];
+  const withoutComments = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const line of withoutComments.split("\n")) {
+    const s = line.trim();
+    // A bare line of prose between tags: "Add block", "No projects yet".
+    if (/^[A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?]$/.test(s) && !s.includes("=") && !s.includes("(")) {
+      found.push(s);
+    }
+    for (const m of s.matchAll(
+      /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label)="([^"]{3,})"/g,
+    )) {
+      // A sample address or id is an illustration, not a sentence: it stays the
+      // same in every language, and translating it would break the example.
+      const v = m[1];
+      if (/^https?:\/\//.test(v) || /^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(v)) continue;
+      found.push(v);
+    }
+  }
+  return found;
+}
+
+test("no screen still holds its English inline", () => {
+  const offenders = [];
+  for (const entry of readdirSync(pagesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const file = join(pagesDir, entry.name, "index.tsx");
+    let src;
+    try {
+      src = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const text of englishInSource(src)) offenders.push(`${entry.name}: ${text}`);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these read as English text rather than t("…") keys:\n  ${offenders.join("\n  ")}`,
+  );
+});
