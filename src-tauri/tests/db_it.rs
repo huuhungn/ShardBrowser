@@ -8,6 +8,7 @@
 
 use serde_json::{json, Value};
 use shardx_launcher_lib::automation::{Block, Branch, Project, RunSettings};
+use shardx_launcher_lib::runner::StepOutcome;
 use shardx_launcher_lib::{runner, store};
 use std::collections::HashMap;
 
@@ -275,4 +276,75 @@ async fn a_project_cannot_open_a_database_outside_the_workspace() {
     assert!(!report.ok, "the run should have failed: {report:?}");
     let error = report.steps[0].error.clone().unwrap_or_default();
     assert!(error.contains(".."), "the error should say why: {error}");
+}
+
+/// A scraped value containing a quote must not restructure the params array.
+///
+/// `params` is written by hand in the editor, so it arrives as a JSON *string*
+/// and the variables inside it are substituted before the array is parsed. That
+/// ordering is the risk: a value like `alice"` would close its own string, and
+/// `alice", "extra` would add an element the project never wrote. SQL injection
+/// is already off the table because the values are bound, but a params array
+/// that silently grows an element binds the wrong value to the wrong column,
+/// which is its own corruption.
+#[tokio::test]
+async fn a_quote_in_a_value_cannot_add_a_parameter() {
+    let (_guard, _dir) = scratch();
+
+    let p = project(vec![
+        block(
+            "make",
+            "dbExecute",
+            json!({ "database": "quotes", "sql": "CREATE TABLE t (a TEXT, b TEXT)" }),
+        ),
+        block(
+            "name",
+            "setVariable",
+            json!({ "name": "who", "value": "alice\", \"injected" }),
+        ),
+        block(
+            "insert",
+            "dbExecute",
+            json!({
+                "database": "quotes",
+                "sql": "INSERT INTO t (a, b) VALUES (?, ?)",
+                "params": "[\"{{who}}\", \"real\"]",
+            }),
+        ),
+        block(
+            "read",
+            "dbQuery",
+            json!({
+                "database": "quotes",
+                "sql": "SELECT a, b FROM t",
+                "into": "rows",
+            }),
+        ),
+    ]);
+
+    let report = runner::run(&p, "db-profile", HashMap::new())
+        .await
+        .expect("the run should start");
+
+    assert!(
+        report.ok,
+        "the quote belongs inside the value, so the run should succeed: {:?}",
+        report
+            .steps
+            .iter()
+            .find(|s| matches!(s.outcome, StepOutcome::Failed)),
+    );
+
+    let rows: Vec<Value> =
+        serde_json::from_str(&report.variables["rows"]).expect("rows should be JSON");
+    assert_eq!(rows.len(), 1, "exactly one row should have been inserted");
+    assert_eq!(
+        rows[0]["b"], "real",
+        "the second column must still hold the value the project wrote, not one \
+         shifted in by a quote in the first: {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["a"], "alice\", \"injected",
+        "the quote and everything after it belong inside the value: {rows:?}"
+    );
 }

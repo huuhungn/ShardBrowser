@@ -24,11 +24,6 @@ fn config_root_cell() -> &'static RwLock<Option<PathBuf>> {
     CELL.get_or_init(|| RwLock::new(None))
 }
 
-/// Point the config dir somewhere else (None = back to the OS config dir).
-///
-/// Exists for tests: a test that writes automation projects into the
-/// operator's real store would corrupt the profiles this machine actually
-/// runs. Production never calls it.
 /// Serialises tests that swap the config root.
 ///
 /// The root is process-global, so two test modules that each hold their own
@@ -42,6 +37,11 @@ pub fn config_root_test_lock() -> &'static std::sync::Mutex<()> {
     &LOCK
 }
 
+/// Point the config dir somewhere else (None = back to the OS config dir).
+///
+/// Exists for tests: a test that writes automation projects into the
+/// operator's real store would corrupt the profiles this machine actually
+/// runs. Production never calls it.
 pub fn set_config_root(root: Option<PathBuf>) {
     if let Ok(mut g) = config_root_cell().write() {
         *g = root;

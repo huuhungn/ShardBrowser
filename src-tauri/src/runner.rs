@@ -423,12 +423,26 @@ fn db_params(block: &Block, vars: &Variables) -> Result<Vec<serde_json::Value>> 
     let list = match raw {
         serde_json::Value::Array(items) => items.clone(),
         serde_json::Value::String(text) => {
-            let expanded = vars.expand(text);
-            if expanded.trim().is_empty() {
+            if text.trim().is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_str::<Vec<serde_json::Value>>(&expanded)
-                .context("\"params\" must be a JSON array, e.g. [\"alice\", 1]")?
+
+            // Parse the array before substituting anything. A scraped value
+            // holding a quote would otherwise close its own string and could
+            // add or drop an element, binding values to the wrong columns.
+            // Only if the text is not an array on its own is it expanded
+            // first, which is how a whole array held in one variable works.
+            match serde_json::from_str::<Vec<serde_json::Value>>(text) {
+                Ok(list) => list,
+                Err(_) => {
+                    let expanded = vars.expand(text);
+                    if expanded.trim().is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    serde_json::from_str::<Vec<serde_json::Value>>(&expanded)
+                        .context("\"params\" must be a JSON array, e.g. [\"alice\", 1]")?
+                }
+            }
         }
         other => return Err(anyhow!("\"params\" must be a JSON array, not {other}")),
     };
