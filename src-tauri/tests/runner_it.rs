@@ -292,3 +292,223 @@ async fn a_false_assertion_quotes_what_the_page_actually_said() {
         "the error should quote both sides, got: {error}"
     );
 }
+
+/// A throwaway HTTP server, so traffic tests exercise the real network stack
+/// rather than `file://` reads that never touch it.
+///
+/// It answers exactly three paths: one that works, one that 500s, and the page
+/// that fetches both.
+struct Server {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Unblock the accept loop so the thread can notice and exit.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+    }
+}
+
+fn start_server() -> Server {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a test server");
+    let port = listener.local_addr().unwrap().port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]).to_string();
+            let path = request
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+
+            let (status, body) = match path.as_str() {
+                "/api/ok" => ("200 OK", "{\"ok\":true}".to_string()),
+                "/api/broken" => ("500 Internal Server Error", "{\"ok\":false}".to_string()),
+                _ => (
+                    "200 OK",
+                    format!(
+                        "<!doctype html><meta charset=\"utf-8\"><title>traffic</title>\
+                         <h1 id=\"title\">ready</h1>\
+                         <script>\
+                           fetch('/api/ok').then(() => {{ document.title = 'fetched'; }});\
+                         </script>"
+                    ),
+                ),
+            };
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+
+    Server { port, stop }
+}
+
+/// Recording proves the requests a page really made, including the ones that
+/// no rendered text would reveal.
+///
+/// This is the test the unit tests cannot stand in for: they fold hand-written
+/// events into the log, and would pass unchanged if `Network.enable` were
+/// never sent, if the events arrived on a session the recorder does not read,
+/// or if CDP named its fields differently than assumed.
+#[tokio::test]
+async fn a_recorded_run_reports_the_requests_the_page_actually_made() {
+    let server = start_server();
+    let page = format!("http://127.0.0.1:{}/", server.port);
+
+    let Some(engine) = start_engine("about:blank") else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-traffic-ok";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("rec", "recordTraffic", json!({})),
+        block("nav", "navigate", json!({ "url": page })),
+        // The fetch is fired from a promise callback, so the document being
+        // loaded does not mean it has happened yet.
+        block("settle", "wait", json!({ "ms": 1500 })),
+        block("seen", "assertRequest", json!({ "urlContains": "/api/ok", "into": "hits" })),
+        block("stop", "stopTraffic", json!({ "into": "requests" })),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(
+        report.ok,
+        "the run should pass; steps: {:?}",
+        report
+            .steps
+            .iter()
+            .map(|s| (&s.kind, &s.outcome, &s.error))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        report.variables.get("hits").map(String::as_str),
+        Some("1"),
+        "the XHR the page fired should have been recorded exactly once"
+    );
+    let recorded: usize = report
+        .variables
+        .get("requests")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        recorded >= 2,
+        "the document and its fetch should both be recorded, got {recorded}"
+    );
+}
+
+/// A request the operator asked about that never happened is a failed step,
+/// not a quietly passing one.
+#[tokio::test]
+async fn asserting_on_a_request_the_page_never_made_fails_the_step() {
+    let server = start_server();
+    let page = format!("http://127.0.0.1:{}/", server.port);
+
+    let Some(engine) = start_engine("about:blank") else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-traffic-missing";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("rec", "recordTraffic", json!({})),
+        block("nav", "navigate", json!({ "url": page })),
+        block("settle", "wait", json!({ "ms": 800 })),
+        block("nope", "assertRequest", json!({ "urlContains": "/api/never" })),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(!report.ok, "asserting on a request nobody made must fail");
+    let step = report
+        .steps
+        .iter()
+        .find(|s| s.block_id == "nope")
+        .expect("the assertion should be in the report");
+    assert!(
+        step.error.as_deref().unwrap_or_default().contains("/api/never"),
+        "the error should name the URL the operator asked about: {:?}",
+        step.error
+    );
+}
+
+/// A request that came back 500 is not a request that worked.
+///
+/// The page loads fine and shows nothing wrong; only the recording knows.
+#[tokio::test]
+async fn a_request_that_failed_on_the_server_fails_the_assertion() {
+    let server = start_server();
+    let page = format!("http://127.0.0.1:{}/api/broken", server.port);
+
+    let Some(engine) = start_engine("about:blank") else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-traffic-500";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("rec", "recordTraffic", json!({})),
+        block("nav", "navigate", json!({ "url": page })),
+        block("settle", "wait", json!({ "ms": 600 })),
+        block("seen", "assertRequest", json!({ "urlContains": "/api/broken" })),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(!report.ok, "a 500 must not pass an assertion about the request");
+    let step = report
+        .steps
+        .iter()
+        .find(|s| s.block_id == "seen")
+        .expect("the assertion should be in the report");
+    assert!(
+        step.error.as_deref().unwrap_or_default().contains("500"),
+        "the error should say what the server answered: {:?}",
+        step.error
+    );
+}

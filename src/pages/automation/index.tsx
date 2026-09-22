@@ -59,6 +59,12 @@ const PARAMS: Record<string, ParamSpec[]> = {
     { key: "script", label: "Script", placeholder: "document.title" },
     { key: "into", label: "Store in variable", placeholder: "title" },
   ],
+  recordTraffic: [],
+  stopTraffic: [{ key: "into", label: "Store count in", placeholder: "requests" }],
+  assertRequest: [
+    { key: "urlContains", label: "URL contains", placeholder: "/api/login" },
+    { key: "into", label: "Store count in", placeholder: "hits" },
+  ],
 };
 
 const str = (v: unknown) => (v == null ? "" : String(v));

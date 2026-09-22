@@ -15,6 +15,7 @@ pub mod gpu_caps;
 pub mod automation;
 pub mod cdp;
 pub mod runner;
+pub mod traffic;
 mod launch;
 
 /// Where the engine binary lives, for integration tests that need to know

@@ -15,6 +15,7 @@
 
 use crate::automation::{Block, Branch, Project};
 use crate::cdp;
+use crate::traffic;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -150,6 +151,9 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "readText",
         "assert",
         "evaluate",
+        "recordTraffic",
+        "stopTraffic",
+        "assertRequest",
     ]
 }
 
@@ -190,6 +194,7 @@ pub async fn run(
 
     let started = Instant::now();
     let mut vars = Variables::new(seed);
+    let mut state = RunState::default();
     let mut steps: Vec<StepReport> = Vec::new();
     let mut stopped_because: Option<String> = None;
     let mut failed_any = false;
@@ -252,7 +257,7 @@ pub async fn run(
             let branch = loop {
                 attempt += 1;
                 let step_started = Instant::now();
-                let result = perform(block, profile_id, &mut vars).await;
+                let result = perform(block, profile_id, &mut vars, &mut state).await;
                 let ms = step_started.elapsed().as_millis() as u64;
 
                 match result {
@@ -360,7 +365,22 @@ fn param_text(block: &Block, name: &str, vars: &Variables) -> Result<String> {
     Ok(vars.expand(raw))
 }
 
-async fn perform(block: &Block, profile_id: &str, vars: &mut Variables) -> Result<()> {
+/// What a run carries between blocks besides its variables.
+///
+/// The recorder has to outlive the block that started it -- that is the whole
+/// point of a separate stop block -- so it lives here rather than in
+/// `perform`.
+#[derive(Default)]
+struct RunState {
+    traffic: Option<traffic::Recorder>,
+}
+
+async fn perform(
+    block: &Block,
+    profile_id: &str,
+    vars: &mut Variables,
+    state: &mut RunState,
+) -> Result<()> {
     match block.kind.as_str() {
         "navigate" => {
             let url = param_text(block, "url", vars)?;
@@ -491,6 +511,83 @@ async fn perform(block: &Block, profile_id: &str, vars: &mut Variables) -> Resul
                     seen.trim()
                 ))
             }
+        }
+
+        // Traffic recording. Split into start and stop blocks on purpose: what
+        // an operator wants to assert on is usually the requests one action
+        // provoked, not every request the profile made all run.
+        "recordTraffic" => {
+            if state.traffic.is_some() {
+                // Silently restarting would throw away what was recorded so
+                // far, and the operator would be asserting against a window
+                // they did not mean.
+                return Err(anyhow!(
+                    "traffic is already being recorded; stop it before starting again"
+                ));
+            }
+            state.traffic = Some(traffic::Recorder::start(profile_id).await?);
+            Ok(())
+        }
+
+        "stopTraffic" => {
+            let recorder = state
+                .traffic
+                .take()
+                .context("nothing is being recorded — add a \"recordTraffic\" block first")?;
+            let dropped = recorder.dropped();
+            let entries = recorder.stop().await;
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, entries.len().to_string());
+            }
+            if dropped > 0 {
+                // Report rather than fail: the requests that were recorded are
+                // still true, and a run that failed here would be failing for
+                // something the page did, not something the project got wrong.
+                vars.set("traffic_dropped", dropped.to_string());
+            }
+            Ok(())
+        }
+
+        "assertRequest" => {
+            let recorder = state
+                .traffic
+                .as_ref()
+                .context("nothing is being recorded — add a \"recordTraffic\" block first")?;
+            let url_part = param_text(block, "urlContains", vars)?;
+            let entries = recorder.entries();
+            let matched: Vec<_> = entries
+                .iter()
+                .filter(|e| e.url.contains(&url_part))
+                .collect();
+
+            if matched.is_empty() {
+                return Err(anyhow!(
+                    "no request matching {url_part:?} was made ({} recorded so far)",
+                    entries.len()
+                ));
+            }
+
+            // Default to demanding a request that worked: "the page called the
+            // login endpoint" is nearly always meant as "and it did not 500".
+            let require_ok = block
+                .params
+                .get("mustSucceed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if require_ok && matched.iter().all(|e| e.failed()) {
+                let worst = matched
+                    .iter()
+                    .find_map(|e| e.error.clone())
+                    .or_else(|| matched.iter().find_map(|e| e.status.map(|s| format!("HTTP {s}"))))
+                    .unwrap_or_else(|| "it never came back".to_string());
+                return Err(anyhow!(
+                    "every request matching {url_part:?} failed — {worst}"
+                ));
+            }
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, matched.len().to_string());
+            }
+            Ok(())
         }
 
         "evaluate" => {
@@ -639,6 +736,55 @@ mod tests {
             secrets: Vec::new(),
             on_fail: Branch::Stop,
         }
+    }
+
+    /// Run one block with no recorder started, the way a project that forgot
+    /// its `recordTraffic` block would.
+    async fn perform_alone(b: &Block) -> Result<()> {
+        let mut v = vars(&[]);
+        let mut state = RunState::default();
+        perform(b, "no-such-profile", &mut v, &mut state).await
+    }
+
+    #[tokio::test]
+    async fn asserting_on_traffic_nobody_recorded_says_so() {
+        // The failure an operator actually hits: they added assertRequest and
+        // not the record block that has to come before it. Reporting "no
+        // request matched" there would send them looking at the page.
+        let b = block("b1", "assertRequest", json!({ "urlContains": "/login" }));
+        let e = perform_alone(&b).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("recordTraffic"),
+            "the error should name the block that is missing, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_recording_that_never_started_says_so() {
+        let b = block("b1", "stopTraffic", json!({}));
+        let e = perform_alone(&b).await.unwrap_err();
+        assert!(format!("{e:#}").contains("recordTraffic"));
+    }
+
+    #[tokio::test]
+    async fn recording_traffic_on_a_dead_profile_fails_rather_than_hangs() {
+        // Same contract as every other block: a profile that went away is a
+        // failed step, not a run that never finishes.
+        let b = block("b1", "recordTraffic", json!({}));
+        assert!(perform_alone(&b).await.is_err());
+    }
+
+    #[test]
+    fn the_traffic_blocks_are_ones_this_build_will_run() {
+        // A block the editor offers but `run` refuses is a project that saves
+        // and then cannot start at all.
+        let p = project(vec![
+            block("b1", "recordTraffic", json!({})),
+            block("b2", "assertRequest", json!({ "urlContains": "/x" })),
+            block("b3", "stopTraffic", json!({})),
+        ]);
+        assert!(unsupported_blocks(&p).is_empty());
     }
 
     fn project(blocks: Vec<Block>) -> Project {

@@ -21,6 +21,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
+/// One event off the wire.
+#[derive(Clone, Debug)]
+pub struct CdpEvent {
+    pub method: String,
+    pub params: Value,
+}
+
 struct Session {
     out: mpsc::UnboundedSender<Message>,
     pending: Pending,
@@ -29,8 +36,11 @@ struct Session {
     /// page (navigate, evaluate, click) must carry it; browser-level ones
     /// must not.
     page_session: Mutex<Option<String>>,
-    /// Every event method name, for callers waiting on one.
-    events: broadcast::Sender<String>,
+    /// Every event, for callers waiting on one or recording them. Carries the
+    /// params as well as the name: a recorder told only that
+    /// `Network.responseReceived` fired would still have to go back and ask
+    /// which request it was about, by which time the page may have moved on.
+    events: broadcast::Sender<CdpEvent>,
 }
 
 impl Session {
@@ -105,7 +115,7 @@ where
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-    let (events, _) = broadcast::channel::<String>(64);
+    let (events, _) = broadcast::channel::<CdpEvent>(512);
 
     let session = Arc::new(Session {
         out: out_tx.clone(),
@@ -173,7 +183,10 @@ where
                     }
                 }
 
-                let _ = session_for_reader.events.send(method.to_string());
+                let _ = session_for_reader.events.send(CdpEvent {
+                    method: method.to_string(),
+                    params: params.clone(),
+                });
                 on_event(method.to_string(), params);
             }
 
@@ -280,7 +293,15 @@ pub async fn browser_call(profile_id: &str, method: &str, params: Value) -> Resu
 /// produce the event. Taking it afterwards is a race the run loses roughly
 /// whenever the machine is busy.
 pub struct EventWait {
-    rx: broadcast::Receiver<String>,
+    rx: broadcast::Receiver<CdpEvent>,
+}
+
+/// Subscribe to every event on a profile's session.
+///
+/// Callers that want one named event should use `watch`; this is for the ones
+/// that record a stream of them and cannot know the names in advance.
+pub fn subscribe(profile_id: &str) -> Option<broadcast::Receiver<CdpEvent>> {
+    Some(get(profile_id)?.events.subscribe())
 }
 
 pub fn watch(profile_id: &str) -> Option<EventWait> {
@@ -302,7 +323,7 @@ impl EventWait {
                 return false;
             }
             match tokio::time::timeout(left, self.rx.recv()).await {
-                Ok(Ok(seen)) if seen == method => return true,
+                Ok(Ok(seen)) if seen.method == method => return true,
                 Ok(Ok(_)) => continue,
                 // Lagged: events were dropped while we were not reading. The
                 // one we want may have been among them, so keep waiting

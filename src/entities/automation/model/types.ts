@@ -84,6 +84,9 @@ export const BLOCK_KINDS = [
   "readText",
   "assert",
   "evaluate",
+  "recordTraffic",
+  "stopTraffic",
+  "assertRequest",
 ] as const;
 
 export type BlockKind = (typeof BLOCK_KINDS)[number];
