@@ -12,6 +12,9 @@ mod fingerprints;
 pub mod fleet_client;
 mod fleet_keys;
 pub mod gpu_caps;
+pub mod automation;
+pub mod cdp;
+pub mod runner;
 mod launch;
 
 /// Where the engine binary lives, for integration tests that need to know

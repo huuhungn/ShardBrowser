@@ -84,6 +84,11 @@ pub fn settings_path() -> Result<PathBuf> {
     Ok(config_root()?.join("settings.json"))
 }
 
+/// Automation projects: blocks, run settings, export bundles.
+pub fn automation_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("automation.json"))
+}
+
 /// Folder-scoped bookmarks, merged into each profile's Bookmarks on launch.
 pub fn bookmarks_path() -> Result<PathBuf> {
     Ok(config_root()?.join("bookmarks.json"))
