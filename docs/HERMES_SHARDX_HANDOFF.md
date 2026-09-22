@@ -297,6 +297,63 @@ Launcher` window is hidden. A CAffiliate `-Now` dry-run observed the account as
 already checked in, did not dispatch a click, closed its temporary page,
 restored the canonical profile to stopped, and left `/running` empty.
 
+## Fork parity work, September 2026
+
+Four changes on top of `924d081`, each proven against the engine actually
+installed (152.0.7977.65) rather than against the upstream source they came
+from.
+
+**GPU compatibility probe** (ported from upstream). A fingerprint may claim a
+GPU whose WebGL extension set the host cannot produce; a site that asks for the
+extension list then sees the claim contradicted. The probe runs the engine once
+against a temporary profile, caches the host's real WebGL/WebGL2 extension
+lists under `%APPDATA%\shardx-launcher\host-gl-caps.json` keyed by engine
+version and OS, and the editor warns before a profile is saved with a claim the
+machine cannot back. Measured on this host: 94 of the 220 bundled fingerprints
+claim mobile GPU extensions (ASTC, ETC) an RTX 2060 does not expose. The warning
+is advisory — the operator can keep the claim.
+
+**Profile edit round trip (#83).** `fromStored()` did not read `platform_version`
+back out of the stored profile, so opening a profile in the editor and saving it
+silently dropped the OS version that `toStored()` had written. One line to read
+the field, plus `scripts/profile-form-roundtrip.test.mjs`, which walks every
+form field rather than the one that broke and fails if any is lost.
+
+**UI locale (#81).** Chromium renders its own strings — validation bubbles,
+context menus, built-in error pages — in the UI locale it takes from the host
+OS. Spoofing `navigator.language` never touched that, so an en-US profile on
+this machine showed Russian validation text. The launcher now passes
+`--lang=<profile locale>`. Proven both ways against the installed engine: with
+the flag the bubble is English, without it Russian.
+
+**Speech voices (#80).** All 120 bundled `win-*` presets carried the same two
+local SAPI voices, `Microsoft Irina` and `Microsoft Pavel`, both `ru-RU`,
+captured from one donor machine. `speechSynthesis.getVoices()` needs no
+permission, so any page could read that pair — identical across every profile
+built from those presets, which links them to each other, and implausible on a
+Windows box in any other language. `src-tauri/src/speech.rs` rewrites the local
+voices to the ones Windows actually installs for the profile's locale, leaves
+the network voices alone, and leaves a locale untouched when its voice names are
+not known rather than inventing one. An en-US profile now reports David, Mark
+and Zira.
+
+### Motion domain: probed, not ported
+
+Upstream ships Node, Python and Rust SDKs over a browser-level CDP domain called
+`Motion` (human pointer curves, keystroke timing, finger gestures, orientation).
+The domain is deliberately absent from `Schema.getDomains` and `/json/protocol`,
+so the only honest test is to call it and read the error.
+
+**This engine does not implement it.** All eleven documented methods answer
+`'Motion.<method>' wasn't found`, on both the browser and page targets. Porting
+the SDKs now would ship three libraries whose every call fails at runtime.
+
+`src-tauri/tests/motion_protocol_it.rs` records that state and watches for the
+day it changes: if an engine update adds the domain, the first test fails and
+the SDK port becomes justified. The second test asserts the domain stays out of
+`Schema.getDomains` whether or not it is implemented — an enumerable private
+domain is itself a fingerprint.
+
 ## Start-of-task verification
 
 ```powershell
