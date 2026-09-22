@@ -875,6 +875,43 @@ fn extension_delete(id: String) -> Result<(), String> {
     extensions::delete(&id).map_err(|e| e.to_string())
 }
 
+// ---- Automation ----
+
+#[tauri::command]
+fn automation_list() -> Result<Vec<automation::Project>, String> {
+    automation::list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn automation_get(id: String) -> Result<automation::Project, String> {
+    automation::get(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn automation_save(project: automation::Project) -> Result<automation::Project, String> {
+    automation::save(project).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn automation_delete(id: String) -> Result<(), String> {
+    automation::delete(&id).map_err(|e| e.to_string())
+}
+
+/// Run a saved project against a running profile.
+///
+/// Guards live in the runner, so this path and the HTTP API enforce the same
+/// rules rather than drifting apart.
+#[tauri::command]
+async fn automation_run(
+    project_id: String,
+    profile_id: String,
+    variables: std::collections::HashMap<String, String>,
+) -> Result<runner::RunReport, String> {
+    runner::run_saved(&project_id, &profile_id, variables)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---- Bookmarks ----
 
 #[tauri::command]
@@ -2373,6 +2410,11 @@ pub fn run() {
             extension_import,
             extension_import_url,
             extension_delete,
+            automation_list,
+            automation_get,
+            automation_save,
+            automation_delete,
+            automation_run,
             bookmark_list,
             bookmark_save,
             bookmark_delete,

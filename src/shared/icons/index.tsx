@@ -49,6 +49,7 @@ import {
   ArchiveRestoreIcon,
   FilterIcon as HugeFilterIcon,
   Cancel01Icon,
+  WorkflowSquare10Icon,
 } from "@hugeicons/core-free-icons";
 import type { ComponentProps } from "react";
 
@@ -71,6 +72,7 @@ export const NavPatchLogIcon = make(SparklesIcon);
 export const NavExtensionsIcon = make(PuzzleIcon);
 export const NavBookmarksIcon = make(Bookmark02Icon);
 export const NavTrashIcon = make(Delete03Icon);
+export const NavAutomationIcon = make(WorkflowSquare10Icon);
 
 /* ── OS logos ── */
 export const AppleOsIcon = make(AppleIcon);

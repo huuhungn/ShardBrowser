@@ -580,6 +580,38 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
+/// Run a saved project by id against a running profile, attaching if needed.
+///
+/// Shared by the HTTP API and the desktop UI so both enforce the same rules:
+/// the profile must already be running (a run never launches a browser as a
+/// side effect), and it must expose a debugging port the launcher itself
+/// recorded, so a run cannot reach a browser the launcher does not own.
+pub async fn run_saved(
+    project_id: &str,
+    profile_id: &str,
+    seed: HashMap<String, String>,
+) -> Result<RunReport> {
+    let project = crate::automation::get(project_id)?;
+
+    if !crate::is_profile_running(profile_id) {
+        return Err(anyhow!("profile {profile_id} is not running"));
+    }
+
+    if !cdp::is_attached(profile_id) {
+        let endpoint = crate::process::Tracker::shared()
+            .cdp(profile_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "profile {profile_id} is running without a debugging port; \
+                     restart it to automate it"
+                )
+            })?;
+        cdp::attach(profile_id.to_string(), endpoint.web_socket_debugger_url).await?;
+    }
+
+    run(&project, profile_id, seed).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

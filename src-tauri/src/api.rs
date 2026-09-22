@@ -866,41 +866,22 @@ struct RunReq {
 }
 
 async fn run_automation_project(Path(id): Path<String>, Json(body): Json<RunReq>) -> ApiResult {
-    let project = crate::automation::get(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
-
-    // Refuse rather than launch: starting a browser as a side effect of "run
-    // this script" is how an unattended caller ends up with a fleet it never
-    // asked for.
-    if !crate::is_profile_running(&body.profile_id) {
-        return Err(err(
-            StatusCode::CONFLICT,
-            format!("profile {} is not running", body.profile_id),
-        ));
-    }
-
-    // Attach on demand. The websocket URL is the one the launcher already read
-    // from this instance's DevToolsActivePort, so a run cannot reach a browser
-    // the launcher does not believe it started.
-    if !crate::cdp::is_attached(&body.profile_id) {
-        let cdp = crate::process::Tracker::shared()
-            .cdp(&body.profile_id)
-            .ok_or_else(|| {
-                err(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "profile {} is running without a debugging port; restart it to automate it",
-                        body.profile_id
-                    ),
-                )
-            })?;
-        crate::cdp::attach(body.profile_id.clone(), cdp.web_socket_debugger_url)
-            .await
-            .map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
-    }
-
-    let report = crate::runner::run(&project, &body.profile_id, body.variables)
+    // Every guard lives in the runner so the UI and the API cannot drift:
+    // the profile must already be running, and it must expose a debugging
+    // port the launcher itself recorded.
+    let report = crate::runner::run_saved(&id, &body.profile_id, body.variables)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            let text = e.to_string();
+            let code = if text.contains("no such project") {
+                StatusCode::NOT_FOUND
+            } else if text.contains("is not running") || text.contains("debugging port") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err(code, text)
+        })?;
     Ok(Json(json!(report)))
 }
 
