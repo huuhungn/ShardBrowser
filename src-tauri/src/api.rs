@@ -813,6 +813,97 @@ async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> 
     })))
 }
 
+// ---- automation ----
+
+async fn list_automation_projects() -> ApiResult {
+    let projects =
+        crate::automation::list().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "projects": projects })))
+}
+
+async fn get_automation_project(Path(id): Path<String>) -> ApiResult {
+    let project = crate::automation::get(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!(project)))
+}
+
+#[derive(Deserialize)]
+struct NewProjectReq {
+    name: String,
+}
+
+async fn create_automation_project(Json(body): Json<NewProjectReq>) -> ApiResult {
+    let project = crate::automation::create(&body.name)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!(project)))
+}
+
+async fn save_automation_project(
+    Path(id): Path<String>,
+    Json(mut project): Json<crate::automation::Project>,
+) -> ApiResult {
+    // The path is the authority on which project this is: a body naming a
+    // different id would otherwise overwrite something the caller did not ask
+    // for.
+    project.id = id;
+    let saved =
+        crate::automation::save(project).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!(saved)))
+}
+
+async fn delete_automation_project(Path(id): Path<String>) -> ApiResult {
+    crate::automation::delete(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!({ "id": id, "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct RunReq {
+    /// Which profile to drive. Must already be running.
+    profile_id: String,
+    /// Values the project's placeholders expand to, for parameters the author
+    /// marked secret and anything else the caller wants to vary per run.
+    #[serde(default)]
+    variables: std::collections::HashMap<String, String>,
+}
+
+async fn run_automation_project(Path(id): Path<String>, Json(body): Json<RunReq>) -> ApiResult {
+    let project = crate::automation::get(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+
+    // Refuse rather than launch: starting a browser as a side effect of "run
+    // this script" is how an unattended caller ends up with a fleet it never
+    // asked for.
+    if !crate::is_profile_running(&body.profile_id) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            format!("profile {} is not running", body.profile_id),
+        ));
+    }
+
+    // Attach on demand. The websocket URL is the one the launcher already read
+    // from this instance's DevToolsActivePort, so a run cannot reach a browser
+    // the launcher does not believe it started.
+    if !crate::cdp::is_attached(&body.profile_id) {
+        let cdp = crate::process::Tracker::shared()
+            .cdp(&body.profile_id)
+            .ok_or_else(|| {
+                err(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "profile {} is running without a debugging port; restart it to automate it",
+                        body.profile_id
+                    ),
+                )
+            })?;
+        crate::cdp::attach(body.profile_id.clone(), cdp.web_socket_debugger_url)
+            .await
+            .map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    }
+
+    let report = crate::runner::run(&project, &body.profile_id, body.variables)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!(report)))
+}
+
 async fn stop_profile(Path(id): Path<String>) -> ApiResult {
     let stopped = crate::process::Tracker::shared()
         .kill(&id)
@@ -1277,6 +1368,14 @@ pub async fn serve(secret: String, port: u16) {
         error: None,
     });
 
+    serve_router(router(), port).await
+}
+
+/// The API's routes, exactly as [`serve`] mounts them.
+///
+/// Split out so tests exercise the real routing table -- including which
+/// routes sit behind the auth layer -- instead of a copy that can drift.
+fn router() -> Router {
     let protected = Router::new()
         .route("/profiles", get(list_profiles).post(create_profile))
         .route("/profiles/temporary", post(create_temporary))
@@ -1313,12 +1412,29 @@ pub async fn serve(secret: String, port: u16) {
         .route("/trash", get(list_trash))
         .route("/trash/:id", delete(purge_trash))
         .route("/trash/:id/restore", post(restore_trash))
+        .route(
+            "/automation/projects",
+            get(list_automation_projects).post(create_automation_project),
+        )
+        .route(
+            "/automation/projects/:id",
+            get(get_automation_project)
+                .put(save_automation_project)
+                .delete(delete_automation_project),
+        )
+        .route("/automation/projects/:id/run", post(run_automation_project))
         .route_layer(middleware::from_fn(auth));
 
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health))
-        .merge(protected);
+        .merge(protected)
+}
 
+/// Bind `port` and serve `app`, publishing runtime status as it goes.
+///
+/// Split out of [`serve`] so tests can exercise the same router this
+/// function serves, rather than a copy of it that could drift.
+async fn serve_router(app: Router, port: u16) {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
@@ -1390,5 +1506,286 @@ mod listener_handle_tests {
         let read = unsafe { GetHandleInformation(handle, &mut flags) };
         assert_ne!(read, 0, "read listener handle flags");
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+#[cfg(test)]
+mod automation_endpoint_tests {
+    //! The automation endpoints, driven through the real routing table.
+    //!
+    //! The storage and runner unit tests say nothing about whether these
+    //! endpoints are mounted, or whether the auth layer covers them. A route
+    //! mounted outside `route_layer(auth)` would leave every one of those
+    //! tests green while handing any local process the ability to drive the
+    //! operator's logged-in browsers -- so that is what this checks.
+    //!
+    //! Requests go through `tower`'s `oneshot` rather than a socket: same
+    //! router, same middleware, no port to race over.
+
+    use super::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    const SECRET: &str = "test-secret-not-a-real-one";
+
+    /// Point the store at a scratch dir and mint a token for it.
+    ///
+    /// Never the operator's real store: these tests create and delete
+    /// projects, and this machine's launcher runs against the real one.
+    ///
+    /// The store root is process-global, so these tests hold a lock for the
+    /// duration: without it, two tests racing on the same root see each
+    /// other's projects and the failure looks like a routing bug.
+    fn scratch_store() -> (tempfile::TempDir, String, std::sync::MutexGuard<'static, ()>) {
+        static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("a scratch config root");
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        super::set_secret(SECRET);
+        let token = super::long_lived_token(SECRET).expect("mint a token");
+        (dir, token, guard)
+    }
+
+    async fn send(request: Request<Body>) -> (StatusCode, Value) {
+        let response = router().oneshot(request).await.expect("route the request");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("read the body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    fn authed(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build the request")
+    }
+
+    /// Every automation endpoint sits behind the same auth as the rest of the
+    /// API. This is the check that matters most: they drive real browsers.
+    #[tokio::test]
+    async fn the_automation_endpoints_refuse_an_unauthenticated_caller() {
+        let (_store, _token, _lock) = scratch_store();
+
+        let unauthenticated = [
+            ("GET", "/automation/projects"),
+            ("GET", "/automation/projects/anything"),
+            ("POST", "/automation/projects"),
+            ("PUT", "/automation/projects/anything"),
+            ("POST", "/automation/projects/anything/run"),
+            ("DELETE", "/automation/projects/anything"),
+        ];
+
+        for (method, path) in unauthenticated {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("build the request");
+            let (status, _) = send(request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} answered an unauthenticated caller"
+            );
+        }
+
+        // A wrong token is no better than no token.
+        let (status, _) = send(authed(
+            "GET",
+            "/automation/projects",
+            "not-the-token",
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The full lifecycle through the API: create, edit, read back, list, delete.
+    #[tokio::test]
+    async fn a_project_survives_the_round_trip_through_the_api() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (status, created) = send(authed(
+            "POST",
+            "/automation/projects",
+            &token,
+            json!({ "name": "API round trip" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {created}");
+        let id = created["id"].as_str().expect("a new id").to_string();
+        assert_eq!(created["name"], "API round trip");
+
+        let mut project = created.clone();
+        project["blocks"] = json!([{
+            "id": "one",
+            "kind": "navigate",
+            "params": { "url": "https://example.invalid/" },
+            "enabled": true,
+            "on_done": "next",
+            "on_fail": "stop",
+        }]);
+
+        let (status, saved) = send(authed(
+            "PUT",
+            &format!("/automation/projects/{id}"),
+            &token,
+            project,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "save failed: {saved}");
+        assert_eq!(saved["blocks"].as_array().map(Vec::len), Some(1));
+
+        // Read it back from storage, not from the save's own reply.
+        let (status, fetched) = send(authed(
+            "GET",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["blocks"][0]["kind"], "navigate");
+        assert_eq!(
+            fetched["blocks"][0]["params"]["url"],
+            "https://example.invalid/"
+        );
+
+        let (status, listed) =
+            send(authed("GET", "/automation/projects", &token, json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            listed["projects"]
+                .as_array()
+                .expect("an array of projects")
+                .iter()
+                .any(|p| p["id"] == id.as_str()),
+            "the new project should appear in the list"
+        );
+
+        let (status, _) = send(authed(
+            "DELETE",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send(authed(
+            "GET",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a deleted project should be gone"
+        );
+    }
+
+    /// A body naming a different id must not overwrite another project: the
+    /// path is the authority, so a confused client cannot redirect a save.
+    #[tokio::test]
+    async fn a_save_cannot_overwrite_a_project_the_path_did_not_name() {
+        let (_store, token, _lock) = scratch_store();
+
+        let mut created = Vec::new();
+        for name in ["Target", "Other"] {
+            let (status, project) = send(authed(
+                "POST",
+                "/automation/projects",
+                &token,
+                json!({ "name": name }),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            created.push(project);
+        }
+        let target_id = created[0]["id"].as_str().expect("an id").to_string();
+        let other_id = created[1]["id"].as_str().expect("an id").to_string();
+
+        // Save to the target's path while claiming to be the other in the body.
+        let mut body = created[1].clone();
+        body["name"] = json!("Rewritten");
+        send(authed(
+            "PUT",
+            &format!("/automation/projects/{target_id}"),
+            &token,
+            body,
+        ))
+        .await;
+
+        let (_, untouched) = send(authed(
+            "GET",
+            &format!("/automation/projects/{other_id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(
+            untouched["name"], "Other",
+            "a save must not rewrite the project its path did not name"
+        );
+    }
+
+    /// Running against a profile that is not running is refused, rather than
+    /// launching a browser nobody asked for.
+    #[tokio::test]
+    async fn running_against_a_stopped_profile_is_refused() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (_, created) = send(authed(
+            "POST",
+            "/automation/projects",
+            &token,
+            json!({ "name": "Needs a browser" }),
+        ))
+        .await;
+        let id = created["id"].as_str().expect("an id").to_string();
+
+        let (status, body) = send(authed(
+            "POST",
+            &format!("/automation/projects/{id}/run"),
+            &token,
+            json!({ "profile_id": "no-such-profile-is-running" }),
+        ))
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a run against a stopped profile should be refused"
+        );
+        assert!(
+            body.to_string().contains("not running"),
+            "the refusal should say why: {body}"
+        );
+    }
+
+    /// Running a project that does not exist is a 404, not a 500.
+    #[tokio::test]
+    async fn running_an_unknown_project_is_not_found() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (status, _) = send(authed(
+            "POST",
+            "/automation/projects/no-such-project/run",
+            &token,
+            json!({ "profile_id": "anything" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

@@ -4526,6 +4526,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tungstenite",
  "url",
  "uuid",

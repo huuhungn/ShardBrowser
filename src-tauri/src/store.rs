@@ -9,10 +9,30 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 pub fn config_root() -> Result<PathBuf> {
+    if let Some(root) = config_root_cell().read().ok().and_then(|g| g.clone()) {
+        std::fs::create_dir_all(&root)?;
+        return Ok(root);
+    }
     let base = dirs::config_dir().context("OS config dir unavailable")?;
     let root = base.join("shardx-launcher");
     std::fs::create_dir_all(&root)?;
     Ok(root)
+}
+
+fn config_root_cell() -> &'static RwLock<Option<PathBuf>> {
+    static CELL: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(None))
+}
+
+/// Point the config dir somewhere else (None = back to the OS config dir).
+///
+/// Exists for tests: a test that writes automation projects into the
+/// operator's real store would corrupt the profiles this machine actually
+/// runs. Production never calls it.
+pub fn set_config_root(root: Option<PathBuf>) {
+    if let Ok(mut g) = config_root_cell().write() {
+        *g = root;
+    }
 }
 
 fn data_root_cell() -> &'static RwLock<Option<PathBuf>> {

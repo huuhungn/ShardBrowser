@@ -1,7 +1,7 @@
 // ShardX Launcher — Tauri backend.
 
 mod profile_icon;
-mod api;
+pub mod api;
 mod backup_cmd;
 mod bookmarks;
 mod codex_mcp;
