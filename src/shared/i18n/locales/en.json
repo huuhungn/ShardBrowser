@@ -22,5 +22,8 @@
   "incompatibleNotice.webgpuFeaturesPart": " WebGPU features",
   "incompatibleNotice.webgpuNote": "These behave differently from the extensions above: the browser does not claim them. It reports the profile's list narrowed to what this machine really has, so nothing contradicts itself — the adapter just reports a shorter list than the device the profile names would.",
   "incompatibleNotice.webgpuUnbackedMany": "{n} WebGPU features this machine cannot back:",
-  "incompatibleNotice.webgpuUnbackedOne": "{n} WebGPU feature this machine cannot back:"
+  "incompatibleNotice.webgpuUnbackedOne": "{n} WebGPU feature this machine cannot back:",
+  "settings.language.help": "Which language the interface is written in. Screens not yet translated stay in English rather than showing their key names.",
+  "settings.language.label": "Language",
+  "settings.language.title": "Language"
 }

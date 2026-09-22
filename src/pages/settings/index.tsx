@@ -15,6 +15,7 @@ import { settingsGet, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mc
 import { StartupCard, McpCard } from "../../features/manage-settings";
 import { safeUiError } from "../../shared/lib/utils";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
+import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
 import { TeamCard } from "../../features/manage-team/ui/TeamCard";
 
 function SettingsCard({ title, children }: { title: string; children: React.ReactNode }) {
@@ -27,6 +28,9 @@ function SettingsCard({ title, children }: { title: string; children: React.Reac
 }
 
 export function SettingsPage() {
+  const t = useT();
+  const lang = useLang((v) => v.lang);
+  const setLang = useLang((v) => v.setLang);
   const [s, setS] = useState<Settings>({
     browser_path: null,
     theme: "dark",
@@ -178,6 +182,19 @@ export function SettingsPage() {
 
       <SettingsCard title="Team">
         <TeamCard />
+      </SettingsCard>
+
+      <SettingsCard title={t("settings.language.title")}>
+        <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
+          {t("settings.language.help")}
+        </p>
+        <Select
+          label={t("settings.language.label")}
+          size="small"
+          value={lang}
+          onChange={(v) => setLang(v as (typeof LANG_OPTIONS)[number]["value"])}
+          options={LANG_OPTIONS}
+        />
       </SettingsCard>
 
       <SettingsCard title="Proxy geo checker">

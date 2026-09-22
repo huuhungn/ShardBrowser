@@ -181,6 +181,40 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
   await expect(page.getByRole("button", { name: /Save settings/ })).toBeEnabled();
 });
 
+test("choosing a language translates what has been moved into locales", async ({ page }) => {
+  await gotoMocked(page);
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  // The picker carries the language's own name, so someone who cannot read the
+  // current interface language can still find their own.
+  const picker = page.getByRole("combobox", { name: "Language" });
+  await expect(picker).toBeVisible();
+  await expect(picker).toContainText("English");
+
+  await picker.click();
+  await page.getByRole("option", { name: "Tiếng Việt" }).click();
+
+  // The card's own title comes from locales/, so it flips immediately.
+  await expect(
+    page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Language", level: 3 }),
+  ).toHaveCount(0);
+
+  // The choice has to survive a reload, or it is a toggle rather than a setting.
+  await page.reload();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
+  ).toBeVisible();
+
+  // Screens that still hold their English inline keep showing it. A key with no
+  // translation must never surface as its own name to someone using the app.
+  await expect(page.getByText("Proxy geo checker")).toBeVisible();
+  await expect(page.getByText(/settings\.language\./)).toHaveCount(0);
+});
+
 test("startup setting registers the Launcher while MCP stays client-spawned", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Settings" }).click();
