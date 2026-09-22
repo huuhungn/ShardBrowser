@@ -209,10 +209,21 @@ test("choosing a language translates what has been moved into locales", async ({
     page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
   ).toBeVisible();
 
+  // The whole Settings screen moved into locales/, so its other cards follow.
+  await expect(
+    page.getByRole("heading", { name: "Dịch vụ tra vị trí proxy", level: 3 }),
+  ).toBeVisible();
+
+  // Emphasis is carried inside the translated string rather than by the JSX
+  // around it, so the bold word has to survive the trip through locales/.
+  const apiHelp = page.getByText(/API HTTP cục bộ \(axum\)/);
+  await expect(apiHelp.locator("strong")).toHaveText("127.0.0.1");
+  await expect(apiHelp).not.toContainText("*");
+
   // Screens that still hold their English inline keep showing it. A key with no
   // translation must never surface as its own name to someone using the app.
-  await expect(page.getByText("Proxy geo checker")).toBeVisible();
-  await expect(page.getByText(/settings\.language\./)).toHaveCount(0);
+  await expect(page.getByLabel("Start ShardX Launcher when I sign in")).toBeVisible();
+  await expect(page.getByText(/settings\.[a-z]+\./)).toHaveCount(0);
 });
 
 test("startup setting registers the Launcher while MCP stays client-spawned", async ({ page }) => {

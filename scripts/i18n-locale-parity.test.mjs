@@ -21,6 +21,13 @@ const placeholders = (s) => (s.match(/\{(\w+)\}/g) ?? []).sort();
 const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
 const en = read("en.json");
 
+// A product name is the same word in every language, so an identical value is
+// the correct translation rather than a forgotten one. Listing the keys — as
+// opposed to letting short strings through — keeps the check strict: adding a
+// name here is a deliberate line in a diff, and a genuinely untranslated
+// sentence can never slip past by being brief.
+const SAME_IN_EVERY_LANGUAGE = new Set(["settings.helper.title"]);
+
 test("english is the full key set", () => {
   assert.ok(Object.keys(en).length > 0, "en.json should not be empty");
 });
@@ -61,9 +68,40 @@ for (const file of files.filter((f) => f !== "en.json")) {
     }
   });
 
+  // Emphasis travels inside the string (*bold*, `code`, \n), so a translator
+  // can move the bold word to where the sentence needs it. An unpaired marker
+  // renders as a literal asterisk on screen instead of bolding anything.
+  test(`${lang} keeps emphasis markers paired`, () => {
+    for (const key of Object.keys(en)) {
+      if (!(key in dict)) continue;
+      for (const [mark, name] of [
+        ["*", "bold"],
+        ["`", "code"],
+      ]) {
+        const count = (s) => s.split(mark).length - 1;
+        assert.equal(
+          count(dict[key]) % 2,
+          0,
+          `${file} leaves an unpaired ${mark} in "${key}", which renders as a ` +
+            `literal ${mark} rather than ${name}`,
+        );
+        assert.equal(
+          count(dict[key]),
+          count(en[key]),
+          `${file} changed how many ${name} spans "${key}" has, so the ` +
+            `emphasis no longer matches the English`,
+        );
+      }
+    }
+  });
+
   test(`${lang} left nothing in english`, () => {
     const untouched = Object.keys(en).filter(
-      (k) => k in dict && dict[k] === en[k] && /[a-z]{4}/.test(en[k]),
+      (k) =>
+        !SAME_IN_EVERY_LANGUAGE.has(k) &&
+        k in dict &&
+        dict[k] === en[k] &&
+        /[a-z]{4}/.test(en[k]),
     );
     assert.deepEqual(
       untouched,
