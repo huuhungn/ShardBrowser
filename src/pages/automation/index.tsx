@@ -91,6 +91,30 @@ const PARAMS: Record<string, ParamSpec[]> = {
     { key: "into", label: "Store in variable", placeholder: "found" },
   ],
   deleteFile: [{ key: "path", label: "File", placeholder: "out/result.txt" }],
+  dbExecute: [
+    { key: "database", label: "Database", placeholder: "work.db" },
+    {
+      key: "sql",
+      label: "Statement",
+      placeholder: "insert into seen (name) values (?)",
+    },
+    { key: "params", label: "Parameters", placeholder: '["{{who}}"]' },
+    { key: "into", label: "Store row count in", placeholder: "changed" },
+  ],
+  dbQuery: [
+    { key: "database", label: "Database", placeholder: "work.db" },
+    {
+      key: "sql",
+      label: "Query",
+      placeholder: "select name from seen where done = ?",
+    },
+    { key: "params", label: "Parameters", placeholder: "[0]" },
+    { key: "into", label: "Store rows in", placeholder: "rows" },
+    { key: "countInto", label: "Store count in", placeholder: "found" },
+    { key: "firstColumn", label: "First row column", placeholder: "name" },
+    { key: "firstInto", label: "Store first value in", placeholder: "next" },
+    { key: "minRows", label: "Require at least", placeholder: "1", numeric: true },
+  ],
 };
 
 const str = (v: unknown) => (v == null ? "" : String(v));

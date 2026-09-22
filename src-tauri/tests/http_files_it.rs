@@ -47,10 +47,7 @@ fn project(blocks: Vec<Block>) -> Project {
 }
 
 /// A scratch config root, so tests never touch the real profile store.
-fn scratch() -> (
-    std::sync::MutexGuard<'static, ()>,
-    tempfile::TempDir,
-) {
+fn scratch() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
     let guard = store::config_root_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -115,9 +112,17 @@ fn start_origin() -> Origin {
                     .find(|l| l.to_lowercase().starts_with("cookie:"))
                     .unwrap_or("")
                     .to_string();
-                ("200 OK", String::new(), format!("{{\"cookie\":\"{}\"}}", cookie.replace('"', "")))
+                (
+                    "200 OK",
+                    String::new(),
+                    format!("{{\"cookie\":\"{}\"}}", cookie.replace('"', "")),
+                )
             } else if path.starts_with("/boom") {
-                ("500 Internal Server Error", String::new(), "nope".to_string())
+                (
+                    "500 Internal Server Error",
+                    String::new(),
+                    "nope".to_string(),
+                )
             } else {
                 ("200 OK", String::new(), "{\"ok\":true}".to_string())
             };
@@ -170,7 +175,9 @@ fn start_proxy() -> ProxyServer {
                 continue;
             }
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let Some(line) = req.lines().next() else { continue };
+            let Some(line) = req.lines().next() else {
+                continue;
+            };
             let mut parts = line.split_whitespace();
             let _method = parts.next().unwrap_or("");
             let target = parts.next().unwrap_or("");
@@ -283,7 +290,10 @@ async fn a_projects_http_call_goes_out_through_the_profiles_proxy() {
             .map(|s| (&s.kind, &s.outcome, &s.error))
             .collect::<Vec<_>>()
     );
-    assert_eq!(report.variables.get("code").map(String::as_str), Some("200"));
+    assert_eq!(
+        report.variables.get("code").map(String::as_str),
+        Some("200")
+    );
     assert_eq!(
         proxy.seen.load(Ordering::Relaxed),
         1,
@@ -342,7 +352,11 @@ async fn a_session_carries_its_cookies_between_blocks() {
     let base = format!("http://127.0.0.1:{}", origin.port);
     let p = project(vec![
         block("open", "httpOpen", json!({})),
-        block("login", "httpRequest", json!({ "url": format!("{base}/set") })),
+        block(
+            "login",
+            "httpRequest",
+            json!({ "url": format!("{base}/set") }),
+        ),
         block(
             "check",
             "httpRequest",
@@ -374,7 +388,11 @@ async fn a_failed_run_does_not_leave_its_session_open() {
     let base = format!("http://127.0.0.1:{}", origin.port);
     let p = project(vec![
         block("open", "httpOpen", json!({})),
-        block("login", "httpRequest", json!({ "url": format!("{base}/set") })),
+        block(
+            "login",
+            "httpRequest",
+            json!({ "url": format!("{base}/set") }),
+        ),
         // Fails, so the run stops before any close block.
         block(
             "boom",
@@ -431,7 +449,10 @@ async fn a_status_is_reported_when_the_project_did_not_demand_success() {
         report.ok,
         "polling an endpoint that 500s is not itself a failure"
     );
-    assert_eq!(report.variables.get("code").map(String::as_str), Some("500"));
+    assert_eq!(
+        report.variables.get("code").map(String::as_str),
+        Some("500")
+    );
 }
 
 /// Files a project writes land on disk and read back through the run.
@@ -440,10 +461,26 @@ async fn a_project_can_write_then_read_its_own_file() {
     let (_g, dir) = scratch();
 
     let p = project(vec![
-        block("w", "writeFile", json!({ "path": "out/run.txt", "contents": "alpha" })),
-        block("a", "appendFile", json!({ "path": "out/run.txt", "contents": "-beta" })),
-        block("e", "fileExists", json!({ "path": "out/run.txt", "mustExist": true })),
-        block("r", "readFile", json!({ "path": "out/run.txt", "into": "text" })),
+        block(
+            "w",
+            "writeFile",
+            json!({ "path": "out/run.txt", "contents": "alpha" }),
+        ),
+        block(
+            "a",
+            "appendFile",
+            json!({ "path": "out/run.txt", "contents": "-beta" }),
+        ),
+        block(
+            "e",
+            "fileExists",
+            json!({ "path": "out/run.txt", "mustExist": true }),
+        ),
+        block(
+            "r",
+            "readFile",
+            json!({ "path": "out/run.txt", "into": "text" }),
+        ),
     ]);
 
     let report = runner::run(&p, "file-profile", HashMap::new())
@@ -451,7 +488,10 @@ async fn a_project_can_write_then_read_its_own_file() {
         .expect("the run should start");
 
     assert!(report.ok, "steps: {:?}", report.steps);
-    assert_eq!(report.variables.get("text").map(String::as_str), Some("alpha-beta"));
+    assert_eq!(
+        report.variables.get("text").map(String::as_str),
+        Some("alpha-beta")
+    );
     assert!(
         dir.path().join("automation-files/out/run.txt").is_file(),
         "the file should be inside the workspace"
@@ -465,13 +505,21 @@ async fn file_contents_flow_through_variables() {
     let (_g, _d) = scratch();
 
     let p = project(vec![
-        block("set", "setVariable", json!({ "name": "who", "value": "alice" })),
+        block(
+            "set",
+            "setVariable",
+            json!({ "name": "who", "value": "alice" }),
+        ),
         block(
             "w",
             "writeFile",
             json!({ "path": "greet.txt", "contents": "hello {{who}}" }),
         ),
-        block("r", "readFile", json!({ "path": "greet.txt", "into": "greeting" })),
+        block(
+            "r",
+            "readFile",
+            json!({ "path": "greet.txt", "into": "greeting" }),
+        ),
     ]);
 
     let report = runner::run(&p, "file-profile", HashMap::new())

@@ -169,6 +169,8 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "appendFile",
         "fileExists",
         "deleteFile",
+        "dbExecute",
+        "dbQuery",
     ]
 }
 
@@ -406,6 +408,40 @@ fn start_index(project: &Project) -> Option<usize> {
 }
 
 /// A string parameter, expanded, or an error naming what is missing.
+/// Read a block's SQL parameters.
+///
+/// Placeholders are expanded inside string parameters, so a project can bind
+/// a value an earlier block found, but the result is still *bound* rather
+/// than pasted into the statement.
+fn db_params(block: &Block, vars: &Variables) -> Result<Vec<serde_json::Value>> {
+    let Some(raw) = block.params.get("params") else {
+        return Ok(Vec::new());
+    };
+
+    // Written by hand in the editor, so it arrives as a JSON string there and
+    // as an array over the API.
+    let list = match raw {
+        serde_json::Value::Array(items) => items.clone(),
+        serde_json::Value::String(text) => {
+            let expanded = vars.expand(text);
+            if expanded.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str::<Vec<serde_json::Value>>(&expanded)
+                .context("\"params\" must be a JSON array, e.g. [\"alice\", 1]")?
+        }
+        other => return Err(anyhow!("\"params\" must be a JSON array, not {other}")),
+    };
+
+    Ok(list
+        .into_iter()
+        .map(|value| match value {
+            serde_json::Value::String(s) => serde_json::Value::String(vars.expand(&s)),
+            other => other,
+        })
+        .collect())
+}
+
 fn param_text(block: &Block, name: &str, vars: &Variables) -> Result<String> {
     let raw = block
         .params
@@ -685,14 +721,9 @@ async fn perform(
                 .and_then(|v| v.as_str())
                 .map(|s| vars.expand(s));
 
-            let reply = crate::http_session::request(
-                profile_id,
-                method,
-                &url,
-                &headers,
-                body.as_deref(),
-            )
-            .await?;
+            let reply =
+                crate::http_session::request(profile_id, method, &url, &headers, body.as_deref())
+                    .await?;
 
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
                 vars.set(name, reply.body.clone());
@@ -772,6 +803,63 @@ async fn perform(
         "deleteFile" => {
             let path = param_text(block, "path", vars)?;
             crate::files::remove(&path)
+        }
+
+        "dbExecute" => {
+            let database = param_text(block, "database", vars)?;
+            let sql = param_text(block, "sql", vars)?;
+            let params = db_params(block, vars)?;
+            let changed = crate::db::execute(&database, &sql, &params)?;
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, changed.to_string());
+            }
+            Ok(())
+        }
+
+        "dbQuery" => {
+            let database = param_text(block, "database", vars)?;
+            let sql = param_text(block, "sql", vars)?;
+            let params = db_params(block, vars)?;
+            let rows = crate::db::query(&database, &sql, &params)?;
+
+            // Two shapes, because projects want two different things: the
+            // whole result to write out or pass on, and a single field to
+            // branch on without parsing JSON in an evaluate block.
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, serde_json::to_string(&rows)?);
+            }
+            if let Some(name) = block.params.get("countInto").and_then(|v| v.as_str()) {
+                vars.set(name, rows.len().to_string());
+            }
+            if let Some(name) = block.params.get("firstInto").and_then(|v| v.as_str()) {
+                let column = block
+                    .params
+                    .get("firstColumn")
+                    .and_then(|v| v.as_str())
+                    .context("\"firstInto\" also needs a \"firstColumn\"")?;
+                let value = rows
+                    .first()
+                    .and_then(|row| row.get(column))
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                vars.set(name, value);
+            }
+
+            let least = block
+                .params
+                .get("minRows")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if rows.len() < least {
+                return Err(anyhow!(
+                    "the query returned {} rows, fewer than the {least} required",
+                    rows.len()
+                ));
+            }
+            Ok(())
         }
 
         "evaluate" => {

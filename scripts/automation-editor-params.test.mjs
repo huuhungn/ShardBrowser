@@ -40,6 +40,13 @@ function execBlockBody(source) {
   return source.slice(start);
 }
 
+/// Params read by a helper rather than named in the arm itself.
+///
+/// `db_params(block, vars)` reads "params" internally; without this the guard
+/// would report a key the editor writes and the runner "never reads", which
+/// is exactly the false alarm that teaches people to ignore the guard.
+const HELPER_PARAMS = { db_params: "params" };
+
 /// Params one arm reads, however it reads them.
 ///
 /// Both spellings count: `param_text(block, "url", vars)` for the substituted
@@ -55,6 +62,11 @@ function paramsForKind(execBody, kind) {
   const keys = new Set();
   for (const m of body.matchAll(/param_text\(\s*block\s*,\s*"([^"]+)"/g)) keys.add(m[1]);
   for (const m of body.matchAll(/params\s*\.\s*get\(\s*"([^"]+)"\s*\)/g)) keys.add(m[1]);
+  // Helpers that read a well-known key off the block themselves, so the name
+  // never appears as a literal in the arm.
+  for (const [helper, key] of Object.entries(HELPER_PARAMS)) {
+    if (body.includes(`${helper}(block`)) keys.add(key);
+  }
   return keys;
 }
 

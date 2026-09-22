@@ -95,6 +95,8 @@ export const BLOCK_KINDS = [
   "appendFile",
   "fileExists",
   "deleteFile",
+  "dbExecute",
+  "dbQuery",
 ] as const;
 
 export type BlockKind = (typeof BLOCK_KINDS)[number];

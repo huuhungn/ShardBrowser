@@ -101,6 +101,15 @@ fn resolve(rel: &str) -> Result<PathBuf> {
     Ok(normalised)
 }
 
+/// Resolve a database name to a path inside the workspace.
+///
+/// Databases are subject to the same containment rules as files -- they are
+/// files -- but SQLite opens them by path itself, so the check has to be
+/// available separately from the read and write helpers.
+pub fn resolve_for_db(rel: &str) -> Result<PathBuf> {
+    resolve(rel)
+}
+
 /// Read a file from the workspace.
 pub fn read(rel: &str) -> Result<String> {
     let path = resolve(rel)?;

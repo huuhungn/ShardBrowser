@@ -15,8 +15,12 @@ use shardx_launcher_lib::{cdp, runner};
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let ws = args.next().expect("usage: traffic_smoke <ws-url> <page-url>");
-    let url = args.next().expect("usage: traffic_smoke <ws-url> <page-url>");
+    let ws = args
+        .next()
+        .expect("usage: traffic_smoke <ws-url> <page-url>");
+    let url = args
+        .next()
+        .expect("usage: traffic_smoke <ws-url> <page-url>");
 
     let profile_id = "smoke";
     cdp::attach(profile_id.to_string(), ws)

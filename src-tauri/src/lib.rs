@@ -7,6 +7,7 @@ mod bookmarks;
 pub mod cdp;
 mod codex_mcp;
 mod cookies;
+pub mod db;
 mod extensions;
 pub mod files;
 mod fingerprints;
