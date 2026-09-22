@@ -9,3 +9,25 @@ export type FingerprintEntry = {
   builtin: boolean;
   payload: any;
 };
+
+/// What this machine's GPU really supports, as reported by the engine itself.
+export type HostGlCaps = {
+  renderer: string;
+  vendor: string;
+  webgl1: string[];
+  webgl2: string[];
+  /// `null` means never probed — not "this machine supports nothing".
+  webgpu: string[] | null;
+  engine_version: string;
+};
+
+/// What a fingerprint asks of this machine that the machine cannot give. `compatible:
+/// false` is catchable: the extension is listed but getExtension() returns null.
+export type GpuCompat = {
+  compatible: boolean;
+  missing_webgl1: string[];
+  missing_webgl2: string[];
+  /// WebGPU features the profile claims that this machine's adapter lacks.
+  missing_webgpu: string[];
+  profile_renderer: string;
+};

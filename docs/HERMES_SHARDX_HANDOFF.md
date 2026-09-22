@@ -1,6 +1,6 @@
 # Hermes / ShardX local handoff
 
-Last verified: 2026-09-09 (Hermes Desktop as the MCP host)
+Last verified: 2026-09-19 (Hermes Desktop as the MCP host)
 
 ## Repository and runtime map
 
@@ -10,10 +10,13 @@ Last verified: 2026-09-09 (Hermes Desktop as the MCP host)
 | Fork remote | `origin = https://github.com/huuhungn/ShardBrowser.git` |
 | Upstream remote | `upstream = https://github.com/ProxyShard/ShardBrowser.git` |
 | Upstream push | Disabled intentionally |
-| Custom integration branch | `feat/upstream-v2.0.1-integration` |
-| Latest release source | tag `v0.2.4`; working tree tracks upstream `v2.0.1` |
+| Custom integration branch | absorbed into `origin/main` (PR #37); do not recreate locally |
+| Latest release source | tag `v2.2.7`, `origin/main`, commit `aaf4782` |
 | Local MCP runtime clone | `%USERPROFILE%\Documents\MCP\ShardBrowser` |
 | Hermes config | `%LOCALAPPDATA%\hermes\config.yaml` (`mcp_servers.shardbrowser`) |
+| Active release source | fork `origin/main`, tag `v2.2.7`, commit `aaf4782` |
+| Active MCP runtime branch | `codex-mcp-helpers-runtime`, merge commit `d73c1d9` |
+| MCP runtime backup | `C:\Users\Administrator\AppData\Local\Temp\shardx-backups\mcp-runtime-pre-sync-2.2.5-20260919-102734.tar.gz` |
 
 The development checkout and MCP runtime clone have different roles. Do not
 move, delete, merge, or switch either clone casually. Development is backed up
@@ -21,19 +24,64 @@ to `origin`; upstream changes are proposed only through a scoped pull request.
 
 ## Current version state
 
-- Released Launcher and MCP archive: `v0.2.4`.
-- Release: <https://github.com/huuhungn/ShardBrowser/releases/tag/v0.2.4>.
-- The working tree has merged upstream `v2.0.1` and is versioned `2.1.2`: the
-  fork must stay at or above `2.0.1`, because the runtime manifest now carries
+- Launcher release `v2.2.7` is public at
+  <https://github.com/huuhungn/ShardBrowser/releases/tag/v2.2.7>.
+- The fork must stay at or above `2.0.1`, because the runtime manifest carries
   `min_launcher_version`.
+- Release commit is `aaf4782`; the development fork's `origin/main` and tag
+  `v2.2.7` point to that commit. The installed Launcher/API reports `2.2.7`
+  on `http://127.0.0.1:40325`.
+- The selected local MCP runtime is
+  `%USERPROFILE%\Documents\MCP\ShardBrowser`, branch
+  `codex-mcp-helpers-runtime`, merged through `d73c1d9`. Its root package,
+  `mcp/package.json`, `mcp/package-lock.json`, and `src-tauri/tauri.conf.json`
+  all report `2.2.7`.
+- Hermes config launches `C:/Users/Administrator/Documents/MCP/ShardBrowser/mcp/index.js`
+  with `SHARDX_API=http://127.0.0.1:40325`. Restart Hermes Desktop after a
+  runtime replacement so it starts a fresh stdio process and reloads tools.
+- MCP runtime sync backup:
+  `C:\Users\Administrator\AppData\Local\Temp\shardx-backups\mcp-runtime-pre-sync-2.2.5-20260919-102734.tar.gz`.
 - MCP tool count is 110 after the merge (96 from this fork, plus 14 upstream
   additions including `human_click` and `human_type`). `mcp/contract.test.js`
   asserts that count and fails on drift, which is how the change was noticed.
-- API base URL: `http://127.0.0.1:40325`.
-- Canonical profile: `VN Automation 001 - No Proxy`. Never used for destructive
-  tests; disposable profiles and disposable servers only.
+- Canonical profile: `VN Automation 001 - No Proxy`. Never use it for destructive
+  tests; use disposable profiles and disposable servers only.
 
-## Engine manifest, and why it is pinned
+## Runtime-local backup and monitor inventory
+
+These entries are intentionally outside Git's tracked source and were not
+merged into the release runtime:
+
+- `backup-hermes-safe-tools-20260828-133152/`: one 64 KB `index.js` snapshot;
+  preserve as a rollback/reference copy, not as the active MCP source.
+- `mcp-backup-20260716-211548/`: a 39 MB historical MCP tree including
+  `node_modules`; preserve until the 2.2.7 runtime has completed its post-sync
+  smoke check, then it is safe to archive or remove separately from source.
+- `scripts/Run-ShardXStartMonitor-hidden.vbs`,
+  `scripts/monitor-start-attribution.py`, and
+  `scripts/test-monitor-start-attribution.py`: local Windows process-start
+  attribution/monitor helpers. Preserve; they are not imported by `mcp/index.js`
+  and are not part of the shipped MCP archive.
+- `scripts/__pycache__/`: generated Python bytecode only. It is safe to remove
+  after any monitor test is finished; never treat it as source.
+
+The local `mcp/vet-*.mjs` scripts are tracked operator scripts restored after
+sync; they are also not imported by `mcp/index.js` or included in the packaged
+MCP archive. Do not delete them as part of routine runtime cleanup.
+
+## Sync verification record (2026-09-19)
+
+- Created branch `backup/pre-sync-2.2.7-20260919-102734` before merging.
+- Archived `mcp/` before the merge and verified the archive contains the
+  expected `index.js`, package manifests, lockfile, and README.
+- Merged fork `origin/main` / `v2.2.7` into the runtime branch with no conflicts.
+- Ran `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PATCHRIGHT_SKIP_BROWSER_DOWNLOAD=1
+  npm ci --no-audit --no-fund` in `mcp/`, followed by `npm test`; all 29
+  MCP tests passed (`29 passed, 0 failed`).
+- The installed Launcher health endpoint reports `ok=true`, version `2.2.7`.
+- The MCP process was not running during the source replacement. Restart Hermes
+  Desktop before relying on the refreshed stdio tool schema.
+
 
 `src-tauri/src/runtime.rs` fetches a runtime manifest at startup. It used to
 point at `ProxyShard/ShardBrowser@main`, so upstream's v2 release retargeted
@@ -186,19 +234,17 @@ profiles/fonts only and must not mutate real profiles.
 
 ## Upstream pull requests
 
-Verified 2026-07-17: upstream PRs
-[#19](https://github.com/ProxyShard/ShardBrowser/pull/19),
-[#20](https://github.com/ProxyShard/ShardBrowser/pull/20),
-[#21](https://github.com/ProxyShard/ShardBrowser/pull/21),
-[#22](https://github.com/ProxyShard/ShardBrowser/pull/22),
-[#23](https://github.com/ProxyShard/ShardBrowser/pull/23),
-[#24](https://github.com/ProxyShard/ShardBrowser/pull/24),
-[#25](https://github.com/ProxyShard/ShardBrowser/pull/25), and
-[#26](https://github.com/ProxyShard/ShardBrowser/pull/26) are open and mergeable
-(`CLEAN`) with no comments, reviews, review decision, or status checks.
+Verified 2026-09-19: upstream `ProxyShard/ShardBrowser` still has open PRs
+[#19](https://github.com/ProxyShard/ShardBrowser/pull/19) (conflicting),
+[#23](https://github.com/ProxyShard/ShardBrowser/pull/23) (mergeable),
+[#24](https://github.com/ProxyShard/ShardBrowser/pull/24) (mergeable), and
+[#33](https://github.com/ProxyShard/ShardBrowser/pull/33) (mergeable, authored by
+another contributor). These are not part of the v2.2.7 runtime sync; review
+individually before accepting any of them. The fork's v2.2.7 release work is
+already on `origin/main`.
 
-Issue [#27](https://github.com/ProxyShard/ShardBrowser/issues/27) is implemented
-in the released custom integration. A separate upstream PR remains deferred.
+Historical release notes below are retained as an audit trail; they are not the
+current version or test state.
 
 The v0.1.23 tag and release passed frontend build/E2E, eight MCP tests, Rust
 check/tests, updater-signing verification, and the real Windows NSIS regression

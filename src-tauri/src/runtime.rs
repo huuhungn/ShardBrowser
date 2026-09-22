@@ -220,6 +220,13 @@ fn effective_installed_version(local: &Manifest) -> Option<String> {
         .or_else(installed_engine_version)
 }
 
+/// Engine version the GPU-capability cache is keyed against. A Chromium bump can
+/// move ANGLE, which changes the extension list, so a probe result is only valid
+/// for the engine build it ran on.
+pub fn engine_version() -> Option<String> {
+    effective_installed_version(&load_manifest())
+}
+
 fn load_manifest() -> Manifest {
     let Ok(p) = manifest_path() else { return Manifest::default() };
     fs::read_to_string(p)

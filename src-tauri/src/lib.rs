@@ -11,6 +11,7 @@ mod extensions;
 mod fingerprints;
 pub mod fleet_client;
 mod fleet_keys;
+mod gpu_caps;
 mod launch;
 mod mcp_setup;
 mod migrate;
@@ -1155,6 +1156,29 @@ fn fingerprint_import(json_text: String, id_hint: Option<String>) -> Result<fing
 #[tauri::command]
 fn fingerprint_delete(id: String) -> Result<(), String> {
     fingerprints::delete(&id).map_err(|e| e.to_string())
+}
+
+/// What this machine's GPU can actually do. Cached; `force` re-asks the engine.
+/// Slow on the first call — it starts the engine off-screen — so the UI asks once.
+#[tauri::command]
+async fn gpu_caps(force: bool) -> Result<gpu_caps::HostGlCaps, String> {
+    gpu_caps::probe(force).await.map_err(|e| e.to_string())
+}
+
+/// Whether the machine can wear each library fingerprint, keyed by id. Kept out of
+/// fingerprint_list() so that stays fast; an empty map means "not known", not "all fine".
+#[tauri::command]
+async fn gpu_caps_compat(
+) -> Result<std::collections::HashMap<String, gpu_caps::Compat>, String> {
+    let caps = match gpu_caps::probe(false).await {
+        Ok(c) => c,
+        Err(_) => return Ok(Default::default()),
+    };
+    let entries = fingerprints::list_all().map_err(|e| e.to_string())?;
+    Ok(entries
+        .into_iter()
+        .map(|e| (e.id, gpu_caps::compat(&e.payload, &caps)))
+        .collect())
 }
 
 /// Path to fingerprint library dir (UI "Open library folder").
@@ -2358,6 +2382,8 @@ pub fn run() {
             fingerprint_get,
             fingerprint_import,
             fingerprint_delete,
+            gpu_caps,
+            gpu_caps_compat,
             fingerprint_dir,
             read_text_file,
             process_list,

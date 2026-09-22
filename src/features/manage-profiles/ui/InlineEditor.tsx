@@ -18,6 +18,8 @@ import type { ProfileForm, GeoMode, WebRtcMode } from "../../../entities/profile
 import type { FingerprintEntry } from "../../../entities/fingerprint";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { enrichPicksForPreset } from "../../../entities/profile";
+import { useGpuCompat } from "../../../shared/model/gpuCompat";
+import { IncompatibleWarningModal } from "../../gpu-compat";
 
 function SectionHeading({ children }: { children: React.ReactNode }) {
   return (
@@ -52,6 +54,16 @@ export function InlineEditor({
     [fingerprints, osFilter],
   );
 
+  // Which library fingerprints this machine can actually wear. The verdict is
+  // advisory: it steers the RANDOM pick away from a self-contradicting profile
+  // and warns on a deliberate one, but never refuses the operator's choice.
+  const compatById = useGpuCompat((s) => s.byId);
+  const suppressed = useGpuCompat((s) => s.suppressed);
+  const loadCompat = useGpuCompat((s) => s.load);
+  useEffect(() => { void loadCompat(); }, [loadCompat]);
+
+  const [pendingGpu, setPendingGpu] = useState<string | null>(null);
+
   /// Pick GPU = full fingerprint snap; toStored carries lib.payload at save.
   const setGpu = async (id: string) => {
     const fp = fingerprints.find((x) => x.id === id);
@@ -75,16 +87,30 @@ export function InlineEditor({
   };
 
   // Snap unknown / empty gpu_preset_id to a random GPU of the active OS.
+  // Prefer one this host can back; fall back to the whole pool rather than
+  // leaving the profile without a fingerprint.
   useEffect(() => {
     if (fingerprints.length === 0) return;
     const exists = fingerprints.some((g) => g.id === f.gpu_preset_id);
     if (!exists) {
-      const pool = gpusForOs.length > 0 ? gpusForOs : fingerprints;
+      const base = gpusForOs.length > 0 ? gpusForOs : fingerprints;
+      const fitting = base.filter((g) => compatById[g.id]?.compatible !== false);
+      const pool = fitting.length > 0 ? fitting : base;
       const pick = pool[Math.floor(Math.random() * pool.length)];
       if (pick) setGpu(pick.id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fingerprints, osFilter, f.gpu_preset_id]);
+  }, [fingerprints, osFilter, f.gpu_preset_id, compatById]);
+
+  /// A deliberate pick of an unbackable fingerprint asks once, then obeys.
+  const chooseGpu = (id: string) => {
+    const verdict = compatById[id];
+    if (verdict && !verdict.compatible && !suppressed) {
+      setPendingGpu(id);
+      return;
+    }
+    void setGpu(id);
+  };
 
   const pickOs = (os: string) => {
     setOsFilter(os);
@@ -118,7 +144,7 @@ export function InlineEditor({
           <label className="flex flex-col gap-1">
             <CSSelect
               value={f.gpu_preset_id}
-              onChange={(v) => setGpu(v)}
+              onChange={(v) => chooseGpu(v)}
               title="GPU / device (from Fingerprint Library)"
               placeholder={`— no ${osFilter} fingerprints in library —`}
               options={gpusForOs.map((g) => ({ value: g.id, label: g.label }))}
@@ -303,6 +329,18 @@ export function InlineEditor({
           {f.id ? "Save changes" : "Create profile"}
         </Button>
       </div>
+
+      {pendingGpu && compatById[pendingGpu] && (
+        <IncompatibleWarningModal
+          compat={compatById[pendingGpu]}
+          onKeep={() => {
+            const id = pendingGpu;
+            setPendingGpu(null);
+            void setGpu(id);
+          }}
+          onCancel={() => setPendingGpu(null)}
+        />
+      )}
     </div>
   );
 }
