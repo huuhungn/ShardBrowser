@@ -165,7 +165,10 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
             "Profile name cannot be '.' or '..'",
         ));
     }
-    if normalized.chars().any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*')) {
+    if normalized
+        .chars()
+        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
             "Profile name contains characters reserved by Windows",
@@ -191,10 +194,7 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     Ok(normalized.to_string())
 }
 
-pub fn validate_profile_name_for_mutation(
-    name: &str,
-    profile_id: Option<&str>,
-) -> Result<String> {
+pub fn validate_profile_name_for_mutation(name: &str, profile_id: Option<&str>) -> Result<String> {
     let existing_name = profile_id
         .filter(|id| !id.is_empty())
         .and_then(|id| load_raw(id).ok())
@@ -357,9 +357,12 @@ where
     keys.sort();
     keys.dedup();
 
-    let mut claims = lifecycle_claims()
-        .lock()
-        .map_err(|_| profile_error(ProfileErrorKind::Busy, "Profile lifecycle lock is unavailable"))?;
+    let mut claims = lifecycle_claims().lock().map_err(|_| {
+        profile_error(
+            ProfileErrorKind::Busy,
+            "Profile lifecycle lock is unavailable",
+        )
+    })?;
     if claims.contains_key(GLOBAL_FOLDER_CLAIM) {
         return Err(profile_error(
             ProfileErrorKind::Busy,
@@ -401,11 +404,7 @@ where
 }
 
 pub fn begin_profile_creation(action: &str) -> Result<ProfileClaimGuard> {
-    begin_claim(
-        [PROFILE_NAME_CLAIM],
-        action,
-        ProfileClaimKind::Mutation,
-    )
+    begin_claim([PROFILE_NAME_CLAIM], action, ProfileClaimKind::Mutation)
 }
 
 pub fn begin_clone_mutation(profile_id: &str) -> Result<ProfileClaimGuard> {
@@ -421,9 +420,12 @@ pub fn begin_profile_launch(profile_id: &str) -> Result<ProfileClaimGuard> {
 }
 
 fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard> {
-    let mut claims = lifecycle_claims()
-        .lock()
-        .map_err(|_| profile_error(ProfileErrorKind::Busy, "Profile lifecycle lock is unavailable"))?;
+    let mut claims = lifecycle_claims().lock().map_err(|_| {
+        profile_error(
+            ProfileErrorKind::Busy,
+            "Profile lifecycle lock is unavailable",
+        )
+    })?;
     if !claims.is_empty() {
         return Err(profile_error(
             ProfileErrorKind::Busy,
@@ -465,7 +467,8 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
         }
         let path = entry.path();
         let body = fs::read_to_string(&path)?;
-        let Ok(mut stored): std::result::Result<StoredProfile, _> = serde_json::from_str(&body) else {
+        let Ok(mut stored): std::result::Result<StoredProfile, _> = serde_json::from_str(&body)
+        else {
             continue;
         };
         // Hide ephemeral profiles.
@@ -552,7 +555,9 @@ pub fn purge_temporary() -> Result<usize> {
         if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Ok(body) = fs::read_to_string(entry.path()) else { continue; };
+        let Ok(body) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
         let Ok(stored): std::result::Result<StoredProfile, _> = serde_json::from_str(&body) else {
             continue;
         };
@@ -614,7 +619,11 @@ fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> Resu
     };
 
     let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let moved = unsafe {
         MoveFileExW(
             source_wide.as_ptr(),
@@ -665,7 +674,10 @@ fn fill_noise_seeds(config: &mut serde_json::Map<String, serde_json::Value>, id:
             .map(|n| n == 0)
             .unwrap_or(true);
         if needs {
-            obj.insert("seed".into(), serde_json::Value::from(derive_noise_seed(id, slot)));
+            obj.insert(
+                "seed".into(),
+                serde_json::Value::from(derive_noise_seed(id, slot)),
+            );
         }
     }
 }
@@ -959,9 +971,18 @@ mod tests {
 
     #[test]
     fn profile_name_validation_accepts_unicode_and_trims_leading_space() {
-        assert_eq!(normalize_profile_name("  Việt Nam 001").unwrap(), "Việt Nam 001");
-        assert_eq!(normalize_profile_name("Khách_hàng-01").unwrap(), "Khách_hàng-01");
-        assert_eq!(normalize_profile_name(&"A".repeat(MAX_PROFILE_NAME_CHARS)).unwrap(), "A".repeat(MAX_PROFILE_NAME_CHARS));
+        assert_eq!(
+            normalize_profile_name("  Việt Nam 001").unwrap(),
+            "Việt Nam 001"
+        );
+        assert_eq!(
+            normalize_profile_name("Khách_hàng-01").unwrap(),
+            "Khách_hàng-01"
+        );
+        assert_eq!(
+            normalize_profile_name(&"A".repeat(MAX_PROFILE_NAME_CHARS)).unwrap(),
+            "A".repeat(MAX_PROFILE_NAME_CHARS)
+        );
     }
 
     #[test]
@@ -983,7 +1004,10 @@ mod tests {
             "LPT9",
         ];
         for name in invalid {
-            assert!(normalize_profile_name(name).is_err(), "expected invalid name: {name:?}");
+            assert!(
+                normalize_profile_name(name).is_err(),
+                "expected invalid name: {name:?}"
+            );
         }
         assert!(normalize_profile_name(&"A".repeat(MAX_PROFILE_NAME_CHARS + 1)).is_err());
     }
@@ -995,7 +1019,11 @@ mod tests {
         assert!(!profile_names_collide("Automation 1", "Automation 2"));
         assert!(should_validate_profile_name(true, None, "new"));
         assert!(should_validate_profile_name(false, Some("old"), "new"));
-        assert!(!should_validate_profile_name(false, Some("legacy/name"), "legacy/name"));
+        assert!(!should_validate_profile_name(
+            false,
+            Some("legacy/name"),
+            "legacy/name"
+        ));
     }
 
     #[test]
@@ -1006,7 +1034,10 @@ mod tests {
             Ok(_) => panic!("launch must not overlap a mutation"),
             Err(error) => error,
         };
-        assert_eq!(profile_error_kind(&launch_error), Some(ProfileErrorKind::Busy));
+        assert_eq!(
+            profile_error_kind(&launch_error),
+            Some(ProfileErrorKind::Busy)
+        );
         drop(mutation);
 
         let launch = begin_profile_launch("profile-claim-a").unwrap();
@@ -1014,7 +1045,10 @@ mod tests {
             Ok(_) => panic!("mutation must not overlap a launch reservation"),
             Err(error) => error,
         };
-        assert_eq!(profile_error_kind(&mutation_error), Some(ProfileErrorKind::Busy));
+        assert_eq!(
+            profile_error_kind(&mutation_error),
+            Some(ProfileErrorKind::Busy)
+        );
         drop(launch);
 
         assert!(begin_user_mutation(["profile-claim-a"], "edit profile").is_ok());
@@ -1037,7 +1071,10 @@ mod tests {
             Ok(_) => panic!("profile edit must not overlap name allocation"),
             Err(error) => error,
         };
-        assert_eq!(profile_error_kind(&mutation_error), Some(ProfileErrorKind::Busy));
+        assert_eq!(
+            profile_error_kind(&mutation_error),
+            Some(ProfileErrorKind::Busy)
+        );
         let launch = begin_profile_launch("profile-name-launch-a").unwrap();
         drop((launch, creation));
 
@@ -1046,7 +1083,10 @@ mod tests {
             Ok(_) => panic!("name allocation must not overlap profile edit"),
             Err(error) => error,
         };
-        assert_eq!(profile_error_kind(&creation_error), Some(ProfileErrorKind::Busy));
+        assert_eq!(
+            profile_error_kind(&creation_error),
+            Some(ProfileErrorKind::Busy)
+        );
         drop(mutation);
     }
 

@@ -33,7 +33,7 @@ shardx-core = { path = "../shared" }
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json", "cookies"] }
 base64 = "0.22"
 # Local automation HTTP API (axum) + JWT bearer auth.
 axum = "0.7"

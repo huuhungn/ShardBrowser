@@ -87,6 +87,14 @@ export const BLOCK_KINDS = [
   "recordTraffic",
   "stopTraffic",
   "assertRequest",
+  "httpOpen",
+  "httpRequest",
+  "httpClose",
+  "readFile",
+  "writeFile",
+  "appendFile",
+  "fileExists",
+  "deleteFile",
 ] as const;
 
 export type BlockKind = (typeof BLOCK_KINDS)[number];

@@ -33,7 +33,10 @@ fn server_binary() -> std::path::PathBuf {
         .join("server")
         .join("target")
         .join("debug")
-        .join(format!("shardx-team-server{}", std::env::consts::EXE_SUFFIX))
+        .join(format!(
+            "shardx-team-server{}",
+            std::env::consts::EXE_SUFFIX
+        ))
 }
 
 async fn start_server() -> Option<TestServer> {
@@ -286,7 +289,15 @@ async fn launcher_pushes_and_pulls_a_container_through_a_real_server() {
     let device = [0x7Eu8; 16];
 
     assert!(
-        seed_fleet(&server.data_dir, &tenant, &fleet, &profile, &account, &user_id).await,
+        seed_fleet(
+            &server.data_dir,
+            &tenant,
+            &fleet,
+            &profile,
+            &account,
+            &user_id
+        )
+        .await,
         "could not seed the fleet, so the test would prove nothing"
     );
 
@@ -399,7 +410,15 @@ async fn two_devices_share_a_profile_through_the_fleet_key_without_a_passphrase(
     let device_a = [0x8Eu8; 16];
 
     assert!(
-        seed_fleet(&server.data_dir, &tenant, &fleet, &profile, &account, &user_id).await,
+        seed_fleet(
+            &server.data_dir,
+            &tenant,
+            &fleet,
+            &profile,
+            &account,
+            &user_id
+        )
+        .await,
         "could not seed the fleet, so the test would prove nothing"
     );
 

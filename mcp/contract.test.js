@@ -29,7 +29,7 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
     // bump fails this test for no reason, which trains people to edit it
     // without reading what it guards.
     assert.equal(version, pkg.version);
-    assert.equal(tools.length, 113);
+    assert.equal(tools.length, 114);
     for (const name of [
       "health_check",
       "startup_status",
@@ -53,6 +53,7 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
       "list_automation_projects",
       "get_automation_project",
       "run_automation_project",
+      "record_profile_traffic",
     ]) {
       assert(names.has(name), `missing MCP tool: ${name}`);
     }
@@ -64,6 +65,13 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
     // control as safe_open_url rather than leaving profiles running.
     const run = tools.find((tool) => tool.name === "run_automation_project");
     assert(run.inputSchema.properties.keep_running, "run_automation_project.keep_running missing");
+
+    // Recording drives a browser, so it must offer the same lifecycle control
+    // as the other tools that open one: without it a caller cannot say
+    // "leave the profile as you found it".
+    const traffic = tools.find((tool) => tool.name === "record_profile_traffic");
+    assert(traffic.inputSchema.properties.keep_running, "record_profile_traffic.keep_running missing");
+    assert(traffic.inputSchema.properties.url, "record_profile_traffic.url missing");
   } finally {
     await client.close();
   }

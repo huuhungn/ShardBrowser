@@ -70,6 +70,13 @@ pub struct RunReport {
     pub variables: HashMap<String, String>,
     /// Set when the run ended for a reason other than finishing its passes.
     pub stopped_because: Option<String>,
+    /// Requests recorded by `stopTraffic`, in the order they were made.
+    ///
+    /// Counting them into a variable tells an operator how many there were;
+    /// only the entries themselves say which ones failed, which is the whole
+    /// reason to record traffic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<crate::traffic::Entry>,
 }
 
 /// Values carried between steps. Text params interpolate `{{name}}`.
@@ -154,6 +161,14 @@ pub fn supported_kinds() -> &'static [&'static str] {
         "recordTraffic",
         "stopTraffic",
         "assertRequest",
+        "httpOpen",
+        "httpRequest",
+        "httpClose",
+        "readFile",
+        "writeFile",
+        "appendFile",
+        "fileExists",
+        "deleteFile",
     ]
 }
 
@@ -168,17 +183,45 @@ pub fn unsupported_blocks(project: &Project) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Run a whole project against an already-attached profile.
+/// Blocks that drive the page, and so need a browser attached.
 ///
-/// The profile must be running and attached (`cdp::attach`) first: starting
-/// browsers is the launcher's job, and a runner that started them too would
-/// race the launcher's own bookkeeping.
+/// Everything else -- HTTP calls, files, variables -- runs without one, so a
+/// project that never touches a page should not have to start a browser to
+/// do its work.
+fn needs_browser(kind: &str) -> bool {
+    matches!(
+        kind,
+        "navigate"
+            | "waitForSelector"
+            | "click"
+            | "type"
+            | "readText"
+            | "assert"
+            | "evaluate"
+            | "recordTraffic"
+            | "stopTraffic"
+            | "assertRequest"
+    )
+}
+
+/// Run a whole project against a profile.
+///
+/// A project with page blocks needs the profile running and attached
+/// (`cdp::attach`) first: starting browsers is the launcher's job, and a
+/// runner that started them too would race the launcher's own bookkeeping.
+/// A project made only of HTTP, file and variable blocks needs no browser and
+/// is allowed to run without one.
 pub async fn run(
     project: &Project,
     profile_id: &str,
     seed: HashMap<String, String>,
 ) -> Result<RunReport> {
-    if !cdp::is_attached(profile_id) {
+    let wants_browser = project
+        .blocks
+        .iter()
+        .any(|b| b.enabled && needs_browser(&b.kind));
+
+    if wants_browser && !cdp::is_attached(profile_id) {
         return Err(anyhow!(
             "the profile is not attached — start it before running a project"
         ));
@@ -326,6 +369,12 @@ pub async fn run(
         }
     }
 
+    // Cookies are an identity, and a session left open would hand the next
+    // run whatever this one logged into. Closing is safe to call blind.
+    if state.http_open {
+        crate::http_session::close(profile_id);
+    }
+
     Ok(RunReport {
         project_id: project.id.clone(),
         profile_id: profile_id.to_string(),
@@ -335,6 +384,7 @@ pub async fn run(
         ms: started.elapsed().as_millis() as u64,
         variables: vars.into_inner(),
         stopped_because,
+        requests: state.recorded,
     })
 }
 
@@ -373,6 +423,14 @@ fn param_text(block: &Block, name: &str, vars: &Variables) -> Result<String> {
 #[derive(Default)]
 struct RunState {
     traffic: Option<traffic::Recorder>,
+    /// Requests handed over by `stopTraffic`, kept for the run report.
+    recorded: Vec<traffic::Entry>,
+    /// Whether an `httpOpen` block opened a session this run.
+    ///
+    /// Tracked so a run that ends without reaching its `httpClose` -- because
+    /// a step failed, or the project simply forgot one -- does not leave a
+    /// logged-in session behind for the next run to inherit.
+    http_open: bool,
 }
 
 async fn perform(
@@ -460,7 +518,9 @@ async fn perform(
             if v.as_str() == Some("ok") {
                 Ok(())
             } else {
-                Err(anyhow!("nothing matched {selector} when the text was typed"))
+                Err(anyhow!(
+                    "nothing matched {selector} when the text was typed"
+                ))
             }
         }
 
@@ -539,6 +599,7 @@ async fn perform(
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
                 vars.set(name, entries.len().to_string());
             }
+            state.recorded.extend(entries.iter().cloned());
             if dropped > 0 {
                 // Report rather than fail: the requests that were recorded are
                 // still true, and a run that failed here would be failing for
@@ -578,7 +639,11 @@ async fn perform(
                 let worst = matched
                     .iter()
                     .find_map(|e| e.error.clone())
-                    .or_else(|| matched.iter().find_map(|e| e.status.map(|s| format!("HTTP {s}"))))
+                    .or_else(|| {
+                        matched
+                            .iter()
+                            .find_map(|e| e.status.map(|s| format!("HTTP {s}")))
+                    })
                     .unwrap_or_else(|| "it never came back".to_string());
                 return Err(anyhow!(
                     "every request matching {url_part:?} failed — {worst}"
@@ -588,6 +653,125 @@ async fn perform(
                 vars.set(name, matched.len().to_string());
             }
             Ok(())
+        }
+
+        "httpOpen" => {
+            crate::http_session::open(profile_id)?;
+            state.http_open = true;
+            Ok(())
+        }
+
+        "httpRequest" => {
+            let url = param_text(block, "url", vars)?;
+            let method = block
+                .params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET");
+
+            // Headers and body are the places credentials appear, so both go
+            // through variable expansion and neither is logged here.
+            let mut headers = std::collections::HashMap::new();
+            if let Some(map) = block.params.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in map {
+                    if let Some(s) = v.as_str() {
+                        headers.insert(k.clone(), vars.expand(s));
+                    }
+                }
+            }
+            let body = block
+                .params
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(|s| vars.expand(s));
+
+            let reply = crate::http_session::request(
+                profile_id,
+                method,
+                &url,
+                &headers,
+                body.as_deref(),
+            )
+            .await?;
+
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, reply.body.clone());
+            }
+            if let Some(name) = block.params.get("statusInto").and_then(|v| v.as_str()) {
+                vars.set(name, reply.status.to_string());
+            }
+
+            // A status check is opt-in: polling an endpoint until it stops
+            // returning 404 is a normal thing for a project to do.
+            let expect_ok = block
+                .params
+                .get("mustSucceed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if expect_ok && !(200..300).contains(&reply.status) {
+                return Err(anyhow!(
+                    "{method} {url} answered HTTP {}, not a success",
+                    reply.status
+                ));
+            }
+            Ok(())
+        }
+
+        "httpClose" => {
+            if !crate::http_session::close(profile_id) {
+                return Err(anyhow!(
+                    "no HTTP session is open for this profile; add an \"httpOpen\" block first"
+                ));
+            }
+            state.http_open = false;
+            Ok(())
+        }
+
+        "readFile" => {
+            let path = param_text(block, "path", vars)?;
+            let contents = crate::files::read(&path)?;
+            let name = block
+                .params
+                .get("into")
+                .and_then(|v| v.as_str())
+                .context("the \"readFile\" block needs an into")?;
+            vars.set(name, contents);
+            Ok(())
+        }
+
+        "writeFile" => {
+            let path = param_text(block, "path", vars)?;
+            let contents = param_text(block, "contents", vars)?;
+            crate::files::write(&path, &contents)
+        }
+
+        "appendFile" => {
+            let path = param_text(block, "path", vars)?;
+            let contents = param_text(block, "contents", vars)?;
+            crate::files::append(&path, &contents)
+        }
+
+        "fileExists" => {
+            let path = param_text(block, "path", vars)?;
+            let found = crate::files::exists(&path)?;
+            if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
+                vars.set(name, found.to_string());
+            }
+            // Opt-in so this can be used both to branch and to assert.
+            let required = block
+                .params
+                .get("mustExist")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if required && !found {
+                return Err(anyhow!("{path} is not in the automation workspace"));
+            }
+            Ok(())
+        }
+
+        "deleteFile" => {
+            let path = param_text(block, "path", vars)?;
+            crate::files::remove(&path)
         }
 
         "evaluate" => {
@@ -689,24 +873,54 @@ pub async fn run_saved(
     seed: HashMap<String, String>,
 ) -> Result<RunReport> {
     let project = crate::automation::get(project_id)?;
+    run_guarded(&project, profile_id, seed).await
+}
 
-    if !crate::is_profile_running(profile_id) {
-        return Err(anyhow!("profile {profile_id} is not running"));
+/// Run a project that was handed to us rather than saved.
+///
+/// Callers that build a project on the fly -- the MCP traffic tool asking
+/// "what did this page request?" -- go through here so they are held to the
+/// same rules as a saved run instead of reaching the runner unguarded.
+pub async fn run_unsaved(
+    project: &Project,
+    profile_id: &str,
+    seed: HashMap<String, String>,
+) -> Result<RunReport> {
+    run_guarded(project, profile_id, seed).await
+}
+
+/// The guards every run passes, whoever asked for it.
+async fn run_guarded(
+    project: &Project,
+    profile_id: &str,
+    seed: HashMap<String, String>,
+) -> Result<RunReport> {
+    // A project with no page blocks needs no browser, so requiring one would
+    // refuse runs that are pure HTTP and file work.
+    let wants_browser = project
+        .blocks
+        .iter()
+        .any(|b| b.enabled && needs_browser(&b.kind));
+
+    if wants_browser {
+        if !crate::is_profile_running(profile_id) {
+            return Err(anyhow!("profile {profile_id} is not running"));
+        }
+
+        if !cdp::is_attached(profile_id) {
+            let endpoint = crate::process::Tracker::shared()
+                .cdp(profile_id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "profile {profile_id} is running without a debugging port; \
+                         restart it to automate it"
+                    )
+                })?;
+            cdp::attach(profile_id.to_string(), endpoint.web_socket_debugger_url).await?;
+        }
     }
 
-    if !cdp::is_attached(profile_id) {
-        let endpoint = crate::process::Tracker::shared()
-            .cdp(profile_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "profile {profile_id} is running without a debugging port; \
-                     restart it to automate it"
-                )
-            })?;
-        cdp::attach(profile_id.to_string(), endpoint.web_socket_debugger_url).await?;
-    }
-
-    run(&project, profile_id, seed).await
+    run(project, profile_id, seed).await
 }
 
 #[cfg(test)]
@@ -889,9 +1103,26 @@ mod tests {
         assert_eq!(start_index(&project(vec![])), None);
     }
 
+    /// The flip side of the rule above: work that never touches a page should
+    /// not have to start a browser to get done.
+    #[tokio::test]
+    async fn a_project_of_only_offline_blocks_needs_no_browser() {
+        let p = project(vec![block("a", "wait", json!({ "ms": 1 }))]);
+        let report = run(&p, "no-such-profile", HashMap::new())
+            .await
+            .expect("a project with no page blocks should run without one");
+        assert!(report.ok, "the run should have succeeded: {report:?}");
+    }
+
     #[tokio::test]
     async fn a_run_against_an_unattached_profile_is_refused_not_reported_as_success() {
-        let p = project(vec![block("a", "wait", json!({ "ms": 1 }))]);
+        // A page block, because those are the ones that need a browser: a
+        // project of pure waits has nothing to attach to and is allowed to run.
+        let p = project(vec![block(
+            "a",
+            "navigate",
+            json!({ "url": "https://example.com" }),
+        )]);
         let err = run(&p, "no-such-profile", HashMap::new())
             .await
             .expect_err("a run with no browser must fail");

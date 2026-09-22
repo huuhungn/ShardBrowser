@@ -156,13 +156,7 @@ impl Bus {
         };
 
         // Re-place every member, not just the newcomer: slots depend on the count.
-        let replay = self
-            .state
-            .lock()
-            .unwrap()
-            .arranged
-            .get(&group)
-            .copied();
+        let replay = self.state.lock().unwrap().arranged.get(&group).copied();
         if let Some((layout, area)) = replay {
             self.arrange(&group, layout, area);
         }
@@ -268,7 +262,12 @@ impl Bus {
                     let cols = (n as f64).sqrt().ceil() as i32;
                     let rows = (n + cols - 1) / cols;
                     let (cx, cy) = (i % cols, i / cols);
-                    (ax + aw * cx / cols, ay + ah * cy / rows, aw / cols, ah / rows)
+                    (
+                        ax + aw * cx / cols,
+                        ay + ah * cy / rows,
+                        aw / cols,
+                        ah / rows,
+                    )
                 }
                 Layout::Cascade => {
                     // A title bar of offset each; the last must still fit.
@@ -316,7 +315,11 @@ impl Bus {
     /// The operator closed the panel. Remember what it was offering.
     pub fn helper_dismiss(&self, profile: &str) {
         let mut st = self.state.lock().unwrap();
-        let key = st.helper.get(profile).map(Self::helper_key).unwrap_or_default();
+        let key = st
+            .helper
+            .get(profile)
+            .map(Self::helper_key)
+            .unwrap_or_default();
         st.helper_dismissed.insert(profile.to_string(), key);
     }
 
@@ -456,12 +459,15 @@ mod tests {
         let mut st = bus.state.lock().unwrap();
         st.next_id += 1;
         let id = st.next_id;
-        st.groups.entry(group.to_string()).or_default().push(Member {
-            id,
-            profile: profile.to_string(),
-            excluded: false,
-            tx,
-        });
+        st.groups
+            .entry(group.to_string())
+            .or_default()
+            .push(Member {
+                id,
+                profile: profile.to_string(),
+                excluded: false,
+                tx,
+            });
         id
     }
 

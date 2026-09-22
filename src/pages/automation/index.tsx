@@ -65,6 +65,32 @@ const PARAMS: Record<string, ParamSpec[]> = {
     { key: "urlContains", label: "URL contains", placeholder: "/api/login" },
     { key: "into", label: "Store count in", placeholder: "hits" },
   ],
+  httpOpen: [],
+  httpRequest: [
+    { key: "url", label: "URL", placeholder: "https://api.example.com/v1/me" },
+    { key: "method", label: "Method", placeholder: "GET" },
+    { key: "body", label: "Body", placeholder: '{"name":"{{who}}"}' },
+    { key: "into", label: "Store body in", placeholder: "response" },
+    { key: "statusInto", label: "Store status in", placeholder: "code" },
+  ],
+  httpClose: [],
+  readFile: [
+    { key: "path", label: "File", placeholder: "accounts.txt" },
+    { key: "into", label: "Store in variable", placeholder: "accounts" },
+  ],
+  writeFile: [
+    { key: "path", label: "File", placeholder: "out/result.txt" },
+    { key: "contents", label: "Contents", placeholder: "{{response}}" },
+  ],
+  appendFile: [
+    { key: "path", label: "File", placeholder: "out/run.log" },
+    { key: "contents", label: "Contents", placeholder: "{{who}} done\n" },
+  ],
+  fileExists: [
+    { key: "path", label: "File", placeholder: "out/result.txt" },
+    { key: "into", label: "Store in variable", placeholder: "found" },
+  ],
+  deleteFile: [{ key: "path", label: "File", placeholder: "out/result.txt" }],
 };
 
 const str = (v: unknown) => (v == null ? "" : String(v));

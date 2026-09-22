@@ -32,7 +32,10 @@ fn server_binary() -> std::path::PathBuf {
         .join("server")
         .join("target")
         .join("debug")
-        .join(format!("shardx-team-server{}", std::env::consts::EXE_SUFFIX))
+        .join(format!(
+            "shardx-team-server{}",
+            std::env::consts::EXE_SUFFIX
+        ))
 }
 
 /// Start a server isolated to one test.
@@ -60,7 +63,11 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
         .spawn()
         .ok()?;
 
-    let server = TestServer { child, port, data_dir };
+    let server = TestServer {
+        child,
+        port,
+        data_dir,
+    };
 
     // Poll for readiness instead of sleeping a fixed amount.
     let http = reqwest::Client::new();

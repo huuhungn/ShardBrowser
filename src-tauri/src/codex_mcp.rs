@@ -5,7 +5,10 @@ use crate::{api, mcp_setup, settings};
 
 fn normalize_cli_path(path: &str) -> String {
     let trimmed = path.trim().trim_matches('"').trim_matches('\'');
-    let normalized = trimmed.replace('/', "\\").trim_end_matches('\\').to_string();
+    let normalized = trimmed
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
     #[cfg(windows)]
     {
         normalized.to_ascii_lowercase()
@@ -253,7 +256,10 @@ pub async fn status() -> Result<Value, String> {
     };
 
     if !output.status.success() {
-        return Ok(codex_not_registered_status(expected_index_path, expected_api));
+        return Ok(codex_not_registered_status(
+            expected_index_path,
+            expected_api,
+        ));
     }
 
     let config: Value = serde_json::from_slice(&output.stdout).map_err(|_| {

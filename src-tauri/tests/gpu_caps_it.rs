@@ -21,13 +21,18 @@ async fn the_installed_engine_reports_this_machine_s_own_gpu() {
         return;
     };
     if !binary.exists() {
-        eprintln!("skipped: engine runtime is not installed at {}", binary.display());
+        eprintln!(
+            "skipped: engine runtime is not installed at {}",
+            binary.display()
+        );
         return;
     }
 
     // force: the cache may hold an answer from a previous run, and a cache hit
     // would test the JSON file rather than the engine.
-    let caps = gpu_caps::probe(true).await.expect("probe the installed engine");
+    let caps = gpu_caps::probe(true)
+        .await
+        .expect("probe the installed engine");
 
     // A real driver names itself. The empty string is what a failed read or a
     // silently-dropped devtools reply leaves behind, so it is the interesting
@@ -69,7 +74,10 @@ async fn the_installed_engine_reports_this_machine_s_own_gpu() {
     // Second call, no force: must come back from disk without launching.
     let started = std::time::Instant::now();
     let hit = gpu_caps::probe(false).await.expect("cached probe");
-    assert_eq!(hit.renderer, caps.renderer, "cache should return the same answer");
+    assert_eq!(
+        hit.renderer, caps.renderer,
+        "cache should return the same answer"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
         "a cache hit must not relaunch the engine (took {:?})",
@@ -90,7 +98,9 @@ async fn the_verdict_is_drawn_against_what_the_engine_reported() {
         return;
     }
 
-    let caps = gpu_caps::probe(false).await.expect("probe the installed engine");
+    let caps = gpu_caps::probe(false)
+        .await
+        .expect("probe the installed engine");
 
     // Built from the host's own answer, so this is compatible by construction
     // on any machine the test runs on.
@@ -104,8 +114,7 @@ async fn the_verdict_is_drawn_against_what_the_engine_reported() {
     assert!(
         verdict.compatible,
         "a fingerprint claiming exactly what the host has must pass, missing: {:?} / {:?}",
-        verdict.missing_webgl1,
-        verdict.missing_webgl2,
+        verdict.missing_webgl1, verdict.missing_webgl2,
     );
 
     // No driver ships an extension by this name.
@@ -120,7 +129,10 @@ async fn the_verdict_is_drawn_against_what_the_engine_reported() {
     let verdict = gpu_caps::compat(&lying, &caps);
     assert!(!verdict.compatible, "an unbackable claim must be reported");
     assert!(
-        verdict.missing_webgl1.iter().any(|m| m.contains("does_not_exist")),
+        verdict
+            .missing_webgl1
+            .iter()
+            .any(|m| m.contains("does_not_exist")),
         "the verdict should name the offending extension, got {:?}",
         verdict.missing_webgl1,
     );

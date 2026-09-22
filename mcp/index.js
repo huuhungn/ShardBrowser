@@ -2254,6 +2254,114 @@ server.tool(
     });
   },
 );
+
+server.tool(
+  "record_profile_traffic",
+  "Visit a URL in a profile and report the HTTP requests the page actually made, including ones that failed. Use when a page looks fine but something behind it is broken, or to find which endpoint a site calls. Starts the profile only if it is not already running and stops it again afterwards unless keep_running is set.",
+  {
+    url: z.string(),
+    profile_id: z.string().optional(),
+    profile_query: z.string().optional(),
+    exact: z.boolean().optional(),
+    headless: z.boolean().optional(),
+    keep_running: z.boolean().optional(),
+    /// How long to keep recording after the page loads. Requests fired from a
+    /// promise callback arrive after load, so stopping at load would miss the
+    /// XHRs that are usually the point of recording.
+    settle_ms: z.number().int().min(0).max(60000).optional(),
+    url_contains: z.string().optional(),
+  },
+  async ({
+    url,
+    profile_id,
+    profile_query,
+    exact,
+    headless,
+    keep_running,
+    settle_ms,
+    url_contains,
+  }) => {
+    if (!/^https?:\/\//i.test(url)) {
+      throw new Error("url must be an explicit http:// or https:// address");
+    }
+    const profile = await resolveProfile({ profile_id, profile_query, exact });
+
+    // Built here rather than saved: recording is a question the caller is
+    // asking now, and writing a project per question would fill the
+    // operator's project list with single-use junk.
+    const blocks = [
+      { id: "rec", kind: "recordTraffic", params: {} },
+      { id: "nav", kind: "navigate", params: { url } },
+      { id: "settle", kind: "wait", params: { ms: settle_ms ?? 2000 } },
+    ];
+    if (url_contains) {
+      // Opt-in: asserting by default would turn "show me the traffic" into a
+      // failure whenever the guessed endpoint was not called.
+      blocks.push({
+        id: "seen",
+        kind: "assertRequest",
+        params: { urlContains: url_contains, into: "matched" },
+      });
+    }
+    blocks.push({ id: "stop", kind: "stopTraffic", params: { into: "requests" } });
+
+    const acquire = () =>
+      acquireSafeOpenProfile({
+        profileId: profile.id,
+        headless: !!headless,
+        listRunning: () => api("/running"),
+        getLauncherHealth: () => api("/health"),
+        startProfile: ({ headless: startHeadless }) =>
+          api(`/profiles/${profile.id}/start`, {
+            method: "POST",
+            body: { headless: startHeadless },
+          }),
+        cleanupStartedProfile: (ownedPid, ownedLaunchInstanceToken) =>
+          stopStartedProfile(profile.id, ownedPid, ownedLaunchInstanceToken),
+      });
+
+    const run = async () =>
+      api("/automation/run", {
+        method: "POST",
+        body: {
+          profile_id: profile.id,
+          project: {
+            id: "mcp-traffic",
+            name: "Traffic recording",
+            notes: "",
+            blocks,
+            run: { loops: 1, hours: 0, start: "" },
+            created_at: 0,
+            updated_at: 0,
+          },
+          variables: {},
+        },
+      });
+
+    const { result, lifecycle } = await runSafeOpenLifecycle({
+      acquire,
+      open: run,
+      stopStartedProfile: (ownedPid, ownedLaunchInstanceToken) =>
+        stopStartedProfile(profile.id, ownedPid, ownedLaunchInstanceToken),
+      getRunningProfile: async () =>
+        (await api("/running")).find((item) => item.profile_id === profile.id) || null,
+      keepRunning: !!keep_running,
+    });
+
+    return text({
+      profile: profileSummary(profile),
+      url,
+      requests: result?.requests ?? [],
+      recorded: result?.variables?.requests ?? "0",
+      matched: result?.variables?.matched,
+      dropped: result?.variables?.traffic_dropped,
+      ok: result?.ok,
+      steps: result?.steps,
+      lifecycle,
+    });
+  },
+);
+
 //
 // Two transports:
 //   * stdio (default) — the MCP client spawns this process and talks over

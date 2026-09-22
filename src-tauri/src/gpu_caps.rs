@@ -181,7 +181,9 @@ async fn evaluate_in_core(port: u16) -> Result<String> {
         },
     });
     socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string()))
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            msg.to_string(),
+        ))
         .await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline {
@@ -378,8 +380,14 @@ mod tests {
             "webgpu": { "features": ["texture-compression-etc2", "subgroups", "shader-f16"] }
         });
         let c = compat(&payload, &caps());
-        assert_eq!(c.missing_webgpu, vec!["texture-compression-etc2", "subgroups"]);
-        assert!(!c.compatible, "the profile asks for what the machine has not got");
+        assert_eq!(
+            c.missing_webgpu,
+            vec!["texture-compression-etc2", "subgroups"]
+        );
+        assert!(
+            !c.compatible,
+            "the profile asks for what the machine has not got"
+        );
     }
 
     /// A profile with no list at all keeps the old behaviour — the host's own
@@ -427,6 +435,9 @@ mod tests {
         c.webgpu = None;
         let json = serde_json::to_string(&c).unwrap();
         let back: HostGlCaps = serde_json::from_str(&json).unwrap();
-        assert!(back.webgpu.is_none(), "the field must survive the round trip");
+        assert!(
+            back.webgpu.is_none(),
+            "the field must survive the round trip"
+        );
     }
 }

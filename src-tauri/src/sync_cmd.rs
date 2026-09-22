@@ -61,7 +61,10 @@ fn ready_config() -> Result<team_config::TeamConfig, String> {
         // An older enrollment predates storing the account id. It cannot be
         // reconstructed locally, and guessing one would fail server-side
         // authorization anyway.
-        return Err("this device was enrolled before profile sync existed — re-enroll it in Settings".into());
+        return Err(
+            "this device was enrolled before profile sync existed — re-enroll it in Settings"
+                .into(),
+        );
     }
     Ok(c)
 }

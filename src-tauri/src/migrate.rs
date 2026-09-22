@@ -42,7 +42,16 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     let out = do_run(app, dst);
     MIGRATING.store(false, Ordering::SeqCst);
     if out.is_err() {
-        emit(app, Progress { phase: "done", done: 0, total: 0, percent: 100, current: String::new() });
+        emit(
+            app,
+            Progress {
+                phase: "done",
+                done: 0,
+                total: 0,
+                percent: 100,
+                current: String::new(),
+            },
+        );
     }
     out
 }
@@ -59,7 +68,16 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     std::fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
     writable(&dst)?;
 
-    emit(app, Progress { phase: "scan", done: 0, total: 0, percent: 0, current: String::new() });
+    emit(
+        app,
+        Progress {
+            phase: "scan",
+            done: 0,
+            total: 0,
+            percent: 0,
+            current: String::new(),
+        },
+    );
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
     for name in MOVED {
         let from = src.join(name);
@@ -70,7 +88,16 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     let total = files.len() as u64;
     if total == 0 {
         finish(&dst)?;
-        emit(app, Progress { phase: "done", done: 0, total: 0, percent: 100, current: String::new() });
+        emit(
+            app,
+            Progress {
+                phase: "done",
+                done: 0,
+                total: 0,
+                percent: 100,
+                current: String::new(),
+            },
+        );
         return Ok(0);
     }
 
@@ -85,31 +112,55 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
         // One event per file is noise on a profile with ten thousand cache
         // entries; the bar only needs to move.
         if done % 25 == 0 || done == total {
-            emit(app, Progress {
-                phase: "copy",
-                done,
-                total,
-                percent: ((done * 100) / total) as u8,
-                current: from
-                    .strip_prefix(&src)
-                    .unwrap_or(from)
-                    .display()
-                    .to_string(),
-            });
+            emit(
+                app,
+                Progress {
+                    phase: "copy",
+                    done,
+                    total,
+                    percent: ((done * 100) / total) as u8,
+                    current: from
+                        .strip_prefix(&src)
+                        .unwrap_or(from)
+                        .display()
+                        .to_string(),
+                },
+            );
         }
     }
 
-    emit(app, Progress { phase: "verify", done, total, percent: 100, current: String::new() });
+    emit(
+        app,
+        Progress {
+            phase: "verify",
+            done,
+            total,
+            percent: 100,
+            current: String::new(),
+        },
+    );
     for (from, to) in &files {
         let a = std::fs::metadata(from).map(|m| m.len()).unwrap_or(0);
         let b = std::fs::metadata(to).map(|m| m.len()).unwrap_or(u64::MAX);
         if a != b {
-            anyhow::bail!("{} did not copy cleanly — nothing was deleted", from.display());
+            anyhow::bail!(
+                "{} did not copy cleanly — nothing was deleted",
+                from.display()
+            );
         }
     }
 
     // Only now is the old copy expendable.
-    emit(app, Progress { phase: "cleanup", done, total, percent: 100, current: String::new() });
+    emit(
+        app,
+        Progress {
+            phase: "cleanup",
+            done,
+            total,
+            percent: 100,
+            current: String::new(),
+        },
+    );
     finish(&dst)?;
     for name in MOVED {
         let old = src.join(name);
@@ -118,7 +169,16 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
         }
     }
 
-    emit(app, Progress { phase: "done", done, total, percent: 100, current: String::new() });
+    emit(
+        app,
+        Progress {
+            phase: "done",
+            done,
+            total,
+            percent: 100,
+            current: String::new(),
+        },
+    );
     Ok(done)
 }
 
@@ -135,8 +195,7 @@ fn finish(dst: &Path) -> Result<()> {
 /// read-only looks like an ordinary directory until something is written.
 fn writable(dir: &Path) -> Result<()> {
     let probe = dir.join(".shardx-write-test");
-    std::fs::write(&probe, b"ok")
-        .with_context(|| format!("{} is not writable", dir.display()))?;
+    std::fs::write(&probe, b"ok").with_context(|| format!("{} is not writable", dir.display()))?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
 }

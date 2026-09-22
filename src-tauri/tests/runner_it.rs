@@ -151,7 +151,11 @@ async fn the_minimal_blocks_really_drive_a_real_page() {
         // Only appears 400ms after load: a wait that does not really wait
         // fails here.
         block("late", "waitForSelector", json!({ "selector": "#late" })),
-        block("name", "setVariable", json!({ "name": "who", "value": "ann" })),
+        block(
+            "name",
+            "setVariable",
+            json!({ "name": "who", "value": "ann" }),
+        ),
         block(
             "type",
             "type",
@@ -217,7 +221,11 @@ async fn a_step_that_cannot_succeed_fails_and_stops_the_run() {
     let mut p = project(vec![
         block("nav", "navigate", json!({ "url": url })),
         block("missing", "click", json!({ "selector": "#nothing-here" })),
-        block("after", "setVariable", json!({ "name": "ran", "value": "yes" })),
+        block(
+            "after",
+            "setVariable",
+            json!({ "name": "ran", "value": "yes" }),
+        ),
     ]);
     // Keep the wait short: the point is the verdict, not the timeout.
     p.blocks[1].on_fail = Branch::Stop;
@@ -228,7 +236,10 @@ async fn a_step_that_cannot_succeed_fails_and_stops_the_run() {
 
     cdp::detach(profile_id);
 
-    assert!(!report.ok, "a run with a failed step must not report success");
+    assert!(
+        !report.ok,
+        "a run with a failed step must not report success"
+    );
     let failed = report
         .steps
         .iter()
@@ -391,7 +402,11 @@ async fn a_recorded_run_reports_the_requests_the_page_actually_made() {
         // The fetch is fired from a promise callback, so the document being
         // loaded does not mean it has happened yet.
         block("settle", "wait", json!({ "ms": 1500 })),
-        block("seen", "assertRequest", json!({ "urlContains": "/api/ok", "into": "hits" })),
+        block(
+            "seen",
+            "assertRequest",
+            json!({ "urlContains": "/api/ok", "into": "hits" }),
+        ),
         block("stop", "stopTraffic", json!({ "into": "requests" })),
     ]);
 
@@ -447,7 +462,11 @@ async fn asserting_on_a_request_the_page_never_made_fails_the_step() {
         block("rec", "recordTraffic", json!({})),
         block("nav", "navigate", json!({ "url": page })),
         block("settle", "wait", json!({ "ms": 800 })),
-        block("nope", "assertRequest", json!({ "urlContains": "/api/never" })),
+        block(
+            "nope",
+            "assertRequest",
+            json!({ "urlContains": "/api/never" }),
+        ),
     ]);
 
     let report = runner::run(&p, profile_id, HashMap::new())
@@ -463,7 +482,10 @@ async fn asserting_on_a_request_the_page_never_made_fails_the_step() {
         .find(|s| s.block_id == "nope")
         .expect("the assertion should be in the report");
     assert!(
-        step.error.as_deref().unwrap_or_default().contains("/api/never"),
+        step.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("/api/never"),
         "the error should name the URL the operator asked about: {:?}",
         step.error
     );
@@ -491,7 +513,11 @@ async fn a_request_that_failed_on_the_server_fails_the_assertion() {
         block("rec", "recordTraffic", json!({})),
         block("nav", "navigate", json!({ "url": page })),
         block("settle", "wait", json!({ "ms": 600 })),
-        block("seen", "assertRequest", json!({ "urlContains": "/api/broken" })),
+        block(
+            "seen",
+            "assertRequest",
+            json!({ "urlContains": "/api/broken" }),
+        ),
     ]);
 
     let report = runner::run(&p, profile_id, HashMap::new())
@@ -500,7 +526,10 @@ async fn a_request_that_failed_on_the_server_fails_the_assertion() {
 
     cdp::detach(profile_id);
 
-    assert!(!report.ok, "a 500 must not pass an assertion about the request");
+    assert!(
+        !report.ok,
+        "a 500 must not pass an assertion about the request"
+    );
     let step = report
         .steps
         .iter()

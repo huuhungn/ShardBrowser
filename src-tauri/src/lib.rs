@@ -1,22 +1,24 @@
 // ShardX Launcher — Tauri backend.
 
-mod profile_icon;
 pub mod api;
+pub mod automation;
 mod backup_cmd;
 mod bookmarks;
+pub mod cdp;
 mod codex_mcp;
-mod hermes_mcp;
 mod cookies;
 mod extensions;
+pub mod files;
 mod fingerprints;
 pub mod fleet_client;
 mod fleet_keys;
 pub mod gpu_caps;
-pub mod automation;
-pub mod cdp;
+mod hermes_mcp;
+pub mod http_session;
+mod launch;
+mod profile_icon;
 pub mod runner;
 pub mod traffic;
-mod launch;
 
 /// Where the engine binary lives, for integration tests that need to know
 /// whether a runtime is installed before probing it. The `runtime` module
@@ -31,14 +33,18 @@ mod process;
 mod profile;
 mod proxy;
 mod psapi;
+mod runtime;
+mod settings;
+mod speech;
+mod startup;
+/// Where the launcher keeps its files.
+///
+/// Public so the integration tests, which are separate crates, can point the
+/// config root at a scratch directory instead of the real profile store.
+pub mod store;
+mod sync_bus;
 mod sync_cmd;
 mod team_config;
-mod runtime;
-mod speech;
-mod settings;
-mod startup;
-mod store;
-mod sync_bus;
 mod trash;
 mod updater;
 
@@ -171,8 +177,14 @@ fn mcp_status_value(path: Option<String>, version: Option<String>, flags: McpSta
         (
             "update_available",
             match version.as_deref() {
-                Some(v) => format!("MCP files are v{v}; download/repair them for Launcher v{}.", env!("CARGO_PKG_VERSION")),
-                None => format!("MCP file version is unknown; download/repair them for Launcher v{}.", env!("CARGO_PKG_VERSION")),
+                Some(v) => format!(
+                    "MCP files are v{v}; download/repair them for Launcher v{}.",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                None => format!(
+                    "MCP file version is unknown; download/repair them for Launcher v{}.",
+                    env!("CARGO_PKG_VERSION")
+                ),
             },
         )
     } else if !dependencies_installed {
@@ -188,7 +200,8 @@ fn mcp_status_value(path: Option<String>, version: Option<String>, flags: McpSta
     } else {
         (
             "api_unavailable",
-            "MCP files and dependencies are ready, but the Automation API is unreachable.".to_string(),
+            "MCP files and dependencies are ready, but the Automation API is unreachable."
+                .to_string(),
         )
     };
 
@@ -234,7 +247,10 @@ mod mcp_status_tests {
         assert_eq!(status["ready"].as_bool(), Some(false));
         assert_eq!(status["version"].as_str(), Some("0.1.11"));
         assert_eq!(status["lockfile_present"].as_bool(), Some(true));
-        assert_eq!(status["required_version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            status["required_version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]
@@ -432,26 +448,20 @@ fn infer_gpu_preset_id(config: &serde_json::Map<String, Value>) -> Option<String
 
 // macOS Sonoma 14.x, Sequoia 15.x, Tahoe 26.x.
 const MACOS_PLATFORM_VERSIONS: &[&str] = &[
-    "14.6.1", "14.7", "14.7.1", "14.7.2",
-    "15.4", "15.4.1", "15.5", "15.6", "15.6.1", "15.7",
+    "14.6.1", "14.7", "14.7.1", "14.7.2", "15.4", "15.4.1", "15.5", "15.6", "15.6.1", "15.7",
     "26.0", "26.0.1", "26.1",
 ];
 
 // Win 10 21H1+ ("10.0.0"), Win 11 21H2..25H2 ("13"–"17"); weighted to 22H2/23H2/24H2.
 const WINDOWS_PLATFORM_VERSIONS: &[&str] = &[
-    "10.0.0",
-    "13.0.0",
-    "14.0.0", "14.0.0", "14.0.0",
-    "15.0.0", "15.0.0", "15.0.0", "15.0.0",
-    "16.0.0", "16.0.0", "16.0.0",
-    "17.0.0",
+    "10.0.0", "13.0.0", "14.0.0", "14.0.0", "14.0.0", "15.0.0", "15.0.0", "15.0.0", "15.0.0",
+    "16.0.0", "16.0.0", "16.0.0", "17.0.0",
 ];
 
 // LTS kernels + current mainline.
 const LINUX_PLATFORM_VERSIONS: &[&str] = &[
-    "5.15.0", "6.1.0", "6.5.0",
-    "6.6.0", "6.8.0", "6.10.0", "6.11.0", "6.12.0",
-    "6.14.0", "6.15.0", "6.16.0",
+    "5.15.0", "6.1.0", "6.5.0", "6.6.0", "6.8.0", "6.10.0", "6.11.0", "6.12.0", "6.14.0", "6.15.0",
+    "6.16.0",
 ];
 
 /// Write a random platform_version into navigator + client_hints; unknown platforms left alone.
@@ -462,10 +472,10 @@ pub(crate) fn randomize_platform_version(payload: &mut serde_json::Map<String, V
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let pool: &[&str] = match platform {
-        "macOS"   => MACOS_PLATFORM_VERSIONS,
+        "macOS" => MACOS_PLATFORM_VERSIONS,
         "Windows" => WINDOWS_PLATFORM_VERSIONS,
-        "Linux"   => LINUX_PLATFORM_VERSIONS,
-        _         => return,
+        "Linux" => LINUX_PLATFORM_VERSIONS,
+        _ => return,
     };
     let pick_idx = (uuid::Uuid::new_v4().as_bytes()[0] as usize) % pool.len();
     let version = pool[pick_idx].to_string();
@@ -473,7 +483,10 @@ pub(crate) fn randomize_platform_version(payload: &mut serde_json::Map<String, V
     if let Some(nav) = payload.get_mut("navigator").and_then(|v| v.as_object_mut()) {
         nav.insert("platform_version".into(), Value::String(version.clone()));
     }
-    if let Some(ch) = payload.get_mut("client_hints").and_then(|v| v.as_object_mut()) {
+    if let Some(ch) = payload
+        .get_mut("client_hints")
+        .and_then(|v| v.as_object_mut())
+    {
         ch.insert("platform_version".into(), Value::String(version));
     }
 }
@@ -487,14 +500,10 @@ fn mac_hw_configs(model: &str) -> Option<&'static [(u32, u32)]> {
         "mac-m2-air13" | "mac-m2-air15" | "mac-m2-mbp13" => &[(8, 8), (8, 16)],
         "mac-m2-pro-mbp14" | "mac-m2-pro-mbp16" => &[(10, 16), (12, 16), (12, 32)],
         "mac-m2-max-mbp14" | "mac-m2-max-mbp16" => &[(12, 32)],
-        "mac-m3-air13" | "mac-m3-air15" | "mac-m3-mbp14" | "mac-m3-imac24" => {
-            &[(8, 8), (8, 16)]
-        }
+        "mac-m3-air13" | "mac-m3-air15" | "mac-m3-mbp14" | "mac-m3-imac24" => &[(8, 8), (8, 16)],
         "mac-m3-pro-mbp14" | "mac-m3-pro-mbp16" => &[(11, 16), (12, 16), (12, 32)],
         "mac-m3-max-mbp14" | "mac-m3-max-mbp16" => &[(14, 32), (16, 32)],
-        "mac-m4-air13" | "mac-m4-air15" | "mac-m4-mbp14" | "mac-m4-imac24" => {
-            &[(10, 16), (10, 32)]
-        }
+        "mac-m4-air13" | "mac-m4-air15" | "mac-m4-mbp14" | "mac-m4-imac24" => &[(10, 16), (10, 32)],
         "mac-m4-pro-mbp14" | "mac-m4-pro-mbp16" => &[(12, 16), (14, 16), (14, 32)],
         "mac-m4-max-mbp14" | "mac-m4-max-mbp16" => &[(14, 32), (16, 32)],
         "mac-m5-mbp14" => &[(10, 16), (10, 32)],
@@ -543,7 +552,10 @@ fn host_ram_gb() -> Option<u32> {
             .output()
             .ok()?;
         let txt = String::from_utf8_lossy(&out.stdout);
-        let bytes: u64 = txt.lines().filter_map(|l| l.trim().parse::<u64>().ok()).next()?;
+        let bytes: u64 = txt
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .next()?;
         return Some((bytes / (1024 * 1024 * 1024)) as u32);
     }
     #[allow(unreachable_code)]
@@ -642,7 +654,12 @@ fn clamp_screen_to_real_display(
     let real_h = (phys.height as f64 / scale).round() as i64;
     eprintln!(
         "[launcher] display: name={:?} physical={}x{} scale={} -> logical={}x{}",
-        monitor.name(), phys.width, phys.height, scale, real_w, real_h
+        monitor.name(),
+        phys.width,
+        phys.height,
+        scale,
+        real_w,
+        real_h
     );
     if real_w <= 0 || real_h <= 0 {
         return;
@@ -667,8 +684,14 @@ fn clamp_screen_to_real_display(
     }
 
     // Preserve FP menubar/dock insets for avail_*.
-    let fp_avail_w = scr.get("avail_width").and_then(|v| v.as_i64()).unwrap_or(fp_w);
-    let fp_avail_h = scr.get("avail_height").and_then(|v| v.as_i64()).unwrap_or(fp_h);
+    let fp_avail_w = scr
+        .get("avail_width")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(fp_w);
+    let fp_avail_h = scr
+        .get("avail_height")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(fp_h);
     let chrome_w = (fp_w - fp_avail_w).max(0);
     let chrome_h = (fp_h - fp_avail_h).max(0);
     let avail_w = (real_w - chrome_w).max(1);
@@ -745,8 +768,7 @@ pub fn persist_profile_core(
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         profile::begin_user_mutation([id], "modify this profile")
-    }
-    ?;
+    }?;
 
     persist_profile_core_claimed(window, payload, enrich)
 }
@@ -773,8 +795,7 @@ pub(crate) fn persist_profile_core_claimed(
         }
     }
 
-    let mut stored: profile::StoredProfile =
-        serde_json::from_value(payload)?;
+    let mut stored: profile::StoredProfile = serde_json::from_value(payload)?;
     profile::prepare_profile_name_for_save(&mut stored)?;
     profile::save_raw(&mut stored)?;
     let name = stored
@@ -809,7 +830,9 @@ pub(crate) fn persist_profile_core_claimed(
 fn profile_delete(id: String) -> Result<(), String> {
     let _claim = profile::begin_user_mutation([&id], "delete this profile")
         .map_err(|error| error.to_string())?;
-    trash::move_to_trash(&id).map(|_| ()).map_err(|e| e.to_string())
+    trash::move_to_trash(&id)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ---- Trash ----
@@ -868,7 +891,9 @@ fn extension_import(paths: Vec<String>) -> Result<Vec<extensions::ExtensionEntry
 /// URL — the launcher fetches the file itself.
 #[tauri::command]
 async fn extension_import_url(url: String) -> Result<extensions::ExtensionEntry, String> {
-    extensions::import_url(&url).await.map_err(|e| format!("{e:#}"))
+    extensions::import_url(&url)
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -982,8 +1007,8 @@ fn profile_clone(id: String) -> Result<profile::ProfileMeta, String> {
 /// Import profiles verbatim under fresh ids; returns the count.
 #[tauri::command]
 fn profile_import(payloads: Vec<Value>) -> Result<usize, String> {
-    let _claim = profile::begin_profile_creation("import profiles")
-        .map_err(|error| error.to_string())?;
+    let _claim =
+        profile::begin_profile_creation("import profiles").map_err(|error| error.to_string())?;
     let mut stored_profiles: Vec<profile::StoredProfile> = payloads
         .into_iter()
         .map(|payload| serde_json::from_value(payload).map_err(|error| error.to_string()))
@@ -1075,7 +1100,9 @@ pub fn merge_library_fingerprint(
     );
     if let Some(o) = entry.payload.as_object() {
         for (k, v) in o {
-            if k == "_meta" { continue; }
+            if k == "_meta" {
+                continue;
+            }
             merged.insert(k.clone(), v.clone());
         }
     }
@@ -1199,7 +1226,10 @@ fn fingerprint_get(id: String) -> Result<Option<fingerprints::LibraryEntry>, Str
 }
 
 #[tauri::command]
-fn fingerprint_import(json_text: String, id_hint: Option<String>) -> Result<fingerprints::LibraryEntry, String> {
+fn fingerprint_import(
+    json_text: String,
+    id_hint: Option<String>,
+) -> Result<fingerprints::LibraryEntry, String> {
     fingerprints::import(&json_text, id_hint).map_err(|e| e.to_string())
 }
 
@@ -1218,8 +1248,7 @@ async fn gpu_caps(force: bool) -> Result<gpu_caps::HostGlCaps, String> {
 /// Whether the machine can wear each library fingerprint, keyed by id. Kept out of
 /// fingerprint_list() so that stays fast; an empty map means "not known", not "all fine".
 #[tauri::command]
-async fn gpu_caps_compat(
-) -> Result<std::collections::HashMap<String, gpu_caps::Compat>, String> {
+async fn gpu_caps_compat() -> Result<std::collections::HashMap<String, gpu_caps::Compat>, String> {
     let caps = match gpu_caps::probe(false).await {
         Ok(c) => c,
         Err(_) => return Ok(Default::default()),
@@ -1252,7 +1281,10 @@ fn process_list() -> Vec<process::RunningProfile> {
 }
 
 fn devtools_frontend_url(cdp_http_url: &str, path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") || path.starts_with("devtools://") {
+    if path.starts_with("http://")
+        || path.starts_with("https://")
+        || path.starts_with("devtools://")
+    {
         return path.to_string();
     }
     format!(
@@ -1421,8 +1453,13 @@ async fn proxy_check_udp(entry: proxy::ProxyEntry) -> Result<u128, String> {
 }
 
 #[tauri::command]
-async fn proxy_geo(entry: proxy::ProxyEntry, provider: Option<String>) -> Result<proxy::GeoInfo, String> {
-    proxy::geo_check(&entry, provider).await.map_err(|e| e.to_string())
+async fn proxy_geo(
+    entry: proxy::ProxyEntry,
+    provider: Option<String>,
+) -> Result<proxy::GeoInfo, String> {
+    proxy::geo_check(&entry, provider)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1542,8 +1579,9 @@ async fn sync_launch(
 
     let mut failed: Vec<String> = Vec::new();
     for id in &profile_ids {
-        if let Err(e) = launch::launch_profile_synced(
-            id, false, false, Some(&group), b.port, &b.token).await {
+        if let Err(e) =
+            launch::launch_profile_synced(id, false, false, Some(&group), b.port, &b.token).await
+        {
             failed.push(format!("{id}: {e}"));
         }
     }
@@ -1552,8 +1590,11 @@ async fn sync_launch(
     }
     // A partial launch is still a usable group; just say what did not make it.
     if !failed.is_empty() {
-        eprintln!("[launcher] sync group '{group}': {} failed — {}",
-                  failed.len(), failed.join("; "));
+        eprintln!(
+            "[launcher] sync group '{group}': {} failed — {}",
+            failed.len(),
+            failed.join("; ")
+        );
     }
     open_sync_panel(&app, &group);
     Ok(group)
@@ -1604,11 +1645,7 @@ async fn sync_stop(group: String) -> Result<(), String> {
 
 /// Holds one profile out of the group — a captcha, a different password.
 #[tauri::command]
-async fn sync_set_excluded(
-    group: String,
-    profile: String,
-    excluded: bool,
-) -> Result<(), String> {
+async fn sync_set_excluded(group: String, profile: String, excluded: bool) -> Result<(), String> {
     bus().await?.set_excluded(&group, &profile, excluded);
     Ok(())
 }
@@ -1782,11 +1819,9 @@ fn startup_status(app: tauri::AppHandle) -> Result<startup::StartupStatus, Strin
 
 fn api_info_value(s: &settings::Settings, token: String) -> Value {
     let runtime = api::runtime_status();
-    let runtime_base_url = runtime
-        .port
-        .map(|port| format!("http://127.0.0.1:{port}"));
-    let restart_required = s.api_enabled != runtime.enabled
-        || (s.api_enabled && runtime.port != Some(s.api_port));
+    let runtime_base_url = runtime.port.map(|port| format!("http://127.0.0.1:{port}"));
+    let restart_required =
+        s.api_enabled != runtime.enabled || (s.api_enabled && runtime.port != Some(s.api_port));
     serde_json::json!({
         "enabled": s.api_enabled,
         "port": s.api_port,
@@ -1969,7 +2004,11 @@ async fn ps_me() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn ps_orders(status: String, offset: Option<i64>, limit: Option<i64>) -> Result<Value, String> {
+async fn ps_orders(
+    status: String,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Value, String> {
     let mut q = vec![("status".to_string(), status)];
     if let Some(o) = offset {
         q.push(("offset".into(), o.to_string()));
@@ -2064,7 +2103,11 @@ async fn ps_purchase(body: Value) -> Result<Value, String> {
 
 /// Buy extra GB of residential traffic for an order.
 #[tauri::command]
-async fn ps_add_bandwidth(id: i64, amount: i64, promo_code: Option<String>) -> Result<Value, String> {
+async fn ps_add_bandwidth(
+    id: i64,
+    amount: i64,
+    promo_code: Option<String>,
+) -> Result<Value, String> {
     let mut body = serde_json::json!({ "amount": amount });
     if let Some(p) = promo_code.filter(|s| !s.is_empty()) {
         body["promo_code"] = Value::String(p);
@@ -2128,7 +2171,11 @@ async fn ps_regions(proxy_type: String, country_code: String) -> Result<Value, S
 }
 
 #[tauri::command]
-async fn ps_cities(proxy_type: String, country_code: String, region_code: String) -> Result<Value, String> {
+async fn ps_cities(
+    proxy_type: String,
+    country_code: String,
+    region_code: String,
+) -> Result<Value, String> {
     psapi::call(
         "GET",
         "/user/api/proxies/cities",
@@ -2506,7 +2553,9 @@ pub fn run() {
             let autostart_launch = startup::launched_for_autostart();
             match settings::load() {
                 Ok(configured) => {
-                    if let Err(error) = startup::refresh_registration_path(app.handle(), &configured) {
+                    if let Err(error) =
+                        startup::refresh_registration_path(app.handle(), &configured)
+                    {
                         eprintln!("[launcher] startup registration refresh failed: {error}");
                     }
                     if !startup::should_start_hidden(&configured, autostart_launch) {
@@ -2522,7 +2571,8 @@ pub fn run() {
             {
                 use tauri::menu::{Menu, MenuItem};
                 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-                let show = MenuItem::with_id(app, "tray_show", "Show Launcher", true, None::<&str>)?;
+                let show =
+                    MenuItem::with_id(app, "tray_show", "Show Launcher", true, None::<&str>)?;
                 let quit = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show, &quit])?;
                 if let Some(icon) = app.default_window_icon().cloned() {

@@ -161,9 +161,15 @@ impl Tracker {
             if temporary {
                 let cleanup = std::panic::catch_unwind(|| crate::profile::delete(&profile_id));
                 match cleanup {
-                    Ok(Ok(())) => eprintln!("[launcher] temporary profile {profile_id} deleted on close"),
-                    Ok(Err(e)) => eprintln!("[launcher] temporary profile {profile_id} cleanup failed: {e}"),
-                    Err(_) => eprintln!("[launcher] temporary profile {profile_id} cleanup panicked"),
+                    Ok(Ok(())) => {
+                        eprintln!("[launcher] temporary profile {profile_id} deleted on close")
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[launcher] temporary profile {profile_id} cleanup failed: {e}")
+                    }
+                    Err(_) => {
+                        eprintln!("[launcher] temporary profile {profile_id} cleanup panicked")
+                    }
                 }
             }
             // Keep the entry visible until every final profile write/delete is
@@ -486,11 +492,7 @@ mod tests {
             web_socket_debugger_url: "ws://127.0.0.1:9222/devtools/browser/stale".into(),
         };
 
-        assert!(!tracker.set_cdp_if_instance(
-            "profile-instance-cdp",
-            "instance-1",
-            stale_cdp
-        ));
+        assert!(!tracker.set_cdp_if_instance("profile-instance-cdp", "instance-1", stale_cdp));
         assert!(tracker.cdp("profile-instance-cdp").is_none());
     }
 }

@@ -120,7 +120,12 @@ impl Recorder {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 let Ok(mut l) = sink.lock() else { break };
-                absorb(&mut l, &event.method, &event.params, started.elapsed().as_millis() as u64);
+                absorb(
+                    &mut l,
+                    &event.method,
+                    &event.params,
+                    started.elapsed().as_millis() as u64,
+                );
             }
         });
 
@@ -275,7 +280,12 @@ mod tests {
     #[test]
     fn a_request_and_its_response_become_one_entry() {
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/x", "POST"), 5);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/x", "POST"),
+            5,
+        );
         absorb(&mut log, "Network.responseReceived", &received("1", 201), 9);
         absorb(
             &mut log,
@@ -299,10 +309,25 @@ mod tests {
         // Two requests in flight at once is the normal case on any real page,
         // and the second one's response routinely lands first.
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/slow", "GET"), 0);
-        absorb(&mut log, "Network.requestWillBeSent", &sent("2", "https://a/fast", "GET"), 1);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/slow", "GET"),
+            0,
+        );
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("2", "https://a/fast", "GET"),
+            1,
+        );
         absorb(&mut log, "Network.responseReceived", &received("2", 200), 2);
-        absorb(&mut log, "Network.responseReceived", &received("1", 500), 30);
+        absorb(
+            &mut log,
+            "Network.responseReceived",
+            &received("1", 500),
+            30,
+        );
 
         assert_eq!(log.by_id["1"].status, Some(500));
         assert_eq!(log.by_id["2"].status, Some(200));
@@ -313,17 +338,35 @@ mod tests {
     #[test]
     fn a_server_error_counts_as_a_failure() {
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/x", "GET"), 0);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/x", "GET"),
+            0,
+        );
         absorb(&mut log, "Network.responseReceived", &received("1", 500), 1);
-        assert!(log.by_id["1"].failed(), "a 500 is not a request that worked");
+        assert!(
+            log.by_id["1"].failed(),
+            "a 500 is not a request that worked"
+        );
     }
 
     #[test]
     fn a_redirect_is_reported_as_the_url_the_operator_asked_for() {
         // CDP reuses the request id across a redirect chain.
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/login", "GET"), 0);
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/home", "GET"), 1);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/login", "GET"),
+            0,
+        );
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/home", "GET"),
+            1,
+        );
 
         assert_eq!(log.order.len(), 1, "a redirect is one request, not two");
         assert_eq!(log.by_id["1"].url, "https://a/login");
@@ -332,7 +375,12 @@ mod tests {
     #[test]
     fn a_request_that_never_came_back_is_a_failure_not_a_success() {
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://a/x", "GET"), 0);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://a/x", "GET"),
+            0,
+        );
         assert!(
             log.by_id["1"].failed(),
             "a request still in flight has not succeeded, and a report must not imply it has",
@@ -342,7 +390,12 @@ mod tests {
     #[test]
     fn a_transport_failure_is_recorded_with_its_reason() {
         let mut log = Log::default();
-        absorb(&mut log, "Network.requestWillBeSent", &sent("1", "https://nope/x", "GET"), 0);
+        absorb(
+            &mut log,
+            "Network.requestWillBeSent",
+            &sent("1", "https://nope/x", "GET"),
+            0,
+        );
         absorb(
             &mut log,
             "Network.loadingFailed",
@@ -361,7 +414,12 @@ mod tests {
         // reader task and silently stop recording mid-run.
         let mut log = Log::default();
         absorb(&mut log, "Network.requestServedFromCache", &json!({}), 0);
-        absorb(&mut log, "Network.responseReceived", &json!({ "nothing": true }), 0);
+        absorb(
+            &mut log,
+            "Network.responseReceived",
+            &json!({ "nothing": true }),
+            0,
+        );
         assert!(log.order.is_empty());
     }
 
@@ -370,7 +428,12 @@ mod tests {
         // Enabling Network mid-flight means responses to requests that left
         // before we were listening.
         let mut log = Log::default();
-        absorb(&mut log, "Network.responseReceived", &received("99", 200), 0);
+        absorb(
+            &mut log,
+            "Network.responseReceived",
+            &received("99", 200),
+            0,
+        );
         assert!(log.by_id.is_empty());
         assert!(log.order.is_empty());
     }

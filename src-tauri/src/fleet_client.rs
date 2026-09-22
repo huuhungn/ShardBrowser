@@ -291,7 +291,12 @@ impl FleetClient {
     /// Returns raw bytes: still sealed, still unverified. The caller must run
     /// the backup-file restore path before treating any of it as a profile,
     /// because the signed head proving completeness sits at the end.
-    pub async fn download(&self, tenant_id: &str, profile_id: &str, version: i64) -> Result<Vec<u8>> {
+    pub async fn download(
+        &self,
+        tenant_id: &str,
+        profile_id: &str,
+        version: i64,
+    ) -> Result<Vec<u8>> {
         let head = self.head(tenant_id, profile_id).await?;
         let total = head.container_size.max(0) as usize;
         let mut out = Vec::with_capacity(total);
@@ -320,7 +325,10 @@ impl FleetClient {
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
-                bail!("server returned no bytes at offset {} of {total}", out.len());
+                bail!(
+                    "server returned no bytes at offset {} of {total}",
+                    out.len()
+                );
             }
             out.extend_from_slice(&bytes);
         }
@@ -674,7 +682,10 @@ mod tests {
     #[test]
     fn a_trailing_slash_does_not_double_up_in_paths() {
         let c = FleetClient::new("https://example.com/", "t").unwrap();
-        assert_eq!(c.url("/v2/server-identity"), "https://example.com/v2/server-identity");
+        assert_eq!(
+            c.url("/v2/server-identity"),
+            "https://example.com/v2/server-identity"
+        );
     }
 
     #[test]

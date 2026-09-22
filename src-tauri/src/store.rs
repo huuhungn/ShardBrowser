@@ -29,6 +29,19 @@ fn config_root_cell() -> &'static RwLock<Option<PathBuf>> {
 /// Exists for tests: a test that writes automation projects into the
 /// operator's real store would corrupt the profiles this machine actually
 /// runs. Production never calls it.
+/// Serialises tests that swap the config root.
+///
+/// The root is process-global, so two test modules that each hold their own
+/// lock still race with each other: the failure shows up as one module's
+/// fixtures appearing in the other's store, which reads like a routing bug
+/// rather than a test isolation one. Every test that calls
+/// [`set_config_root`] must hold this, including the integration tests, which
+/// are separate crates and so cannot see a `#[cfg(test)]` item.
+pub fn config_root_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 pub fn set_config_root(root: Option<PathBuf>) {
     if let Ok(mut g) = config_root_cell().write() {
         *g = root;

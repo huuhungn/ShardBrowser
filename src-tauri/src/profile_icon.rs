@@ -29,15 +29,33 @@ struct Geometry {
 const fn geometry() -> Geometry {
     #[cfg(target_os = "macos")]
     {
-        Geometry { margin: 0.098, radius: 0.0, squircle: true, shadow: true, outline: false }
+        Geometry {
+            margin: 0.098,
+            radius: 0.0,
+            squircle: true,
+            shadow: true,
+            outline: false,
+        }
     }
     #[cfg(target_os = "windows")]
     {
-        Geometry { margin: 0.045, radius: 0.115, squircle: false, shadow: false, outline: false }
+        Geometry {
+            margin: 0.045,
+            radius: 0.115,
+            squircle: false,
+            shadow: false,
+            outline: false,
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        Geometry { margin: 0.055, radius: 0.165, squircle: false, shadow: false, outline: true }
+        Geometry {
+            margin: 0.055,
+            radius: 0.165,
+            squircle: false,
+            shadow: false,
+            outline: true,
+        }
     }
 }
 
@@ -290,7 +308,13 @@ pub fn ensure_icon(cache_dir: &Path, name: &str, color: Option<&str>) -> Result<
 
     // White body.
     paint.set_color(Color::from_rgba8(255, 255, 255, 255));
-    pix.fill_path(&body, &paint, FillRule::Winding, Transform::identity(), None);
+    pix.fill_path(
+        &body,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 
     // Accent band, clipped to the body so its corners follow the same curve.
     let band_h = y0 + (y1 - y0) * 0.30;
@@ -300,14 +324,23 @@ pub fn ensure_icon(cache_dir: &Path, name: &str, color: Option<&str>) -> Result<
         let mut clip = tiny_skia::Mask::new(s, s).context("mask")?;
         clip.fill_path(&body, FillRule::Winding, true, Transform::identity());
         paint.set_color(color.and_then(parse_hex).unwrap_or_else(|| accent(name)));
-        pix.fill_path(&rect, &paint, FillRule::Winding, Transform::identity(), Some(&clip));
+        pix.fill_path(
+            &rect,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            Some(&clip),
+        );
         draw_mark(&mut pix, cx, (y0 + band_h) / 2.0, (band_h - y0) * 0.62);
     }
 
     // Hairline outline, Linux only.
     if g.outline {
         paint.set_color(Color::from_rgba8(0, 0, 0, 38));
-        let stroke = tiny_skia::Stroke { width: SIZE * 0.006, ..Default::default() };
+        let stroke = tiny_skia::Stroke {
+            width: SIZE * 0.006,
+            ..Default::default()
+        };
         pix.stroke_path(&body, &paint, &stroke, Transform::identity(), None);
     }
 
@@ -341,8 +374,7 @@ fn draw_mark(pix: &mut Pixmap, cx: f32, cy: f32, height: f32) {
         0,
         mark.as_ref(),
         &paint,
-        Transform::from_scale(scale, scale)
-            .post_translate(cx - w / 2.0, cy - height / 2.0),
+        Transform::from_scale(scale, scale).post_translate(cx - w / 2.0, cy - height / 2.0),
         None,
     );
 }
@@ -370,4 +402,3 @@ fn mark_pixmap() -> Option<&'static Pixmap> {
         })
         .as_ref()
 }
-
