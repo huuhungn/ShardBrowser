@@ -474,16 +474,29 @@ Backups taken before any of this, both verified by listing their contents:
 - `%TEMP%\shardx-backups\shardx-config-pre-phase3-*.tar.gz` — 13 profiles, 220 fingerprints
 - `%TEMP%\shardx-backups\mcp-runtime-pre-phase3-*.tar.gz` — the MCP runtime's `mcp/`
 
-Remaining step, which needs the operator to close the launcher:
+### Installed, and verified end to end
 
-```powershell
-Stop-Process -Name shardx-launcher
-Copy-Item $env:USERPROFILE\Documents\GitHub\ShardBrowser\src-tauri\target\release\shardx-launcher.exe `
-  -Destination '<installed path>' -Force
-```
+Installed over `%LOCALAPPDATA%\ShardX Launcher\shardx-launcher.exe`, with the
+replaced 2.2.7 binary kept beside the config archives as
+`shardx-launcher-2.2.7-installed-*.exe`. Rolling back is a copy in the other
+direction.
 
-Then confirm `/health` reports the new build and `POST /automation/run` no longer
-answers 404.
+Checked before replacing the binary: no profiles were running, and `migrate.rs`
+moves `user-data` only from the `data_root_migrate` command, which the operator
+invokes by hand and which refuses to start while any profile is open. Nothing
+migrates on startup, so the 560 MB of browser sessions were never at risk — which
+is why they are not in the config archive.
+
+After the restart, `POST /automation/run` answers 401 rather than 404: the route
+now exists and wants its token. `record_profile_traffic` then ran through the MCP
+runtime's stdio server against `https://httpbin.org/html` and recorded 4 requests
+— the document, a `Fetch` for `spec.json`, a data-URL image, and a 404 favicon.
+Recording is read-only, so the 404 rides through untouched instead of being
+cancelled. The profile went back to stopped with no Chrome processes left behind.
+
+Note the tool's parameters are `profile_query` + `exact` (or `profile_id`), plus
+`headless`, `settle_ms`, `keep_running` and `url_contains`. There is no `seconds`
+or `name_or_id`.
 
 ## Start-of-task verification
 
