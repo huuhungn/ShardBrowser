@@ -21,14 +21,23 @@ import {
 } from "../../entities/automation";
 import { useProfile } from "../../entities/profile";
 
-/** Param fields each kind actually reads, so the editor cannot invent keys. */
-const PARAMS: Record<string, { key: string; label: string; placeholder: string }[]> = {
+type ParamSpec = {
+  key: string;
+  label: string;
+  placeholder: string;
+  /** Numbers are stored as JSON numbers; the runner rejects a string here. */
+  numeric?: boolean;
+};
+
+/**
+ * The params each kind actually reads, keyed exactly as `runner::exec_block`
+ * looks them up. A key that does not appear there is a param the runner will
+ * silently ignore, so this list is deliberately narrow.
+ */
+const PARAMS: Record<string, ParamSpec[]> = {
   navigate: [{ key: "url", label: "URL", placeholder: "https://example.com" }],
-  wait: [{ key: "ms", label: "Milliseconds", placeholder: "1000" }],
-  waitForSelector: [
-    { key: "selector", label: "Selector", placeholder: "#login" },
-    { key: "timeoutMs", label: "Timeout (ms)", placeholder: "10000" },
-  ],
+  wait: [{ key: "ms", label: "Milliseconds", placeholder: "1000", numeric: true }],
+  waitForSelector: [{ key: "selector", label: "Selector", placeholder: "#login" }],
   click: [{ key: "selector", label: "Selector", placeholder: "button[type=submit]" }],
   type: [
     { key: "selector", label: "Selector", placeholder: "input[name=email]" },
@@ -40,19 +49,27 @@ const PARAMS: Record<string, { key: string; label: string; placeholder: string }
   ],
   readText: [
     { key: "selector", label: "Selector", placeholder: ".price" },
-    { key: "name", label: "Store in variable", placeholder: "price" },
+    { key: "into", label: "Store in variable", placeholder: "price" },
   ],
   assert: [
     { key: "selector", label: "Selector", placeholder: ".welcome" },
-    { key: "contains", label: "Must contain", placeholder: "Signed in" },
+    { key: "expected", label: "Must contain", placeholder: "Signed in" },
   ],
   evaluate: [
-    { key: "expression", label: "Expression", placeholder: "document.title" },
-    { key: "name", label: "Store in variable", placeholder: "title" },
+    { key: "script", label: "Script", placeholder: "document.title" },
+    { key: "into", label: "Store in variable", placeholder: "title" },
   ],
 };
 
 const str = (v: unknown) => (v == null ? "" : String(v));
+
+/** Keep an empty box out of the params rather than storing "" or NaN. */
+function paramValue(spec: ParamSpec, typed: string): unknown {
+  if (typed === "") return undefined;
+  if (!spec.numeric) return typed;
+  const n = Number(typed);
+  return Number.isFinite(n) ? n : typed;
+}
 
 function BlockRow({
   block,
@@ -91,9 +108,13 @@ function BlockRow({
                 label={f.label}
                 value={str(block.params[f.key])}
                 placeholder={f.placeholder}
-                onChange={(v) =>
-                  onChange({ ...block, params: { ...block.params, [f.key]: v } })
-                }
+                onChange={(v) => {
+                  const next = { ...block.params };
+                  const parsed = paramValue(f, v);
+                  if (parsed === undefined) delete next[f.key];
+                  else next[f.key] = parsed;
+                  onChange({ ...block, params: next });
+                }}
               />
             </div>
           ))}
