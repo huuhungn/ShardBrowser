@@ -2175,6 +2175,85 @@ server.tool(
 );
 
 // ---------- run ----------
+
+// ---- automation ----
+//
+// The launcher owns the runner; these tools are a thin, guarded door to it.
+//
+// The lifecycle guard matters here more than anywhere else in this file: a
+// run drives the operator's logged-in browser. A tool that started a profile
+// to run a project and then left it running would silently grow a fleet of
+// logged-in browsers nobody is watching. So a run restores whatever state it
+// found -- unless the caller explicitly asks to keep the profile up for a
+// follow-up tool in the same session.
+
+server.tool(
+  "list_automation_projects",
+  "List saved automation projects (id, name, block count). Read-only: never starts a profile.",
+  {},
+  async () => text(await api("/automation/projects")),
+);
+
+server.tool(
+  "get_automation_project",
+  "Fetch one automation project including its blocks. Read-only: never starts a profile.",
+  { project_id: z.string() },
+  async ({ project_id }) => text(await api(`/automation/projects/${encodeURIComponent(project_id)}`)),
+);
+
+server.tool(
+  "run_automation_project",
+  "Run a saved automation project against a profile. Starts the profile only if it is not already running, and stops it again afterwards unless keep_running is set. Returns per-block results.",
+  {
+    project_id: z.string(),
+    profile_id: z.string().optional(),
+    profile_query: z.string().optional(),
+    exact: z.boolean().optional(),
+    headless: z.boolean().optional(),
+    keep_running: z.boolean().optional(),
+    variables: z.record(z.string()).optional(),
+  },
+  async ({ project_id, profile_id, profile_query, exact, headless, keep_running, variables }) => {
+    const profile = await resolveProfile({ profile_id, profile_query, exact });
+
+    const acquire = () =>
+      acquireSafeOpenProfile({
+        profileId: profile.id,
+        headless: !!headless,
+        listRunning: () => api("/running"),
+        getLauncherHealth: () => api("/health"),
+        startProfile: ({ headless: startHeadless }) =>
+          api(`/profiles/${profile.id}/start`, {
+            method: "POST",
+            body: { headless: startHeadless },
+          }),
+        cleanupStartedProfile: (ownedPid, ownedLaunchInstanceToken) =>
+          stopStartedProfile(profile.id, ownedPid, ownedLaunchInstanceToken),
+      });
+
+    const run = async () =>
+      api(`/automation/projects/${encodeURIComponent(project_id)}/run`, {
+        method: "POST",
+        body: { profile_id: profile.id, variables: variables || {} },
+      });
+
+    const { result, lifecycle } = await runSafeOpenLifecycle({
+      acquire,
+      open: run,
+      stopStartedProfile: (ownedPid, ownedLaunchInstanceToken) =>
+        stopStartedProfile(profile.id, ownedPid, ownedLaunchInstanceToken),
+      getRunningProfile: async () =>
+        (await api("/running")).find((item) => item.profile_id === profile.id) || null,
+      keepRunning: !!keep_running,
+    });
+
+    return text({
+      profile: profileSummary(profile),
+      run: result,
+      lifecycle,
+    });
+  },
+);
 //
 // Two transports:
 //   * stdio (default) — the MCP client spawns this process and talks over

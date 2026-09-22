@@ -29,7 +29,7 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
     // bump fails this test for no reason, which trains people to edit it
     // without reading what it guards.
     assert.equal(version, pkg.version);
-    assert.equal(tools.length, 110);
+    assert.equal(tools.length, 113);
     for (const name of [
       "health_check",
       "startup_status",
@@ -49,12 +49,21 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
       "list_bookmarks",
       "list_trash",
       "restore_profile",
+      // Automation: the runner's only door for MCP clients.
+      "list_automation_projects",
+      "get_automation_project",
+      "run_automation_project",
     ]) {
       assert(names.has(name), `missing MCP tool: ${name}`);
     }
 
     const safeOpen = tools.find((tool) => tool.name === "safe_open_url");
     assert(safeOpen.inputSchema.properties.keep_running, "safe_open_url.keep_running missing");
+
+    // A run drives a logged-in browser, so it must offer the same lifecycle
+    // control as safe_open_url rather than leaving profiles running.
+    const run = tools.find((tool) => tool.name === "run_automation_project");
+    assert(run.inputSchema.properties.keep_running, "run_automation_project.keep_running missing");
   } finally {
     await client.close();
   }
