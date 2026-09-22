@@ -27,6 +27,8 @@ type ParamSpec = {
   placeholder: string;
   /** Numbers are stored as JSON numbers; the runner rejects a string here. */
   numeric?: boolean;
+  /** Read with `as_bool()`, so the string "true" would be ignored in silence. */
+  boolean?: boolean;
 };
 
 /**
@@ -57,12 +59,16 @@ const PARAMS: Record<string, ParamSpec[]> = {
   ],
   evaluate: [
     { key: "script", label: "Script", placeholder: "document.title" },
+    // A script may not interpolate a value that came from outside the project;
+    // this is where such a value goes instead, arriving as an argument.
+    { key: "with", label: "Pass variables in", placeholder: '["price"]' },
     { key: "into", label: "Store in variable", placeholder: "title" },
   ],
   recordTraffic: [],
   stopTraffic: [{ key: "into", label: "Store count in", placeholder: "requests" }],
   assertRequest: [
     { key: "urlContains", label: "URL contains", placeholder: "/api/login" },
+    { key: "mustSucceed", label: "Require one to have succeeded", placeholder: "", boolean: true },
     { key: "into", label: "Store count in", placeholder: "hits" },
   ],
   httpOpen: [],
@@ -70,6 +76,12 @@ const PARAMS: Record<string, ParamSpec[]> = {
     { key: "url", label: "URL", placeholder: "https://api.example.com/v1/me" },
     { key: "method", label: "Method", placeholder: "GET" },
     { key: "body", label: "Body", placeholder: '{"name":"{{who}}"}' },
+    {
+      key: "headers",
+      label: "Headers",
+      placeholder: '{"Authorization":"Bearer {{token}}"}',
+    },
+    { key: "mustSucceed", label: "Require a 2xx reply", placeholder: "", boolean: true },
     { key: "into", label: "Store body in", placeholder: "response" },
     { key: "statusInto", label: "Store status in", placeholder: "code" },
   ],
@@ -88,6 +100,7 @@ const PARAMS: Record<string, ParamSpec[]> = {
   ],
   fileExists: [
     { key: "path", label: "File", placeholder: "out/result.txt" },
+    { key: "mustExist", label: "Fail the run when missing", placeholder: "", boolean: true },
     { key: "into", label: "Store in variable", placeholder: "found" },
   ],
   deleteFile: [{ key: "path", label: "File", placeholder: "out/result.txt" }],
@@ -122,6 +135,7 @@ const str = (v: unknown) => (v == null ? "" : String(v));
 /** Keep an empty box out of the params rather than storing "" or NaN. */
 function paramValue(spec: ParamSpec, typed: string): unknown {
   if (typed === "") return undefined;
+  if (spec.boolean) return typed === "true";
   if (!spec.numeric) return typed;
   const n = Number(typed);
   return Number.isFinite(n) ? n : typed;
@@ -160,18 +174,36 @@ function BlockRow({
         <div className="flex min-w-0 flex-1 flex-wrap gap-2">
           {fields.map((f) => (
             <div key={f.key} className="min-w-[160px] flex-1">
-              <Field
-                label={f.label}
-                value={str(block.params[f.key])}
-                placeholder={f.placeholder}
-                onChange={(v) => {
-                  const next = { ...block.params };
-                  const parsed = paramValue(f, v);
-                  if (parsed === undefined) delete next[f.key];
-                  else next[f.key] = parsed;
-                  onChange({ ...block, params: next });
-                }}
-              />
+              {f.boolean ? (
+                // A text box here would store "true", which `as_bool()` reads
+                // as absent -- the setting would look set and do nothing.
+                <label className="flex items-center gap-2 py-[7px] text-paragraph-xs text-text-sub-600">
+                  <input
+                    type="checkbox"
+                    checked={block.params[f.key] === true}
+                    onChange={(e) => {
+                      const next = { ...block.params };
+                      if (e.target.checked) next[f.key] = true;
+                      else delete next[f.key];
+                      onChange({ ...block, params: next });
+                    }}
+                  />
+                  {f.label}
+                </label>
+              ) : (
+                <Field
+                  label={f.label}
+                  value={str(block.params[f.key])}
+                  placeholder={f.placeholder}
+                  onChange={(v) => {
+                    const next = { ...block.params };
+                    const parsed = paramValue(f, v);
+                    if (parsed === undefined) delete next[f.key];
+                    else next[f.key] = parsed;
+                    onChange({ ...block, params: next });
+                  }}
+                />
+              )}
             </div>
           ))}
           {fields.length === 0 && (

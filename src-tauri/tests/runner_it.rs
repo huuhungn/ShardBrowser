@@ -121,6 +121,18 @@ fn block(id: &str, kind: &str, params: Value) -> Block {
     }
 }
 
+/// A block that carries on when it fails.
+///
+/// The refusal tests need the run to continue past the refused step so a
+/// later block can confirm nothing happened; the default `Branch::Stop` would
+/// end the run and leave that unproven.
+fn block_continuing(id: &str, kind: &str, params: Value) -> Block {
+    Block {
+        on_fail: Branch::Next,
+        ..block(id, kind, params)
+    }
+}
+
 fn project(blocks: Vec<Block>) -> Project {
     Project {
         id: "it".into(),
@@ -545,24 +557,17 @@ async fn a_request_that_failed_on_the_server_fails_the_assertion() {
     );
 }
 
-/// `evaluate` runs the text it is handed, and `{{var}}` is substituted before
-/// that text reaches the page. So a value the PAGE chose becomes script the
-/// runner executes — here a heading read off the fixture ends up assigning to
-/// `window.__owned`.
+/// The attack the provenance guard exists to stop, end to end.
 ///
-/// That is not a bug today: every variable in a run is put there by the same
-/// operator who wrote the project, so this is them running their own code.
-/// It is recorded because the property holding it up is provenance, not
-/// escaping — the moment a value can arrive from somewhere the operator did
-/// not write (a WASM module contributing blocks, a project called as a
-/// subroutine, a fleet-synced project), the same three lines become an
-/// injection, and nothing in this file would have noticed.
+/// The fixture serves a heading whose *text* closes a JS string literal and
+/// appends a statement. A `readText` block lifts it into a variable, and an
+/// `evaluate` block interpolates that variable believing it is a string.
 ///
-/// Upstream carries the matching defence: it marks which variables came from a
-/// module and refuses a step that would turn one into code. Port that WITH the
-/// module system, not after it.
+/// Before the guard this ran the page's statement (`window.__pwned = 'yes'`).
+/// Now the step is refused, and the error names the variable and points at the
+/// alternative rather than leaving the operator to guess.
 #[tokio::test]
-async fn a_page_supplied_value_reaches_evaluate_as_code() {
+async fn a_page_supplied_value_is_refused_at_the_script_sink() {
     let (_fixture_dir, url) = fixture_url();
     let Some(engine) = start_engine(&url) else {
         eprintln!("skipped: engine runtime is not installed");
@@ -576,19 +581,15 @@ async fn a_page_supplied_value_reaches_evaluate_as_code() {
 
     let p = project(vec![
         block("nav", "navigate", json!({ "url": url })),
-        // The page decides what this says. On the fixture it is "ready"; a
-        // hostile page would put a statement here instead.
         block(
             "steal",
             "readText",
             json!({ "selector": "#hostile", "into": "payload" }),
         ),
-        // The operator meant to interpolate a string. Substitution happens
-        // before the engine parses it, so the page's text is parsed as code.
-        block(
+        block_continuing(
             "run",
             "evaluate",
-            json!({ "script": "window.__owned = '{{payload}}'; window.__owned" }),
+            json!({ "script": "window.__pwned = '{{payload}}'; 1" }),
         ),
         block(
             "confirm",
@@ -603,12 +604,193 @@ async fn a_page_supplied_value_reaches_evaluate_as_code() {
 
     cdp::detach(profile_id);
 
-    assert!(report.ok, "the run should complete: {:?}", report.steps);
+    let run = report
+        .steps
+        .iter()
+        .find(|s| s.block_id == "run")
+        .expect("the script step should be in the report");
+    let error = run.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("payload") && error.contains("outside the project"),
+        "the refusal should name the variable and why: {error:?}"
+    );
+    assert!(
+        error.contains("with"),
+        "the refusal should point at the safe alternative: {error:?}"
+    );
     assert_eq!(
         report.variables.get("pwned").map(String::as_str),
-        Some("yes"),
-        "the page's text closed the operator's string literal and ran a \
-         statement of its own, which is execution rather than interpolation: {:?}",
+        Some("no"),
+        "the page's statement must not have run: {:?}",
+        report.variables
+    );
+}
+
+/// Refusing interpolation is only reasonable because there is somewhere else
+/// for the value to go. `with` hands it to the page as a real argument, so the
+/// same hostile text arrives as data — quotes and all — and can be used.
+#[tokio::test]
+async fn outside_text_still_reaches_a_script_as_a_bound_argument() {
+    let (_fixture_dir, url) = fixture_url();
+    let Some(engine) = start_engine(&url) else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-evaluate-bound";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("nav", "navigate", json!({ "url": url })),
+        block(
+            "steal",
+            "readText",
+            json!({ "selector": "#hostile", "into": "payload" }),
+        ),
+        // Same value, same script, delivered as an argument instead.
+        block(
+            "use",
+            "evaluate",
+            json!({
+                "script": "window.__pwned ??= 'no'; return payload",
+                "with": ["payload"],
+                "into": "seen",
+            }),
+        ),
+        block(
+            "confirm",
+            "evaluate",
+            json!({ "script": "window.__pwned ?? 'no'", "into": "pwned" }),
+        ),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(report.ok, "the run should succeed: {:?}", report.steps);
+    assert_eq!(
+        report.variables.get("seen").map(String::as_str),
+        Some("'; window.__pwned = 'yes'; '"),
+        "the script should have received the hostile text intact, as data: {:?}",
+        report.variables
+    );
+    assert_eq!(
+        report.variables.get("pwned").map(String::as_str),
+        Some("no"),
+        "and none of it should have executed: {:?}",
+        report.variables
+    );
+}
+
+/// A copy must carry the origin with it. Otherwise one `setVariable` launders
+/// the page's text into a name the guard trusts, and the refusal above becomes
+/// a formality anyone can step around.
+#[tokio::test]
+async fn copying_an_outside_value_does_not_launder_it() {
+    let (_fixture_dir, url) = fixture_url();
+    let Some(engine) = start_engine(&url) else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-evaluate-launder";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("nav", "navigate", json!({ "url": url })),
+        block(
+            "steal",
+            "readText",
+            json!({ "selector": "#hostile", "into": "payload" }),
+        ),
+        block(
+            "launder",
+            "setVariable",
+            json!({ "name": "clean", "value": "{{payload}}" }),
+        ),
+        block_continuing(
+            "run",
+            "evaluate",
+            json!({ "script": "window.__pwned = '{{clean}}'; 1" }),
+        ),
+        block(
+            "confirm",
+            "evaluate",
+            json!({ "script": "window.__pwned ?? 'no'", "into": "pwned" }),
+        ),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    let run = report
+        .steps
+        .iter()
+        .find(|s| s.block_id == "run")
+        .expect("the script step should be in the report");
+    assert!(
+        run.error.as_deref().unwrap_or_default().contains("clean"),
+        "the copy should still be refused, naming the copy: {:?}",
+        run.error
+    );
+    assert_eq!(
+        report.variables.get("pwned").map(String::as_str),
+        Some("no"),
+        "the page's statement must not have run: {:?}",
+        report.variables
+    );
+}
+
+/// An operator's own text is not restricted. The guard is about provenance,
+/// so a script interpolating a variable the project itself set keeps working.
+#[tokio::test]
+async fn an_operators_own_value_still_interpolates() {
+    let (_fixture_dir, url) = fixture_url();
+    let Some(engine) = start_engine(&url) else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-evaluate-operator";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("nav", "navigate", json!({ "url": url })),
+        block(
+            "mine",
+            "setVariable",
+            json!({ "name": "greeting", "value": "hello" }),
+        ),
+        block(
+            "run",
+            "evaluate",
+            json!({ "script": "'{{greeting}} there'", "into": "said" }),
+        ),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(report.ok, "the run should succeed: {:?}", report.steps);
+    assert_eq!(
+        report.variables.get("said").map(String::as_str),
+        Some("hello there"),
+        "the operator's own text should interpolate as before: {:?}",
         report.variables
     );
 }

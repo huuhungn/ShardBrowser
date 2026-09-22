@@ -79,25 +79,85 @@ pub struct RunReport {
     pub requests: Vec<crate::traffic::Entry>,
 }
 
+/// Where a variable's text came from.
+///
+/// The distinction that matters is not "which block wrote it" but "who chose
+/// the characters". An operator writing `setVariable` chose them. A page,
+/// a server, a file on disk or a database row did not -- and a project cannot
+/// tell the difference once the value is sitting in a variable, because by
+/// then it is just text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The operator typed it, or seeded it when starting the run.
+    Operator,
+    /// Something outside the project chose it: a page, an HTTP reply, a file,
+    /// a database row.
+    Outside,
+}
+
 /// Values carried between steps. Text params interpolate `{{name}}`.
+///
+/// Each value remembers its [`Origin`] so a step that would turn text into
+/// running code can refuse text the project did not write. See
+/// [`Variables::outside_names_in`].
 #[derive(Debug, Default, Clone)]
-pub struct Variables(HashMap<String, String>);
+pub struct Variables {
+    values: HashMap<String, String>,
+    /// Names whose current value came from outside the project.
+    ///
+    /// Absence means [`Origin::Operator`]: seeded variables are the operator's
+    /// own, so an empty set is the correct starting state.
+    outside: std::collections::HashSet<String>,
+}
 
 impl Variables {
     pub fn new(seed: HashMap<String, String>) -> Self {
-        Self(seed)
+        Self {
+            values: seed,
+            outside: std::collections::HashSet::new(),
+        }
     }
 
+    /// Record a value the operator's own project chose.
     pub fn set(&mut self, name: &str, value: impl Into<String>) {
-        self.0.insert(name.to_string(), value.into());
+        self.values.insert(name.to_string(), value.into());
+        // Writing a fresh operator value clears any earlier outside mark:
+        // the name now holds text the project chose.
+        self.outside.remove(name);
+    }
+
+    /// Record a value chosen by a page, a server, a file or a database.
+    ///
+    /// Kept separate from [`Variables::set`] so that adding a block which
+    /// reads the outside world is a decision someone makes on purpose, rather
+    /// than something that happens by calling the obvious method.
+    pub fn set_from_outside(&mut self, name: &str, value: impl Into<String>) {
+        self.values.insert(name.to_string(), value.into());
+        self.outside.insert(name.to_string());
+    }
+
+    /// Which outside-sourced names this raw (unexpanded) text interpolates.
+    ///
+    /// The *raw* parameter is searched, never the expanded one: after
+    /// substitution the value is indistinguishable from text the operator
+    /// typed, which is exactly the confusion being guarded against.
+    pub fn outside_names_in(&self, raw: &str) -> Vec<String> {
+        let mut found: Vec<String> = self
+            .outside
+            .iter()
+            .filter(|name| raw.contains(&format!("{{{{{name}}}}}")))
+            .cloned()
+            .collect();
+        found.sort();
+        found
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(String::as_str)
+        self.values.get(name).map(String::as_str)
     }
 
     pub fn into_inner(self) -> HashMap<String, String> {
-        self.0
+        self.values
     }
 
     /// Replace every `{{name}}` with its value. An unknown name is left
@@ -112,7 +172,7 @@ impl Variables {
             if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
                 if let Some(close) = find_close(&chars, i + 2) {
                     let name: String = chars[i + 2..close].iter().collect();
-                    match self.0.get(name.trim()) {
+                    match self.values.get(name.trim()) {
                         Some(v) => out.push_str(v),
                         None => {
                             out.push_str("{{");
@@ -413,6 +473,28 @@ fn start_index(project: &Project) -> Option<usize> {
 /// Placeholders are expanded inside string parameters, so a project can bind
 /// a value an earlier block found, but the result is still *bound* rather
 /// than pasted into the statement.
+/// Refuse SQL that splices outside text into the statement itself.
+///
+/// The `params` list already exists for this and binds properly, so the fix
+/// is a rewrite rather than a restriction: `WHERE name = {{scraped}}` becomes
+/// `WHERE name = ?` with `scraped` in `params`.
+fn refuse_outside_sql(raw_sql: &str, vars: &Variables) -> Result<()> {
+    let borrowed = vars.outside_names_in(raw_sql);
+    if borrowed.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "this SQL builds the statement out of {}, which came from outside the \
+         project — put a ? in the statement and pass the value in \"params\", \
+         where it is bound instead of parsed",
+        borrowed
+            .iter()
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 fn db_params(block: &Block, vars: &Variables) -> Result<Vec<serde_json::Value>> {
     let Some(raw) = block.params.get("params") else {
         return Ok(Vec::new());
@@ -581,8 +663,20 @@ async fn perform(
                 .and_then(|v| v.as_str())
                 .context("the \"setVariable\" block needs a name")?
                 .to_string();
-            let value = param_text(block, "value", vars).unwrap_or_default();
-            vars.set(&name, value);
+            // Copying carries the origin with it. Without this, one
+            // `setVariable` launders a page's text into an operator-owned
+            // name and the guard at the sink sees nothing to object to.
+            let raw = block
+                .params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let value = vars.expand(raw);
+            if vars.outside_names_in(raw).is_empty() {
+                vars.set(&name, value);
+            } else {
+                vars.set_from_outside(&name, value);
+            }
             Ok(())
         }
 
@@ -598,7 +692,7 @@ async fn perform(
             let v = evaluate(profile_id, &read_text_expr(&selector)).await?;
             match v.as_str() {
                 Some(text) => {
-                    vars.set(&into, text.trim());
+                    vars.set_from_outside(&into, text.trim());
                     Ok(())
                 }
                 None => Err(anyhow!("nothing matched {selector} to read")),
@@ -740,7 +834,7 @@ async fn perform(
                     .await?;
 
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
-                vars.set(name, reply.body.clone());
+                vars.set_from_outside(name, reply.body.clone());
             }
             if let Some(name) = block.params.get("statusInto").and_then(|v| v.as_str()) {
                 vars.set(name, reply.status.to_string());
@@ -780,7 +874,7 @@ async fn perform(
                 .get("into")
                 .and_then(|v| v.as_str())
                 .context("the \"readFile\" block needs an into")?;
-            vars.set(name, contents);
+            vars.set_from_outside(name, contents);
             Ok(())
         }
 
@@ -821,7 +915,13 @@ async fn perform(
 
         "dbExecute" => {
             let database = param_text(block, "database", vars)?;
-            let sql = param_text(block, "sql", vars)?;
+            let raw_sql = block
+                .params
+                .get("sql")
+                .and_then(|v| v.as_str())
+                .context("the \"dbExecute\" block needs a sql")?;
+            refuse_outside_sql(raw_sql, vars)?;
+            let sql = vars.expand(raw_sql);
             let params = db_params(block, vars)?;
             let changed = crate::db::execute(&database, &sql, &params)?;
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
@@ -832,7 +932,13 @@ async fn perform(
 
         "dbQuery" => {
             let database = param_text(block, "database", vars)?;
-            let sql = param_text(block, "sql", vars)?;
+            let raw_sql = block
+                .params
+                .get("sql")
+                .and_then(|v| v.as_str())
+                .context("the \"dbQuery\" block needs a sql")?;
+            refuse_outside_sql(raw_sql, vars)?;
+            let sql = vars.expand(raw_sql);
             let params = db_params(block, vars)?;
             let rows = crate::db::query(&database, &sql, &params)?;
 
@@ -840,7 +946,7 @@ async fn perform(
             // whole result to write out or pass on, and a single field to
             // branch on without parsing JSON in an evaluate block.
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
-                vars.set(name, serde_json::to_string(&rows)?);
+                vars.set_from_outside(name, serde_json::to_string(&rows)?);
             }
             if let Some(name) = block.params.get("countInto").and_then(|v| v.as_str()) {
                 vars.set(name, rows.len().to_string());
@@ -859,7 +965,7 @@ async fn perform(
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                vars.set(name, value);
+                vars.set_from_outside(name, value);
             }
 
             let least = block
@@ -877,10 +983,40 @@ async fn perform(
         }
 
         "evaluate" => {
-            let script = param_text(block, "script", vars)?;
-            let v = evaluate(profile_id, &script).await?;
+            let raw = block
+                .params
+                .get("script")
+                .and_then(|v| v.as_str())
+                .context("the \"evaluate\" block needs a script")?;
+
+            // Interpolating outside text into a script means the page, the
+            // server or the database gets to decide what code runs. Refuse it
+            // and point at the alternative rather than silently mangling the
+            // value, which would leave the project broken in a way nobody can
+            // see.
+            let borrowed = vars.outside_names_in(raw);
+            if !borrowed.is_empty() {
+                return Err(anyhow!(
+                    "this script would run the value of {}, which came from \
+                     outside the project — pass it through \"with\" instead, \
+                     where it arrives as data",
+                    borrowed
+                        .iter()
+                        .map(|n| format!("{n:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+
+            // The safe path: named values are handed to the page as arguments,
+            // so text stays text however many quotes it contains.
+            let script = vars.expand(raw);
+            let v = match bound_arguments(block, vars)? {
+                Some(args) => evaluate_with(profile_id, &script, args).await?,
+                None => evaluate(profile_id, &script).await?,
+            };
             if let Some(name) = block.params.get("into").and_then(|x| x.as_str()) {
-                vars.set(name, value_to_text(&v));
+                vars.set_from_outside(name, value_to_text(&v));
             }
             Ok(())
         }
@@ -918,6 +1054,156 @@ async fn wait_for_selector(profile_id: &str, selector: &str) -> Result<()> {
 }
 
 /// Evaluate an expression in the page and return its value.
+/// The `with` parameter of an `evaluate` block: names to hand the page as
+/// arguments.
+///
+/// Accepts `["a", "b"]` or `{"page_name": "var_name"}`. `None` means the block
+/// had no `with`, which keeps the plain expression path for the vast majority
+/// of scripts that need no data at all.
+fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String, String)>>> {
+    let Some(raw) = block.params.get("with") else {
+        return Ok(None);
+    };
+
+    // Hand-written in the editor, so it arrives as a JSON string there and as
+    // a real array or object over the API.
+    let parsed;
+    let raw = match raw {
+        Value::String(s) if !s.trim().is_empty() => {
+            parsed = serde_json::from_str::<Value>(s)
+                .context("the \"with\" list is not valid JSON")?;
+            &parsed
+        }
+        other => other,
+    };
+
+    let pairs: Vec<(String, String)> = match raw {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                let name = item
+                    .as_str()
+                    .context("every entry in \"with\" must be a variable name")?;
+                Ok((name.to_string(), name.to_string()))
+            })
+            .collect::<Result<_>>()?,
+        Value::Object(map) => map
+            .iter()
+            .map(|(as_name, var)| {
+                let var = var
+                    .as_str()
+                    .context("every value in \"with\" must be a variable name")?;
+                Ok((as_name.clone(), var.to_string()))
+            })
+            .collect::<Result<_>>()?,
+        Value::Null => return Ok(None),
+        _ => return Err(anyhow!("\"with\" must be a list or an object")),
+    };
+
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+
+    pairs
+        .iter()
+        .map(|(as_name, var)| {
+            let value = vars
+                .get(var)
+                .with_context(|| format!("\"with\" names {var:?}, which no step has set"))?;
+            Ok((as_name.clone(), value.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Run a script with values delivered as arguments rather than spliced in.
+///
+/// The script becomes the body of a function and the values are passed by
+/// CDP as real arguments, so a value containing quotes, newlines or `</script>`
+/// is data on arrival. This is the mechanism that makes refusing interpolation
+/// reasonable: there is somewhere else for the value to go.
+async fn evaluate_with(
+    profile_id: &str,
+    body: &str,
+    args: Vec<(String, String)>,
+) -> Result<Value> {
+    let names: Vec<&str> = args.iter().map(|(n, _)| n.as_str()).collect();
+    for name in &names {
+        if !is_js_identifier(name) {
+            return Err(anyhow!(
+                "{name:?} cannot be the name of an argument; use letters, \
+                 digits, _ or $, not starting with a digit"
+            ));
+        }
+    }
+
+    let declaration = format!("(function({}) {{ {body} }})", names.join(", "));
+    let call_args: Vec<Value> = args
+        .into_iter()
+        .map(|(_, v)| json!({ "value": v }))
+        .collect();
+
+    // Evaluate the function, then call it with the values: Runtime.callFunctionOn
+    // carries arguments across the boundary as data.
+    let fun = cdp::page_call(
+        profile_id,
+        "Runtime.evaluate",
+        json!({ "expression": declaration, "returnByValue": false }),
+    )
+    .await?;
+    throw_if_page_threw(&fun)?;
+
+    let object_id = fun
+        .get("result")
+        .and_then(|r| r.get("objectId"))
+        .and_then(|id| id.as_str())
+        .context("the page did not return a callable script")?;
+
+    let reply = cdp::page_call(
+        profile_id,
+        "Runtime.callFunctionOn",
+        json!({
+            "functionDeclaration": "function(...a) { return this(...a); }",
+            "objectId": object_id,
+            "arguments": call_args,
+            "returnByValue": true,
+            "awaitPromise": true,
+        }),
+    )
+    .await?;
+    throw_if_page_threw(&reply)?;
+
+    Ok(reply
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn is_js_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A thrown exception comes back as a *successful* CDP reply carrying
+/// `exceptionDetails`. Treating that as success is how a broken step passes.
+fn throw_if_page_threw(reply: &Value) -> Result<()> {
+    let Some(details) = reply.get("exceptionDetails") else {
+        return Ok(());
+    };
+    let text = details
+        .get("exception")
+        .and_then(|e| e.get("description"))
+        .and_then(|d| d.as_str())
+        .or_else(|| details.get("text").and_then(|t| t.as_str()))
+        .unwrap_or("the page threw while running this step");
+    Err(anyhow!(text.to_string()))
+}
+
 async fn evaluate(profile_id: &str, expression: &str) -> Result<Value> {
     let reply = cdp::page_call(
         profile_id,
@@ -930,17 +1216,7 @@ async fn evaluate(profile_id: &str, expression: &str) -> Result<Value> {
     )
     .await?;
 
-    // A thrown exception comes back as a successful CDP reply carrying
-    // exceptionDetails. Treating that as success is how a broken step passes.
-    if let Some(details) = reply.get("exceptionDetails") {
-        let text = details
-            .get("exception")
-            .and_then(|e| e.get("description"))
-            .and_then(|d| d.as_str())
-            .or_else(|| details.get("text").and_then(|t| t.as_str()))
-            .unwrap_or("the page threw while running this step");
-        return Err(anyhow!(text.to_string()));
-    }
+    throw_if_page_threw(&reply)?;
 
     Ok(reply
         .get("result")

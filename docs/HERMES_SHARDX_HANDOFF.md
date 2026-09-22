@@ -357,41 +357,76 @@ the SDK port becomes justified. The second test asserts the domain stays out of
 `Schema.getDomains` whether or not it is implemented — an enumerable private
 domain is itself a fingerprint.
 
-### WASM modules: blocked on provenance, not on the port
+### Variable provenance, and what it unblocks
 
-Upstream's `src-tauri/src/wasm.rs` (1,273 lines) lets an operator write their own
-blocks in Rust, compiled to WebAssembly. A module never touches the page: it is
-handed the step's parameters and the run's variables and answers with primitive
+A run now remembers where each variable's text came from. The distinction is
+not "which block wrote it" but "who chose the characters": an operator writing
+`setVariable` chose them, while a page, an HTTP reply, a file or a database row
+did not — and once the value is sitting in a variable nothing can tell the
+difference, because by then it is just text.
+
+`Variables` therefore carries an `Origin` per name. `set` records the
+operator's own text; `set_from_outside` records text from elsewhere, and is a
+separate method so that adding a block which reads the outside world is a
+decision someone makes rather than something that happens by calling the
+obvious one. Marked today: `readText`, `httpRequest` bodies, `readFile`,
+`dbQuery` rows and cells, and `evaluate` results. Counts and status codes the
+runner computes itself stay operator-owned.
+
+Copying carries the origin with it. Without that, one
+`setVariable value="{{scraped}}"` launders a page's text into a name the guard
+trusts and the whole thing becomes a formality.
+
+Two sinks refuse outside text, both checking the **raw** parameter rather than
+the expanded one — after substitution the value is indistinguishable from text
+the operator typed, which is the confusion being guarded against:
+
+- `evaluate` refuses a script that interpolates an outside name.
+- `dbExecute`/`dbQuery` refuse SQL that builds the statement from one.
+
+Each refusal names the variable and points at the alternative, because an
+operator who cannot see the supported route reaches for a worse workaround:
+
+- Scripts take `with`, which hands values to the page as real arguments via
+  `Runtime.callFunctionOn` — quotes, newlines and `</script>` arrive as data.
+  `with` accepts `["name"]` or `{"asName": "varName"}`.
+- SQL already had `params`, which binds. `WHERE name = '{{who}}'` becomes
+  `WHERE name = ?` with `who` in `params`.
+
+Tests: `runner_it.rs` covers the refusal, the `with` path carrying the same
+hostile text intact, the laundering attempt through `setVariable`, and an
+operator's own value still interpolating. `db_it.rs` covers the SQL refusal and
+the bound equivalent. Verified by mutation — removing either guard, dropping
+either origin mark, un-propagating the copy, or checking the expanded string
+instead of the raw one each turns a test red.
+
+`javascript:` URLs were probed as a third sink and are not one: the engine
+refuses to navigate to them, so `navigate` does not need the guard.
+
+### WASM modules: the blocker is cleared, the port is not done
+
+Upstream's `src-tauri/src/wasm.rs` (1,273 lines) lets an operator write blocks
+in Rust compiled to WebAssembly. A module never touches the page: it receives
+the step's parameters and the run's variables and answers with primitive
 actions for the runner to perform. It imports only `crate::store` and names no
-block kind, so it does not depend on upstream's block vocabulary — ours diverged
-completely (`navigate`/`click`/`type` against their `goto`/`hover`/`press`) and
-that turns out not to matter.
+block kind, so our diverged block vocabulary (`navigate`/`click`/`type` against
+their `goto`/`hover`/`press`) is not the obstacle it appeared to be.
 
-What does matter is the 24 call sites around it in upstream's runner. A module
-is a third party inside a run, so upstream tracks which variables a module
-wrote and refuses a step that would turn one into code — refusing a module's
-`script.run` is not enough when it can write a variable and let the operator's
-own `evaluate` run it.
+The obstacle was that a module is a third party inside a run, and this runner
+could not tell a module's text from the operator's. That is what the section
+above fixes — a module's writes become `set_from_outside` and the existing
+sinks refuse them, with `with` and `params` as the supported routes.
 
-**Our runner has no provenance tracking of any kind.** `evaluate` substitutes
-`{{var}}` into its script before the engine parses it, so a variable's contents
-are executed. `a_page_supplied_value_reaches_evaluate_as_code` in
-`tests/runner_it.rs` proves it end to end: the fixture serves a heading whose
-*text* is `'; window.__pwned = 'yes'; '`, a `readText` block lifts it into a
-variable, and the operator's `evaluate` — interpolating what it believes is a
-string — closes the literal and runs the page's statement. A later block reads
-`window.__pwned` back as `yes`.
+Still required before `wasm.rs` lands, and deliberately not started here:
 
-That is not a live vulnerability. Every variable in a run today is put there by
-the same operator who wrote the project, so this is them running their own code
-in their own browser, and the test asserts the current behaviour rather than
-failing on it. The property holding it up is provenance, not escaping.
-
-A module system removes exactly that property, and the same three blocks become
-an injection carrying a third party's text. So: **port `wasm.rs` together with
-upstream's variable-provenance defence, never before it.** The same applies to
-anything else that lets a value enter a run from outside the project — a project
-called as a subroutine, a fleet-synced project, an imported flow.
+- `wasmtime` as a dependency (large; needs a look at build time and binary size
+  against the 90 MB the launcher ships today).
+- Upstream's call-depth and action budgets (`MAX_CHAIN_ACTIONS`), which stop a
+  module calling itself forever.
+- The `Frame`/grant machinery deciding which modules and flows a module may
+  call.
+- A decision about where modules are stored and how they are reviewed before an
+  operator runs someone else's.
 
 ## Automation blocks beyond the page, September 2026
 

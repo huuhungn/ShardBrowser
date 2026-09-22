@@ -178,6 +178,43 @@ test("every param the runner requires is one the editor can fill in", async () =
   }
 });
 
+/// A param the runner reads but the editor has no box for is unreachable: the
+/// operator cannot type it, so the feature it controls does not exist for
+/// anyone working in the UI. Optional params are exactly where this hides,
+/// because the "required" check above passes them by.
+///
+/// Some params are genuinely not for the editor -- they are written by another
+/// program through the API. Those are listed here, so that exempting one is a
+/// visible decision rather than a silent gap.
+const NOT_FOR_THE_EDITOR = new Set([
+  // Written by the MCP traffic tool, which builds its own project.
+  "recordTraffic.urlContains",
+]);
+
+test("every optional param the runner reads has a box in the editor", async () => {
+  const runner = await readFile(RUNNER_RS, "utf8");
+  const execBody = execBlockBody(runner);
+  const PARAMS = await loadEditorParams();
+
+  const missing = [];
+  for (const kind of kindsFromRunner(runner)) {
+    const read = paramsForKind(execBody, kind);
+    if (!read) continue;
+    const offered = new Set((PARAMS[kind] ?? []).map((s) => s.key));
+    for (const key of read) {
+      if (!offered.has(key) && !NOT_FOR_THE_EDITOR.has(`${kind}.${key}`)) {
+        missing.push(`${kind}.${key}`);
+      }
+    }
+  }
+
+  assert.deepEqual(
+    missing,
+    [],
+    `the runner reads these, but nobody using the editor can set them: ${missing.join(", ")}`,
+  );
+});
+
 test("params the runner reads as numbers are not offered as text", async () => {
   const runner = await readFile(RUNNER_RS, "utf8");
   const execBody = execBlockBody(runner);

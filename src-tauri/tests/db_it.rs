@@ -348,3 +348,142 @@ async fn a_quote_in_a_value_cannot_add_a_parameter() {
         "the quote and everything after it belong inside the value: {rows:?}"
     );
 }
+
+/// SQL built out of a value the project did not choose is refused.
+///
+/// `params` already exists and binds properly, so this is a rewrite rather
+/// than a restriction — and the refusal says so, because an operator who
+/// cannot see the alternative will reach for a worse workaround.
+///
+/// The outside value here arrives from a file, which is the same class of
+/// source as a scraped page: the project did not pick the characters.
+#[tokio::test]
+async fn sql_built_from_an_outside_value_is_refused() {
+    let (_lock, _dir) = scratch();
+
+    let p = project(vec![
+        block(
+            "create",
+            "dbExecute",
+            json!({ "database": "work.db", "sql": "create table t (name text)" }),
+        ),
+        block(
+            "seed",
+            "dbExecute",
+            json!({
+                "database": "work.db",
+                "sql": "insert into t (name) values (?)",
+                "params": ["alice"],
+            }),
+        ),
+        block(
+            "plant",
+            "writeFile",
+            json!({ "path": "name.txt", "contents": "alice'; drop table t; --" }),
+        ),
+        block(
+            "read",
+            "readFile",
+            json!({ "path": "name.txt", "into": "who" }),
+        ),
+        // The operator means "look up that name", but the name decides the
+        // statement.
+        block(
+            "lookup",
+            "dbQuery",
+            json!({
+                "database": "work.db",
+                "sql": "select name from t where name = '{{who}}'",
+                "into": "rows",
+            }),
+        ),
+    ]);
+
+    let report = runner::run(&p, "no-profile-needed", HashMap::new())
+        .await
+        .expect("a database-only project needs no browser");
+
+    let step = report
+        .steps
+        .iter()
+        .find(|s| s.block_id == "lookup")
+        .expect("the query step should be in the report");
+    let error = step.error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("who") && error.contains("outside the project"),
+        "the refusal should name the variable and why: {error:?}"
+    );
+    assert!(
+        error.contains("params"),
+        "the refusal should point at binding as the way to do this: {error:?}"
+    );
+    assert!(
+        !report.ok,
+        "a refused step should fail the run rather than pass quietly"
+    );
+}
+
+/// And the safe path works: the same outside value, bound as a parameter,
+/// queries exactly what it says without the statement changing shape.
+#[tokio::test]
+async fn an_outside_value_still_queries_when_it_is_bound() {
+    let (_lock, _dir) = scratch();
+
+    let p = project(vec![
+        block(
+            "create",
+            "dbExecute",
+            json!({ "database": "work.db", "sql": "create table t (name text)" }),
+        ),
+        block(
+            "seed",
+            "dbExecute",
+            json!({
+                "database": "work.db",
+                "sql": "insert into t (name) values (?)",
+                "params": ["o'brien"],
+            }),
+        ),
+        block(
+            "plant",
+            "writeFile",
+            // A name containing a quote: harmless bound, syntax if spliced.
+            json!({ "path": "name.txt", "contents": "o'brien" }),
+        ),
+        block(
+            "read",
+            "readFile",
+            json!({ "path": "name.txt", "into": "who" }),
+        ),
+        block(
+            "lookup",
+            "dbQuery",
+            json!({
+                "database": "work.db",
+                "sql": "select name from t where name = ?",
+                "params": ["{{who}}"],
+                "into": "rows",
+                "countInto": "found",
+            }),
+        ),
+    ]);
+
+    let report = runner::run(&p, "no-profile-needed", HashMap::new())
+        .await
+        .expect("a database-only project needs no browser");
+
+    assert!(
+        report.ok,
+        "binding the value is the supported way to do this: {:?}",
+        report
+            .steps
+            .iter()
+            .find(|s| matches!(s.outcome, StepOutcome::Failed)),
+    );
+    assert_eq!(
+        report.variables.get("found").map(String::as_str),
+        Some("1"),
+        "the bound value should have matched the row it names: {:?}",
+        report.variables
+    );
+}
