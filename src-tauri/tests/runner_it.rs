@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 /// read, an input to type into, and a button whose click changes the text.
 const PAGE: &str = r#"<!doctype html><meta charset="utf-8"><title>Runner fixture</title>
 <h1 id="title">ready</h1>
+<!-- Text a hostile page would serve: it closes the operator's string literal
+     and appends a statement of its own. -->
+<div id="hostile">'; window.__pwned = 'yes'; '</div>
 <input id="name">
 <button id="go" onclick="document.getElementById('title').textContent = 'hello ' + document.getElementById('name').value">go</button>
 <div id="late"></div>
@@ -539,5 +542,73 @@ async fn a_request_that_failed_on_the_server_fails_the_assertion() {
         step.error.as_deref().unwrap_or_default().contains("500"),
         "the error should say what the server answered: {:?}",
         step.error
+    );
+}
+
+/// `evaluate` runs the text it is handed, and `{{var}}` is substituted before
+/// that text reaches the page. So a value the PAGE chose becomes script the
+/// runner executes — here a heading read off the fixture ends up assigning to
+/// `window.__owned`.
+///
+/// That is not a bug today: every variable in a run is put there by the same
+/// operator who wrote the project, so this is them running their own code.
+/// It is recorded because the property holding it up is provenance, not
+/// escaping — the moment a value can arrive from somewhere the operator did
+/// not write (a WASM module contributing blocks, a project called as a
+/// subroutine, a fleet-synced project), the same three lines become an
+/// injection, and nothing in this file would have noticed.
+///
+/// Upstream carries the matching defence: it marks which variables came from a
+/// module and refuses a step that would turn one into code. Port that WITH the
+/// module system, not after it.
+#[tokio::test]
+async fn a_page_supplied_value_reaches_evaluate_as_code() {
+    let (_fixture_dir, url) = fixture_url();
+    let Some(engine) = start_engine(&url) else {
+        eprintln!("skipped: engine runtime is not installed");
+        return;
+    };
+
+    let profile_id = "it-evaluate-provenance";
+    cdp::attach(profile_id.to_string(), engine.ws_url.clone())
+        .await
+        .expect("attach to the running engine");
+
+    let p = project(vec![
+        block("nav", "navigate", json!({ "url": url })),
+        // The page decides what this says. On the fixture it is "ready"; a
+        // hostile page would put a statement here instead.
+        block(
+            "steal",
+            "readText",
+            json!({ "selector": "#hostile", "into": "payload" }),
+        ),
+        // The operator meant to interpolate a string. Substitution happens
+        // before the engine parses it, so the page's text is parsed as code.
+        block(
+            "run",
+            "evaluate",
+            json!({ "script": "window.__owned = '{{payload}}'; window.__owned" }),
+        ),
+        block(
+            "confirm",
+            "evaluate",
+            json!({ "script": "window.__pwned ?? 'no'", "into": "pwned" }),
+        ),
+    ]);
+
+    let report = runner::run(&p, profile_id, HashMap::new())
+        .await
+        .expect("the run should start");
+
+    cdp::detach(profile_id);
+
+    assert!(report.ok, "the run should complete: {:?}", report.steps);
+    assert_eq!(
+        report.variables.get("pwned").map(String::as_str),
+        Some("yes"),
+        "the page's text closed the operator's string literal and ran a \
+         statement of its own, which is execution rather than interpolation: {:?}",
+        report.variables
     );
 }

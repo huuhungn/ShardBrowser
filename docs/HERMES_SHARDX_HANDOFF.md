@@ -357,6 +357,42 @@ the SDK port becomes justified. The second test asserts the domain stays out of
 `Schema.getDomains` whether or not it is implemented — an enumerable private
 domain is itself a fingerprint.
 
+### WASM modules: blocked on provenance, not on the port
+
+Upstream's `src-tauri/src/wasm.rs` (1,273 lines) lets an operator write their own
+blocks in Rust, compiled to WebAssembly. A module never touches the page: it is
+handed the step's parameters and the run's variables and answers with primitive
+actions for the runner to perform. It imports only `crate::store` and names no
+block kind, so it does not depend on upstream's block vocabulary — ours diverged
+completely (`navigate`/`click`/`type` against their `goto`/`hover`/`press`) and
+that turns out not to matter.
+
+What does matter is the 24 call sites around it in upstream's runner. A module
+is a third party inside a run, so upstream tracks which variables a module
+wrote and refuses a step that would turn one into code — refusing a module's
+`script.run` is not enough when it can write a variable and let the operator's
+own `evaluate` run it.
+
+**Our runner has no provenance tracking of any kind.** `evaluate` substitutes
+`{{var}}` into its script before the engine parses it, so a variable's contents
+are executed. `a_page_supplied_value_reaches_evaluate_as_code` in
+`tests/runner_it.rs` proves it end to end: the fixture serves a heading whose
+*text* is `'; window.__pwned = 'yes'; '`, a `readText` block lifts it into a
+variable, and the operator's `evaluate` — interpolating what it believes is a
+string — closes the literal and runs the page's statement. A later block reads
+`window.__pwned` back as `yes`.
+
+That is not a live vulnerability. Every variable in a run today is put there by
+the same operator who wrote the project, so this is them running their own code
+in their own browser, and the test asserts the current behaviour rather than
+failing on it. The property holding it up is provenance, not escaping.
+
+A module system removes exactly that property, and the same three blocks become
+an injection carrying a third party's text. So: **port `wasm.rs` together with
+upstream's variable-provenance defence, never before it.** The same applies to
+anything else that lets a value enter a run from outside the project — a project
+called as a subroutine, a fleet-synced project, an imported flow.
+
 ## Automation blocks beyond the page, September 2026
 
 The runner started out able to drive a page and nothing else. Four additions
