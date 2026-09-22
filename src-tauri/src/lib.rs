@@ -11,8 +11,16 @@ mod extensions;
 mod fingerprints;
 pub mod fleet_client;
 mod fleet_keys;
-mod gpu_caps;
+pub mod gpu_caps;
 mod launch;
+
+/// Where the engine binary lives, for integration tests that need to know
+/// whether a runtime is installed before probing it. The `runtime` module
+/// itself stays private; only this one fact is worth exposing.
+pub fn runtime_binary_path_for_tests() -> anyhow::Result<std::path::PathBuf> {
+    runtime::binary_path()
+}
+
 mod mcp_setup;
 mod migrate;
 mod process;
