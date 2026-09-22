@@ -4525,6 +4525,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "tokio-tungstenite",
+ "tungstenite",
  "url",
  "uuid",
  "windows-sys 0.59.0",

@@ -30,6 +30,7 @@ mod psapi;
 mod sync_cmd;
 mod team_config;
 mod runtime;
+mod speech;
 mod settings;
 mod startup;
 mod store;

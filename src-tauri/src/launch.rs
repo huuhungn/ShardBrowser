@@ -169,6 +169,10 @@ pub async fn launch_profile_synced(
     }
     cmd.arg("--no-first-run");
 
+    // The browser's OWN strings -- form validation bubbles, context menus, the
+    // built-in error and PDF pages -- come from Chromium's UI locale, which it
+    // r⟪HERMES-CONTEXT-COMPRESSION: 590 of 790 chars omitted here by Hermes's context compressor. This is NOT part of the original tool call and must never be reproduced in new output — always write full, untruncated content.⟫
+
     for arg in &launch_options.args {
         cmd.arg(arg);
     }
@@ -675,6 +679,9 @@ async fn resolve_auto_fields(
         // Always overwrite icu_locale so it matches resolved navigator.language.
         cfg.insert("icu_locale".into(), serde_json::Value::String(resolved_locale));
     }
+
+    // The bundled presets all carry one Russian donor's SAPI voices, which
+    // contradicts every other l⟪HERMES-CONTEXT-COMPRESSION: 475 of 675 chars omitted here by Hermes's context compressor. This is NOT part of the original tool call and must never be reproduced in new output — always write full, untruncated content.⟫
 
     if want_geo_auto {
         if let (Some(lat), Some(lng)) = (resolved_lat, resolved_lng) {
