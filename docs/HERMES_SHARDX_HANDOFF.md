@@ -41,9 +41,12 @@ to `origin`; upstream changes are proposed only through a scoped pull request.
   runtime replacement so it starts a fresh stdio process and reloads tools.
 - MCP runtime sync backup:
   `C:\Users\Administrator\AppData\Local\Temp\shardx-backups\mcp-runtime-pre-sync-2.2.5-20260919-102734.tar.gz`.
-- MCP tool count is 110 after the merge (96 from this fork, plus 14 upstream
-  additions including `human_click` and `human_type`). `mcp/contract.test.js`
-  asserts that count and fails on drift, which is how the change was noticed.
+- MCP tool count is **114**: 110 after the 2.2.5 merge, plus the automation
+  tools (`list_automation_projects`, `get_automation_project`,
+  `run_automation_project`) and `record_profile_traffic`.
+  `mcp/contract.test.js` asserts that count and fails on drift, which is how
+  earlier changes were noticed. Verified live by driving the runtime's stdio
+  server through `initialize` + `tools/list`, not by reading the source.
 - Canonical profile: `VN Automation 001 - No Proxy`. Never use it for destructive
   tests; use disposable profiles and disposable servers only.
 
@@ -353,6 +356,134 @@ day it changes: if an engine update adds the domain, the first test fails and
 the SDK port becomes justified. The second test asserts the domain stays out of
 `Schema.getDomains` whether or not it is implemented — an enumerable private
 domain is itself a fingerprint.
+
+## Automation blocks beyond the page, September 2026
+
+The runner started out able to drive a page and nothing else. Four additions
+since then let a project do the work around the page as well. Each is listed
+with the boundary it enforces, because in every case the useful version and the
+dangerous version look identical from the editor.
+
+**Traffic (`recordTraffic`, `assertRequest`, `stopTraffic`).** A project can
+assert on the requests a page really made, which is the only way to catch a
+page that renders correctly while its XHR quietly fails. Recording is
+*read-only*: it enables `Network`, not `Fetch`. Interception would let a run
+block or rewrite requests, and a cancelled run would leave the page hanging on
+a request nobody will answer. Capped at 5,000 entries with a drop counter, so a
+long run cannot exhaust memory silently.
+
+**HTTP (`httpOpen`, `httpRequest`, `httpClose`).** Calls go out through the
+profile's own proxy. This is the one to be careful with: a client built with a
+proxy that silently failed to apply behaves identically in every unit test and
+puts this host's IP in the site's logs next to that profile's session. The
+integration test therefore runs a real CONNECT proxy in-process and asserts the
+request arrived through it; a dead proxy must fail the run, never fall back to
+a direct connection. The cookie jar is per-run and dropped at the end, so one
+run cannot inherit another's session.
+
+**Files (`readFile`, `writeFile`, `appendFile`, `fileExists`, `deleteFile`).**
+Confined to the run's workspace under
+`%APPDATA%\shardx-launcher\automation\<run>\`. Both the workspace root and
+the requested path are canonicalised before comparison, which on Windows means
+stripping the `\\?\` prefix: `canonicalize()` adds it for paths that exist and
+omits it for paths that do not, so a naive `starts_with` check passes for reads
+and fails for writes. Traversal, symlinks and absolute paths are refused; files
+are capped at 10 MB.
+
+**Database (`dbExecute`, `dbQuery`).** A SQLite database per run workspace, for
+the structured notes a file cannot hold well — which accounts are done, what an
+earlier query found. Parameters are *bound*, never interpolated: projects build
+statements out of values scraped from pages, so `'); drop table t; --` arriving
+in a variable has to land in a column as an ordinary string. Placeholders
+expand into the parameter list, not into the statement; one statement per
+block, so a stray semicolon cannot smuggle in a second. The database is named
+rather than pathed, the name goes through the same containment check as files,
+and the connection is given a limit of zero attached databases so `ATTACH`
+cannot reach a second file from inside SQL. Queries stop at 5,000 rows.
+
+Databases and files persist between runs on purpose — that is what makes
+resuming work possible — and there is a test for it, because "persists" and
+"leaks into the next run" are the same mechanism seen from two sides.
+
+### What the tests are worth
+
+The suite is 177 tests, but the number is not the point. Three of them were
+written so that removing the protection fails them, and that has been checked
+by removing it:
+
+- dropping the SQL binding fails the two injection tests (unit and through the
+  runner);
+- the proxy test fails if the HTTP client is built without the profile's proxy.
+
+The editor guard (`scripts/automation-editor-params.test.mjs`) compares the
+params the editor writes against the ones the runner reads, in both directions.
+It caught four real key mismatches when it was introduced. It knows about
+helpers that read a key internally (`db_params` reads `params`); without that
+it reports a false alarm, and a guard that cries wolf gets ignored.
+
+### Running blocks without a browser
+
+The runner attaches a browser only for projects that contain a block needing
+one. HTTP, file and database projects run with no window open. This started as
+a test annoyance and is a real property: a scheduled data job should not have
+to launch a browser it never uses.
+
+### MCP
+
+`record_profile_traffic` runs an inline project against a live profile and
+returns the traffic it saw. It goes through the same `runSafeOpenLifecycle`
+guard as `automation_run`: a profile already running is left running, a profile
+the tool started is stopped again. The contract test pins the tool count, so an
+added or renamed tool has to be acknowledged rather than discovered later by a
+caller.
+
+### Shipping these blocks to the operator's launcher
+
+The code is on `main`; the running launcher does not have it. Two facts decide
+how it gets there, and both were measured rather than assumed.
+
+**A second launcher cannot run alongside the first.** `tauri_plugin_single_instance`
+forwards to the running process under the shared `com.shardx.launcher` identifier,
+so the new binary exits within seconds. Pointing `APPDATA` at a scratch tree and
+moving `api_port` to 40399 does not help: the guard fires before the settings are
+read. There is no side-by-side smoke test; installing means replacing the binary
+the operator is using.
+
+**The old launcher answers the new tool with 404.** Measured against the running
+2.2.7:
+
+```
+POST http://127.0.0.1:40325/automation/run  ->  404
+```
+
+So `record_profile_traffic` is reachable but cannot succeed until the launcher is
+replaced. The MCP runtime at `%USERPROFILE%\Documents\MCP\ShardBrowser` was synced
+from this repo and now lists **114 tools** including `record_profile_traffic`,
+verified by driving its stdio server through `initialize` + `tools/list` rather
+than by grepping the file. Its previous `mcp/index.js` is kept beside it as
+`mcp/index.js.prephase3`.
+
+**Verifying a build contains these blocks.** Grepping the binary for a block kind
+is worthless: `dbQuery`, `httpRequest` and even the long-shipped `waitForSelector`
+all return zero hits, because the kind strings are packed into a shared table
+without separators. Grep for a distinctive error message instead — the presence of
+`the statement could not be prepared` is what proves `db.rs` was linked in.
+
+Backups taken before any of this, both verified by listing their contents:
+
+- `%TEMP%\shardx-backups\shardx-config-pre-phase3-*.tar.gz` — 13 profiles, 220 fingerprints
+- `%TEMP%\shardx-backups\mcp-runtime-pre-phase3-*.tar.gz` — the MCP runtime's `mcp/`
+
+Remaining step, which needs the operator to close the launcher:
+
+```powershell
+Stop-Process -Name shardx-launcher
+Copy-Item $env:USERPROFILE\Documents\GitHub\ShardBrowser\src-tauri\target\release\shardx-launcher.exe `
+  -Destination '<installed path>' -Force
+```
+
+Then confirm `/health` reports the new build and `POST /automation/run` no longer
+answers 404.
 
 ## Start-of-task verification
 
