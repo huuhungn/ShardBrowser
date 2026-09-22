@@ -11,6 +11,7 @@
     "build:e2e": "tsc && vite build --mode e2e",
     "test:e2e": "playwright test",
     "test:release-package": "node --test scripts/stage-mcp-release.test.mjs",
+    "test:profile-form": "node --test scripts/profile-form-roundtrip.test.mjs",
     "test:updater-signatures": "node --test scripts/verify-updater-signatures.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
