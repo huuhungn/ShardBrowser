@@ -43,14 +43,26 @@ await page.evaluate(() => localStorage.setItem("shardx.lang", "en"));
 await page.reload({ waitUntil: "domcontentloaded" });
 await page.waitForTimeout(600);
 
+// The star prompt appears on a timer after the app settles, so a one-shot wait
+// races it: the modal can arrive after the wait gives up and then swallow every
+// later click. Dismiss it whenever it shows up instead.
 const starModal = page.locator(".fixed.inset-0.z-50");
-await starModal.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
-if (await starModal.count()) {
-  await page.getByRole("button", { name: /later|maybe|not now|close/i }).first().click().catch(async () => {
-    await page.keyboard.press("Escape");
-  });
-  await page.waitForTimeout(300);
+async function dismissStarModal() {
+  if (!(await starModal.count())) return;
+  // Scope the button lookup to the modal: `close`-ish buttons exist elsewhere
+  // in the chrome, and a page-wide .first() picks one of those instead, which
+  // clicks successfully and leaves the overlay in place.
+  await starModal
+    .getByRole("button", { name: /later|maybe|not now|close/i })
+    .first()
+    .click({ timeout: 2000 })
+    .catch(async () => {
+      await page.keyboard.press("Escape");
+    });
+  await starModal.waitFor({ state: "detached", timeout: 3000 }).catch(() => {});
 }
+await starModal.waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+await dismissStarModal();
 
 // The app navigates through its sidebar, not the URL, so drive it the way a
 // person does — by the English name, because English is still loaded.
@@ -63,12 +75,14 @@ const EN_NAMES = {
 // Visit every screen in English first, so each module is imported while English
 // is the loaded language. A frozen label is only wrong after this point.
 for (const [route] of SCREENS) {
+  await dismissStarModal();
   await page.getByRole("button", { name: EN_NAMES[route], exact: true }).click();
   await page.waitForTimeout(250);
 }
 
 // Now switch to Vietnamese from the settings screen, the way a user would,
 // and do NOT reload: a reload would re-import every module and hide the bug.
+await dismissStarModal();
 await page.getByRole("button", { name: "Settings", exact: true }).click();
 await page.waitForTimeout(400);
 const combo = page.getByRole("combobox").filter({ hasText: /English|Ti.ng Vi.t/ }).first();
@@ -94,6 +108,7 @@ const englishLeft = /\b(Add|Delete|Remove|Save|Cancel|Close|Enable|Disable|Impor
 
 const report = [];
 for (const [route, label] of SCREENS) {
+  await dismissStarModal();
   await page.getByRole("button", { name: label, exact: true }).click();
   await page.waitForTimeout(450);
   const shot = join(OUT, `${route}.png`);
