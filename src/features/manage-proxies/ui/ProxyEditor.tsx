@@ -4,7 +4,7 @@ import { Field } from "../../../shared/ui/Field";
 import { NumField } from "../../../shared/ui/NumField";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { toast } from "../../../shared/model/toast";
-import { PS_SIGNATURES } from "../../../entities/proxyshard";
+import { psSignatures } from "../../../entities/proxyshard";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { proxySave } from "../../../entities/proxy";
 import { psActive, psSignatureSet } from "../../../entities/proxyshard";
@@ -100,7 +100,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
                 p0f signature · order #{orderId}
                 <span className="text-text-soft-400"> · current: {curSig || "none"}</span>
               </span>
-              <CSSelect value={sig} onChange={setSig} options={PS_SIGNATURES} placeholder={t("proxy.donTChange")} />
+              <CSSelect value={sig} onChange={setSig} options={psSignatures(t)} placeholder={t("proxy.donTChange")} />
             </label>
             <div />
           </div>

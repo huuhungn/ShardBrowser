@@ -150,7 +150,7 @@ export function ProfileTable() {
             totalPages={pageCount}
             asLinks={false}
             onPageChange={setPage}
-            infoLabel={(p, total) => `Page ${p} of ${total} · ${visible.length} profiles`}
+            infoLabel={(p, total) => t("profileTable.pageInfo", { p, total, n: visible.length })}
           />
         </div>
       )}

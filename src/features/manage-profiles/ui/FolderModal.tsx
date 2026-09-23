@@ -27,7 +27,7 @@ export function FolderModal({
       onClose={onClose}
       icon={<FolderIcon className="size-5" />}
       title={mode === "move" ? t("folders.moveToFolder") : t("folders.newFolder")}
-      confirmLabel={showList ? "Create & move" : t("folders.create")}
+      confirmLabel={showList ? t("folders.createAndMove") : t("folders.create")}
       onConfirm={create}
       isDisabled={!trimmed || dup}
       cancelLabel={t("common.cancel")}

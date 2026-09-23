@@ -9,7 +9,7 @@ import { toast } from "../../shared/model/toast";
 import { useNav } from "../../shared/model/navigation";
 import { withUtm } from "../../shared/lib/utils";
 import type { Settings, ApiInfo, StartupStatus, McpStatus, CodexMcpStatus, HermesMcpStatus } from "../../entities/settings";
-import { HELPER_KINDS } from "../../entities/settings";
+import { helperKinds } from "../../entities/settings";
 import { settingsGet, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
   startupStatus, mcpStatus as mcpStatusGet, codexMcpStatus, hermesMcpStatus } from "../../entities/settings";
 import { StartupCard, McpCard } from "../../features/manage-settings";
@@ -247,7 +247,7 @@ export function SettingsPage() {
                 {t("settings.helper.triggersHelp")}
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {HELPER_KINDS.map((k) => {
+                {helperKinds(t).map((k) => {
                   const picked = (s.helper_triggers ?? []).includes(k.value);
                   return (
                     <button

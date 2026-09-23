@@ -220,7 +220,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         const { proxySel, proxies, testProxy } = get();
         const ids = [...proxySel];
         if (ids.length === 0) return;
-        toast.info(`Testing ${ids.length} prox${ids.length === 1 ? "y" : "ies"}…`);
+        toast.info(t(ids.length === 1 ? "proxy.testingOne" : "proxy.testingMany", { n: ids.length }));
         const targets = proxies.filter((p) => proxySel.has(p.id));
         const CONCURRENCY = 5;
         let i = 0;
@@ -239,14 +239,14 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         const { proxySel } = get();
         const ids = [...proxySel];
         if (ids.length === 0) return;
-        if ((await confirmModal({ title: t("proxy.deleteProxies"), message: `Delete ${ids.length} prox${ids.length === 1 ? "y" : "ies"}?`, danger: true })) !== true) return;
+        if ((await confirmModal({ title: t("proxy.deleteProxies"), message: t(ids.length === 1 ? "proxy.deleteAskOne" : "proxy.deleteAskMany", { n: ids.length }), danger: true })) !== true) return;
         for (const id of ids) {
             try { await proxyDelete(id); } catch (e) { toast.err(String(e)); }
         }
         get().clearSelected();
         get().reload();
         storeBus.emit('proxies');
-        toast.ok(`Deleted ${ids.length}`);
+        toast.ok(t("proxy.deletedCount", { n: ids.length }));
     },
     // Export in bulk-import format so a round-trip preserves the name.
     bulkExport: () => {
@@ -285,7 +285,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         set({ distributeOpen: false });
         get().reload();
         storeBus.emit('profiles');
-        toast.ok(`Bound ${bound} profile${bound === 1 ? '' : 's'}`);
+        toast.ok(t(bound === 1 ? "proxy.boundProfileOne" : "proxy.boundProfileMany", { n: bound }));
         return bound;
     },
 
@@ -297,7 +297,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
             const n = await proxyBulkImport(text, "socks5");
             get().reload();
             storeBus.emit('proxies');
-            toast.ok(`Imported ${n} prox${n === 1 ? "y" : "ies"}`);
+            toast.ok(t(n === 1 ? "proxy.importedOne" : "proxy.importedMany", { n }));
         } catch (e) { toast.err(t("proxy.importFailed") + String(e)); }
     },
 }))

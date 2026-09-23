@@ -565,7 +565,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       });
       if (typeof path !== "string") return; // cancelled
       const n = await cookiesExportToFile(p.id, path);
-      toast.ok(`Exported ${n} cookie${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "profile.exportedCookieOne" : "profile.exportedCookieMany", { n }));
       // Open the containing folder so the user sees exactly where it went.
       const dir = path.replace(/[/\\][^/\\]*$/, "");
       try { await openPath(dir); } catch {}
@@ -584,7 +584,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const cookies = JSON.parse(text);
       if (!Array.isArray(cookies)) { toast.err(t("profile.expectedAJSONArrayOfCookies")); return; }
       const n = await cookiesImport(p.id, cookies);
-      toast.ok(`Imported ${n} cookie${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "profile.importedCookieOne" : "profile.importedCookieMany", { n }));
     } catch (e) { toast.err(String(e)); }
   },
 
@@ -674,7 +674,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const name = await syncLaunch(ids, group);
       set({ syncGroup: name });
       get().clearSelected();
-      toast.ok(`Synchronising ${ids.length} profiles`);
+      toast.ok(t("profile.synchronisingProfiles", { n: ids.length }));
     } catch (e) {
       toast.err(String(e));
     }
@@ -753,7 +753,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const arr = Array.isArray(data) ? data : [data];
       const n = await profileImport(arr);
       get().reload();
-      toast.ok(`Imported ${n} profile${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "profile.importedProfileOne" : "profile.importedProfileMany", { n }));
     } catch (e) { toast.err(t("profile.importFailed") + String(e)); }
   },
 }));

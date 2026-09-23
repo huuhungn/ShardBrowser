@@ -165,7 +165,7 @@ export function TeamCard() {
 
       <div className="flex gap-2">
         <Button size="small" disabled={!!busy} onClick={save}>
-          {busy === "save" ? "Saving…" : t("team.saveConnection")}
+          {busy === "save" ? t("common.saving") : t("team.saveConnection")}
         </Button>
         <Button size="small" mode="stroke" disabled={!!busy || !connected} onClick={test}>
           {busy === "test" ? "Testing…" : t("team.testConnection")}

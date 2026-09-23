@@ -89,7 +89,7 @@ export function FolderTabs() {
           title={t("folders.rightClickForFolderActionsDropProfil")}
           onContextMenu={(e) =>
             ctx.open(e, [
-              { label: "Delete folder…", onClick: () => deleteFolder(f), danger: true },
+              { label: t("folders.deleteFolder"), onClick: () => deleteFolder(f), danger: true },
             ])
           }
           onDragOver={(e) => {

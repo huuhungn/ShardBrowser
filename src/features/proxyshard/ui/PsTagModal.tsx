@@ -27,7 +27,7 @@ export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose
       icon={<EditIcon className="size-5" />}
       title={t("ps.editTag")}
       subtitle={t("ps.productOrder", { product: order.product_name, id: order.order_id })}
-      confirmLabel={busy ? "Saving…" : t("ps.save")}
+      confirmLabel={busy ? t("common.saving") : t("ps.save")}
       onConfirm={submit}
       isLoading={busy}
       cancelLabel={t("common.cancel")}

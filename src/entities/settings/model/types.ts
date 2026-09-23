@@ -1,4 +1,7 @@
-import { t } from "../../../shared/i18n";
+
+/** The translate function, taken as an argument so a label is built when it
+ *  is drawn rather than when this module is first imported. */
+type Tr = (key: string, vars?: Record<string, string | number>) => string;
 
 export type Settings = {
   browser_path: string | null;
@@ -42,7 +45,7 @@ export type MigrationProgress = {
 };
 
 /** The kinds the engine publishes, and what they are called to a person. */
-export const HELPER_KINDS: { value: string; label: string }[] = [
+export const helperKinds = (t: Tr): { value: string; label: string }[] => [
   { value: "first_name",  label: t("helper.firstName") },
   { value: "last_name",   label: t("helper.lastName") },
   { value: "full_name",   label: t("helper.fullName") },

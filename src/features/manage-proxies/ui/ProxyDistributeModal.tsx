@@ -62,7 +62,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
     <DialogModal
       open
       onClose={onClose}
-      title={`Distribute ${picked.length} prox${picked.length === 1 ? "y" : "ies"}`}
+      title={t(picked.length === 1 ? "proxy.distributeOne" : "proxy.distributeMany", { n: picked.length })}
       maxWidthClassName="max-w-[760px]"
       confirmLabel={willBind === 0 ? t("proxy.nothingToBind") : `Bind ${willBind}`}
       onConfirm={run}

@@ -69,7 +69,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
     if (entries.length === 0) { toast.err(t("proxy.nothingSelected")); return; }
     try {
       const n = await proxyBulkSave(entries);
-      toast.ok(`Imported ${n} prox${n === 1 ? "y" : "ies"}`);
+      toast.ok(t(n === 1 ? "proxy.importedOne" : "proxy.importedMany", { n }));
       onClose();
     } catch (e) { toast.err(String(e)); }
   };
@@ -131,7 +131,7 @@ host:8080               # no auth
             <div className="flex items-center gap-3 pb-1.5">
               <Checkbox
                 checked={allSel}
-                label={`${selCount} of ${rows.length} selected`}
+                label={t("proxy.selectedOfTotal", { n: selCount, total: rows.length })}
                 onChange={(e) =>
                   setRows((rs) => rs.map((r) => ({ ...r, selected: e.target.checked })))
                 }

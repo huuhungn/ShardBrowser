@@ -5,7 +5,7 @@ import { CSSelect } from "../../../shared/ui/CSSelect";
 import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import type { PsOrder, PsActiveProxy } from "../../../entities/proxyshard";
-import { PS_SIGNATURES, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
+import { psSignatures, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
 import { useT } from "../../../shared/i18n";
 
@@ -80,7 +80,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
     setSaving(true);
     try {
       const n = await proxyBulkSave(entries);
-      toast.ok(n > 0 ? `Added ${n} prox${n === 1 ? "y" : "ies"}` : t("ps.noNewProxiesAlreadyInYourList"));
+      toast.ok(n > 0 ? t(n === 1 ? "ps.addedProxyOne" : "ps.addedProxyMany", { n }) : t("ps.noNewProxiesAlreadyInYourList"));
       // Apply only the selected proxies whose signature actually changed
       // (a non-empty value differing from the one already set).
       const sigItems = chosen
@@ -90,7 +90,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         try {
           await psSignatureSet(order.order_id, sigItems);
           toast.ok(t(sigItems.length === 1 ? "ps.setP0fOnOne" : "ps.setP0fOnMany", { n: sigItems.length }));
-        } catch (e) { toast.err("Signature: " + String(e)); }
+        } catch (e) { toast.err(t("ps.signatureError", { error: String(e) })); }
       }
       onClose();
     } catch (e) { toast.err(String(e)); }
@@ -161,7 +161,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
                     // Editable when free slots exist, or this IP is already
                     // signed (re-assigning an OS doesn't consume a slot).
                     <div onClick={(e) => e.stopPropagation()}>
-                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={PS_SIGNATURES} placeholder={t("ps.p0f")} />
+                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={psSignatures(t)} placeholder={t("ps.p0f")} />
                     </div>
                   ) : (
                     <span className="text-right text-paragraph-xs text-text-soft-400">—</span>

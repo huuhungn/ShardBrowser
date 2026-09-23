@@ -57,7 +57,7 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
         } catch (e) { toast.err(String(e)); }
     },
     remove: async (id) => {
-        if ((await confirmModal({ title: t("fp.removeFingerprint"), message: "Remove this fingerprint from the library?", danger: true })) !== true) return;
+        if ((await confirmModal({ title: t("fp.removeFingerprint"), message: t("fp.removeAsk"), danger: true })) !== true) return;
         try {
             await fingerprintDelete(id);
             toast.ok(t("fp.removed"));

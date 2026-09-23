@@ -102,7 +102,7 @@ export function ProxyTable() {
             totalPages={proxyPageCount}
             asLinks={false}
             onPageChange={setProxyPage}
-            infoLabel={(p, total) => `Page ${p} of ${total} · ${totalProxies} proxies`}
+            infoLabel={(p, total) => t("proxyTable.pageInfo", { p, total, n: totalProxies })}
           />
         </div>
       )}

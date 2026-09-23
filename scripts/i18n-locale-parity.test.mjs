@@ -273,7 +273,7 @@ function withoutComments(src) {
  */
 function normalizeQuotes(src) {
   return src.replace(
-    /(^|[=(,:[?{]\s*)'((?:[^'\\\n]|\\.)*)'/gm,
+    /(^|[=(,:[?{]\s*|\b(?:return|throw|case|typeof|await|yield)\s+|=>\s*)'((?:[^'\\\n]|\\.)*)'/gm,
     (_, lead, body) => `${lead}"${body.replace(/"/g, '\\"')}"`,
   );
 }
@@ -425,6 +425,14 @@ const NOT_TEXT = new Set([
 ]);
 
 const LITERAL = /"([A-Z][A-Za-z0-9 ,.'’:/()—–-]{2,60})"/g;
+// A name with no spaces and a capital inside it — WebGL2RenderingContext,
+// HTMLCanvasElement, AudioWorkletNode — is an API the fingerprint code checks
+// for, not a label. Prose has spaces; these never do, so the absence of a
+// space is what tells them apart rather than a list that needs adding to.
+const CODE_IDENTIFIER = /^[A-Za-z][A-Za-z0-9_$]*$/;
+function isCodeIdentifier(text) {
+  return CODE_IDENTIFIER.test(text) && /[a-z]/.test(text) && /[A-Z0-9]/.test(text.slice(1));
+}
 // The updater pill wrote its whole status ladder in lower case — "ready to
 // install", "up to date" — and a rule anchored on a capital never saw any of
 // it. A lower-case string of three or more words is a sentence too.
@@ -441,6 +449,34 @@ const CSS_WORDS =
 const MACHINERY =
   /\b(import|from|className|invoke|querySelector|getElementById|setAttribute|localStorage|sessionStorage|fetch|headers|key=|data-|aria-label=\{t)\b|classList|\.(?:get|set|has)\(\s*["'`]?[\w.-]+["'`]?\s*\)/;
 
+/**
+ * The machinery check used to skip the whole line, which meant one invoke() or
+ * one data- attribute hid every other string beside it:
+ * `<button data-id="save" title="Delete this profile">` was never read. Blank
+ * out the machinery arguments themselves and judge what is left, the same way
+ * withoutClassNames already does for Tailwind.
+ */
+function withoutMachinery(line) {
+  return line
+    // import ... from "path" / export ... from "path"
+    .replace(/\b(?:import|export)\b[^;]*?\bfrom\s*["'`][^"'`]*["'`]/g, "")
+    .replace(/\bimport\s*\(\s*["'`][^"'`]*["'`]\s*\)/g, "")
+    // A bare `from "path"` — in a re-export, or quoted inside a comment — is a
+    // module path too, and letting the bare keyword stand hid the prose beside it.
+    .replace(/\bfrom\s*["'`][^"'`]*["'`]/g, "")
+    // invoke("cmd"), fetch("url"), getElementById("id"), localStorage.getItem("k")
+    .replace(
+      /\b(?:invoke|fetch|querySelector|querySelectorAll|getElementById|setAttribute|getAttribute|emit|listen)\s*\(\s*["'`][^"'`]*["'`]/g,
+      "(",
+    )
+    .replace(
+      /\b(?:localStorage|sessionStorage|headers|params|searchParams)\s*\.\s*(?:get|set|has|delete|getItem|setItem|removeItem|append)\s*\(\s*["'`][^"'`]*["'`]/g,
+      "(",
+    )
+    // data-*, key=, id=, name=, type=, href=, src=: identifiers, not prose
+    .replace(/\b(?:data-[\w-]+|key|id|name|type|href|src|htmlFor|role)=(?:["'`][^"'`]*["'`]|\{[^{}]*\})/g, "");
+}
+
 test("no ternary or toast still holds its English", () => {
   const offenders = [];
   for (const root of uiRoots) {
@@ -450,12 +486,13 @@ test("no ternary or toast still holds its English", () => {
     for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
       const src = readable(readFileSync(file, "utf8"));
       const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
-      for (const line of src.split("\n")) {
+      for (const rawLine of src.split("\n")) {
+        const line = withoutMachinery(rawLine);
         if (MACHINERY.test(line)) continue;
         for (const re of [LITERAL, LOWER_SENTENCE]) {
           for (const m of line.matchAll(re)) {
             const text = m[1];
-            if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
+            if (NOT_TEXT.has(text) || NOT_PROSE.has(text) || isCodeIdentifier(text)) continue;
             if (!/[a-z]{2}/.test(text)) continue; // SCREAMING_CASE constants
             if (CSS_WORDS.test(text)) continue;
             // An IANA zone id — "Europe/Paris" — is the value the platform
@@ -543,10 +580,23 @@ function englishInTemplates(src) {
       // `${name} · ${host}:${port}` is punctuation holding values apart. There
       // is no English in it to translate, so leave those joins alone.
       if (!/[A-Za-z]{2}/.test(prose.replace(/\u0001/g, " "))) continue;
+      // A sentence is not always whole between two holes. `Added ${n}
+      // prox${n === 1 ? "y" : "ies"}` has no piece longer than one word, yet a
+      // reader sees an English sentence. So read the pieces joined as well: a
+      // hole stands for the value it will hold, which is one word.
+      // An Accept-Language value is a protocol string: its "en" names a
+      // language to a server, and translating it would change the request.
+      if (/;q=0\.\d/.test(prose)) continue;
+      const joined = prose.replace(/\u0001/g, " ").replace(/\s+/g, " ").trim();
+      const words = joined.match(/[A-Za-z][a-z]+/g) ?? [];
+      if (words.length >= 2 && !NOT_TEXT.has(joined) && !NOT_PROSE.has(joined)) {
+        out.push(joined);
+        continue;
+      }
       for (const piece of prose.split("\u0001")) {
         const text = piece.trim();
         if (text.length < 4) continue;
-        if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
+        if (NOT_TEXT.has(text) || NOT_PROSE.has(text) || isCodeIdentifier(text)) continue;
         // Prose has at least two lowercase letters and a space, or ends a
         // sentence: "profile bound to this proxy", "Delete folder".
         if (!/[a-z]{2}/.test(text)) continue;
@@ -631,5 +681,53 @@ test("no t() call is stranded inside a string", () => {
     offenders,
     [],
     `these render the translator call itself to the user:\n  ${offenders.join("\n  ")}`,
+  );
+});
+
+// A translation read at module scope is read once, when the file is first
+// imported, and keeps whichever language was loaded at that moment. Switching
+// to Vietnamese then leaves those labels in English until the app restarts —
+// a bug no screenshot catches, because the first run looks perfect. A
+// function is fine: it runs when it is called, in the language of that moment.
+test("no translation is frozen at import time", () => {
+  const frozen = [];
+  for (const root of uiRoots) {
+  for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
+    const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+    const src = readable(readFileSync(file, "utf8"));
+    const lines = src.split("\n");
+    let depth = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (depth === 0 && /^\s*(?:export\s+)?(?:const|let|var)\s+\w+/.test(line)) {
+        // Read the whole initializer: it may run to several lines.
+        let d = 0, j = i, body = "";
+        do {
+          body += lines[j] + "\n";
+          for (const ch of lines[j]) {
+            if ("{([".includes(ch)) d++;
+            else if ("})]".includes(ch)) d--;
+          }
+          j++;
+        } while (d > 0 && j < lines.length);
+        const beforeCall = body.split(/(?<![\w.])t\(/)[0];
+        const callsT = /(?<![\w.])t\(\s*["'`]/.test(body);
+        const isFunction = /=>|\bfunction\b/.test(beforeCall);
+        if (callsT && !isFunction) {
+          frozen.push(`${where}:${i + 1}: ${lines[i].trim().slice(0, 70)}`);
+        }
+      }
+      for (const ch of line) {
+        if ("{([".includes(ch)) depth++;
+        else if ("})]".includes(ch)) depth--;
+      }
+      if (depth < 0) depth = 0;
+    }
+  }
+  }
+  assert.deepEqual(
+    frozen,
+    [],
+    `a module-scope t() keeps the language it was first imported with, so these stay in the old language after a switch:\n${frozen.join("\n")}`,
   );
 });

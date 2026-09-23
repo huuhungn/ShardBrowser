@@ -68,7 +68,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
     try {
       await trashEmpty();
       await get().reload();
-      toast.ok(`Deleted ${n}`);
+      toast.ok(t("trash.deletedCount", { n }));
     } catch (err) { toast.err(String(err)); }
   },
 }));

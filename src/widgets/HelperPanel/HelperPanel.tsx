@@ -4,16 +4,16 @@ import {
 } from "../../entities/profile/model/api";
 import { SyncIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
-import { t, useT } from "../../shared/i18n";
+import { useT } from "../../shared/i18n";
 
-/** What a kind is called to a person. */
-const LABELS: Record<string, string> = {
+/** What a kind is called to a person, in the language on screen right now. */
+const labelFor = (t: ReturnType<typeof useT>): Record<string, string> => ({
   first_name: t("helper.firstName"), last_name: t("helper.lastName"), full_name: t("helper.fullName"),
   email: t("helper.email"), username: t("helper.username"), phone: t("helper.phone"), country: t("helper.country"), city: t("helper.city"),
   postal_code: t("helper.postcode"), street: t("helper.address"),
   birth_day: t("helper.birthDay"), birth_month: t("helper.birthMonth"), birth_year: t("helper.birthYear"),
   birth_date: t("helper.dateOfBirth"), gender: t("helper.gender"),
-};
+});
 
 /**
  * Shard Helper: offers to fill a form the browser noticed. It only ever offers —
@@ -22,6 +22,7 @@ const LABELS: Record<string, string> = {
  */
 export function HelperPanel({ profile }: { profile: string }) {
   const t = useT();
+  const labels = labelFor(t);
   const [fields, setFields] = useState<HelperField[]>([]);
   const [busy, setBusy] = useState(false);
   const [filled, setFilled] = useState(0);
@@ -68,7 +69,7 @@ export function HelperPanel({ profile }: { profile: string }) {
           {kinds.map((k) => (
             <span key={k}
                   className="rounded-6 px-1.5 py-0.5 text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
-              {LABELS[k] ?? k}
+              {labels[k] ?? k}
             </span>
           ))}
         </div>
@@ -90,7 +91,7 @@ export function HelperPanel({ profile }: { profile: string }) {
             ? t("helper.filledWindows", { n: filled })
             : filled === 1
               ? t("helper.fillAgain")
-              : `Fill ${fields.length} field${fields.length === 1 ? "" : "s"}`}
+              : t(fields.length === 1 ? "helper.fillFieldOne" : "helper.fillFieldMany", { n: fields.length })}
         </button>
       </div>
     </div>

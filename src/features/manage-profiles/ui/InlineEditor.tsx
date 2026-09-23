@@ -11,7 +11,7 @@ import { ExtensionPicker } from "./ExtensionPicker";
 import { ProxySelect } from "./ProxySelect";
 import { HOST_OS } from "../../../shared/lib/utils";
 import {
-  AUTO_TZ, TIMEZONES, LOCALES,
+  AUTO_TZ, TIMEZONES, locales,
   MEMORY_OPTIONS, CPU_OPTIONS, MEDIA_COUNT_OPTIONS, OS_OPTIONS,
 } from "../../../shared/constants";
 import type { ProfileForm, GeoMode, WebRtcMode } from "../../../entities/profile";
@@ -208,7 +208,7 @@ export function InlineEditor({
                 title={t("common.language")}
                 value={f.language}
                 onChange={(v) => u("language", v)}
-                options={LOCALES.map((l) => ({ value: l.code, label: l.label }))}
+                options={locales(t).map((l) => ({ value: l.code, label: l.label }))}
               />
             </label>
           </div>

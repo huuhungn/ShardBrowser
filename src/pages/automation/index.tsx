@@ -20,13 +20,16 @@ import {
   type RunReport,
 } from "../../entities/automation";
 import { useProfile } from "../../entities/profile";
-import { t, useT } from "../../shared/i18n";
+import { useT } from "../../shared/i18n";
 
 type ParamSpec = {
   key: string;
   /** A key in locales/, not the English text: the box label is translated. */
   labelKey: string;
   placeholder: string;
+  /** When the hint is words rather than syntax, it is translated where it is
+   *  drawn: a t() call here would freeze the first language the module saw. */
+  placeholderKey?: string;
   /** Numbers are stored as JSON numbers; the runner rejects a string here. */
   numeric?: boolean;
   /** Read with `as_bool()`, so the string "true" would be ignored in silence. */
@@ -57,7 +60,7 @@ const PARAMS: Record<string, ParamSpec[]> = {
   ],
   assert: [
     { key: "selector", labelKey: "automation.param.selector", placeholder: ".welcome" },
-    { key: "expected", labelKey: "automation.param.mustContain", placeholder: t("automation.signedIn") },
+    { key: "expected", labelKey: "automation.param.mustContain", placeholder: "", placeholderKey: "automation.signedIn" },
   ],
   evaluate: [
     { key: "script", labelKey: "automation.param.script", placeholder: "document.title" },
@@ -76,7 +79,7 @@ const PARAMS: Record<string, ParamSpec[]> = {
   httpOpen: [],
   httpRequest: [
     { key: "url", labelKey: "automation.param.url", placeholder: "https://api.example.com/v1/me" },
-    { key: "method", labelKey: "automation.param.method", placeholder: t("automation.get") },
+    { key: "method", labelKey: "automation.param.method", placeholder: "", placeholderKey: "automation.get" },
     { key: "body", labelKey: "automation.param.body", placeholder: '{"name":"{{who}}"}' },
     {
       key: "headers",
@@ -197,7 +200,7 @@ function BlockRow({
                 <Field
                   label={t(f.labelKey)}
                   value={str(block.params[f.key])}
-                  placeholder={f.placeholder}
+                  placeholder={f.placeholderKey ? t(f.placeholderKey) : f.placeholder}
                   onChange={(v) => {
                     const next = { ...block.params };
                     const parsed = paramValue(f, v);

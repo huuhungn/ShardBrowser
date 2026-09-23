@@ -9,53 +9,34 @@ import { randSid } from "../../../shared/lib/utils";
 import type { ResiType, PsLoc } from "../../../entities/proxyshard";
 import { PS_PLAN, PS_PROXY_TYPE, PS_RELAYS, PS_PORT, psProfileTraffic, psCountries, psRegions, psCities } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
-import { t, useT } from "../../../shared/i18n";
+import { useT } from "../../../shared/i18n";
 
 
-const SESSION_MODE_OPTIONS: SelectOption[] = [
-  {
-    label: t("ps.defaultAfter5sec"),
-    value: "default"
-  },
-  {
-    label: t("ps.static"),
-    value: "static"
-  }
-]
+// A label is built when it is drawn, not when the module loads: a list built
+// once at import time keeps whichever language was active then, and a reader
+// who switches to Vietnamese goes on reading English until the app restarts.
+type Tr = ReturnType<typeof useT>;
 
-const POF_OPTIONS: SelectOption[] = [
-  {
-    label: t("ps.unset"),
-    value: "unset"
-  },
-  {
-    label: t("ps.macos"),
-    value: "macos"
-  },
-  {
-    label: t("ps.windows"),
-    value: "windows"
-  },
-  {
-    label: t("ps.android"),
-    value: "android"
-  },
-  {
-    label: t("ps.linux"),
-    value: "linux"
-  },
-  {
-    label: t("ps.ios"),
-    value: "ios"
-  },
-]
+const sessionModeOptions = (t: Tr): SelectOption[] => [
+  { label: t("ps.defaultAfter5sec"), value: "default" },
+  { label: t("ps.static"), value: "static" },
+];
 
-const PROTO_OPTIONS: SelectOption[] = [
+const pofOptions = (t: Tr): SelectOption[] => [
+  { label: t("ps.unset"), value: "unset" },
+  { label: t("ps.macos"), value: "macos" },
+  { label: t("ps.windows"), value: "windows" },
+  { label: t("ps.android"), value: "android" },
+  { label: t("ps.linux"), value: "linux" },
+  { label: t("ps.ios"), value: "ios" },
+];
+
+const protoOptions = (t: Tr): SelectOption[] => [
   { value: "http", label: t("ps.http") },
   { value: "socks5", label: t("ps.socks5") },
 ];
 
-const SESSION_OPTIONS: SelectOption[] = [
+const sessionOptions = (t: Tr): SelectOption[] => [
   { value: "rotating", label: t("ps.rotating") },
   { value: "sticky", label: t("ps.sticky") },
 ];
@@ -144,7 +125,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
     setSaving(true);
     try {
       const added = await proxyBulkSave(entries);
-      toast.ok(added > 0 ? `Added ${added} prox${added === 1 ? "y" : "ies"}` : t("ps.noNewProxiesDuplicates"));
+      toast.ok(added > 0 ? t(added === 1 ? "ps.addedProxyOne" : "ps.addedProxyMany", { n: added }) : t("ps.noNewProxiesDuplicates"));
      // onClose();
     } catch (e) { toast.err(String(e)); }
     finally { setSaving(false); }
@@ -156,7 +137,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
       onClose={onClose}
       title={t("ps.generateResidential", { plan })}
       maxWidthClassName="max-w-[880px]"
-      confirmLabel={saving ? "Generating…" : `Generate ${Math.max(1, Math.round(count))}`}
+      confirmLabel={saving ? t("ps.generating") : t("ps.generateCount", { n: Math.max(1, Math.round(count)) })}
       onConfirm={generate}
       isLoading={saving}
       isDisabled={saving || !password}
@@ -177,7 +158,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
             <SegmentControl
               size="small"
               value={proto}
-              items={PROTO_OPTIONS}
+              items={protoOptions(t)}
               onChange={(v) => setProto(v as "http" | "socks5")}
             />
           </label>
@@ -197,7 +178,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
             <SegmentControl
               size="small"
               value={session}
-              items={SESSION_OPTIONS}
+              items={sessionOptions(t)}
               onChange={(v) => setSession(v as "rotating" | "sticky")}
             />
           </label>
@@ -229,7 +210,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
                 title={t("ps.deviceOS")}
                 onChange={setCity}
                 placeholder={t("ps.selectDeviceOS")}
-                options={POF_OPTIONS}
+                options={pofOptions(t)}
               />
             )
           }
@@ -270,7 +251,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
               <CSSelect
                 value={sessionMode}
                 onChange={(v) => setSessionMode(v as "default" | "static")}
-                options={SESSION_MODE_OPTIONS}
+                options={sessionModeOptions(t)}
               />
             </div>
           )}
