@@ -45,11 +45,11 @@ export function ProfileRowActions({ profile, onMore }: {
             : <span className={isStarting ? "spin-icon inline-grid place-items-center" : "inline-grid place-items-center"}><PlayIcon className="size-3.5" /></span>
         }
         onClick={() => startStop(p)}
-        aria-label={`${isRunning ? "Stop" : "Start"} profile ${p.name}`}
+        aria-label={`${isRunning ? t("profileTable.stop") : t("profileTable.start")} profile ${p.name}`}
         disabled={!isRunning && isStarting}
         title={!isRunning && isStarting ? "Starting (UDP probe + geo + spawn)…" : undefined}
       >
-        {isRunning ? "Stop" : isStarting ? "Starting…" : "Start"}
+        {isRunning ? t("profileTable.stop") : isStarting ? "Starting…" : t("profileTable.start")}
       </Button>
       {wide && <Button
         variant={p.pinned ? "primary" : "neutral"}
@@ -57,8 +57,8 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={() => togglePin(p)}
-        aria-label={`${p.pinned ? "Unpin" : "Pin"} profile ${p.name}`}
-        title={p.pinned ? "Unpin" : "Pin to top"}
+        aria-label={`${p.pinned ? t("profileTable.unpin") : t("profileTable.pin")} profile ${p.name}`}
+        title={p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop")}
         leftIcon={<PinIconApp className="size-4" />}
       >
       </Button>}

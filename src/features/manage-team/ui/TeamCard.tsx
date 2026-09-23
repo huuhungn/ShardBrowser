@@ -7,7 +7,7 @@ import {
   teamEnrollDevice, teamCollectCustody, useTeam,
   type TeamStatus,
 } from "../../../entities/team";
-import { useT } from "../../../shared/i18n";
+import { t, useT } from "../../../shared/i18n";
 
 /** A tenant id is a UUID the operator picks once; typing one by hand is how
  *  two devices end up in different fleets over a mistyped character. */
@@ -26,9 +26,9 @@ function newTenantId(): string {
 /** A default label that says which machine this is without asking. */
 function suggestLabel(): string {
   const ua = navigator.userAgent;
-  const os = /Windows/i.test(ua) ? "Windows"
+  const os = /Windows/i.test(ua) ? t("team.windows")
     : /Macintosh|Mac OS X/i.test(ua) ? "macOS"
-    : /Linux|X11|CrOS/i.test(ua) ? "Linux" : "device";
+    : /Linux|X11|CrOS/i.test(ua) ? t("team.linux") : "device";
   return `${os} ${new Date().toISOString().slice(0, 10)}`;
 }
 
@@ -72,7 +72,7 @@ export function TeamCard() {
     setSt(next);
     setToken("");
     void shareStatus();
-    toast.ok("Connection saved");
+    toast.ok(t("team.connectionSaved"));
   });
 
   const test = () => run("test", async () => {
@@ -84,13 +84,13 @@ export function TeamCard() {
     const next = await teamEnrollDevice(label.trim() || suggestLabel());
     setSt(next);
     void shareStatus();
-    toast.ok("Device enrolled");
+    toast.ok(t("team.deviceEnrolled"));
   });
 
   const collect = () => run("collect", async () => {
     const r = await teamCollectCustody();
     if (r.grants === 0) {
-      toast.info("No grants waiting — a custodian device has to issue one");
+      toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
       toast.err(`${r.opened} of ${r.grants} opened; ${r.failed} could not be opened`);
     } else {
@@ -111,7 +111,7 @@ export function TeamCard() {
             `sync still needs a passphrase.`,
         );
       } else {
-        toast.err("No grants are waiting for this device yet");
+        toast.err(t("team.noGrantsAreWaitingForThisDeviceYet"));
       }
     }
   });
@@ -155,7 +155,7 @@ export function TeamCard() {
           size="small"
           mode="stroke"
           disabled={!!busy}
-          onClick={() => { setTenant(newTenantId()); toast.info("Generated — save to apply"); }}
+          onClick={() => { setTenant(newTenantId()); toast.info(t("team.generatedSaveToApply")); }}
         >
           {t("common.generate")}
         </Button>
@@ -166,10 +166,10 @@ export function TeamCard() {
 
       <div className="flex gap-2">
         <Button size="small" disabled={!!busy} onClick={save}>
-          {busy === "save" ? "Saving…" : "Save connection"}
+          {busy === "save" ? "Saving…" : t("team.saveConnection")}
         </Button>
         <Button size="small" mode="stroke" disabled={!!busy || !connected} onClick={test}>
-          {busy === "test" ? "Testing…" : "Test connection"}
+          {busy === "test" ? "Testing…" : t("team.testConnection")}
         </Button>
       </div>
 
@@ -186,7 +186,7 @@ export function TeamCard() {
               />
               <div>
                 <Button size="small" disabled={!!busy || !connected} onClick={enroll}>
-                  {busy === "enroll" ? "Enrolling…" : "Enrol this device"}
+                  {busy === "enroll" ? "Enrolling…" : t("team.enrolThisDevice")}
                 </Button>
               </div>
               {!connected && (
@@ -206,7 +206,7 @@ export function TeamCard() {
                 <>
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
-                      {busy === "collect" ? "Collecting…" : "Collect key custody"}
+                      {busy === "collect" ? "Collecting…" : t("team.collectKeyCustody")}
                     </Button>
                   </div>
                   <p className="m-0 text-paragraph-xs text-text-soft-400">

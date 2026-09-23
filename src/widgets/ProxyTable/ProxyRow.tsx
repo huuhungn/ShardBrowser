@@ -46,11 +46,11 @@ export function ProxyRow({ proxy, profileCount, onMenu }: {
       onClick={(e) => { if (shiftPress.current) e.preventDefault(); }}
       onContextMenu={(e) =>
         onMenu(e, [
-          { label: "Test (TCP/UDP/geo)", onClick: () => testProxy(proxy) },
-          { label: "View details", onClick: () => setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } }) },
-          { label: "Edit", onClick: () => setEditing(proxy) },
+          { label: t("proxyTable.testTcpUdpGeo"), onClick: () => testProxy(proxy) },
+          { label: t("proxyTable.viewDetails"), onClick: () => setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } }) },
+          { label: t("common.edit"), onClick: () => setEditing(proxy) },
           { sep: true, label: "", onClick: () => { } },
-          { label: "Delete", onClick: () => removeProxy(proxy.id), danger: true },
+          { label: t("common.delete"), onClick: () => removeProxy(proxy.id), danger: true },
         ])
       }
     >

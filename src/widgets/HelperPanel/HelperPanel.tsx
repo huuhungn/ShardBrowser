@@ -4,15 +4,15 @@ import {
 } from "../../entities/profile/model/api";
 import { SyncIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
-import { useT } from "../../shared/i18n";
+import { t, useT } from "../../shared/i18n";
 
 /** What a kind is called to a person. */
 const LABELS: Record<string, string> = {
-  first_name: "First name", last_name: "Last name", full_name: "Full name",
-  email: "Email", username: "Username", phone: "Phone", country: "Country", city: "City",
-  postal_code: "Postcode", street: "Address",
-  birth_day: "Birth day", birth_month: "Birth month", birth_year: "Birth year",
-  birth_date: "Date of birth", gender: "Gender",
+  first_name: t("helper.firstName"), last_name: t("helper.lastName"), full_name: t("helper.fullName"),
+  email: t("helper.email"), username: t("helper.username"), phone: t("helper.phone"), country: t("helper.country"), city: t("helper.city"),
+  postal_code: t("helper.postcode"), street: t("helper.address"),
+  birth_day: t("helper.birthDay"), birth_month: t("helper.birthMonth"), birth_year: t("helper.birthYear"),
+  birth_date: t("helper.dateOfBirth"), gender: t("helper.gender"),
 };
 
 /**
@@ -89,7 +89,7 @@ export function HelperPanel({ profile }: { profile: string }) {
           {filled > 1
             ? `Filled ${filled} windows — fill again`
             : filled === 1
-              ? "Fill again"
+              ? t("helper.fillAgain")
               : `Fill ${fields.length} field${fields.length === 1 ? "" : "s"}`}
         </button>
       </div>

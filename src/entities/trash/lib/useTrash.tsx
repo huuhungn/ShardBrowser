@@ -4,6 +4,7 @@ import { confirmModal } from "../../../shared/lib/confirm";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { trashEmpty, trashList, trashPurge, trashRestore } from "../model/api";
 import type { TrashEntry } from "../model/types";
+import { t } from "../../../shared/i18n";
 
 export type TrashStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -46,7 +47,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
 
   purge: async (e) => {
     const ok = await confirmModal({
-      title: "Delete for good",
+      title: t("trash.deleteForGood"),
       message: `"${e.name}" cannot be brought back after this.`,
       danger: true,
     });
@@ -59,7 +60,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
     const n = get().items.length;
     if (n === 0) return;
     const ok = await confirmModal({
-      title: "Empty the trash",
+      title: t("trash.emptyTheTrash"),
       message: `Delete ${n} profile${n === 1 ? "" : "s"} for good?`,
       danger: true,
     });

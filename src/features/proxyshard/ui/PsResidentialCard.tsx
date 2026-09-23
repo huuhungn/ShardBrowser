@@ -69,14 +69,14 @@ export function PsResidentialCard() {
   return (
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
       <div className="mb-2.5 flex items-center justify-between gap-3">
-        <h3 className="m-0 text-label-sm text-text-strong-950">Residential</h3>
+        <h3 className="m-0 text-label-sm text-text-strong-950">{t("ps.residential")}</h3>
         <SegmentControl
           size="small"
           value={type}
           items={[
-            { value: "standart", label: "Standard" },
-            { value: "premium", label: "Premium" },
-            { value: "unmetered", label: "Unmetered" },
+            { value: "standart", label: t("ps.standard") },
+            { value: "premium", label: t("ps.premium") },
+            { value: "unmetered", label: t("ps.unmetered") },
           ]}
           onChange={(v) => setType(v as ResiType)}
         />
@@ -112,7 +112,7 @@ export function PsResidentialCard() {
             size="small"
             leftIcon={<AddIcon className="size-4" />}
             disabled={!order}
-            title={order ? undefined : "No residential order found for this tier"}
+            title={order ? undefined : t("ps.noResidentialOrderFoundForThisTier")}
             onClick={() => order && setTopup(order)}
           >
             {t("ps.addTraffic")}
@@ -124,10 +124,10 @@ export function PsResidentialCard() {
             size="small"
             disabled={!order || renewing}
             isLoading={renewing}
-            title={order ? undefined : "No unmetered order found"}
+            title={order ? undefined : t("ps.noUnmeteredOrderFound")}
             onClick={renew}
           >
-            {renewing ? "Renewing…" : "Renew"}
+            {renewing ? "Renewing…" : t("ps.renew")}
           </Button>
         )}
         <Button variant="primary" mode="filled" size="small" onClick={() => setGenOpen(true)}>

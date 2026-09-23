@@ -48,12 +48,12 @@ export function ProxyTable() {
               onChange={(e) => selectProxy(e.target.checked, pagedProxies)}
             />
           </div>
-          <div>Name</div>
-          <div>Type</div>
+          <div>{t("proxyTable.name")}</div>
+          <div>{t("proxyTable.type")}</div>
           <div>Host:Port</div>
-          <div className="head-country">Country</div>
-          <div className="head-profiles">Profiles</div>
-          <div>Test result</div>
+          <div className="head-country">{t("proxyTable.country")}</div>
+          <div className="head-profiles">{t("proxyTable.profiles")}</div>
+          <div>{t("proxyTable.testResult")}</div>
           <div></div>
         </div>
         {pagedProxies.map((p) => (
@@ -73,17 +73,17 @@ export function ProxyTable() {
                 "add a proxy" there buries the ones the user already has. */}
             {search ? (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No matching proxies</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("proxyTable.noMatchingProxies")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   Nothing matches “{search}”.
                 </p>
                 <div className="mt-2 flex gap-2">
-                  <Button size="xsmall" onClick={() => setSearch("")}>Clear search</Button>
+                  <Button size="xsmall" onClick={() => setSearch("")}>{t("proxyTable.clearSearch")}</Button>
                 </div>
               </>
             ) : (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No proxies yet</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("proxyTable.noProxiesYet")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   Add a SOCKS5/HTTP(S) endpoint so profiles can route through it.
                 </p>

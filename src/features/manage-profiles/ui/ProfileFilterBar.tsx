@@ -29,7 +29,7 @@ export function ProfileFilterBar() {
         leftIcon={<FilterIcon className="size-4" />}
         onClick={() => setOpen((v) => !v)}
       >
-        {active > 0 ? `Filters · ${active}` : "Filters"}
+        {active > 0 ? `Filters · ${active}` : t("profile.filters")}
       </Button>
 
       {open && (
@@ -41,9 +41,9 @@ export function ProfileFilterBar() {
               value={filters.status}
               onChange={(v) => setFilters({ status: v as typeof filters.status })}
               options={[
-                { value: "all", label: "Any status" },
-                { value: "running", label: "Running" },
-                { value: "idle", label: "Idle" },
+                { value: "all", label: t("profile.anyStatus") },
+                { value: "running", label: t("common.running") },
+                { value: "idle", label: t("profile.idle") },
               ]}
             />
             <CSSelect
@@ -51,9 +51,9 @@ export function ProfileFilterBar() {
               value={filters.proxy}
               onChange={(v) => setFilters({ proxy: v as typeof filters.proxy })}
               options={[
-                { value: "all", label: "Any connection" },
-                { value: "bound", label: "Through a proxy" },
-                { value: "direct", label: "Direct" },
+                { value: "all", label: t("profile.anyConnection") },
+                { value: "bound", label: t("profile.throughAProxy") },
+                { value: "direct", label: t("profile.direct") },
               ]}
             />
             <label className="flex flex-col gap-1">
@@ -64,7 +64,7 @@ export function ProfileFilterBar() {
                 isSearchable={countries.length > 8}
                 searchPlaceholder="Search countries…"
                 options={[
-                  { value: "", label: "Any country" },
+                  { value: "", label: t("profile.anyCountry") },
                   ...countries.map((c) => ({ value: c, label: c })),
                 ]}
               />

@@ -16,10 +16,10 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
 
   const parse = async () => {
-    if (!text.trim()) { toast.err("Nothing to parse"); return; }
+    if (!text.trim()) { toast.err(t("proxy.nothingToParse")); return; }
     try {
       const parsed = await proxyBulkParse(text, kind);
-      if (parsed.length === 0) { toast.err("No valid proxy lines found"); return; }
+      if (parsed.length === 0) { toast.err(t("proxy.noValidProxyLinesFound")); return; }
       setRows(parsed.map((e) => ({ entry: e, selected: true, status: "idle" })));
     } catch (e) { toast.err(String(e)); }
   };
@@ -66,7 +66,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
 
   const saveSelected = async () => {
     const entries = rows.filter((r) => r.selected).map((r) => r.entry);
-    if (entries.length === 0) { toast.err("Nothing selected"); return; }
+    if (entries.length === 0) { toast.err(t("proxy.nothingSelected")); return; }
     try {
       const n = await proxyBulkSave(entries);
       toast.ok(`Imported ${n} prox${n === 1 ? "y" : "ies"}`);
@@ -85,7 +85,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
       maxWidthClassName="max-w-[750px]"
       footer={
         <div className="flex items-center justify-end gap-2">
-          <Button variant="neutral" mode="stroke" size="small" onClick={onClose}>Cancel</Button>
+          <Button variant="neutral" mode="stroke" size="small" onClick={onClose}>{t("proxy.cancel")}</Button>
           {rows.length === 0 ? (
             <Button variant="primary" mode="filled" size="small" onClick={parse}>Parse →</Button>
           ) : (
@@ -105,9 +105,9 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
               value={kind}
               onChange={(v) => setKind(v as ProxyEntry["kind"])}
               options={[
-                { value: "socks5", label: "SOCKS5" },
-                { value: "http", label: "HTTP" },
-                { value: "https", label: "HTTPS" },
+                { value: "socks5", label: t("proxy.socks5") },
+                { value: "http", label: t("proxy.http") },
+                { value: "https", label: t("proxy.https") },
               ]}
             />
             <Textarea
@@ -147,7 +147,7 @@ host:8080               # no auth
                   disabled={busy}
                   isLoading={busy}
                 >
-                  {busy ? "Testing…" : "Test all"}
+                  {busy ? "Testing…" : t("proxy.testAll")}
                 </Button>
                 <Button
                   variant="neutral"
@@ -192,7 +192,7 @@ host:8080               # no auth
                     {r.status === "testing" && <span className="text-text-soft-400">testing…</span>}
                     {r.status === "ok" && (
                       <>
-                        <Badge color="success" variant="filled" size="small" title={`TCP ${r.tcp_ms} ms`}>Active</Badge>
+                        <Badge color="success" variant="filled" size="small" title={`TCP ${r.tcp_ms} ms`}>{t("proxy.active")}</Badge>
                         {r.entry.kind === "socks5" && r.udp_ms != null && (
                           <Badge color="primary" variant="filled" size="small" title={`UDP relay works (${r.udp_ms} ms)`}>UDP</Badge>
                         )}
@@ -205,7 +205,7 @@ host:8080               # no auth
                       </>
                     )}
                     {r.status === "fail" && (
-                      <Badge color="error" variant="filled" size="small" title={r.error}>Failed</Badge>
+                      <Badge color="error" variant="filled" size="small" title={r.error}>{t("proxy.failed")}</Badge>
                     )}
                   </div>
                   <Button

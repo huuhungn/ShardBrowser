@@ -66,7 +66,7 @@ export function PsOrdersCard() {
   return (
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
       <div className="mb-2.5 flex items-center justify-between gap-3">
-        <h3 className="m-0 text-label-sm text-text-strong-950">Orders</h3>
+        <h3 className="m-0 text-label-sm text-text-strong-950">{t("ps.orders")}</h3>
         <div className="flex items-center gap-2">
           <div className="w-[130px]">
             <Select
@@ -74,10 +74,10 @@ export function PsOrdersCard() {
               value={status}
               onChange={setStatus}
               options={[
-                { value: "active", label: "Active" },
-                { value: "on-hold", label: "On hold" },
-                { value: "cancelled", label: "Cancelled" },
-                { value: "all", label: "All" },
+                { value: "active", label: t("ps.active") },
+                { value: "on-hold", label: t("ps.onHold") },
+                { value: "cancelled", label: t("ps.cancelled") },
+                { value: "all", label: t("ps.all") },
               ]}
             />
           </div>
@@ -87,7 +87,7 @@ export function PsOrdersCard() {
         </div>
       </div>
       {loading && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading…</p>}
-      {!loading && visible.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">No orders for this filter.</p>}
+      {!loading && visible.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.noOrdersForThisFilter")}</p>}
       {!loading && visible.length > 0 && (
         <div className="mt-1 overflow-hidden rounded-10 ring-1 ring-inset ring-stroke-soft-200">
           {visible.map((o) => (

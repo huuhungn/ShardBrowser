@@ -26,8 +26,8 @@ export function FolderModal({
       open
       onClose={onClose}
       icon={<FolderIcon className="size-5" />}
-      title={mode === "move" ? "Move to folder" : "New folder"}
-      confirmLabel={showList ? "Create & move" : "Create"}
+      title={mode === "move" ? t("folders.moveToFolder") : t("folders.newFolder")}
+      confirmLabel={showList ? "Create & move" : t("folders.create")}
       onConfirm={create}
       isDisabled={!trimmed || dup}
       cancelLabel={t("common.cancel")}
@@ -36,7 +36,7 @@ export function FolderModal({
       <div className="flex flex-col gap-3 py-4">
         {showList && (
           <>
-            <span className="text-label-xs text-text-sub-600">Existing folders</span>
+            <span className="text-label-xs text-text-sub-600">{t("profile.existingFolders")}</span>
             <div className="flex max-h-[220px] flex-col gap-1 overflow-y-auto">
               {existing.map((f) => (
                 <Button
@@ -59,7 +59,7 @@ export function FolderModal({
         )}
         <Input
           ref={ref}
-          label={showList ? "New folder name" : "Folder name"}
+          label={showList ? t("folders.newFolderName") : t("folders.folderName")}
           inputSize="small"
           value={name}
           placeholder={t("profile.eGShopsSocialsQa")}

@@ -1,8 +1,9 @@
 import type { ResiType } from "./types";
+import { t } from "../../../shared/i18n";
 
 // p0f OS-fingerprint signatures (signature/set endpoint enum).
 export const PS_SIGNATURES: { value: string; label: string }[] = [
-  { value: "", label: "Don't set" },
+  { value: "", label: t("ps.dontSet") },
   { value: "ios", label: "iOS" },
   { value: "macos", label: "macOS" },
   { value: "android", label: "Android" },

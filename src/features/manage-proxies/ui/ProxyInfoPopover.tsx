@@ -10,6 +10,7 @@ import { toast } from "../../../shared/model/toast";
 import { fmtTs } from "../../../shared/lib/utils";
 import type { ProxyEntry, ProxyTestSnapshot } from "../../../entities/proxy";
 import { proxyHistory } from "../../../entities/proxy";
+import { t } from "../../../shared/i18n";
 
 /// Proxy detail popover: latest IP/geo + UDP + IP-change history.
 export function ProxyInfoPopover({
@@ -92,7 +93,7 @@ export function ProxyInfoPopover({
       </div>
       <div className="border-b border-t border-stroke-soft-200 bg-bg-weak-50 px-4 py-2 text-center text-subheading-2xs text-text-soft-400">IP HISTORY</div>
       <div className="flex-1 overflow-y-auto py-1">
-        {history.length === 0 && <div className="px-4 py-2.5 text-paragraph-xs text-text-soft-400">No history yet</div>}
+        {history.length === 0 && <div className="px-4 py-2.5 text-paragraph-xs text-text-soft-400">{t("proxy.noHistoryYet")}</div>}
         {history.map((s, i) => (
           <div key={`${s.ip}-${s.first_seen}-${i}`} className="border-b border-stroke-soft-200 px-4 py-2 last:border-b-0">
             <div className="flex items-center gap-2 text-paragraph-sm text-text-strong-950">

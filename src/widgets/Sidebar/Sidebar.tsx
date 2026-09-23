@@ -35,28 +35,28 @@ export function Sidebar() {
 
   const sections: { label: string; items: { id: Section; label: string; svg: ReactNode }[] }[] = [
     {
-      label: "Workspace",
+      label: t("sidebar.workspace"),
       items: [
-        { id: "browsers", label: "Browsers", svg: <NavBrowsersIcon className="size-[18px]" /> },
-        { id: "proxies", label: "Proxies", svg: <RouteIcon className="size-[18px]" /> },
-        { id: "proxyshard", label: "ProxyShard", svg: <NavShopIcon className="size-[18px]" /> },
-        { id: "automation", label: "Automation", svg: <NavAutomationIcon className="size-[18px]" /> },
+        { id: "browsers", label: t("sidebar.browsers"), svg: <NavBrowsersIcon className="size-[18px]" /> },
+        { id: "proxies", label: t("common.proxies"), svg: <RouteIcon className="size-[18px]" /> },
+        { id: "proxyshard", label: t("sidebar.proxyshard"), svg: <NavShopIcon className="size-[18px]" /> },
+        { id: "automation", label: t("sidebar.automation"), svg: <NavAutomationIcon className="size-[18px]" /> },
       ],
     },
     {
-      label: "Library",
+      label: t("sidebar.library"),
       items: [
-        { id: "fingerprints", label: "Fingerprints", svg: <NavFingerprintsIcon className="size-[18px]" /> },
-        { id: "extensions", label: "Extensions", svg: <NavExtensionsIcon className="size-[18px]" /> },
-        { id: "bookmarks", label: "Bookmarks", svg: <NavBookmarksIcon className="size-[18px]" /> },
+        { id: "fingerprints", label: t("common.fingerprints"), svg: <NavFingerprintsIcon className="size-[18px]" /> },
+        { id: "extensions", label: t("sidebar.extensions"), svg: <NavExtensionsIcon className="size-[18px]" /> },
+        { id: "bookmarks", label: t("sidebar.bookmarks"), svg: <NavBookmarksIcon className="size-[18px]" /> },
       ],
     },
     {
-      label: "System",
+      label: t("sidebar.system"),
       items: [
-        { id: "trash", label: "Trash", svg: <NavTrashIcon className="size-[18px]" /> },
-        { id: "patchlog", label: "Patch log", svg: <NavPatchLogIcon className="size-[18px]" /> },
-        { id: "settings", label: "Settings", svg: <NavSettingsIcon className="size-[18px]" /> },
+        { id: "trash", label: t("sidebar.trash"), svg: <NavTrashIcon className="size-[18px]" /> },
+        { id: "patchlog", label: t("sidebar.patchLog"), svg: <NavPatchLogIcon className="size-[18px]" /> },
+        { id: "settings", label: t("sidebar.settings"), svg: <NavSettingsIcon className="size-[18px]" /> },
       ],
     },
   ];
@@ -114,13 +114,13 @@ export function Sidebar() {
             <button
               className="flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-lg bg-bg-white-0 px-2 py-[5px] text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200 transition-colors hover:text-text-strong-950 hover:ring-stroke-sub-300"
               title={t("sidebar.copyApiBaseUrl")}
-              onClick={() => { clip.write(autoUrl); toast.ok("Copied API URL"); }}
+              onClick={() => { clip.write(autoUrl); toast.ok(t("sidebar.copiedAPIURL")); }}
             >
               <span className="mono truncate">{autoUrl.replace(/^https?:\/\//, "")}</span>
               <CopyIcon className="size-3.5 shrink-0" />
             </button>
           ) : (
-            <div className="text-paragraph-xs text-text-soft-400">API off — enable in Settings</div>
+            <div className="text-paragraph-xs text-text-soft-400">{t("sidebar.apiOffEnableInSettings")}</div>
           )}
           <DownloadMcp />
           <Button

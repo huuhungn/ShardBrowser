@@ -13,7 +13,7 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
   const [promo, setPromo] = useState("");
   const [busy, setBusy] = useState(false);
   const submit = async () => {
-    if (amount < 1) { toast.err("Amount must be at least 1 GB"); return; }
+    if (amount < 1) { toast.err(t("ps.amountMustBeAtLeast1GB")); return; }
     setBusy(true);
     try {
       await psAddBandwidth(order.order_id, amount, promo.trim() || null);

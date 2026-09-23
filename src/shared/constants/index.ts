@@ -1,3 +1,5 @@
+import { t } from "../i18n";
+
 /// "auto" sentinel; the Rust launch resolver replaces with concrete TZ.
 export const AUTO_TZ = "auto";
 export const AUTO_LANG = "auto";
@@ -18,7 +20,7 @@ export const TIMEZONES = [
 ];
 
 export const LOCALES: { code: string; label: string }[] = [
-  { code: AUTO_LANG, label: "Auto (from proxy geo)" },
+  { code: AUTO_LANG, label: t("profile.autoFromProxyGeo") },
   { code: "en-US", label: "English (US)" },
   { code: "en-GB", label: "English (UK)" },
   { code: "en-CA", label: "English (Canada)" },

@@ -129,7 +129,7 @@ export function PsBuyCard() {
   };
 
   const buy = async () => {
-    if (needLocation && !country) { toast.err("Pick a location for Datacenter/ISP proxies"); return; }
+    if (needLocation && !country) { toast.err(t("ps.pickALocationForDatacenterISPProxies")); return; }
     // Auto-calculate when the user hasn't pressed Calculate, so the confirm
     // shows the real total (incl. add-ons) instead of a placeholder.
     let c = calc;
@@ -138,18 +138,18 @@ export function PsBuyCard() {
     }
     const price = c ? fmtCents(c.total_with_addons ?? c.final_price) : "this order";
     const ok = await confirmModal({
-      title: "Confirm purchase",
+      title: t("ps.confirmPurchase"),
       message: `Buy ${quantity} × ${productName}${cycle ? ` (${cycle})` : ""} for ${price}? Your wallet will be charged.`,
       buttons: [
-        { label: "Cancel", value: false },
-        { label: "Buy", value: true, primary: true },
+        { label: t("common.cancel"), value: false },
+        { label: t("ps.buy"), value: true, primary: true },
       ],
     });
     if (ok !== true) return;
     setBuying(true);
     try {
       const r = await psPurchase(buildBody());
-      toast.ok(r.message ? `${r.message}${r.order_id ? ` (#${r.order_id})` : ""}` : "Order placed");
+      toast.ok(r.message ? `${r.message}${r.order_id ? ` (#${r.order_id})` : ""}` : t("ps.orderPlaced"));
       setCalc(null);
       onPurchased();
     } catch (e) { toast.err(String(e)); }
@@ -158,16 +158,16 @@ export function PsBuyCard() {
 
   return (
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
-      <h3 className="m-0 mb-2 text-label-sm text-text-strong-950">Buy proxies</h3>
+      <h3 className="m-0 mb-2 text-label-sm text-text-strong-950">{t("ps.buyProxies")}</h3>
       {!ready ? (
         <p className="m-0 text-paragraph-xs text-text-soft-400">Loading products…</p>
       ) : options.length === 0 ? (
-        <p className="m-0 text-paragraph-xs text-text-soft-400">Nothing available to buy right now.</p>
+        <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.nothingAvailableToBuyRightNow")}</p>
       ) : (
         <div className="flex flex-col gap-3">
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
-              <span className="text-label-xs text-text-sub-600">Product</span>
+              <span className="text-label-xs text-text-sub-600">{t("ps.product")}</span>
               <CSSelect
                 value={productName}
                 onChange={setProductName}
@@ -175,7 +175,7 @@ export function PsBuyCard() {
               />
             </label>
             <label className="flex flex-col gap-1">
-              <span className="text-label-xs text-text-sub-600">Billing cycle</span>
+              <span className="text-label-xs text-text-sub-600">{t("ps.billingCycle")}</span>
               <CSSelect
                 value={cycle}
                 onChange={setCycle}
@@ -222,7 +222,7 @@ export function PsBuyCard() {
           )}
           <div className="mt-1 flex items-center gap-3">
             <Button variant="neutral" mode="stroke" size="small" onClick={calculate} disabled={calcing || !productName} isLoading={calcing}>
-              {calcing ? "Calculating…" : "Calculate price"}
+              {calcing ? "Calculating…" : t("ps.calculatePrice")}
             </Button>
             {calc && (
               <span className="ml-auto inline-flex items-center gap-2">
@@ -235,7 +235,7 @@ export function PsBuyCard() {
               </span>
             )}
             <Button variant="primary" mode="filled" size="small" onClick={buy} disabled={buying || !productName} isLoading={buying}>
-              {buying ? "Buying…" : "Buy"}
+              {buying ? "Buying…" : t("ps.buy")}
             </Button>
           </div>
         </div>

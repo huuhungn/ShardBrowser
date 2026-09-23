@@ -79,12 +79,12 @@ export function ProfileTable() {
               onChange={(e) => selectProfiles(e.target.checked, paged)}
             />
           </div>
-          <div>Name</div>
-          <div>Status</div>
-          <div>Proxy</div>
-          <div className="head-notes">Notes</div>
-          <div className="head-time">Time</div>
-          <div className="head-lastrun">Last run</div>
+          <div>{t("profileTable.name")}</div>
+          <div>{t("profileTable.status")}</div>
+          <div>{t("profileTable.proxy")}</div>
+          <div className="head-notes">{t("profileTable.notes")}</div>
+          <div className="head-time">{t("profileTable.time")}</div>
+          <div className="head-lastrun">{t("profileTable.lastRun")}</div>
           <div></div>
         </div>
         {expanded === "__new__" && (
@@ -107,7 +107,7 @@ export function ProfileTable() {
             </div>
             {search ? (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No matching profiles</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noMatchingProfiles")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   Nothing matches “{search}”.
                 </p>
@@ -119,7 +119,7 @@ export function ProfileTable() {
               </>
             ) : folder && folder !== "all" ? (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">Folder is empty</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.folderIsEmpty")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   “{folder}” has no profiles. Move one in, or create one here.
                 </p>
@@ -130,7 +130,7 @@ export function ProfileTable() {
               </>
             ) : (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No profiles yet</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noProfilesYet")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   {t("profileTable.pickAFingerprintTemplateToStartFromA")}
                 </p>

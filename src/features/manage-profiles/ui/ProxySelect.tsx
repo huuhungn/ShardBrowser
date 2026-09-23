@@ -309,7 +309,7 @@ function CreatePanel({ onCancel, onCreated }: {
         ) : (
           <span className="text-text-soft-400">
             {line.trim()
-              ? "Not a proxy line — check the host and port."
+              ? t("profile.notAProxyLineCheckTheHostAndPort")
               : "Paste a line: host:port, host:port:user:pass, user:pass@host:port, or a socks5:// URL."}
           </span>
         )}

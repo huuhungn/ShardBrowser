@@ -8,6 +8,7 @@ import {
   automationSave,
 } from "../model/api";
 import type { Block, Project, RunReport } from "../model/types";
+import { t } from "../../../shared/i18n";
 
 let seq = 0;
 
@@ -102,7 +103,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       // and timestamps, and editing a stale copy would overwrite them.
       set({ editing: saved });
       await get().reload();
-      toast.ok(p.id ? "Project saved" : "Project created");
+      toast.ok(p.id ? t("automation.projectSaved") : t("automation.projectCreated"));
     } catch (e) {
       toast.err(String(e));
     }
@@ -110,11 +111,11 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
 
   remove: async (p) => {
     const ok = await confirmModal({
-      title: "Delete project",
+      title: t("automation.deleteProject"),
       message: `Delete "${p.name || "this project"}"? This cannot be undone.`,
       buttons: [
-        { label: "Cancel", value: false },
-        { label: "Delete", value: true, danger: true },
+        { label: t("common.cancel"), value: false },
+        { label: t("common.delete"), value: true, danger: true },
       ],
     });
     if (!ok) return;
@@ -122,7 +123,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       await automationDelete(p.id);
       if (get().editing?.id === p.id) set({ editing: null, lastRun: null });
       await get().reload();
-      toast.ok("Project deleted");
+      toast.ok(t("automation.projectDeleted"));
     } catch (e) {
       toast.err(String(e));
     }
@@ -131,11 +132,11 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
   run: async (p) => {
     const profileId = get().runProfile;
     if (!profileId) {
-      toast.err("Pick a running profile first");
+      toast.err(t("automation.pickARunningProfileFirst"));
       return;
     }
     if (!p.id) {
-      toast.err("Save the project before running it");
+      toast.err(t("automation.saveTheProjectBeforeRunningIt"));
       return;
     }
     set({ running: true, lastRun: null });
@@ -144,7 +145,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       set({ lastRun: report });
       // A run that ends early is not a success, even though the call returned.
       if (report.ok) toast.ok(`Run finished in ${report.ms} ms`);
-      else toast.err(report.stopped_because || "Run failed");
+      else toast.err(report.stopped_because || t("automation.runFailed"));
     } catch (e) {
       toast.err(String(e));
     } finally {

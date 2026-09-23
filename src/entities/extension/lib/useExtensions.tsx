@@ -5,6 +5,7 @@ import { confirmModal } from "../../../shared/lib/confirm";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { extensionDelete, extensionImport, extensionImportUrl, extensionList } from "../model/api";
 import type { ExtensionEntry } from "../model/types";
+import { t } from "../../../shared/i18n";
 
 export type ExtensionStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -58,15 +59,15 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       await get().reload();
       set({ linkOpen: false });
       toast.ok(`Added "${added.name}"`);
-    } catch (e) { toast.err("Download failed: " + String(e)); }
+    } catch (e) { toast.err(t("extensions.downloadFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
 
   importFiles: async () => {
     const picked = await open({
       multiple: true,
-      title: "Pick .crx or .zip extensions",
-      filters: [{ name: "Extension", extensions: ["crx", "zip"] }],
+      title: t("extensions.pickCrxOrZipExtensions"),
+      filters: [{ name: t("extensions.extension"), extensions: ["crx", "zip"] }],
     });
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
     if (paths.length === 0) return;
@@ -75,25 +76,25 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       const added = await extensionImport(paths as string[]);
       await get().reload();
       toast.ok(`Added ${added.length} extension${added.length === 1 ? "" : "s"}`);
-    } catch (e) { toast.err("Import failed: " + String(e)); }
+    } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
 
   importFolder: async () => {
-    const dir = await open({ directory: true, title: "Pick an unpacked extension folder" });
+    const dir = await open({ directory: true, title: t("extensions.pickAnUnpackedExtensionFolder") });
     if (typeof dir !== "string") return;
     set({ busy: true });
     try {
       const added = await extensionImport([dir]);
       await get().reload();
-      toast.ok(added.length > 0 ? `Added "${added[0].name}"` : "Nothing added");
-    } catch (e) { toast.err("Import failed: " + String(e)); }
+      toast.ok(added.length > 0 ? `Added "${added[0].name}"` : t("extensions.nothingAdded"));
+    } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
 
   remove: async (e) => {
     const ok = await confirmModal({
-      title: "Remove extension",
+      title: t("extensions.removeExtension"),
       message: `Remove "${e.name}" from the library? Profiles using it stop loading it on their next launch.`,
       danger: true,
     });
@@ -101,7 +102,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
     try {
       await extensionDelete(e.id);
       await get().reload();
-      toast.ok("Extension removed");
+      toast.ok(t("extensions.extensionRemoved"));
     } catch (err) { toast.err(String(err)); }
   },
 }));

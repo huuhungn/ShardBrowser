@@ -20,9 +20,9 @@ export function ProxyTestResult({ snap, kind, busy }: {
         variant='filled'
         size="small"
         dot
-        title={snap.tcp_ms != null ? `TCP ${snap.tcp_ms} ms` : "TCP failed"}
+        title={snap.tcp_ms != null ? `TCP ${snap.tcp_ms} ms` : t("proxyTable.tcpFailed")}
       >
-        {snap.tcp_ms != null ? "Active" : "Failed"}
+        {snap.tcp_ms != null ? t("proxyTable.active") : t("proxyTable.failed")}
       </Badge>
       {/* UDP pill: clickable to docs explaining what the presence/absence of
           UDP means for QUIC + WebRTC. HTTP proxies never have UDP, but the

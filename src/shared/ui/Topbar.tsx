@@ -18,7 +18,7 @@ export function Topbar({ crumbs, search = "", onSearch }: {
   const t = useT();
   const ref = useRef<HTMLInputElement>(null);
   const section = crumbs[crumbs.length - 1] ?? "";
-  const label = section ? `Search ${section}` : "Search";
+  const label = section ? t("ui.searchSection", { section }) : t("ui.search");
   const searchable = typeof onSearch === "function";
   const isMac = HOST_OS === "macOS";
 

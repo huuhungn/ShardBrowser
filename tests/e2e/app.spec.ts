@@ -204,7 +204,9 @@ test("choosing a language translates what has been moved into locales", async ({
 
   // The choice has to survive a reload, or it is a toggle rather than a setting.
   await page.reload();
-  await page.getByRole("button", { name: "Settings" }).click();
+  // And the sidebar came with it: the button that said "Settings" on the way in
+  // is "Cài đặt" on the way back, which is the whole point of the setting.
+  await page.getByRole("button", { name: "Cài đặt" }).click();
   await expect(
     page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
   ).toBeVisible();

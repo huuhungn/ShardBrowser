@@ -58,7 +58,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
   const save = async () => {
     if (!items) return;
     const chosen = items.filter((d) => sel.has(d.ip));
-    if (chosen.length === 0) { toast.err("Select at least one proxy"); return; }
+    if (chosen.length === 0) { toast.err(t("ps.selectAtLeastOneProxy")); return; }
     const label = tag.trim() || `order ${order.order_id}`;
     const entries = chosen
       .map((d) => {
@@ -80,7 +80,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
     setSaving(true);
     try {
       const n = await proxyBulkSave(entries);
-      toast.ok(n > 0 ? `Added ${n} prox${n === 1 ? "y" : "ies"}` : "No new proxies (already in your list)");
+      toast.ok(n > 0 ? `Added ${n} prox${n === 1 ? "y" : "ies"}` : t("ps.noNewProxiesAlreadyInYourList"));
       // Apply only the selected proxies whose signature actually changed
       // (a non-empty value differing from the one already set).
       const sigItems = chosen
@@ -120,8 +120,8 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
               size="small"
               value={kind}
               items={[
-                { value: "socks5", label: "SOCKS5" },
-                { value: "http", label: "HTTP" },
+                { value: "socks5", label: t("ps.socks5") },
+                { value: "http", label: t("ps.http") },
               ]}
               onChange={(v) => setKind(v as "socks5" | "http")}
             />
@@ -135,7 +135,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         )}
         {!items && !err && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading proxies…</p>}
         {err && <p className="m-0 text-paragraph-xs text-text-soft-400">{err}</p>}
-        {items && items.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">This order has no active proxies.</p>}
+        {items && items.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.thisOrderHasNoActiveProxies")}</p>}
         {items && items.length > 0 && (
           <div className="mt-1.5 max-h-[320px] overflow-hidden overflow-y-auto rounded-10 bg-bg-white-0 ring-1 ring-inset ring-stroke-soft-200">
             <div className="grid items-center gap-2.5 border-b border-stroke-soft-200 bg-bg-weak-50 px-3 py-2" style={{ gridTemplateColumns: "20px 1fr 132px" }}>

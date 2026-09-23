@@ -10,14 +10,14 @@ import {
   dataRootGet, dataRootMigrate,
   type DataRootInfo, type MigrationProgress,
 } from "../../../entities/settings";
-import { useT } from "../../../shared/i18n";
+import { t, useT } from "../../../shared/i18n";
 
 const PHASE_LABEL: Record<MigrationProgress["phase"], string> = {
   scan: "Looking at what there is to move…",
-  copy: "Copying",
+  copy: t("profile.copying"),
   verify: "Checking every file arrived…",
   cleanup: "Removing the old copy…",
-  done: "Done",
+  done: t("profile.done"),
 };
 
 /** Where profiles, user-data, extensions and the trash live. The move copies,
@@ -45,15 +45,15 @@ export function DataRootCard() {
     const dir = await open({ directory: true, title: "Where should profiles live?" });
     if (typeof dir !== "string") return;
     const ok = await confirmModal({
-      title: "Move profile data",
+      title: t("profile.moveProfileData"),
       message:
         `Move profiles, user-data, extensions and the trash to "${dir}"?\n\n` +
         "Every file is copied and checked before anything is deleted, so a " +
         "failure leaves the current folder untouched. Profiles cannot be " +
         "launched until it finishes.",
       buttons: [
-        { label: "Cancel", value: false },
-        { label: "Move", value: true, primary: true },
+        { label: t("common.cancel"), value: false },
+        { label: t("profile.move"), value: true, primary: true },
       ],
     });
     if (ok !== true) return;
@@ -85,7 +85,7 @@ export function DataRootCard() {
           </span>
           <Button
             variant="neutral" mode="stroke" size="small" disabled={!info || running}
-            onClick={() => info && openPath(info.path).catch(() => toast.err("Could not open that folder"))}
+            onClick={() => info && openPath(info.path).catch(() => toast.err(t("profile.couldNotOpenThatFolder")))}
           >
             {t("profile.reveal")}
           </Button>

@@ -1,3 +1,5 @@
+import { t } from "../../../shared/i18n";
+
 export type Settings = {
   browser_path: string | null;
   theme: string;
@@ -41,21 +43,21 @@ export type MigrationProgress = {
 
 /** The kinds the engine publishes, and what they are called to a person. */
 export const HELPER_KINDS: { value: string; label: string }[] = [
-  { value: "first_name",  label: "First name" },
-  { value: "last_name",   label: "Last name" },
-  { value: "full_name",   label: "Full name" },
-  { value: "email",       label: "Email" },
-  { value: "username",    label: "Username" },
-  { value: "phone",       label: "Phone" },
-  { value: "country",     label: "Country" },
-  { value: "city",        label: "City" },
-  { value: "postal_code", label: "Postcode" },
-  { value: "street",      label: "Address" },
-  { value: "birth_date",  label: "Date of birth" },
-  { value: "birth_day",   label: "Birth day" },
-  { value: "birth_month", label: "Birth month" },
-  { value: "birth_year",  label: "Birth year" },
-  { value: "gender",      label: "Gender" },
+  { value: "first_name",  label: t("helper.firstName") },
+  { value: "last_name",   label: t("helper.lastName") },
+  { value: "full_name",   label: t("helper.fullName") },
+  { value: "email",       label: t("helper.email") },
+  { value: "username",    label: t("helper.username") },
+  { value: "phone",       label: t("helper.phone") },
+  { value: "country",     label: t("helper.country") },
+  { value: "city",        label: t("helper.city") },
+  { value: "postal_code", label: t("helper.postcode") },
+  { value: "street",      label: t("helper.address") },
+  { value: "birth_date",  label: t("helper.dateOfBirth") },
+  { value: "birth_day",   label: t("helper.birthDay") },
+  { value: "birth_month", label: t("helper.birthMonth") },
+  { value: "birth_year",  label: t("helper.birthYear") },
+  { value: "gender",      label: t("helper.gender") },
 ];
 
 export type ApiInfo = {

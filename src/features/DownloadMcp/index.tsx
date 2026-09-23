@@ -4,19 +4,20 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "@proxyshard/shardx-ui-kit";
 import { DownloadIcon } from "../../shared/icons";
 import { toast } from "../../shared/model/toast";
+import { t } from "../../shared/i18n";
 
 export function DownloadMcp() {
   const [mcpBusy, setMcpBusy] = useState(false);
 
   const downloadMcp = async () => {
-    const dir = await open({ directory: true, title: "Where to download the MCP server" });
+    const dir = await open({ directory: true, title: t("mcp.whereToDownloadTheMcpServer") });
     if (typeof dir !== "string") return;
     setMcpBusy(true);
     try {
       const p = await invoke<string>("mcp_download", { dir });
       toast.ok(`MCP downloaded to ${p}`);
     } catch (e) {
-      toast.err("MCP download failed: " + String(e));
+      toast.err(t("mcp.mcpDownloadFailed") + String(e));
     } finally {
       setMcpBusy(false);
     }
@@ -32,7 +33,7 @@ export function DownloadMcp() {
       leftIcon={<DownloadIcon className="size-4" />}
       onClick={downloadMcp}
     >
-      {mcpBusy ? "Downloading…" : "Download MCP"}
+      {mcpBusy ? "Downloading…" : t("mcp.downloadMCP")}
     </Button>
   );
 }

@@ -64,7 +64,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
       onClose={onClose}
       title={`Distribute ${picked.length} prox${picked.length === 1 ? "y" : "ies"}`}
       maxWidthClassName="max-w-[760px]"
-      confirmLabel={willBind === 0 ? "Nothing to bind" : `Bind ${willBind}`}
+      confirmLabel={willBind === 0 ? t("proxy.nothingToBind") : `Bind ${willBind}`}
       onConfirm={run}
       isLoading={busy}
       isDisabled={busy || willBind === 0}
@@ -79,19 +79,19 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
             onChange={setFolder}
             isSearchable={folders.length > 8}
             options={[
-              { value: "all", label: "Every folder" },
+              { value: "all", label: t("proxy.everyFolder") },
               ...folders.map((f) => ({ value: f, label: f })),
             ]}
           />
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Apply to</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("proxy.applyTo")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
               value={scope}
               items={[
-                { value: "unbound", label: "Without a proxy" },
-                { value: "all", label: "All profiles" },
+                { value: "unbound", label: t("proxy.withoutAProxy") },
+                { value: "all", label: t("proxy.allProfiles") },
               ]}
               onChange={(v) => setScope(v as "unbound" | "all")}
             />

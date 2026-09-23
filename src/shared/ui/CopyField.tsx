@@ -21,7 +21,7 @@ export function CopyField({ value, secret }: { value: string; secret?: boolean }
           onClick={async () => {
             try {
               await clip.write(value);
-              toast.ok("Copied");
+              toast.ok(t("ui.copied"));
             } catch (e) {
               toast.err(String(e));
             }

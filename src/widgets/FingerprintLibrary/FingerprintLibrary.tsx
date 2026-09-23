@@ -2,6 +2,7 @@ import Badge from "../../shared/ui/Badge";
 import { AppleOsIcon, WindowsOsIcon, LinuxOsIcon } from "../../shared/icons";
 import { useFingerprint, useFingerprintGroups, FingerprintCard } from "../../entities/fingerprint";
 import { FingerprintCardActions } from "../../features/manage-fingerprints";
+import { useT } from "../../shared/i18n";
 
 function PlatformIcon({ platform }: { platform: string }) {
   switch (platform.toLowerCase()) {
@@ -17,13 +18,14 @@ function PlatformIcon({ platform }: { platform: string }) {
 }
 
 export function FingerprintLibrary() {
+  const t = useT();
   const isEmpty = useFingerprint((s) => s.items.length === 0);
   const groups = useFingerprintGroups();
 
   if (isEmpty) {
     return (
       <div className="rounded-12 bg-bg-white-0 px-6 py-14 text-center text-paragraph-sm text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
-        Library is empty — click "Import from file" or "Paste JSON".
+        {t("fp.libraryIsEmpty")}
       </div>
     );
   }

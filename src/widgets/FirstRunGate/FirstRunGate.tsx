@@ -101,7 +101,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
   return (
     <div className="fixed inset-0 z-1000 flex items-center justify-center bg-bg-weak-50 text-text-strong-950">
       <div className="w-[460px] px-9 py-8 text-center">
-        <div className="mb-2 text-title-h6">Setting up ShardX browser</div>
+        <div className="mb-2 text-title-h6">{t("firstRun.settingUpShardXBrowser")}</div>
         <div className="mb-6 text-paragraph-xs text-text-soft-400">
           {t("firstRun.firstRunDownloadFromOurCdnDoneOncePe")}
           (~{prog?.total ? fmt(prog.total) : "150 MB"}).

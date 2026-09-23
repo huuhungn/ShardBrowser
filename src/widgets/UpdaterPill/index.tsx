@@ -190,10 +190,10 @@ export function UpdaterPill() {
 
         <div className="flex justify-end gap-2 px-5 pb-5">
           {(phase === "available" || (phase === "error" && info?.update_available)) && (
-            <Button size="xsmall" onClick={download}>Download update</Button>
+            <Button size="xsmall" onClick={download}>{t("updater.downloadUpdate")}</Button>
           )}
           {phase === "ready" && (
-            <Button size="xsmall" onClick={install}>Install and restart</Button>
+            <Button size="xsmall" onClick={install}>{t("updater.installAndRestart")}</Button>
           )}
           {phase === "up_to_date" && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={check}>

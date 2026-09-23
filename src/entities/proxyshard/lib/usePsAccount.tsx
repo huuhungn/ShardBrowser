@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { t } from "../../../shared/i18n";
 import { toast } from "../../../shared/lib/toast";
 import { PsMe } from "../model/types";
 import { psGetKey, psSetKey, psMe } from "../model/api";
@@ -51,7 +52,7 @@ export const usePsAccount = create<PsAccountStore>((set, get) => ({
         try {
             await psSetKey(value);
             set({ key: value });
-            toast.ok("API key saved");
+            toast.ok(t("ps.apiKeySaved"));
             if (value) get().refreshMe();
             else set({ me: null, status: "idle" });
         } catch (e) { toast.err(String(e)); }

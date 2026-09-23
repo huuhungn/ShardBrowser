@@ -39,7 +39,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
       .catch(() => {});
   }, [orderId]);
   const save = async () => {
-    if (!p.host.trim()) { toast.err("A proxy needs a host"); return; }
+    if (!p.host.trim()) { toast.err(t("proxy.aProxyNeedsAHost")); return; }
     try {
       const saved = await proxySave(p);
       // Apply the p0f signature only when it changed to a non-empty value.
@@ -49,7 +49,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
           toast.ok(`p0f set to ${sig}`);
         } catch (e) { toast.err("p0f: " + String(e)); }
       }
-      toast.ok(initial.id ? "Proxy saved" : "Proxy added");
+      toast.ok(initial.id ? t("proxy.proxySaved") : t("proxy.proxyAdded"));
       onSaved?.(saved);
       onClose();
     } catch (e) { toast.err(String(e)); }
@@ -58,7 +58,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
     <DialogModal
       open
       onClose={onClose}
-      title={initial.id ? "Edit proxy" : "New proxy"}
+      title={initial.id ? t("proxy.editProxy") : t("proxy.newProxy")}
       confirmLabel={t("common.save")}
       onConfirm={save}
       cancelLabel={t("common.cancel")}
@@ -78,9 +78,9 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
             value={p.kind}
             onChange={(v) => setP({ ...p, kind: v as ProxyEntry["kind"] })}
             options={[
-              { value: "socks5", label: "SOCKS5" },
-              { value: "http", label: "HTTP" },
-              { value: "https", label: "HTTPS" },
+              { value: "socks5", label: t("proxy.socks5") },
+              { value: "http", label: t("proxy.http") },
+              { value: "https", label: t("proxy.https") },
             ]}
           />
           <Field label={t("common.country")} value={p.country} onChange={(v: string) => setP({ ...p, country: v })} />

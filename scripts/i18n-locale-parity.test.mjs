@@ -28,6 +28,26 @@ const en = read("en.json");
 // sentence can never slip past by being brief.
 const SAME_IN_EVERY_LANGUAGE = new Set([
   "settings.helper.title",
+  "helper.email",
+  "ps.relay",
+  "team.linux",
+  "team.windows",
+  // Words Vietnamese borrowed outright: the proxy screens say "proxy" and
+  // "residential", and a translated coinage would read as a different product.
+  "profileTable.proxy",
+  "ps.residential",
+  // Protocol and platform names, spelled the same on every screen in the world.
+  "automation.get",
+  "proxy.http",
+  "proxy.https",
+  "proxy.socks5",
+  "ps.http",
+  "ps.socks5",
+  "ps.android",
+  "ps.linux",
+  "ps.windows",
+  "ps.premium",
+  "sidebar.proxyshard",
   // Web platform names a Vietnamese reader meets in English everywhere else —
   // in Chrome's own settings, in every tutorial. Translating "Canvas" or
   // "WebRTC" would make the row harder to recognise, not easier.
@@ -176,19 +196,89 @@ function tsxFilesUnder(dir) {
   return out;
 }
 
+/**
+ * Components are not the only place text lives: option lists, field catalogues
+ * and confirm defaults sit in plain .ts data modules, and the Shard Helper's
+ * whole field list ("First name", "Postcode", "Date of birth") stayed English
+ * there long after every .tsx had been translated. Walk those too.
+ *
+ * One body of text is deliberately outside all of this: `pages/patchlog/
+ * patchlog.json` is the release history, 44 entries of it, written once per
+ * release the way release notes always are. It is a record of what shipped, not
+ * interface text, so it stays in the language it was written in.
+ */
+function tsDataFilesUnder(dir) {
+  const out = [];
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name === "locales") continue; // the translations themselves
+      out.push(...tsDataFilesUnder(full));
+    } else if (e.name.endsWith(".ts") && !e.name.endsWith(".d.ts")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 // The product's own name reads the same in every language; translating it would
-// be a bug, not a feature.
-const NOT_PROSE = new Set(["ShardX Launcher"]);
+// be a bug, not a feature. Nor do language endonyms belong in a translation
+// file: a Vietnamese speaker picking German from a list looks for "Deutsch",
+// not for the Vietnamese word for German. Operating-system names are likewise
+// spelled one way everywhere.
+const NOT_PROSE = new Set([
+  "ShardX Launcher",
+  "ShardX",
+  "ProxyShard",
+  "English",
+  "English (US)",
+  "English (UK)",
+  "English (Canada)",
+  "English (Australia)",
+  "Deutsch (Deutschland)",
+  "Italiano",
+  "Nederlands",
+  "Polski",
+  "Svenska",
+  "Suomi",
+  "Norsk",
+  "Dansk",
+  "Magyar",
+  "Bahasa Indonesia",
+  "Windows",
+  "Windows 10",
+  "Windows 11",
+  "Linux",
+  "Android",
+  "macOS",
+  "Residential",
+]);
+
+/** Comments explain the code to us; they are not text anyone reads on screen. */
+function withoutComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
 
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
-  const withoutComments = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  for (const line of withoutComments.split("\n")) {
+  for (const line of withoutComments(src).split("\n")) {
     const s = line.trim();
     // A bare line of prose between tags: "Add block", "No projects yet".
     if (/^[A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?]$/.test(s) && !s.includes("=") && !s.includes("(")) {
       found.push(s);
+    }
+    // Short labels often share a line with their tag — `<div class=…>Notes</div>`
+    // — so the bare-line rule above never sees them. A column heading that hid
+    // behind its own className is still a word someone reads.
+    for (const m of s.matchAll(/>([A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?])</g)) {
+      found.push(m[1]);
     }
     for (const m of s.matchAll(
       /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label)="([^"]{3,})"/g,
@@ -202,6 +292,86 @@ function englishInSource(src) {
   }
   return found;
 }
+
+// The JSX scan above reads what sits between tags, which is why a sidebar
+// built from `{ label: "Browsers" }` stayed English through a whole migration
+// that claimed to be finished: the text never appears as a JSX child, only as
+// a value in a table the component maps over. Menus, filter options, confirm
+// dialogs and file pickers are all built this way, so they get their own check.
+const PROSE_PROP =
+  /\b(label|title|placeholder|heading|confirmLabel|cancelLabel|emptyText|message)\s*:\s*"([A-Z][A-Za-z0-9 ,.'()/-]{2,})"/g;
+
+function englishInProps(src) {
+  const out = [];
+  for (const line of withoutComments(src).split("\n")) {
+    for (const m of line.matchAll(PROSE_PROP)) out.push(m[2]);
+  }
+  return out;
+}
+
+test("no data table still holds its English in a label", () => {
+  const offenders = [];
+  for (const root of uiRoots) {
+    for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
+      const src = readFileSync(file, "utf8");
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      for (const text of englishInProps(src)) {
+        if (NOT_PROSE.has(text)) continue;
+        offenders.push(`${where}: ${text}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these labels read as English text rather than t("…") keys:\n  ${offenders.join("\n  ")}`,
+  );
+});
+
+// The two checks above read JSX children and object labels. Text also reaches
+// people through a third door: a bare literal in a ternary, a toast argument, a
+// confirm message. `{running ? "Stop" : "Start"}` is neither a JSX child nor a
+// property, and a whole table of row actions stayed English behind exactly that
+// shape. So the last check is the general one — any English-looking literal in
+// a .tsx file — with the genuinely non-prose spelled out rather than guessed.
+
+// DOM and platform vocabulary: these strings are compared against, not read.
+const NOT_TEXT = new Set([
+  "Enter", "Escape", "Tab", "Backspace", "Delete", "Home", "End",
+  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown",
+  "Authorization", "Signature: ", "ShardX", "ProxyShard", "ShardX Launcher",
+  "Windows", "Linux", "MacOS", "macOS", "IOS", "Android",
+]);
+
+const LITERAL = /"([A-Z][A-Za-z0-9 ,.'’:/()—–-]{2,60})"/g;
+// Lines where a string is machinery rather than prose: module paths, CSS class
+// names, DOM ids, invoke() command names, HTTP headers.
+const MACHINERY =
+  /\b(import|from|className|invoke|querySelector|getElementById|setAttribute|localStorage|sessionStorage|fetch|headers|key=|data-|aria-label=\{t)\b|classList|\.get\(/;
+
+test("no ternary or toast still holds its English", () => {
+  const offenders = [];
+  for (const root of uiRoots) {
+    for (const file of tsxFilesUnder(root)) {
+      const src = withoutComments(readFileSync(file, "utf8"));
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      for (const line of src.split("\n")) {
+        if (MACHINERY.test(line)) continue;
+        for (const m of line.matchAll(LITERAL)) {
+          const text = m[1];
+          if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
+          if (!/[a-z]{2}/.test(text)) continue; // SCREAMING_CASE constants
+          offenders.push(`${where}: ${text}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these literals reach the screen as English:\n  ${offenders.join("\n  ")}`,
+  );
+});
 
 test("no screen still holds its English inline", () => {
   const offenders = [];

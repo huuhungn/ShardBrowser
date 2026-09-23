@@ -20,7 +20,7 @@ import {
   type RunReport,
 } from "../../entities/automation";
 import { useProfile } from "../../entities/profile";
-import { useT } from "../../shared/i18n";
+import { t, useT } from "../../shared/i18n";
 
 type ParamSpec = {
   key: string;
@@ -57,7 +57,7 @@ const PARAMS: Record<string, ParamSpec[]> = {
   ],
   assert: [
     { key: "selector", labelKey: "automation.param.selector", placeholder: ".welcome" },
-    { key: "expected", labelKey: "automation.param.mustContain", placeholder: "Signed in" },
+    { key: "expected", labelKey: "automation.param.mustContain", placeholder: t("automation.signedIn") },
   ],
   evaluate: [
     { key: "script", labelKey: "automation.param.script", placeholder: "document.title" },
@@ -76,7 +76,7 @@ const PARAMS: Record<string, ParamSpec[]> = {
   httpOpen: [],
   httpRequest: [
     { key: "url", labelKey: "automation.param.url", placeholder: "https://api.example.com/v1/me" },
-    { key: "method", labelKey: "automation.param.method", placeholder: "GET" },
+    { key: "method", labelKey: "automation.param.method", placeholder: t("automation.get") },
     { key: "body", labelKey: "automation.param.body", placeholder: '{"name":"{{who}}"}' },
     {
       key: "headers",
@@ -234,9 +234,9 @@ function BlockRow({
             variant={block.enabled ? "neutral" : "primary"}
             mode="ghost" size="2xsmall"
             onClick={() => onChange({ ...block, enabled: !block.enabled })}
-            title={block.enabled ? "Skip this block" : "Enable this block"}
+            title={block.enabled ? t("automation.skipThisBlock") : t("automation.enableThisBlock")}
           >
-            {block.enabled ? "On" : "Off"}
+            {block.enabled ? "On" : t("automation.off")}
           </Button>
           <Button
             variant="error" mode="ghost" size="2xsmall"
@@ -246,7 +246,7 @@ function BlockRow({
         </div>
       </div>
       <div className="mt-2 flex items-center gap-2 pl-8">
-        <span className="text-paragraph-xs text-text-soft-400">On failure</span>
+        <span className="text-paragraph-xs text-text-soft-400">{t("automation.onFailure")}</span>
         <div className="w-[150px]">
           <CSSelect
             value={block.on_fail === "next" ? "next" : "stop"}

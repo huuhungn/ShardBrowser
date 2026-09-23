@@ -58,7 +58,7 @@ export function SyncPanel({ group }: { group: string }) {
         </div>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} disabled={busy}
                 onClick={() => run(() => syncSetPaused(group, !paused))}
-                title={paused ? "Resume" : "Hold — work in one window alone"}
+                title={paused ? t("sync.resume") : t("sync.holdWorkInOneWindowAlone")}
                 className="flex size-6 items-center justify-center rounded-6 text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200 hover:bg-bg-weak-50 disabled:opacity-50">
           {paused ? <PlayIcon className="size-3" /> : <PauseIcon className="size-3" />}
         </button>
@@ -94,7 +94,7 @@ export function SyncPanel({ group }: { group: string }) {
                 disabled={busy}
                 onClick={() => run(() => syncSetExcluded(group, m.profile, !m.excluded))}
                 title={`${m.profile}${m.driving ? " — driving" : ""}\n${
-                  m.excluded ? "Click to bring back into the group" : "Click to hold out"}`}
+                  m.excluded ? t("sync.clickToBringBackIntoTheGroup") : t("sync.clickToHoldOut")}`}
                 className={`flex max-w-[9rem] items-center gap-1 rounded-6 px-1.5 py-0.5 text-paragraph-xs ring-1 ring-inset disabled:opacity-50 ${
                   m.excluded
                     ? "text-text-soft-400 line-through ring-stroke-soft-200"

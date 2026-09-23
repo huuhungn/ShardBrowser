@@ -22,7 +22,7 @@ export function QuickEditDialog({
   const saveProxy = async () => {
     try {
       await profileBindProxy(profile.id, proxyId);
-      toast.ok("Proxy updated");
+      toast.ok(t("profile.proxyUpdated"));
       onSaved();
     } catch (e) { toast.err(String(e)); }
   };
@@ -33,7 +33,7 @@ export function QuickEditDialog({
       const stored = await profileGet(profile.id);
       stored.notes = notes;
       await profileSave(stored);
-      toast.ok("Notes saved");
+      toast.ok(t("profile.notesSaved"));
       onSaved();
     } catch (e) { toast.err(String(e)); }
   };
@@ -42,7 +42,7 @@ export function QuickEditDialog({
     <DialogModal
       open
       onClose={onClose}
-      title={`${kind === "proxy" ? "Bind proxy" : "Edit notes"} — ${profile.name}`}
+      title={`${kind === "proxy" ? t("profile.bindProxy") : t("profile.editNotes")} — ${profile.name}`}
       confirmLabel={t("common.save")}
       onConfirm={kind === "proxy" ? saveProxy : saveNotes}
       cancelLabel={t("common.cancel")}

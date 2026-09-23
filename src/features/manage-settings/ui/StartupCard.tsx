@@ -43,16 +43,16 @@ export function StartupCard({
       >
         <strong className="text-label-xs text-text-strong-950">
           {status?.registered
-            ? "Startup entry registered"
+            ? t("settings.startupEntryRegistered")
             : error
-              ? "Startup status unavailable"
-              : "Startup entry not registered"}
+              ? t("settings.startupStatusUnavailable")
+              : t("settings.startupEntryNotRegistered")}
         </strong>
         <span className="text-paragraph-xs text-text-sub-600">
           {error ??
             (status?.registered
-              ? "Launcher and Automation API will start at desktop sign-in."
-              : "Enable this option and save settings to register it for the current user.")}
+              ? t("settings.launcherAndAutomationAPIWillStartAtDes")
+              : t("settings.enableThisOptionAndSaveSettingsToReg"))}
         </span>
       </div>
     </div>

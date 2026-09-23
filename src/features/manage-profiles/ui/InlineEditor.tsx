@@ -129,11 +129,11 @@ export function InlineEditor({
       <div className="grid grid-cols-3 gap-4">
         {/* ----- col 1: identity + hardware ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Identity</SectionHeading>
+          <SectionHeading>{t("profile.identity")}</SectionHeading>
           <Field label={t("profile.profileName")} value={f.name} onChange={(v) => u("name", v)} placeholder={t("profile.eGShopPl1")} />
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Operating system</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.operatingSystem")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
@@ -171,7 +171,7 @@ export function InlineEditor({
           </div>
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Proxy</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.proxy")}</span>
             <ProxySelect
               value={f.proxy_id}
               proxies={proxies}
@@ -188,7 +188,7 @@ export function InlineEditor({
 
         {/* ----- col 2: locale + noise ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Locale</SectionHeading>
+          <SectionHeading>{t("profile.locale")}</SectionHeading>
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
              
@@ -198,7 +198,7 @@ export function InlineEditor({
                 onChange={(v) => u("timezone", v)}
                 options={TIMEZONES.map((tz) => ({
                   value: tz,
-                  label: tz === AUTO_TZ ? "Auto (from proxy geo)" : tz,
+                  label: tz === AUTO_TZ ? t("profile.autoFromProxyGeo") : tz,
                 }))}
               />
             </label>
@@ -214,7 +214,7 @@ export function InlineEditor({
           </div>
 
           <div className="mt-1.5">
-            <SectionHeading>Noise</SectionHeading>
+            <SectionHeading>{t("profile.noise")}</SectionHeading>
           </div>
           <div className="grid grid-cols-2 gap-2 gap-x-3">
             <Pair label={t("profile.canvas")}        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
@@ -222,7 +222,7 @@ export function InlineEditor({
             <Pair label={t("profile.audio")}         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
             <Pair label={t("profile.clientRects")}  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
             <Pair label={t("profile.sensors")}       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
-            <Pair label={t("profile.fonts")}         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText="Noise" />
+            <Pair label={t("profile.fonts")}         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText={t("profile.noise")} />
           </div>
 
           <PortList
@@ -234,7 +234,7 @@ export function InlineEditor({
 
         {/* ----- col 3: privacy + media + notes ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Privacy</SectionHeading>
+          <SectionHeading>{t("profile.privacy")}</SectionHeading>
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
               <CSSelect
@@ -242,9 +242,9 @@ export function InlineEditor({
                 value={f.webrtc}
                 onChange={(v) => u("webrtc", v as WebRtcMode)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "tcp_only", label: "TCP only" },
-                  { value: "block", label: "Block" },
+                  { value: "auto", label: t("profile.auto") },
+                  { value: "tcp_only", label: t("profile.tcpOnly") },
+                  { value: "block", label: t("profile.block") },
                 ]}
               />
             </label>
@@ -254,8 +254,8 @@ export function InlineEditor({
                 value={f.do_not_track ? "1" : "0"}
                 onChange={(v) => u("do_not_track", v === "1")}
                 options={[
-                  { value: "0", label: "Off" },
-                  { value: "1", label: "On (send DNT: 1)" },
+                  { value: "0", label: t("profile.off") },
+                  { value: "1", label: t("profile.onSendDNT1") },
                 ]}
               />
             </label>
@@ -267,21 +267,21 @@ export function InlineEditor({
               value={f.restore_session ? "1" : "0"}
               onChange={(v) => u("restore_session", v === "1")}
               options={[
-                { value: "1", label: "Reopen last session's tabs" },
-                { value: "0", label: "Always start fresh" },
+                { value: "1", label: t("profile.reopenLastSessionSTabs") },
+                { value: "0", label: t("profile.alwaysStartFresh") },
               ]}
             />
           </label>
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Geolocation</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.geolocation")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
               value={f.geo_mode}
               items={(["auto", "manual"] as GeoMode[]).map((m) => ({
                 value: m,
-                label: m === "auto" ? "Auto (from proxy)" : "Manual coords",
+                label: m === "auto" ? t("profile.autoFromProxy") : t("profile.manualCoords"),
               }))}
               onChange={(v) => u("geo_mode", v as GeoMode)}
             />
@@ -295,7 +295,7 @@ export function InlineEditor({
           )}
 
           <div className="mt-2.5">
-            <SectionHeading>Media devices</SectionHeading>
+            <SectionHeading>{t("profile.mediaDevices")}</SectionHeading>
           </div>
           <div className="grid grid-cols-3 gap-3">
             <SelectField label={t("profile.micIn")} value={f.media_audio_in} onChange={(v) => u("media_audio_in", v)} options={MEDIA_COUNT_OPTIONS} />
@@ -304,7 +304,7 @@ export function InlineEditor({
           </div>
 
           <div className="mt-2.5">
-            <SectionHeading>Extensions</SectionHeading>
+            <SectionHeading>{t("profile.extensions")}</SectionHeading>
           </div>
           <ExtensionPicker
             value={f.extensions}
@@ -326,9 +326,9 @@ export function InlineEditor({
             {error}
           </p>
         )}
-        <Button variant="neutral" mode="stroke" size="small" onClick={onCancel}>Cancel</Button>
+        <Button variant="neutral" mode="stroke" size="small" onClick={onCancel}>{t("profile.cancel")}</Button>
         <Button variant="primary" mode="filled" size="small" onClick={onSave}>
-          {f.id ? "Save changes" : "Create profile"}
+          {f.id ? t("profile.saveChanges") : t("profile.createProfile")}
         </Button>
       </div>
 

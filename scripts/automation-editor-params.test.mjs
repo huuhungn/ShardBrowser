@@ -110,7 +110,12 @@ async function loadEditorParams() {
 
   const entry = path.join(dir, "params.ts");
   const { writeFile } = await import("node:fs/promises");
-  await writeFile(entry, `${specType[0]}\n${table[0]}\nexport { PARAMS };\n`, "utf8");
+  // The labels in the table are translated now, and `t` lives in the app's i18n
+  // module that this bundle deliberately leaves behind. The test reads param
+  // names and types, never the label text, so a stub that hands back the key is
+  // all the table needs to evaluate.
+  const tStub = `const t = (key: string): string => key;\n`;
+  await writeFile(entry, `${tStub}${specType[0]}\n${table[0]}\nexport { PARAMS };\n`, "utf8");
   await build({
     entryPoints: [entry],
     outfile,

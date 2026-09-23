@@ -1,6 +1,7 @@
 import Badge from "../../../shared/ui/Badge";
 import type { PsMe } from "../model/types";
 import type { PsStatus } from "../lib/usePsAccount";
+import { t } from "../../../shared/i18n";
 
 export function PsConnectionBadge({ status, me, err, hasKey }: {
   status: PsStatus;
@@ -17,7 +18,7 @@ export function PsConnectionBadge({ status, me, err, hasKey }: {
       {status === "err" && (
         <Badge color="error" variant="filled" size="small" dot title={err}>Not connected — {err}</Badge>
       )}
-      {status === "idle" && !hasKey && <span className="text-paragraph-xs text-text-soft-400">No key set yet.</span>}
+      {status === "idle" && !hasKey && <span className="text-paragraph-xs text-text-soft-400">{t("ps.noKeySetYet")}</span>}
     </div>
   );
 }
