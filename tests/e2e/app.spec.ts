@@ -220,9 +220,13 @@ test("choosing a language translates what has been moved into locales", async ({
   await expect(apiHelp.locator("strong")).toHaveText("127.0.0.1");
   await expect(apiHelp).not.toContainText("*");
 
-  // Screens that still hold their English inline keep showing it. A key with no
-  // translation must never surface as its own name to someone using the app.
-  await expect(page.getByLabel("Start ShardX Launcher when I sign in")).toBeVisible();
+  // This row used to be the example of a screen still holding its English; it
+  // has since moved into locales/ with the rest, so Vietnamese is what a
+  // Vietnamese reader gets.
+  await expect(page.getByLabel("Mở ShardX Launcher khi tôi đăng nhập")).toBeVisible();
+
+  // A key with no translation must never surface as its own name to someone
+  // using the app — no raw "settings.foo.bar" anywhere on the screen.
   await expect(page.getByText(/settings\.[a-z]+\./)).toHaveCount(0);
 });
 

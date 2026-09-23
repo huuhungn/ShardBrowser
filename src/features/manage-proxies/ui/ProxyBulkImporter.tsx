@@ -6,8 +6,10 @@ import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { toast } from "../../../shared/model/toast";
 import type { ProxyEntry, BulkRowState } from "../../../entities/proxy";
 import { proxyBulkParse, proxyBulkSave, proxyFullTest } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const [text, setText] = useState("");
   const [kind, setKind] = useState<ProxyEntry["kind"]>("socks5");
   const [rows, setRows] = useState<BulkRowState[]>([]);
@@ -79,7 +81,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
     <Modal
       open
       onClose={onClose}
-      title="Bulk import proxies"
+      title={t("proxy.bulkImportProxies")}
       maxWidthClassName="max-w-[750px]"
       footer={
         <div className="flex items-center justify-end gap-2">
@@ -98,7 +100,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
         {rows.length === 0 ? (
           <>
             <Select
-              label="Default type (used when a line has no scheme)"
+              label={t("proxy.defaultTypeUsedWhenALineHasNoScheme")}
               size="small"
               value={kind}
               onChange={(v) => setKind(v as ProxyEntry["kind"])}
@@ -109,7 +111,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
               ]}
             />
             <Textarea
-              label="Paste one proxy per line"
+              label={t("proxy.pasteOneProxyPerLine")}
               rows={12}
               className="mono"
               value={text}
@@ -156,7 +158,7 @@ host:8080               # no auth
                       rs.map((r) => ({ ...r, selected: r.status === "ok" }))
                     )
                   }
-                  title="Tick only proxies whose latest test succeeded"
+                  title={t("proxy.tickOnlyProxiesWhoseLatestTestSuccee")}
                 >
                   ✓ Keep working only
                 </Button>
@@ -213,7 +215,7 @@ host:8080               # no auth
                     onlyIcon
                     onClick={() => testOne(i)}
                     disabled={r.status === "testing"}
-                    title="Test this row"
+                    title={t("proxy.testThisRow")}
                     leftIcon={<RefreshIcon className="size-3.5" />}
                   />
                 </div>

@@ -7,6 +7,7 @@ import type { PsOrder } from "../../../entities/proxyshard";
 import { psOrders, psRenew, usePsAccount } from "../../../entities/proxyshard";
 import { PsImportModal } from "./PsImportModal";
 import { PsTagModal } from "./PsTagModal";
+import { useT } from "../../../shared/i18n";
 
 /// Orders list: add DC/ISP proxies to the local list, top up residential
 /// traffic, edit the tag, or renew an on-hold order. Mobile proxies are
@@ -14,6 +15,7 @@ import { PsTagModal } from "./PsTagModal";
 const PS_ORDERS_PAGE = 10;
 
 export function PsOrdersCard() {
+  const t = useT();
   // Refresh the account wallet/orders metrics after a renew.
   const onChanged = usePsAccount((s) => s.refreshMe);
   const [status, setStatus] = useState("active");
@@ -79,7 +81,7 @@ export function PsOrdersCard() {
               ]}
             />
           </div>
-          <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => load()} title="Refresh">
+          <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => load()} title={t("ps.refresh")}>
             <RefreshIcon className="size-4" />
           </Button>
         </div>
@@ -105,16 +107,16 @@ export function PsOrdersCard() {
                   size="2xsmall"
                   leftIcon={<DownloadIcon className="size-3.5" />}
                   onClick={() => setImporting(o)}
-                  title="Pick which proxies to add to your list"
+                  title={t("ps.pickWhichProxiesToAddToYourList")}
                 >
-                  Add to proxies
+                  {t("ps.addToProxies")}
                 </Button>
-                <Button variant="neutral" mode="stroke" size="2xsmall" onlyIcon onClick={() => setTagging(o)} title="Edit tag">
+                <Button variant="neutral" mode="stroke" size="2xsmall" onlyIcon onClick={() => setTagging(o)} title={t("ps.editTag")}>
                   <EditIcon className="size-3.5" />
                 </Button>
                 {status === "on-hold" && (
                   <Button variant="neutral" mode="stroke" size="2xsmall" disabled={busy[o.order_id]} onClick={() => renew(o)}>
-                    Renew
+                    {t("ps.renew")}
                   </Button>
                 )}
               </div>

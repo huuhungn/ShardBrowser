@@ -9,11 +9,13 @@ import { confirmModal } from "../../../shared/model/confirm";
 import { fmtCents, isDcIsp, availCode } from "../../../shared/lib/utils";
 import type { PsOrder, PsProduct, PsCalc, PsBuyOption } from "../../../entities/proxyshard";
 import { psProducts, psOrders, psAvailableCount, psCalculate, psPurchase, usePsAccount } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 /// Buy a new order. DC/ISP can be bought repeatedly (quantity + country);
 /// residential products can only be owned once, so any already-owned tier is
 /// hidden here (top it up from the Residential card instead).
 export function PsBuyCard() {
+  const t = useT();
   // Refresh the account wallet/orders metrics after a purchase.
   const onPurchased = usePsAccount((s) => s.refreshMe);
   const [options, setOptions] = useState<PsBuyOption[]>([]);
@@ -191,7 +193,7 @@ export function PsBuyCard() {
                 <CSSelect
                   value={country}
                   onChange={setCountry}
-                  placeholder="Pick a country"
+                  placeholder={t("ps.pickACountry")}
                   isSearchable
                   searchPlaceholder="Search locations…"
                   options={(product?.locations ?? []).map((l) => ({ value: l, label: l }))}
@@ -200,12 +202,12 @@ export function PsBuyCard() {
             ) : (
               <div />
             )}
-            <NumField label="Quantity" value={quantity} onChange={(v) => { setQuantity(Math.max(1, Math.round(v))); setCalc(null); }} />
+            <NumField label={t("ps.quantity")} value={quantity} onChange={(v) => { setQuantity(Math.max(1, Math.round(v))); setCalc(null); }} />
           </div>
           <div className="grid grid-cols-2 items-end gap-3">
-            <Field label="Promo code (optional)" value={promo} onChange={setPromo} />
+            <Field label={t("ps.promoCodeOptional")} value={promo} onChange={setPromo} />
             <Checkbox
-              label="Auto-renew"
+              label={t("ps.autoRenew")}
               checked={autoRenew}
               onChange={(e) => setAutoRenew(e.target.checked)}
               wrapperClassName="mb-2"

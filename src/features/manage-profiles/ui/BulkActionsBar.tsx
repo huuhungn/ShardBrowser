@@ -9,8 +9,10 @@ import {
 } from "../../../shared/icons";
 import { useProfile } from "../../../entities/profile";
 import { useNav } from "../../../shared/model/navigation";
+import { useT } from "../../../shared/i18n";
 
 export function BulkActionsBar() {
+  const t = useT();
   const count = useProfile((s) => s.selected.size);
   const bulkLaunch = useProfile((s) => s.bulkLaunch);
   const goToPatchLog = useNav((s) => s.setSection);
@@ -33,13 +35,13 @@ export function BulkActionsBar() {
           mode="stroke"
           className="pr-4"
           size="2xsmall"
-          title="Not released yet — read why in the patch log"
+          title={t("profile.notReleasedYetReadWhyInThePatchLog")}
           leftIcon={<LockedIcon className="size-3.5" />}
           onClick={() => goToPatchLog("patchlog")}
         >
           <span className="inline-flex items-center gap-1.5">
             <SyncIcon className="size-3.5" />
-            Launch synced
+            {t("profile.launchSynced")}
           </span>
         </Button>
       )}

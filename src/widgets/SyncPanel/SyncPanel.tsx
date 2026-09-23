@@ -5,12 +5,14 @@ import {
 } from "../../entities/profile/model/api";
 import { PlayIcon, PauseIcon, SyncIcon, StopIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
+import { useT } from "../../shared/i18n";
 
 /**
  * One floating control surface for the whole group. Every window is equal —
  * whichever the operator works in is the one driving — so nothing is per-window.
  */
 export function SyncPanel({ group }: { group: string }) {
+  const t = useT();
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [busy, setBusy] = useState(false);
   // Must survive the second before the first browser connects, and go once
@@ -62,7 +64,7 @@ export function SyncPanel({ group }: { group: string }) {
         </button>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} disabled={busy}
                 onClick={() => run(() => syncStop(group))}
-                title="Close every window in the group"
+                title={t("sync.closeEveryWindowInTheGroup")}
                 className="flex size-6 items-center justify-center rounded-6 text-error-base ring-1 ring-inset ring-stroke-soft-200 hover:bg-error-lighter disabled:opacity-50">
           <StopIcon className="size-3" />
         </button>

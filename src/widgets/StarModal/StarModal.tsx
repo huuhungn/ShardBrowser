@@ -3,10 +3,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button, Modal } from "@proxyshard/shardx-ui-kit";
 import { GithubMark } from "../../shared/icons";
 import { GH_REPO_URL } from "../../shared/lib/utils";
+import { useT } from "../../shared/i18n";
 
 /// One-time GitHub-star prompt shown after the app first loads. Dismissal is
 /// remembered in localStorage so it never nags again.
 export function StarModal() {
+  const t = useT();
   const [show, setShow] = useState(false);
   useEffect(() => {
     if (localStorage.getItem("shardx-star-prompt") === "done") return;
@@ -38,10 +40,10 @@ export function StarModal() {
         </p>
         <div className="flex justify-center gap-2.5">
           <Button variant="neutral" mode="stroke" size="small" onClick={close}>
-            Maybe later
+            {t("star.maybeLater")}
           </Button>
           <Button variant="primary" mode="filled" size="small" leftIcon={<GithubMark />} onClick={star}>
-            Star on GitHub
+            {t("star.starOnGithub")}
           </Button>
         </div>
       </div>

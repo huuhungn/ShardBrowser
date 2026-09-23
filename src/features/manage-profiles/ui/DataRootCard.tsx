@@ -10,6 +10,7 @@ import {
   dataRootGet, dataRootMigrate,
   type DataRootInfo, type MigrationProgress,
 } from "../../../entities/settings";
+import { useT } from "../../../shared/i18n";
 
 const PHASE_LABEL: Record<MigrationProgress["phase"], string> = {
   scan: "Looking at what there is to move…",
@@ -22,6 +23,7 @@ const PHASE_LABEL: Record<MigrationProgress["phase"], string> = {
 /** Where profiles, user-data, extensions and the trash live. The move copies,
  *  verifies, then deletes; the backend refuses launches while it runs. */
 export function DataRootCard() {
+  const t = useT();
   const [info, setInfo] = useState<DataRootInfo | null>(null);
   const [progress, setProgress] = useState<MigrationProgress | null>(null);
 
@@ -70,10 +72,7 @@ export function DataRootCard() {
   return (
     <div className="flex flex-col gap-3">
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Profiles, their user-data dirs, the extension library and the trash. The
-        small config files stay in the app's own folder so the launcher can always
-        find where the data went. Pick a folder on any disk — an external drive
-        mounted read-only is rejected before anything is copied.
+        {t("profile.profilesTheirUserDataDirsTheExtensio")}
       </p>
 
       <label className="flex flex-col gap-1.5">
@@ -88,7 +87,7 @@ export function DataRootCard() {
             variant="neutral" mode="stroke" size="small" disabled={!info || running}
             onClick={() => info && openPath(info.path).catch(() => toast.err("Could not open that folder"))}
           >
-            Reveal
+            {t("profile.reveal")}
           </Button>
           <Button
             variant="primary" mode="stroke" size="small" disabled={running}

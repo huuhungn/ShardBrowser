@@ -26,8 +26,10 @@ import { useNav } from "../../shared/model/navigation";
 import { DownloadMcp } from "../../features/DownloadMcp";
 import { ThemeSwitch } from "../../features/ThemeSwitch";
 import { UpdaterPill } from "../UpdaterPill";
+import { useT } from "../../shared/i18n";
 
 export function Sidebar() {
+  const t = useT();
   const section = useNav((s) => s.section);
   const setSection = useNav((s) => s.setSection);
 
@@ -111,7 +113,7 @@ export function Sidebar() {
           {autoUrl ? (
             <button
               className="flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-lg bg-bg-white-0 px-2 py-[5px] text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200 transition-colors hover:text-text-strong-950 hover:ring-stroke-sub-300"
-              title="Copy API base URL"
+              title={t("sidebar.copyApiBaseUrl")}
               onClick={() => { clip.write(autoUrl); toast.ok("Copied API URL"); }}
             >
               <span className="mono truncate">{autoUrl.replace(/^https?:\/\//, "")}</span>
@@ -130,9 +132,9 @@ export function Sidebar() {
             onClick={() => {
               openUrl(withUtm("https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle?fallback=true")).catch(() => {});
             }}
-            title="Open the full Automation API reference on docs.proxyshard.com"
+            title={t("sidebar.openTheFullAutomationApiReferenceOnD")}
           >
-            Documentation
+            {t("sidebar.documentation")}
           </Button>
         </div>
         <ThemeSwitch />

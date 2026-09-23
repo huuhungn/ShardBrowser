@@ -7,6 +7,7 @@ import type { PsOrder, ResiType } from "../../../entities/proxyshard";
 import { psProfileTraffic, psOrders, psRenew } from "../../../entities/proxyshard";
 import { PsTopupModal } from "./PsTopupModal";
 import { PsResiGenerator } from "./PsResiGenerator";
+import { useT } from "../../../shared/i18n";
 
 function TrafficStat({ value, label }: { value: string; label: string }) {
   return (
@@ -21,6 +22,7 @@ function TrafficStat({ value, label }: { value: string; label: string }) {
 /// traffic for Standard/Premium, in-place top-up, and the relay proxy
 /// generator. Unmetered is a flat plan, so it skips the GB meter.
 export function PsResidentialCard() {
+  const t = useT();
   const [type, setType] = useState<ResiType>("standart");
   const [data, setData] = useState<{ data: number; data_remain: number; data_spent: number } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -87,9 +89,9 @@ export function PsResidentialCard() {
           {data && !loading && (
             <>
               <div className="my-1 mb-3 grid grid-cols-3 gap-2.5">
-                <TrafficStat value={fmtGB(data.data_remain)} label="Remaining" />
-                <TrafficStat value={fmtGB(data.data_spent)} label="Used" />
-                <TrafficStat value={fmtGB(data.data)} label="Total" />
+                <TrafficStat value={fmtGB(data.data_remain)} label={t("ps.remaining")} />
+                <TrafficStat value={fmtGB(data.data_spent)} label={t("ps.used")} />
+                <TrafficStat value={fmtGB(data.data)} label={t("ps.total")} />
               </div>
               <ProgressBar value={pct} color={pct > 90 ? "error" : pct > 70 ? "warning" : "primary"} />
               <p className="m-0 mt-1 text-paragraph-xs text-text-soft-400">{pct}% used.</p>
@@ -113,7 +115,7 @@ export function PsResidentialCard() {
             title={order ? undefined : "No residential order found for this tier"}
             onClick={() => order && setTopup(order)}
           >
-            Add traffic
+            {t("ps.addTraffic")}
           </Button>
         ) : (
           <Button
@@ -129,7 +131,7 @@ export function PsResidentialCard() {
           </Button>
         )}
         <Button variant="primary" mode="filled" size="small" onClick={() => setGenOpen(true)}>
-          Generate proxies
+          {t("ps.generateProxies")}
         </Button>
       </div>
 

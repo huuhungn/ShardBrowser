@@ -4,6 +4,7 @@ import { toast } from "../../../shared/model/toast";
 import type { ProfileMeta } from "../../../entities/profile";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { profileBindProxy, profileGet, profileSave } from "../../../entities/profile";
+import { useT } from "../../../shared/i18n";
 
 export function QuickEditDialog({
   kind, profile, proxies, onClose, onSaved,
@@ -14,6 +15,7 @@ export function QuickEditDialog({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const t = useT();
   const [proxyId, setProxyId] = useState<string | null>(profile.proxy_id);
   const [notes, setNotes] = useState(profile.notes);
 
@@ -41,15 +43,15 @@ export function QuickEditDialog({
       open
       onClose={onClose}
       title={`${kind === "proxy" ? "Bind proxy" : "Edit notes"} — ${profile.name}`}
-      confirmLabel="Save"
+      confirmLabel={t("common.save")}
       onConfirm={kind === "proxy" ? saveProxy : saveNotes}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="py-4">
         {kind === "proxy" ? (
           <Select
-            label="Proxy"
+            label={t("profile.proxy")}
             size="small"
             isSearchable
             value={proxyId ?? ""}
@@ -64,7 +66,7 @@ export function QuickEditDialog({
           />
         ) : (
           <Textarea
-            label="Notes"
+            label={t("common.notes")}
             rows={6}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}

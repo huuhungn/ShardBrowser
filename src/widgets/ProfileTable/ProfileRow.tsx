@@ -9,12 +9,14 @@ import { useProfile, type ProfileMeta } from "../../entities/profile";
 import { useTeam, canSyncProfiles, syncBlockedReason } from "../../entities/team";
 import type { ProxyEntry } from "../../entities/proxy";
 import { ProfileInlineEditor, ProfileRowActions } from "../../features/manage-profiles";
+import { useT } from "../../shared/i18n";
 
 export function ProfileRow({ profile, proxy, onMenu }: {
   profile: ProfileMeta;
   proxy: ProxyEntry | null;
   onMenu: (e: React.MouseEvent, items: ContextItem[]) => void;
 }) {
+  const t = useT();
   const p = profile;
   const isRunning = useProfile((s) => !!s.running[p.id]);
   const runningSince = useProfile((s) => s.running[p.id]);
@@ -183,7 +185,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         <div className="cell-name min-w-0 cursor-pointer overflow-hidden" title={p.name} onClick={() => { if (!shiftPress.current) expand(p.id); }}>
           <div className="overflow-hidden text-ellipsis whitespace-nowrap text-label-xs text-text-strong-950">
             {p.pinned && (
-              <span className="mr-1.5 inline-flex items-center align-middle text-primary-base" title="Pinned">
+              <span className="mr-1.5 inline-flex items-center align-middle text-primary-base" title={t("common.pinned")}>
                 <PinIconApp className="size-3" />
               </span>
             )}
@@ -204,7 +206,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         <div
           className="cursor-pointer transition-colors hover:text-primary-base"
           onClick={() => { if (!shiftPress.current) setQuickEdit({ kind: "proxy", profile: p }); }}
-          title="Change proxy"
+          title={t("profileTable.changeProxy")}
         >
           {proxy ? (
             <div className="flex min-w-0 items-center gap-2 overflow-hidden">

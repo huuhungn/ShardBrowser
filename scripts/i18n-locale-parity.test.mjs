@@ -8,7 +8,7 @@
 
 import { strict as assert } from "node:assert";
 import { readdirSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -26,7 +26,20 @@ const en = read("en.json");
 // opposed to letting short strings through — keeps the check strict: adding a
 // name here is a deliberate line in a diff, and a genuinely untranslated
 // sentence can never slip past by being brief.
-const SAME_IN_EVERY_LANGUAGE = new Set(["settings.helper.title"]);
+const SAME_IN_EVERY_LANGUAGE = new Set([
+  "settings.helper.title",
+  // Web platform names a Vietnamese reader meets in English everywhere else —
+  // in Chrome's own settings, in every tutorial. Translating "Canvas" or
+  // "WebRTC" would make the row harder to recognise, not easier.
+  "profile.canvas",
+  "profile.clientRects",
+  "profile.doNotTrack",
+  "profile.userAgent",
+  "profile.webcam",
+  "profile.proxy",
+  // A worked example of proxy syntax: it is input to copy, not prose to read.
+  "profile.hostPortUserPassFacebook",
+]);
 
 test("english is the full key set", () => {
   assert.ok(Object.keys(en).length > 0, "en.json should not be empty");
@@ -131,14 +144,41 @@ test("every locale in the folder is registered in the store", () => {
 
 // A screen that still holds its English inline is invisible to every check
 // above: the locale files agree with each other perfectly while the page
-// renders English to a Vietnamese reader. So read the pages themselves and
+// renders English to a Vietnamese reader. So read the sources themselves and
 // fail on a sentence that never became a key.
+//
+// Pages are only half the interface. A profile row, a proxy editor, the update
+// pill — most of what a person reads lives in widgets/ and features/, so those
+// are walked too, and shared/ and entities/ with them.
 //
 // The rule is narrow on purpose — a JSX text node, or a label/title/placeholder
 // attribute, that reads like a sentence rather than an identifier. A className
 // or an icon name has no business here and would only teach people to add
 // exceptions until the test means nothing.
-const pagesDir = join(here, "..", "src", "pages");
+const uiRoots = ["pages", "widgets", "features", "shared", "entities", "app"].map((d) =>
+  join(here, "..", "src", d),
+);
+
+/** Every .tsx under a root, so a nested feature folder cannot hide from this. */
+function tsxFilesUnder(dir) {
+  const out = [];
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) out.push(...tsxFilesUnder(full));
+    else if (e.name.endsWith(".tsx")) out.push(full);
+  }
+  return out;
+}
+
+// The product's own name reads the same in every language; translating it would
+// be a bug, not a feature.
+const NOT_PROSE = new Set(["ShardX Launcher"]);
 
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
@@ -165,16 +205,15 @@ function englishInSource(src) {
 
 test("no screen still holds its English inline", () => {
   const offenders = [];
-  for (const entry of readdirSync(pagesDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const file = join(pagesDir, entry.name, "index.tsx");
-    let src;
-    try {
-      src = readFileSync(file, "utf8");
-    } catch {
-      continue;
+  for (const root of uiRoots) {
+    for (const file of tsxFilesUnder(root)) {
+      const src = readFileSync(file, "utf8");
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      for (const text of englishInSource(src)) {
+        if (NOT_PROSE.has(text)) continue;
+        offenders.push(`${where}: ${text}`);
+      }
     }
-    for (const text of englishInSource(src)) offenders.push(`${entry.name}: ${text}`);
   }
   assert.deepEqual(
     offenders,

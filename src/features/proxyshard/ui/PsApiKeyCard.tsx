@@ -4,8 +4,10 @@ import { Button, Input } from "@proxyshard/shardx-ui-kit";
 import { EyeIcon, EyeOffIcon, KeyIcon } from "../../../shared/icons";
 import { DASHBOARD_URL } from "../../../shared/lib/utils";
 import { PsConnectionBadge, usePsAccount } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 export function PsApiKeyCard() {
+  const t = useT();
   const key = usePsAccount((s) => s.key);
   const status = usePsAccount((s) => s.status);
   const me = usePsAccount((s) => s.me);
@@ -36,7 +38,7 @@ export function PsApiKeyCard() {
           <Input
             inputSize="small"
             type={showKey ? "text" : "password"}
-            placeholder="paste API key…"
+            placeholder={t("ps.pasteApiKey")}
             leftIcon={<KeyIcon className="size-4" />}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -60,7 +62,7 @@ export function PsApiKeyCard() {
           onClick={() => saveKey(draft)}
           disabled={draft.trim() === (key ?? "")}
         >
-          Save
+          {t("common.save")}
         </Button>
         <Button
           variant="neutral"

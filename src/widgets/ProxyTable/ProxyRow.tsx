@@ -9,12 +9,14 @@ import {
 import { ProxyRowActions, RenameProxyCell } from "../../features/manage-proxies";
 
 import { ProxyTypeBadge, ProxyCountryCell, ProxyTestResult } from "../../entities/proxy";
+import { useT } from "../../shared/i18n";
 
 export function ProxyRow({ proxy, profileCount, onMenu }: {
   proxy: ProxyEntry;
   profileCount: number;
   onMenu: (e: React.MouseEvent, items: ContextItem[]) => void;
 }) {
+  const t = useT();
   const snap = useProxy((s) => s.snapshots[proxy.id]);
   const busy = useProxy((s) => !!s.proxyTesting[proxy.id]);
   const isSel = useProxy((s) => s.proxySel.has(proxy.id));
@@ -65,7 +67,7 @@ export function ProxyRow({ proxy, profileCount, onMenu }: {
           <span
             className="mono small inline-block max-w-full cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap align-middle text-text-sub-600 transition-colors hover:text-primary-base"
             onClick={() => { if (!shiftPress.current) setEditing(proxy); }}
-            title="Edit proxy"
+            title={t("proxyTable.editProxy")}
           >
             {proxy.host}:{proxy.port}
           </span>

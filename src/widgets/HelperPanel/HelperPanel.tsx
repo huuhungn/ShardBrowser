@@ -4,6 +4,7 @@ import {
 } from "../../entities/profile/model/api";
 import { SyncIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
+import { useT } from "../../shared/i18n";
 
 /** What a kind is called to a person. */
 const LABELS: Record<string, string> = {
@@ -20,6 +21,7 @@ const LABELS: Record<string, string> = {
  * has nothing left to fill.
  */
 export function HelperPanel({ profile }: { profile: string }) {
+  const t = useT();
   const [fields, setFields] = useState<HelperField[]>([]);
   const [busy, setBusy] = useState(false);
   const [filled, setFilled] = useState(0);
@@ -51,10 +53,10 @@ export function HelperPanel({ profile }: { profile: string }) {
       <div className="flex shrink-0 select-none items-center gap-2 px-3 pt-2.5 pb-1">
         <SyncIcon className="size-4 shrink-0 text-primary-base" />
         <div className="flex-1 truncate text-label-xs text-text-strong-950">
-          Fillable form
+          {t("helper.fillableForm")}
         </div>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} onClick={() => void helperDismiss(profile)}
-                title="Dismiss"
+                title={t("common.dismiss")}
                 className="rounded-4 px-1.5 text-paragraph-xs text-text-soft-400 hover:bg-bg-weak-50">
           ✕
         </button>

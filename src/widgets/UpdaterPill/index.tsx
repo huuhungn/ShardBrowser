@@ -4,6 +4,7 @@ import { Alert, Button, Modal, ProgressBar, cn } from "@proxyshard/shardx-ui-kit
 import { safeUiError } from "../../shared/lib/utils";
 import { ShardMini } from "../../shared/icons";
 import type { RtUpdate } from "../../shared/types";
+import { useT } from "../../shared/i18n";
 
 /// Sidebar status and consent surface for signed Tauri updates.
 ///
@@ -25,6 +26,7 @@ type UpdateDownloadEvent =
   | { event: "finished" };
 
 export function UpdaterPill() {
+  const t = useT();
   const [info, setInfo] = useState<RtUpdate | null>(null);
   const [phase, setPhase] = useState<UpdatePhase>("checking");
   const [open, setOpen] = useState(false);
@@ -144,7 +146,7 @@ export function UpdaterPill() {
       <Modal
         open={open}
         onClose={close}
-        title="ShardX Launcher update"
+        title={t("updater.shardxLauncherUpdate")}
         maxWidthClassName="max-w-md"
         showClose={!busy}
       >
@@ -156,7 +158,7 @@ export function UpdaterPill() {
 
           {phase === "up_to_date" && (
             <p className="m-0 text-paragraph-sm text-text-sub-600">
-              Launcher is up to date
+              {t("updater.launcherIsUpToDate")}
             </p>
           )}
 
@@ -169,13 +171,13 @@ export function UpdaterPill() {
           {phase === "downloading" && (
             <ProgressBar
               value={percent ?? 0}
-              aria-label="Download Launcher update"
+              aria-label={t("updater.downloadLauncherUpdate")}
             />
           )}
 
           {phase === "ready" && (
             <Alert status="success" variant="light">
-              Signature verified — ready to install
+              {t("updater.signatureVerifiedReadyToInstall")}
             </Alert>
           )}
 
@@ -195,12 +197,12 @@ export function UpdaterPill() {
           )}
           {phase === "up_to_date" && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={check}>
-              Check again
+              {t("updater.checkAgain")}
             </Button>
           )}
           {phase === "error" && !info?.update_available && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={check}>
-              Retry
+              {t("common.retry")}
             </Button>
           )}
         </div>

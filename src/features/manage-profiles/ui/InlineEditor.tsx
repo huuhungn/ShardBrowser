@@ -20,6 +20,7 @@ import type { ProxyEntry } from "../../../entities/proxy";
 import { enrichPicksForPreset } from "../../../entities/profile";
 import { useGpuCompat } from "../../../shared/model/gpuCompat";
 import { IncompatibleWarningModal } from "../../gpu-compat";
+import { useT } from "../../../shared/i18n";
 
 function SectionHeading({ children }: { children: React.ReactNode }) {
   return (
@@ -41,6 +42,7 @@ export function InlineEditor({
   error?: string | null;
   onCancel: () => void;
 }) {
+  const t = useT();
   const f = draft;
   const u = <K extends keyof ProfileForm>(k: K, v: ProfileForm[K]) => setDraft({ ...f, [k]: v });
 
@@ -128,7 +130,7 @@ export function InlineEditor({
         {/* ----- col 1: identity + hardware ----- */}
         <div className="flex flex-col gap-4">
           <SectionHeading>Identity</SectionHeading>
-          <Field label="Profile name" value={f.name} onChange={(v) => u("name", v)} placeholder="e.g. shop-pl-1" />
+          <Field label={t("profile.profileName")} value={f.name} onChange={(v) => u("name", v)} placeholder={t("profile.eGShopPl1")} />
 
           <label className="flex flex-col gap-1">
             <span className="text-label-base font-medium text-text-strong-900">Operating system</span>
@@ -145,23 +147,23 @@ export function InlineEditor({
             <CSSelect
               value={f.gpu_preset_id}
               onChange={(v) => chooseGpu(v)}
-              title="GPU / device (from Fingerprint Library)"
+              title={t("profile.gpuDeviceFromFingerprintLibrary")}
               placeholder={`— no ${osFilter} fingerprints in library —`}
               options={gpusForOs.map((g) => ({ value: g.id, label: g.label }))}
             />
           </label>
 
-          <Field label="User-Agent" value={f.user_agent} onChange={(v) => u("user_agent", v)} mono />
+          <Field label={t("profile.userAgent")} value={f.user_agent} onChange={(v) => u("user_agent", v)} mono />
 
           <div className="grid grid-cols-2 gap-3">
             <SelectField
-              label="CPU cores"
+              label={t("profile.cpuCores")}
               value={f.hardware_concurrency}
               onChange={(v) => u("hardware_concurrency", v)}
               options={CPU_OPTIONS}
             />
             <SelectField
-              label="Memory (GB)"
+              label={t("profile.memoryGb")}
               value={f.device_memory}
               onChange={(v) => u("device_memory", v)}
               options={MEMORY_OPTIONS}
@@ -178,7 +180,7 @@ export function InlineEditor({
           </label>
 
           <ColorSwatches
-            label="Colour"
+            label={t("profile.colour")}
             value={f.color}
             onChange={(v) => u("color", v)}
           />
@@ -192,7 +194,7 @@ export function InlineEditor({
              
               <CSSelect
                 value={f.timezone}
-                title="Timezone"
+                title={t("profile.timezone")}
                 onChange={(v) => u("timezone", v)}
                 options={TIMEZONES.map((tz) => ({
                   value: tz,
@@ -203,7 +205,7 @@ export function InlineEditor({
             <label className="flex flex-col gap-1">
              
               <CSSelect
-                title="Language"
+                title={t("common.language")}
                 value={f.language}
                 onChange={(v) => u("language", v)}
                 options={LOCALES.map((l) => ({ value: l.code, label: l.label }))}
@@ -215,16 +217,16 @@ export function InlineEditor({
             <SectionHeading>Noise</SectionHeading>
           </div>
           <div className="grid grid-cols-2 gap-2 gap-x-3">
-            <Pair label="Canvas"        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
-            <Pair label="WebGL"         value={f.noise_webgl}         on={(v) => u("noise_webgl", v)} />
-            <Pair label="Audio"         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
-            <Pair label="Client rects"  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
-            <Pair label="Sensors"       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
-            <Pair label="Fonts"         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText="Noise" />
+            <Pair label={t("profile.canvas")}        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
+            <Pair label={t("profile.webgl")}         value={f.noise_webgl}         on={(v) => u("noise_webgl", v)} />
+            <Pair label={t("profile.audio")}         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
+            <Pair label={t("profile.clientRects")}  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
+            <Pair label={t("profile.sensors")}       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
+            <Pair label={t("profile.fonts")}         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText="Noise" />
           </div>
 
           <PortList
-            label="Ports to block"
+            label={t("profile.portsToBlock")}
             value={f.blocked_ports}
             onChange={(v) => u("blocked_ports", v)}
           />
@@ -236,7 +238,7 @@ export function InlineEditor({
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
               <CSSelect
-                title="WebRTC"
+                title={t("profile.webrtc")}
                 value={f.webrtc}
                 onChange={(v) => u("webrtc", v as WebRtcMode)}
                 options={[
@@ -248,7 +250,7 @@ export function InlineEditor({
             </label>
             <label className="flex flex-col gap-1">
               <CSSelect
-                title="Do Not Track"
+                title={t("profile.doNotTrack")}
                 value={f.do_not_track ? "1" : "0"}
                 onChange={(v) => u("do_not_track", v === "1")}
                 options={[
@@ -261,7 +263,7 @@ export function InlineEditor({
 
           <label className="flex flex-col gap-1">
             <CSSelect
-              title="Session restore"
+              title={t("profile.sessionRestore")}
               value={f.restore_session ? "1" : "0"}
               onChange={(v) => u("restore_session", v === "1")}
               options={[
@@ -286,9 +288,9 @@ export function InlineEditor({
           </label>
           {f.geo_mode === "manual" && (
             <div className="grid grid-cols-3 gap-3">
-              <NumField label="Latitude" value={f.geo_lat} onChange={(v) => u("geo_lat", v)} step={0.0001} />
-              <NumField label="Longitude" value={f.geo_lng} onChange={(v) => u("geo_lng", v)} step={0.0001} />
-              <NumField label="Accuracy m" value={f.geo_accuracy} onChange={(v) => u("geo_accuracy", v)} />
+              <NumField label={t("profile.latitude")} value={f.geo_lat} onChange={(v) => u("geo_lat", v)} step={0.0001} />
+              <NumField label={t("profile.longitude")} value={f.geo_lng} onChange={(v) => u("geo_lng", v)} step={0.0001} />
+              <NumField label={t("profile.accuracyM")} value={f.geo_accuracy} onChange={(v) => u("geo_accuracy", v)} />
             </div>
           )}
 
@@ -296,9 +298,9 @@ export function InlineEditor({
             <SectionHeading>Media devices</SectionHeading>
           </div>
           <div className="grid grid-cols-3 gap-3">
-            <SelectField label="Mic in" value={f.media_audio_in} onChange={(v) => u("media_audio_in", v)} options={MEDIA_COUNT_OPTIONS} />
-            <SelectField label="Speakers" value={f.media_audio_out} onChange={(v) => u("media_audio_out", v)} options={MEDIA_COUNT_OPTIONS} />
-            <SelectField label="Webcam" value={f.media_video_in} onChange={(v) => u("media_video_in", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.micIn")} value={f.media_audio_in} onChange={(v) => u("media_audio_in", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.speakers")} value={f.media_audio_out} onChange={(v) => u("media_audio_out", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.webcam")} value={f.media_video_in} onChange={(v) => u("media_video_in", v)} options={MEDIA_COUNT_OPTIONS} />
           </div>
 
           <div className="mt-2.5">
@@ -310,11 +312,11 @@ export function InlineEditor({
           />
 
           <Textarea
-            label="Notes"
+            label={t("common.notes")}
             rows={2}
             value={f.notes}
             onChange={(e) => u("notes", e.target.value)}
-            placeholder="Free-form notes…"
+            placeholder={t("profile.freeFormNotes")}
           />
         </div>
       </div>

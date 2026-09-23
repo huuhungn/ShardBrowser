@@ -10,11 +10,13 @@ import {
 } from "../../../shared/icons";
 import { useProfile, type ProfileMeta } from "../../../entities/profile";
 import { useMediaQuery, WIDE_ACTIONS_QUERY } from "../../../shared/hooks/useMediaQuery";
+import { useT } from "../../../shared/i18n";
 
 export function ProfileRowActions({ profile, onMore }: {
   profile: ProfileMeta;
   onMore: (e: React.MouseEvent) => void;
 }) {
+  const t = useT();
   const p = profile;
   const isRunning = useProfile((s) => !!s.running[p.id]);
   const isStarting = useProfile((s) => s.startBusy.has(p.id));
@@ -60,15 +62,15 @@ export function ProfileRowActions({ profile, onMore }: {
         leftIcon={<PinIconApp className="size-4" />}
       >
       </Button>}
-      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title="Edit" aria-label={`Edit profile ${p.name}`}
+      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title={t("common.edit")} aria-label={`Edit profile ${p.name}`}
         leftIcon={<EditIcon className="size-4" />}
       >
       </Button>
-      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title="Clone" aria-label={`Clone profile ${p.name}`}
+      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title={t("common.clone")} aria-label={`Clone profile ${p.name}`}
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
-      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title="Delete" aria-label={`Delete profile ${p.name}`}
+      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={`Delete profile ${p.name}`}
         leftIcon={<DeleteIcon className="size-4" />}
       >
       </Button>}
@@ -79,7 +81,7 @@ export function ProfileRowActions({ profile, onMore }: {
         onlyIcon
         onClick={() => { void copyCdp(p.id); }}
         aria-label={`Copy CDP HTTP URL for ${p.name}`}
-        title="Copy CDP HTTP URL"
+        title={t("profile.copyCdpHttpUrl")}
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
@@ -90,7 +92,7 @@ export function ProfileRowActions({ profile, onMore }: {
         onlyIcon
         onClick={onMore}
         aria-label={`More actions for profile ${p.name}`}
-        title="More actions"
+        title={t("profile.moreActions")}
         leftIcon={<MoreIcon className="size-4" />}
       >
       </Button>

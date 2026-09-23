@@ -2,12 +2,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import Badge from "../../../shared/ui/Badge";
 import { UDP_DOCS_URL } from "../../../shared/lib/utils";
 import type { ProxyEntry, ProxyTestSnapshot } from "../model/types";
+import { useT } from "../../../shared/i18n";
 
 export function ProxyTestResult({ snap, kind, busy }: {
   snap?: ProxyTestSnapshot;
   kind: ProxyEntry["kind"];
   busy: boolean;
 }) {
+  const t = useT();
   if (busy) return <span className="text-paragraph-xs text-text-soft-400">testing…</span>;
   if (!snap) return <span className="text-paragraph-xs text-text-soft-400">not tested</span>;
 
@@ -39,7 +41,7 @@ export function ProxyTestResult({ snap, kind, busy }: {
         <button
           type="button"
           className="status-pill-no-udp relative flex items-center cursor-pointer rounded-full border-0 bg-transparent p-0 transition-[filter,transform] hover:brightness-110 active:translate-y-px"
-          title="No UDP support — QUIC/HTTP-3 disabled at launch. Click for docs."
+          title={t("entity.noUdpSupportQuicHttp3DisabledAtLaunc")}
           onClick={() => { openUrl(UDP_DOCS_URL).catch(() => { }); }}
         >
           <Badge color="error" variant='filled' size="small">UDP</Badge>

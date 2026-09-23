@@ -8,6 +8,7 @@ import { PS_SIGNATURES } from "../../../entities/proxyshard";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { proxySave } from "../../../entities/proxy";
 import { psActive, psSignatureSet } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 export function ProxyEditor({ initial, onClose, onSaved }: {
   initial: ProxyEntry;
@@ -15,6 +16,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
   /** Hands back the saved entry, id included — the caller may want to bind it. */
   onSaved?: (p: ProxyEntry) => void;
 }) {
+  const t = useT();
   const [p, setP] = useState<ProxyEntry>(initial);
   // DC/ISP proxies imported from a ProxyShard order carry the order id in
   // notes — enables editing their p0f OS signature here.
@@ -57,21 +59,21 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
       open
       onClose={onClose}
       title={initial.id ? "Edit proxy" : "New proxy"}
-      confirmLabel="Save"
+      confirmLabel={t("common.save")}
       onConfirm={save}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4">
         <Field
-          label="Name"
+          label={t("common.name")}
           value={p.name}
           onChange={(v: string) => setP({ ...p, name: v })}
           placeholder={p.host ? `${p.host}:${p.port}` : "e.g. facebook — shown in the profile's proxy list"}
         />
         <div className="grid grid-cols-2 gap-3">
           <Select
-            label="Type"
+            label={t("common.type")}
             size="small"
             value={p.kind}
             onChange={(v) => setP({ ...p, kind: v as ProxyEntry["kind"] })}
@@ -81,15 +83,15 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
               { value: "https", label: "HTTPS" },
             ]}
           />
-          <Field label="Country" value={p.country} onChange={(v: string) => setP({ ...p, country: v })} />
+          <Field label={t("common.country")} value={p.country} onChange={(v: string) => setP({ ...p, country: v })} />
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Host" value={p.host} onChange={(v: string) => setP({ ...p, host: v })} />
-          <NumField label="Port" value={p.port} onChange={(v) => setP({ ...p, port: v as any })} />
+          <Field label={t("common.host")} value={p.host} onChange={(v: string) => setP({ ...p, host: v })} />
+          <NumField label={t("common.port")} value={p.port} onChange={(v) => setP({ ...p, port: v as any })} />
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Username" value={p.username} onChange={(v: string) => setP({ ...p, username: v })} />
-          <Field label="Password" value={p.password} onChange={(v: string) => setP({ ...p, password: v })} type="password" />
+          <Field label={t("common.username")} value={p.username} onChange={(v: string) => setP({ ...p, username: v })} />
+          <Field label={t("common.password")} value={p.password} onChange={(v: string) => setP({ ...p, password: v })} type="password" />
         </div>
         {orderId && (
           <div className="grid grid-cols-2 gap-3">
@@ -98,7 +100,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
                 p0f signature · order #{orderId}
                 <span className="text-text-soft-400"> · current: {curSig || "none"}</span>
               </span>
-              <CSSelect value={sig} onChange={setSig} options={PS_SIGNATURES} placeholder="Don't change" />
+              <CSSelect value={sig} onChange={setSig} options={PS_SIGNATURES} placeholder={t("proxy.donTChange")} />
             </label>
             <div />
           </div>

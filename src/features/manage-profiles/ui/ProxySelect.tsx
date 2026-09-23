@@ -6,6 +6,7 @@ import { toast } from "../../../shared/model/toast";
 import { proxyBulkParse, proxySave, type ProxyEntry } from "../../../entities/proxy";
 import { useProfile } from "../../../entities/profile";
 import { storeBus } from "../../../shared/lib/storeBus";
+import { useT } from "../../../shared/i18n";
 
 const label = (p: ProxyEntry) =>
   p.name && p.name !== `${p.host}:${p.port}`
@@ -52,6 +53,7 @@ export function ProxySelect({
   proxies: ProxyEntry[];
   onChange: (id: string | null) => void;
 }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   /// Keyboard highlight; null is "direct connection". Separate from `value`
@@ -104,7 +106,7 @@ export function ProxySelect({
         )}
       >
         <AddIcon className="size-4 shrink-0" />
-        Create new proxy
+        {t("profile.createNewProxy")}
       </button>
 
       {creating ? (
@@ -121,7 +123,7 @@ export function ProxySelect({
                 inputSize="small"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search by name, host, country…"
+                placeholder={t("profile.searchByNameHostCountry")}
               />
             </div>
           )}
@@ -145,7 +147,7 @@ export function ProxySelect({
             ))}
             {shown.length === 0 && (
               <li className="px-2.5 py-4 text-center text-paragraph-sm text-text-soft-400">
-                No proxy matches that.
+                {t("profile.noProxyMatchesThat")}
               </li>
             )}
           </ul>
@@ -248,6 +250,7 @@ function CreatePanel({ onCancel, onCreated }: {
   onCancel: () => void;
   onCreated: (p: ProxyEntry) => void;
 }) {
+  const t = useT();
   const [line, setLine] = useState("");
   const [parsed, setParsed] = useState<ProxyEntry | null>(null);
   const [busy, setBusy] = useState(false);
@@ -293,7 +296,7 @@ function CreatePanel({ onCancel, onCreated }: {
         onKeyDown={(e) => {
           if (e.key === "Enter" && parsed && !busy) { e.preventDefault(); void save(); }
         }}
-        placeholder="host:port:user:pass #facebook"
+        placeholder={t("profile.hostPortUserPassFacebook")}
       />
       <div className="min-h-[34px] rounded-8 bg-bg-weak-50 px-2.5 py-1.5 text-paragraph-xs ring-1 ring-inset ring-stroke-soft-200">
         {parsed ? (
@@ -313,14 +316,14 @@ function CreatePanel({ onCancel, onCreated }: {
       </div>
       <div className="flex justify-end gap-2">
         <Button variant="neutral" mode="ghost" size="2xsmall" onClick={onCancel}>
-          Cancel
+          {t("common.cancel")}
         </Button>
         <Button
           variant="primary" mode="filled" size="2xsmall"
           disabled={!parsed || busy} isLoading={busy}
           onClick={save}
         >
-          Add and bind
+          {t("profile.addAndBind")}
         </Button>
       </div>
     </div>

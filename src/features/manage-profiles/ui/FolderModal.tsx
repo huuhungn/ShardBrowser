@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, DialogModal, Input } from "@proxyshard/shardx-ui-kit";
 import { FolderIcon } from "../../../shared/icons";
+import { useT } from "../../../shared/i18n";
 
 /// Folder picker/creator modal (replaces native prompt). mode: "create" | "move".
 export function FolderModal({
@@ -12,6 +13,7 @@ export function FolderModal({
   onCreate: (name: string) => void;
   onClose: () => void;
 }) {
+  const t = useT();
   const [name, setName] = useState("");
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { ref.current?.focus(); }, []);
@@ -28,7 +30,7 @@ export function FolderModal({
       confirmLabel={showList ? "Create & move" : "Create"}
       onConfirm={create}
       isDisabled={!trimmed || dup}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4">
@@ -60,7 +62,7 @@ export function FolderModal({
           label={showList ? "New folder name" : "Folder name"}
           inputSize="small"
           value={name}
-          placeholder="e.g. Shops, Socials, QA…"
+          placeholder={t("profile.eGShopsSocialsQa")}
           error={dup ? `Folder "${trimmed}" already exists.` : undefined}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {

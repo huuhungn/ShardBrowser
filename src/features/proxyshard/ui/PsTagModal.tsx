@@ -5,8 +5,10 @@ import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import type { PsOrder } from "../../../entities/proxyshard";
 import { psSetTag } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose: () => void; onDone: () => void }) {
+  const t = useT();
   const [tag, setTag] = useState(order.tag && order.tag !== "none" ? order.tag : "");
   const [busy, setBusy] = useState(false);
   const submit = async () => {
@@ -23,16 +25,16 @@ export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose
       open
       onClose={onClose}
       icon={<EditIcon className="size-5" />}
-      title="Edit tag"
+      title={t("ps.editTag")}
       subtitle={`${order.product_name} · order #${order.order_id}`}
       confirmLabel={busy ? "Saving…" : "Save"}
       onConfirm={submit}
       isLoading={busy}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="py-4">
-        <Field label="Tag" value={tag} onChange={setTag} placeholder="leave empty to clear" />
+        <Field label={t("ps.tag")} value={tag} onChange={setTag} placeholder={t("ps.leaveEmptyToClear")} />
       </div>
     </DialogModal>
   );

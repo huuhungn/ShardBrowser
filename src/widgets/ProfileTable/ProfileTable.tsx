@@ -13,10 +13,12 @@ import {
   NewProfileButton,
 } from "../../features/manage-profiles";
 import { ProfileRow } from "./ProfileRow";
+import { useT } from "../../shared/i18n";
 
 const PAGE_SIZE = 20;
 
 export function ProfileTable() {
+  const t = useT();
   const selected = useProfile((s) => s.selected);
   const selectProfiles = useProfile((s) => s.selectProfiles);
   const expanded = useProfile((s) => s.expanded);
@@ -69,8 +71,8 @@ export function ProfileTable() {
           <div></div>
           <div>
             <Checkbox
-              aria-label="Select all profiles on this page"
-              title="Select all on this page"
+              aria-label={t("profileTable.selectAllProfilesOnThisPage")}
+              title={t("profileTable.selectAllOnThisPage")}
               // Header checkbox toggles only visible page rows; other pages preserved.
               checked={allPageSelected}
               indeterminate={anyPageSelected && !allPageSelected}
@@ -111,7 +113,7 @@ export function ProfileTable() {
                 </p>
                 <div className="mt-2 flex gap-2">
                   <Button variant="neutral" mode="stroke" size="xsmall" onClick={() => setSearch("")}>
-                    Clear search
+                    {t("profileTable.clearSearch")}
                   </Button>
                 </div>
               </>
@@ -130,7 +132,7 @@ export function ProfileTable() {
               <>
                 <h3 className="m-0 text-label-sm text-text-strong-950">No profiles yet</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-                  Pick a fingerprint template to start from a curated real-Chrome snapshot, or build one from scratch.
+                  {t("profileTable.pickAFingerprintTemplateToStartFromA")}
                 </p>
                 <div className="mt-2 flex gap-2">
                   <FromTemplateButton />

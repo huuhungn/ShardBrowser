@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { Input } from "@proxyshard/shardx-ui-kit";
 import { useProxy, type ProxyEntry } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 export function RenameProxyCell({ proxy }: { proxy: ProxyEntry }) {
+  const t = useT();
   const renameProxy = useProxy((s) => s.renameProxy);
   const [draft, setDraft] = useState<string | null>(null);
 
@@ -32,7 +34,7 @@ export function RenameProxyCell({ proxy }: { proxy: ProxyEntry }) {
           // A shift-click on the row is a range selection, not a rename. The
           // event is honest here — this is a span, not a checkbox's label.
           onClick={(e) => { if (!e.shiftKey) setDraft(proxy.name); }}
-          title="Click to rename"
+          title={t("proxy.clickToRename")}
         >
           {proxy.name || "—"}
         </span>

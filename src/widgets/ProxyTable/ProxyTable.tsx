@@ -5,10 +5,12 @@ import { useContextMenu } from "../../shared/hooks/useContextMenu";
 import { useProxy, useFilteredProxies, useProfileCountByProxy } from "../../entities/proxy";
 import { NewProxyButton } from "../../features/manage-proxies";
 import { ProxyRow } from "./ProxyRow";
+import { useT } from "../../shared/i18n";
 
 const PROXY_PAGE_SIZE = 20;
 
 export function ProxyTable() {
+  const t = useT();
   const totalProxies = useProxy((s) => s.proxies.length);
   const selectProxy = useProxy((s) => s.selectProxy);
   const proxySel = useProxy((s) => s.proxySel);
@@ -40,7 +42,7 @@ export function ProxyTable() {
         <div className="p-cols w-full justify-between border-b border-stroke-soft-200 bg-bg-weak-50 text-subheading-2xs text-text-soft-400">
           <div>
             <Checkbox
-              title="Select all on this page"
+              title={t("proxyTable.selectAllOnThisPage")}
               checked={allPageSelected}
               indeterminate={anyPageSelected && !allPageSelected}
               onChange={(e) => selectProxy(e.target.checked, pagedProxies)}

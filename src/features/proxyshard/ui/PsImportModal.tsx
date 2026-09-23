@@ -7,10 +7,12 @@ import { toast } from "../../../shared/model/toast";
 import type { PsOrder, PsActiveProxy } from "../../../entities/proxyshard";
 import { PS_SIGNATURES, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 /// Active-proxy picker: fetch an order's proxies, choose SOCKS5/HTTP and which
 /// IPs to import into the local proxy list (via proxy_bulk_save, which dedups).
 export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () => void }) {
+  const t = useT();
   const [items, setItems] = useState<PsActiveProxy[] | null>(null);
   const [err, setErr] = useState("");
   const [kind, setKind] = useState<"socks5" | "http">("socks5");
@@ -105,13 +107,13 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
       onConfirm={save}
       isLoading={saving}
       isDisabled={saving || !items || sel.size === 0}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4">
         <div className="mb-2.5 flex items-end gap-3">
           <div className="flex-1">
-            <Field label="Name prefix" value={tag} onChange={setTag} />
+            <Field label={t("ps.namePrefix")} value={tag} onChange={setTag} />
           </div>
           <div>
             <SegmentControl
@@ -137,7 +139,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         {items && items.length > 0 && (
           <div className="mt-1.5 max-h-[320px] overflow-hidden overflow-y-auto rounded-10 bg-bg-white-0 ring-1 ring-inset ring-stroke-soft-200">
             <div className="grid items-center gap-2.5 border-b border-stroke-soft-200 bg-bg-weak-50 px-3 py-2" style={{ gridTemplateColumns: "20px 1fr 132px" }}>
-              <Checkbox checked={allChecked} onChange={toggleAll} title="Select all" />
+              <Checkbox checked={allChecked} onChange={toggleAll} title={t("ps.selectAll")} />
               <span className="text-paragraph-xs text-text-soft-400">{sel.size} of {items.length} selected</span>
               <span className="text-right text-paragraph-xs text-text-soft-400">{canSetP0f ? "p0f" : ""}</span>
             </div>
@@ -159,7 +161,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
                     // Editable when free slots exist, or this IP is already
                     // signed (re-assigning an OS doesn't consume a slot).
                     <div onClick={(e) => e.stopPropagation()}>
-                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={PS_SIGNATURES} placeholder="p0f" />
+                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={PS_SIGNATURES} placeholder={t("ps.p0f")} />
                     </div>
                   ) : (
                     <span className="text-right text-paragraph-xs text-text-soft-400">—</span>

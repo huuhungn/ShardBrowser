@@ -9,6 +9,7 @@ import { randSid } from "../../../shared/lib/utils";
 import type { ResiType, PsLoc } from "../../../entities/proxyshard";
 import { PS_PLAN, PS_PROXY_TYPE, PS_RELAYS, PS_PORT, psProfileTraffic, psCountries, psRegions, psCities } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 
 const SESSION_MODE_OPTIONS: SelectOption[] = [
@@ -60,6 +61,7 @@ const SESSION_OPTIONS: SelectOption[] = [
 ];
 
 export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: () => void }) {
+  const t = useT();
   const plan = PS_PLAN[type];
   const pt = PS_PROXY_TYPE[type];
   const [password, setPassword] = useState("");
@@ -158,7 +160,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
       onConfirm={generate}
       isLoading={saving}
       isDisabled={saving || !password}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4 w-[450px]">
@@ -185,7 +187,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
             value={country}
             title={"Country"}
             onChange={setCountry}
-            placeholder="Any"
+            placeholder={t("common.any")}
             isSearchable
             searchPlaceholder="Search countries…"
             options={[{ value: "", label: "Any" }, ...countries.map((c) => ({ value: c.code, label: `${c.name} (${c.code})` }))]}
@@ -233,7 +235,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
           }
         </div>
         <div className="grid grid-cols-2 gap-3">
-          <Field label="Name prefix" value={prefix} onChange={setPrefix} />
+          <Field label={t("ps.namePrefix")} value={prefix} onChange={setPrefix} />
           <NumField label={session === "sticky" ? "Count (random sid each)" : "Count"} value={count} onChange={(v) => setCount(Math.max(1, Math.round(v)))} />
         </div>
         <div className="flex flex-col gap-3">
@@ -245,7 +247,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
                 onClick={() => setShowAdvanced((v) => !v)}
                 className="flex w-fit items-center gap-2 rounded-lg text-label-sm font-medium text-text-soft-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-base"
               >
-                Advanced settings
+                {t("ps.advancedSettings")}
                 <ChevronDownIcon
                   aria-hidden="true"
                   className={`size-4 transition-transform duration-200 ${showAdvanced ? "rotate-180" : ""}`}

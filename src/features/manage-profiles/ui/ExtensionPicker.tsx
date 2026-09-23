@@ -3,6 +3,7 @@ import { Checkbox, Input, cn } from "@proxyshard/shardx-ui-kit";
 import { ChevronDownIcon, CloseIcon } from "../../../shared/icons";
 import { useExtensions, type ExtensionEntry } from "../../../entities/extension";
 import { useNav } from "../../../shared/model/navigation";
+import { useT } from "../../../shared/i18n";
 
 function Icon({ e, className }: { e: ExtensionEntry; className?: string }) {
   return e.icon ? (
@@ -27,6 +28,7 @@ export function ExtensionPicker({
   value: string[];
   onChange: (v: string[]) => void;
 }) {
+  const t = useT();
   const items = useExtensions((s) => s.items);
   const init = useExtensions((s) => s.init);
   const go = useNav((s) => s.setSection);
@@ -79,7 +81,7 @@ export function ExtensionPicker({
               <span className="truncate">{e.name}</span>
               <button
                 type="button"
-                title="Remove"
+                title={t("profile.remove")}
                 onClick={() => toggle(e.id)}
                 className="grid size-4 shrink-0 place-items-center rounded-4 text-primary-base/70 hover:bg-primary-alpha-16 hover:text-primary-base"
               >
@@ -107,7 +109,7 @@ export function ExtensionPicker({
               inputSize="small"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Search extensions…"
+              placeholder={t("profile.searchExtensions")}
             />
           )}
           <div className="flex max-h-[176px] flex-col overflow-y-auto scrollbar">
@@ -131,7 +133,7 @@ export function ExtensionPicker({
             ))}
             {shown.length === 0 && (
               <div className="px-1.5 py-3 text-center text-paragraph-xs text-text-soft-400">
-                Nothing matches that.
+                {t("profile.nothingMatchesThat")}
               </div>
             )}
           </div>

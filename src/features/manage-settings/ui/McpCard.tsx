@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Button } from "@proxyshard/shardx-ui-kit";
 import { clip } from "../../../shared/lib/clipboard";
 import type { ApiInfo, McpStatus, CodexMcpStatus, HermesMcpStatus } from "../../../entities/settings";
+import { useT } from "../../../shared/i18n";
 
 /// MCP readiness, plus the single honest Codex action for the current state.
 ///
@@ -33,6 +34,7 @@ export function McpCard({
   onCheckCodex: () => Promise<void>;
   onCheckHermes: () => Promise<void>;
 }) {
+  const t = useT();
   const [busy, setBusy] = useState(false);
   const [advanced, setAdvanced] = useState(false);
 
@@ -115,7 +117,7 @@ export function McpCard({
         </span>
       </div>
 
-      <div aria-label="MCP setup readiness" className="grid gap-2 sm:grid-cols-2">
+      <div aria-label={t("settings.mcpSetupReadiness")} className="grid gap-2 sm:grid-cols-2">
         {items.map(([ok, label, detail]) => (
           <div key={label} className="flex flex-col gap-0.5 rounded-lg bg-bg-weak-50 px-3 py-2">
             <strong className="text-label-xs text-text-strong-950">{ok ? "✓" : "○"} {label}</strong>
@@ -164,18 +166,18 @@ export function McpCard({
         <summary className="cursor-pointer text-label-xs text-text-sub-600">Advanced actions</summary>
         <div className="mt-2 flex flex-col gap-2">
           <Button size="xsmall" variant="neutral" mode="stroke" onClick={copyRepair} disabled={!codex?.repair_command}>
-            Copy Codex repair command
+            {t("settings.copyCodexRepairCommand")}
           </Button>
           <Button size="xsmall" variant="neutral" mode="stroke" disabled={busy} onClick={() => void run(onCheckCodex)}>
             {busy ? "Checking Codex…" : "Check Codex registration"}
           </Button>
           {primary.label !== "Copy Hermes add command" && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={copyHermesAdd} disabled={!hermesChecked}>
-              Copy Hermes add command
+              {t("settings.copyHermesAddCommand")}
             </Button>
           )}
           <p className="m-0 text-paragraph-xs text-text-sub-600">
-            The command is copied for you to run — no config is changed automatically.
+            {t("settings.theCommandIsCopiedForYouToRunNoConfi")}
           </p>
         </div>
       </details>

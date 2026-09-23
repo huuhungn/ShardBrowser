@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Breadcrumb, Input } from "@proxyshard/shardx-ui-kit";
 import { HOST_OS } from "../lib/utils";
 import { SearchIcon } from "../icons";
+import { useT } from "../../shared/i18n";
 
 /// Page header — UI-kit Breadcrumb + search Input.
 ///
@@ -14,6 +15,7 @@ export function Topbar({ crumbs, search = "", onSearch }: {
   search?: string;
   onSearch?: (v: string) => void;
 }) {
+  const t = useT();
   const ref = useRef<HTMLInputElement>(null);
   const section = crumbs[crumbs.length - 1] ?? "";
   const label = section ? `Search ${section}` : "Search";
@@ -43,7 +45,7 @@ export function Topbar({ crumbs, search = "", onSearch }: {
           type="search"
           inputSize="small"
           aria-label={label}
-          placeholder="Search..."
+          placeholder={t("ui.search")}
           leftIcon={<SearchIcon className="size-4" />}
           value={search}
           onChange={(e) => onSearch?.(e.target.value)}

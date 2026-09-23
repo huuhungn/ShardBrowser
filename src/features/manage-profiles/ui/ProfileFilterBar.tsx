@@ -4,9 +4,11 @@ import { FilterIcon } from "../../../shared/icons";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { useProfile, useProfileCountries } from "../../../entities/profile";
+import { useT } from "../../../shared/i18n";
 
 /** Status / proxy country / bound-or-direct, behind one button with a count. */
 export function ProfileFilterBar() {
+  const t = useT();
   const filters = useProfile((s) => s.filters);
   const setFilters = useProfile((s) => s.setFilters);
   const clearFilters = useProfile((s) => s.clearFilters);
@@ -35,7 +37,7 @@ export function ProfileFilterBar() {
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div className="absolute right-0 z-20 mt-1.5 flex w-[260px] flex-col gap-3 rounded-xl bg-bg-white-0 p-3 shadow-[var(--shadow-md)] ring-1 ring-stroke-soft-200">
             <CSSelect
-              title="Status"
+              title={t("profile.status")}
               value={filters.status}
               onChange={(v) => setFilters({ status: v as typeof filters.status })}
               options={[
@@ -45,7 +47,7 @@ export function ProfileFilterBar() {
               ]}
             />
             <CSSelect
-              title="Connection"
+              title={t("profile.connection")}
               value={filters.proxy}
               onChange={(v) => setFilters({ proxy: v as typeof filters.proxy })}
               options={[
@@ -56,7 +58,7 @@ export function ProfileFilterBar() {
             />
             <label className="flex flex-col gap-1">
               <CSSelect
-                title="Proxy country"
+                title={t("profile.proxyCountry")}
                 value={filters.country}
                 onChange={(v) => setFilters({ country: v })}
                 isSearchable={countries.length > 8}
@@ -89,7 +91,7 @@ export function ProfileFilterBar() {
             </label>
             {active > 0 && (
               <Button variant="neutral" mode="ghost" size="2xsmall" onClick={clearFilters}>
-                Clear filters
+                {t("profile.clearFilters")}
               </Button>
             )}
           </div>

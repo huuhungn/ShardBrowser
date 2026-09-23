@@ -7,6 +7,7 @@ import {
   teamEnrollDevice, teamCollectCustody, useTeam,
   type TeamStatus,
 } from "../../../entities/team";
+import { useT } from "../../../shared/i18n";
 
 /** A tenant id is a UUID the operator picks once; typing one by hand is how
  *  two devices end up in different fleets over a mistyped character. */
@@ -40,6 +41,7 @@ function suggestLabel(): string {
  * was kept — the server has its public key, the private half is gone).
  */
 export function TeamCard() {
+  const t = useT();
   const [st, setSt] = useState<TeamStatus | null>(null);
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -119,19 +121,18 @@ export function TeamCard() {
   return (
     <div className="flex flex-col gap-2">
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Enrol this device with a team server to sync encrypted profiles. The
-        server routes ciphertext only — it never sees a key.
+        {t("team.enrolThisDeviceWithATeamServerToSync")}
       </p>
 
       <Input
-        label="Server URL"
+        label={t("team.serverUrl")}
         inputSize="small"
         placeholder="https://team.example.com"
         value={url}
         onChange={(e) => setUrl(e.target.value)}
       />
       <Input
-        label="API token"
+        label={t("team.apiToken")}
         inputSize="small"
         type="password"
         placeholder={st?.has_token ? "•••••••• (saved — type to replace)" : "paste the token"}
@@ -142,10 +143,10 @@ export function TeamCard() {
       <div className="flex items-end gap-2">
         <div className="grow">
           <Input
-            label="Tenant ID"
+            label={t("team.tenantId")}
             inputSize="small"
             className="mono"
-            placeholder="00000000-0000-0000-0000-000000000000"
+            placeholder={t("team.00000000000000000000000000000000")}
             value={tenant}
             onChange={(e) => setTenant(e.target.value)}
           />
@@ -156,14 +157,11 @@ export function TeamCard() {
           disabled={!!busy}
           onClick={() => { setTenant(newTenantId()); toast.info("Generated — save to apply"); }}
         >
-          Generate
+          {t("common.generate")}
         </Button>
       </div>
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Generate one for a new fleet; paste the existing one to join a fleet
-        that already has devices. Changing the server or tenant clears this
-        device's keys, because keys enrolled against one fleet mean nothing to
-        another.
+        {t("team.generateOneForANewFleetPasteTheExist")}
       </p>
 
       <div className="flex gap-2">
@@ -180,7 +178,7 @@ export function TeamCard() {
           {!st.is_enrolled ? (
             <>
               <Input
-                label="Device label"
+                label={t("team.deviceLabel")}
                 inputSize="small"
                 placeholder={suggestLabel()}
                 value={label}
@@ -193,7 +191,7 @@ export function TeamCard() {
               </div>
               {!connected && (
                 <p className="m-0 text-paragraph-xs text-text-soft-400">
-                  Save a server URL and token first.
+                  {t("team.saveAServerUrlAndTokenFirst")}
                 </p>
               )}
             </>
@@ -212,22 +210,18 @@ export function TeamCard() {
                     </Button>
                   </div>
                   <p className="m-0 text-paragraph-xs text-text-soft-400">
-                    Picks up the root key grants a custodian has issued to this
-                    device and checks they open. The key is never shown, and
-                    never leaves this machine.
+                    {t("team.picksUpTheRootKeyGrantsACustodianHas")}
                   </p>
                 </>
               ) : (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
-                  This device was enrolled before its key material was kept, so
-                  grants sealed to it can never be opened. Re-enrol it to take
-                  custody.
+                  {t("team.thisDeviceWasEnrolledBeforeItsKeyMat")}
                 </p>
               )}
 
               {!st.can_sync && (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
-                  Enrolled before profile sync existed — re-enrol to sync.
+                  {t("team.enrolledBeforeProfileSyncExistedReEn")}
                 </p>
               )}
             </>
