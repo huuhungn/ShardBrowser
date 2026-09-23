@@ -196,6 +196,11 @@ jobs:
       - name: Updater signature verification tests
         run: npm run test:updater-signatures
 
+      - name: Interface language tests
+        run: |
+          npm run test:i18n
+          npm run test:rust-strings
+
       # The release workflow gates on these, but only inside the release job.
       # Running them here keeps zip-extraction regressions from reaching a tag.
       - name: Node SDK tests
