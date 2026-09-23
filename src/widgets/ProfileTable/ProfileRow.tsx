@@ -9,12 +9,14 @@ import { useProfile, type ProfileMeta } from "../../entities/profile";
 import { useTeam, canSyncProfiles, syncBlockedReason } from "../../entities/team";
 import type { ProxyEntry } from "../../entities/proxy";
 import { ProfileInlineEditor, ProfileRowActions } from "../../features/manage-profiles";
+import { useT } from "../../shared/i18n";
 
 export function ProfileRow({ profile, proxy, onMenu }: {
   profile: ProfileMeta;
   proxy: ProxyEntry | null;
   onMenu: (e: React.MouseEvent, items: ContextItem[]) => void;
 }) {
+  const t = useT();
   const p = profile;
   const isRunning = useProfile((s) => !!s.running[p.id]);
   const runningSince = useProfile((s) => s.running[p.id]);
@@ -52,14 +54,14 @@ export function ProfileRow({ profile, proxy, onMenu }: {
 
   // Per-profile action menu shared by right-click and the ⋮ button.
   const menu = (): ContextItem[] => [
-    { label: isRunning ? "Stop" : "Launch", onClick: () => startStop(p) },
-    { label: "Edit", onClick: () => expand(p.id) },
-    { label: "Clone", onClick: () => cloneProfile(p.id) },
-    { label: p.pinned ? "Unpin" : "Pin to top", onClick: () => togglePin(p) },
+    { label: isRunning ? t("profileTable.stop") : t("profileTable.launch"), onClick: () => startStop(p) },
+    { label: t("common.edit"), onClick: () => expand(p.id) },
+    { label: t("common.clone"), onClick: () => cloneProfile(p.id) },
+    { label: p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop"), onClick: () => togglePin(p) },
     { sep: true, label: "", onClick: () => {} },
     { label: "Move to folder…", onClick: () => setFolderModal({ profileId: p.id }) },
     ...(p.folder
-      ? [{ label: "Remove from folder", onClick: () => setProfileFolder(p.id, "") }]
+      ? [{ label: t("profileTable.removeFromFolder"), onClick: () => setProfileFolder(p.id, "") }]
       : []),
     { sep: true, label: "", onClick: () => {} },
     // These read or replace the whole profile directory, which Chromium holds
@@ -68,54 +70,54 @@ export function ProfileRow({ profile, proxy, onMenu }: {
     {
       label: "Back up (encrypted)…",
       onClick: () => backupProfile(p),
-      disabledReason: isRunning ? "Stop the profile first" : undefined,
+      disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
     },
     {
       label: "Restore from backup…",
       onClick: () => restoreProfile(p),
-      disabledReason: isRunning ? "Stop the profile first" : undefined,
+      disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
     },
     ...(teamReady || syncBlocked
       ? [
           { sep: true, label: "", onClick: () => {} },
           {
-            label: "Push to team",
+            label: t("profileTable.pushToTeam"),
             onClick: () => pushProfile(p),
-            disabledReason: syncBlocked ?? (isRunning ? "Stop the profile first" : undefined),
+            disabledReason: syncBlocked ?? (isRunning ? t("profileTable.stopTheProfileFirst") : undefined),
           },
           {
-            label: "Pull from team",
+            label: t("profileTable.pullFromTeam"),
             onClick: () => pullProfile(p),
-            disabledReason: syncBlocked ?? (isRunning ? "Stop the profile first" : undefined),
+            disabledReason: syncBlocked ?? (isRunning ? t("profileTable.stopTheProfileFirst") : undefined),
           },
         ]
       : []),
     { sep: true, label: "", onClick: () => {} },
     // Only meaningful while the engine is up and exposing a debugger port.
     {
-      label: "Copy CDP HTTP URL",
+      label: t("profileTable.copyCdpHttpUrl"),
       onClick: () => { void copyCdpHttpUrl(p.id); },
-      disabledReason: isRunning ? undefined : "Start the profile first",
+      disabledReason: isRunning ? undefined : t("profileTable.startTheProfileFirst"),
     },
     {
-      label: "Copy DevTools inspect URL",
+      label: t("profileTable.copyDevtoolsInspectUrl"),
       onClick: () => { void copyDevToolsInspectUrl(p.id); },
-      disabledReason: isRunning ? undefined : "Start the profile first",
+      disabledReason: isRunning ? undefined : t("profileTable.startTheProfileFirst"),
     },
     {
-      label: "Bring verification tab to front",
+      label: t("profileTable.bringVerificationTabToFront"),
       onClick: () => { void bringVerificationToFront(p.id); },
-      disabledReason: isRunning ? undefined : "Start the profile first",
+      disabledReason: isRunning ? undefined : t("profileTable.startTheProfileFirst"),
     },
     { sep: true, label: "", onClick: () => {} },
-    { label: "Export cookies", onClick: () => exportCookies(p) },
-    { label: "Import cookies", onClick: () => importCookies(p) },
+    { label: t("profileTable.exportCookies"), onClick: () => exportCookies(p) },
+    { label: t("profileTable.importCookies"), onClick: () => importCookies(p) },
     { sep: true, label: "", onClick: () => {} },
     {
-      label: "Delete",
+      label: t("common.delete"),
       onClick: () => remove(p.id),
       danger: true,
-      disabledReason: isRunning ? "Stop the profile first" : undefined,
+      disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
     },
   ];
 
@@ -175,7 +177,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         </div>
         <div>
           <Checkbox
-            aria-label={`Select profile ${p.name}`}
+            aria-label={t("profileTable.selectProfile", { name: p.name })}
             checked={isSel}
             onChange={() => { if (!shiftPress.current) toggleSelect(p.id); }}
           />
@@ -183,7 +185,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         <div className="cell-name min-w-0 cursor-pointer overflow-hidden" title={p.name} onClick={() => { if (!shiftPress.current) expand(p.id); }}>
           <div className="overflow-hidden text-ellipsis whitespace-nowrap text-label-xs text-text-strong-950">
             {p.pinned && (
-              <span className="mr-1.5 inline-flex items-center align-middle text-primary-base" title="Pinned">
+              <span className="mr-1.5 inline-flex items-center align-middle text-primary-base" title={t("common.pinned")}>
                 <PinIconApp className="size-3" />
               </span>
             )}
@@ -198,13 +200,13 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         </div>
         <div>
           <Badge color={isRunning ? "success" : "gray"} variant='filled' size="small" dot>
-            {isRunning ? "Running" : "Idle"}
+            {isRunning ? t("profileTable.running") : t("profileTable.idle")}
           </Badge>
         </div>
         <div
           className="cursor-pointer transition-colors hover:text-primary-base"
           onClick={() => { if (!shiftPress.current) setQuickEdit({ kind: "proxy", profile: p }); }}
-          title="Change proxy"
+          title={t("profileTable.changeProxy")}
         >
           {proxy ? (
             <div className="flex min-w-0 items-center gap-2 overflow-hidden">
@@ -229,7 +231,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         </div>
         <div
           className="cell-notes min-w-0 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-paragraph-xs text-text-sub-600 transition-colors hover:text-primary-base"
-          title={p.notes || "Click to edit notes"}
+          title={p.notes || t("profileTable.clickToEditNotes")}
           onClick={() => { if (!shiftPress.current) setQuickEdit({ kind: "notes", profile: p }); }}
         >
           {p.notes || <span className="text-text-soft-400">—</span>}

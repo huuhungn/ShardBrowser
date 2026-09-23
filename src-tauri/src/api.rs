@@ -133,9 +133,9 @@ fn err(code: StatusCode, msg: impl Into<String>) -> ApiError {
 
 fn profile_api_error(error: anyhow::Error, fallback: StatusCode) -> ApiError {
     let status = match crate::profile::profile_error_kind(&error) {
-        Some(crate::profile::ProfileErrorKind::Running | crate::profile::ProfileErrorKind::Busy) => {
-            StatusCode::CONFLICT
-        }
+        Some(
+            crate::profile::ProfileErrorKind::Running | crate::profile::ProfileErrorKind::Busy,
+        ) => StatusCode::CONFLICT,
         Some(
             crate::profile::ProfileErrorKind::InvalidName
             | crate::profile::ProfileErrorKind::NameConflict,
@@ -212,16 +212,19 @@ async fn configure_startup(Json(body): Json<StartupConfigReq>) -> ApiResult {
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     crate::notify_store_changed("settings");
 
-    let status = crate::startup::status(app)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let status =
+        crate::startup::status(app).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::to_value(status).unwrap_or(Value::Null)))
 }
 
 async fn list_profiles() -> ApiResult {
-    let metas = crate::profile::list_all().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let metas = crate::profile::list_all()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let running = crate::process::Tracker::shared().running();
-    let by_id: std::collections::HashMap<String, crate::process::RunningProfile> =
-        running.into_iter().map(|r| (r.profile_id.clone(), r)).collect();
+    let by_id: std::collections::HashMap<String, crate::process::RunningProfile> = running
+        .into_iter()
+        .map(|r| (r.profile_id.clone(), r))
+        .collect();
     let out: Vec<Value> = metas
         .into_iter()
         .map(|m| {
@@ -248,14 +251,17 @@ async fn list_profiles() -> ApiResult {
 }
 
 async fn get_profile(Path(id): Path<String>) -> ApiResult {
-    let stored = crate::profile::load_raw(&id)
-        .map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let stored =
+        crate::profile::load_raw(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
     let mut val = serde_json::to_value(stored)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if let Some(cdp) = crate::process::Tracker::shared().cdp(&id) {
         if let Some(obj) = val.as_object_mut() {
             obj.insert("running".into(), json!(true));
-            obj.insert("cdp".into(), serde_json::to_value(cdp).unwrap_or(Value::Null));
+            obj.insert(
+                "cdp".into(),
+                serde_json::to_value(cdp).unwrap_or(Value::Null),
+            );
         }
     }
     Ok(Json(val))
@@ -306,8 +312,7 @@ fn reject_unavailable_custom_fonts(
 ) -> Result<(), String> {
     if custom_fonts.is_some() || cfg.contains_key("custom_fonts") {
         return Err(
-            "custom fonts are not available: browser-engine coherence has not been verified"
-                .into(),
+            "custom fonts are not available: browser-engine coherence has not been verified".into(),
         );
     }
     Ok(())
@@ -359,8 +364,12 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
     if let Some(pid) = body.proxy_id.as_ref() {
         meta["proxy_id"] = json!(pid);
     } else if let Some(pstr) = body.proxy.as_ref() {
-        let entry = crate::proxy::parse_single(pstr)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
+        let entry = crate::proxy::parse_single(pstr).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("unparseable proxy: {pstr}"),
+            )
+        })?;
         let stored = crate::proxy::upsert_dedup(entry)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         // Best-effort full test (UDP + geo); launch re-probes UDP live anyway.
@@ -385,7 +394,10 @@ async fn create_profile(Json(body): Json<CreateReq>) -> ApiResult {
     persist_created(None, body).await
 }
 
-async fn create_profile_in_folder(Path(folder): Path<String>, Json(body): Json<CreateReq>) -> ApiResult {
+async fn create_profile_in_folder(
+    Path(folder): Path<String>,
+    Json(body): Json<CreateReq>,
+) -> ApiResult {
     persist_created(Some(folder), body).await
 }
 
@@ -460,8 +472,12 @@ mod temp_profile_tests {
     fn temporary_profile_accepts_launch_object() {
         let mut cfg = Map::<String, Value>::new();
 
-        apply_temp_object_override(&mut cfg, "launch", Some(json!({ "args": ["--mute-audio"] })))
-            .unwrap();
+        apply_temp_object_override(
+            &mut cfg,
+            "launch",
+            Some(json!({ "args": ["--mute-audio"] })),
+        )
+        .unwrap();
 
         assert_eq!(cfg["launch"]["args"][0].as_str(), Some("--mute-audio"));
     }
@@ -487,8 +503,8 @@ mod temp_profile_tests {
         });
 
         assert!(super::validated_api_fingerprint(&fingerprint, &None).is_err());
-        let accepted = super::validated_api_fingerprint(&json!({ "name": "fixture" }), &None)
-            .unwrap();
+        let accepted =
+            super::validated_api_fingerprint(&json!({ "name": "fixture" }), &None).unwrap();
         assert!(!accepted.contains_key("_meta"));
     }
 
@@ -587,11 +603,7 @@ mod temp_profile_tests {
         assert!(launch_guard.contains("\"400\":"));
         assert!(launch_guard.contains("\"409\":"));
 
-        let running = operation_block(
-            &spec,
-            "    RunningProfile:\n",
-            "    LibraryEntry:\n",
-        );
+        let running = operation_block(&spec, "    RunningProfile:\n", "    LibraryEntry:\n");
         assert!(!running.contains("launch_instance_token"));
     }
 
@@ -628,14 +640,18 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
     .map_err(|error| profile_api_error(error, StatusCode::BAD_REQUEST))?;
     cfg.insert("name".into(), json!(normalized_name));
     crate::ensure_default_noise(&mut cfg);
-    apply_temp_noise_override(&mut cfg, body.noise)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    apply_temp_noise_override(&mut cfg, body.noise).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     apply_temp_object_override(&mut cfg, "launch", body.launch)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let mut meta = json!({ "id": "", "folder": body.folder.unwrap_or_default(), "temporary": true });
+    let mut meta =
+        json!({ "id": "", "folder": body.folder.unwrap_or_default(), "temporary": true });
     if let Some(pstr) = body.proxy.as_ref() {
-        let entry = crate::proxy::parse_single(pstr)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
+        let entry = crate::proxy::parse_single(pstr).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("unparseable proxy: {pstr}"),
+            )
+        })?;
         meta["inline_proxy"] = serde_json::to_value(entry).unwrap_or(Value::Null);
     }
     cfg.insert("_meta".into(), meta);
@@ -710,12 +726,12 @@ fn validate_extension_ids(ids: &[String]) -> Result<(), ApiError> {
 async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiResult {
     let _claim = crate::profile::begin_user_mutation([&id], "modify this profile")
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
-    let mut stored = crate::profile::load_raw(&id)
-        .map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let mut stored =
+        crate::profile::load_raw(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
 
     if let Some(fp) = body.fingerprint {
-        let cfg = validated_api_fingerprint(&fp, &None)
-            .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        let cfg =
+            validated_api_fingerprint(&fp, &None).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
         stored.config = cfg;
     }
     if let Some(n) = body.name.as_ref() {
@@ -727,11 +743,19 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
     crate::profile::prepare_profile_name_for_save(&mut stored)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     if let Some(pid) = body.proxy_id.as_ref() {
-        stored.meta.proxy_id = if pid.is_empty() { None } else { Some(pid.clone()) };
+        stored.meta.proxy_id = if pid.is_empty() {
+            None
+        } else {
+            Some(pid.clone())
+        };
         stored.meta.inline_proxy = None;
     } else if let Some(pstr) = body.proxy.as_ref() {
-        let entry = crate::proxy::parse_single(pstr)
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
+        let entry = crate::proxy::parse_single(pstr).ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("unparseable proxy: {pstr}"),
+            )
+        })?;
         let s = crate::proxy::upsert_dedup(entry)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = crate::proxy::full_test(&s).await;
@@ -767,7 +791,10 @@ struct RenameFolderReq {
     name: String,
 }
 
-async fn rename_folder_ep(Path(folder): Path<String>, Json(body): Json<RenameFolderReq>) -> ApiResult {
+async fn rename_folder_ep(
+    Path(folder): Path<String>,
+    Json(body): Json<RenameFolderReq>,
+) -> ApiResult {
     let n = crate::profile::rename_folder(&folder, &body.name)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     crate::notify_store_changed("profiles");
@@ -781,7 +808,10 @@ struct DeleteFolderQuery {
     delete_profiles: bool,
 }
 
-async fn delete_folder_ep(Path(folder): Path<String>, Query(q): Query<DeleteFolderQuery>) -> ApiResult {
+async fn delete_folder_ep(
+    Path(folder): Path<String>,
+    Query(q): Query<DeleteFolderQuery>,
+) -> ApiResult {
     let n = crate::profile::delete_folder(&folder, q.delete_profiles)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     crate::notify_store_changed("profiles");
@@ -813,6 +843,115 @@ async fn start_profile(Path(id): Path<String>, body: Option<Json<StartReq>>) -> 
     })))
 }
 
+// ---- automation ----
+
+async fn list_automation_projects() -> ApiResult {
+    let projects = crate::automation::list()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "projects": projects })))
+}
+
+async fn get_automation_project(Path(id): Path<String>) -> ApiResult {
+    let project =
+        crate::automation::get(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!(project)))
+}
+
+#[derive(Deserialize)]
+struct NewProjectReq {
+    name: String,
+}
+
+async fn create_automation_project(Json(body): Json<NewProjectReq>) -> ApiResult {
+    let project = crate::automation::create(&body.name)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!(project)))
+}
+
+async fn save_automation_project(
+    Path(id): Path<String>,
+    Json(mut project): Json<crate::automation::Project>,
+) -> ApiResult {
+    // The path is the authority on which project this is: a body naming a
+    // different id would otherwise overwrite something the caller did not ask
+    // for.
+    project.id = id;
+    let saved = crate::automation::save(project)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!(saved)))
+}
+
+async fn delete_automation_project(Path(id): Path<String>) -> ApiResult {
+    crate::automation::delete(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!({ "id": id, "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct RunReq {
+    /// Which profile to drive. Must already be running.
+    profile_id: String,
+    /// Values the project's placeholders expand to, for parameters the author
+    /// marked secret and anything else the caller wants to vary per run.
+    #[serde(default)]
+    variables: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct RunUnsavedReq {
+    profile_id: String,
+    /// The project to run, supplied whole rather than by id.
+    project: crate::automation::Project,
+    #[serde(default)]
+    variables: std::collections::HashMap<String, String>,
+}
+
+/// Run a project the caller supplied instead of one that was saved.
+///
+/// Exists for callers that build a project to answer a question asked once --
+/// "what did this page request?" -- which would otherwise have to save a
+/// single-use project and delete it again.
+async fn run_automation_unsaved(Json(body): Json<RunUnsavedReq>) -> ApiResult {
+    if let Some((block_id, kind)) = crate::runner::unsupported_blocks(&body.project).first() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("block {block_id} has unknown kind \"{kind}\""),
+        ));
+    }
+
+    let report = crate::runner::run_unsaved(&body.project, &body.profile_id, body.variables)
+        .await
+        .map_err(|e| {
+            let text = e.to_string();
+            let code = if text.contains("is not running") || text.contains("debugging port") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err(code, text)
+        })?;
+    Ok(Json(json!(report)))
+}
+
+async fn run_automation_project(Path(id): Path<String>, Json(body): Json<RunReq>) -> ApiResult {
+    // Every guard lives in the runner so the UI and the API cannot drift:
+    // the profile must already be running, and it must expose a debugging
+    // port the launcher itself recorded.
+    let report = crate::runner::run_saved(&id, &body.profile_id, body.variables)
+        .await
+        .map_err(|e| {
+            let text = e.to_string();
+            let code = if text.contains("no such project") {
+                StatusCode::NOT_FOUND
+            } else if text.contains("is not running") || text.contains("debugging port") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err(code, text)
+        })?;
+    Ok(Json(json!(report)))
+}
+
 async fn stop_profile(Path(id): Path<String>) -> ApiResult {
     let stopped = crate::process::Tracker::shared()
         .kill(&id)
@@ -839,7 +978,10 @@ async fn stop_profile_if_instance(
     Json(body): Json<StopIfInstanceReq>,
 ) -> ApiResult {
     if body.expected_pid == 0 {
-        return Err(err(StatusCode::BAD_REQUEST, "expected_pid must be positive"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "expected_pid must be positive",
+        ));
     }
     if uuid::Uuid::parse_str(&body.launch_instance_token).is_err() {
         return Err(err(
@@ -1019,10 +1161,12 @@ async fn add_proxy(Json(body): Json<AddProxyReq>) -> ApiResult {
         crate::proxy::parse_single(s)
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {s}")))?
     } else {
-        let host = body
-            .host
-            .clone()
-            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "`proxy` string or host+port required"))?;
+        let host = body.host.clone().ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "`proxy` string or host+port required",
+            )
+        })?;
         let port = body
             .port
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "`port` required"))?;
@@ -1073,7 +1217,8 @@ async fn delete_proxy(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn list_proxies() -> ApiResult {
-    let list = crate::proxy::list().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let list =
+        crate::proxy::list().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // Credentials never exposed over API.
     let out: Vec<Value> = list
         .into_iter()
@@ -1129,10 +1274,8 @@ async fn add_extension(Json(body): Json<AddExtensionReq>) -> ApiResult {
         (Some(u), _) if !u.is_empty() => crate::extensions::import_url(u)
             .await
             .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?,
-        (_, Some(p)) if !p.is_empty() => {
-            crate::extensions::import(std::path::Path::new(p))
-                .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
-        }
+        (_, Some(p)) if !p.is_empty() => crate::extensions::import(std::path::Path::new(p))
+            .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?,
         _ => return Err(err(StatusCode::BAD_REQUEST, "`url` or `path` required")),
     };
     crate::notify_store_changed("extensions");
@@ -1189,30 +1332,29 @@ async fn delete_bookmark(Path(id): Path<String>) -> ApiResult {
 // ---- trash ----
 
 async fn list_trash() -> ApiResult {
-    let list = crate::trash::list()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let list =
+        crate::trash::list().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::to_value(list).unwrap_or(Value::Null)))
 }
 
 /// Puts the profile back under its own id, so anything that referenced it
 /// still points at it.
 async fn restore_trash(Path(id): Path<String>) -> ApiResult {
-    let meta = crate::trash::restore(&id)
-        .map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let meta = crate::trash::restore(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
     crate::notify_store_changed("profiles");
     Ok(Json(serde_json::to_value(meta).unwrap_or(Value::Null)))
 }
 
 /// Deletes the archive for good. There is nothing after this.
 async fn purge_trash(Path(id): Path<String>) -> ApiResult {
-    crate::trash::purge(&id)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::trash::purge(&id).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::notify_store_changed("trash");
     Ok(Json(json!({ "purged": true, "id": id })))
 }
 
 async fn list_folders() -> ApiResult {
-    let metas = crate::profile::list_all().map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let metas = crate::profile::list_all()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut set = std::collections::BTreeSet::new();
     for m in metas {
         if !m.folder.is_empty() {
@@ -1277,10 +1419,21 @@ pub async fn serve(secret: String, port: u16) {
         error: None,
     });
 
+    serve_router(router(), port).await
+}
+
+/// The API's routes, exactly as [`serve`] mounts them.
+///
+/// Split out so tests exercise the real routing table -- including which
+/// routes sit behind the auth layer -- instead of a copy that can drift.
+fn router() -> Router {
     let protected = Router::new()
         .route("/profiles", get(list_profiles).post(create_profile))
         .route("/profiles/temporary", post(create_temporary))
-        .route("/profiles/:id", get(get_profile).patch(edit_profile).delete(delete_profile))
+        .route(
+            "/profiles/:id",
+            get(get_profile).patch(edit_profile).delete(delete_profile),
+        )
         .route("/profiles/:id/start", post(start_profile))
         .route("/profiles/:id/stop", post(stop_profile))
         .route(
@@ -1295,9 +1448,15 @@ pub async fn serve(secret: String, port: u16) {
             "/profiles/:id/verification-status",
             post(report_verification_status),
         )
-        .route("/profiles/:id/cookies", get(export_cookies).post(import_cookies))
+        .route(
+            "/profiles/:id/cookies",
+            get(export_cookies).post(import_cookies),
+        )
         .route("/folders", get(list_folders))
-        .route("/folders/:folder", patch(rename_folder_ep).delete(delete_folder_ep))
+        .route(
+            "/folders/:folder",
+            patch(rename_folder_ep).delete(delete_folder_ep),
+        )
         .route("/folders/:folder/profiles", post(create_profile_in_folder))
         .route("/fingerprint/new", get(new_fingerprint))
         .route("/fingerprint/new/:platform", get(new_fingerprint_for))
@@ -1313,12 +1472,28 @@ pub async fn serve(secret: String, port: u16) {
         .route("/trash", get(list_trash))
         .route("/trash/:id", delete(purge_trash))
         .route("/trash/:id/restore", post(restore_trash))
+        .route(
+            "/automation/projects",
+            get(list_automation_projects).post(create_automation_project),
+        )
+        .route(
+            "/automation/projects/:id",
+            get(get_automation_project)
+                .put(save_automation_project)
+                .delete(delete_automation_project),
+        )
+        .route("/automation/projects/:id/run", post(run_automation_project))
+        .route("/automation/run", post(run_automation_unsaved))
         .route_layer(middleware::from_fn(auth));
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(protected);
+    Router::new().route("/health", get(health)).merge(protected)
+}
 
+/// Bind `port` and serve `app`, publishing runtime status as it goes.
+///
+/// Split out of [`serve`] so tests can exercise the same router this
+/// function serves, rather than a copy of it that could drift.
+async fn serve_router(app: Router, port: u16) {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
@@ -1390,5 +1565,307 @@ mod listener_handle_tests {
         let read = unsafe { GetHandleInformation(handle, &mut flags) };
         assert_ne!(read, 0, "read listener handle flags");
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+    }
+}
+
+#[cfg(test)]
+mod automation_endpoint_tests {
+    //! The automation endpoints, driven through the real routing table.
+    //!
+    //! The storage and runner unit tests say nothing about whether these
+    //! endpoints are mounted, or whether the auth layer covers them. A route
+    //! mounted outside `route_layer(auth)` would leave every one of those
+    //! tests green while handing any local process the ability to drive the
+    //! operator's logged-in browsers -- so that is what this checks.
+    //!
+    //! Requests go through `tower`'s `oneshot` rather than a socket: same
+    //! router, same middleware, no port to race over.
+
+    use super::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    const SECRET: &str = "test-secret-not-a-real-one";
+
+    /// Point the store at a scratch dir and mint a token for it.
+    ///
+    /// Never the operator's real store: these tests create and delete
+    /// projects, and this machine's launcher runs against the real one.
+    ///
+    /// The store root is process-global, so these tests hold a lock for the
+    /// duration: without it, two tests racing on the same root see each
+    /// other's projects and the failure looks like a routing bug.
+    fn scratch_store() -> (
+        tempfile::TempDir,
+        String,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("a scratch config root");
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        super::set_secret(SECRET);
+        let token = super::long_lived_token(SECRET).expect("mint a token");
+        (dir, token, guard)
+    }
+
+    async fn send(request: Request<Body>) -> (StatusCode, Value) {
+        let response = router().oneshot(request).await.expect("route the request");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("read the body");
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    fn authed(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build the request")
+    }
+
+    /// Every automation endpoint sits behind the same auth as the rest of the
+    /// API. This is the check that matters most: they drive real browsers.
+    #[tokio::test]
+    async fn the_automation_endpoints_refuse_an_unauthenticated_caller() {
+        let (_store, _token, _lock) = scratch_store();
+
+        let unauthenticated = [
+            ("GET", "/automation/projects"),
+            ("GET", "/automation/projects/anything"),
+            ("POST", "/automation/projects"),
+            ("PUT", "/automation/projects/anything"),
+            ("POST", "/automation/projects/anything/run"),
+            ("POST", "/automation/run"),
+            ("DELETE", "/automation/projects/anything"),
+        ];
+
+        for (method, path) in unauthenticated {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("build the request");
+            let (status, _) = send(request).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} answered an unauthenticated caller"
+            );
+        }
+
+        // A wrong token is no better than no token.
+        let (status, _) = send(authed(
+            "GET",
+            "/automation/projects",
+            "not-the-token",
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The full lifecycle through the API: create, edit, read back, list, delete.
+    #[tokio::test]
+    async fn a_project_survives_the_round_trip_through_the_api() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (status, created) = send(authed(
+            "POST",
+            "/automation/projects",
+            &token,
+            json!({ "name": "API round trip" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {created}");
+        let id = created["id"].as_str().expect("a new id").to_string();
+        assert_eq!(created["name"], "API round trip");
+
+        let mut project = created.clone();
+        project["blocks"] = json!([{
+            "id": "one",
+            "kind": "navigate",
+            "params": { "url": "https://example.invalid/" },
+            "enabled": true,
+            "on_done": "next",
+            "on_fail": "stop",
+        }]);
+
+        let (status, saved) = send(authed(
+            "PUT",
+            &format!("/automation/projects/{id}"),
+            &token,
+            project,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "save failed: {saved}");
+        assert_eq!(saved["blocks"].as_array().map(Vec::len), Some(1));
+
+        // Read it back from storage, not from the save's own reply.
+        let (status, fetched) = send(authed(
+            "GET",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["blocks"][0]["kind"], "navigate");
+        assert_eq!(
+            fetched["blocks"][0]["params"]["url"],
+            "https://example.invalid/"
+        );
+
+        let (status, listed) = send(authed("GET", "/automation/projects", &token, json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            listed["projects"]
+                .as_array()
+                .expect("an array of projects")
+                .iter()
+                .any(|p| p["id"] == id.as_str()),
+            "the new project should appear in the list"
+        );
+
+        let (status, _) = send(authed(
+            "DELETE",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = send(authed(
+            "GET",
+            &format!("/automation/projects/{id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a deleted project should be gone"
+        );
+    }
+
+    /// A body naming a different id must not overwrite another project: the
+    /// path is the authority, so a confused client cannot redirect a save.
+    #[tokio::test]
+    async fn a_save_cannot_overwrite_a_project_the_path_did_not_name() {
+        let (_store, token, _lock) = scratch_store();
+
+        let mut created = Vec::new();
+        for name in ["Target", "Other"] {
+            let (status, project) = send(authed(
+                "POST",
+                "/automation/projects",
+                &token,
+                json!({ "name": name }),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            created.push(project);
+        }
+        let target_id = created[0]["id"].as_str().expect("an id").to_string();
+        let other_id = created[1]["id"].as_str().expect("an id").to_string();
+
+        // Save to the target's path while claiming to be the other in the body.
+        let mut body = created[1].clone();
+        body["name"] = json!("Rewritten");
+        send(authed(
+            "PUT",
+            &format!("/automation/projects/{target_id}"),
+            &token,
+            body,
+        ))
+        .await;
+
+        let (_, untouched) = send(authed(
+            "GET",
+            &format!("/automation/projects/{other_id}"),
+            &token,
+            json!({}),
+        ))
+        .await;
+        assert_eq!(
+            untouched["name"], "Other",
+            "a save must not rewrite the project its path did not name"
+        );
+    }
+
+    /// Running against a profile that is not running is refused, rather than
+    /// launching a browser nobody asked for.
+    #[tokio::test]
+    async fn running_against_a_stopped_profile_is_refused() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (_, created) = send(authed(
+            "POST",
+            "/automation/projects",
+            &token,
+            json!({ "name": "Needs a browser" }),
+        ))
+        .await;
+        let id = created["id"].as_str().expect("an id").to_string();
+
+        // Creation only takes a name, so the block that needs a browser goes
+        // in with a save. Without it the project is empty, needs no browser,
+        // and would run happily against a profile that is not there.
+        let mut project = created.clone();
+        project["blocks"] = json!([
+            { "id": "a", "kind": "navigate", "params": { "url": "https://example.com" } }
+        ]);
+        let (status, _) = send(authed(
+            "PUT",
+            &format!("/automation/projects/{id}"),
+            &token,
+            project,
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "the project should have saved");
+
+        let (status, body) = send(authed(
+            "POST",
+            &format!("/automation/projects/{id}/run"),
+            &token,
+            json!({ "profile_id": "no-such-profile-is-running" }),
+        ))
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a run against a stopped profile should be refused"
+        );
+        assert!(
+            body.to_string().contains("not running"),
+            "the refusal should say why: {body}"
+        );
+    }
+
+    /// Running a project that does not exist is a 404, not a 500.
+    #[tokio::test]
+    async fn running_an_unknown_project_is_not_found() {
+        let (_store, token, _lock) = scratch_store();
+
+        let (status, _) = send(authed(
+            "POST",
+            "/automation/projects/no-such-project/run",
+            &token,
+            json!({ "profile_id": "anything" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

@@ -2,10 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Checkbox, DialogModal, SegmentControl, cn } from "@proxyshard/shardx-ui-kit";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { useProxy } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 /** Spreads the selected proxies over the chosen profiles, paired by position —
  *  which is why both lists are shown rather than just their counts. */
 export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const proxies = useProxy((s) => s.proxies);
   const proxySel = useProxy((s) => s.proxySel);
   const profiles = useProxy((s) => s.profiles);
@@ -60,36 +62,36 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
     <DialogModal
       open
       onClose={onClose}
-      title={`Distribute ${picked.length} prox${picked.length === 1 ? "y" : "ies"}`}
+      title={t(picked.length === 1 ? "proxy.distributeOne" : "proxy.distributeMany", { n: picked.length })}
       maxWidthClassName="max-w-[760px]"
-      confirmLabel={willBind === 0 ? "Nothing to bind" : `Bind ${willBind}`}
+      confirmLabel={willBind === 0 ? t("proxy.nothingToBind") : `Bind ${willBind}`}
       onConfirm={run}
       isLoading={busy}
       isDisabled={busy || willBind === 0}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3.5 py-4">
         <div className="grid grid-cols-2 gap-3">
           <CSSelect
-            title="Profiles from"
+            title={t("proxy.profilesFrom")}
             value={folder}
             onChange={setFolder}
             isSearchable={folders.length > 8}
             options={[
-              { value: "all", label: "Every folder" },
+              { value: "all", label: t("proxy.everyFolder") },
               ...folders.map((f) => ({ value: f, label: f })),
             ]}
           />
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Apply to</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("proxy.applyTo")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
               value={scope}
               items={[
-                { value: "unbound", label: "Without a proxy" },
-                { value: "all", label: "All profiles" },
+                { value: "unbound", label: t("proxy.withoutAProxy") },
+                { value: "all", label: t("proxy.allProfiles") },
               ]}
               onChange={(v) => setScope(v as "unbound" | "all")}
             />
@@ -98,7 +100,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
 
         {scope === "all" && boundCount > 0 && (
           <p className="m-0 rounded-8 bg-warning-alpha-16 px-2.5 py-1.5 text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-warning-base/30">
-            {boundCount} of the profiles below already {boundCount === 1 ? "has a proxy" : "have proxies"} — binding replaces {boundCount === 1 ? "it" : "them"}.
+            {t(boundCount === 1 ? "proxy.alreadyBoundOne" : "proxy.alreadyBoundMany", { n: boundCount })}
           </p>
         )}
 
@@ -163,7 +165,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
               })}
               {candidates.length === 0 && (
                 <div className="px-2.5 py-4 text-center text-paragraph-xs text-text-soft-400">
-                  No profiles match — try another folder, or untick the filter.
+                  {t("proxy.noProfilesMatchTryAnotherFolderOrUnt")}
                 </div>
               )}
             </div>
@@ -171,9 +173,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
         </div>
 
         <p className="m-0 text-paragraph-xs text-text-soft-400">
-          Pairs are made in the order shown, one proxy each. Run out of proxies and the
-          remaining profiles are left alone — two profiles behind one IP is the thing you
-          are avoiding by distributing them.
+          {t("proxy.pairsAreMadeInTheOrderShownOneProxyE")}
         </p>
       </div>
     </DialogModal>

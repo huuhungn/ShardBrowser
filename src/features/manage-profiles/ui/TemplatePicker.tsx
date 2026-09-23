@@ -3,6 +3,7 @@ import { Modal } from "@proxyshard/shardx-ui-kit";
 import type { FingerprintEntry } from "../../../entities/fingerprint";
 import { fingerprintList } from "../../../entities/fingerprint";
 import { hostPlatform } from "../../../entities/profile";
+import { useT } from "../../../shared/i18n";
 
 export function TemplatePicker({
   fingerprints,
@@ -15,6 +16,7 @@ export function TemplatePicker({
   onPick: (id: string) => void;
   onClose: () => void;
 }) {
+  const t = useT();
   const [lib, setLib] = useState<FingerprintEntry[]>(fingerprints ?? []);
   const [host, setHost] = useState<string>("");
   useEffect(() => {
@@ -29,7 +31,7 @@ export function TemplatePicker({
     <Modal
       open
       onClose={onClose}
-      title={`Pick a ${host || ""} fingerprint`}
+      title={t("fp.pickAFingerprint", { host: host || "" })}
       maxWidthClassName="max-w-[880px]"
     >
       {tpls.length === 0 ? (

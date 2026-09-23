@@ -10,18 +10,23 @@ import {
   dataRootGet, dataRootMigrate,
   type DataRootInfo, type MigrationProgress,
 } from "../../../entities/settings";
+import { useT } from "../../../shared/i18n";
 
-const PHASE_LABEL: Record<MigrationProgress["phase"], string> = {
-  scan: "Looking at what there is to move…",
-  copy: "Copying",
-  verify: "Checking every file arrived…",
-  cleanup: "Removing the old copy…",
-  done: "Done",
+// Keys, not translated text: this table is built once when the module loads,
+// so holding finished strings would pin the card to whichever language
+// happened to be active at startup.
+const PHASE_KEY: Record<MigrationProgress["phase"], string> = {
+  scan: "dataRoot.phaseScan",
+  copy: "profile.copying",
+  verify: "dataRoot.phaseVerify",
+  cleanup: "dataRoot.phaseCleanup",
+  done: "profile.done",
 };
 
 /** Where profiles, user-data, extensions and the trash live. The move copies,
  *  verifies, then deletes; the backend refuses launches while it runs. */
 export function DataRootCard() {
+  const t = useT();
   const [info, setInfo] = useState<DataRootInfo | null>(null);
   const [progress, setProgress] = useState<MigrationProgress | null>(null);
 
@@ -40,25 +45,21 @@ export function DataRootCard() {
   const running = progress !== null;
 
   const move = async () => {
-    const dir = await open({ directory: true, title: "Where should profiles live?" });
+    const dir = await open({ directory: true, title: t("dataRoot.pickFolderTitle") });
     if (typeof dir !== "string") return;
     const ok = await confirmModal({
-      title: "Move profile data",
-      message:
-        `Move profiles, user-data, extensions and the trash to "${dir}"?\n\n` +
-        "Every file is copied and checked before anything is deleted, so a " +
-        "failure leaves the current folder untouched. Profiles cannot be " +
-        "launched until it finishes.",
+      title: t("profile.moveProfileData"),
+      message: t("dataRoot.moveAsk", { dir }),
       buttons: [
-        { label: "Cancel", value: false },
-        { label: "Move", value: true, primary: true },
+        { label: t("common.cancel"), value: false },
+        { label: t("profile.move"), value: true, primary: true },
       ],
     });
     if (ok !== true) return;
     setProgress({ phase: "scan", done: 0, total: 0, percent: 0, current: "" });
     try {
       const n = await dataRootMigrate(dir);
-      toast.ok(`Moved ${n} file${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "dataRoot.movedOne" : "dataRoot.movedMany", { n }));
     } catch (e) {
       toast.err(String(e));
     } finally {
@@ -70,15 +71,15 @@ export function DataRootCard() {
   return (
     <div className="flex flex-col gap-3">
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Profiles, their user-data dirs, the extension library and the trash. The
-        small config files stay in the app's own folder so the launcher can always
-        find where the data went. Pick a folder on any disk — an external drive
-        mounted read-only is rejected before anything is copied.
+        {t("profile.profilesTheirUserDataDirsTheExtensio")}
       </p>
 
       <label className="flex flex-col gap-1.5">
         <span className="text-label-xs text-text-sub-600">
-          Current location{info && !info.custom && <span className="text-text-soft-400"> · default</span>}
+          {t("dataRoot.currentLocation")}
+          {info && !info.custom && (
+            <span className="text-text-soft-400">{t("dataRoot.defaultSuffix")}</span>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <span className="mono min-w-0 flex-1 truncate rounded-8 bg-bg-weak-50 px-[11px] py-[9px] text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
@@ -86,9 +87,9 @@ export function DataRootCard() {
           </span>
           <Button
             variant="neutral" mode="stroke" size="small" disabled={!info || running}
-            onClick={() => info && openPath(info.path).catch(() => toast.err("Could not open that folder"))}
+            onClick={() => info && openPath(info.path).catch(() => toast.err(t("profile.couldNotOpenThatFolder")))}
           >
-            Reveal
+            {t("profile.reveal")}
           </Button>
           <Button
             variant="primary" mode="stroke" size="small" disabled={running}
@@ -104,7 +105,7 @@ export function DataRootCard() {
         <div className="flex flex-col gap-1.5 rounded-8 bg-bg-weak-50 p-3 ring-1 ring-inset ring-stroke-soft-200">
           <div className="flex items-baseline justify-between gap-3">
             <span className="text-label-xs text-text-strong-950">
-              {PHASE_LABEL[progress.phase]}
+              {t(PHASE_KEY[progress.phase])}
             </span>
             <span className="mono text-paragraph-xs text-text-soft-400">
               {progress.total > 0 ? `${progress.done} / ${progress.total}` : ""}

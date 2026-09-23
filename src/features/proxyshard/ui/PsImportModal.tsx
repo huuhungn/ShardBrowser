@@ -5,12 +5,14 @@ import { CSSelect } from "../../../shared/ui/CSSelect";
 import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import type { PsOrder, PsActiveProxy } from "../../../entities/proxyshard";
-import { PS_SIGNATURES, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
+import { psSignatures, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 /// Active-proxy picker: fetch an order's proxies, choose SOCKS5/HTTP and which
 /// IPs to import into the local proxy list (via proxy_bulk_save, which dedups).
 export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () => void }) {
+  const t = useT();
   const [items, setItems] = useState<PsActiveProxy[] | null>(null);
   const [err, setErr] = useState("");
   const [kind, setKind] = useState<"socks5" | "http">("socks5");
@@ -56,7 +58,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
   const save = async () => {
     if (!items) return;
     const chosen = items.filter((d) => sel.has(d.ip));
-    if (chosen.length === 0) { toast.err("Select at least one proxy"); return; }
+    if (chosen.length === 0) { toast.err(t("ps.selectAtLeastOneProxy")); return; }
     const label = tag.trim() || `order ${order.order_id}`;
     const entries = chosen
       .map((d) => {
@@ -71,14 +73,14 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
           username: d.username ?? "",
           password: d.password ?? "",
           country: "",
-          notes: `ProxyShard order ${order.order_id}`,
+          notes: t("ps.orderTitle", { id: order.order_id }),
         };
       })
       .filter(Boolean);
     setSaving(true);
     try {
       const n = await proxyBulkSave(entries);
-      toast.ok(n > 0 ? `Added ${n} prox${n === 1 ? "y" : "ies"}` : "No new proxies (already in your list)");
+      toast.ok(n > 0 ? t(n === 1 ? "ps.addedProxyOne" : "ps.addedProxyMany", { n }) : t("ps.noNewProxiesAlreadyInYourList"));
       // Apply only the selected proxies whose signature actually changed
       // (a non-empty value differing from the one already set).
       const sigItems = chosen
@@ -87,8 +89,8 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
       if (sigItems.length > 0) {
         try {
           await psSignatureSet(order.order_id, sigItems);
-          toast.ok(`Set p0f on ${sigItems.length} IP${sigItems.length === 1 ? "" : "s"}`);
-        } catch (e) { toast.err("Signature: " + String(e)); }
+          toast.ok(t(sigItems.length === 1 ? "ps.setP0fOnOne" : "ps.setP0fOnMany", { n: sigItems.length }));
+        } catch (e) { toast.err(t("ps.signatureError", { error: String(e) })); }
       }
       onClose();
     } catch (e) { toast.err(String(e)); }
@@ -99,27 +101,27 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
     <DialogModal
       open
       onClose={onClose}
-      title={`Add proxies — ${order.product_name} #${order.order_id}`}
+      title={t("ps.addProxiesTitle", { product: order.product_name, id: order.order_id })}
       maxWidthClassName="max-w-[880px]"
       confirmLabel={saving ? "Adding…" : `Add ${sel.size}`}
       onConfirm={save}
       isLoading={saving}
       isDisabled={saving || !items || sel.size === 0}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4">
         <div className="mb-2.5 flex items-end gap-3">
           <div className="flex-1">
-            <Field label="Name prefix" value={tag} onChange={setTag} />
+            <Field label={t("ps.namePrefix")} value={tag} onChange={setTag} />
           </div>
           <div>
             <SegmentControl
               size="small"
               value={kind}
               items={[
-                { value: "socks5", label: "SOCKS5" },
-                { value: "http", label: "HTTP" },
+                { value: "socks5", label: t("ps.socks5") },
+                { value: "http", label: t("ps.http") },
               ]}
               onChange={(v) => setKind(v as "socks5" | "http")}
             />
@@ -128,16 +130,16 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         {slots && (
           <p className="m-0 mb-1.5 text-paragraph-xs text-text-soft-400">
             p0f slots: {slots.used}/{slots.avail} used
-            {canSetP0f ? ` · ${free} free — set a signature per proxy below` : " · no free slots (buy more to assign p0f)"}
+            {canSetP0f ? t("ps.freeSetSignature", { free }) : " · no free slots (buy more to assign p0f)"}
           </p>
         )}
         {!items && !err && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading proxies…</p>}
         {err && <p className="m-0 text-paragraph-xs text-text-soft-400">{err}</p>}
-        {items && items.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">This order has no active proxies.</p>}
+        {items && items.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.thisOrderHasNoActiveProxies")}</p>}
         {items && items.length > 0 && (
           <div className="mt-1.5 max-h-[320px] overflow-hidden overflow-y-auto rounded-10 bg-bg-white-0 ring-1 ring-inset ring-stroke-soft-200">
             <div className="grid items-center gap-2.5 border-b border-stroke-soft-200 bg-bg-weak-50 px-3 py-2" style={{ gridTemplateColumns: "20px 1fr 132px" }}>
-              <Checkbox checked={allChecked} onChange={toggleAll} title="Select all" />
+              <Checkbox checked={allChecked} onChange={toggleAll} title={t("ps.selectAll")} />
               <span className="text-paragraph-xs text-text-soft-400">{sel.size} of {items.length} selected</span>
               <span className="text-right text-paragraph-xs text-text-soft-400">{canSetP0f ? "p0f" : ""}</span>
             </div>
@@ -159,7 +161,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
                     // Editable when free slots exist, or this IP is already
                     // signed (re-assigning an OS doesn't consume a slot).
                     <div onClick={(e) => e.stopPropagation()}>
-                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={PS_SIGNATURES} placeholder="p0f" />
+                      <CSSelect value={sigByIp[d.ip] ?? ""} onChange={(v) => setSig(d.ip, v)} options={psSignatures(t)} placeholder={t("ps.p0f")} />
                     </div>
                   ) : (
                     <span className="text-right text-paragraph-xs text-text-soft-400">—</span>

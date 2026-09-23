@@ -95,7 +95,11 @@ fn read_entry(id: &str) -> Result<ExtensionEntry> {
         id: id.to_string(),
         name: {
             let n = sv("name");
-            if n.is_empty() { id.to_string() } else { n }
+            if n.is_empty() {
+                id.to_string()
+            } else {
+                n
+            }
         },
         version: sv("version"),
         description: sv("description"),
@@ -121,7 +125,10 @@ fn locale_messages(root: &Path, manifest: &serde_json::Value) -> serde_json::Val
 }
 
 fn resolve_msg(raw: &str, msgs: &serde_json::Value) -> String {
-    let Some(key) = raw.strip_prefix("__MSG_").and_then(|r| r.strip_suffix("__")) else {
+    let Some(key) = raw
+        .strip_prefix("__MSG_")
+        .and_then(|r| r.strip_suffix("__"))
+    else {
         return raw.to_string();
     };
     msgs.get(key)
@@ -151,7 +158,9 @@ fn best_icon(root: &Path, manifest: &serde_json::Value) -> Option<String> {
     }
     if best.is_none() {
         for key in ["action", "browser_action", "page_action"] {
-            let Some(v) = manifest.get(key).and_then(|a| a.get("default_icon")) else { continue };
+            let Some(v) = manifest.get(key).and_then(|a| a.get("default_icon")) else {
+                continue;
+            };
             match v.as_str() {
                 Some(s) => best = Some((0, s.to_string())),
                 None => largest(v, &mut best),
@@ -239,7 +248,9 @@ pub async fn import_url(raw: &str) -> Result<ExtensionEntry> {
     if status == reqwest::StatusCode::NO_CONTENT {
         anyhow::bail!("the Web Store has no extension with that id");
     }
-    let resp = resp.error_for_status().with_context(|| format!("fetch {url}"))?;
+    let resp = resp
+        .error_for_status()
+        .with_context(|| format!("fetch {url}"))?;
     let bytes = resp.bytes().await?;
     if bytes.len() < 4 {
         anyhow::bail!("the link returned nothing to unpack");
@@ -249,7 +260,8 @@ pub async fn import_url(raw: &str) -> Result<ExtensionEntry> {
         anyhow::bail!("that link is a web page, not an extension file");
     }
 
-    let tmp = std::env::temp_dir().join(format!("shardx-ext-{}.crx", uuid::Uuid::new_v4().simple()));
+    let tmp =
+        std::env::temp_dir().join(format!("shardx-ext-{}.crx", uuid::Uuid::new_v4().simple()));
     fs::write(&tmp, &bytes)?;
     let out = import(&tmp);
     let _ = fs::remove_file(&tmp);
@@ -307,7 +319,9 @@ fn unpack_archive(src: &Path, dst: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(cursor).context("not a zip/crx archive")?;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
-        let Some(rel) = f.enclosed_name() else { continue };
+        let Some(rel) = f.enclosed_name() else {
+            continue;
+        };
         let out = dst.join(rel);
         if f.is_dir() {
             fs::create_dir_all(&out)?;

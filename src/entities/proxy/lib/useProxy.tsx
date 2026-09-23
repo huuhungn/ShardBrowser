@@ -8,6 +8,7 @@ import { confirmModal } from '../../../shared/lib/confirm';
 import { storeBus } from '../../../shared/lib/storeBus';
 import { safeUiError } from '../../../shared/lib/utils';
 import { ProfileMeta } from '../../profile/model/types';
+import { t } from "../../../shared/i18n";
 
 export type ProxyInfoTarget = { proxy: ProxyEntry; anchor: { x: number; y: number } };
 
@@ -210,8 +211,8 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         } catch (e) { toast.err(String(e)); }
     },
     removeProxy: async (id) => {
-        if ((await confirmModal({ title: "Delete proxy", message: "Delete this proxy?", danger: true })) !== true) return;
-        try { await proxyDelete(id); get().reload(); storeBus.emit('proxies'); toast.ok("Proxy deleted"); }
+        if ((await confirmModal({ title: t("proxy.deleteProxy"), message: "Delete this proxy?", danger: true })) !== true) return;
+        try { await proxyDelete(id); get().reload(); storeBus.emit('proxies'); toast.ok(t("proxy.proxyDeleted")); }
         catch (e) { toast.err(String(e)); }
     },
     // Capped-parallel bulk TCP/UDP/geo to avoid socket fan-out.
@@ -219,7 +220,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         const { proxySel, proxies, testProxy } = get();
         const ids = [...proxySel];
         if (ids.length === 0) return;
-        toast.info(`Testing ${ids.length} prox${ids.length === 1 ? "y" : "ies"}…`);
+        toast.info(t(ids.length === 1 ? "proxy.testingOne" : "proxy.testingMany", { n: ids.length }));
         const targets = proxies.filter((p) => proxySel.has(p.id));
         const CONCURRENCY = 5;
         let i = 0;
@@ -232,20 +233,20 @@ export const useProxy = create<ProxyStore>((set, get) => ({
                 }
             }),
         );
-        toast.ok("Bulk test done");
+        toast.ok(t("proxy.bulkTestDone"));
     },
     bulkDelete: async () => {
         const { proxySel } = get();
         const ids = [...proxySel];
         if (ids.length === 0) return;
-        if ((await confirmModal({ title: "Delete proxies", message: `Delete ${ids.length} prox${ids.length === 1 ? "y" : "ies"}?`, danger: true })) !== true) return;
+        if ((await confirmModal({ title: t("proxy.deleteProxies"), message: t(ids.length === 1 ? "proxy.deleteAskOne" : "proxy.deleteAskMany", { n: ids.length }), danger: true })) !== true) return;
         for (const id of ids) {
             try { await proxyDelete(id); } catch (e) { toast.err(String(e)); }
         }
         get().clearSelected();
         get().reload();
         storeBus.emit('proxies');
-        toast.ok(`Deleted ${ids.length}`);
+        toast.ok(t("proxy.deletedCount", { n: ids.length }));
     },
     // Export in bulk-import format so a round-trip preserves the name.
     bulkExport: () => {
@@ -262,8 +263,8 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         });
         const text = lines.join("\n");
         clip.write(text).then(
-            () => toast.ok(`Copied ${targets.length} to clipboard`),
-            (e) => toast.err("Copy failed: " + String(e)),
+            () => toast.ok(t("common.copiedNToClipboard", { n: targets.length })),
+            (e) => toast.err(t("proxy.copyFailed") + String(e)),
         );
     },
     // One proxy per profile, in the order shown, stopping when the proxies run
@@ -284,7 +285,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         set({ distributeOpen: false });
         get().reload();
         storeBus.emit('profiles');
-        toast.ok(`Bound ${bound} profile${bound === 1 ? '' : 's'}`);
+        toast.ok(t(bound === 1 ? "proxy.boundProfileOne" : "proxy.boundProfileMany", { n: bound }));
         return bound;
     },
 
@@ -292,11 +293,11 @@ export const useProxy = create<ProxyStore>((set, get) => ({
     bulkImportClipboard: async () => {
         try {
             const text = await clip.read();
-            if (!text.trim()) { toast.err("Clipboard is empty"); return; }
+            if (!text.trim()) { toast.err(t("proxy.clipboardIsEmpty")); return; }
             const n = await proxyBulkImport(text, "socks5");
             get().reload();
             storeBus.emit('proxies');
-            toast.ok(`Imported ${n} prox${n === 1 ? "y" : "ies"}`);
-        } catch (e) { toast.err("Import failed: " + String(e)); }
+            toast.ok(t(n === 1 ? "proxy.importedOne" : "proxy.importedMany", { n }));
+        } catch (e) { toast.err(t("proxy.importFailed") + String(e)); }
     },
 }))

@@ -7,6 +7,7 @@ import {
   teamEnrollDevice, teamCollectCustody, useTeam,
   type TeamStatus,
 } from "../../../entities/team";
+import { t, useT } from "../../../shared/i18n";
 
 /** A tenant id is a UUID the operator picks once; typing one by hand is how
  *  two devices end up in different fleets over a mistyped character. */
@@ -25,9 +26,9 @@ function newTenantId(): string {
 /** A default label that says which machine this is without asking. */
 function suggestLabel(): string {
   const ua = navigator.userAgent;
-  const os = /Windows/i.test(ua) ? "Windows"
+  const os = /Windows/i.test(ua) ? t("team.windows")
     : /Macintosh|Mac OS X/i.test(ua) ? "macOS"
-    : /Linux|X11|CrOS/i.test(ua) ? "Linux" : "device";
+    : /Linux|X11|CrOS/i.test(ua) ? t("team.linux") : "device";
   return `${os} ${new Date().toISOString().slice(0, 10)}`;
 }
 
@@ -40,6 +41,7 @@ function suggestLabel(): string {
  * was kept — the server has its public key, the private half is gone).
  */
 export function TeamCard() {
+  const t = useT();
   const [st, setSt] = useState<TeamStatus | null>(null);
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -70,46 +72,45 @@ export function TeamCard() {
     setSt(next);
     setToken("");
     void shareStatus();
-    toast.ok("Connection saved");
+    toast.ok(t("team.connectionSaved"));
   });
 
   const test = () => run("test", async () => {
     const id = await teamTestConnection();
-    toast.ok(`Server identity: ${id}`);
+    toast.ok(t("team.serverIdentity", { id }));
   });
 
   const enroll = () => run("enroll", async () => {
     const next = await teamEnrollDevice(label.trim() || suggestLabel());
     setSt(next);
     void shareStatus();
-    toast.ok("Device enrolled");
+    toast.ok(t("team.deviceEnrolled"));
   });
 
   const collect = () => run("collect", async () => {
     const r = await teamCollectCustody();
     if (r.grants === 0) {
-      toast.info("No grants waiting — a custodian device has to issue one");
+      toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
-      toast.err(`${r.opened} of ${r.grants} opened; ${r.failed} could not be opened`);
+      toast.err(t("team.grantsOpened", { opened: r.opened, grants: r.grants, failed: r.failed }));
     } else {
       // The fleet key is the one sync needs, so lead with that.
       if (r.can_sync_without_passphrase) {
         const gen =
           r.newest_fleet_generation == null
             ? ""
-            : ` (generation ${r.newest_fleet_generation})`;
+            : t("team.generationSuffix", { n: r.newest_fleet_generation });
         toast.ok(
-          `Fleet key collected${gen} — this device can sync without a passphrase`,
+          t("team.fleetKeyCollected", { gen }),
         );
       } else if (r.opened > 0) {
         const gen =
-          r.newest_generation == null ? "" : ` (generation ${r.newest_generation})`;
-        toast.ok(
-          `Root custody in place: ${r.opened} grant(s)${gen}. No fleet key yet — ` +
-            `sync still needs a passphrase.`,
-        );
+          r.newest_generation == null
+            ? ""
+            : t("team.generationSuffix", { n: r.newest_generation });
+        toast.ok(t("team.rootCustody", { opened: r.opened, gen }));
       } else {
-        toast.err("No grants are waiting for this device yet");
+        toast.err(t("team.noGrantsAreWaitingForThisDeviceYet"));
       }
     }
   });
@@ -119,22 +120,21 @@ export function TeamCard() {
   return (
     <div className="flex flex-col gap-2">
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Enrol this device with a team server to sync encrypted profiles. The
-        server routes ciphertext only — it never sees a key.
+        {t("team.enrolThisDeviceWithATeamServerToSync")}
       </p>
 
       <Input
-        label="Server URL"
+        label={t("team.serverUrl")}
         inputSize="small"
         placeholder="https://team.example.com"
         value={url}
         onChange={(e) => setUrl(e.target.value)}
       />
       <Input
-        label="API token"
+        label={t("team.apiToken")}
         inputSize="small"
         type="password"
-        placeholder={st?.has_token ? "•••••••• (saved — type to replace)" : "paste the token"}
+        placeholder={st?.has_token ? t("team.tokenSavedPlaceholder") : t("team.pasteTheToken")}
         value={token}
         onChange={(e) => setToken(e.target.value)}
       />
@@ -142,10 +142,10 @@ export function TeamCard() {
       <div className="flex items-end gap-2">
         <div className="grow">
           <Input
-            label="Tenant ID"
+            label={t("team.tenantId")}
             inputSize="small"
             className="mono"
-            placeholder="00000000-0000-0000-0000-000000000000"
+            placeholder={t("team.00000000000000000000000000000000")}
             value={tenant}
             onChange={(e) => setTenant(e.target.value)}
           />
@@ -154,24 +154,21 @@ export function TeamCard() {
           size="small"
           mode="stroke"
           disabled={!!busy}
-          onClick={() => { setTenant(newTenantId()); toast.info("Generated — save to apply"); }}
+          onClick={() => { setTenant(newTenantId()); toast.info(t("team.generatedSaveToApply")); }}
         >
-          Generate
+          {t("common.generate")}
         </Button>
       </div>
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        Generate one for a new fleet; paste the existing one to join a fleet
-        that already has devices. Changing the server or tenant clears this
-        device's keys, because keys enrolled against one fleet mean nothing to
-        another.
+        {t("team.generateOneForANewFleetPasteTheExist")}
       </p>
 
       <div className="flex gap-2">
         <Button size="small" disabled={!!busy} onClick={save}>
-          {busy === "save" ? "Saving…" : "Save connection"}
+          {busy === "save" ? t("common.saving") : t("team.saveConnection")}
         </Button>
         <Button size="small" mode="stroke" disabled={!!busy || !connected} onClick={test}>
-          {busy === "test" ? "Testing…" : "Test connection"}
+          {busy === "test" ? "Testing…" : t("team.testConnection")}
         </Button>
       </div>
 
@@ -180,7 +177,7 @@ export function TeamCard() {
           {!st.is_enrolled ? (
             <>
               <Input
-                label="Device label"
+                label={t("team.deviceLabel")}
                 inputSize="small"
                 placeholder={suggestLabel()}
                 value={label}
@@ -188,12 +185,12 @@ export function TeamCard() {
               />
               <div>
                 <Button size="small" disabled={!!busy || !connected} onClick={enroll}>
-                  {busy === "enroll" ? "Enrolling…" : "Enrol this device"}
+                  {busy === "enroll" ? "Enrolling…" : t("team.enrolThisDevice")}
                 </Button>
               </div>
               {!connected && (
                 <p className="m-0 text-paragraph-xs text-text-soft-400">
-                  Save a server URL and token first.
+                  {t("team.saveAServerUrlAndTokenFirst")}
                 </p>
               )}
             </>
@@ -208,26 +205,22 @@ export function TeamCard() {
                 <>
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
-                      {busy === "collect" ? "Collecting…" : "Collect key custody"}
+                      {busy === "collect" ? "Collecting…" : t("team.collectKeyCustody")}
                     </Button>
                   </div>
                   <p className="m-0 text-paragraph-xs text-text-soft-400">
-                    Picks up the root key grants a custodian has issued to this
-                    device and checks they open. The key is never shown, and
-                    never leaves this machine.
+                    {t("team.picksUpTheRootKeyGrantsACustodianHas")}
                   </p>
                 </>
               ) : (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
-                  This device was enrolled before its key material was kept, so
-                  grants sealed to it can never be opened. Re-enrol it to take
-                  custody.
+                  {t("team.thisDeviceWasEnrolledBeforeItsKeyMat")}
                 </p>
               )}
 
               {!st.can_sync && (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
-                  Enrolled before profile sync existed — re-enrol to sync.
+                  {t("team.enrolledBeforeProfileSyncExistedReEn")}
                 </p>
               )}
             </>

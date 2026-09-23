@@ -1,6 +1,6 @@
 # Hermes / ShardX local handoff
 
-Last verified: 2026-09-09 (Hermes Desktop as the MCP host)
+Last verified: 2026-09-19 (Hermes Desktop as the MCP host)
 
 ## Repository and runtime map
 
@@ -10,10 +10,13 @@ Last verified: 2026-09-09 (Hermes Desktop as the MCP host)
 | Fork remote | `origin = https://github.com/huuhungn/ShardBrowser.git` |
 | Upstream remote | `upstream = https://github.com/ProxyShard/ShardBrowser.git` |
 | Upstream push | Disabled intentionally |
-| Custom integration branch | `feat/upstream-v2.0.1-integration` |
-| Latest release source | tag `v0.2.4`; working tree tracks upstream `v2.0.1` |
+| Custom integration branch | absorbed into `origin/main` (PR #37); do not recreate locally |
+| Latest release source | tag `v2.2.7`, `origin/main`, commit `aaf4782` |
 | Local MCP runtime clone | `%USERPROFILE%\Documents\MCP\ShardBrowser` |
 | Hermes config | `%LOCALAPPDATA%\hermes\config.yaml` (`mcp_servers.shardbrowser`) |
+| Active release source | fork `origin/main`, tag `v2.2.7`, commit `aaf4782` |
+| Active MCP runtime branch | `codex-mcp-helpers-runtime`, merge commit `d73c1d9` |
+| MCP runtime backup | `C:\Users\Administrator\AppData\Local\Temp\shardx-backups\mcp-runtime-pre-sync-2.2.5-20260919-102734.tar.gz` |
 
 The development checkout and MCP runtime clone have different roles. Do not
 move, delete, merge, or switch either clone casually. Development is backed up
@@ -21,19 +24,67 @@ to `origin`; upstream changes are proposed only through a scoped pull request.
 
 ## Current version state
 
-- Released Launcher and MCP archive: `v0.2.4`.
-- Release: <https://github.com/huuhungn/ShardBrowser/releases/tag/v0.2.4>.
-- The working tree has merged upstream `v2.0.1` and is versioned `2.1.2`: the
-  fork must stay at or above `2.0.1`, because the runtime manifest now carries
+- Launcher release `v2.2.7` is public at
+  <https://github.com/huuhungn/ShardBrowser/releases/tag/v2.2.7>.
+- The fork must stay at or above `2.0.1`, because the runtime manifest carries
   `min_launcher_version`.
-- MCP tool count is 110 after the merge (96 from this fork, plus 14 upstream
-  additions including `human_click` and `human_type`). `mcp/contract.test.js`
-  asserts that count and fails on drift, which is how the change was noticed.
-- API base URL: `http://127.0.0.1:40325`.
-- Canonical profile: `VN Automation 001 - No Proxy`. Never used for destructive
-  tests; disposable profiles and disposable servers only.
+- Release commit is `aaf4782`; the development fork's `origin/main` and tag
+  `v2.2.7` point to that commit. The installed Launcher/API reports `2.2.7`
+  on `http://127.0.0.1:40325`.
+- The selected local MCP runtime is
+  `%USERPROFILE%\Documents\MCP\ShardBrowser`, branch
+  `codex-mcp-helpers-runtime`, merged through `d73c1d9`. Its root package,
+  `mcp/package.json`, `mcp/package-lock.json`, and `src-tauri/tauri.conf.json`
+  all report `2.2.7`.
+- Hermes config launches `C:/Users/Administrator/Documents/MCP/ShardBrowser/mcp/index.js`
+  with `SHARDX_API=http://127.0.0.1:40325`. Restart Hermes Desktop after a
+  runtime replacement so it starts a fresh stdio process and reloads tools.
+- MCP runtime sync backup:
+  `C:\Users\Administrator\AppData\Local\Temp\shardx-backups\mcp-runtime-pre-sync-2.2.5-20260919-102734.tar.gz`.
+- MCP tool count is **114**: 110 after the 2.2.5 merge, plus the automation
+  tools (`list_automation_projects`, `get_automation_project`,
+  `run_automation_project`) and `record_profile_traffic`.
+  `mcp/contract.test.js` asserts that count and fails on drift, which is how
+  earlier changes were noticed. Verified live by driving the runtime's stdio
+  server through `initialize` + `tools/list`, not by reading the source.
+- Canonical profile: `VN Automation 001 - No Proxy`. Never use it for destructive
+  tests; use disposable profiles and disposable servers only.
 
-## Engine manifest, and why it is pinned
+## Runtime-local backup and monitor inventory
+
+These entries are intentionally outside Git's tracked source and were not
+merged into the release runtime:
+
+- `backup-hermes-safe-tools-20260828-133152/`: one 64 KB `index.js` snapshot;
+  preserve as a rollback/reference copy, not as the active MCP source.
+- `mcp-backup-20260716-211548/`: a 39 MB historical MCP tree including
+  `node_modules`; preserve until the 2.2.7 runtime has completed its post-sync
+  smoke check, then it is safe to archive or remove separately from source.
+- `scripts/Run-ShardXStartMonitor-hidden.vbs`,
+  `scripts/monitor-start-attribution.py`, and
+  `scripts/test-monitor-start-attribution.py`: local Windows process-start
+  attribution/monitor helpers. Preserve; they are not imported by `mcp/index.js`
+  and are not part of the shipped MCP archive.
+- `scripts/__pycache__/`: generated Python bytecode only. It is safe to remove
+  after any monitor test is finished; never treat it as source.
+
+The local `mcp/vet-*.mjs` scripts are tracked operator scripts restored after
+sync; they are also not imported by `mcp/index.js` or included in the packaged
+MCP archive. Do not delete them as part of routine runtime cleanup.
+
+## Sync verification record (2026-09-19)
+
+- Created branch `backup/pre-sync-2.2.7-20260919-102734` before merging.
+- Archived `mcp/` before the merge and verified the archive contains the
+  expected `index.js`, package manifests, lockfile, and README.
+- Merged fork `origin/main` / `v2.2.7` into the runtime branch with no conflicts.
+- Ran `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 PATCHRIGHT_SKIP_BROWSER_DOWNLOAD=1
+  npm ci --no-audit --no-fund` in `mcp/`, followed by `npm test`; all 29
+  MCP tests passed (`29 passed, 0 failed`).
+- The installed Launcher health endpoint reports `ok=true`, version `2.2.7`.
+- The MCP process was not running during the source replacement. Restart Hermes
+  Desktop before relying on the refreshed stdio tool schema.
+
 
 `src-tauri/src/runtime.rs` fetches a runtime manifest at startup. It used to
 point at `ProxyShard/ShardBrowser@main`, so upstream's v2 release retargeted
@@ -186,19 +237,17 @@ profiles/fonts only and must not mutate real profiles.
 
 ## Upstream pull requests
 
-Verified 2026-07-17: upstream PRs
-[#19](https://github.com/ProxyShard/ShardBrowser/pull/19),
-[#20](https://github.com/ProxyShard/ShardBrowser/pull/20),
-[#21](https://github.com/ProxyShard/ShardBrowser/pull/21),
-[#22](https://github.com/ProxyShard/ShardBrowser/pull/22),
-[#23](https://github.com/ProxyShard/ShardBrowser/pull/23),
-[#24](https://github.com/ProxyShard/ShardBrowser/pull/24),
-[#25](https://github.com/ProxyShard/ShardBrowser/pull/25), and
-[#26](https://github.com/ProxyShard/ShardBrowser/pull/26) are open and mergeable
-(`CLEAN`) with no comments, reviews, review decision, or status checks.
+Verified 2026-09-19: upstream `ProxyShard/ShardBrowser` still has open PRs
+[#19](https://github.com/ProxyShard/ShardBrowser/pull/19) (conflicting),
+[#23](https://github.com/ProxyShard/ShardBrowser/pull/23) (mergeable),
+[#24](https://github.com/ProxyShard/ShardBrowser/pull/24) (mergeable), and
+[#33](https://github.com/ProxyShard/ShardBrowser/pull/33) (mergeable, authored by
+another contributor). These are not part of the v2.2.7 runtime sync; review
+individually before accepting any of them. The fork's v2.2.7 release work is
+already on `origin/main`.
 
-Issue [#27](https://github.com/ProxyShard/ShardBrowser/issues/27) is implemented
-in the released custom integration. A separate upstream PR remains deferred.
+Historical release notes below are retained as an audit trail; they are not the
+current version or test state.
 
 The v0.1.23 tag and release passed frontend build/E2E, eight MCP tests, Rust
 check/tests, updater-signing verification, and the real Windows NSIS regression
@@ -250,6 +299,275 @@ configured, registered, matching, and minimized, and the actual `ShardX
 Launcher` window is hidden. A CAffiliate `-Now` dry-run observed the account as
 already checked in, did not dispatch a click, closed its temporary page,
 restored the canonical profile to stopped, and left `/running` empty.
+
+## Fork parity work, September 2026
+
+Four changes on top of `924d081`, each proven against the engine actually
+installed (152.0.7977.65) rather than against the upstream source they came
+from.
+
+**GPU compatibility probe** (ported from upstream). A fingerprint may claim a
+GPU whose WebGL extension set the host cannot produce; a site that asks for the
+extension list then sees the claim contradicted. The probe runs the engine once
+against a temporary profile, caches the host's real WebGL/WebGL2 extension
+lists under `%APPDATA%\shardx-launcher\host-gl-caps.json` keyed by engine
+version and OS, and the editor warns before a profile is saved with a claim the
+machine cannot back. Measured on this host: 94 of the 220 bundled fingerprints
+claim mobile GPU extensions (ASTC, ETC) an RTX 2060 does not expose. The warning
+is advisory — the operator can keep the claim.
+
+**Profile edit round trip (#83).** `fromStored()` did not read `platform_version`
+back out of the stored profile, so opening a profile in the editor and saving it
+silently dropped the OS version that `toStored()` had written. One line to read
+the field, plus `scripts/profile-form-roundtrip.test.mjs`, which walks every
+form field rather than the one that broke and fails if any is lost.
+
+**UI locale (#81).** Chromium renders its own strings — validation bubbles,
+context menus, built-in error pages — in the UI locale it takes from the host
+OS. Spoofing `navigator.language` never touched that, so an en-US profile on
+this machine showed Russian validation text. The launcher now passes
+`--lang=<profile locale>`. Proven both ways against the installed engine: with
+the flag the bubble is English, without it Russian.
+
+**Speech voices (#80).** All 120 bundled `win-*` presets carried the same two
+local SAPI voices, `Microsoft Irina` and `Microsoft Pavel`, both `ru-RU`,
+captured from one donor machine. `speechSynthesis.getVoices()` needs no
+permission, so any page could read that pair — identical across every profile
+built from those presets, which links them to each other, and implausible on a
+Windows box in any other language. `src-tauri/src/speech.rs` rewrites the local
+voices to the ones Windows actually installs for the profile's locale, leaves
+the network voices alone, and leaves a locale untouched when its voice names are
+not known rather than inventing one. An en-US profile now reports David, Mark
+and Zira.
+
+### Motion domain: probed, not ported
+
+Upstream ships Node, Python and Rust SDKs over a browser-level CDP domain called
+`Motion` (human pointer curves, keystroke timing, finger gestures, orientation).
+The domain is deliberately absent from `Schema.getDomains` and `/json/protocol`,
+so the only honest test is to call it and read the error.
+
+**This engine does not implement it.** All eleven documented methods answer
+`'Motion.<method>' wasn't found`, on both the browser and page targets. Porting
+the SDKs now would ship three libraries whose every call fails at runtime.
+
+`src-tauri/tests/motion_protocol_it.rs` records that state and watches for the
+day it changes: if an engine update adds the domain, the first test fails and
+the SDK port becomes justified. The second test asserts the domain stays out of
+`Schema.getDomains` whether or not it is implemented — an enumerable private
+domain is itself a fingerprint.
+
+### Variable provenance, and what it unblocks
+
+A run now remembers where each variable's text came from. The distinction is
+not "which block wrote it" but "who chose the characters": an operator writing
+`setVariable` chose them, while a page, an HTTP reply, a file or a database row
+did not — and once the value is sitting in a variable nothing can tell the
+difference, because by then it is just text.
+
+`Variables` therefore carries an `Origin` per name. `set` records the
+operator's own text; `set_from_outside` records text from elsewhere, and is a
+separate method so that adding a block which reads the outside world is a
+decision someone makes rather than something that happens by calling the
+obvious one. Marked today: `readText`, `httpRequest` bodies, `readFile`,
+`dbQuery` rows and cells, and `evaluate` results. Counts and status codes the
+runner computes itself stay operator-owned.
+
+Copying carries the origin with it. Without that, one
+`setVariable value="{{scraped}}"` launders a page's text into a name the guard
+trusts and the whole thing becomes a formality.
+
+Two sinks refuse outside text, both checking the **raw** parameter rather than
+the expanded one — after substitution the value is indistinguishable from text
+the operator typed, which is the confusion being guarded against:
+
+- `evaluate` refuses a script that interpolates an outside name.
+- `dbExecute`/`dbQuery` refuse SQL that builds the statement from one.
+
+Each refusal names the variable and points at the alternative, because an
+operator who cannot see the supported route reaches for a worse workaround:
+
+- Scripts take `with`, which hands values to the page as real arguments via
+  `Runtime.callFunctionOn` — quotes, newlines and `</script>` arrive as data.
+  `with` accepts `["name"]` or `{"asName": "varName"}`.
+- SQL already had `params`, which binds. `WHERE name = '{{who}}'` becomes
+  `WHERE name = ?` with `who` in `params`.
+
+Tests: `runner_it.rs` covers the refusal, the `with` path carrying the same
+hostile text intact, the laundering attempt through `setVariable`, and an
+operator's own value still interpolating. `db_it.rs` covers the SQL refusal and
+the bound equivalent. Verified by mutation — removing either guard, dropping
+either origin mark, un-propagating the copy, or checking the expanded string
+instead of the raw one each turns a test red.
+
+`javascript:` URLs were probed as a third sink and are not one: the engine
+refuses to navigate to them, so `navigate` does not need the guard.
+
+### WASM modules: the blocker is cleared, the port is not done
+
+Upstream's `src-tauri/src/wasm.rs` (1,273 lines) lets an operator write blocks
+in Rust compiled to WebAssembly. A module never touches the page: it receives
+the step's parameters and the run's variables and answers with primitive
+actions for the runner to perform. It imports only `crate::store` and names no
+block kind, so our diverged block vocabulary (`navigate`/`click`/`type` against
+their `goto`/`hover`/`press`) is not the obstacle it appeared to be.
+
+The obstacle was that a module is a third party inside a run, and this runner
+could not tell a module's text from the operator's. That is what the section
+above fixes — a module's writes become `set_from_outside` and the existing
+sinks refuse them, with `with` and `params` as the supported routes.
+
+Still required before `wasm.rs` lands, and deliberately not started here:
+
+- `wasmtime` as a dependency (large; needs a look at build time and binary size
+  against the 90 MB the launcher ships today).
+- Upstream's call-depth and action budgets (`MAX_CHAIN_ACTIONS`), which stop a
+  module calling itself forever.
+- The `Frame`/grant machinery deciding which modules and flows a module may
+  call.
+- A decision about where modules are stored and how they are reviewed before an
+  operator runs someone else's.
+
+## Automation blocks beyond the page, September 2026
+
+The runner started out able to drive a page and nothing else. Four additions
+since then let a project do the work around the page as well. Each is listed
+with the boundary it enforces, because in every case the useful version and the
+dangerous version look identical from the editor.
+
+**Traffic (`recordTraffic`, `assertRequest`, `stopTraffic`).** A project can
+assert on the requests a page really made, which is the only way to catch a
+page that renders correctly while its XHR quietly fails. Recording is
+*read-only*: it enables `Network`, not `Fetch`. Interception would let a run
+block or rewrite requests, and a cancelled run would leave the page hanging on
+a request nobody will answer. Capped at 5,000 entries with a drop counter, so a
+long run cannot exhaust memory silently.
+
+**HTTP (`httpOpen`, `httpRequest`, `httpClose`).** Calls go out through the
+profile's own proxy. This is the one to be careful with: a client built with a
+proxy that silently failed to apply behaves identically in every unit test and
+puts this host's IP in the site's logs next to that profile's session. The
+integration test therefore runs a real CONNECT proxy in-process and asserts the
+request arrived through it; a dead proxy must fail the run, never fall back to
+a direct connection. The cookie jar is per-run and dropped at the end, so one
+run cannot inherit another's session.
+
+**Files (`readFile`, `writeFile`, `appendFile`, `fileExists`, `deleteFile`).**
+Confined to the run's workspace under
+`%APPDATA%\shardx-launcher\automation\<run>\`. Both the workspace root and
+the requested path are canonicalised before comparison, which on Windows means
+stripping the `\\?\` prefix: `canonicalize()` adds it for paths that exist and
+omits it for paths that do not, so a naive `starts_with` check passes for reads
+and fails for writes. Traversal, symlinks and absolute paths are refused; files
+are capped at 10 MB.
+
+**Database (`dbExecute`, `dbQuery`).** A SQLite database per run workspace, for
+the structured notes a file cannot hold well — which accounts are done, what an
+earlier query found. Parameters are *bound*, never interpolated: projects build
+statements out of values scraped from pages, so `'); drop table t; --` arriving
+in a variable has to land in a column as an ordinary string. Placeholders
+expand into the parameter list, not into the statement; one statement per
+block, so a stray semicolon cannot smuggle in a second. The database is named
+rather than pathed, the name goes through the same containment check as files,
+and the connection is given a limit of zero attached databases so `ATTACH`
+cannot reach a second file from inside SQL. Queries stop at 5,000 rows.
+
+Databases and files persist between runs on purpose — that is what makes
+resuming work possible — and there is a test for it, because "persists" and
+"leaks into the next run" are the same mechanism seen from two sides.
+
+### What the tests are worth
+
+The suite is 177 tests, but the number is not the point. Three of them were
+written so that removing the protection fails them, and that has been checked
+by removing it:
+
+- dropping the SQL binding fails the two injection tests (unit and through the
+  runner);
+- the proxy test fails if the HTTP client is built without the profile's proxy.
+
+The editor guard (`scripts/automation-editor-params.test.mjs`) compares the
+params the editor writes against the ones the runner reads, in both directions.
+It caught four real key mismatches when it was introduced. It knows about
+helpers that read a key internally (`db_params` reads `params`); without that
+it reports a false alarm, and a guard that cries wolf gets ignored.
+
+### Running blocks without a browser
+
+The runner attaches a browser only for projects that contain a block needing
+one. HTTP, file and database projects run with no window open. This started as
+a test annoyance and is a real property: a scheduled data job should not have
+to launch a browser it never uses.
+
+### MCP
+
+`record_profile_traffic` runs an inline project against a live profile and
+returns the traffic it saw. It goes through the same `runSafeOpenLifecycle`
+guard as `automation_run`: a profile already running is left running, a profile
+the tool started is stopped again. The contract test pins the tool count, so an
+added or renamed tool has to be acknowledged rather than discovered later by a
+caller.
+
+### Shipping these blocks to the operator's launcher
+
+The code is on `main`; the running launcher does not have it. Two facts decide
+how it gets there, and both were measured rather than assumed.
+
+**A second launcher cannot run alongside the first.** `tauri_plugin_single_instance`
+forwards to the running process under the shared `com.shardx.launcher` identifier,
+so the new binary exits within seconds. Pointing `APPDATA` at a scratch tree and
+moving `api_port` to 40399 does not help: the guard fires before the settings are
+read. There is no side-by-side smoke test; installing means replacing the binary
+the operator is using.
+
+**The old launcher answers the new tool with 404.** Measured against the running
+2.2.7:
+
+```
+POST http://127.0.0.1:40325/automation/run  ->  404
+```
+
+So `record_profile_traffic` is reachable but cannot succeed until the launcher is
+replaced. The MCP runtime at `%USERPROFILE%\Documents\MCP\ShardBrowser` was synced
+from this repo and now lists **114 tools** including `record_profile_traffic`,
+verified by driving its stdio server through `initialize` + `tools/list` rather
+than by grepping the file. Its previous `mcp/index.js` is kept beside it as
+`mcp/index.js.prephase3`.
+
+**Verifying a build contains these blocks.** Grepping the binary for a block kind
+is worthless: `dbQuery`, `httpRequest` and even the long-shipped `waitForSelector`
+all return zero hits, because the kind strings are packed into a shared table
+without separators. Grep for a distinctive error message instead — the presence of
+`the statement could not be prepared` is what proves `db.rs` was linked in.
+
+Backups taken before any of this, both verified by listing their contents:
+
+- `%TEMP%\shardx-backups\shardx-config-pre-phase3-*.tar.gz` — 13 profiles, 220 fingerprints
+- `%TEMP%\shardx-backups\mcp-runtime-pre-phase3-*.tar.gz` — the MCP runtime's `mcp/`
+
+### Installed, and verified end to end
+
+Installed over `%LOCALAPPDATA%\ShardX Launcher\shardx-launcher.exe`, with the
+replaced 2.2.7 binary kept beside the config archives as
+`shardx-launcher-2.2.7-installed-*.exe`. Rolling back is a copy in the other
+direction.
+
+Checked before replacing the binary: no profiles were running, and `migrate.rs`
+moves `user-data` only from the `data_root_migrate` command, which the operator
+invokes by hand and which refuses to start while any profile is open. Nothing
+migrates on startup, so the 560 MB of browser sessions were never at risk — which
+is why they are not in the config archive.
+
+After the restart, `POST /automation/run` answers 401 rather than 404: the route
+now exists and wants its token. `record_profile_traffic` then ran through the MCP
+runtime's stdio server against `https://httpbin.org/html` and recorded 4 requests
+— the document, a `Fetch` for `spec.json`, a data-URL image, and a 404 favicon.
+Recording is read-only, so the 404 rides through untouched instead of being
+cancelled. The profile went back to stopped with no Chrome processes left behind.
+
+Note the tool's parameters are `profile_query` + `exact` (or `profile_id`), plus
+`headless`, `settle_ms`, `keep_running` and `url_contains`. There is no `seconds`
+or `name_or_id`.
 
 ## Start-of-task verification
 

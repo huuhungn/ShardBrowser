@@ -4,6 +4,7 @@ import { Alert, Button, Modal, ProgressBar, cn } from "@proxyshard/shardx-ui-kit
 import { safeUiError } from "../../shared/lib/utils";
 import { ShardMini } from "../../shared/icons";
 import type { RtUpdate } from "../../shared/types";
+import { useT } from "../../shared/i18n";
 
 /// Sidebar status and consent surface for signed Tauri updates.
 ///
@@ -25,6 +26,7 @@ type UpdateDownloadEvent =
   | { event: "finished" };
 
 export function UpdaterPill() {
+  const t = useT();
   const [info, setInfo] = useState<RtUpdate | null>(null);
   const [phase, setPhase] = useState<UpdatePhase>("checking");
   const [open, setOpen] = useState(false);
@@ -103,20 +105,20 @@ export function UpdaterPill() {
 
   const statusText =
     phase === "checking"
-      ? "checking for updates…"
+      ? t("updater.checking")
       : phase === "available"
-        ? `Update available → ${info?.latest}`
+        ? t("updater.availableArrow", { v: String(info?.latest ?? "") })
         : phase === "downloading"
           ? percent === null
-            ? "downloading update…"
-            : `downloading… ${percent}%`
+            ? t("updater.downloading")
+            : t("updater.downloadingPct", { p: percent })
           : phase === "ready"
-            ? "ready to install"
+            ? t("updater.readyToInstall")
             : phase === "installing"
-              ? "installing update…"
+              ? t("updater.installing")
               : phase === "error"
-                ? "update check needs attention"
-                : "up to date";
+                ? t("updater.needsAttention")
+                : t("updater.upToDate");
 
   return (
     <>
@@ -126,7 +128,7 @@ export function UpdaterPill() {
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen(true)}
-        title={`ShardX Launcher update status: ${statusText}`}
+        title={t("updater.statusAria", { status: statusText })}
         className={cn(
           "flex w-full cursor-pointer items-center gap-2.5 rounded-lg border border-transparent bg-transparent px-2.5 py-2 text-left text-text-strong-950 transition-colors hover:bg-bg-weak-50",
           (phase === "available" || phase === "ready") &&
@@ -144,19 +146,19 @@ export function UpdaterPill() {
       <Modal
         open={open}
         onClose={close}
-        title="ShardX Launcher update"
+        title={t("updater.shardxLauncherUpdate")}
         maxWidthClassName="max-w-md"
         showClose={!busy}
       >
         <div className="flex flex-col gap-3 px-5 py-4" aria-busy={busy}>
           <div className="text-paragraph-sm text-text-sub-600">
             Installed v{info?.current ?? "…"}
-            {info?.latest ? ` · latest v${info.latest}` : ""}
+            {info?.latest ? t("updater.latestSuffix", { v: info.latest }) : ""}
           </div>
 
           {phase === "up_to_date" && (
             <p className="m-0 text-paragraph-sm text-text-sub-600">
-              Launcher is up to date
+              {t("updater.launcherIsUpToDate")}
             </p>
           )}
 
@@ -169,13 +171,13 @@ export function UpdaterPill() {
           {phase === "downloading" && (
             <ProgressBar
               value={percent ?? 0}
-              aria-label="Download Launcher update"
+              aria-label={t("updater.downloadLauncherUpdate")}
             />
           )}
 
           {phase === "ready" && (
             <Alert status="success" variant="light">
-              Signature verified — ready to install
+              {t("updater.signatureVerifiedReadyToInstall")}
             </Alert>
           )}
 
@@ -188,19 +190,19 @@ export function UpdaterPill() {
 
         <div className="flex justify-end gap-2 px-5 pb-5">
           {(phase === "available" || (phase === "error" && info?.update_available)) && (
-            <Button size="xsmall" onClick={download}>Download update</Button>
+            <Button size="xsmall" onClick={download}>{t("updater.downloadUpdate")}</Button>
           )}
           {phase === "ready" && (
-            <Button size="xsmall" onClick={install}>Install and restart</Button>
+            <Button size="xsmall" onClick={install}>{t("updater.installAndRestart")}</Button>
           )}
           {phase === "up_to_date" && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={check}>
-              Check again
+              {t("updater.checkAgain")}
             </Button>
           )}
           {phase === "error" && !info?.update_available && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={check}>
-              Retry
+              {t("common.retry")}
             </Button>
           )}
         </div>

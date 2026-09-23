@@ -7,6 +7,7 @@ import { readTextFile } from "../../../shared/lib/utils";
 import { profileCreateFromTemplate } from "../../profile/model/api";
 import { FingerprintEntry } from "../model/types";
 import { fingerprintList, fingerprintDelete, fingerprintImport, fingerprintDir } from "../model/api";
+import { t } from "../../../shared/i18n";
 
 export type FingerprintStore = {
     status: "idle" | "loading" | "ready" | "error";
@@ -52,14 +53,14 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
     useTemplate: async (id) => {
         try {
             const meta = await profileCreateFromTemplate(id);
-            toast.ok(`Created "${meta.name}" — open Browsers to edit`);
+            toast.ok(t("fp.createdOpenBrowsers", { name: meta.name }));
         } catch (e) { toast.err(String(e)); }
     },
     remove: async (id) => {
-        if ((await confirmModal({ title: "Remove fingerprint", message: "Remove this fingerprint from the library?", danger: true })) !== true) return;
+        if ((await confirmModal({ title: t("fp.removeFingerprint"), message: t("fp.removeAsk"), danger: true })) !== true) return;
         try {
             await fingerprintDelete(id);
-            toast.ok("Removed");
+            toast.ok(t("fp.removed"));
             get().reload();
         } catch (e) { toast.err(String(e)); }
     },
@@ -67,14 +68,14 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
         const path = await open({
             multiple: false,
             directory: false,
-            title: "Pick a FingerprintConfig JSON",
+            title: t("fp.pickAFingerprintconfigJson"),
             filters: [{ name: "JSON", extensions: ["json"] }],
         });
         if (typeof path !== "string") return;
         try {
             const txt = await readTextFile(path);
             const e = await fingerprintImport(txt, null);
-            toast.ok(`Imported "${e.label}"`);
+            toast.ok(t("fp.importedNamed", { label: e.label }));
             get().reload();
         } catch (e) { toast.err(String(e)); }
     },

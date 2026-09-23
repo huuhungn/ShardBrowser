@@ -4,15 +4,16 @@ import {
 } from "../../entities/profile/model/api";
 import { SyncIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
+import { useT } from "../../shared/i18n";
 
-/** What a kind is called to a person. */
-const LABELS: Record<string, string> = {
-  first_name: "First name", last_name: "Last name", full_name: "Full name",
-  email: "Email", username: "Username", phone: "Phone", country: "Country", city: "City",
-  postal_code: "Postcode", street: "Address",
-  birth_day: "Birth day", birth_month: "Birth month", birth_year: "Birth year",
-  birth_date: "Date of birth", gender: "Gender",
-};
+/** What a kind is called to a person, in the language on screen right now. */
+const labelFor = (t: ReturnType<typeof useT>): Record<string, string> => ({
+  first_name: t("helper.firstName"), last_name: t("helper.lastName"), full_name: t("helper.fullName"),
+  email: t("helper.email"), username: t("helper.username"), phone: t("helper.phone"), country: t("helper.country"), city: t("helper.city"),
+  postal_code: t("helper.postcode"), street: t("helper.address"),
+  birth_day: t("helper.birthDay"), birth_month: t("helper.birthMonth"), birth_year: t("helper.birthYear"),
+  birth_date: t("helper.dateOfBirth"), gender: t("helper.gender"),
+});
 
 /**
  * Shard Helper: offers to fill a form the browser noticed. It only ever offers —
@@ -20,6 +21,8 @@ const LABELS: Record<string, string> = {
  * has nothing left to fill.
  */
 export function HelperPanel({ profile }: { profile: string }) {
+  const t = useT();
+  const labels = labelFor(t);
   const [fields, setFields] = useState<HelperField[]>([]);
   const [busy, setBusy] = useState(false);
   const [filled, setFilled] = useState(0);
@@ -51,10 +54,10 @@ export function HelperPanel({ profile }: { profile: string }) {
       <div className="flex shrink-0 select-none items-center gap-2 px-3 pt-2.5 pb-1">
         <SyncIcon className="size-4 shrink-0 text-primary-base" />
         <div className="flex-1 truncate text-label-xs text-text-strong-950">
-          Fillable form
+          {t("helper.fillableForm")}
         </div>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} onClick={() => void helperDismiss(profile)}
-                title="Dismiss"
+                title={t("common.dismiss")}
                 className="rounded-4 px-1.5 text-paragraph-xs text-text-soft-400 hover:bg-bg-weak-50">
           ✕
         </button>
@@ -66,7 +69,7 @@ export function HelperPanel({ profile }: { profile: string }) {
           {kinds.map((k) => (
             <span key={k}
                   className="rounded-6 px-1.5 py-0.5 text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
-              {LABELS[k] ?? k}
+              {labels[k] ?? k}
             </span>
           ))}
         </div>
@@ -85,10 +88,10 @@ export function HelperPanel({ profile }: { profile: string }) {
           className="w-full rounded-8 bg-primary-base py-1.5 text-label-xs text-static-white hover:bg-primary-darker disabled:opacity-50"
         >
           {filled > 1
-            ? `Filled ${filled} windows — fill again`
+            ? t("helper.filledWindows", { n: filled })
             : filled === 1
-              ? "Fill again"
-              : `Fill ${fields.length} field${fields.length === 1 ? "" : "s"}`}
+              ? t("helper.fillAgain")
+              : t(fields.length === 1 ? "helper.fillFieldOne" : "helper.fillFieldMany", { n: fields.length })}
         </button>
       </div>
     </div>

@@ -5,7 +5,10 @@ use crate::{api, mcp_setup, settings};
 
 fn normalize_cli_path(path: &str) -> String {
     let trimmed = path.trim().trim_matches('"').trim_matches('\'');
-    let normalized = trimmed.replace('/', "\\").trim_end_matches('\\').to_string();
+    let normalized = trimmed
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
     #[cfg(windows)]
     {
         normalized.to_ascii_lowercase()
@@ -386,7 +389,10 @@ mod tests {
 
         assert_eq!(status["state"].as_str(), Some("needs_repair"));
         assert_eq!(status["token_in_config"].as_bool(), Some(true));
-        assert!(status["message"].as_str().unwrap_or_default().contains("repair"));
+        assert!(status["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("repair"));
     }
 
     #[test]

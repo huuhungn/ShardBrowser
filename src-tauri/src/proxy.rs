@@ -46,10 +46,10 @@ impl ProxyEntry {
         if self.username.is_empty() && self.password.is_empty() {
             format!("{scheme}://{host_port}")
         } else {
-            let user = url::form_urlencoded::byte_serialize(self.username.as_bytes())
-                .collect::<String>();
-            let pass = url::form_urlencoded::byte_serialize(self.password.as_bytes())
-                .collect::<String>();
+            let user =
+                url::form_urlencoded::byte_serialize(self.username.as_bytes()).collect::<String>();
+            let pass =
+                url::form_urlencoded::byte_serialize(self.password.as_bytes()).collect::<String>();
             format!("{scheme}://{user}:{pass}@{host_port}")
         }
     }
@@ -144,7 +144,11 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
     match entry.kind {
         ProxyKind::Socks5 => {
             // RFC 1928 §3 greeting
-            let auth_method: u8 = if entry.username.is_empty() { 0x00 } else { 0x02 };
+            let auth_method: u8 = if entry.username.is_empty() {
+                0x00
+            } else {
+                0x02
+            };
             stream.write_all(&[0x05, 0x01, auth_method]).await?;
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
@@ -191,7 +195,9 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 let n = timeout(Duration::from_secs(8), stream.read(&mut tmp))
                     .await
                     .context("read timeout")??;
-                if n == 0 { break String::from_utf8_lossy(&buf).to_string(); }
+                if n == 0 {
+                    break String::from_utf8_lossy(&buf).to_string();
+                }
                 buf.extend_from_slice(&tmp[..n]);
                 if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 4096 {
                     break String::from_utf8_lossy(&buf).to_string();
@@ -289,11 +295,19 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
     }
     // A bare comment is the name; fall back to a legacy `name=` when the line
     // carried only `key=value` fields.
-    let name = if name_parts.is_empty() { name } else { name_parts.join(" ") };
+    let name = if name_parts.is_empty() {
+        name
+    } else {
+        name_parts.join(" ")
+    };
     Some(ProxyEntry {
         // ID assigned now so pre-save test snapshots key under the kept uuid.
         id: uuid::Uuid::new_v4().to_string(),
-        name: if name.is_empty() { format!("{host}:{port}") } else { name },
+        name: if name.is_empty() {
+            format!("{host}:{port}")
+        } else {
+            name
+        },
         kind,
         host: host.to_string(),
         port,
@@ -363,7 +377,11 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     .await
     .context("connect timeout")??;
 
-    let auth_method: u8 = if entry.username.is_empty() { 0x00 } else { 0x02 };
+    let auth_method: u8 = if entry.username.is_empty() {
+        0x00
+    } else {
+        0x02
+    };
     tcp.write_all(&[0x05, 0x01, auth_method]).await?;
     let mut greet = [0u8; 2];
     tcp.read_exact(&mut greet).await?;
@@ -413,7 +431,10 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
             tcp.read_exact(&mut ip).await?;
             let mut p = [0u8; 2];
             tcp.read_exact(&mut p).await?;
-            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip)), u16::from_be_bytes(p))
+            SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip)),
+                u16::from_be_bytes(p),
+            )
         }
         _ => anyhow::bail!("unsupported ATYP in UDP reply"),
     };
@@ -471,10 +492,18 @@ pub async fn geo_check(entry: &ProxyEntry, provider_override: Option<String>) ->
 }
 
 /// Probe geo through `entry` if Some, else direct; provider default ip-api.com.
-pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option<String>) -> Result<GeoInfo> {
+pub async fn geo_check_via(
+    entry: Option<&ProxyEntry>,
+    provider_override: Option<String>,
+) -> Result<GeoInfo> {
     let provider = provider_override
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| settings::load().ok().and_then(|s| s.geo_checker).unwrap_or_else(|| "ip-api.com".into()));
+        .unwrap_or_else(|| {
+            settings::load()
+                .ok()
+                .and_then(|s| s.geo_checker)
+                .unwrap_or_else(|| "ip-api.com".into())
+        });
 
     let url = match provider.as_str() {
         "ip-api.com" => "http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,isp,timezone,lat,lon",
@@ -483,8 +512,7 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
         _ => "http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,isp,timezone,lat,lon",
     };
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8));
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8));
     if let Some(entry) = entry {
         let scheme = match entry.kind {
             ProxyKind::Socks5 => "socks5h", // DNS via proxy
@@ -494,8 +522,10 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
         let proxy_url = if entry.username.is_empty() && entry.password.is_empty() {
             format!("{scheme}://{}:{}", entry.host, entry.port)
         } else {
-            let user = url::form_urlencoded::byte_serialize(entry.username.as_bytes()).collect::<String>();
-            let pass = url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
+            let user =
+                url::form_urlencoded::byte_serialize(entry.username.as_bytes()).collect::<String>();
+            let pass =
+                url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
             format!("{scheme}://{user}:{pass}@{}:{}", entry.host, entry.port)
         };
         let proxy = reqwest::Proxy::all(&proxy_url).context("bad proxy URL")?;
@@ -511,9 +541,7 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
     let s = |v: &serde_json::Value, k: &str| {
         v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
     };
-    let f = |v: &serde_json::Value, k: &str| {
-        v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0)
-    };
+    let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
     let info = match provider.as_str() {
         "ip-api.com" => {
             if s(&body, "status") == "fail" {
@@ -550,8 +578,18 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
             country_code: s(&body, "country_code"),
             region: s(&body, "region"),
             city: s(&body, "city"),
-            isp: body.get("connection").and_then(|c| c.get("isp")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            timezone: body.get("timezone").and_then(|t| t.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            isp: body
+                .get("connection")
+                .and_then(|c| c.get("isp"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            timezone: body
+                .get("timezone")
+                .and_then(|t| t.get("id"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             latitude: f(&body, "latitude"),
             longitude: f(&body, "longitude"),
             provider,
@@ -748,13 +786,29 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     let (ip, country_code, country, region, city, isp, tz, lat, lng, provider) =
         match (&geo_res, tcp_failed) {
             (Ok(g), false) => (
-                g.ip.clone(), g.country_code.clone(), g.country.clone(),
-                g.region.clone(), g.city.clone(), g.isp.clone(),
-                g.timezone.clone(), g.latitude, g.longitude, g.provider.clone(),
+                g.ip.clone(),
+                g.country_code.clone(),
+                g.country.clone(),
+                g.region.clone(),
+                g.city.clone(),
+                g.isp.clone(),
+                g.timezone.clone(),
+                g.latitude,
+                g.longitude,
+                g.provider.clone(),
             ),
-            _ => (String::new(), String::new(), String::new(),
-                  String::new(), String::new(), String::new(),
-                  String::new(), 0.0, 0.0, String::new()),
+            _ => (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                0.0,
+                0.0,
+                String::new(),
+            ),
         };
 
     let snap = TestSnapshot {
@@ -770,9 +824,7 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
         latitude: lat,
         longitude: lng,
         tcp_ms: tcp_res.ok(),
-        udp_ms: udp_res
-            .as_ref()
-            .and_then(|r| r.as_ref().ok().copied()),
+        udp_ms: udp_res.as_ref().and_then(|r| r.as_ref().ok().copied()),
         udp_error: udp_res
             .as_ref()
             .and_then(|r| r.as_ref().err().map(|e| e.to_string())),

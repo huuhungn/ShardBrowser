@@ -13,10 +13,12 @@ import {
   NewProfileButton,
 } from "../../features/manage-profiles";
 import { ProfileRow } from "./ProfileRow";
+import { useT } from "../../shared/i18n";
 
 const PAGE_SIZE = 20;
 
 export function ProfileTable() {
+  const t = useT();
   const selected = useProfile((s) => s.selected);
   const selectProfiles = useProfile((s) => s.selectProfiles);
   const expanded = useProfile((s) => s.expanded);
@@ -69,20 +71,20 @@ export function ProfileTable() {
           <div></div>
           <div>
             <Checkbox
-              aria-label="Select all profiles on this page"
-              title="Select all on this page"
+              aria-label={t("profileTable.selectAllProfilesOnThisPage")}
+              title={t("profileTable.selectAllOnThisPage")}
               // Header checkbox toggles only visible page rows; other pages preserved.
               checked={allPageSelected}
               indeterminate={anyPageSelected && !allPageSelected}
               onChange={(e) => selectProfiles(e.target.checked, paged)}
             />
           </div>
-          <div>Name</div>
-          <div>Status</div>
-          <div>Proxy</div>
-          <div className="head-notes">Notes</div>
-          <div className="head-time">Time</div>
-          <div className="head-lastrun">Last run</div>
+          <div>{t("profileTable.name")}</div>
+          <div>{t("profileTable.status")}</div>
+          <div>{t("profileTable.proxy")}</div>
+          <div className="head-notes">{t("profileTable.notes")}</div>
+          <div className="head-time">{t("profileTable.time")}</div>
+          <div className="head-lastrun">{t("profileTable.lastRun")}</div>
           <div></div>
         </div>
         {expanded === "__new__" && (
@@ -105,19 +107,19 @@ export function ProfileTable() {
             </div>
             {search ? (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No matching profiles</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noMatchingProfiles")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   Nothing matches “{search}”.
                 </p>
                 <div className="mt-2 flex gap-2">
                   <Button variant="neutral" mode="stroke" size="xsmall" onClick={() => setSearch("")}>
-                    Clear search
+                    {t("profileTable.clearSearch")}
                   </Button>
                 </div>
               </>
             ) : folder && folder !== "all" ? (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">Folder is empty</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.folderIsEmpty")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
                   “{folder}” has no profiles. Move one in, or create one here.
                 </p>
@@ -128,9 +130,9 @@ export function ProfileTable() {
               </>
             ) : (
               <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">No profiles yet</h3>
+                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noProfilesYet")}</h3>
                 <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-                  Pick a fingerprint template to start from a curated real-Chrome snapshot, or build one from scratch.
+                  {t("profileTable.pickAFingerprintTemplateToStartFromA")}
                 </p>
                 <div className="mt-2 flex gap-2">
                   <FromTemplateButton />
@@ -148,7 +150,7 @@ export function ProfileTable() {
             totalPages={pageCount}
             asLinks={false}
             onPageChange={setPage}
-            infoLabel={(p, total) => `Page ${p} of ${total} · ${visible.length} profiles`}
+            infoLabel={(p, total) => t("profileTable.pageInfo", { p, total, n: visible.length })}
           />
         </div>
       )}

@@ -6,8 +6,10 @@ import {
   DeleteIcon,
 } from "../../../shared/icons";
 import { useProxy, type ProxyEntry } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 export function ProxyRowActions({ proxy }: { proxy: ProxyEntry }) {
+  const t = useT();
   const busy = useProxy((s) => !!s.proxyTesting[proxy.id]);
   const testProxy = useProxy((s) => s.testProxy);
   const removeProxy = useProxy((s) => s.removeProxy);
@@ -27,19 +29,19 @@ export function ProxyRowActions({ proxy }: { proxy: ProxyEntry }) {
             ? setInfoFor(null)
             : setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } })
         }
-        title="Details + history"
+        title={t("proxy.detailsHistory")}
         leftIcon={<InfoIcon />}
       >
       </Button>
-      <Button variant="neutral" mode="stroke" size="xsmall"  onlyIcon onClick={() => testProxy(proxy)} disabled={busy} title="Test TCP + UDP + geo"
+      <Button variant="neutral" mode="stroke" size="xsmall"  onlyIcon onClick={() => testProxy(proxy)} disabled={busy} title={t("proxy.testTcpUdpGeo")}
         leftIcon={<RefreshIcon />}
       >
       </Button>
-      <Button variant="neutral" mode="stroke" size="xsmall"  onlyIcon onClick={() => setEditing(proxy)} title="Edit"
+      <Button variant="neutral" mode="stroke" size="xsmall"  onlyIcon onClick={() => setEditing(proxy)} title={t("common.edit")}
         leftIcon={<EditIcon />}
       >
       </Button>
-      <Button variant="error" mode='filled' size="xsmall"  onlyIcon onClick={() => removeProxy(proxy.id)} title="Delete"
+      <Button variant="error" mode='filled' size="xsmall"  onlyIcon onClick={() => removeProxy(proxy.id)} title={t("common.delete")}
         leftIcon={<DeleteIcon />}
       >
       </Button>

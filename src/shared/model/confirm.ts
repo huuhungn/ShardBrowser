@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ConfirmButton, ConfirmReq } from "../types";
+import { t } from "../i18n";
 
 /// Imperative confirm dialog backed by a zustand store; the ConfirmHost
 /// widget renders the current request with the UI-kit modal.
@@ -24,9 +25,9 @@ export function confirmModal(opts: {
   return new Promise((resolve) => {
     const buttons =
       opts.buttons ?? [
-        { label: "Cancel", value: false },
+        { label: t("common.cancel"), value: false },
         {
-          label: opts.danger ? "Delete" : "OK",
+          label: opts.danger ? t("common.delete") : t("common.ok"),
           value: true,
           danger: opts.danger,
           primary: !opts.danger,

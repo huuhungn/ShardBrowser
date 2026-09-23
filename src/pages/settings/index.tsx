@@ -9,12 +9,14 @@ import { toast } from "../../shared/model/toast";
 import { useNav } from "../../shared/model/navigation";
 import { withUtm } from "../../shared/lib/utils";
 import type { Settings, ApiInfo, StartupStatus, McpStatus, CodexMcpStatus, HermesMcpStatus } from "../../entities/settings";
-import { HELPER_KINDS } from "../../entities/settings";
+import { helperKinds } from "../../entities/settings";
 import { settingsGet, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
   startupStatus, mcpStatus as mcpStatusGet, codexMcpStatus, hermesMcpStatus } from "../../entities/settings";
 import { StartupCard, McpCard } from "../../features/manage-settings";
 import { safeUiError } from "../../shared/lib/utils";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
+import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
+import { Rich } from "../../shared/i18n/Rich";
 import { TeamCard } from "../../features/manage-team/ui/TeamCard";
 
 function SettingsCard({ title, children }: { title: string; children: React.ReactNode }) {
@@ -27,6 +29,9 @@ function SettingsCard({ title, children }: { title: string; children: React.Reac
 }
 
 export function SettingsPage() {
+  const t = useT();
+  const lang = useLang((v) => v.lang);
+  const setLang = useLang((v) => v.setLang);
   const [s, setS] = useState<Settings>({
     browser_path: null,
     theme: "dark",
@@ -74,33 +79,33 @@ export function SettingsPage() {
     void refreshMcp();
   }, []);
   const regenToken = async () => {
-    try { setApi(await apiRegenerateToken()); toast.ok("Token regenerated"); }
+    try { setApi(await apiRegenerateToken()); toast.ok(t("settings.api.tokenRegenerated")); }
     catch (e) { toast.err(String(e)); }
   };
 
   const [mcpBusy, setMcpBusy] = useState(false);
   // Download MCP server source; user manages install + client setup.
   const downloadMcp = async () => {
-    const dir = await open({ directory: true, title: "Where to download the MCP server" });
+    const dir = await open({ directory: true, title: t("settings.mcp.pickDownloadDir") });
     if (typeof dir !== "string") return;
     setMcpBusy(true);
     try {
       const path = await mcpDownload(dir);
-      toast.ok(`MCP downloaded to ${path}`);
-    } catch (e) { toast.err("MCP download failed: " + String(e)); }
+      toast.ok(t("settings.mcp.downloaded", { path }));
+    } catch (e) { toast.err(t("settings.mcp.downloadFailed", { error: String(e) })); }
     finally { setMcpBusy(false); }
   };
   // Adopt an MCP server the operator already has, instead of downloading a
   // duplicate copy next to it.
   const useExistingMcp = async () => {
-    const dir = await open({ directory: true, title: "Select an existing ShardX MCP folder" });
+    const dir = await open({ directory: true, title: t("settings.mcp.pickExistingDir") });
     if (typeof dir !== "string") return;
     setMcpBusy(true);
     try {
       const status = await mcpSetPath(dir);
       setMcp(status);
       setMcpError(null);
-      toast.ok(`Using MCP server at ${status.path ?? dir}`);
+      toast.ok(t("settings.mcp.usingAt", { path: status.path ?? dir }));
     } catch (e) { toast.err(safeUiError(e)); }
     finally { setMcpBusy(false); }
   };
@@ -110,7 +115,7 @@ export function SettingsPage() {
       setBaseline({ ...s });
       // Saving is what registers the startup entry, so re-read the truth.
       await Promise.all([refreshApi(), refreshStartup()]);
-      toast.ok("Settings saved");
+      toast.ok(t("settings.save.saved"));
     } catch (e) { toast.err(safeUiError(e)); }
   };
 
@@ -119,16 +124,16 @@ export function SettingsPage() {
     !!api && ((s.api_enabled ?? true) !== api.enabled || (s.api_port ?? 40325) !== api.port);
   return (
     <section className="flex flex-col">
-      <Topbar crumbs={["System", "Settings"]} />
+      <Topbar crumbs={[t("settings.crumb.system"), t("settings.crumb.settings")]} />
       <div className="mb-3.5 flex items-end justify-between gap-4">
-        <h1 className="m-0 text-title-h5 text-text-strong-950">Settings</h1>
+        <h1 className="m-0 text-title-h5 text-text-strong-950">{t("settings.title")}</h1>
       </div>
 
-      <SettingsCard title="Startup &amp; background services">
+      <SettingsCard title={t("settings.startup.title")}>
         <StartupCard settings={s} onChange={setS} status={startup} error={startupError} />
       </SettingsCard>
 
-      <SettingsCard title="MCP server">
+      <SettingsCard title={t("settings.mcp.title")}>
         <McpCard
           status={mcp}
           statusError={mcpError}
@@ -142,10 +147,7 @@ export function SettingsPage() {
           onCheckHermes={checkHermes}
         />
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          Download the <strong>MCP</strong> server source (lets an AI client drive
-          profiles and a CDP browser) into a folder you choose. The app does not run
-          it — install its deps and register it with your MCP client per the included
-          README. Requires Node.js.
+          <Rich text={t("settings.mcp.help")} />
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <Button
@@ -157,7 +159,7 @@ export function SettingsPage() {
             disabled={mcpBusy}
             isLoading={mcpBusy}
           >
-            {mcpBusy ? "Downloading…" : "Download MCP server"}
+            {mcpBusy ? t("settings.mcp.downloading") : t("settings.mcp.download")}
           </Button>
           <Button
             variant="neutral"
@@ -166,26 +168,39 @@ export function SettingsPage() {
             onClick={useExistingMcp}
             disabled={mcpBusy}
           >
-            Use existing MCP folder
+            {t("settings.mcp.useExisting")}
           </Button>
         </div>
         {mcp?.path && (
           <p className="m-0 mt-2 text-paragraph-xs text-text-sub-600">
-            Current folder: <code>{mcp.path}</code>
+            {t("settings.mcp.currentFolder")} <code>{mcp.path}</code>
           </p>
         )}
       </SettingsCard>
 
-      <SettingsCard title="Team">
+      <SettingsCard title={t("settings.team.title")}>
         <TeamCard />
       </SettingsCard>
 
-      <SettingsCard title="Proxy geo checker">
+      <SettingsCard title={t("settings.language.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          Which free public IP-geo service to hit when you press the proxy <strong>Test</strong> button. All three are no-key, rate-limited.
+          {t("settings.language.help")}
         </p>
         <Select
-          label="Provider"
+          label={t("settings.language.label")}
+          size="small"
+          value={lang}
+          onChange={(v) => setLang(v as (typeof LANG_OPTIONS)[number]["value"])}
+          options={LANG_OPTIONS}
+        />
+      </SettingsCard>
+
+      <SettingsCard title={t("settings.geo.title")}>
+        <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
+          <Rich text={t("settings.geo.help")} />
+        </p>
+        <Select
+          label={t("settings.geo.label")}
           size="small"
           value={s.geo_checker ?? "ip-api.com"}
           onChange={(v) => setS({ ...s, geo_checker: v })}
@@ -197,54 +212,42 @@ export function SettingsPage() {
         />
       </SettingsCard>
 
-      <SettingsCard title="Screen resolution">
+      <SettingsCard title={t("settings.screen.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          <strong>From fingerprint</strong> reports the screen carried in the bound profile (recommended for anti-detect coherence).
-          <strong> Real</strong> lets ShardX expose the host monitor's actual size.
+          <Rich text={t("settings.screen.help")} />
         </p>
         <Select
-          label="Mode"
+          label={t("settings.screen.label")}
           size="small"
           value={s.screen_resolution_mode ?? "fingerprint"}
           onChange={(v) => setS({ ...s, screen_resolution_mode: v })}
           options={[
-            { value: "fingerprint", label: "From fingerprint" },
-            { value: "real", label: "Real (host monitor)" },
+            { value: "fingerprint", label: t("settings.screen.fingerprint") },
+            { value: "real", label: t("settings.screen.real") },
           ]}
         />
       </SettingsCard>
 
-      <SettingsCard title="Shard Helper">
+      <SettingsCard title={t("settings.helper.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          Watches each page for fields a generated identity fits — names, email,
-          phone, date of birth — and offers to fill them. It only ever
-          <strong> offers</strong>: nothing is typed until you press the button
-          on the panel that appears. Values come from the profile's own language,
-          and go in through the same human typing the rest of the browser uses.
-          <br />
-          <strong>Never runs on a synchronised launch.</strong> In a group whatever
-          you type in one window is mirrored into the others already, so a helper
-          per window would find the same form ten times and offer ten prompts for
-          one page.
+          <Rich text={t("settings.helper.help")} />
         </p>
         <div className="flex flex-col gap-3">
           <Switch
-            label="Enable Shard Helper"
+            label={t("settings.helper.enable")}
             checked={s.helper_enabled ?? true}
             onChange={(checked) => setS({ ...s, helper_enabled: checked })}
           />
           {(s.helper_enabled ?? true) && (
             <div>
               <div className="mb-1.5 text-label-xs text-text-sub-600">
-                React to
+                {t("settings.helper.reactTo")}
               </div>
               <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-                Nothing selected means every kind. Narrow it if the panel appears
-                on forms you do not care about — a login page with an email field
-                is still a form.
+                {t("settings.helper.triggersHelp")}
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {HELPER_KINDS.map((k) => {
+                {helperKinds(t).map((k) => {
                   const picked = (s.helper_triggers ?? []).includes(k.value);
                   return (
                     <button
@@ -275,35 +278,24 @@ export function SettingsPage() {
         </div>
       </SettingsCard>
 
-      <SettingsCard title="Profile camera">
+      <SettingsCard title={t("settings.camera.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          The profile gets ShardX's camera instead of the machine's, and shows the
-          picture or clip you pick from the control left of the browser's app menu.
-          <strong> Leave this on.</strong> The profile's fingerprint already names a
-          particular camera, so handing a page the host's real one contradicts the
-          profile and identifies the machine behind every profile on it.
+          <Rich text={t("settings.camera.help")} />
         </p>
         <Switch
-          label="Substitute the camera"
+          label={t("settings.camera.substitute")}
           checked={s.camera_enabled ?? true}
           onChange={(checked) => setS({ ...s, camera_enabled: checked })}
         />
       </SettingsCard>
 
-      <SettingsCard title="Profile data location">
+      <SettingsCard title={t("settings.dataRoot.title")}>
         <DataRootCard />
       </SettingsCard>
 
-      <SettingsCard title="Extra launch arguments">
+      <SettingsCard title={t("settings.args.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          Appended to every profile launch, one per line or space-separated.
-          They go on <strong>last</strong>, so a switch repeated here is the one the
-          engine sees — which is also how you get to undo one of the launcher's own.
-          Quote a value with spaces.
-          <br />
-          Anything that changes what a page can measure belongs in the profile, not
-          here: a switch applied to every profile at once makes them all alike, which
-          is the opposite of what a profile is for.
+          <Rich text={t("settings.args.help")} />
         </p>
         <Textarea
           rows={3}
@@ -314,11 +306,9 @@ export function SettingsPage() {
         />
       </SettingsCard>
 
-      <SettingsCard title="Automation API">
+      <SettingsCard title={t("settings.api.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          Local HTTP API (axum) for scripting — create/launch/close profiles
-          and get a CDP WebSocket URL. Binds <strong>127.0.0.1</strong> only,
-          JWT Bearer auth. Changes to enable/port apply after restarting the app.{" "}
+          <Rich text={t("settings.api.help")} />{" "}
           <a
             href="#"
             className="text-primary-base hover:underline"
@@ -327,17 +317,17 @@ export function SettingsPage() {
               openUrl(withUtm("https://docs.proxyshard.com/eng/shardx-launcher-api/binding-and-lifecycle?fallback=true")).catch(() => {});
             }}
           >
-            Full API reference →
+            {t("settings.api.reference")}
           </a>
         </p>
         <div className="flex flex-col gap-3">
           <Switch
-            label="Enable API server"
+            label={t("settings.api.enable")}
             checked={s.api_enabled ?? true}
             onChange={(checked) => setS({ ...s, api_enabled: checked })}
           />
           <Input
-            label="Port"
+            label={t("settings.api.port")}
             inputSize="small"
             type="number"
             value={s.api_port ?? 40325}
@@ -346,18 +336,18 @@ export function SettingsPage() {
           {api && (
             <>
               <label className="flex flex-col gap-1.5">
-                <span className="text-label-xs text-text-sub-600">Base URL</span>
+                <span className="text-label-xs text-text-sub-600">{t("settings.api.baseUrl")}</span>
                 <CopyField value={api.base_url} />
               </label>
               <label className="flex flex-col gap-1.5">
-                <span className="text-label-xs text-text-sub-600">Bearer token</span>
+                <span className="text-label-xs text-text-sub-600">{t("settings.api.token")}</span>
                 <CopyField value={api.token} secret />
               </label>
               <div className="mt-1 flex items-center gap-2.5">
                 <Button variant="neutral" mode="stroke" size="small" onClick={regenToken}>
-                  Regenerate token
+                  {t("settings.api.regenerate")}
                 </Button>
-                <span className="text-paragraph-xs text-text-soft-400">Invalidates the current token immediately.</span>
+                <span className="text-paragraph-xs text-text-soft-400">{t("settings.api.regenerateHelp")}</span>
               </div>
               <p className="m-0 text-paragraph-xs text-text-soft-400">
                 Send it as <code>Authorization: Bearer &lt;token&gt;</code>.
@@ -369,12 +359,9 @@ export function SettingsPage() {
 
 
 
-      <SettingsCard title="What's new">
+      <SettingsCard title={t("settings.whatsNew.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-          After an update the launcher opens the patch log once, so the changes
-          get seen before they surprise anyone. This reopens it on demand —
-          useful when that first run went by in a hurry, or when someone else
-          installed the update on this machine.
+          <Rich text={t("settings.whatsNew.help")} />
         </p>
         <div className="flex items-center gap-2.5">
           <Button
@@ -383,30 +370,30 @@ export function SettingsPage() {
             size="small"
             onClick={() => setSection("patchlog")}
           >
-            View the update notes
+            {t("settings.whatsNew.view")}
           </Button>
           <span className="text-paragraph-xs text-text-soft-400">
-            Also in the sidebar, under Patch log.
+            {t("settings.whatsNew.alsoInSidebar")}
           </span>
         </div>
       </SettingsCard>
 
       <div
         role="region"
-        aria-label="Settings save status"
+        aria-label={t("settings.save.region")}
         className="sticky bottom-0 z-10 mt-2 flex items-center justify-between gap-3 rounded-lg bg-bg-white-0 px-4 py-3 shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200"
       >
         <div className="flex flex-col gap-0.5">
           <strong className="text-label-xs text-text-strong-950">
-            {dirty ? "Unsaved changes" : "All changes saved"}
+            {dirty ? t("settings.save.dirty") : t("settings.save.clean")}
           </strong>
           {restartPending && (
             <span className="text-paragraph-xs text-warning-base">
-              Restart required for Automation API changes
+              {t("settings.save.restartRequired")}
             </span>
           )}
         </div>
-        <Button size="xsmall" onClick={save} disabled={!dirty}>Save settings</Button>
+        <Button size="xsmall" onClick={save} disabled={!dirty}>{t("settings.save.button")}</Button>
       </div>
 </section>
   );

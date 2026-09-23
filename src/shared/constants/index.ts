@@ -1,3 +1,8 @@
+
+/** The translate function, taken as an argument so a label is built when it
+ *  is drawn rather than when this module is first imported. */
+type Tr = (key: string, vars?: Record<string, string | number>) => string;
+
 /// "auto" sentinel; the Rust launch resolver replaces with concrete TZ.
 export const AUTO_TZ = "auto";
 export const AUTO_LANG = "auto";
@@ -17,8 +22,8 @@ export const TIMEZONES = [
   "Pacific/Auckland", "UTC",
 ];
 
-export const LOCALES: { code: string; label: string }[] = [
-  { code: AUTO_LANG, label: "Auto (from proxy geo)" },
+export const locales = (t: Tr): { code: string; label: string }[] => [
+  { code: AUTO_LANG, label: t("profile.autoFromProxyGeo") },
   { code: "en-US", label: "English (US)" },
   { code: "en-GB", label: "English (UK)" },
   { code: "en-CA", label: "English (Canada)" },

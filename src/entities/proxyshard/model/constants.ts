@@ -1,8 +1,12 @@
 import type { ResiType } from "./types";
 
+/** The translate function, taken as an argument so a label is built when it
+ *  is drawn rather than when this module is first imported. */
+type Tr = (key: string, vars?: Record<string, string | number>) => string;
+
 // p0f OS-fingerprint signatures (signature/set endpoint enum).
-export const PS_SIGNATURES: { value: string; label: string }[] = [
-  { value: "", label: "Don't set" },
+export const psSignatures = (t: Tr): { value: string; label: string }[] => [
+  { value: "", label: t("ps.dontSet") },
   { value: "ios", label: "iOS" },
   { value: "macos", label: "macOS" },
   { value: "android", label: "Android" },

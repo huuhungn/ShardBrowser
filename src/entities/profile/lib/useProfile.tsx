@@ -21,6 +21,7 @@ import {
   devtoolsContext, devtoolsActivate, type CdpInfo,
 } from "../model/api";
 import { defaultForm, fromStored, toStored } from "../model/form";
+import { t } from "../../../shared/i18n";
 
 const FOLDERS_KEY = "shardx-folders";
 
@@ -235,7 +236,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
         // a legitimately running list out from under the user.
         if (consecutiveFailures === 3) {
           set({ running: {}, runningCdp: {} });
-          toast.err(`Lost track of running browsers: ${safeUiError(e)}`);
+          toast.err(t("profile.lostTrack", { err: safeUiError(e) }));
         }
       }
     };
@@ -248,10 +249,10 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   // first-class actions rather than something to reconstruct by hand.
   copyCdpHttpUrl: async (id) => {
     const cdp = get().runningCdp[id];
-    if (!cdp) { toast.err("CDP is not enabled for this running profile"); return; }
+    if (!cdp) { toast.err(t("profile.cdpIsNotEnabledForThisRunningProfile")); return; }
     try {
       await clip.write(cdp.http_url);
-      toast.ok("Copied CDP HTTP URL");
+      toast.ok(t("profile.copiedCDPHTTPURL"));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
@@ -262,7 +263,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
         ?? ctx.targets[0]?.devtools_frontend_url
         ?? `${ctx.cdp.http_url}/json/list`;
       await clip.write(url);
-      toast.ok("Copied DevTools inspect URL");
+      toast.ok(t("profile.copiedDevToolsInspectURL"));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
@@ -274,9 +275,9 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     set({ verificationBusy: new Set([...get().verificationBusy, id]) });
     try {
       await devtoolsActivate(id);
-      toast.ok("Verification tab brought to front");
+      toast.ok(t("profile.verificationTabBroughtToFront"));
     } catch (e) {
-      toast.err(`Could not bring verification tab to front: ${safeUiError(e)}`);
+      toast.err(t("profile.couldNotFrontTab", { err: safeUiError(e) }));
     } finally {
       const n = new Set(get().verificationBusy);
       n.delete(id);
@@ -362,7 +363,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const saved = await profileSave(toStored(draft, fp));
       await profileBindProxy(saved.id, draft.proxy_id);
       // A profile created while a folder tab is active should land in that
-      // folder (otherwise it pops into "All" and the user has to drag it back).
+      // folder (otherwise it pops into t("profile.all") and the user has to drag it back).
       // `!draft.id` scopes this to creations only — edits keep their folder.
       if (!draft.id && folder && folder !== "all") {
         try { await profileSetFolder(saved.id, folder); }
@@ -371,7 +372,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       set({ expanded: null, draft: null });
       get().reload();
       storeBus.emit("profiles");
-      toast.ok(draft.id ? "Profile saved" : `Created "${saved.name}"`);
+      toast.ok(draft.id ? t("profile.profileSaved") : t("profile.createdNamed", { name: saved.name }));
     } catch (e) {
       // Shown beside the form, where the offending field is. A toast as well
       // would be the same message twice, and it would scroll away from it.
@@ -425,7 +426,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
 
   remove: async (id) => {
     if ((await confirmModal({
-      title: "Delete profile",
+      title: t("profile.deleteProfile"),
       message: "Move this profile to the trash? It can be restored there for 7 days.",
       danger: true,
     })) !== true) return;
@@ -448,54 +449,52 @@ export const useProfile = create<ProfileStore>((set, get) => ({
 
   // Encrypted single-profile backup to a .shxbak file.
   backupProfile: async (p) => {
-    if (get().running[p.id]) { toast.err("Stop the profile before backing it up"); return; }
+    if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforeBackingItUp")); return; }
     try {
       const path = await saveDialog({
         defaultPath: `${(p.name || p.id).replace(/[^\w.-]+/g, "_")}.shxbak`,
-        filters: [{ name: "ShardX backup", extensions: ["shxbak"] }],
+        filters: [{ name: t("profile.shardxBackup"), extensions: ["shxbak"] }],
       });
       if (typeof path !== "string") return; // cancelled
       const passphrase = await passphraseModal({
-        title: "Encrypt backup",
-        message:
-          "This passphrase is the only way to open the backup. It is not stored " +
-          "anywhere and cannot be recovered — if you lose it, the backup is unreadable.",
+        title: t("profile.encryptBackup"),
+        message: t("profile.passphraseOnlyWay"),
         confirm: true,
       });
       if (passphrase === null) return;
       const res = await profileBackupCreate(p.id, path, passphrase);
-      toast.ok(`Backed up ${fmtBytes(res.file_bytes)} — SHA-256 ${res.sha256.slice(0, 12)}…`);
+      toast.ok(t("profile.backedUp", { size: fmtBytes(res.file_bytes), hash: res.sha256.slice(0, 12) }));
       const dir = path.replace(/[/\\][^/\\]*$/, "");
       try { await openPath(dir); } catch {}
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
   restoreProfile: async (p) => {
-    if (get().running[p.id]) { toast.err("Stop the profile before restoring it"); return; }
+    if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforeRestoringIt")); return; }
     try {
       const path = await open({
-        multiple: false, directory: false, title: "Select a ShardX backup",
-        filters: [{ name: "ShardX backup", extensions: ["shxbak"] }],
+        multiple: false, directory: false, title: t("profile.selectAShardxBackup"),
+        filters: [{ name: t("profile.shardxBackup"), extensions: ["shxbak"] }],
       });
       if (typeof path !== "string") return;
       // Validate the file before asking for a passphrase, so a wrong pick is
       // caught without the user typing anything.
       await profileBackupInspect(path);
       if ((await confirmModal({
-        title: "Restore profile",
+        title: t("profile.restoreProfile"),
         message:
           "This replaces the current profile data with the backup's contents. " +
-          "Anything not in the backup is lost.",
+          t("profile.anythingNotInTheBackupIsLost"),
         danger: true,
-        buttons: [{ label: "Cancel", value: false }, { label: "Restore", value: true, danger: true }],
+        buttons: [{ label: t("common.cancel"), value: false }, { label: t("profile.restore"), value: true, danger: true }],
       })) !== true) return;
       const passphrase = await passphraseModal({
-        title: "Open backup",
-        message: "Enter the passphrase this backup was created with.",
+        title: t("profile.openBackup"),
+        message: t("profile.enterThePassphraseThisBackupWasCrea"),
       });
       if (passphrase === null) return;
       await profileBackupRestore(p.id, path, passphrase);
-      toast.ok("Profile restored");
+      toast.ok(t("profile.profileRestored"));
       get().reload();
     } catch (e) { toast.err(safeUiError(e)); }
   },
@@ -503,7 +502,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   // Push a profile to the team server. The passphrase is the shared secret
   // between devices: whoever pulls this profile must type the same one.
   pushProfile: async (p) => {
-    if (get().running[p.id]) { toast.err("Stop the profile before pushing it"); return; }
+    if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforePushingIt")); return; }
     try {
       // Read the remote version first. Pushing from a stale base is what the
       // server refuses, and showing the version is how the user learns that
@@ -515,46 +514,46 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       let passphrase = "";
       if (!useTeam.getState().status?.has_fleet_key) {
         const typed = await passphraseModal({
-          title: base === 0 ? "Encrypt profile for the team" : `Push over version ${base}`,
+          title: base === 0 ? t("profile.encryptProfileForTheTeam") : t("profile.pushOverVersion", { v: base }),
           message:
-            "Everyone who pulls this profile must enter the same passphrase. " +
-            "It is not stored anywhere and cannot be recovered.",
+            t("profile.passphraseShared") +
+            t("profile.itIsNotStoredAnywhereAndCannotBeRecove"),
           confirm: base === 0,
         });
         if (typed === null) return;
         passphrase = typed;
       }
       const res = await profileSyncPush(p.id, passphrase, base);
-      toast.ok(`Pushed version ${res.version} — ${fmtBytes(res.container_bytes)}`);
+      toast.ok(t("profile.pushedVersion", { v: res.version, size: fmtBytes(res.container_bytes) }));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
   // Pull the team's current version over the local profile.
   pullProfile: async (p) => {
-    if (get().running[p.id]) { toast.err("Stop the profile before pulling it"); return; }
+    if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforePullingIt")); return; }
     try {
       const remote = await profileSyncStatus(p.id);
-      if (!remote) { toast.err("The team server has no snapshot for this profile yet"); return; }
+      if (!remote) { toast.err(t("profile.theTeamServerHasNoSnapshotForThisProfi")); return; }
       if (!(await confirmModal({
-        title: `Pull version ${remote.version}`,
+        title: t("profile.pullVersion", { v: remote.version }),
         message:
-          "This replaces the current profile data with the team's copy. " +
-          "Anything not in that snapshot is lost.",
+          t("profile.thisReplacesTheCurrentProfileDataWithT") +
+          t("profile.anythingNotInThatSnapshotIsLost"),
         buttons: [
-          { label: "Cancel", value: false },
-          { label: "Pull and replace", value: true, danger: true },
+          { label: t("common.cancel"), value: false },
+          { label: t("profile.pullAndReplace"), value: true, danger: true },
         ],
       }))) return;
       let passphrase: string | null = "";
       if (!useTeam.getState().status?.has_fleet_key) {
         passphrase = await passphraseModal({
-          title: "Passphrase for this profile",
-          message: "The passphrase used when this profile was pushed.",
+          title: t("profile.passphraseForThisProfile"),
+          message: t("profile.thePassphraseUsedWhenThisProfileWas"),
         });
       }
       if (passphrase === null) return;
       const bytes = await profileSyncPull(p.id, passphrase);
-      toast.ok(`Pulled version ${remote.version} — ${fmtBytes(bytes)} restored`);
+      toast.ok(t("profile.pulledVersion", { v: remote.version, size: fmtBytes(bytes) }));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
@@ -566,7 +565,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       });
       if (typeof path !== "string") return; // cancelled
       const n = await cookiesExportToFile(p.id, path);
-      toast.ok(`Exported ${n} cookie${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "profile.exportedCookieOne" : "profile.exportedCookieMany", { n }));
       // Open the containing folder so the user sees exactly where it went.
       const dir = path.replace(/[/\\][^/\\]*$/, "");
       try { await openPath(dir); } catch {}
@@ -574,18 +573,18 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   },
 
   importCookies: async (p) => {
-    if (get().running[p.id]) { toast.err("Stop the profile before importing cookies"); return; }
+    if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforeImportingCookies")); return; }
     try {
       const path = await open({
-        multiple: false, directory: false, title: "Select cookies JSON",
+        multiple: false, directory: false, title: t("profile.selectCookiesJson"),
         filters: [{ name: "JSON", extensions: ["json"] }],
       });
       if (typeof path !== "string") return;
       const text = await readTextFile(path);
       const cookies = JSON.parse(text);
-      if (!Array.isArray(cookies)) { toast.err("Expected a JSON array of cookies"); return; }
+      if (!Array.isArray(cookies)) { toast.err(t("profile.expectedAJSONArrayOfCookies")); return; }
       const n = await cookiesImport(p.id, cookies);
-      toast.ok(`Imported ${n} cookie${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "profile.importedCookieOne" : "profile.importedCookieMany", { n }));
     } catch (e) { toast.err(String(e)); }
   },
 
@@ -595,7 +594,11 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const p = get().profiles.find((x) => x.id === id);
     if (p && p.folder === f) {
       const who = p.name || id.slice(0, 8);
-      toast.info(f ? `"${who}" is already in "${f}"` : `"${who}" isn't in any folder`);
+      toast.info(
+        f
+          ? t("profile.alreadyInFolder", { who, folder: f })
+          : t("profile.notInAnyFolder", { who }),
+      );
       return;
     }
     try {
@@ -610,22 +613,24 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const count = get().profiles.filter((p) => p.folder === f).length;
     // Three outcomes: delete profiles, unfile, cancel.
     const choice = await confirmModal({
-      title: `Delete folder "${f}"`,
+      title: t("profile.deleteFolderTitle", { f }),
       message:
         count > 0
-          ? `This folder has ${count} profile${count === 1 ? "" : "s"}. ` +
-            `Delete them too, or keep them (they move to "All")?`
-          : `Delete the empty folder "${f}"?`,
+          ? t(count === 1 ? "profile.deleteFolderAskOne" : "profile.deleteFolderAskMany", {
+              n: count,
+              all: t("profile.all"),
+            })
+          : t("profile.deleteFolderEmpty", { f }),
       buttons:
         count > 0
           ? [
-              { label: "Cancel", value: "cancel" },
-              { label: "Keep profiles", value: "keep" },
-              { label: "Delete profiles", value: "delete", danger: true },
+              { label: t("common.cancel"), value: "cancel" },
+              { label: t("profile.keepProfiles"), value: "keep" },
+              { label: t("profile.deleteProfiles"), value: "delete", danger: true },
             ]
           : [
-              { label: "Cancel", value: "cancel" },
-              { label: "Delete", value: "keep", danger: true },
+              { label: t("common.cancel"), value: "cancel" },
+              { label: t("common.delete"), value: "keep", danger: true },
             ],
     });
     if (choice == null || choice === "cancel") return;
@@ -640,8 +645,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       get().reload();
       toast.ok(
         alsoDelete
-          ? `Deleted folder "${f}" + ${n} profile${n === 1 ? "" : "s"}`
-          : `Removed folder "${f}" (${n} profile${n === 1 ? "" : "s"} kept)`,
+          ? t(n === 1 ? "profile.deletedFolderOne" : "profile.deletedFolderMany", { f, n })
+          : t(n === 1 ? "profile.removedFolderOne" : "profile.removedFolderMany", { f, n }),
       );
     } catch (e) { toast.err(String(e)); }
   },
@@ -651,7 +656,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const meta = await profileCreateFromTemplate(tplId);
       set({ templatePickerOpen: false });
       get().reload();
-      toast.ok(`Profile "${meta.name}" created`);
+      toast.ok(t("profile.profileCreatedNamed", { name: meta.name }));
       // Auto-open the new profile in the editor.
       const stored = await profileGet(meta.id);
       set({ draft: fromStored(stored), expanded: meta.id });
@@ -669,7 +674,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const name = await syncLaunch(ids, group);
       set({ syncGroup: name });
       get().clearSelected();
-      toast.ok(`Synchronising ${ids.length} profiles`);
+      toast.ok(t("profile.synchronisingProfiles", { n: ids.length }));
     } catch (e) {
       toast.err(String(e));
     }
@@ -689,8 +694,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (failures.length) {
       toast.err(
         failures.length === 1
-          ? `Could not start one browser: ${failures[0]}`
-          : `Could not start ${failures.length} browsers: ${failures[0]}`,
+          ? t("profile.couldNotStartOne", { err: failures[0] })
+          : t("profile.couldNotStartMany", { n: failures.length, err: failures[0] }),
       );
     }
   },
@@ -705,8 +710,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (failures.length) {
       toast.err(
         failures.length === 1
-          ? `Could not stop one browser: ${failures[0]}`
-          : `Could not stop ${failures.length} browsers: ${failures[0]}`,
+          ? t("profile.couldNotStopOne", { err: failures[0] })
+          : t("profile.couldNotStopMany", { n: failures.length, err: failures[0] }),
       );
     }
   },
@@ -715,8 +720,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const ids = [...get().selected];
     if (ids.length === 0) return;
     if ((await confirmModal({
-      title: "Delete profiles",
-      message: `Move ${ids.length} profile${ids.length === 1 ? "" : "s"} to the trash? They can be restored there for 7 days.`,
+      title: t("profile.deleteProfiles"),
+      message: t(ids.length === 1 ? "profile.trashAskOne" : "profile.trashAskMany", { n: ids.length }),
       danger: true,
     })) !== true) return;
     for (const id of ids) {
@@ -725,7 +730,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     get().clearSelected();
     get().reload();
     storeBus.emit("profiles");
-    toast.ok(`Moved ${ids.length} to the trash`);
+    toast.ok(t("profile.movedToTrashN", { n: ids.length }));
   },
 
   // Dump selected profile FingerprintConfigs as a JSON array to clipboard.
@@ -735,7 +740,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     try {
       const payloads = await Promise.all(ids.map((id) => profileGet(id)));
       await clip.write(JSON.stringify(payloads, null, 2));
-      toast.ok(`Copied ${payloads.length} to clipboard`);
+      toast.ok(t("common.copiedNToClipboard", { n: payloads.length }));
     } catch (e) { toast.err(String(e)); }
   },
 
@@ -743,13 +748,13 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   bulkImport: async () => {
     try {
       const text = await clip.read();
-      if (!text.trim()) { toast.err("Clipboard is empty"); return; }
+      if (!text.trim()) { toast.err(t("profile.clipboardIsEmpty")); return; }
       const data = JSON.parse(text);
       const arr = Array.isArray(data) ? data : [data];
       const n = await profileImport(arr);
       get().reload();
-      toast.ok(`Imported ${n} profile${n === 1 ? "" : "s"}`);
-    } catch (e) { toast.err("Import failed: " + String(e)); }
+      toast.ok(t(n === 1 ? "profile.importedProfileOne" : "profile.importedProfileMany", { n }));
+    } catch (e) { toast.err(t("profile.importFailed") + String(e)); }
   },
 }));
 

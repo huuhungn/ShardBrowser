@@ -3,6 +3,7 @@ import { toast } from "../../../shared/lib/toast";
 import { confirmModal } from "../../../shared/lib/confirm";
 import { bookmarkDelete, bookmarkList, bookmarkSave } from "../model/api";
 import type { Bookmark } from "../model/types";
+import { t } from "../../../shared/i18n";
 
 export const emptyBookmark = (folder = ""): Bookmark => ({
   id: "",
@@ -59,14 +60,14 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
       await bookmarkSave(b);
       set({ editing: null });
       await get().reload();
-      toast.ok(b.id ? "Bookmark saved" : "Bookmark added");
+      toast.ok(b.id ? t("bookmarks.bookmarkSaved") : t("bookmarks.bookmarkAdded"));
     } catch (e) { toast.err(String(e)); }
   },
 
   remove: async (b) => {
     const ok = await confirmModal({
-      title: "Delete bookmark",
-      message: `Delete "${b.title || b.url}"? It disappears from its profiles on their next launch.`,
+      title: t("bookmarks.deleteBookmark"),
+      message: t("bookmarks.deleteAsk", { name: b.title || b.url }),
       danger: true,
     });
     if (ok !== true) return;

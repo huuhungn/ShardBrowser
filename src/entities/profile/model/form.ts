@@ -64,6 +64,13 @@ export function fromStored(stored: any): ProfileForm {
   f.user_agent = stored?.navigator?.user_agent ?? f.user_agent;
   f.hardware_concurrency = stored?.navigator?.hardware_concurrency ?? 8;
   f.device_memory = stored?.navigator?.device_memory ?? 16;
+  // The OS version sites read. Absent from the form meant the editor forgot it
+  // on every load, and save then rebuilt it from the preset — so editing an
+  // unrelated toggle silently moved the profile to a different OS release.
+  // client_hints is the fallback: a profile written before navigator carried
+  // the key still has it there, and the two are written together on save.
+  f.platform_version =
+    stored?.navigator?.platform_version ?? stored?.client_hints?.platform_version ?? "";
   f.timezone = stored?.timezone ?? AUTO_TZ;
   f.language = stored?.navigator?.language ?? AUTO_LANG;
   f.webrtc = (stored?.webrtc === "replace" ? "tcp_only" : stored?.webrtc) ?? "auto";

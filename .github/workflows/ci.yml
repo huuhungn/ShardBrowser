@@ -190,6 +190,9 @@ jobs:
       - name: MCP release manifest tests
         run: npm run test:release-package
 
+      - name: Profile form round-trip tests
+        run: npm run test:profile-form
+
       - name: Updater signature verification tests
         run: npm run test:updater-signatures
 

@@ -14,3 +14,7 @@ dist/
 ui-kit/dist/
 ui-kit/node_modules/
 /src-tauri/target
+
+# Screenshots from scripts/vi-screens.mjs, regenerated on demand.
+vi-shots/
+vi-switch-shots/

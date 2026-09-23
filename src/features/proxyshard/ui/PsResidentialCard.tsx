@@ -7,6 +7,7 @@ import type { PsOrder, ResiType } from "../../../entities/proxyshard";
 import { psProfileTraffic, psOrders, psRenew } from "../../../entities/proxyshard";
 import { PsTopupModal } from "./PsTopupModal";
 import { PsResiGenerator } from "./PsResiGenerator";
+import { useT } from "../../../shared/i18n";
 
 function TrafficStat({ value, label }: { value: string; label: string }) {
   return (
@@ -21,6 +22,7 @@ function TrafficStat({ value, label }: { value: string; label: string }) {
 /// traffic for Standard/Premium, in-place top-up, and the relay proxy
 /// generator. Unmetered is a flat plan, so it skips the GB meter.
 export function PsResidentialCard() {
+  const t = useT();
   const [type, setType] = useState<ResiType>("standart");
   const [data, setData] = useState<{ data: number; data_remain: number; data_spent: number } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -57,7 +59,7 @@ export function PsResidentialCard() {
     setRenewing(true);
     try {
       await psRenew(order.order_id);
-      toast.ok(`Renewed order #${order.order_id}`);
+      toast.ok(t("ps.renewedOrder", { id: order.order_id }));
       loadOrders();
     } catch (e) { toast.err(String(e)); }
     finally { setRenewing(false); }
@@ -67,14 +69,14 @@ export function PsResidentialCard() {
   return (
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
       <div className="mb-2.5 flex items-center justify-between gap-3">
-        <h3 className="m-0 text-label-sm text-text-strong-950">Residential</h3>
+        <h3 className="m-0 text-label-sm text-text-strong-950">{t("ps.residential")}</h3>
         <SegmentControl
           size="small"
           value={type}
           items={[
-            { value: "standart", label: "Standard" },
-            { value: "premium", label: "Premium" },
-            { value: "unmetered", label: "Unmetered" },
+            { value: "standart", label: t("ps.standard") },
+            { value: "premium", label: t("ps.premium") },
+            { value: "unmetered", label: t("ps.unmetered") },
           ]}
           onChange={(v) => setType(v as ResiType)}
         />
@@ -87,9 +89,9 @@ export function PsResidentialCard() {
           {data && !loading && (
             <>
               <div className="my-1 mb-3 grid grid-cols-3 gap-2.5">
-                <TrafficStat value={fmtGB(data.data_remain)} label="Remaining" />
-                <TrafficStat value={fmtGB(data.data_spent)} label="Used" />
-                <TrafficStat value={fmtGB(data.data)} label="Total" />
+                <TrafficStat value={fmtGB(data.data_remain)} label={t("ps.remaining")} />
+                <TrafficStat value={fmtGB(data.data_spent)} label={t("ps.used")} />
+                <TrafficStat value={fmtGB(data.data)} label={t("ps.total")} />
               </div>
               <ProgressBar value={pct} color={pct > 90 ? "error" : pct > 70 ? "warning" : "primary"} />
               <p className="m-0 mt-1 text-paragraph-xs text-text-soft-400">{pct}% used.</p>
@@ -98,7 +100,7 @@ export function PsResidentialCard() {
         </>
       ) : (
         <p className="m-0 text-paragraph-xs text-text-soft-400">
-          Unlimited plan{order?.expires_at ? ` · expires ${order.expires_at.slice(0, 10)}` : ""}.
+          Unlimited plan{order?.expires_at ? t("ps.expiresDate", { date: order.expires_at.slice(0, 10) }) : ""}.
         </p>
       )}
 
@@ -110,10 +112,10 @@ export function PsResidentialCard() {
             size="small"
             leftIcon={<AddIcon className="size-4" />}
             disabled={!order}
-            title={order ? undefined : "No residential order found for this tier"}
+            title={order ? undefined : t("ps.noResidentialOrderFoundForThisTier")}
             onClick={() => order && setTopup(order)}
           >
-            Add traffic
+            {t("ps.addTraffic")}
           </Button>
         ) : (
           <Button
@@ -122,14 +124,14 @@ export function PsResidentialCard() {
             size="small"
             disabled={!order || renewing}
             isLoading={renewing}
-            title={order ? undefined : "No unmetered order found"}
+            title={order ? undefined : t("ps.noUnmeteredOrderFound")}
             onClick={renew}
           >
-            {renewing ? "Renewing…" : "Renew"}
+            {renewing ? "Renewing…" : t("ps.renew")}
           </Button>
         )}
         <Button variant="primary" mode="filled" size="small" onClick={() => setGenOpen(true)}>
-          Generate proxies
+          {t("ps.generateProxies")}
         </Button>
       </div>
 

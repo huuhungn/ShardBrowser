@@ -9,6 +9,8 @@ export function useFingerprintGroups() {
         const order = ["macOS", "Windows", "Linux"];
         const buckets = new Map<string, FingerprintEntry[]>();
         for (const it of items) {
+            // A bucket key, not a label: the library translates it when it
+            // draws the heading, so grouping stays stable across languages.
             const k = it.platform || "Other";
             if (!buckets.has(k)) buckets.set(k, []);
             buckets.get(k)!.push(it);

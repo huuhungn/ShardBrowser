@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { cn } from "@proxyshard/shardx-ui-kit";
 import { useContextMenu } from "../../shared/hooks/useContextMenu";
 import { useProfile, useFolders } from "../../entities/profile";
+import { useT } from "../../shared/i18n";
 
 /* UI-kit "line" tab look, hand-rolled because tabs are drop targets too. */
 const tabBase =
@@ -19,6 +20,7 @@ const readDragId = (e: React.DragEvent) =>
   e.dataTransfer.getData("application/x-shardx-profile") || e.dataTransfer.getData("text/plain");
 
 export function FolderTabs() {
+  const t = useT();
   const profiles = useProfile((s) => s.profiles);
   const folder = useProfile((s) => s.folder);
   const dropTarget = useProfile((s) => s.dropTarget);
@@ -84,10 +86,10 @@ export function FolderTabs() {
           key={f}
           className={cn(tabBase, folder === f ? tabActive : tabIdle, dropTarget === f && tabDrop)}
           onClick={() => setFolder(f)}
-          title="Right-click for folder actions · drop profiles to move them"
+          title={t("folders.rightClickForFolderActionsDropProfil")}
           onContextMenu={(e) =>
             ctx.open(e, [
-              { label: "Delete folder…", onClick: () => deleteFolder(f), danger: true },
+              { label: t("folders.deleteFolder"), onClick: () => deleteFolder(f), danger: true },
             ])
           }
           onDragOver={(e) => {
@@ -113,7 +115,7 @@ export function FolderTabs() {
       ))}
       <button
         className="flex-none cursor-pointer whitespace-nowrap border-0 bg-transparent px-3 py-2 text-base font-normal leading-none text-text-soft-400 hover:text-primary-base"
-        title="Create a new folder"
+        title={t("folders.createANewFolder")}
         onClick={() => setFolderModal({ profileId: null })}
       >
         +

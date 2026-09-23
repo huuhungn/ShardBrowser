@@ -9,10 +9,43 @@ use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
 pub fn config_root() -> Result<PathBuf> {
+    if let Some(root) = config_root_cell().read().ok().and_then(|g| g.clone()) {
+        std::fs::create_dir_all(&root)?;
+        return Ok(root);
+    }
     let base = dirs::config_dir().context("OS config dir unavailable")?;
     let root = base.join("shardx-launcher");
     std::fs::create_dir_all(&root)?;
     Ok(root)
+}
+
+fn config_root_cell() -> &'static RwLock<Option<PathBuf>> {
+    static CELL: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(None))
+}
+
+/// Serialises tests that swap the config root.
+///
+/// The root is process-global, so two test modules that each hold their own
+/// lock still race with each other: the failure shows up as one module's
+/// fixtures appearing in the other's store, which reads like a routing bug
+/// rather than a test isolation one. Every test that calls
+/// [`set_config_root`] must hold this, including the integration tests, which
+/// are separate crates and so cannot see a `#[cfg(test)]` item.
+pub fn config_root_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
+/// Point the config dir somewhere else (None = back to the OS config dir).
+///
+/// Exists for tests: a test that writes automation projects into the
+/// operator's real store would corrupt the profiles this machine actually
+/// runs. Production never calls it.
+pub fn set_config_root(root: Option<PathBuf>) {
+    if let Ok(mut g) = config_root_cell().write() {
+        *g = root;
+    }
 }
 
 fn data_root_cell() -> &'static RwLock<Option<PathBuf>> {
@@ -82,6 +115,11 @@ pub fn proxies_path() -> Result<PathBuf> {
 
 pub fn settings_path() -> Result<PathBuf> {
     Ok(config_root()?.join("settings.json"))
+}
+
+/// Automation projects: blocks, run settings, export bundles.
+pub fn automation_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("automation.json"))
 }
 
 /// Folder-scoped bookmarks, merged into each profile's Bookmarks on launch.

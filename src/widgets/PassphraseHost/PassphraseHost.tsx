@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { Button, Input, Modal } from "@proxyshard/shardx-ui-kit";
 import { usePassphraseStore } from "../../shared/model/passphrase";
+import { useT } from "../../shared/i18n";
 
 /** Global passphrase prompt. Kept deliberately plain: no strength meter, no
  *  "remember this" — there is nowhere safe to remember it. */
 export function PassphraseHost() {
+  const t = useT();
   const req = usePassphraseStore((s) => s.req);
   const [a, setA] = useState("");
   const [b, setB] = useState("");
@@ -29,10 +31,10 @@ export function PassphraseHost() {
       footer={
         <div className="flex justify-end gap-2">
           <Button size="small" mode="stroke" onClick={() => done(null)}>
-            Cancel
+            {t("common.cancel")}
           </Button>
           <Button size="small" disabled={!ready} onClick={() => ready && done(a)}>
-            Continue
+            {t("common.continue")}
           </Button>
         </div>
       }
@@ -47,7 +49,7 @@ export function PassphraseHost() {
         <p className="m-0 text-paragraph-sm text-text-sub-600">{req.message}</p>
         <Input
           autoFocus
-          label="Passphrase"
+          label={t("passphrase.passphrase")}
           inputSize="small"
           type="password"
           value={a}
@@ -55,7 +57,7 @@ export function PassphraseHost() {
         />
         {req.confirm && (
           <Input
-            label="Repeat passphrase"
+            label={t("passphrase.repeatPassphrase")}
             inputSize="small"
             type="password"
             value={b}
@@ -64,7 +66,7 @@ export function PassphraseHost() {
         )}
         {mismatch && (
           <p className="m-0 text-paragraph-xs text-state-error-base">
-            The two entries don't match.
+            {t("passphrase.theTwoEntriesDonTMatch")}
           </p>
         )}
         {/* Lets Enter submit without a visible duplicate button. */}

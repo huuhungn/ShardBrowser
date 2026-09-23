@@ -103,12 +103,10 @@ pub async fn profile_backup_restore(
         return Err("backup file not found".into());
     }
 
-    tokio::task::spawn_blocking(move || {
-        shardx_core::backup_file::restore(&src, &udd, &passphrase)
-    })
-    .await
-    .map_err(|e| format!("restore task failed: {e}"))?
-    .map_err(|e| format!("{e:#}"))
+    tokio::task::spawn_blocking(move || shardx_core::backup_file::restore(&src, &udd, &passphrase))
+        .await
+        .map_err(|e| format!("restore task failed: {e}"))?
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// Check that a file looks like a ShardX backup, without a passphrase.

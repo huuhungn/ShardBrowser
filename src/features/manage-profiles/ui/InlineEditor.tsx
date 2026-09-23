@@ -11,13 +11,16 @@ import { ExtensionPicker } from "./ExtensionPicker";
 import { ProxySelect } from "./ProxySelect";
 import { HOST_OS } from "../../../shared/lib/utils";
 import {
-  AUTO_TZ, TIMEZONES, LOCALES,
+  AUTO_TZ, TIMEZONES, locales,
   MEMORY_OPTIONS, CPU_OPTIONS, MEDIA_COUNT_OPTIONS, OS_OPTIONS,
 } from "../../../shared/constants";
 import type { ProfileForm, GeoMode, WebRtcMode } from "../../../entities/profile";
 import type { FingerprintEntry } from "../../../entities/fingerprint";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { enrichPicksForPreset } from "../../../entities/profile";
+import { useGpuCompat } from "../../../shared/model/gpuCompat";
+import { IncompatibleWarningModal } from "../../gpu-compat";
+import { useT } from "../../../shared/i18n";
 
 function SectionHeading({ children }: { children: React.ReactNode }) {
   return (
@@ -39,6 +42,7 @@ export function InlineEditor({
   error?: string | null;
   onCancel: () => void;
 }) {
+  const t = useT();
   const f = draft;
   const u = <K extends keyof ProfileForm>(k: K, v: ProfileForm[K]) => setDraft({ ...f, [k]: v });
 
@@ -51,6 +55,16 @@ export function InlineEditor({
     () => fingerprints.filter((fp) => fp.platform === osFilter),
     [fingerprints, osFilter],
   );
+
+  // Which library fingerprints this machine can actually wear. The verdict is
+  // advisory: it steers the RANDOM pick away from a self-contradicting profile
+  // and warns on a deliberate one, but never refuses the operator's choice.
+  const compatById = useGpuCompat((s) => s.byId);
+  const suppressed = useGpuCompat((s) => s.suppressed);
+  const loadCompat = useGpuCompat((s) => s.load);
+  useEffect(() => { void loadCompat(); }, [loadCompat]);
+
+  const [pendingGpu, setPendingGpu] = useState<string | null>(null);
 
   /// Pick GPU = full fingerprint snap; toStored carries lib.payload at save.
   const setGpu = async (id: string) => {
@@ -75,16 +89,30 @@ export function InlineEditor({
   };
 
   // Snap unknown / empty gpu_preset_id to a random GPU of the active OS.
+  // Prefer one this host can back; fall back to the whole pool rather than
+  // leaving the profile without a fingerprint.
   useEffect(() => {
     if (fingerprints.length === 0) return;
     const exists = fingerprints.some((g) => g.id === f.gpu_preset_id);
     if (!exists) {
-      const pool = gpusForOs.length > 0 ? gpusForOs : fingerprints;
+      const base = gpusForOs.length > 0 ? gpusForOs : fingerprints;
+      const fitting = base.filter((g) => compatById[g.id]?.compatible !== false);
+      const pool = fitting.length > 0 ? fitting : base;
       const pick = pool[Math.floor(Math.random() * pool.length)];
       if (pick) setGpu(pick.id);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fingerprints, osFilter, f.gpu_preset_id]);
+  }, [fingerprints, osFilter, f.gpu_preset_id, compatById]);
+
+  /// A deliberate pick of an unbackable fingerprint asks once, then obeys.
+  const chooseGpu = (id: string) => {
+    const verdict = compatById[id];
+    if (verdict && !verdict.compatible && !suppressed) {
+      setPendingGpu(id);
+      return;
+    }
+    void setGpu(id);
+  };
 
   const pickOs = (os: string) => {
     setOsFilter(os);
@@ -101,11 +129,11 @@ export function InlineEditor({
       <div className="grid grid-cols-3 gap-4">
         {/* ----- col 1: identity + hardware ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Identity</SectionHeading>
-          <Field label="Profile name" value={f.name} onChange={(v) => u("name", v)} placeholder="e.g. shop-pl-1" />
+          <SectionHeading>{t("profile.identity")}</SectionHeading>
+          <Field label={t("profile.profileName")} value={f.name} onChange={(v) => u("name", v)} placeholder={t("profile.eGShopPl1")} />
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Operating system</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.operatingSystem")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
@@ -118,24 +146,24 @@ export function InlineEditor({
           <label className="flex flex-col gap-1">
             <CSSelect
               value={f.gpu_preset_id}
-              onChange={(v) => setGpu(v)}
-              title="GPU / device (from Fingerprint Library)"
-              placeholder={`— no ${osFilter} fingerprints in library —`}
+              onChange={(v) => chooseGpu(v)}
+              title={t("profile.gpuDeviceFromFingerprintLibrary")}
+              placeholder={t("fp.noneInLibraryForOs", { os: osFilter })}
               options={gpusForOs.map((g) => ({ value: g.id, label: g.label }))}
             />
           </label>
 
-          <Field label="User-Agent" value={f.user_agent} onChange={(v) => u("user_agent", v)} mono />
+          <Field label={t("profile.userAgent")} value={f.user_agent} onChange={(v) => u("user_agent", v)} mono />
 
           <div className="grid grid-cols-2 gap-3">
             <SelectField
-              label="CPU cores"
+              label={t("profile.cpuCores")}
               value={f.hardware_concurrency}
               onChange={(v) => u("hardware_concurrency", v)}
               options={CPU_OPTIONS}
             />
             <SelectField
-              label="Memory (GB)"
+              label={t("profile.memoryGb")}
               value={f.device_memory}
               onChange={(v) => u("device_memory", v)}
               options={MEMORY_OPTIONS}
@@ -143,7 +171,7 @@ export function InlineEditor({
           </div>
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Proxy</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.proxy")}</span>
             <ProxySelect
               value={f.proxy_id}
               proxies={proxies}
@@ -152,7 +180,7 @@ export function InlineEditor({
           </label>
 
           <ColorSwatches
-            label="Colour"
+            label={t("profile.colour")}
             value={f.color}
             onChange={(v) => u("color", v)}
           />
@@ -160,45 +188,45 @@ export function InlineEditor({
 
         {/* ----- col 2: locale + noise ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Locale</SectionHeading>
+          <SectionHeading>{t("profile.locale")}</SectionHeading>
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
              
               <CSSelect
                 value={f.timezone}
-                title="Timezone"
+                title={t("profile.timezone")}
                 onChange={(v) => u("timezone", v)}
                 options={TIMEZONES.map((tz) => ({
                   value: tz,
-                  label: tz === AUTO_TZ ? "Auto (from proxy geo)" : tz,
+                  label: tz === AUTO_TZ ? t("profile.autoFromProxyGeo") : tz,
                 }))}
               />
             </label>
             <label className="flex flex-col gap-1">
              
               <CSSelect
-                title="Language"
+                title={t("common.language")}
                 value={f.language}
                 onChange={(v) => u("language", v)}
-                options={LOCALES.map((l) => ({ value: l.code, label: l.label }))}
+                options={locales(t).map((l) => ({ value: l.code, label: l.label }))}
               />
             </label>
           </div>
 
           <div className="mt-1.5">
-            <SectionHeading>Noise</SectionHeading>
+            <SectionHeading>{t("profile.noise")}</SectionHeading>
           </div>
           <div className="grid grid-cols-2 gap-2 gap-x-3">
-            <Pair label="Canvas"        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
-            <Pair label="WebGL"         value={f.noise_webgl}         on={(v) => u("noise_webgl", v)} />
-            <Pair label="Audio"         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
-            <Pair label="Client rects"  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
-            <Pair label="Sensors"       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
-            <Pair label="Fonts"         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText="Noise" />
+            <Pair label={t("profile.canvas")}        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
+            <Pair label={t("profile.webgl")}         value={f.noise_webgl}         on={(v) => u("noise_webgl", v)} />
+            <Pair label={t("profile.audio")}         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
+            <Pair label={t("profile.clientRects")}  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
+            <Pair label={t("profile.sensors")}       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
+            <Pair label={t("profile.fonts")}         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText={t("profile.noise")} />
           </div>
 
           <PortList
-            label="Ports to block"
+            label={t("profile.portsToBlock")}
             value={f.blocked_ports}
             onChange={(v) => u("blocked_ports", v)}
           />
@@ -206,28 +234,28 @@ export function InlineEditor({
 
         {/* ----- col 3: privacy + media + notes ----- */}
         <div className="flex flex-col gap-4">
-          <SectionHeading>Privacy</SectionHeading>
+          <SectionHeading>{t("profile.privacy")}</SectionHeading>
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
               <CSSelect
-                title="WebRTC"
+                title={t("profile.webrtc")}
                 value={f.webrtc}
                 onChange={(v) => u("webrtc", v as WebRtcMode)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "tcp_only", label: "TCP only" },
-                  { value: "block", label: "Block" },
+                  { value: "auto", label: t("profile.auto") },
+                  { value: "tcp_only", label: t("profile.tcpOnly") },
+                  { value: "block", label: t("profile.block") },
                 ]}
               />
             </label>
             <label className="flex flex-col gap-1">
               <CSSelect
-                title="Do Not Track"
+                title={t("profile.doNotTrack")}
                 value={f.do_not_track ? "1" : "0"}
                 onChange={(v) => u("do_not_track", v === "1")}
                 options={[
-                  { value: "0", label: "Off" },
-                  { value: "1", label: "On (send DNT: 1)" },
+                  { value: "0", label: t("profile.off") },
+                  { value: "1", label: t("profile.onSendDNT1") },
                 ]}
               />
             </label>
@@ -235,48 +263,48 @@ export function InlineEditor({
 
           <label className="flex flex-col gap-1">
             <CSSelect
-              title="Session restore"
+              title={t("profile.sessionRestore")}
               value={f.restore_session ? "1" : "0"}
               onChange={(v) => u("restore_session", v === "1")}
               options={[
-                { value: "1", label: "Reopen last session's tabs" },
-                { value: "0", label: "Always start fresh" },
+                { value: "1", label: t("profile.reopenLastSessionSTabs") },
+                { value: "0", label: t("profile.alwaysStartFresh") },
               ]}
             />
           </label>
 
           <label className="flex flex-col gap-1">
-            <span className="text-label-base font-medium text-text-strong-900">Geolocation</span>
+            <span className="text-label-base font-medium text-text-strong-900">{t("profile.geolocation")}</span>
             <SegmentControl
               size="small"
               className="w-full *:flex-1"
               value={f.geo_mode}
               items={(["auto", "manual"] as GeoMode[]).map((m) => ({
                 value: m,
-                label: m === "auto" ? "Auto (from proxy)" : "Manual coords",
+                label: m === "auto" ? t("profile.autoFromProxy") : t("profile.manualCoords"),
               }))}
               onChange={(v) => u("geo_mode", v as GeoMode)}
             />
           </label>
           {f.geo_mode === "manual" && (
             <div className="grid grid-cols-3 gap-3">
-              <NumField label="Latitude" value={f.geo_lat} onChange={(v) => u("geo_lat", v)} step={0.0001} />
-              <NumField label="Longitude" value={f.geo_lng} onChange={(v) => u("geo_lng", v)} step={0.0001} />
-              <NumField label="Accuracy m" value={f.geo_accuracy} onChange={(v) => u("geo_accuracy", v)} />
+              <NumField label={t("profile.latitude")} value={f.geo_lat} onChange={(v) => u("geo_lat", v)} step={0.0001} />
+              <NumField label={t("profile.longitude")} value={f.geo_lng} onChange={(v) => u("geo_lng", v)} step={0.0001} />
+              <NumField label={t("profile.accuracyM")} value={f.geo_accuracy} onChange={(v) => u("geo_accuracy", v)} />
             </div>
           )}
 
           <div className="mt-2.5">
-            <SectionHeading>Media devices</SectionHeading>
+            <SectionHeading>{t("profile.mediaDevices")}</SectionHeading>
           </div>
           <div className="grid grid-cols-3 gap-3">
-            <SelectField label="Mic in" value={f.media_audio_in} onChange={(v) => u("media_audio_in", v)} options={MEDIA_COUNT_OPTIONS} />
-            <SelectField label="Speakers" value={f.media_audio_out} onChange={(v) => u("media_audio_out", v)} options={MEDIA_COUNT_OPTIONS} />
-            <SelectField label="Webcam" value={f.media_video_in} onChange={(v) => u("media_video_in", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.micIn")} value={f.media_audio_in} onChange={(v) => u("media_audio_in", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.speakers")} value={f.media_audio_out} onChange={(v) => u("media_audio_out", v)} options={MEDIA_COUNT_OPTIONS} />
+            <SelectField label={t("profile.webcam")} value={f.media_video_in} onChange={(v) => u("media_video_in", v)} options={MEDIA_COUNT_OPTIONS} />
           </div>
 
           <div className="mt-2.5">
-            <SectionHeading>Extensions</SectionHeading>
+            <SectionHeading>{t("profile.extensions")}</SectionHeading>
           </div>
           <ExtensionPicker
             value={f.extensions}
@@ -284,11 +312,11 @@ export function InlineEditor({
           />
 
           <Textarea
-            label="Notes"
+            label={t("common.notes")}
             rows={2}
             value={f.notes}
             onChange={(e) => u("notes", e.target.value)}
-            placeholder="Free-form notes…"
+            placeholder={t("profile.freeFormNotes")}
           />
         </div>
       </div>
@@ -298,11 +326,23 @@ export function InlineEditor({
             {error}
           </p>
         )}
-        <Button variant="neutral" mode="stroke" size="small" onClick={onCancel}>Cancel</Button>
+        <Button variant="neutral" mode="stroke" size="small" onClick={onCancel}>{t("profile.cancel")}</Button>
         <Button variant="primary" mode="filled" size="small" onClick={onSave}>
-          {f.id ? "Save changes" : "Create profile"}
+          {f.id ? t("profile.saveChanges") : t("profile.createProfile")}
         </Button>
       </div>
+
+      {pendingGpu && compatById[pendingGpu] && (
+        <IncompatibleWarningModal
+          compat={compatById[pendingGpu]}
+          onKeep={() => {
+            const id = pendingGpu;
+            setPendingGpu(null);
+            void setGpu(id);
+          }}
+          onCancel={() => setPendingGpu(null)}
+        />
+      )}
     </div>
   );
 }

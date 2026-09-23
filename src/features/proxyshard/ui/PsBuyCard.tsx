@@ -9,11 +9,13 @@ import { confirmModal } from "../../../shared/model/confirm";
 import { fmtCents, isDcIsp, availCode } from "../../../shared/lib/utils";
 import type { PsOrder, PsProduct, PsCalc, PsBuyOption } from "../../../entities/proxyshard";
 import { psProducts, psOrders, psAvailableCount, psCalculate, psPurchase, usePsAccount } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 /// Buy a new order. DC/ISP can be bought repeatedly (quantity + country);
 /// residential products can only be owned once, so any already-owned tier is
 /// hidden here (top it up from the Residential card instead).
 export function PsBuyCard() {
+  const t = useT();
   // Refresh the account wallet/orders metrics after a purchase.
   const onPurchased = usePsAccount((s) => s.refreshMe);
   const [options, setOptions] = useState<PsBuyOption[]>([]);
@@ -127,27 +129,36 @@ export function PsBuyCard() {
   };
 
   const buy = async () => {
-    if (needLocation && !country) { toast.err("Pick a location for Datacenter/ISP proxies"); return; }
+    if (needLocation && !country) { toast.err(t("ps.pickALocationForDatacenterISPProxies")); return; }
     // Auto-calculate when the user hasn't pressed Calculate, so the confirm
     // shows the real total (incl. add-ons) instead of a placeholder.
     let c = calc;
     if (!c) {
       try { c = await fetchCalc(); setCalc(c); } catch { /* show placeholder below */ }
     }
-    const price = c ? fmtCents(c.total_with_addons ?? c.final_price) : "this order";
+    const price = c ? fmtCents(c.total_with_addons ?? c.final_price) : t("ps.thisOrder");
     const ok = await confirmModal({
-      title: "Confirm purchase",
-      message: `Buy ${quantity} × ${productName}${cycle ? ` (${cycle})` : ""} for ${price}? Your wallet will be charged.`,
+      title: t("ps.confirmPurchase"),
+      message: t("ps.buyAsk", {
+        quantity,
+        product: productName,
+        cycle: cycle ? ` (${cycle})` : "",
+        price,
+      }),
       buttons: [
-        { label: "Cancel", value: false },
-        { label: "Buy", value: true, primary: true },
+        { label: t("common.cancel"), value: false },
+        { label: t("ps.buy"), value: true, primary: true },
       ],
     });
     if (ok !== true) return;
     setBuying(true);
     try {
       const r = await psPurchase(buildBody());
-      toast.ok(r.message ? `${r.message}${r.order_id ? ` (#${r.order_id})` : ""}` : "Order placed");
+      toast.ok(
+        r.message
+          ? `${r.message}${r.order_id ? t("ps.orderIdSuffix", { id: r.order_id }) : ""}`
+          : t("ps.orderPlaced"),
+      );
       setCalc(null);
       onPurchased();
     } catch (e) { toast.err(String(e)); }
@@ -156,16 +167,16 @@ export function PsBuyCard() {
 
   return (
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
-      <h3 className="m-0 mb-2 text-label-sm text-text-strong-950">Buy proxies</h3>
+      <h3 className="m-0 mb-2 text-label-sm text-text-strong-950">{t("ps.buyProxies")}</h3>
       {!ready ? (
         <p className="m-0 text-paragraph-xs text-text-soft-400">Loading products…</p>
       ) : options.length === 0 ? (
-        <p className="m-0 text-paragraph-xs text-text-soft-400">Nothing available to buy right now.</p>
+        <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.nothingAvailableToBuyRightNow")}</p>
       ) : (
         <div className="flex flex-col gap-3">
           <div className="grid grid-cols-2 gap-3">
             <label className="flex flex-col gap-1">
-              <span className="text-label-xs text-text-sub-600">Product</span>
+              <span className="text-label-xs text-text-sub-600">{t("ps.product")}</span>
               <CSSelect
                 value={productName}
                 onChange={setProductName}
@@ -173,7 +184,7 @@ export function PsBuyCard() {
               />
             </label>
             <label className="flex flex-col gap-1">
-              <span className="text-label-xs text-text-sub-600">Billing cycle</span>
+              <span className="text-label-xs text-text-sub-600">{t("ps.billingCycle")}</span>
               <CSSelect
                 value={cycle}
                 onChange={setCycle}
@@ -191,7 +202,7 @@ export function PsBuyCard() {
                 <CSSelect
                   value={country}
                   onChange={setCountry}
-                  placeholder="Pick a country"
+                  placeholder={t("ps.pickACountry")}
                   isSearchable
                   searchPlaceholder="Search locations…"
                   options={(product?.locations ?? []).map((l) => ({ value: l, label: l }))}
@@ -200,12 +211,12 @@ export function PsBuyCard() {
             ) : (
               <div />
             )}
-            <NumField label="Quantity" value={quantity} onChange={(v) => { setQuantity(Math.max(1, Math.round(v))); setCalc(null); }} />
+            <NumField label={t("ps.quantity")} value={quantity} onChange={(v) => { setQuantity(Math.max(1, Math.round(v))); setCalc(null); }} />
           </div>
           <div className="grid grid-cols-2 items-end gap-3">
-            <Field label="Promo code (optional)" value={promo} onChange={setPromo} />
+            <Field label={t("ps.promoCodeOptional")} value={promo} onChange={setPromo} />
             <Checkbox
-              label="Auto-renew"
+              label={t("ps.autoRenew")}
               checked={autoRenew}
               onChange={(e) => setAutoRenew(e.target.checked)}
               wrapperClassName="mb-2"
@@ -213,14 +224,14 @@ export function PsBuyCard() {
           </div>
           {needLocation && (
             <Checkbox
-              label={`Add p0f signature slots for all ${quantity} prox${quantity === 1 ? "y" : "ies"}`}
+              label={t(quantity === 1 ? "ps.addP0fSlotsOne" : "ps.addP0fSlotsMany", { n: quantity })}
               checked={buyP0f}
               onChange={(e) => { setBuyP0f(e.target.checked); setCalc(null); }}
             />
           )}
           <div className="mt-1 flex items-center gap-3">
             <Button variant="neutral" mode="stroke" size="small" onClick={calculate} disabled={calcing || !productName} isLoading={calcing}>
-              {calcing ? "Calculating…" : "Calculate price"}
+              {calcing ? "Calculating…" : t("ps.calculatePrice")}
             </Button>
             {calc && (
               <span className="ml-auto inline-flex items-center gap-2">
@@ -233,7 +244,7 @@ export function PsBuyCard() {
               </span>
             )}
             <Button variant="primary" mode="filled" size="small" onClick={buy} disabled={buying || !productName} isLoading={buying}>
-              {buying ? "Buying…" : "Buy"}
+              {buying ? "Buying…" : t("ps.buy")}
             </Button>
           </div>
         </div>

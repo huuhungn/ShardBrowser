@@ -1,5 +1,6 @@
 import { Button, Modal } from "@proxyshard/shardx-ui-kit";
 import { useConfirmStore } from "../../shared/model/confirm";
+import { t } from "../../shared/i18n";
 
 /// Global confirm dialog — UI-kit Modal fed by the zustand confirm store.
 export function ConfirmHost() {
@@ -10,7 +11,7 @@ export function ConfirmHost() {
     <Modal
       open
       onClose={() => done(null)}
-      title={req.title ?? "Confirm"}
+      title={req.title ?? t("ui.confirm")}
       maxWidthClassName="max-w-md"
       footer={
         <div className="flex justify-end gap-2">

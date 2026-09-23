@@ -120,8 +120,8 @@ pub async fn launch_profile_synced(
     // Strip `_meta` wrapper and resolve "auto" sentinels before serialising.
     let mut raw = stored.config.clone();
     raw.remove("_meta");
-    let launch_options = parse_launch_options(raw.remove("launch"))
-        .context("invalid launch options")?;
+    let launch_options =
+        parse_launch_options(raw.remove("launch")).context("invalid launch options")?;
     // Preserve legacy profile data in storage, but do not hand it to the
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
@@ -169,6 +169,19 @@ pub async fn launch_profile_synced(
     }
     cmd.arg("--no-first-run");
 
+    // The browser's OWN strings -- form validation bubbles, context menus, the
+    // built-in error and PDF pages -- come from Chromium's UI locale, which it
+    // reads from the host OS unless told otherwise. A profile that claims
+    // en-US but whose right-click menu is in Russian has announced the machine
+    // behind it, so pass the locale the profile actually resolved to.
+    if let Some(locale) = raw
+        .get("icu_locale")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        cmd.arg(format!("--lang={locale}"));
+    }
+
     for arg in &launch_options.args {
         cmd.arg(arg);
     }
@@ -201,10 +214,7 @@ pub async fn launch_profile_synced(
         Err(e) => eprintln!("[launcher] bookmarks skipped: {e}"),
     }
     // Disable WebGPU when profile omits `webgpu` (matches real Linux Chrome).
-    let webgpu_present = raw
-        .get("webgpu")
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    let webgpu_present = raw.get("webgpu").map(|v| !v.is_null()).unwrap_or(false);
     if !webgpu_present {
         cmd.arg("--disable-features=WebGPU");
     }
@@ -232,23 +242,24 @@ pub async fn launch_profile_synced(
             );
         } else {
             cmd.arg("--disable-quic");
-            eprintln!("[launcher] QUIC disabled: proxy {} has no working UDP relay", p.host);
+            eprintln!(
+                "[launcher] QUIC disabled: proxy {} has no working UDP relay",
+                p.host
+            );
         }
     }
 
     // WebRTC IP policy: block / tcp_only / auto (auto = relay if UDP, else tcp_only).
-    let webrtc_mode = raw
-        .get("webrtc")
-        .and_then(|v| v.as_str())
-        .unwrap_or("auto");
-    let latest = bound_proxy
-        .as_ref()
-        .and_then(|p| proxy::latest_test(&p.id));
+    let webrtc_mode = raw.get("webrtc").and_then(|v| v.as_str()).unwrap_or("auto");
+    let latest = bound_proxy.as_ref().and_then(|p| proxy::latest_test(&p.id));
     // Live geo for ICE-candidate spoofing, cached snapshot as fallback.
     let proxy_public_ip: Option<String> = if let Some(p) = bound_proxy.as_ref() {
         match proxy::geo_check(p, None).await {
             Ok(g) if !g.ip.is_empty() => Some(g.ip),
-            _ => latest.as_ref().map(|s| s.ip.clone()).filter(|ip| !ip.is_empty()),
+            _ => latest
+                .as_ref()
+                .map(|s| s.ip.clone())
+                .filter(|ip| !ip.is_empty()),
         }
     } else {
         None
@@ -348,7 +359,10 @@ pub async fn launch_profile_synced(
     let cdp = if enable_cdp {
         match read_devtools_endpoint(&udd).await {
             Some(c) => {
-                eprintln!("[launcher] CDP ready for {profile_id}: {}", c.web_socket_debugger_url);
+                eprintln!(
+                    "[launcher] CDP ready for {profile_id}: {}",
+                    c.web_socket_debugger_url
+                );
                 if Tracker::shared().set_cdp_if_instance(
                     profile_id,
                     &tracked.launch_instance_token,
@@ -379,9 +393,7 @@ fn parse_launch_options(value: Option<Value>) -> Result<LaunchOptions> {
     let Some(value) = value else {
         return Ok(LaunchOptions::default());
     };
-    let obj = value
-        .as_object()
-        .context("`launch` must be an object")?;
+    let obj = value.as_object().context("`launch` must be an object")?;
     Ok(LaunchOptions {
         args: parse_launch_args(obj.get("args"))?,
         extension_dirs: parse_dirs(obj.get("extension_dirs"), "launch.extension_dirs")?,
@@ -414,7 +426,9 @@ fn parse_string_list(value: Option<&Value>, label: &str, max_len: usize) -> Resu
     let Some(value) = value else {
         return Ok(Vec::new());
     };
-    let arr = value.as_array().with_context(|| format!("`{label}` must be an array"))?;
+    let arr = value
+        .as_array()
+        .with_context(|| format!("`{label}` must be an array"))?;
     let mut out = Vec::new();
     for item in arr {
         let s = item
@@ -446,7 +460,9 @@ fn parse_dirs(value: Option<&Value>, label: &str) -> Result<Vec<PathBuf>> {
         if !path.is_dir() {
             anyhow::bail!("`{label}` entry is not a directory: {s}");
         }
-        let canonical = path.canonicalize().with_context(|| format!("canonicalize {s}"))?;
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("canonicalize {s}"))?;
         let key = canonical.to_string_lossy().to_string();
         if seen.insert(key) {
             out.push(canonical);
@@ -508,10 +524,7 @@ async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
                     return Some(process::CdpInfo {
                         port,
                         http_url: format!("http://127.0.0.1:{port}"),
-                        web_socket_debugger_url: format!(
-                            "ws://127.0.0.1:{port}{}",
-                            path.trim()
-                        ),
+                        web_socket_debugger_url: format!("ws://127.0.0.1:{port}{}", path.trim()),
                     });
                 }
             }
@@ -533,7 +546,9 @@ async fn resolve_auto_fields(
         .and_then(|v| v.as_str())
         == Some("auto");
     let want_geo_auto = matches!(
-        cfg.get("geolocation").and_then(|g| g.get("mode")).and_then(|v| v.as_str()),
+        cfg.get("geolocation")
+            .and_then(|g| g.get("mode"))
+            .and_then(|v| v.as_str()),
         Some("auto")
     );
 
@@ -546,63 +561,73 @@ async fn resolve_auto_fields(
         want_tz_auto,
         want_lang_auto,
         want_geo_auto,
-        proxy_opt.map(|p| format!("{}:{}", p.host, p.port)).unwrap_or_else(|| "(direct)".into()),
+        proxy_opt
+            .map(|p| format!("{}:{}", p.host, p.port))
+            .unwrap_or_else(|| "(direct)".into()),
     );
 
     // ---- geo source ----
     let mut source = "";
     let geo: Option<proxy::GeoInfo> = match proxy_opt {
-        Some(p) => {
-            match proxy::geo_check_via(Some(p), None).await {
-                Ok(g) => { source = "proxy-live"; Some(g) }
-                Err(e) => {
-                    eprintln!("[launcher] proxy geo failed: {e} — falling back to cached snapshot");
-                    if let Some(snap) = proxy::latest_test(&p.id) {
-                        if !snap.country_code.is_empty() || !snap.timezone.is_empty() {
-                            source = "cached-snapshot";
-                            Some(proxy::GeoInfo {
-                                ip: snap.ip,
-                                country: snap.country,
-                                country_code: snap.country_code,
-                                region: snap.region,
-                                city: snap.city,
-                                isp: snap.isp,
-                                timezone: snap.timezone,
-                                latitude: snap.latitude,
-                                longitude: snap.longitude,
-                                provider: snap.provider,
-                            })
-                        } else { None }
-                    } else { None }
-                    .or_else(|| {
-                        if !p.country.is_empty() {
-                            source = "country-tag";
-                            Some(proxy::GeoInfo {
-                                ip: String::new(),
-                                country: String::new(),
-                                country_code: p.country.clone(),
-                                region: String::new(),
-                                city: String::new(),
-                                isp: String::new(),
-                                timezone: String::new(),
-                                latitude: 0.0,
-                                longitude: 0.0,
-                                provider: String::new(),
-                            })
-                        } else { None }
-                    })
-                }
+        Some(p) => match proxy::geo_check_via(Some(p), None).await {
+            Ok(g) => {
+                source = "proxy-live";
+                Some(g)
             }
-        }
-        None => {
-            match proxy::geo_check_via(None, None).await {
-                Ok(g) => { source = "direct-live"; Some(g) }
-                Err(e) => {
-                    eprintln!("[launcher] direct geo failed: {e} — falling back to host TZ/locale");
+            Err(e) => {
+                eprintln!("[launcher] proxy geo failed: {e} — falling back to cached snapshot");
+                if let Some(snap) = proxy::latest_test(&p.id) {
+                    if !snap.country_code.is_empty() || !snap.timezone.is_empty() {
+                        source = "cached-snapshot";
+                        Some(proxy::GeoInfo {
+                            ip: snap.ip,
+                            country: snap.country,
+                            country_code: snap.country_code,
+                            region: snap.region,
+                            city: snap.city,
+                            isp: snap.isp,
+                            timezone: snap.timezone,
+                            latitude: snap.latitude,
+                            longitude: snap.longitude,
+                            provider: snap.provider,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
                     None
                 }
+                .or_else(|| {
+                    if !p.country.is_empty() {
+                        source = "country-tag";
+                        Some(proxy::GeoInfo {
+                            ip: String::new(),
+                            country: String::new(),
+                            country_code: p.country.clone(),
+                            region: String::new(),
+                            city: String::new(),
+                            isp: String::new(),
+                            timezone: String::new(),
+                            latitude: 0.0,
+                            longitude: 0.0,
+                            provider: String::new(),
+                        })
+                    } else {
+                        None
+                    }
+                })
             }
-        }
+        },
+        None => match proxy::geo_check_via(None, None).await {
+            Ok(g) => {
+                source = "direct-live";
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("[launcher] direct geo failed: {e} — falling back to host TZ/locale");
+                None
+            }
+        },
     };
 
     let host_warn = || {
@@ -624,8 +649,16 @@ async fn resolve_auto_fields(
                 proxy::country_to_timezone(&g.country_code).to_string()
             };
             let locale = proxy::country_to_locale(&g.country_code).to_string();
-            let lat = if g.latitude != 0.0 { Some(g.latitude) } else { None };
-            let lng = if g.longitude != 0.0 { Some(g.longitude) } else { None };
+            let lat = if g.latitude != 0.0 {
+                Some(g.latitude)
+            } else {
+                None
+            };
+            let lng = if g.longitude != 0.0 {
+                Some(g.longitude)
+            } else {
+                None
+            };
             (tz, locale, lat, lng)
         }
         None => {
@@ -639,16 +672,21 @@ async fn resolve_auto_fields(
         }
     };
 
-    eprintln!(
-        "[launcher] resolved tz={resolved_tz} locale={resolved_locale} (source={source})"
-    );
+    eprintln!("[launcher] resolved tz={resolved_tz} locale={resolved_locale} (source={source})");
 
     if want_tz_auto {
-        cfg.insert("timezone".into(), serde_json::Value::String(resolved_tz.clone()));
+        cfg.insert(
+            "timezone".into(),
+            serde_json::Value::String(resolved_tz.clone()),
+        );
     }
 
     if want_lang_auto {
-        let base = resolved_locale.split('-').next().unwrap_or(&resolved_locale).to_string();
+        let base = resolved_locale
+            .split('-')
+            .next()
+            .unwrap_or(&resolved_locale)
+            .to_string();
         let accept = if resolved_locale == "en-US" {
             "en-US,en;q=0.9".to_string()
         } else {
@@ -668,12 +706,24 @@ async fn resolve_auto_fields(
             ]
         };
         if let Some(nav) = cfg.get_mut("navigator").and_then(|v| v.as_object_mut()) {
-            nav.insert("language".into(), serde_json::Value::String(resolved_locale.clone()));
+            nav.insert(
+                "language".into(),
+                serde_json::Value::String(resolved_locale.clone()),
+            );
             nav.insert("accept_language".into(), serde_json::Value::String(accept));
             nav.insert("languages".into(), serde_json::Value::Array(languages));
         }
         // Always overwrite icu_locale so it matches resolved navigator.language.
-        cfg.insert("icu_locale".into(), serde_json::Value::String(resolved_locale));
+        cfg.insert(
+            "icu_locale".into(),
+            serde_json::Value::String(resolved_locale.clone()),
+        );
+
+        // The bundled presets all carry one Russian donor's SAPI voices, which
+        // contradicts every other locale signal: a profile claiming en-US that
+        // enumerates Irina and Pavel is a profile that stands out. Overwrite
+        // them to match the locale actually resolved above.
+        crate::speech::align_voices_with_locale(cfg, &resolved_locale);
     }
 
     if want_geo_auto {
@@ -705,8 +755,8 @@ fn install_widevine(udd: &Path) -> Result<()> {
         anyhow::bail!("cache missing manifest.json — re-seed from a real Chrome");
     }
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
-        .context("parse widevine manifest.json")?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_text).context("parse widevine manifest.json")?;
     let version = manifest
         .get("version")
         .and_then(|v| v.as_str())
@@ -729,9 +779,8 @@ fn install_widevine(udd: &Path) -> Result<()> {
             }
         }
     }
-    copy_dir_recursive(&src, &versioned).with_context(|| {
-        format!("copy {} → {}", src.display(), versioned.display())
-    })?;
+    copy_dir_recursive(&src, &versioned)
+        .with_context(|| format!("copy {} → {}", src.display(), versioned.display()))?;
     // Chromium reads this single-line marker on startup.
     std::fs::write(
         widevine_root.join("latest-component-updated-version"),
@@ -753,7 +802,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else if ty.is_symlink() {
             // Resolve symlinks so dst tree stays portable across hosts.
             let target = std::fs::read_link(&from)?;
-            let resolved = if target.is_absolute() { target } else { from.parent().unwrap().join(target) };
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                from.parent().unwrap().join(target)
+            };
             if resolved.is_dir() {
                 copy_dir_recursive(&resolved, &to)?;
             } else {
@@ -798,7 +851,8 @@ mod launch_option_tests {
     use serde_json::json;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("shardx-launch-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shardx-launch-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -822,7 +876,11 @@ mod launch_option_tests {
     fn launch_options_restore_session_defaults_on_and_opts_out() {
         // Absent key keeps the browser's own behaviour.
         assert!(parse_launch_options(None).unwrap().restore_session);
-        assert!(parse_launch_options(Some(json!({}))).unwrap().restore_session);
+        assert!(
+            parse_launch_options(Some(json!({})))
+                .unwrap()
+                .restore_session
+        );
         assert!(
             parse_launch_options(Some(json!({"restore_session": null})))
                 .unwrap()

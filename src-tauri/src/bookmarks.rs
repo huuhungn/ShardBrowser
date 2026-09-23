@@ -115,7 +115,11 @@ fn empty_tree() -> Value {
 }
 
 fn max_id(node: &Value, cur: &mut u64) {
-    if let Some(id) = node.get("id").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()) {
+    if let Some(id) = node
+        .get("id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
         *cur = (*cur).max(id);
     }
     if let Some(children) = node.get("children").and_then(|v| v.as_array()) {

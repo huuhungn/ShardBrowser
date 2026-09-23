@@ -5,14 +5,16 @@ import { PsApiKeyCard } from "../../features/proxyshard";
 import { PsAccountMetrics } from "../../widgets/ProxyShard/PsAccountMetrics";
 import { PsToolbar } from "../../widgets/ProxyShard/PsToolbar";
 import { PsManagementPanels } from "../../widgets/ProxyShard/PsManagementPanels";
+import { useT } from "../../shared/i18n";
 
 export function ProxyShardPage() {
+  const t = useT();
   const init = usePsAccount((s) => s.init);
   useEffect(() => { init(); }, [init]);
 
   return (
     <section className="ps-page flex flex-col">
-      <Topbar crumbs={["Workspace", "ProxyShard"]} />
+      <Topbar crumbs={[t("nav.workspace"), "ProxyShard"]} />
 
       <PsAccountMetrics />
 

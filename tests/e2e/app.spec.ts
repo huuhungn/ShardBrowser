@@ -181,6 +181,57 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
   await expect(page.getByRole("button", { name: /Save settings/ })).toBeEnabled();
 });
 
+test("choosing a language translates what has been moved into locales", async ({ page }) => {
+  await gotoMocked(page);
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  // The picker carries the language's own name, so someone who cannot read the
+  // current interface language can still find their own.
+  const picker = page.getByRole("combobox", { name: "Language" });
+  await expect(picker).toBeVisible();
+  await expect(picker).toContainText("English");
+
+  await picker.click();
+  await page.getByRole("option", { name: "Tiếng Việt" }).click();
+
+  // The card's own title comes from locales/, so it flips immediately.
+  await expect(
+    page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Language", level: 3 }),
+  ).toHaveCount(0);
+
+  // The choice has to survive a reload, or it is a toggle rather than a setting.
+  await page.reload();
+  // And the sidebar came with it: the button that said "Settings" on the way in
+  // is "Cài đặt" on the way back, which is the whole point of the setting.
+  await page.getByRole("button", { name: "Cài đặt" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Ngôn ngữ", level: 3 }),
+  ).toBeVisible();
+
+  // The whole Settings screen moved into locales/, so its other cards follow.
+  await expect(
+    page.getByRole("heading", { name: "Dịch vụ tra vị trí proxy", level: 3 }),
+  ).toBeVisible();
+
+  // Emphasis is carried inside the translated string rather than by the JSX
+  // around it, so the bold word has to survive the trip through locales/.
+  const apiHelp = page.getByText(/API HTTP cục bộ \(axum\)/);
+  await expect(apiHelp.locator("strong")).toHaveText("127.0.0.1");
+  await expect(apiHelp).not.toContainText("*");
+
+  // This row used to be the example of a screen still holding its English; it
+  // has since moved into locales/ with the rest, so Vietnamese is what a
+  // Vietnamese reader gets.
+  await expect(page.getByLabel("Mở ShardX Launcher khi tôi đăng nhập")).toBeVisible();
+
+  // A key with no translation must never surface as its own name to someone
+  // using the app — no raw "settings.foo.bar" anywhere on the screen.
+  await expect(page.getByText(/settings\.[a-z]+\./)).toHaveCount(0);
+});
+
 test("startup setting registers the Launcher while MCP stays client-spawned", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Settings" }).click();

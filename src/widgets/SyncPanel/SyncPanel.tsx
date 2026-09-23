@@ -5,12 +5,14 @@ import {
 } from "../../entities/profile/model/api";
 import { PlayIcon, PauseIcon, SyncIcon, StopIcon } from "../../shared/icons";
 import { dragWindowOnMouseDown } from "../../shared/lib/dragWindow";
+import { useT } from "../../shared/i18n";
 
 /**
  * One floating control surface for the whole group. Every window is equal —
  * whichever the operator works in is the one driving — so nothing is per-window.
  */
 export function SyncPanel({ group }: { group: string }) {
+  const t = useT();
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [busy, setBusy] = useState(false);
   // Must survive the second before the first browser connects, and go once
@@ -56,13 +58,13 @@ export function SyncPanel({ group }: { group: string }) {
         </div>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} disabled={busy}
                 onClick={() => run(() => syncSetPaused(group, !paused))}
-                title={paused ? "Resume" : "Hold — work in one window alone"}
+                title={paused ? t("sync.resume") : t("sync.holdWorkInOneWindowAlone")}
                 className="flex size-6 items-center justify-center rounded-6 text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200 hover:bg-bg-weak-50 disabled:opacity-50">
           {paused ? <PlayIcon className="size-3" /> : <PauseIcon className="size-3" />}
         </button>
         <button type="button" onMouseDown={(e) => e.stopPropagation()} disabled={busy}
                 onClick={() => run(() => syncStop(group))}
-                title="Close every window in the group"
+                title={t("sync.closeEveryWindowInTheGroup")}
                 className="flex size-6 items-center justify-center rounded-6 text-error-base ring-1 ring-inset ring-stroke-soft-200 hover:bg-error-lighter disabled:opacity-50">
           <StopIcon className="size-3" />
         </button>
@@ -92,7 +94,7 @@ export function SyncPanel({ group }: { group: string }) {
                 disabled={busy}
                 onClick={() => run(() => syncSetExcluded(group, m.profile, !m.excluded))}
                 title={`${m.profile}${m.driving ? " — driving" : ""}\n${
-                  m.excluded ? "Click to bring back into the group" : "Click to hold out"}`}
+                  m.excluded ? t("sync.clickToBringBackIntoTheGroup") : t("sync.clickToHoldOut")}`}
                 className={`flex max-w-[9rem] items-center gap-1 rounded-6 px-1.5 py-0.5 text-paragraph-xs ring-1 ring-inset disabled:opacity-50 ${
                   m.excluded
                     ? "text-text-soft-400 line-through ring-stroke-soft-200"

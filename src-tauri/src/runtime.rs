@@ -220,8 +220,17 @@ fn effective_installed_version(local: &Manifest) -> Option<String> {
         .or_else(installed_engine_version)
 }
 
+/// Engine version the GPU-capability cache is keyed against. A Chromium bump can
+/// move ANGLE, which changes the extension list, so a probe result is only valid
+/// for the engine build it ran on.
+pub fn engine_version() -> Option<String> {
+    effective_installed_version(&load_manifest())
+}
+
 fn load_manifest() -> Manifest {
-    let Ok(p) = manifest_path() else { return Manifest::default() };
+    let Ok(p) = manifest_path() else {
+        return Manifest::default();
+    };
     fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -345,8 +354,12 @@ fn migrate_dir_to(
         if p.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&p) else { continue };
-        let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let Ok(text) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
         let mut changed = false;
 
         // navigator.user_agent: replace the Chrome/<ver> token with major.0.0.0.
@@ -381,7 +394,10 @@ fn migrate_dir_to(
             }
             if let Some(gv) = grease_version {
                 wants.push(("grease_version", serde_json::json!(gv)));
-                wants.push(("grease_full_version", serde_json::json!(format!("{gv}.0.0.0"))));
+                wants.push((
+                    "grease_full_version",
+                    serde_json::json!(format!("{gv}.0.0.0")),
+                ));
             }
             for (k, want) in wants {
                 if ch.get(k) != Some(&want) {
@@ -444,7 +460,9 @@ fn migrate_all_to(
 /// whose engine auto-updated via the etag path without an explicit install.
 pub async fn ensure_profiles_migrated() {
     let m = fetch_manifest().await;
-    let Some(target) = m.chromium_version.clone() else { return };
+    let Some(target) = m.chromium_version.clone() else {
+        return;
+    };
     // TLS is part of the signature: without it a manifest that changes only
     // the ClientHello shape would be a no-op for anyone already on this
     // version, and their profiles would keep the previous release's JA4.
@@ -482,7 +500,10 @@ fn version_lt(a: &str, b: &str) -> bool {
     };
     let (va, vb) = (part(a), part(b));
     for i in 0..va.len().max(vb.len()) {
-        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            va.get(i).copied().unwrap_or(0),
+            vb.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x < y;
         }
@@ -515,7 +536,10 @@ fn engine_outdated(local: &Manifest, remote: &RemoteManifest, browser_key: &str)
         (Some(h), Some(w)) => !h.is_empty() && h != w,
         _ => false,
     };
-    let build_moved = differs(installed_engine_build(local), remote.engine_build.as_deref());
+    let build_moved = differs(
+        installed_engine_build(local),
+        remote.engine_build.as_deref(),
+    );
     let hash_moved = differs(
         local.browser_etag.clone(),
         remote.archives.get(browser_key).map(|s| s.as_str()),
@@ -556,9 +580,8 @@ pub async fn runtime_status() -> Result<RuntimeStatus, String> {
             .map(|d| {
                 fs::read_dir(&d)
                     .map(|it| {
-                        it.flatten().any(|e| {
-                            e.path().extension().and_then(|s| s.to_str()) == Some("json")
-                        })
+                        it.flatten()
+                            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
                     })
                     .unwrap_or(false)
             })
@@ -665,11 +688,19 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
 
     // Fingerprint seed: overwrites bundled templates, leaves user-added files;
     // skipped when the etag matches. User-added FP get version-migrated below.
-    let fp_remote = manifest.archives.get(FINGERPRINTS_ARCHIVE_KEY).map(|s| s.as_str());
-    let fp_etag = install_fingerprints(&window, force, local.fingerprints_etag.as_deref(), fp_remote)
-        .await
-        .map_err(|e| e.to_string())?
-        .or(local.fingerprints_etag);
+    let fp_remote = manifest
+        .archives
+        .get(FINGERPRINTS_ARCHIVE_KEY)
+        .map(|s| s.as_str());
+    let fp_etag = install_fingerprints(
+        &window,
+        force,
+        local.fingerprints_etag.as_deref(),
+        fp_remote,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .or(local.fingerprints_etag);
 
     // Migrate already-created profiles AND the fingerprint library (incl.
     // user-added) to the new engine descriptor (UA + client_hints incl. grease).
@@ -682,7 +713,11 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         "{target_ver}|{}|{}|{}",
         manifest.grease_brand.as_deref().unwrap_or(""),
         manifest.grease_version.as_deref().unwrap_or(""),
-        manifest.tls.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+        manifest
+            .tls
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_default(),
     );
     if local.applied_signature.as_deref() != Some(sig.as_str()) {
         let n = migrate_all_to(
@@ -763,7 +798,11 @@ async fn install_fingerprints(
         let dst = dir.join(p.file_name().unwrap());
         let existed = dst.exists();
         fs::copy(&p, &dst)?;
-        if existed { overwritten += 1; } else { added += 1; }
+        if existed {
+            overwritten += 1;
+        } else {
+            added += 1;
+        }
     }
     let _ = fs::remove_dir_all(&staging);
     eprintln!("[runtime] fingerprints sync: added={added} overwritten={overwritten}");
@@ -773,7 +812,11 @@ async fn install_fingerprints(
 /// Stream archive → temp file → extract; emits `runtime:progress` events.
 async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
     let url = format!("{PUB_BASE}/{}", spec.key);
-    let mut resp = reqwest::Client::new().get(&url).send().await?.error_for_status()?;
+    let mut resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
     let etag = resp
         .headers()
@@ -890,23 +933,41 @@ fn fix_unix_exec_bits(root: &Path) {
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     const MAGIC: &[[u8; 4]] = &[
-        [0x7f, b'E', b'L', b'F'],                              // ELF
-        [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe],   // Mach-O 64 BE/LE
-        [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe],   // Mach-O 32 BE/LE
-        [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca],   // Mach-O universal
+        [0x7f, b'E', b'L', b'F'], // ELF
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64 BE/LE
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xce, 0xfa, 0xed, 0xfe], // Mach-O 32 BE/LE
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca], // Mach-O universal
     ];
     fn walk(dir: &Path, magic: &[[u8; 4]]) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for ent in entries.flatten() {
             let p = ent.path();
             let Ok(ft) = ent.file_type() else { continue };
-            if ft.is_symlink() { continue; }
-            if ft.is_dir() { walk(&p, magic); continue; }
-            if !ft.is_file() { continue; }
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                walk(&p, magic);
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
             let mut head = [0u8; 4];
-            let Ok(mut f) = fs::File::open(&p) else { continue };
-            if f.read_exact(&mut head).is_err() { continue; }
-            if !magic.iter().any(|m| *m == head) { continue; }
+            let Ok(mut f) = fs::File::open(&p) else {
+                continue;
+            };
+            if f.read_exact(&mut head).is_err() {
+                continue;
+            }
+            if !magic.iter().any(|m| *m == head) {
+                continue;
+            }
             if let Ok(meta) = fs::metadata(&p) {
                 let mut perm = meta.permissions();
                 perm.set_mode(perm.mode() | 0o111);
@@ -920,9 +981,7 @@ fn fix_unix_exec_bits(root: &Path) {
 /// Move Widevine to `<Framework>.framework/Versions/<ver>/Libraries/WidevineCdm/`.
 #[cfg(target_os = "macos")]
 fn place_widevine(base: &Path) -> Result<()> {
-    let src = base
-        .join("ShardX-Widevine-Mac-arm64")
-        .join("WidevineCdm");
+    let src = base.join("ShardX-Widevine-Mac-arm64").join("WidevineCdm");
     if !src.exists() {
         return Ok(());
     }

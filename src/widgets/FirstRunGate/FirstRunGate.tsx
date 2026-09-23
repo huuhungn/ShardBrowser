@@ -3,8 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Alert, Button, ProgressBar } from "@proxyshard/shardx-ui-kit";
 import type { RtStatus, RtProgress } from "../../shared/types";
+import { useT } from "../../shared/i18n";
 
 export function FirstRunGate({ children }: { children: ReactNode }) {
+  const t = useT();
   // null = querying backend; true = reveal; false = show overlay.
   const [installed, setInstalled] = useState<boolean | null>(null);
   const [prog, setProg] = useState<RtProgress | null>(null);
@@ -99,9 +101,9 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
   return (
     <div className="fixed inset-0 z-1000 flex items-center justify-center bg-bg-weak-50 text-text-strong-950">
       <div className="w-[460px] px-9 py-8 text-center">
-        <div className="mb-2 text-title-h6">Setting up ShardX browser</div>
+        <div className="mb-2 text-title-h6">{t("firstRun.settingUpShardXBrowser")}</div>
         <div className="mb-6 text-paragraph-xs text-text-soft-400">
-          First-run download from our CDN. Done once per install
+          {t("firstRun.firstRunDownloadFromOurCdnDoneOncePe")}
           (~{prog?.total ? fmt(prog.total) : "150 MB"}).
         </div>
 
@@ -138,7 +140,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
                 setAttempt((n) => n + 1);
               }}
             >
-              Retry setup
+              {t("firstRun.retrySetup")}
             </Button>
           </div>
         )}

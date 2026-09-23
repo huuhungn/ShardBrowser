@@ -9,12 +9,14 @@ import {
 import { ProxyRowActions, RenameProxyCell } from "../../features/manage-proxies";
 
 import { ProxyTypeBadge, ProxyCountryCell, ProxyTestResult } from "../../entities/proxy";
+import { useT } from "../../shared/i18n";
 
 export function ProxyRow({ proxy, profileCount, onMenu }: {
   proxy: ProxyEntry;
   profileCount: number;
   onMenu: (e: React.MouseEvent, items: ContextItem[]) => void;
 }) {
+  const t = useT();
   const snap = useProxy((s) => s.snapshots[proxy.id]);
   const busy = useProxy((s) => !!s.proxyTesting[proxy.id]);
   const isSel = useProxy((s) => s.proxySel.has(proxy.id));
@@ -44,11 +46,11 @@ export function ProxyRow({ proxy, profileCount, onMenu }: {
       onClick={(e) => { if (shiftPress.current) e.preventDefault(); }}
       onContextMenu={(e) =>
         onMenu(e, [
-          { label: "Test (TCP/UDP/geo)", onClick: () => testProxy(proxy) },
-          { label: "View details", onClick: () => setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } }) },
-          { label: "Edit", onClick: () => setEditing(proxy) },
+          { label: t("proxyTable.testTcpUdpGeo"), onClick: () => testProxy(proxy) },
+          { label: t("proxyTable.viewDetails"), onClick: () => setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } }) },
+          { label: t("common.edit"), onClick: () => setEditing(proxy) },
           { sep: true, label: "", onClick: () => { } },
-          { label: "Delete", onClick: () => removeProxy(proxy.id), danger: true },
+          { label: t("common.delete"), onClick: () => removeProxy(proxy.id), danger: true },
         ])
       }
     >
@@ -65,14 +67,17 @@ export function ProxyRow({ proxy, profileCount, onMenu }: {
           <span
             className="mono small inline-block max-w-full cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap align-middle text-text-sub-600 transition-colors hover:text-primary-base"
             onClick={() => { if (!shiftPress.current) setEditing(proxy); }}
-            title="Edit proxy"
+            title={t("proxyTable.editProxy")}
           >
             {proxy.host}:{proxy.port}
           </span>
         </div>
         <div className="cell-country"><ProxyCountryCell snap={snap} fallback={proxy.country} /></div>
         <div className="cell-profiles">
-          <Badge color="gray" variant='filled' size="small" title={`${profileCount} profile(s) bound to this proxy`}>
+          <Badge color="gray" variant='filled' size="small" title={t(
+            profileCount === 1 ? "proxyTable.boundProfilesOne" : "proxyTable.boundProfilesMany",
+            { n: profileCount },
+          )}>
             {profileCount}
           </Badge>
         </div>

@@ -1,8 +1,10 @@
 import { Button } from "@proxyshard/shardx-ui-kit";
 import { DownloadIcon } from "../../../shared/icons";
 import { useProxy } from "../../../entities/proxy";
+import { useT } from "../../../shared/i18n";
 
 export function ImportProxyButton() {
+  const t = useT();
   const bulkImportClipboard = useProxy((s) => s.bulkImportClipboard);
   return (
     <Button
@@ -11,9 +13,9 @@ export function ImportProxyButton() {
       size="small"
       leftIcon={<DownloadIcon className="size-4" />}
       onClick={bulkImportClipboard}
-      title="Import proxies from the clipboard"
+      title={t("proxy.importProxiesFromTheClipboard")}
     >
-      Import
+      {t("common.import")}
     </Button>
   );
 }

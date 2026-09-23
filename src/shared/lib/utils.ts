@@ -2,7 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 // Host OS of the launcher window (never spoofed) — drives default OS tab + titlebar.
 export function detectHostOs(): "macOS" | "Windows" | "Linux" {
-  const ua = navigator.userAgent;
+  // Node had no global navigator before v21, and the bundled tests import
+  // this module outside a browser. Without a user agent, fall back.
+  const ua = typeof navigator === "undefined" ? "" : navigator.userAgent;
   if (/Windows/i.test(ua)) return "Windows";
   if (/Macintosh|Mac OS X/i.test(ua)) return "macOS";
   if (/Linux|X11|CrOS/i.test(ua)) return "Linux";

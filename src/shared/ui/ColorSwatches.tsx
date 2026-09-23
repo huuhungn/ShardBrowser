@@ -1,4 +1,5 @@
 import { cn } from "@proxyshard/shardx-ui-kit";
+import { useT } from "../../shared/i18n";
 
 /** Profile accent: the window icon and the omnibox pill. "" = derive from the
  *  name, which is what the browser does on its own. */
@@ -14,13 +15,14 @@ export function ColorSwatches({
   onChange: (v: string) => void;
   label?: string;
 }) {
+  const t = useT();
   return (
     <div className="flex flex-col gap-1.5">
       {label && <span className="text-label-base font-medium text-text-strong-900">{label}</span>}
       <div className="flex flex-wrap items-center gap-1.5">
         <button
           type="button"
-          title="Auto — derived from the profile name"
+          title={t("ui.autoDerivedFromTheProfileName")}
           onClick={() => onChange("")}
           className={cn(
             "grid size-6 place-items-center rounded-full text-[9px] font-bold text-text-sub-600 ring-1 ring-inset transition-[box-shadow]",

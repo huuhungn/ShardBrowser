@@ -5,17 +5,19 @@ import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import type { PsOrder } from "../../../entities/proxyshard";
 import { psAddBandwidth } from "../../../entities/proxyshard";
+import { useT } from "../../../shared/i18n";
 
 export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClose: () => void; onDone: () => void }) {
+  const t = useT();
   const [amount, setAmount] = useState(5);
   const [promo, setPromo] = useState("");
   const [busy, setBusy] = useState(false);
   const submit = async () => {
-    if (amount < 1) { toast.err("Amount must be at least 1 GB"); return; }
+    if (amount < 1) { toast.err(t("ps.amountMustBeAtLeast1GB")); return; }
     setBusy(true);
     try {
       await psAddBandwidth(order.order_id, amount, promo.trim() || null);
-      toast.ok(`Added ${amount} GB to order #${order.order_id}`);
+      toast.ok(t("ps.addedGb", { amount, id: order.order_id }));
       onDone();
     } catch (e) { toast.err(String(e)); }
     finally { setBusy(false); }
@@ -24,17 +26,17 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
     <DialogModal
       open
       onClose={onClose}
-      title="Add traffic"
-      subtitle={`${order.product_name} · order #${order.order_id}`}
+      title={t("ps.addTraffic")}
+      subtitle={t("ps.productOrder", { product: order.product_name, id: order.order_id })}
       confirmLabel={busy ? "Buying…" : `Buy ${amount} GB`}
       onConfirm={submit}
       isLoading={busy}
-      cancelLabel="Cancel"
+      cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
       <div className="flex flex-col gap-3 py-4">
-        <NumField label="Amount (GB)" value={amount} onChange={(v) => setAmount(Math.max(1, Math.round(v)))} />
-        <Field label="Promo code (optional)" value={promo} onChange={setPromo} />
+        <NumField label={t("ps.amountGb")} value={amount} onChange={(v) => setAmount(Math.max(1, Math.round(v)))} />
+        <Field label={t("ps.promoCodeOptional")} value={promo} onChange={setPromo} />
       </div>
     </DialogModal>
   );

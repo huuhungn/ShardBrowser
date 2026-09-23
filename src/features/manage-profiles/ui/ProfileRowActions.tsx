@@ -10,11 +10,13 @@ import {
 } from "../../../shared/icons";
 import { useProfile, type ProfileMeta } from "../../../entities/profile";
 import { useMediaQuery, WIDE_ACTIONS_QUERY } from "../../../shared/hooks/useMediaQuery";
+import { useT } from "../../../shared/i18n";
 
 export function ProfileRowActions({ profile, onMore }: {
   profile: ProfileMeta;
   onMore: (e: React.MouseEvent) => void;
 }) {
+  const t = useT();
   const p = profile;
   const isRunning = useProfile((s) => !!s.running[p.id]);
   const isStarting = useProfile((s) => s.startBusy.has(p.id));
@@ -43,11 +45,11 @@ export function ProfileRowActions({ profile, onMore }: {
             : <span className={isStarting ? "spin-icon inline-grid place-items-center" : "inline-grid place-items-center"}><PlayIcon className="size-3.5" /></span>
         }
         onClick={() => startStop(p)}
-        aria-label={`${isRunning ? "Stop" : "Start"} profile ${p.name}`}
+        aria-label={`${isRunning ? t("profileTable.stop") : t("profileTable.start")} profile ${p.name}`}
         disabled={!isRunning && isStarting}
         title={!isRunning && isStarting ? "Starting (UDP probe + geo + spawn)…" : undefined}
       >
-        {isRunning ? "Stop" : isStarting ? "Starting…" : "Start"}
+        {isRunning ? t("profileTable.stop") : isStarting ? "Starting…" : t("profileTable.start")}
       </Button>
       {wide && <Button
         variant={p.pinned ? "primary" : "neutral"}
@@ -55,20 +57,20 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={() => togglePin(p)}
-        aria-label={`${p.pinned ? "Unpin" : "Pin"} profile ${p.name}`}
-        title={p.pinned ? "Unpin" : "Pin to top"}
+        aria-label={`${p.pinned ? t("profileTable.unpin") : t("profileTable.pin")} profile ${p.name}`}
+        title={p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop")}
         leftIcon={<PinIconApp className="size-4" />}
       >
       </Button>}
-      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title="Edit" aria-label={`Edit profile ${p.name}`}
+      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title={t("common.edit")} aria-label={t("profile.editProfileNamed", { name: p.name })}
         leftIcon={<EditIcon className="size-4" />}
       >
       </Button>
-      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title="Clone" aria-label={`Clone profile ${p.name}`}
+      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title={t("common.clone")} aria-label={t("profile.cloneProfileNamed", { name: p.name })}
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
-      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title="Delete" aria-label={`Delete profile ${p.name}`}
+      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
         leftIcon={<DeleteIcon className="size-4" />}
       >
       </Button>}
@@ -78,8 +80,8 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={() => { void copyCdp(p.id); }}
-        aria-label={`Copy CDP HTTP URL for ${p.name}`}
-        title="Copy CDP HTTP URL"
+        aria-label={t("profile.copyCdpFor", { name: p.name })}
+        title={t("profile.copyCdpHttpUrl")}
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
@@ -89,8 +91,8 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={onMore}
-        aria-label={`More actions for profile ${p.name}`}
-        title="More actions"
+        aria-label={t("profile.moreActionsFor", { name: p.name })}
+        title={t("profile.moreActions")}
         leftIcon={<MoreIcon className="size-4" />}
       >
       </Button>
