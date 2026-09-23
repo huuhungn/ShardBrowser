@@ -4,6 +4,7 @@ import { Button, Modal } from "@proxyshard/shardx-ui-kit";
 import { GithubMark } from "../../shared/icons";
 import { GH_REPO_URL } from "../../shared/lib/utils";
 import { useT } from "../../shared/i18n";
+import { Rich } from "../../shared/i18n/Rich";
 
 /// One-time GitHub-star prompt shown after the app first loads. Dismissal is
 /// remembered in localStorage so it never nags again.
@@ -34,9 +35,7 @@ export function StarModal() {
         </div>
         <h2 className="m-0 mb-2 text-title-h6 text-text-strong-950">{t("star.enjoyingShardX")}</h2>
         <p className="m-0 mb-[22px] text-paragraph-sm text-text-sub-600">
-          ShardX is provided and supported <strong>completely free</strong>. If it's
-          useful to you, dropping a <strong>star on GitHub</strong> is the easiest way to
-          support us — and it helps other people find the project.
+          <Rich text={t("star.blurb")} />
         </p>
         <div className="flex justify-center gap-2.5">
           <Button variant="neutral" mode="stroke" size="small" onClick={close}>

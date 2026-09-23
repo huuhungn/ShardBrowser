@@ -100,7 +100,7 @@ export function ProxyDistributeModal({ onClose }: { onClose: () => void }) {
 
         {scope === "all" && boundCount > 0 && (
           <p className="m-0 rounded-8 bg-warning-alpha-16 px-2.5 py-1.5 text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-warning-base/30">
-            {boundCount} of the profiles below already {boundCount === 1 ? "has a proxy" : "have proxies"} — binding replaces {boundCount === 1 ? "it" : "them"}.
+            {t(boundCount === 1 ? "proxy.alreadyBoundOne" : "proxy.alreadyBoundMany", { n: boundCount })}
           </p>
         )}
 

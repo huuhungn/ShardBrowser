@@ -458,9 +458,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       if (typeof path !== "string") return; // cancelled
       const passphrase = await passphraseModal({
         title: t("profile.encryptBackup"),
-        message:
-          "This passphrase is the only way to open the backup. It is not stored " +
-          "anywhere and cannot be recovered — if you lose it, the backup is unreadable.",
+        message: t("profile.passphraseOnlyWay"),
         confirm: true,
       });
       if (passphrase === null) return;

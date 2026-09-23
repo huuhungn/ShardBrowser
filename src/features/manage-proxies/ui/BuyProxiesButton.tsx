@@ -15,7 +15,7 @@ export function BuyProxiesButton() {
       onClick={() => { openUrl(withUtm("https://proxyshard.com")).catch(() => { }); }}
       title={t("proxy.openProxyshardComResidentialSocks5Wi")}
     >
-      Buy Proxies <span className="ml-1 opacity-70">- UDP + p0f</span>
+      {t("proxy.buyProxies")} <span className="ml-1 opacity-70">- UDP + p0f</span>
     </Button>
   );
 }

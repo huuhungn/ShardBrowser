@@ -134,7 +134,7 @@ export function TeamCard() {
         label={t("team.apiToken")}
         inputSize="small"
         type="password"
-        placeholder={st?.has_token ? "•••••••• (saved — type to replace)" : "paste the token"}
+        placeholder={st?.has_token ? t("team.tokenSavedPlaceholder") : t("team.pasteTheToken")}
         value={token}
         onChange={(e) => setToken(e.target.value)}
       />

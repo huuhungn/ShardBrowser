@@ -76,7 +76,10 @@ export function DataRootCard() {
 
       <label className="flex flex-col gap-1.5">
         <span className="text-label-xs text-text-sub-600">
-          Current location{info && !info.custom && <span className="text-text-soft-400"> · default</span>}
+          {t("dataRoot.currentLocation")}
+          {info && !info.custom && (
+            <span className="text-text-soft-400">{t("dataRoot.defaultSuffix")}</span>
+          )}
         </span>
         <div className="flex items-center gap-2">
           <span className="mono min-w-0 flex-1 truncate rounded-8 bg-bg-weak-50 px-[11px] py-[9px] text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">

@@ -280,6 +280,25 @@ function englishInSource(src) {
     for (const m of s.matchAll(/>([A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?])</g)) {
       found.push(m[1]);
     }
+    // A paragraph long enough to wrap, with a <strong> inside it, matches none
+    // of the rules above: the tag breaks the bare-line shape, and each
+    // continuation line starts lowercase and ends mid-sentence. Strip the
+    // inline tags and look at what is left — if the line is only words and
+    // punctuation, with nothing a compiler would read, it is a sentence.
+    const bare = s.replace(/<\/?(?:strong|em|b|i|code|span|br)\s*\/?>/g, "").trim();
+    // A trailing comma means this is an import list or a destructured set of
+    // props wrapped across lines, not a sentence. Sentences also start with a
+    // capital and contain a space; identifier lists rarely do both.
+    if (
+      !/[=(){}"`$;:[\]<>]/.test(bare) &&
+      !bare.endsWith(",") &&
+      !/^[a-z]+[A-Z]/.test(bare) &&
+      /^[A-Z]/.test(bare) &&
+      bare.includes(" ") &&
+      (bare.match(/[A-Za-z]{3,}/g) ?? []).length >= 3
+    ) {
+      found.push(bare);
+    }
     for (const m of s.matchAll(
       /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label)="([^"]{3,})"/g,
     )) {
@@ -344,6 +363,14 @@ const NOT_TEXT = new Set([
 ]);
 
 const LITERAL = /"([A-Z][A-Za-z0-9 ,.'’:/()—–-]{2,60})"/g;
+// The updater pill wrote its whole status ladder in lower case — "ready to
+// install", "up to date" — and a rule anchored on a capital never saw any of
+// it. A lower-case string of three or more words is a sentence too.
+const LOWER_SENTENCE = /"([a-z][a-z0-9]*(?: [A-Za-z0-9,'’.—–-]+){2,})[.…!?]?"/g;
+// Tailwind is written the same way a sentence is — words separated by spaces —
+// so a class list has to be told apart by its vocabulary, not its shape.
+const CSS_WORDS =
+  /\b(flex|grid|items-|justify-|gap-|px-|py-|pt-|pb-|pl-|pr-|mx-|my-|mt-|mb-|ml-|mr-|rounded|border|bg-|text-|w-|h-|size-|min-|max-|absolute|relative|fixed|sticky|inset-|z-\d|overflow|transition|cursor-|place-|ring-|shadow|opacity-|truncate|whitespace|leading-|tracking-|hover:|focus:|disabled:)/;
 // Lines where a string is machinery rather than prose: module paths, CSS class
 // names, DOM ids, invoke() command names, HTTP headers.
 const MACHINERY =
@@ -357,11 +384,14 @@ test("no ternary or toast still holds its English", () => {
       const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
       for (const line of src.split("\n")) {
         if (MACHINERY.test(line)) continue;
-        for (const m of line.matchAll(LITERAL)) {
-          const text = m[1];
-          if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
-          if (!/[a-z]{2}/.test(text)) continue; // SCREAMING_CASE constants
-          offenders.push(`${where}: ${text}`);
+        for (const re of [LITERAL, LOWER_SENTENCE]) {
+          for (const m of line.matchAll(re)) {
+            const text = m[1];
+            if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
+            if (!/[a-z]{2}/.test(text)) continue; // SCREAMING_CASE constants
+            if (CSS_WORDS.test(text)) continue;
+            offenders.push(`${where}: ${text}`);
+          }
         }
       }
     }

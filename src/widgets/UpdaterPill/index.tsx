@@ -105,20 +105,20 @@ export function UpdaterPill() {
 
   const statusText =
     phase === "checking"
-      ? "checking for updates…"
+      ? t("updater.checking")
       : phase === "available"
         ? t("updater.availableArrow", { v: String(info?.latest ?? "") })
         : phase === "downloading"
           ? percent === null
-            ? "downloading update…"
-            : `downloading… ${percent}%`
+            ? t("updater.downloading")
+            : t("updater.downloadingPct", { p: percent })
           : phase === "ready"
-            ? "ready to install"
+            ? t("updater.readyToInstall")
             : phase === "installing"
-              ? "installing update…"
+              ? t("updater.installing")
               : phase === "error"
-                ? "update check needs attention"
-                : "up to date";
+                ? t("updater.needsAttention")
+                : t("updater.upToDate");
 
   return (
     <>

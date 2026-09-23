@@ -87,7 +87,11 @@ export function McpCard({
     [
       !!status?.dependencies_installed,
       t("mcp.dependenciesInstalled"),
-      status?.dependencies_installed ? "node_modules ready" : status?.lockfile_present ? "npm ci required" : t("mcp.legacySetupNpmInstallRequired"),
+      status?.dependencies_installed
+        ? t("mcp.nodeModulesReady")
+        : status?.lockfile_present
+          ? t("mcp.npmCiRequired")
+          : t("mcp.legacySetupNpmInstallRequired"),
     ],
     [
       !!status?.api_reachable,
@@ -138,7 +142,7 @@ export function McpCard({
 
       <div className="flex flex-col gap-0.5 rounded-lg bg-bg-weak-50 px-3 py-2">
         <strong className="text-label-xs text-text-strong-950">
-          {hermes?.ready ? "✓" : "○"} Hermes registration
+          {t("mcp.hermesRegistrationRow", { mark: hermes?.ready ? "✓" : "○" })}
         </strong>
         <span className="text-paragraph-xs text-text-sub-600">
           {hermesError
