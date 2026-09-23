@@ -24,12 +24,13 @@ mkdirSync(OUT, { recursive: true });
 // runs before redaction rather than instead of it; the unknown code proves the
 // fallback is prose and not a bare key.
 const CASES = [
-  ["launch.browserMissing", "[[shardx:launch.browserMissing]]"],
-  ["fleet.closeProfilesFirst", "[[shardx:fleet.closeProfilesFirst]]"],
-  ["updater.waitForDownload", "[[shardx:updater.waitForDownload]]"],
-  ["bookmarks.needsUrl+proxy", "[[shardx:bookmarks.needsUrl]] http://alice:S3cret@10.0.0.9:8080"],
-  ["unknown code", "[[shardx:no.such.code]]"],
-  ["plain English error", "profile is locked by another device"],
+  ["launch.browserMissing", "[[shardx:launch.browserMissing]]", "vi"],
+  ["fleet.closeProfilesFirst", "[[shardx:fleet.closeProfilesFirst]]", "vi"],
+  ["updater.waitForDownload", "[[shardx:updater.waitForDownload]]", "vi"],
+  ["bookmarks.needsUrl+proxy", "[[shardx:bookmarks.needsUrl]] http://alice:S3cret@10.0.0.9:8080", "vi"],
+  ["unknown code", "[[shardx:no.such.code]]", "vi"],
+  // Rust text with no code cannot be translated; it must still reach the user.
+  ["plain English error", "profile is locked by another device", "as-is"],
 ];
 
 const browser = await chromium.launch();
@@ -92,7 +93,7 @@ if (!(await trigger.count())) {
 }
 
 let failures = 0;
-for (const [label, payload] of CASES) {
+for (const [label, payload, expect] of CASES) {
   await page.evaluate((text) => {
     window.__SHARDX_NEXT_ERROR__ = text;
   }, payload);
@@ -105,13 +106,24 @@ for (const [label, payload] of CASES) {
   const leaked = /S3cret|alice:/.test(out);
   const rawKey = /\[\[shardx:/.test(out) || /^[a-z]+\.[a-zA-Z.]+$/.test(out);
   const noToast = out === "(no toast rendered)";
-  if (leaked || rawKey || noToast) failures++;
+  // A code case must render Vietnamese. Diacritics are the cheap proof: every
+  // vi string for these keys carries them, and English never does. Without
+  // this the script passed while the app served untranslated English.
+  const notVi = expect === "vi" && !/[ăâđêôơưàáảãạèéẻẽẹìíỉĩịòóỏõọùúủũụỳýỷỹỵ]/i.test(out);
+  const bridgeFail = /Unhandled E2E command|__TAURI|is not a function/i.test(out);
+  if (leaked || rawKey || noToast || notVi || bridgeFail) failures++;
 
   console.log(
     `${label.padEnd(26)} -> ${JSON.stringify(out)}` +
-      `${leaked ? "  LEAKED" : ""}${rawKey ? "  RAW-KEY" : ""}${noToast ? "  MISSING" : ""}`,
+      `${leaked ? "  LEAKED" : ""}${rawKey ? "  RAW-KEY" : ""}${noToast ? "  MISSING" : ""}` +
+      `${notVi ? "  NOT-VIETNAMESE" : ""}${bridgeFail ? "  BRIDGE-BROKEN" : ""}`,
   );
-  await page.screenshot({ path: join(OUT, `${label.replace(/[^a-z0-9]+/gi, "-")}.png`) });
+  const shot = join(OUT, `${label.replace(/[^a-z0-9]+/gi, "-")}.png`);
+  // Photograph the error toast itself. A full-page shot also catches the
+  // unrelated "saved" toast, which makes the evidence contradict the
+  // assertion above.
+  if (await toastEl.count()) await toastEl.screenshot({ path: shot });
+  else await page.screenshot({ path: shot });
 
   // Clear the stack so the next case reads its own toast.
   await page.evaluate(() => {
