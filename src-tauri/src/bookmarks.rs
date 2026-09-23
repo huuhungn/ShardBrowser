@@ -53,7 +53,7 @@ pub fn save(mut b: Bookmark) -> Result<Bookmark> {
     b.url = normalise_url(&b.url);
     b.folder = b.folder.trim().to_string();
     if b.url.is_empty() {
-        anyhow::bail!("a bookmark needs a URL");
+        anyhow::bail!(crate::errcode::code("bookmarks.needsUrl"));
     }
     if b.title.is_empty() {
         b.title = b.url.clone();

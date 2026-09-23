@@ -883,5 +883,14 @@
   "updater.shardxLauncherUpdate": "Cập nhật ShardX Launcher",
   "updater.signatureVerifiedReadyToInstall": "Đã xác minh chữ ký — sẵn sàng cài",
   "updater.statusAria": "Trạng thái cập nhật ShardX Launcher: {status}",
-  "updater.upToDate": "đã là bản mới nhất"
+  "updater.upToDate": "đã là bản mới nhất",
+  "launch.browserMissing": "Chưa cài trình duyệt ShardX — mở Cài đặt để tải về, hoặc tự chỉ đường dẫn trình duyệt",
+  "launch.cacheNeedsReseed": "Bộ nhớ đệm thiếu manifest.json — hãy nạp lại từ một bản Chrome thật",
+  "fleet.closeProfilesFirst": "Hãy đóng tất cả hồ sơ đang chạy trước",
+  "fleet.setServerAndTokenFirst": "Hãy nhập địa chỉ máy chủ và mã thông báo trước",
+  "fleet.setTenantFirst": "Hãy nhập mã đơn vị trước",
+  "updater.downloadInProgress": "Đang tải một bản cập nhật rồi.",
+  "updater.downloadBeforeInstall": "Hãy tải bản cập nhật đã kiểm chứng trước khi cài.",
+  "updater.waitForDownload": "Hãy đợi tải xong bản cập nhật rồi mới cài.",
+  "bookmarks.needsUrl": "Dấu trang cần có địa chỉ"
 }

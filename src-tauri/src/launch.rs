@@ -59,7 +59,7 @@ pub fn resolve_binary() -> Result<PathBuf> {
     if pb.exists() {
         return Ok(pb);
     }
-    anyhow::bail!("ShardX browser not installed yet — open Settings to download, or configure Browser path manually")
+    anyhow::bail!(crate::errcode::code("launch.browserMissing"))
 }
 
 pub async fn launch_profile(
@@ -752,7 +752,7 @@ fn install_widevine(udd: &Path) -> Result<()> {
     }
     let manifest_path = src.join("manifest.json");
     if !manifest_path.exists() {
-        anyhow::bail!("cache missing manifest.json — re-seed from a real Chrome");
+        anyhow::bail!(crate::errcode::code("launch.cacheNeedsReseed"));
     }
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
     let manifest: serde_json::Value =

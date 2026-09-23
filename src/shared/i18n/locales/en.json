@@ -883,5 +883,14 @@
   "updater.shardxLauncherUpdate": "ShardX Launcher update",
   "updater.signatureVerifiedReadyToInstall": "Signature verified — ready to install",
   "updater.statusAria": "ShardX Launcher update status: {status}",
-  "updater.upToDate": "up to date"
+  "updater.upToDate": "up to date",
+  "launch.browserMissing": "ShardX browser not installed yet — open Settings to download, or set the browser path manually",
+  "launch.cacheNeedsReseed": "The cache has no manifest.json — re-seed it from a real Chrome",
+  "fleet.closeProfilesFirst": "Close every running profile first",
+  "fleet.setServerAndTokenFirst": "Set the server URL and token first",
+  "fleet.setTenantFirst": "Set the tenant id first",
+  "updater.downloadInProgress": "An update is already downloading.",
+  "updater.downloadBeforeInstall": "Download the verified update before installing.",
+  "updater.waitForDownload": "Wait for the update to finish downloading before installing.",
+  "bookmarks.needsUrl": "A bookmark needs a URL"
 }

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { t } from "../i18n";
 
 // Host OS of the launcher window (never spoofed) — drives default OS tab + titlebar.
 export function detectHostOs(): "macOS" | "Windows" | "Linux" {
@@ -97,6 +98,37 @@ export const availCode = (name: string) => (/datacenter/i.test(name) ? "dc" : /i
 export const readTextFile = (path: string) => invoke<string>("read_text_file", { path });
 
 /**
+ * Turn a backend error code into interface language.
+ *
+ * Tauri commands answer with a plain `String`, so there is no room for a
+ * structured error payload without changing every command signature and all
+ * 113 call sites that catch one. Instead the backend emits a marker —
+ * `[[shardx:launch.browserMissing]]`, optionally `|name=value` arguments —
+ * and the lookup happens here, where the chosen language actually lives.
+ *
+ * Rust cannot do the translating itself: the language is a browser-side
+ * setting in localStorage, and shipping a second copy of the dictionary into
+ * the binary would leave two catalogues to keep in step.
+ *
+ * Unknown codes fall through to the English sentence the backend sent, so a
+ * missing key degrades to today's behaviour rather than to an empty toast.
+ */
+export const localiseBackendError = (text: string): string =>
+  text.replace(/\[\[shardx:([a-zA-Z0-9_.]+)((?:\|[a-zA-Z0-9_]+=[^\]|]*)*)\]\]/g, (whole, key, rawArgs) => {
+    const vars: Record<string, string> = {};
+    for (const pair of String(rawArgs).split("|")) {
+      if (!pair) continue;
+      const eq = pair.indexOf("=");
+      if (eq > 0) vars[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+    const translated = t(key, vars);
+    // `translate` echoes the key back when it is missing from every
+    // dictionary. Showing "launch.browserMissing" to an operator is worse
+    // than showing the original English, so keep the marker's own text.
+    return translated === key ? whole : translated;
+  });
+
+/**
  * Error text safe to show in the UI.
  *
  * Backend errors can quote the request that failed, and that request may carry
@@ -106,7 +138,7 @@ export const readTextFile = (path: string) => invoke<string>("read_text_file", {
 export const safeUiError = (error: unknown) => {
   const text = error instanceof Error ? error.message : String(error);
   return (
-    text
+    localiseBackendError(text)
       .replace(/Bearer\s+[^\s"']+/gi, "Bearer ***")
       .replace(/("SHARDX_TOKEN"\s*:\s*")[^"]*(")/gi, "$1***$2")
       .replace(/SHARDX_TOKEN\s*=\s*[^\s;]+/gi, "SHARDX_TOKEN=***")

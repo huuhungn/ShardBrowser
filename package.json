@@ -16,6 +16,7 @@
     "test:updater-signatures": "node --test scripts/verify-updater-signatures.test.mjs",
     "test:i18n": "node --test scripts/i18n-locale-parity.test.mjs",
     "test:rust-strings": "node --test scripts/rust-user-strings.test.mjs",
+    "test:backend-locale": "node --test scripts/backend-error-locale.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
