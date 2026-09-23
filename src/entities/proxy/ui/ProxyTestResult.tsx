@@ -11,7 +11,7 @@ export function ProxyTestResult({ snap, kind, busy }: {
 }) {
   const t = useT();
   if (busy) return <span className="text-paragraph-xs text-text-soft-400">testing…</span>;
-  if (!snap) return <span className="text-paragraph-xs text-text-soft-400">not tested</span>;
+  if (!snap) return <span className="text-paragraph-xs text-text-soft-400">{t("proxy.notTested")}</span>;
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">

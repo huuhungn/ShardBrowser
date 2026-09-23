@@ -188,7 +188,7 @@ host:8080               # no auth
                     {r.entry.username && <span className="text-text-soft-400"> · {r.entry.username}</span>}
                   </span>
                   <div className="inline-flex items-center justify-end gap-1.5">
-                    {r.status === "idle" && <span className="text-text-soft-400">not tested</span>}
+                    {r.status === "idle" && <span className="text-text-soft-400">{t("proxy.notTested")}</span>}
                     {r.status === "testing" && <span className="text-text-soft-400">testing…</span>}
                     {r.status === "ok" && (
                       <>

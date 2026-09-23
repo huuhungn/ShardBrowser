@@ -35,7 +35,6 @@ const SAME_IN_EVERY_LANGUAGE = new Set([
   // Words Vietnamese borrowed outright: the proxy screens say "proxy" and
   // "residential", and a translated coinage would read as a different product.
   "profileTable.proxy",
-  "ps.residential",
   // Protocol and platform names, spelled the same on every screen in the world.
   "automation.get",
   "proxy.http",
@@ -257,7 +256,6 @@ const NOT_PROSE = new Set([
   "Linux",
   "Android",
   "macOS",
-  "Residential",
 ]);
 
 /** Comments explain the code to us; they are not text anyone reads on screen. */
@@ -265,10 +263,74 @@ function withoutComments(src) {
   return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
+/**
+ * Every rule below was written against double quotes, because that is what this
+ * codebase uses — and a reviewer showed that `toast.error('Could not save')`
+ * therefore walks past all of them. Which quote character a string is written
+ * with is a formatting choice; it must not decide whether the string is read.
+ * Only quotes in a position where a string can start are rewritten, so the
+ * apostrophe in a sentence like `don't` is never mistaken for an opening quote.
+ */
+function normalizeQuotes(src) {
+  return src.replace(
+    /(^|[=(,:[?{]\s*)'((?:[^'\\\n]|\\.)*)'/gm,
+    (_, lead, body) => `${lead}"${body.replace(/"/g, '\\"')}"`,
+  );
+}
+
+/**
+ * A className is machinery, but it sits on the same line as the prose it
+ * styles. Skipping the whole line because it contains one — which is what the
+ * machinery check used to do — hides every other string on that line, so
+ * `<Field className="mt-2" helperText="Password must contain letters" />`
+ * passed. Take the class lists out and judge what remains.
+ */
+function withoutClassNames(src) {
+  return src
+    .replace(/\bclassName=(?:"[^"]*"|\{`[^`]*`\}|\{[^{}]*\})/g, "")
+    .replace(/\b(?:class|cn|clsx|cva|tw)\(/g, "(");
+}
+
+/**
+ * Scanning the whole file at once — needed to see a template that wraps — means
+ * a backtick inside a regex literal or a double-quoted string can pair with an
+ * unrelated one far below and swallow the code between them. Blank the insides
+ * of those two forms first; what is left is templates only.
+ */
+function withoutBacktickDecoys(src) {
+  // Pad with a character no rule reads rather than with spaces: blanking a
+  // string to whitespace lets the templates on either side of it run together
+  // into one apparent match spanning the code between them.
+  const blank = (m) => "\u0002".repeat(m.length);
+  return src
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, blank)
+    .replace(/\/(?![/*])(?:[^/\\\n[]|\\.|\[(?:[^\]\\]|\\.)*\])+\/[gimsuy]*/g, blank);
+}
+
+/** A literal's own characters, safe to drop into a RegExp. */
+function escapeForRegExp(v) {
+  return v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** What a scanner should actually read: no comments, no styling, one quote style. */
+function readable(src) {
+  return normalizeQuotes(withoutClassNames(withoutComments(withoutCodeSamples(src))));
+}
+
+/**
+ * A placeholder showing the shape of a JSON payload is an illustration of a
+ * format, not a sentence — translating the keys inside it would make the
+ * example wrong. Such a sample is written in single quotes precisely because
+ * it contains double ones, so normalising quotes would otherwise drag it in.
+ */
+function withoutCodeSamples(src) {
+  return src.replace(/'[^'\n]*[{}[\]][^'\n]*'/g, "''");
+}
+
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
-  for (const line of withoutComments(src).split("\n")) {
+  for (const line of readable(src).split("\n")) {
     const s = line.trim();
     // A bare line of prose between tags: "Add block", "No projects yet".
     if (/^[A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?]$/.test(s) && !s.includes("=") && !s.includes("(")) {
@@ -300,7 +362,7 @@ function englishInSource(src) {
       found.push(bare);
     }
     for (const m of s.matchAll(
-      /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label)="([^"]{3,})"/g,
+      /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label|helperText|hint|tooltip|description|caption|subtitle|alt|emptyText|errorText|summary)="([^"]{3,})"/g,
     )) {
       // A sample address or id is an illustration, not a sentence: it stays the
       // same in every language, and translating it would break the example.
@@ -322,7 +384,7 @@ const PROSE_PROP =
 
 function englishInProps(src) {
   const out = [];
-  for (const line of withoutComments(src).split("\n")) {
+  for (const line of readable(src).split("\n")) {
     for (const m of line.matchAll(PROSE_PROP)) out.push(m[2]);
   }
   return out;
@@ -366,7 +428,10 @@ const LITERAL = /"([A-Z][A-Za-z0-9 ,.'’:/()—–-]{2,60})"/g;
 // The updater pill wrote its whole status ladder in lower case — "ready to
 // install", "up to date" — and a rule anchored on a capital never saw any of
 // it. A lower-case string of three or more words is a sentence too.
-const LOWER_SENTENCE = /"([a-z][a-z0-9]*(?: [A-Za-z0-9,'’.—–-]+){2,})[.…!?]?"/g;
+const LOWER_SENTENCE = /"([a-z][a-z0-9]*(?: [A-Za-z0-9,'’.—–-]+){1,})[.…!?]?"/g;
+// A single lower-case word stays out on purpose: "idle", "ready" and "error"
+// are state values compared against, not labels, and there is no shape that
+// tells those apart from a one-word button. Two words is where prose starts.
 // Tailwind is written the same way a sentence is — words separated by spaces —
 // so a class list has to be told apart by its vocabulary, not its shape.
 const CSS_WORDS =
@@ -374,13 +439,16 @@ const CSS_WORDS =
 // Lines where a string is machinery rather than prose: module paths, CSS class
 // names, DOM ids, invoke() command names, HTTP headers.
 const MACHINERY =
-  /\b(import|from|className|invoke|querySelector|getElementById|setAttribute|localStorage|sessionStorage|fetch|headers|key=|data-|aria-label=\{t)\b|classList|\.get\(/;
+  /\b(import|from|className|invoke|querySelector|getElementById|setAttribute|localStorage|sessionStorage|fetch|headers|key=|data-|aria-label=\{t)\b|classList|\.(?:get|set|has)\(\s*["'`]?[\w.-]+["'`]?\s*\)/;
 
 test("no ternary or toast still holds its English", () => {
   const offenders = [];
   for (const root of uiRoots) {
-    for (const file of tsxFilesUnder(root)) {
-      const src = withoutComments(readFileSync(file, "utf8"));
+    // A string handed straight to a helper — notify("Could not save") — lives
+    // just as often in a plain .ts store as in a component, and scanning only
+    // .tsx left that whole half of the codebase unread.
+    for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
+      const src = readable(readFileSync(file, "utf8"));
       const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
       for (const line of src.split("\n")) {
         if (MACHINERY.test(line)) continue;
@@ -390,6 +458,15 @@ test("no ternary or toast still holds its English", () => {
             if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
             if (!/[a-z]{2}/.test(text)) continue; // SCREAMING_CASE constants
             if (CSS_WORDS.test(text)) continue;
+            // An IANA zone id — "Europe/Paris" — is the value the platform
+            // expects, not a label; the UI shows the city from it separately.
+            if (/^[A-Za-z]+\/[A-Za-z_]+(?:\/[A-Za-z_]+)?$/.test(text)) continue;
+            // A string being compared against, or used as a fallback key, is a
+            // value the code branches on — `platform === "Other"`. Translating
+            // it would break the comparison; the label is translated where it
+            // is drawn instead.
+            if (new RegExp(`[=!]==?\\s*["']${escapeForRegExp(text)}["']`).test(line)) continue;
+            if (new RegExp(`\\|\\|\\s*["']${escapeForRegExp(text)}["']`).test(line)) continue;
             offenders.push(`${where}: ${text}`);
           }
         }
@@ -429,12 +506,26 @@ test("no screen still holds its English inline", () => {
 // reaches the screen as those exact characters. So: read template literals too,
 // and treat an interpolation as the word-boundary it is.
 const TEMPLATE = /`([^`\\]*)`/g;
+// The same shape, but allowed to span lines.
+const TEMPLATE_MULTILINE = /`((?:[^`\\]|\\.)*)`/g;
 
 function englishInTemplates(src) {
   const out = [];
-  for (const line of withoutComments(src).split("\n")) {
-    if (MACHINERY.test(line)) continue;
-    for (const m of line.matchAll(TEMPLATE)) {
+  // A template that wraps across lines — a message long enough to need two
+  // lines is exactly the kind that is prose — has no complete match on either
+  // line, so scanning line by line could never see it. Scan the whole source
+  // and locate each match afterwards to decide whether its line is machinery.
+  const whole = withoutBacktickDecoys(readable(src));
+  const lineStarts = [];
+  { let n = 0; for (const l of whole.split("\n")) { lineStarts.push(n); n += l.length + 1; } }
+  const lineAt = (idx) => {
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= idx) lo = mid; else hi = mid - 1; }
+    return whole.split("\n")[lo] ?? "";
+  };
+  {
+    for (const m of whole.matchAll(TEMPLATE_MULTILINE)) {
+      const line = lineAt(m.index ?? 0);
       // Drop the ${…} holes; what is left is what a reader reads.
       const prose = maskInterpolations(m[1]).trim();
       if (!/[A-Za-z]{2}/.test(prose)) continue;
@@ -444,6 +535,10 @@ function englishInTemplates(src) {
       // translated flag would not run. Same for the `"` fragments the two
       // little markup parsers compare against: those are delimiters, not words.
       if (/\b(hermes|npm|npx|node|cargo|git)\s+\w/.test(prose)) continue;
+      // A console transcript or a list of accepted input formats is shown so it
+      // can be copied or matched character for character; translating an API
+      // call or a proxy line would make the example wrong.
+      if (/\w+\.\w+\(\)|^\w+:\/\/|^\s*->/m.test(prose)) continue;
       if (/^["'`)\s]*(&&|\|\|)/.test(prose) || /\b(startsWith|endsWith)\(/.test(line)) continue;
       // `${name} · ${host}:${port}` is punctuation holding values apart. There
       // is no English in it to translate, so leave those joins alone.

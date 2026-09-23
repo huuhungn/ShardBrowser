@@ -67,7 +67,7 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
   remove: async (b) => {
     const ok = await confirmModal({
       title: t("bookmarks.deleteBookmark"),
-      message: `Delete "${b.title || b.url}"? It disappears from its profiles on their next launch.`,
+      message: t("bookmarks.deleteAsk", { name: b.title || b.url }),
       danger: true,
     });
     if (ok !== true) return;

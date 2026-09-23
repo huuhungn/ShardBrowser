@@ -41,7 +41,7 @@ export function McpCard({
   const filesDownloaded = !!status?.files_downloaded;
   const ready = !!status?.ready;
   const versionLabel = status?.version ? `v${status.version}` : t("mcp.unknown");
-  const requiredLabel = status?.required_version ? `v${status.required_version}` : "this Launcher";
+  const requiredLabel = status?.required_version ? `v${status.required_version}` : t("mcp.thisLauncher");
   const runtimeApiUrl = api?.runtime_base_url ?? api?.base_url ?? "";
   const hermesChecked = !!hermes || !!hermesError;
 

@@ -5,6 +5,7 @@ import { EyeIcon, EyeOffIcon, KeyIcon } from "../../../shared/icons";
 import { DASHBOARD_URL } from "../../../shared/lib/utils";
 import { PsConnectionBadge, usePsAccount } from "../../../entities/proxyshard";
 import { useT } from "../../../shared/i18n";
+import { Rich } from "../../../shared/i18n/Rich";
 
 export function PsApiKeyCard() {
   const t = useT();
@@ -25,13 +26,13 @@ export function PsApiKeyCard() {
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
       <h3 className="m-0 mb-1 text-label-sm text-text-strong-950">{t("ps.apiKey")}</h3>
       <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
-        Paste your ProxyShard <strong>{t("ps.apiKey")}</strong> (from the{" "}
+        <Rich text={t("ps.apiKeyIntroBefore", { label: t("ps.apiKey") })} />
         <a
           href="#"
           className="text-primary-base hover:underline"
           onClick={(e) => { e.preventDefault(); openUrl(DASHBOARD_URL).catch(() => {}); }}
-        >dashboard</a>).
-        It's stored locally and sent as <code>Authorization: Bearer …</code> to user-api.proxyshard.com.
+        >{t("ps.apiKeyDashboardLink")}</a>
+        <Rich text={t("ps.apiKeyIntroAfter")} />
       </p>
       <div className="mt-1 flex items-center gap-2">
         <div className="min-w-0 flex-1">

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Tag } from "@proxyshard/shardx-ui-kit";
+import { useT } from "../i18n";
 
 /// Editable list of ports rendered as removable UI-kit Tags.
 export function PortList({
@@ -9,6 +10,7 @@ export function PortList({
   value: number[];
   onChange: (v: number[]) => void;
 }) {
+  const t = useT();
   const [text, setText] = useState("");
   const commit = () => {
     // Accept "3389", "3389, 5900", "3389 5900"; drops non-numeric tokens.
@@ -41,7 +43,7 @@ export function PortList({
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === "," || e.key === " ") { e.preventDefault(); commit(); } }}
           onBlur={commit}
-          placeholder={value.length === 0 ? "e.g. 3389, 5900, 8080" : "add port…"}
+          placeholder={value.length === 0 ? t("ports.example") : t("ports.addPort")}
         />
       </div>
     </label>
