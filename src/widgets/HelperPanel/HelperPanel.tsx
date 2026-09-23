@@ -87,7 +87,7 @@ export function HelperPanel({ profile }: { profile: string }) {
           className="w-full rounded-8 bg-primary-base py-1.5 text-label-xs text-static-white hover:bg-primary-darker disabled:opacity-50"
         >
           {filled > 1
-            ? `Filled ${filled} windows — fill again`
+            ? t("helper.filledWindows", { n: filled })
             : filled === 1
               ? t("helper.fillAgain")
               : `Fill ${fields.length} field${fields.length === 1 ? "" : "s"}`}

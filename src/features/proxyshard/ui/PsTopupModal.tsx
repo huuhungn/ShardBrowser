@@ -17,7 +17,7 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
     setBusy(true);
     try {
       await psAddBandwidth(order.order_id, amount, promo.trim() || null);
-      toast.ok(`Added ${amount} GB to order #${order.order_id}`);
+      toast.ok(t("ps.addedGb", { amount, id: order.order_id }));
       onDone();
     } catch (e) { toast.err(String(e)); }
     finally { setBusy(false); }
@@ -27,7 +27,7 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
       open
       onClose={onClose}
       title={t("ps.addTraffic")}
-      subtitle={`${order.product_name} · order #${order.order_id}`}
+      subtitle={t("ps.productOrder", { product: order.product_name, id: order.order_id })}
       confirmLabel={busy ? "Buying…" : `Buy ${amount} GB`}
       onConfirm={submit}
       isLoading={busy}

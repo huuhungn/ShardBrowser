@@ -46,7 +46,7 @@ export function PsOrdersCard() {
     setB(o.order_id, true);
     try {
       await psRenew(o.order_id);
-      toast.ok(`Renewed order #${o.order_id}`);
+      toast.ok(t("ps.renewedOrder", { id: o.order_id }));
       load();
       onChanged();
     } catch (e) { toast.err(String(e)); }
@@ -97,7 +97,7 @@ export function PsOrdersCard() {
                 <span className="text-paragraph-xs text-text-soft-400">
                   #{o.order_id} · {o.cycle_name}
                   {o.tag && o.tag !== "none" ? ` · ${o.tag}` : ""}
-                  {o.expires_at ? ` · until ${o.expires_at.slice(0, 10)}` : ""}
+                  {o.expires_at ? t("ps.untilDate", { date: o.expires_at.slice(0, 10) }) : ""}
                 </span>
               </div>
               <div className="flex shrink-0 justify-end gap-1.5">

@@ -77,7 +77,7 @@ export function TeamCard() {
 
   const test = () => run("test", async () => {
     const id = await teamTestConnection();
-    toast.ok(`Server identity: ${id}`);
+    toast.ok(t("team.serverIdentity", { id }));
   });
 
   const enroll = () => run("enroll", async () => {
@@ -92,24 +92,23 @@ export function TeamCard() {
     if (r.grants === 0) {
       toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
-      toast.err(`${r.opened} of ${r.grants} opened; ${r.failed} could not be opened`);
+      toast.err(t("team.grantsOpened", { opened: r.opened, grants: r.grants, failed: r.failed }));
     } else {
       // The fleet key is the one sync needs, so lead with that.
       if (r.can_sync_without_passphrase) {
         const gen =
           r.newest_fleet_generation == null
             ? ""
-            : ` (generation ${r.newest_fleet_generation})`;
+            : t("team.generationSuffix", { n: r.newest_fleet_generation });
         toast.ok(
-          `Fleet key collected${gen} — this device can sync without a passphrase`,
+          t("team.fleetKeyCollected", { gen }),
         );
       } else if (r.opened > 0) {
         const gen =
-          r.newest_generation == null ? "" : ` (generation ${r.newest_generation})`;
-        toast.ok(
-          `Root custody in place: ${r.opened} grant(s)${gen}. No fleet key yet — ` +
-            `sync still needs a passphrase.`,
-        );
+          r.newest_generation == null
+            ? ""
+            : t("team.generationSuffix", { n: r.newest_generation });
+        toast.ok(t("team.rootCustody", { opened: r.opened, gen }));
       } else {
         toast.err(t("team.noGrantsAreWaitingForThisDeviceYet"));
       }

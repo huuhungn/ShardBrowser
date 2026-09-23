@@ -263,7 +263,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         });
         const text = lines.join("\n");
         clip.write(text).then(
-            () => toast.ok(`Copied ${targets.length} to clipboard`),
+            () => toast.ok(t("common.copiedNToClipboard", { n: targets.length })),
             (e) => toast.err(t("proxy.copyFailed") + String(e)),
         );
     },

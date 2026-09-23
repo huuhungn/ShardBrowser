@@ -29,7 +29,7 @@ export function ProfileFilterBar() {
         leftIcon={<FilterIcon className="size-4" />}
         onClick={() => setOpen((v) => !v)}
       >
-        {active > 0 ? `Filters · ${active}` : t("profile.filters")}
+        {active > 0 ? t("profile.filtersCount", { n: active }) : t("profile.filters")}
       </Button>
 
       {open && (

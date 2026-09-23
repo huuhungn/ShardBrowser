@@ -62,15 +62,15 @@ export function ProfileRowActions({ profile, onMore }: {
         leftIcon={<PinIconApp className="size-4" />}
       >
       </Button>}
-      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title={t("common.edit")} aria-label={`Edit profile ${p.name}`}
+      <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => expand(p.id)} title={t("common.edit")} aria-label={t("profile.editProfileNamed", { name: p.name })}
         leftIcon={<EditIcon className="size-4" />}
       >
       </Button>
-      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title={t("common.clone")} aria-label={`Clone profile ${p.name}`}
+      {wide && <Button variant="neutral" mode="stroke" size="xsmall" onlyIcon onClick={() => cloneProfile(p.id)} title={t("common.clone")} aria-label={t("profile.cloneProfileNamed", { name: p.name })}
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
-      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={`Delete profile ${p.name}`}
+      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
         leftIcon={<DeleteIcon className="size-4" />}
       >
       </Button>}
@@ -80,7 +80,7 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={() => { void copyCdp(p.id); }}
-        aria-label={`Copy CDP HTTP URL for ${p.name}`}
+        aria-label={t("profile.copyCdpFor", { name: p.name })}
         title={t("profile.copyCdpHttpUrl")}
         leftIcon={<CopyIcon className="size-4" />}
       >
@@ -91,7 +91,7 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={onMore}
-        aria-label={`More actions for profile ${p.name}`}
+        aria-label={t("profile.moreActionsFor", { name: p.name })}
         title={t("profile.moreActions")}
         leftIcon={<MoreIcon className="size-4" />}
       >

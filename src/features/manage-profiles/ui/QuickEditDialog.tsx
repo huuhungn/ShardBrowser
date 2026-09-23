@@ -57,7 +57,7 @@ export function QuickEditDialog({
             value={proxyId ?? ""}
             onChange={(v) => setProxyId(v || null)}
             options={[
-              { value: "", label: "— direct connection —" },
+              { value: "", label: t("proxy.directConnection") },
               ...proxies.map((px) => ({
                 value: px.id,
                 label: `${px.name || `${px.host}:${px.port}`} · ${px.country || px.kind}`,

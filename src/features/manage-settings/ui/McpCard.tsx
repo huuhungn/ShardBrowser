@@ -82,7 +82,7 @@ export function McpCard({
     [
       !!status?.version_current,
       t("mcp.versionCurrent"),
-      status?.version_current ? versionLabel : filesDownloaded ? `${versionLabel}; repair to ${requiredLabel}` : t("mcp.noFilesYet"),
+      status?.version_current ? versionLabel : filesDownloaded ? t("mcp.repairTo", { version: versionLabel, required: requiredLabel }) : t("mcp.noFilesYet"),
     ],
     [
       !!status?.dependencies_installed,

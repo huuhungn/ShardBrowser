@@ -391,3 +391,120 @@ test("no screen still holds its English inline", () => {
     `these read as English text rather than t("…") keys:\n  ${offenders.join("\n  ")}`,
   );
 });
+
+// Every check above reads double-quoted strings. A backtick is the fourth door,
+// and the widest one: `Deleted folder "${f}"` is a whole sentence the quoted
+// scans never see. It is also where the automated conversion left the worst of
+// its damage, including a t("…") call stranded inside a template literal, which
+// reaches the screen as those exact characters. So: read template literals too,
+// and treat an interpolation as the word-boundary it is.
+const TEMPLATE = /`([^`\\]*)`/g;
+
+function englishInTemplates(src) {
+  const out = [];
+  for (const line of withoutComments(src).split("\n")) {
+    if (MACHINERY.test(line)) continue;
+    for (const m of line.matchAll(TEMPLATE)) {
+      // Drop the ${…} holes; what is left is what a reader reads.
+      const prose = maskInterpolations(m[1]).trim();
+      if (!/[A-Za-z]{2}/.test(prose)) continue;
+      // A path, a css value, a url fragment: machinery wearing backticks.
+      if (/^[\w./\\:%-]+$/.test(prose.replace(/\u0001/g, ""))) continue;
+      // A command someone pastes into a shell is copied verbatim, and a
+      // translated flag would not run. Same for the `"` fragments the two
+      // little markup parsers compare against: those are delimiters, not words.
+      if (/\b(hermes|npm|npx|node|cargo|git)\s+\w/.test(prose)) continue;
+      if (/^["'`)\s]*(&&|\|\|)/.test(prose) || /\b(startsWith|endsWith)\(/.test(line)) continue;
+      // `${name} · ${host}:${port}` is punctuation holding values apart. There
+      // is no English in it to translate, so leave those joins alone.
+      if (!/[A-Za-z]{2}/.test(prose.replace(/\u0001/g, " "))) continue;
+      for (const piece of prose.split("\u0001")) {
+        const text = piece.trim();
+        if (text.length < 4) continue;
+        if (NOT_TEXT.has(text) || NOT_PROSE.has(text)) continue;
+        // Prose has at least two lowercase letters and a space, or ends a
+        // sentence: "profile bound to this proxy", "Delete folder".
+        if (!/[a-z]{2}/.test(text)) continue;
+        if (!/\s/.test(text) && !/[.?!]$/.test(text)) continue;
+        out.push(text);
+      }
+    }
+  }
+  return out;
+}
+
+/// Replace every ${...} with one marker, counting braces so a nested
+/// template (`${a ? `${b}` : ""}`) is swallowed whole instead of ending at
+/// the first inner brace and leaving its identifiers to look like prose.
+function maskInterpolations(text) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "$" && text[i + 1] === "{") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j++) {
+        if (text[j] === "{") depth++;
+        else if (text[j] === "}") depth--;
+      }
+      out += "\u0001";
+      i = j - 1;
+    } else {
+      out += text[i];
+    }
+  }
+  return out;
+}
+
+test("no sentence hides inside a template literal", () => {
+  const offenders = [];
+  for (const root of uiRoots) {
+    for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
+      const src = readFileSync(file, "utf8");
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      for (const text of englishInTemplates(src)) {
+        offenders.push(`${where}: ${text}`);
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these template literals reach the screen as English:\n  ${offenders.join("\n  ")}`,
+  );
+});
+
+// A translator call that ended up inside a string instead of beside it renders
+// as source code to whoever opens that dialog. One conversion left exactly this
+// in a folder-deletion prompt; nothing else in the suite would have caught it.
+test("no t() call is stranded inside a string", () => {
+  const offenders = [];
+  for (const root of uiRoots) {
+    for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
+      const src = withoutComments(readFileSync(file, "utf8"));
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      // A `t("…")` written *as text* rather than called. Inside a template
+      // literal the call only runs within `${…}`, so the damage is a t( that
+      // is not preceded by an unclosed interpolation. Check line by line:
+      // matching across lines finds pairs of unrelated strings instead.
+      for (const line of src.split("\n")) {
+        for (const m of line.matchAll(/`([^`]*)`/g)) {
+          const inner = m[1];
+          // Blank out every interpolation, where a call is legitimate.
+          const outside = inner.replace(/\$\{[^}]*\}/g, "");
+          const stranded = outside.match(/\bt\("[\w.]+"\)/);
+          if (stranded) offenders.push(`${where}: ${stranded[0]} inside a template literal`);
+        }
+        // The same mistake in a double-quoted string shows up as an escaped
+        // quote, since the call's own quotes have to be escaped to fit.
+        for (const m of line.matchAll(/\bt\(\\"[\w.]+\\"\)/g)) {
+          offenders.push(`${where}: ${m[0]}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these render the translator call itself to the user:\n  ${offenders.join("\n  ")}`,
+  );
+});

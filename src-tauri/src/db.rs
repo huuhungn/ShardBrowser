@@ -353,4 +353,29 @@ mod tests {
             "the error should say why: {err}"
         );
     }
+
+    // `VACUUM INTO` writes a whole database to a path of the statement's
+    // choosing without attaching anything, so it is worth proving that the
+    // zero-attachment limit stops it too rather than assuming ATTACH was the
+    // only way out. SQLite counts the destination against that limit.
+    #[test]
+    fn a_statement_cannot_write_a_database_outside_the_workspace() {
+        let escape = std::env::temp_dir().join("shardx-vacuum-escape.db");
+        let _ = std::fs::remove_file(&escape);
+
+        let sql = format!(
+            "vacuum into '{}'",
+            escape.display().to_string().replace('\\', "/")
+        );
+        execute("probe.db", &sql, &[])
+            .expect_err("a statement that writes outside the workspace must be refused");
+
+        assert!(
+            !escape.exists(),
+            "refusing it has to mean the file was never written: {}",
+            escape.display()
+        );
+        let _ = std::fs::remove_file(&escape);
+    }
+
 }

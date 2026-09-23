@@ -136,10 +136,15 @@ export function PsBuyCard() {
     if (!c) {
       try { c = await fetchCalc(); setCalc(c); } catch { /* show placeholder below */ }
     }
-    const price = c ? fmtCents(c.total_with_addons ?? c.final_price) : "this order";
+    const price = c ? fmtCents(c.total_with_addons ?? c.final_price) : t("ps.thisOrder");
     const ok = await confirmModal({
       title: t("ps.confirmPurchase"),
-      message: `Buy ${quantity} × ${productName}${cycle ? ` (${cycle})` : ""} for ${price}? Your wallet will be charged.`,
+      message: t("ps.buyAsk", {
+        quantity,
+        product: productName,
+        cycle: cycle ? ` (${cycle})` : "",
+        price,
+      }),
       buttons: [
         { label: t("common.cancel"), value: false },
         { label: t("ps.buy"), value: true, primary: true },
@@ -149,7 +154,11 @@ export function PsBuyCard() {
     setBuying(true);
     try {
       const r = await psPurchase(buildBody());
-      toast.ok(r.message ? `${r.message}${r.order_id ? ` (#${r.order_id})` : ""}` : t("ps.orderPlaced"));
+      toast.ok(
+        r.message
+          ? `${r.message}${r.order_id ? t("ps.orderIdSuffix", { id: r.order_id }) : ""}`
+          : t("ps.orderPlaced"),
+      );
       setCalc(null);
       onPurchased();
     } catch (e) { toast.err(String(e)); }
@@ -215,7 +224,7 @@ export function PsBuyCard() {
           </div>
           {needLocation && (
             <Checkbox
-              label={`Add p0f signature slots for all ${quantity} prox${quantity === 1 ? "y" : "ies"}`}
+              label={t(quantity === 1 ? "ps.addP0fSlotsOne" : "ps.addP0fSlotsMany", { n: quantity })}
               checked={buyP0f}
               onChange={(e) => { setBuyP0f(e.target.checked); setCalc(null); }}
             />

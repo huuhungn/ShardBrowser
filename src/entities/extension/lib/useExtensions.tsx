@@ -58,7 +58,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       const added = await extensionImportUrl(url.trim());
       await get().reload();
       set({ linkOpen: false });
-      toast.ok(`Added "${added.name}"`);
+      toast.ok(t("extensions.addedNamed", { name: added.name }));
     } catch (e) { toast.err(t("extensions.downloadFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
@@ -75,7 +75,11 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
     try {
       const added = await extensionImport(paths as string[]);
       await get().reload();
-      toast.ok(`Added ${added.length} extension${added.length === 1 ? "" : "s"}`);
+      toast.ok(
+        t(added.length === 1 ? "extensions.addedOne" : "extensions.addedMany", {
+          n: added.length,
+        }),
+      );
     } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
@@ -87,7 +91,11 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
     try {
       const added = await extensionImport([dir]);
       await get().reload();
-      toast.ok(added.length > 0 ? `Added "${added[0].name}"` : t("extensions.nothingAdded"));
+      toast.ok(
+        added.length > 0
+          ? t("extensions.addedNamed", { name: added[0].name })
+          : t("extensions.nothingAdded"),
+      );
     } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
     finally { set({ busy: false }); }
   },
@@ -95,7 +103,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
   remove: async (e) => {
     const ok = await confirmModal({
       title: t("extensions.removeExtension"),
-      message: `Remove "${e.name}" from the library? Profiles using it stop loading it on their next launch.`,
+      message: t("extensions.removeAsk", { name: e.name }),
       danger: true,
     });
     if (ok !== true) return;

@@ -31,7 +31,7 @@ export function ProxyTestResult({ snap, kind, busy }: {
         <button
           type="button"
           className="cursor-pointer flex items-center border-0 bg-transparent p-0 transition-[filter,transform] hover:brightness-110 active:translate-y-px"
-          title={`UDP relay works (${snap.udp_ms} ms) — QUIC enabled at launch. Click for docs.`}
+          title={t("proxy.udpRelayWorksDocs", { ms: snap.udp_ms })}
           onClick={() => { openUrl(UDP_DOCS_URL).catch(() => { }); }}
         >
           <Badge color="primary" variant='filled' size="small">UDP</Badge>

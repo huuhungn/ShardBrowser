@@ -53,7 +53,7 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
     useTemplate: async (id) => {
         try {
             const meta = await profileCreateFromTemplate(id);
-            toast.ok(`Created "${meta.name}" — open Browsers to edit`);
+            toast.ok(t("fp.createdOpenBrowsers", { name: meta.name }));
         } catch (e) { toast.err(String(e)); }
     },
     remove: async (id) => {
@@ -75,7 +75,7 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
         try {
             const txt = await readTextFile(path);
             const e = await fingerprintImport(txt, null);
-            toast.ok(`Imported "${e.label}"`);
+            toast.ok(t("fp.importedNamed", { label: e.label }));
             get().reload();
         } catch (e) { toast.err(String(e)); }
     },

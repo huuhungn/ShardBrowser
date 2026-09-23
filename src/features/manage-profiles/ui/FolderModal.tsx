@@ -63,7 +63,7 @@ export function FolderModal({
           inputSize="small"
           value={name}
           placeholder={t("profile.eGShopsSocialsQa")}
-          error={dup ? `Folder "${trimmed}" already exists.` : undefined}
+          error={dup ? t("profile.folderExists", { name: trimmed }) : undefined}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter") create();

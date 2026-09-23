@@ -74,7 +74,10 @@ export function ProxyRow({ proxy, profileCount, onMenu }: {
         </div>
         <div className="cell-country"><ProxyCountryCell snap={snap} fallback={proxy.country} /></div>
         <div className="cell-profiles">
-          <Badge color="gray" variant='filled' size="small" title={`${profileCount} profile(s) bound to this proxy`}>
+          <Badge color="gray" variant='filled' size="small" title={t(
+            profileCount === 1 ? "proxyTable.boundProfilesOne" : "proxyTable.boundProfilesMany",
+            { n: profileCount },
+          )}>
             {profileCount}
           </Badge>
         </div>

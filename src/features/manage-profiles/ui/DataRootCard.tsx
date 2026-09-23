@@ -10,14 +10,17 @@ import {
   dataRootGet, dataRootMigrate,
   type DataRootInfo, type MigrationProgress,
 } from "../../../entities/settings";
-import { t, useT } from "../../../shared/i18n";
+import { useT } from "../../../shared/i18n";
 
-const PHASE_LABEL: Record<MigrationProgress["phase"], string> = {
-  scan: "Looking at what there is to move…",
-  copy: t("profile.copying"),
-  verify: "Checking every file arrived…",
-  cleanup: "Removing the old copy…",
-  done: t("profile.done"),
+// Keys, not translated text: this table is built once when the module loads,
+// so holding finished strings would pin the card to whichever language
+// happened to be active at startup.
+const PHASE_KEY: Record<MigrationProgress["phase"], string> = {
+  scan: "dataRoot.phaseScan",
+  copy: "profile.copying",
+  verify: "dataRoot.phaseVerify",
+  cleanup: "dataRoot.phaseCleanup",
+  done: "profile.done",
 };
 
 /** Where profiles, user-data, extensions and the trash live. The move copies,
@@ -42,15 +45,11 @@ export function DataRootCard() {
   const running = progress !== null;
 
   const move = async () => {
-    const dir = await open({ directory: true, title: "Where should profiles live?" });
+    const dir = await open({ directory: true, title: t("dataRoot.pickFolderTitle") });
     if (typeof dir !== "string") return;
     const ok = await confirmModal({
       title: t("profile.moveProfileData"),
-      message:
-        `Move profiles, user-data, extensions and the trash to "${dir}"?\n\n` +
-        "Every file is copied and checked before anything is deleted, so a " +
-        "failure leaves the current folder untouched. Profiles cannot be " +
-        "launched until it finishes.",
+      message: t("dataRoot.moveAsk", { dir }),
       buttons: [
         { label: t("common.cancel"), value: false },
         { label: t("profile.move"), value: true, primary: true },
@@ -60,7 +59,7 @@ export function DataRootCard() {
     setProgress({ phase: "scan", done: 0, total: 0, percent: 0, current: "" });
     try {
       const n = await dataRootMigrate(dir);
-      toast.ok(`Moved ${n} file${n === 1 ? "" : "s"}`);
+      toast.ok(t(n === 1 ? "dataRoot.movedOne" : "dataRoot.movedMany", { n }));
     } catch (e) {
       toast.err(String(e));
     } finally {
@@ -103,7 +102,7 @@ export function DataRootCard() {
         <div className="flex flex-col gap-1.5 rounded-8 bg-bg-weak-50 p-3 ring-1 ring-inset ring-stroke-soft-200">
           <div className="flex items-baseline justify-between gap-3">
             <span className="text-label-xs text-text-strong-950">
-              {PHASE_LABEL[progress.phase]}
+              {t(PHASE_KEY[progress.phase])}
             </span>
             <span className="mono text-paragraph-xs text-text-soft-400">
               {progress.total > 0 ? `${progress.done} / ${progress.total}` : ""}

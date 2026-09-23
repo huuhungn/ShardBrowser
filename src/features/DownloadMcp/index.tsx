@@ -15,7 +15,7 @@ export function DownloadMcp() {
     setMcpBusy(true);
     try {
       const p = await invoke<string>("mcp_download", { dir });
-      toast.ok(`MCP downloaded to ${p}`);
+      toast.ok(t("mcp.downloadedTo", { path: p }));
     } catch (e) {
       toast.err(t("mcp.mcpDownloadFailed") + String(e));
     } finally {

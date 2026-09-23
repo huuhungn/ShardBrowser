@@ -40,7 +40,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
       const meta = await trashRestore(e.id);
       await get().reload();
       storeBus.emit("profiles");
-      toast.ok(`Restored "${meta.name}"`);
+      toast.ok(t("trash.restoredNamed", { name: meta.name }));
     } catch (err) { toast.err(String(err)); }
     finally { set({ busy: null }); }
   },
@@ -48,7 +48,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
   purge: async (e) => {
     const ok = await confirmModal({
       title: t("trash.deleteForGood"),
-      message: `"${e.name}" cannot be brought back after this.`,
+      message: t("trash.cannotComeBack", { name: e.name }),
       danger: true,
     });
     if (ok !== true) return;
@@ -61,7 +61,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
     if (n === 0) return;
     const ok = await confirmModal({
       title: t("trash.emptyTheTrash"),
-      message: `Delete ${n} profile${n === 1 ? "" : "s"} for good?`,
+      message: t(n === 1 ? "trash.deleteForGoodOne" : "trash.deleteForGoodMany", { n }),
       danger: true,
     });
     if (ok !== true) return;

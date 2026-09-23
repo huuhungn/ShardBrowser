@@ -148,7 +148,7 @@ export function InlineEditor({
               value={f.gpu_preset_id}
               onChange={(v) => chooseGpu(v)}
               title={t("profile.gpuDeviceFromFingerprintLibrary")}
-              placeholder={`— no ${osFilter} fingerprints in library —`}
+              placeholder={t("fp.noneInLibraryForOs", { os: osFilter })}
               options={gpusForOs.map((g) => ({ value: g.id, label: g.label }))}
             />
           </label>

@@ -25,9 +25,9 @@ export function confirmModal(opts: {
   return new Promise((resolve) => {
     const buttons =
       opts.buttons ?? [
-        { label: t("ui.cancel"), value: false },
+        { label: t("common.cancel"), value: false },
         {
-          label: opts.danger ? "Delete" : "OK",
+          label: opts.danger ? t("common.delete") : t("common.ok"),
           value: true,
           danger: opts.danger,
           primary: !opts.danger,

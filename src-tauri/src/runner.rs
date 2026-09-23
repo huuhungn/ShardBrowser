@@ -95,6 +95,38 @@ pub enum Origin {
     Outside,
 }
 
+/// The name a `{{...}}` placeholder refers to, with the padding an operator
+/// may have typed for readability removed.
+///
+/// One definition, used by both substitution and the provenance check, so the
+/// two cannot drift apart.
+fn placeholder_name(inner: &str) -> &str {
+    inner.trim()
+}
+
+/// Every name interpolated by this raw text, in the order written.
+///
+/// Scans the same way [`Variables::expand`] substitutes: an unterminated or
+/// nested-looking `{{` is skipped by both, so neither sees a placeholder the
+/// other misses.
+fn placeholder_names(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            if let Some(close) = find_close(&chars, i + 2) {
+                let inner: String = chars[i + 2..close].iter().collect();
+                names.push(placeholder_name(&inner).to_string());
+                i = close + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
+}
+
 /// Values carried between steps. Text params interpolate `{{name}}`.
 ///
 /// Each value remembers its [`Origin`] so a step that would turn text into
@@ -142,13 +174,16 @@ impl Variables {
     /// substitution the value is indistinguishable from text the operator
     /// typed, which is exactly the confusion being guarded against.
     pub fn outside_names_in(&self, raw: &str) -> Vec<String> {
-        let mut found: Vec<String> = self
-            .outside
-            .iter()
-            .filter(|name| raw.contains(&format!("{{{{{name}}}}}")))
-            .cloned()
+        // Read the placeholders exactly the way `expand` reads them. Asking a
+        // different question here than the one substitution asks is how a
+        // guard grows a hole: `{{ name }}` interpolates, so it must also be
+        // seen to interpolate.
+        let mut found: Vec<String> = placeholder_names(raw)
+            .into_iter()
+            .filter(|name| self.outside.contains(name))
             .collect();
         found.sort();
+        found.dedup();
         found
     }
 
@@ -172,7 +207,7 @@ impl Variables {
             if chars[i] == '{' && i + 1 < chars.len() && chars[i + 1] == '{' {
                 if let Some(close) = find_close(&chars, i + 2) {
                     let name: String = chars[i + 2..close].iter().collect();
-                    match self.values.get(name.trim()) {
+                    match self.values.get(placeholder_name(&name)) {
                         Some(v) => out.push_str(v),
                         None => {
                             out.push_str("{{");
@@ -1507,6 +1542,71 @@ mod tests {
         assert!(
             err.to_string().contains("not attached"),
             "the error should say why: {err}"
+        );
+    }
+
+
+    // `expand` trims a placeholder's name before looking it up, so `{{ from_page }}`
+    // and `{{from_page}}` substitute the very same value. The provenance check has
+    // to agree with it, or a single space is enough to walk an outside-chosen
+    // string straight into a sink that executes it.
+    #[test]
+    fn a_space_inside_the_braces_does_not_hide_where_the_value_came_from() {
+        let mut v = vars(&[]);
+        v.set_from_outside("from_page", "1; DROP TABLE profiles");
+
+        assert_eq!(v.expand("{{ from_page }}"), v.expand("{{from_page}}"));
+        assert_eq!(
+            v.outside_names_in("select {{ from_page }}"),
+            vec!["from_page".to_string()],
+            "a padded placeholder still interpolates outside text"
+        );
+    }
+
+    #[test]
+    fn a_padded_placeholder_is_refused_by_both_sinks() {
+        let mut v = vars(&[]);
+        v.set_from_outside("payload", "whatever the page said");
+
+        refuse_outside_sql("select * from t where a = '{{ payload }}'", &v)
+            .expect_err("sql built from outside text must be refused however it is spelled");
+
+        let script = block("a", "evaluate", json!({ "script": "return {{ payload }}" }));
+        let raw = script
+            .params
+            .get("script")
+            .and_then(|x| x.as_str())
+            .expect("the fixture has a script");
+        assert!(
+            !v.outside_names_in(raw).is_empty(),
+            "an evaluate script must not lose provenance to a space"
+        );
+    }
+
+    // Provenance has to survive being copied. Assigning an outside value to a new
+    // name through `setVariable` must carry the mark with it, or the guard can be
+    // undone by one extra step.
+    #[test]
+    fn copying_an_outside_value_into_another_name_keeps_it_outside() {
+        let mut v = vars(&[]);
+        v.set_from_outside("first", "from the page");
+
+        let raw = "{{ first }}";
+        let borrowed = v.outside_names_in(raw);
+        assert!(!borrowed.is_empty(), "the source is outside-derived");
+
+        // What the setVariable block does when it decides the value is safe.
+        let expanded = v.expand(raw);
+        if v.outside_names_in(raw).is_empty() {
+            v.set("second", expanded);
+        } else {
+            v.set_from_outside("second", expanded);
+        }
+
+        assert_eq!(
+            v.outside_names_in("select {{second}}"),
+            vec!["second".to_string()],
+            "the copy is as outside-derived as the original"
         );
     }
 

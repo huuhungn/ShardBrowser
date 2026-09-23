@@ -73,7 +73,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
           username: d.username ?? "",
           password: d.password ?? "",
           country: "",
-          notes: `ProxyShard order ${order.order_id}`,
+          notes: t("ps.orderTitle", { id: order.order_id }),
         };
       })
       .filter(Boolean);
@@ -89,7 +89,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
       if (sigItems.length > 0) {
         try {
           await psSignatureSet(order.order_id, sigItems);
-          toast.ok(`Set p0f on ${sigItems.length} IP${sigItems.length === 1 ? "" : "s"}`);
+          toast.ok(t(sigItems.length === 1 ? "ps.setP0fOnOne" : "ps.setP0fOnMany", { n: sigItems.length }));
         } catch (e) { toast.err("Signature: " + String(e)); }
       }
       onClose();
@@ -101,7 +101,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
     <DialogModal
       open
       onClose={onClose}
-      title={`Add proxies — ${order.product_name} #${order.order_id}`}
+      title={t("ps.addProxiesTitle", { product: order.product_name, id: order.order_id })}
       maxWidthClassName="max-w-[880px]"
       confirmLabel={saving ? "Adding…" : `Add ${sel.size}`}
       onConfirm={save}
@@ -130,7 +130,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         {slots && (
           <p className="m-0 mb-1.5 text-paragraph-xs text-text-soft-400">
             p0f slots: {slots.used}/{slots.avail} used
-            {canSetP0f ? ` · ${free} free — set a signature per proxy below` : " · no free slots (buy more to assign p0f)"}
+            {canSetP0f ? t("ps.freeSetSignature", { free }) : " · no free slots (buy more to assign p0f)"}
           </p>
         )}
         {!items && !err && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading proxies…</p>}

@@ -139,7 +139,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
       username: buildUser(session === "sticky" ? randSid() : null),
       password,
       country: country ? country.toUpperCase() : "",
-      notes: `ProxyShard residential (${plan})`,
+      notes: t("ps.residentialPlan", { plan }),
     }));
     setSaving(true);
     try {
@@ -154,7 +154,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
     <DialogModal
       open
       onClose={onClose}
-      title={`Generate residential proxies — ${plan}`}
+      title={t("ps.generateResidential", { plan })}
       maxWidthClassName="max-w-[880px]"
       confirmLabel={saving ? "Generating…" : `Generate ${Math.max(1, Math.round(count))}`}
       onConfirm={generate}

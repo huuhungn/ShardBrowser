@@ -12,7 +12,7 @@ export function FingerprintImporter({ onClose }: { onClose: () => void }) {
   const save = async () => {
     try {
       const e = await fingerprintImport(text, name || null);
-      toast.ok(`Imported "${e.label}"`);
+      toast.ok(t("fp.importedNamed", { label: e.label }));
       onClose();
     } catch (e) { toast.err(String(e)); }
   };

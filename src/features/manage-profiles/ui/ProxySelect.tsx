@@ -130,7 +130,7 @@ export function ProxySelect({
           <ul role="listbox" className="overflow-auto p-1.5 scrollbar" style={{ maxHeight: coords?.maxHeight }}>
             <li>
               <Row
-                text="— direct connection —"
+                text={t("proxy.directConnection")}
                 muted
                 active={active === null}
                 onClick={() => { onChange(null); close(); }}
@@ -206,7 +206,7 @@ export function ProxySelect({
         className="flex h-9 w-full items-center gap-2 rounded-lg bg-bg-white-0 px-2.5 text-left text-paragraph-sm text-text-strong-950 ring-1 ring-inset ring-stroke-soft-200 transition-colors hover:bg-bg-weak-50"
       >
         <span className={cn("min-w-0 flex-1 truncate", !selected && "text-text-soft-400")}>
-          {selected ? label(selected) : "— direct connection —"}
+          {selected ? label(selected) : t("proxy.directConnection")}
         </span>
         <ChevronDownIcon
           className={cn("size-4 shrink-0 text-icon-soft-400 transition-transform", open && "rotate-180")}

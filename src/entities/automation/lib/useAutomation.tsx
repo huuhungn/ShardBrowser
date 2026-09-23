@@ -112,7 +112,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
   remove: async (p) => {
     const ok = await confirmModal({
       title: t("automation.deleteProject"),
-      message: `Delete "${p.name || "this project"}"? This cannot be undone.`,
+      message: t("automation.deleteProjectAsk", { name: p.name || t("automation.thisProject") }),
       buttons: [
         { label: t("common.cancel"), value: false },
         { label: t("common.delete"), value: true, danger: true },
@@ -144,7 +144,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       const report = await automationRun(p.id, profileId);
       set({ lastRun: report });
       // A run that ends early is not a success, even though the call returned.
-      if (report.ok) toast.ok(`Run finished in ${report.ms} ms`);
+      if (report.ok) toast.ok(t("automation.runFinishedMs", { ms: report.ms }));
       else toast.err(report.stopped_because || t("automation.runFailed"));
     } catch (e) {
       toast.err(String(e));

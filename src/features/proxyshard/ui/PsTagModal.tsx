@@ -15,7 +15,7 @@ export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose
     setBusy(true);
     try {
       await psSetTag(order.order_id, tag.trim() || "none");
-      toast.ok(`Tag updated for #${order.order_id}`);
+      toast.ok(t("ps.tagUpdatedFor", { id: order.order_id }));
       onDone();
     } catch (e) { toast.err(String(e)); }
     finally { setBusy(false); }
@@ -26,7 +26,7 @@ export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose
       onClose={onClose}
       icon={<EditIcon className="size-5" />}
       title={t("ps.editTag")}
-      subtitle={`${order.product_name} · order #${order.order_id}`}
+      subtitle={t("ps.productOrder", { product: order.product_name, id: order.order_id })}
       confirmLabel={busy ? "Saving…" : t("ps.save")}
       onConfirm={submit}
       isLoading={busy}

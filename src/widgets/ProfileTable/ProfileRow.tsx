@@ -177,7 +177,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
         </div>
         <div>
           <Checkbox
-            aria-label={`Select profile ${p.name}`}
+            aria-label={t("profileTable.selectProfile", { name: p.name })}
             checked={isSel}
             onChange={() => { if (!shiftPress.current) toggleSelect(p.id); }}
           />

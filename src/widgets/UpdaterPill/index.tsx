@@ -107,7 +107,7 @@ export function UpdaterPill() {
     phase === "checking"
       ? "checking for updates…"
       : phase === "available"
-        ? `Update available → ${info?.latest}`
+        ? t("updater.availableArrow", { v: String(info?.latest ?? "") })
         : phase === "downloading"
           ? percent === null
             ? "downloading update…"
@@ -128,7 +128,7 @@ export function UpdaterPill() {
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen(true)}
-        title={`ShardX Launcher update status: ${statusText}`}
+        title={t("updater.statusAria", { status: statusText })}
         className={cn(
           "flex w-full cursor-pointer items-center gap-2.5 rounded-lg border border-transparent bg-transparent px-2.5 py-2 text-left text-text-strong-950 transition-colors hover:bg-bg-weak-50",
           (phase === "available" || phase === "ready") &&
@@ -153,7 +153,7 @@ export function UpdaterPill() {
         <div className="flex flex-col gap-3 px-5 py-4" aria-busy={busy}>
           <div className="text-paragraph-sm text-text-sub-600">
             Installed v{info?.current ?? "…"}
-            {info?.latest ? ` · latest v${info.latest}` : ""}
+            {info?.latest ? t("updater.latestSuffix", { v: info.latest }) : ""}
           </div>
 
           {phase === "up_to_date" && (

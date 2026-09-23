@@ -194,7 +194,7 @@ host:8080               # no auth
                       <>
                         <Badge color="success" variant="filled" size="small" title={`TCP ${r.tcp_ms} ms`}>{t("proxy.active")}</Badge>
                         {r.entry.kind === "socks5" && r.udp_ms != null && (
-                          <Badge color="primary" variant="filled" size="small" title={`UDP relay works (${r.udp_ms} ms)`}>UDP</Badge>
+                          <Badge color="primary" variant="filled" size="small" title={t("proxy.udpRelayWorks", { ms: r.udp_ms })}>UDP</Badge>
                         )}
                         {r.country && (
                           <>

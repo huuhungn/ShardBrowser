@@ -236,7 +236,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
         // a legitimately running list out from under the user.
         if (consecutiveFailures === 3) {
           set({ running: {}, runningCdp: {} });
-          toast.err(`Lost track of running browsers: ${safeUiError(e)}`);
+          toast.err(t("profile.lostTrack", { err: safeUiError(e) }));
         }
       }
     };
@@ -277,7 +277,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       await devtoolsActivate(id);
       toast.ok(t("profile.verificationTabBroughtToFront"));
     } catch (e) {
-      toast.err(`Could not bring verification tab to front: ${safeUiError(e)}`);
+      toast.err(t("profile.couldNotFrontTab", { err: safeUiError(e) }));
     } finally {
       const n = new Set(get().verificationBusy);
       n.delete(id);
@@ -372,7 +372,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       set({ expanded: null, draft: null });
       get().reload();
       storeBus.emit("profiles");
-      toast.ok(draft.id ? t("profile.profileSaved") : `Created "${saved.name}"`);
+      toast.ok(draft.id ? t("profile.profileSaved") : t("profile.createdNamed", { name: saved.name }));
     } catch (e) {
       // Shown beside the form, where the offending field is. A toast as well
       // would be the same message twice, and it would scroll away from it.
@@ -465,7 +465,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       });
       if (passphrase === null) return;
       const res = await profileBackupCreate(p.id, path, passphrase);
-      toast.ok(`Backed up ${fmtBytes(res.file_bytes)} — SHA-256 ${res.sha256.slice(0, 12)}…`);
+      toast.ok(t("profile.backedUp", { size: fmtBytes(res.file_bytes), hash: res.sha256.slice(0, 12) }));
       const dir = path.replace(/[/\\][^/\\]*$/, "");
       try { await openPath(dir); } catch {}
     } catch (e) { toast.err(safeUiError(e)); }
@@ -516,9 +516,9 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       let passphrase = "";
       if (!useTeam.getState().status?.has_fleet_key) {
         const typed = await passphraseModal({
-          title: base === 0 ? t("profile.encryptProfileForTheTeam") : `Push over version ${base}`,
+          title: base === 0 ? t("profile.encryptProfileForTheTeam") : t("profile.pushOverVersion", { v: base }),
           message:
-            "Everyone who pulls this profile must enter the same passphrase. " +
+            t("profile.passphraseShared") +
             t("profile.itIsNotStoredAnywhereAndCannotBeRecove"),
           confirm: base === 0,
         });
@@ -526,7 +526,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
         passphrase = typed;
       }
       const res = await profileSyncPush(p.id, passphrase, base);
-      toast.ok(`Pushed version ${res.version} — ${fmtBytes(res.container_bytes)}`);
+      toast.ok(t("profile.pushedVersion", { v: res.version, size: fmtBytes(res.container_bytes) }));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
@@ -537,7 +537,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const remote = await profileSyncStatus(p.id);
       if (!remote) { toast.err(t("profile.theTeamServerHasNoSnapshotForThisProfi")); return; }
       if (!(await confirmModal({
-        title: `Pull version ${remote.version}`,
+        title: t("profile.pullVersion", { v: remote.version }),
         message:
           t("profile.thisReplacesTheCurrentProfileDataWithT") +
           t("profile.anythingNotInThatSnapshotIsLost"),
@@ -555,7 +555,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       }
       if (passphrase === null) return;
       const bytes = await profileSyncPull(p.id, passphrase);
-      toast.ok(`Pulled version ${remote.version} — ${fmtBytes(bytes)} restored`);
+      toast.ok(t("profile.pulledVersion", { v: remote.version, size: fmtBytes(bytes) }));
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
@@ -596,7 +596,11 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const p = get().profiles.find((x) => x.id === id);
     if (p && p.folder === f) {
       const who = p.name || id.slice(0, 8);
-      toast.info(f ? `"${who}" is already in "${f}"` : `"${who}" isn't in any folder`);
+      toast.info(
+        f
+          ? t("profile.alreadyInFolder", { who, folder: f })
+          : t("profile.notInAnyFolder", { who }),
+      );
       return;
     }
     try {
@@ -611,12 +615,14 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     const count = get().profiles.filter((p) => p.folder === f).length;
     // Three outcomes: delete profiles, unfile, cancel.
     const choice = await confirmModal({
-      title: `Delete folder "${f}"`,
+      title: t("profile.deleteFolderTitle", { f }),
       message:
         count > 0
-          ? `This folder has ${count} profile${count === 1 ? "" : "s"}. ` +
-            `Delete them too, or keep them (they move to t("profile.all"))?`
-          : `Delete the empty folder "${f}"?`,
+          ? t(count === 1 ? "profile.deleteFolderAskOne" : "profile.deleteFolderAskMany", {
+              n: count,
+              all: t("profile.all"),
+            })
+          : t("profile.deleteFolderEmpty", { f }),
       buttons:
         count > 0
           ? [
@@ -641,8 +647,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       get().reload();
       toast.ok(
         alsoDelete
-          ? `Deleted folder "${f}" + ${n} profile${n === 1 ? "" : "s"}`
-          : `Removed folder "${f}" (${n} profile${n === 1 ? "" : "s"} kept)`,
+          ? t(n === 1 ? "profile.deletedFolderOne" : "profile.deletedFolderMany", { f, n })
+          : t(n === 1 ? "profile.removedFolderOne" : "profile.removedFolderMany", { f, n }),
       );
     } catch (e) { toast.err(String(e)); }
   },
@@ -652,7 +658,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const meta = await profileCreateFromTemplate(tplId);
       set({ templatePickerOpen: false });
       get().reload();
-      toast.ok(`Profile "${meta.name}" created`);
+      toast.ok(t("profile.profileCreatedNamed", { name: meta.name }));
       // Auto-open the new profile in the editor.
       const stored = await profileGet(meta.id);
       set({ draft: fromStored(stored), expanded: meta.id });
@@ -690,8 +696,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (failures.length) {
       toast.err(
         failures.length === 1
-          ? `Could not start one browser: ${failures[0]}`
-          : `Could not start ${failures.length} browsers: ${failures[0]}`,
+          ? t("profile.couldNotStartOne", { err: failures[0] })
+          : t("profile.couldNotStartMany", { n: failures.length, err: failures[0] }),
       );
     }
   },
@@ -706,8 +712,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (failures.length) {
       toast.err(
         failures.length === 1
-          ? `Could not stop one browser: ${failures[0]}`
-          : `Could not stop ${failures.length} browsers: ${failures[0]}`,
+          ? t("profile.couldNotStopOne", { err: failures[0] })
+          : t("profile.couldNotStopMany", { n: failures.length, err: failures[0] }),
       );
     }
   },
@@ -717,7 +723,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (ids.length === 0) return;
     if ((await confirmModal({
       title: t("profile.deleteProfiles"),
-      message: `Move ${ids.length} profile${ids.length === 1 ? "" : "s"} to the trash? They can be restored there for 7 days.`,
+      message: t(ids.length === 1 ? "profile.trashAskOne" : "profile.trashAskMany", { n: ids.length }),
       danger: true,
     })) !== true) return;
     for (const id of ids) {
@@ -726,7 +732,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     get().clearSelected();
     get().reload();
     storeBus.emit("profiles");
-    toast.ok(`Moved ${ids.length} to the trash`);
+    toast.ok(t("profile.movedToTrashN", { n: ids.length }));
   },
 
   // Dump selected profile FingerprintConfigs as a JSON array to clipboard.
@@ -736,7 +742,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     try {
       const payloads = await Promise.all(ids.map((id) => profileGet(id)));
       await clip.write(JSON.stringify(payloads, null, 2));
-      toast.ok(`Copied ${payloads.length} to clipboard`);
+      toast.ok(t("common.copiedNToClipboard", { n: payloads.length }));
     } catch (e) { toast.err(String(e)); }
   },
 

@@ -98,7 +98,7 @@ export function ExtensionPicker({
         onClick={() => setOpen((v) => !v)}
         className="flex w-fit items-center gap-1.5 rounded-6 px-2 py-1 text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200 transition-colors hover:bg-bg-weak-50"
       >
-        {picked.length > 0 ? `Change · ${picked.length} of ${items.length}` : t("profile.chooseExtensions")}
+        {picked.length > 0 ? t("extensions.changeCount", { picked: picked.length, total: items.length }) : t("profile.chooseExtensions")}
         <ChevronDownIcon className={cn("size-3.5 transition-transform", open && "rotate-180")} />
       </button>
 
