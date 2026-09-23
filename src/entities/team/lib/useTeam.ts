@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { t } from "../../../shared/i18n";
 import { teamStatus } from "../model/api";
 import type { TeamStatus } from "../model/types";
 
@@ -39,10 +40,10 @@ export const canSyncProfiles = (s: TeamState) =>
  * discover that re-enrolling is what fixes it.
  */
 export const syncBlockedReason = (s: TeamState): string | undefined => {
-  if (!s.loaded) return "Checking team status…";
+  if (!s.loaded) return t("team.syncChecking");
   if (!s.status?.is_enrolled) return undefined;
   if (!s.status.can_sync) {
-    return "This device was enrolled before sync existed — re-enrol it in Settings";
+    return t("team.syncEnrolledBeforeSync");
   }
   return undefined;
 };

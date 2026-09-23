@@ -241,7 +241,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
               <div className="flex items-center gap-1">
                 <span className="text-label-base font-medium text-text-strong-900">{t("ps.sessionMode")}</span>
                 <Tooltip
-                  content="On Default, the session changes if the device does not respond for more than 5 seconds. On Static, the session does not change and waits for the device to return to the network."
+                  content={t("ps.sessionModeHelp")}
                   side="top"
                   className="left-20"
                 >

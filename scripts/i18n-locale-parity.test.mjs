@@ -327,6 +327,14 @@ function withoutCodeSamples(src) {
   return src.replace(/'[^'\n]*[{}[\]][^'\n]*'/g, "''");
 }
 
+/**
+ * An HTTP header name is not a sentence someone reads: "Accept-Language" is
+ * wire protocol, spelled exactly this way in the RFC, and translating it
+ * would break the request. Two capitalised words joined by a hyphen, no
+ * spaces, is the shape.
+ */
+const PROTOCOL_TOKEN = /^(?:[A-Z][a-z0-9]*-)+[A-Z][a-z0-9]*$/;
+
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
@@ -360,6 +368,17 @@ function englishInSource(src) {
       (bare.match(/[A-Za-z]{3,}/g) ?? []).length >= 3
     ) {
       found.push(bare);
+    }
+    // Prose that is returned or assigned rather than rendered: `return "Could
+    // not save"`, `=> "Remove this proxy"`, `const msg = "Nothing to import"`.
+    // The bare-line rule above cannot see these, because it rejects any line
+    // holding `=`, `(` or a quote — which every one of these forms has.
+    for (const m of s.matchAll(
+      /(?:=>|\breturn\b|\bthrow new [A-Za-z]+\(|=)\s*"([A-Z][a-zA-Z][\w ,.'’—–-]*[a-z.!?])"/g,
+    )) {
+      const v = m[1];
+      if (PROTOCOL_TOKEN.test(v)) continue;
+      if ((v.match(/[A-Za-z]{2,}/g) ?? []).length >= 3) found.push(v);
     }
     for (const m of s.matchAll(
       /(?:label|title|placeholder|confirmLabel|cancelLabel|aria-label|helperText|hint|tooltip|description|caption|subtitle|alt|emptyText|errorText|summary)="([^"]{3,})"/g,
@@ -498,6 +517,9 @@ test("no ternary or toast still holds its English", () => {
             // An IANA zone id — "Europe/Paris" — is the value the platform
             // expects, not a label; the UI shows the city from it separately.
             if (/^[A-Za-z]+\/[A-Za-z_]+(?:\/[A-Za-z_]+)?$/.test(text)) continue;
+            // An HTTP header name is wire protocol spelled exactly as the RFC
+            // has it — "Accept-Language" is sent, not shown.
+            if (PROTOCOL_TOKEN.test(text)) continue;
             // A string being compared against, or used as a fallback key, is a
             // value the code branches on — `platform === "Other"`. Translating
             // it would break the comparison; the label is translated where it
@@ -520,7 +542,11 @@ test("no ternary or toast still holds its English", () => {
 test("no screen still holds its English inline", () => {
   const offenders = [];
   for (const root of uiRoots) {
-    for (const file of tsxFilesUnder(root)) {
+    // A sentence assigned in a plain .ts module reaches a screen exactly like
+    // one written in JSX: `const msg = "Could not save"` is shown by whoever
+    // imports it. Reading only .tsx here left that whole half of the code
+    // unscanned.
+    for (const file of [...tsxFilesUnder(root), ...tsDataFilesUnder(root)]) {
       const src = readFileSync(file, "utf8");
       const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
       for (const text of englishInSource(src)) {
@@ -712,7 +738,22 @@ test("no translation is frozen at import time", () => {
         } while (d > 0 && j < lines.length);
         const beforeCall = body.split(/(?<![\w.])t\(/)[0];
         const callsT = /(?<![\w.])t\(\s*["'`]/.test(body);
-        const isFunction = /=>|\bfunction\b/.test(beforeCall);
+        // An arrow before the call usually means the text is built later, when
+        // the component draws. But an arrow that is *invoked at import time*
+        // freezes just as hard as a plain call: `(() => t("k"))()` and
+        // `list.map(() => t("k"))` both run now. Only a function that is
+        // merely defined defers anything.
+        // A zero-argument arrow that is immediately called, or a list built by
+        // mapping one, runs at import. An arrow that TAKES arguments is a
+        // callback someone else invokes later — a store's `(set, get) => ({…})`
+        // holds its t() calls inside action functions, which run on click.
+        // The closing `)()` sits AFTER the t( call, so beforeCall never holds
+        // it — the whole declaration has to be read to see the arrow is run.
+        const iife = /\(\s*\(\s*\)\s*=>[\s\S]*?\)\s*\(\s*\)/.test(body);
+        const mappedNow =
+          /\.\s*(?:map|flatMap|filter|forEach|reduce|from)\s*\(\s*\(\s*\)\s*=>/.test(beforeCall);
+        const invokedNow = iife || mappedNow;
+        const isFunction = /=>|\bfunction\b/.test(beforeCall) && !invokedNow;
         if (callsT && !isFunction) {
           frozen.push(`${where}:${i + 1}: ${lines[i].trim().slice(0, 70)}`);
         }
