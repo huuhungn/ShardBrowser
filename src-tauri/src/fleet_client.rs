@@ -112,7 +112,7 @@ impl FleetClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
-            .context("build HTTP client")?;
+            .context("could not start the network client")?;
         Ok(Self {
             http,
             base_url: base,
@@ -134,7 +134,7 @@ impl FleetClient {
         }
         let body = res.text().await.unwrap_or_default();
         let detail = body.chars().take(300).collect::<String>();
-        Err(anyhow!("{what} failed ({status}): {detail}"))
+        Err(anyhow!("the team server refused to {what} ({status}): {detail}"))
     }
 
     /// Register this device's signing key with the server.
@@ -165,12 +165,12 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("request enrollment challenge")?;
-        let challenge: EnrollmentChallenge = Self::ok_or_err(res, "enrollment challenge")
+            .context("could not reach the team server to register this device")?;
+        let challenge: EnrollmentChallenge = Self::ok_or_err(res, "register this device")
             .await?
             .json()
             .await
-            .context("decode enrollment challenge")?;
+            .context("the team server sent an unreadable reply while registering this device")?;
 
         let nonce = decode_hex32(&challenge.nonce, "challenge nonce")?;
         let challenge_id = decode_hex16(&challenge.challenge_id, "challenge_id")?;
@@ -202,13 +202,13 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("submit enrollment proof")?;
+            .context("could not reach the team server to finish registering this device")?;
 
-        Self::ok_or_err(res, "device enrollment")
+        Self::ok_or_err(res, "finish registering this device")
             .await?
             .json()
             .await
-            .context("decode enrolled device")
+            .context("the team server sent an unreadable reply after registering this device")
     }
 
     pub async fn server_identity(&self) -> Result<ServerIdentity> {
@@ -218,12 +218,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request server identity")?;
-        Self::ok_or_err(res, "server identity")
+            .context("could not reach the team server to check which server this is")?;
+        Self::ok_or_err(res, "say which server it is")
             .await?
             .json()
             .await
-            .context("decode server identity")
+            .context("the team server sent an unreadable reply about its identity")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -250,12 +250,12 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("request lease")?;
-        Self::ok_or_err(res, "acquire lease")
+            .context("could not reach the team server to claim this profile")?;
+        Self::ok_or_err(res, "claim this profile")
             .await?
             .json()
             .await
-            .context("decode lease")
+            .context("the team server sent an unreadable reply while claiming this profile")
     }
 
     pub async fn release_lease(&self, tenant_id: &str, lease_id: &str) -> Result<()> {
@@ -266,8 +266,8 @@ impl FleetClient {
             .json(&serde_json::json!({ "tenant_id": tenant_id, "lease_id": lease_id }))
             .send()
             .await
-            .context("release lease")?;
-        Self::ok_or_err(res, "release lease").await?;
+            .context("could not tell the team server this profile is free again")?;
+        Self::ok_or_err(res, "free this profile").await?;
         Ok(())
     }
 
@@ -278,12 +278,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request snapshot head")?;
-        Self::ok_or_err(res, "snapshot head")
+            .context("could not reach the team server to see what the team has published")?;
+        Self::ok_or_err(res, "say what the team has published")
             .await?
             .json()
             .await
-            .context("decode snapshot head")
+            .context("the team server sent an unreadable reply about what the team has published")
     }
 
     /// Download a published container in ranges.
@@ -316,12 +316,12 @@ impl FleetClient {
                 ])
                 .send()
                 .await
-                .context("request snapshot range")?;
-            let bytes = Self::ok_or_err(res, "download range")
+                .context("could not reach the team server to download this profile")?;
+            let bytes = Self::ok_or_err(res, "send this profile")
                 .await?
                 .bytes()
                 .await
-                .context("read snapshot range")?;
+                .context("the download from the team server broke off")?;
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
@@ -334,7 +334,7 @@ impl FleetClient {
         }
 
         if out.len() != total {
-            bail!("downloaded {} bytes, expected {total}", out.len());
+            bail!("the download from the team server is incomplete: got {} bytes, expected {total}", out.len());
         }
         Ok(out)
     }
@@ -357,12 +357,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request root key grants")?;
-        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "root key grants")
+            .context("could not reach the team server to fetch this device's account keys")?;
+        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "hand over this device's account keys")
             .await?
             .json()
             .await
-            .context("decode root key grants")?;
+            .context("the team server sent an unreadable reply about this device's account keys")?;
         Ok(body.grants)
     }
 
@@ -383,12 +383,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request fleet key grants")?;
-        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "fleet key grants")
+            .context("could not reach the team server to fetch this device's team keys")?;
+        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "hand over this device's team keys")
             .await?
             .json()
             .await
-            .context("decode fleet key grants")?;
+            .context("the team server sent an unreadable reply about this device's team keys")?;
         Ok(body.grants)
     }
 
@@ -458,7 +458,7 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("open upload session")?;
+            .context("could not reach the team server to begin the upload")?;
         Self::ok_or_err(open, "open upload").await?;
 
         // Staging failure leaves a session the server can discard; nothing is
@@ -489,13 +489,13 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("commit upload")?;
+            .context("could not reach the team server to publish the upload")?;
 
         let body: serde_json::Value = Self::ok_or_err(commit, "commit upload")
             .await?
             .json()
             .await
-            .context("decode commit response")?;
+            .context("the team server sent an unreadable reply after publishing")?;
 
         body.get("version")
             .and_then(|v| v.as_i64())
@@ -518,8 +518,8 @@ impl FleetClient {
                 .body(req.container[offset..end].to_vec())
                 .send()
                 .await
-                .context("send upload chunk")?;
-            Self::ok_or_err(res, "append chunk").await?;
+                .context("could not send part of this profile to the team server")?;
+            Self::ok_or_err(res, "accept part of this profile").await?;
             offset = end;
         }
         Ok(())
@@ -533,8 +533,8 @@ impl FleetClient {
             .json(&serde_json::json!({ "tenant_id": tenant_id, "session_id": session_id }))
             .send()
             .await
-            .context("abort upload")?;
-        Self::ok_or_err(res, "abort upload").await?;
+            .context("could not tell the team server to discard the failed upload")?;
+        Self::ok_or_err(res, "discard the failed upload").await?;
         Ok(())
     }
 
@@ -574,12 +574,12 @@ impl FleetClient {
 
 fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
-        bail!("{field}: must be 64 hex characters");
+        bail!("the team server sent a malformed {field}: expected 64 hex characters");
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!("{field}: not hex"))?;
+            .map_err(|_| anyhow!("the team server sent a malformed {field}: not hexadecimal"))?;
     }
     Ok(out)
 }
@@ -616,12 +616,12 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
-        bail!("{field}: must be 32 hex characters");
+        bail!("the team server sent a malformed {field}: expected 32 hex characters");
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!("{field}: not hex"))?;
+            .map_err(|_| anyhow!("the team server sent a malformed {field}: not hexadecimal"))?;
     }
     Ok(out)
 }
