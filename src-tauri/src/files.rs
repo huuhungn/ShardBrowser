@@ -50,6 +50,21 @@ fn resolve(rel: &str) -> Result<PathBuf> {
         bail!("a file path is required");
     }
 
+    // A Windows path is only made of components on Windows: parsed on Linux,
+    // `C:\Windows\System32` is one ordinary file name, backslashes and all,
+    // so the component walk below would wave it through. Reject the two
+    // Windows spellings by hand, on every platform, before parsing.
+    if rel.contains('\\') {
+        bail!("a file path must use '/' and stay inside the automation workspace: {rel}");
+    }
+    let names_a_drive = {
+        let b = rel.as_bytes();
+        b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    };
+    if names_a_drive {
+        bail!("a file path must be relative to the automation workspace: {rel}");
+    }
+
     let candidate = Path::new(rel);
     for part in candidate.components() {
         match part {
@@ -227,10 +242,15 @@ mod tests {
     #[test]
     fn a_project_cannot_name_an_absolute_path() {
         let (_g, _d) = scratch();
+        // Windows spellings must be refused on Linux too: a path is only
+        // parsed into components by the host's rules, so `C:\...` reaches a
+        // Linux build as one ordinary file name unless it is refused by hand.
         for path in [
             "/etc/passwd",
             r"C:\Windows\System32\drivers\etc\hosts",
+            r"c:/Windows/System32/drivers/etc/hosts",
             r"\\server\share\file.txt",
+            r"notes\..\..\escape.txt",
         ] {
             assert!(
                 write(path, "x").is_err(),
