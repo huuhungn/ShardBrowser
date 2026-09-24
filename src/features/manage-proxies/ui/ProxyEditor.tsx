@@ -99,7 +99,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
             <label className="flex flex-col gap-1">
               <span className="text-label-xs text-text-sub-600">
                 p0f signature · order #{orderId}
-                <span className="text-text-soft-400"> · current: {curSig || "none"}</span>
+                <span className="text-text-soft-400"> · {t("proxy.current")}: {curSig || t("common.none")}</span>
               </span>
               <CSSelect value={sig} onChange={setSig} options={psSignatures(t)} placeholder={t("proxy.donTChange")} />
             </label>

@@ -314,7 +314,18 @@ function escapeForRegExp(v) {
 
 /** What a scanner should actually read: no comments, no styling, one quote style. */
 function readable(src) {
-  return normalizeQuotes(withoutClassNames(withoutComments(withoutCodeSamples(src))));
+  return normalizeQuotes(
+    withoutShellCommands(withoutClassNames(withoutComments(withoutCodeSamples(src)))),
+  );
+}
+
+/**
+ * `<code>npm run build</code>` is an instruction to type, not a sentence to
+ * translate. Blank the span but keep its length, so offsets and the `=>`
+ * lookbehind further down still line up.
+ */
+function withoutShellCommands(src) {
+  return src.replace(/<code>[\s\S]*?<\/code>/g, (m) => " ".repeat(m.length));
 }
 
 /**
@@ -335,6 +346,14 @@ function withoutCodeSamples(src) {
  */
 const PROTOCOL_TOKEN = /^(?:[A-Z][a-z0-9]*-)+[A-Z][a-z0-9]*$/;
 
+/**
+ * A product name is not translated: "Chrome" is Chrome in every locale, and
+ * "ShardX Launcher v" is the name plus a version that follows it. Translating
+ * these would misname the thing on screen, so they are carved out by name
+ * rather than by shape — the list is short and deliberate.
+ */
+const PRODUCT_NAME = /^(?:Chrome|Chromium|ShardX|ProxyShard|ShardX Launcher v)$/;
+
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
@@ -347,8 +366,22 @@ function englishInSource(src) {
     // Short labels often share a line with their tag — `<div class=…>Notes</div>`
     // — so the bare-line rule above never sees them. A column heading that hid
     // behind its own className is still a word someone reads.
-    for (const m of s.matchAll(/>([A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?])</g)) {
-      found.push(m[1]);
+    // The run of text was required to reach `<` directly, so a label ending in
+    // an ellipsis, or followed by an interpolation — `>Connected · {email}<` —
+    // matched nothing and three sentences sat in the badge unread.
+    // `=>` ends in `>`, so `() => Promise<void>` looked like a tag holding the
+    // word "Promise". The lookbehind keeps a return type from reading as text.
+    // A status word is often lowercase -- `starting...`, `testing...` -- and a
+    // sentence can carry a symbol for a button it names, so the run may begin
+    // lowercase and hold glyphs like the refresh arrow.
+    // Arrow and guillemet glyphs decorate a button without being part of the
+    // word: `‹ Prev`, `Parse →`. They sat outside the character class, so the
+    // run never started or never finished and the label went unread.
+    for (const m of s.matchAll(
+      /(?<![=-])>\s*([‹›←→«»]?\s*[A-Za-z][a-zA-Z][\w ,.'’·—–↻✓✗-]*?[a-z.!?…·—]\s*[‹›←→«»]?)\s*(?:\{|<)/g,
+    )) {
+      const text = m[1].trim();
+      if (!PRODUCT_NAME.test(text)) found.push(text);
     }
     // A paragraph long enough to wrap, with a <strong> inside it, matches none
     // of the rules above: the tag breaks the bare-line shape, and each

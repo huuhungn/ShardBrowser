@@ -14,7 +14,7 @@ export function FingerprintCardActions({ entry }: { entry: FingerprintEntry }) {
         Use →
       </Button>
       {entry.builtin ? (
-        <Badge color="gray" variant="lighter" size="small" className="ml-auto">built-in</Badge>
+        <Badge color="gray" variant="lighter" size="small" className="ml-auto">{t("fp.builtIn")}</Badge>
       ) : (
         <Button variant="error" mode="stroke" size="2xsmall" onClick={() => remove(entry.id)} title={t("fp.remove")}>
           ✕

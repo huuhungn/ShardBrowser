@@ -169,7 +169,7 @@ export function PsBuyCard() {
     <div className="mb-3.5 rounded-lg bg-bg-white-0 p-[18px] shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
       <h3 className="m-0 mb-2 text-label-sm text-text-strong-950">{t("ps.buyProxies")}</h3>
       {!ready ? (
-        <p className="m-0 text-paragraph-xs text-text-soft-400">Loading products…</p>
+        <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.loadingProducts")}</p>
       ) : options.length === 0 ? (
         <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.nothingAvailableToBuyRightNow")}</p>
       ) : (
@@ -239,7 +239,7 @@ export function PsBuyCard() {
                 <span className="text-title-h6 text-text-strong-950">{fmtCents(calc.total_with_addons ?? calc.final_price)}</span>
                 {calc.discount_percent > 0 && <Badge color="success" variant="lighter" size="small">-{calc.discount_percent}%</Badge>}
                 {!!calc.addons_price && calc.addons_price > 0 && (
-                  <span className="text-paragraph-xs text-text-soft-400">incl. {fmtCents(calc.addons_price)} p0f</span>
+                  <span className="text-paragraph-xs text-text-soft-400">{t("ps.inclAddons", { amount: fmtCents(calc.addons_price) })}</span>
                 )}
               </span>
             )}

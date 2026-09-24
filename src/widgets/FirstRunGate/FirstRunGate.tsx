@@ -120,7 +120,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
           </>
         )}
         {!prog && !err && (
-          <div className="text-paragraph-xs text-text-soft-400">Contacting CDN…</div>
+          <div className="text-paragraph-xs text-text-soft-400">{t("firstRun.contactingCdn")}</div>
         )}
         {err && (
           <div className="mt-3">

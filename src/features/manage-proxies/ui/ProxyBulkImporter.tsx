@@ -88,7 +88,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-end gap-2">
           <Button variant="neutral" mode="stroke" size="small" onClick={onClose}>{t("proxy.cancel")}</Button>
           {rows.length === 0 ? (
-            <Button variant="primary" mode="filled" size="small" onClick={parse}>Parse →</Button>
+            <Button variant="primary" mode="filled" size="small" onClick={parse}>{t("proxies.bulk.parse")}</Button>
           ) : (
             <Button variant="primary" mode="filled" size="small" onClick={saveSelected}>
               Import {selCount}
@@ -138,7 +138,7 @@ host:8080               # no auth
                 }
               />
               <div className="ml-auto flex gap-1.5">
-                <Button variant="neutral" mode="stroke" size="2xsmall" onClick={() => setRows([])}>← Back</Button>
+                <Button variant="neutral" mode="stroke" size="2xsmall" onClick={() => setRows([])}>{t("proxies.bulk.back")}</Button>
                 <Button
                   variant="neutral"
                   mode="stroke"
@@ -190,7 +190,7 @@ host:8080               # no auth
                   </span>
                   <div className="inline-flex items-center justify-end gap-1.5">
                     {r.status === "idle" && <span className="text-text-soft-400">{t("proxy.notTested")}</span>}
-                    {r.status === "testing" && <span className="text-text-soft-400">testing…</span>}
+                    {r.status === "testing" && <span className="text-text-soft-400">{t("proxy.test.testing")}</span>}
                     {r.status === "ok" && (
                       <>
                         <Badge color="success" variant="filled" size="small" title={`TCP ${r.tcp_ms} ms`}>{t("proxy.active")}</Badge>

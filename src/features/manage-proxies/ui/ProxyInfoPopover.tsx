@@ -8,9 +8,9 @@ import {
 import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { toast } from "../../../shared/model/toast";
 import { fmtTs, safeUiError } from "../../../shared/lib/utils";
+import { useT } from "../../../shared/i18n";
 import type { ProxyEntry, ProxyTestSnapshot } from "../../../entities/proxy";
 import { proxyHistory } from "../../../entities/proxy";
-import { t } from "../../../shared/i18n";
 
 /// Proxy detail popover: latest IP/geo + UDP + IP-change history.
 export function ProxyInfoPopover({
@@ -21,6 +21,7 @@ export function ProxyInfoPopover({
   latest?: ProxyTestSnapshot;
   onClose: () => void;
 }) {
+  const t = useT();
   const [history, setHistory] = useState<ProxyTestSnapshot[]>([]);
   useEffect(() => {
     proxyHistory(proxy.id)
@@ -90,10 +91,10 @@ export function ProxyInfoPopover({
             </div>
           </>
         ) : (
-          <div className="text-paragraph-xs text-text-soft-400">Not tested yet — click ↻ on the row.</div>
+          <div className="text-paragraph-xs text-text-soft-400">{t("proxies.info.notTested")}</div>
         )}
       </div>
-      <div className="border-b border-t border-stroke-soft-200 bg-bg-weak-50 px-4 py-2 text-center text-subheading-2xs text-text-soft-400">IP HISTORY</div>
+      <div className="border-b border-t border-stroke-soft-200 bg-bg-weak-50 px-4 py-2 text-center text-subheading-2xs text-text-soft-400">{t("proxies.info.ipHistory")}</div>
       <div className="flex-1 overflow-y-auto py-1">
         {history.length === 0 && <div className="px-4 py-2.5 text-paragraph-xs text-text-soft-400">{t("proxy.noHistoryYet")}</div>}
         {history.map((s, i) => (
