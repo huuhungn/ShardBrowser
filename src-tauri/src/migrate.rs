@@ -111,7 +111,7 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
         done += 1;
         // One event per file is noise on a profile with ten thousand cache
         // entries; the bar only needs to move.
-        if done % 25 == 0 || done == total {
+        if done.is_multiple_of(25) || done == total {
             emit(
                 app,
                 Progress {

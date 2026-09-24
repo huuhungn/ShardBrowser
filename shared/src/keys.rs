@@ -153,6 +153,18 @@ pub fn unwrap_dek(
     Ok(Zeroizing::new(arr))
 }
 
+/// Fill `out` with OS entropy.
+///
+/// Callers generate key seeds with this rather than reaching for a random
+/// source of their own. Uses the unconditional `getrandom` 0.4 dependency:
+/// the 0.2 one is Windows-only here, and key generation is not.
+///
+/// A failure means the OS entropy source is unavailable. That is not
+/// recoverable and must never fall back to a weaker source.
+pub fn fill_random(out: &mut [u8]) -> Result<(), getrandom04::Error> {
+    getrandom04::fill(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,16 +356,4 @@ mod tests {
         assert_ne!(a, b, "two draws must not be identical");
         assert_ne!(a, [0u8; 32], "must not return all zeroes");
     }
-}
-
-/// Fill `out` with OS entropy.
-///
-/// Callers generate key seeds with this rather than reaching for a random
-/// source of their own. Uses the unconditional `getrandom` 0.4 dependency:
-/// the 0.2 one is Windows-only here, and key generation is not.
-///
-/// A failure means the OS entropy source is unavailable. That is not
-/// recoverable and must never fall back to a weaker source.
-pub fn fill_random(out: &mut [u8]) -> Result<(), getrandom04::Error> {
-    getrandom04::fill(out)
 }

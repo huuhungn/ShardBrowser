@@ -1090,6 +1090,9 @@ async fn begin_generation(
     v["generation"].as_u64().expect("generation number")
 }
 
+// A grant is signed over all eight of these fields; grouping them into a
+// struct here would only move the same list one level down.
+#[allow(clippy::too_many_arguments)]
 fn grant_record(
     sk: &Ed25519SigningKey,
     tenant: [u8; 16],

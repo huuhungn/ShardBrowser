@@ -1589,6 +1589,12 @@ mod automation_endpoint_tests {
     //! Requests go through `tower`'s `oneshot` rather than a socket: same
     //! router, same middleware, no port to race over.
 
+    // The scratch store is shared, so a std Mutex serialises these tests and
+    // the guard is held across their awaits on purpose. An async-aware lock
+    // would let them interleave over the same store, which is the race this
+    // guard exists to prevent.
+    #![allow(clippy::await_holding_lock)]
+
     use super::router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

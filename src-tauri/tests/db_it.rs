@@ -5,6 +5,11 @@
 //! shows: a parameter that never reaches the statement, a variable that is
 //! written but not readable by the next block, or a result that comes back in
 //! a shape the following block cannot use.
+// These tests share one scratch directory, so a std Mutex serialises them. The
+// guard is deliberately held across the awaits inside each test: that is what
+// stops a second test from entering the directory mid-run. An async-aware lock
+// would let them interleave, which is the bug this guard exists to prevent.
+#![allow(clippy::await_holding_lock)]
 
 use serde_json::{json, Value};
 use shardx_launcher_lib::automation::{Block, Branch, Project, RunSettings};

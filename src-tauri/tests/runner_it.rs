@@ -367,13 +367,12 @@ fn start_server() -> Server {
                 "/api/broken" => ("500 Internal Server Error", "{\"ok\":false}".to_string()),
                 _ => (
                     "200 OK",
-                    format!(
-                        "<!doctype html><meta charset=\"utf-8\"><title>traffic</title>\
+                    "<!doctype html><meta charset=\"utf-8\"><title>traffic</title>\
                          <h1 id=\"title\">ready</h1>\
                          <script>\
-                           fetch('/api/ok').then(() => {{ document.title = 'fetched'; }});\
+                           fetch('/api/ok').then(() => { document.title = 'fetched'; });\
                          </script>"
-                    ),
+                        .to_string(),
                 ),
             };
 

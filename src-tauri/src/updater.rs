@@ -90,7 +90,7 @@ pub async fn launcher_update_download(
     let update = {
         let mut state = lock_pending(&pending)?;
         if state.downloading {
-            return Err(crate::errcode::code("updater.downloadInProgress").into());
+            return Err(crate::errcode::code("updater.downloadInProgress"));
         }
         let update = state
             .update
@@ -137,7 +137,7 @@ pub fn launcher_update_install(pending: State<'_, PendingUpdate>) -> Result<(), 
     let (update, bytes) = {
         let mut state = lock_pending(&pending)?;
         if state.downloading {
-            return Err(crate::errcode::code("updater.waitForDownload").into());
+            return Err(crate::errcode::code("updater.waitForDownload"));
         }
         let update = state
             .update
@@ -147,7 +147,7 @@ pub fn launcher_update_install(pending: State<'_, PendingUpdate>) -> Result<(), 
             Some(bytes) => bytes,
             None => {
                 state.update = Some(update);
-                return Err(crate::errcode::code("updater.downloadBeforeInstall").into());
+                return Err(crate::errcode::code("updater.downloadBeforeInstall"));
             }
         };
         (update, bytes)

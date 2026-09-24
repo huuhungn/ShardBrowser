@@ -289,8 +289,10 @@ pub fn ensure_icon(cache_dir: &Path, name: &str, color: Option<&str>) -> Result<
     let (body, (x0, y0, x1, y1)) = body_path(&g).context("body path")?;
     let cx = (x0 + x1) / 2.0;
 
-    let mut paint = Paint::default();
-    paint.anti_alias = true;
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Default::default()
+    };
 
     // Shadow (macOS only): stacked offset copies at low alpha — tiny-skia has
     // no blur, and at icon sizes the stack is indistinguishable.
@@ -392,10 +394,11 @@ fn mark_pixmap() -> Option<&'static Pixmap> {
                 return None;
             }
             buf.truncate(info.buffer_size());
-            for px in buf.chunks_exact_mut(4) {
+            let (chunks, _) = buf.as_chunks_mut::<4>();
+            for px in chunks {
                 let a = px[3] as u32;
-                for c in 0..3 {
-                    px[c] = ((px[c] as u32 * a + 127) / 255) as u8;
+                for c in px.iter_mut().take(3) {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
                 }
             }
             Pixmap::from_vec(buf, tiny_skia::IntSize::from_wh(info.width, info.height)?)
