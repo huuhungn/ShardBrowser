@@ -75,7 +75,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
         setPassword(p);
         if (!p) setPwErr(t("ps.theAPIDidnTReturnAResidentialPasswordF"));
       })
-      .catch((e) => setPwErr(String(e)));
+      .catch((e) => setPwErr(safeUiError(e)));
     psCountries(pt)
       .then((r) => setCountries(r.results ?? []))
       .catch((e) => toast.err(safeUiError(e)));

@@ -12,12 +12,12 @@ export function PsConnectionBadge({ status, me, err, hasKey }: {
 }) {
   return (
     <div className="mt-2.5 min-h-[22px]">
-      {status === "checking" && <span className="text-paragraph-xs text-text-soft-400">Validating…</span>}
+      {status === "checking" && <span className="text-paragraph-xs text-text-soft-400">{t("ps.validating")}</span>}
       {status === "ok" && me && (
-        <Badge color="success" variant="filled" size="small" dot>Connected · {me.email}</Badge>
+        <Badge color="success" variant="filled" size="small" dot>{t("ps.connectedAs", { email: me.email })}</Badge>
       )}
       {status === "err" && (
-        <Badge color="error" variant="filled" size="small" dot title={safeUiError(err)}>Not connected — {safeUiError(err)}</Badge>
+        <Badge color="error" variant="filled" size="small" dot title={safeUiError(err)}>{t("ps.notConnectedReason", { error: safeUiError(err) })}</Badge>
       )}
       {status === "idle" && !hasKey && <span className="text-paragraph-xs text-text-soft-400">{t("ps.noKeySetYet")}</span>}
     </div>

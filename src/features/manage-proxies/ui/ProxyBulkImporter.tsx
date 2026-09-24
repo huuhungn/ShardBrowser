@@ -44,7 +44,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
           : r,
       ));
     } catch (e) {
-      setRows((rs) => rs.map((r, i) => i === idx ? { ...r, status: "fail", error: String(e) } : r));
+      setRows((rs) => rs.map((r, i) => i === idx ? { ...r, status: "fail", error: safeUiError(e) } : r));
     }
   };
 
