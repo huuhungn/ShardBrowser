@@ -11,6 +11,40 @@ sorted by that, not by wording.
 | label | 13 | a .context() breadcrumb naming a step, printed behind the real error |
 | internal | 4 | an invariant the operator cannot act on |
 
+## Correction: the "label" and "internal" verdicts were wrong
+
+The two verdicts below were built on the belief that a `.context()`
+breadcrumb is printed *behind* the real error. It is not. `anyhow`'s
+`Display` prints **only the outermost context**, and `{:#}` prints the
+chain outermost-first. Every caller that reports with `e.to_string()`
+— `automation_run`, the Tauri commands, the toast path — therefore
+shows the breadcrumb *instead of* the cause, not after it.
+
+Re-tracing each one to its exit:
+
+| string | verdict | why |
+| --- | --- | --- |
+| cdp.rs, all 10 | translate | done; shipped in #64 |
+| cookies.rs, 3 | translate | `read_key` → `os_crypt_key` → `export` → `cookies_export`, all bare `?`; the breadcrumb is what the operator reads |
+| mcp_setup.rs, 2 | translate | `download_mcp` → `mcp_download` → `.map_err(|e| e.to_string())` |
+| profile_icon.rs, 2 | translate | `ensure_icon` → `launch`, which is a toast path |
+| gpu_caps.rs, 1 | translate | done below, with the other 7 |
+| sync_bus.rs, 1 | leave | logged at startup, never shown; the only true label |
+| fleet_client.rs, 2 | **bug, not a label** | see below |
+
+`fleet_client.rs` was not a wording problem. `ok_or_err(res, key)` and
+`decode_hex32(s, field)` both expect a **locale key**, and three call
+sites passed an English phrase instead: `"open upload"`, `"commit
+upload"`, `"challenge nonce"`. The first two became `[[shardx:open
+upload|...]]`, a marker with no entry, so the operator read the raw
+marker; the third was spliced into `{field}` of an already-translated
+sentence, leaving English inside Vietnamese. Fixed with real keys, and
+the nonce one nests a marker so the inner label is translated too.
+
+So of the 11 remaining "labels", 9 needed translating, 1 is a genuine
+label, and 2 were bugs. The verdict counts in the table above are kept
+as first written, to show what the heuristic got wrong.
+
 ## Worth translating
 
 ### db.rs (10)
