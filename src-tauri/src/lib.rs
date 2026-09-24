@@ -8,7 +8,7 @@ pub mod cdp;
 mod codex_mcp;
 mod cookies;
 pub mod db;
-mod errcode;
+pub mod errcode;
 mod extensions;
 pub mod files;
 mod fingerprints;

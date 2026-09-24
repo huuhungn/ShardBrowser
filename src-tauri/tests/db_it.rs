@@ -200,9 +200,12 @@ async fn a_query_that_finds_nothing_can_fail_the_run() {
         .find(|s| s.block_id == "read")
         .expect("the query step");
     let error = failed.error.clone().unwrap_or_default();
+    // The step reports an error code so the interface can translate it;
+    // resolve it back to check the operator is still told what was missing.
+    let english = shardx_launcher_lib::errcode::resolve_to_english(&error);
     assert!(
-        error.contains("fewer than"),
-        "the error should say what was missing: {error}"
+        english.contains("fewer than"),
+        "the error should say what was missing: {english}"
     );
 }
 
