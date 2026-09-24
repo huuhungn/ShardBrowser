@@ -547,7 +547,10 @@ async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
         .unwrap();
     let lease_status = lease_res.status();
     let lease_body = lease_res.text().await.unwrap();
-    assert!(lease_status.is_success(), "lease ({lease_status}): {lease_body}");
+    assert!(
+        lease_status.is_success(),
+        "lease ({lease_status}): {lease_body}"
+    );
     let lease: Value = serde_json::from_str(&lease_body).unwrap();
     let fencing = lease["fencing_token"].as_i64().unwrap();
 
@@ -573,7 +576,11 @@ async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
         .send()
         .await
         .unwrap();
-    assert!(open.status().is_success(), "open upload: {}", open.text().await.unwrap());
+    assert!(
+        open.status().is_success(),
+        "open upload: {}",
+        open.text().await.unwrap()
+    );
 
     let chunk = cl
         .post(format!(
@@ -587,7 +594,11 @@ async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
         .send()
         .await
         .unwrap();
-    assert!(chunk.status().is_success(), "chunk: {}", chunk.text().await.unwrap());
+    assert!(
+        chunk.status().is_success(),
+        "chunk: {}",
+        chunk.text().await.unwrap()
+    );
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -638,13 +649,15 @@ async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
 
     let published: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(published["version"].as_i64(), Some(1));
-
 }
 
 /// A lease targets an existing profile, so create the fleet and profile rows
 /// the way tenant provisioning would.
 async fn seed_profile(data: &std::path::Path, fleet: &[u8; 16], profile: &[u8; 16]) {
-    let url = format!("sqlite://{}/shardx.db", data.display().to_string().replace('\\', "/"));
+    let url = format!(
+        "sqlite://{}/shardx.db",
+        data.display().to_string().replace('\\', "/")
+    );
     let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
     pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
 
@@ -1046,7 +1059,6 @@ fn enrollment_proof_bytes(
     ]))
 }
 
-
 /// Build a signed tenant-root-key-grant record.
 ///
 /// The field set matches what the server reads out of the signed container; a
@@ -1305,7 +1317,10 @@ async fn a_filed_root_key_grant_comes_back_sealed_to_its_device() {
         .unwrap();
     let filed_status = filed.status().as_u16();
     let filed_body = filed.text().await.unwrap();
-    assert_eq!(filed_status, 201, "grant should be filed, got: {filed_body}");
+    assert_eq!(
+        filed_status, 201,
+        "grant should be filed, got: {filed_body}"
+    );
 
     // Read it back through the collection endpoint.
     let listed_resp = cl
@@ -1379,7 +1394,6 @@ async fn a_filed_root_key_grant_comes_back_sealed_to_its_device() {
         "a non-member must not read a tenant's root key grants"
     );
 }
-
 
 /// The replay ledger must accept root key grants, and refuse a real replay.
 ///
@@ -1537,12 +1551,10 @@ async fn a_root_key_grant_replay_id_is_claimed_exactly_once() {
         .filter(|g| g["grant_variant"] == "CustodianIssued")
         .count();
     assert_eq!(
-        custodian_grants,
-        1,
+        custodian_grants, 1,
         "a refused replay must not leave a second grant behind"
     );
 }
-
 
 /// An unknown grant variant is refused with a clear error.
 ///
@@ -1621,7 +1633,6 @@ async fn an_unknown_grant_variant_is_refused_before_it_reaches_the_database() {
         "the error should name the offending field, got: {body}"
     );
 }
-
 
 /// A grant naming a generation the tenant never created must be refused.
 ///
@@ -1814,7 +1825,10 @@ async fn a_generation_cannot_activate_without_a_grant() {
         .unwrap();
     let status = res.status().as_u16();
     let body = res.text().await.unwrap();
-    assert_eq!(status, 409, "activation without a grant should conflict: {body}");
+    assert_eq!(
+        status, 409,
+        "activation without a grant should conflict: {body}"
+    );
     assert!(
         body.contains("no root key grant on file"),
         "the refusal should explain what is missing, got: {body}"
@@ -1834,7 +1848,10 @@ async fn a_generation_cannot_activate_without_a_grant() {
         .json()
         .await
         .unwrap();
-    assert_eq!(active["active"], false, "no generation should be active yet");
+    assert_eq!(
+        active["active"], false,
+        "no generation should be active yet"
+    );
 }
 
 /// An outsider cannot create a generation for a tenant they do not belong to.
@@ -1884,7 +1901,6 @@ async fn an_outsider_cannot_begin_a_generation() {
         res.status()
     );
 }
-
 
 /// A grant must wrap the key its generation actually commits to.
 ///
@@ -1938,8 +1954,7 @@ async fn a_grant_wrapping_a_different_key_than_its_generation_is_refused() {
         subject_device_id: device_id.clone().try_into().unwrap(),
         recipient_hpke_key_id: shared::keys::hpke_key_id(&device_hpke_pk),
     };
-    let sealed =
-        shared::grants::seal_trk(&device_hpke_pk, &scope, &other_trk).expect("seal");
+    let sealed = shared::grants::seal_trk(&device_hpke_pk, &scope, &other_trk).expect("seal");
     let record = grant_record(
         &sk_a,
         TENANT_A,
@@ -1969,7 +1984,10 @@ async fn a_grant_wrapping_a_different_key_than_its_generation_is_refused() {
 
 /// Insert a fleet row the way tenant provisioning would.
 async fn seed_fleet(data: &std::path::Path, fleet: &[u8; 16]) {
-    let url = format!("sqlite://{}/shardx.db", data.display().to_string().replace('\\', "/"));
+    let url = format!(
+        "sqlite://{}/shardx.db",
+        data.display().to_string().replace('\\', "/")
+    );
     let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
     pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
     sqlx::query(
@@ -2025,10 +2043,7 @@ fn fleet_grant_record_with_capability(
         ("fleet_id", c::Value::Bytes(scope.fleet_id.to_vec())),
         ("fkek_key_id", c::Value::Bytes(scope.fkek_key_id.to_vec())),
         ("generation", c::Value::Uint(scope.generation)),
-        (
-            "grant_capability",
-            c::Value::Text(capability.to_string()),
-        ),
+        ("grant_capability", c::Value::Text(capability.to_string())),
         (
             "subject_account_id",
             c::Value::Bytes(scope.subject_account_id.to_vec()),
@@ -2047,7 +2062,9 @@ fn fleet_grant_record_with_capability(
         ),
         (
             "hpke_suite_id",
-            c::Value::Uint(shared::grants::HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305 as u64),
+            c::Value::Uint(
+                shared::grants::HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305 as u64,
+            ),
         ),
         (
             "hpke_info_bytes",
@@ -2134,7 +2151,14 @@ async fn fleet_fixture(
     // way a real tenant would: begin, file the first self grant, activate.
     let tenant_hex = hex(&TENANT_A);
     let trk: [u8; 32] = [0x7Cu8; 32];
-    let root_gen = begin_generation(cl, port, &admin, &tenant_hex, &shared::keys::root_key_id(&trk)).await;
+    let root_gen = begin_generation(
+        cl,
+        port,
+        &admin,
+        &tenant_hex,
+        &shared::keys::root_key_id(&trk),
+    )
+    .await;
     let root_scope = shared::grants::GrantScope {
         replay_id: [0x51u8; 16],
         tenant_id: TENANT_A,
@@ -2172,7 +2196,11 @@ async fn fleet_fixture(
         .send()
         .await
         .unwrap();
-    assert_eq!(activated.status().as_u16(), 200, "root generation must activate");
+    assert_eq!(
+        activated.status().as_u16(),
+        200,
+        "root generation must activate"
+    );
 
     (
         admin,
@@ -2242,7 +2270,10 @@ async fn a_fleet_key_grant_round_trips_to_its_device() {
         .unwrap();
     let filed_status = filed.status().as_u16();
     let filed_body = filed.text().await.unwrap();
-    assert_eq!(filed_status, 200, "filing the fleet grant failed: {filed_body}");
+    assert_eq!(
+        filed_status, 200,
+        "filing the fleet grant failed: {filed_body}"
+    );
 
     let listed: Value = cl
         .get(format!(
@@ -2344,7 +2375,8 @@ async fn a_fleet_generation_cannot_activate_without_a_self_grant() {
 #[tokio::test]
 async fn a_fleet_grant_wrapping_a_different_key_is_refused() {
     let port = 38133u16;
-    let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-mismatch-{}", std::process::id()));
+    let data =
+        std::env::temp_dir().join(format!("shardx-e2e-fleet-mismatch-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let cl = client();
     wait_health(&cl, port).await;
@@ -2437,13 +2469,7 @@ async fn the_first_fleet_grant_must_be_a_unique_self_grant() {
 
     // A custodian-issued grant cannot come first: nothing has proven the key is
     // recoverable yet.
-    let premature = fleet_grant_record(
-        &sk_a,
-        &scope,
-        &sealed,
-        subject_key_id,
-        "DeviceHpkeGrant",
-    );
+    let premature = fleet_grant_record(&sk_a, &scope, &sealed, subject_key_id, "DeviceHpkeGrant");
     let resp = cl
         .post(format!("{}/v2/fleet-key-grants", base(port)))
         .bearer_auth(&admin)

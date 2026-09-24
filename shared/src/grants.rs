@@ -705,12 +705,25 @@ mod tests {
 
         let sealed = seal_trk(&pk, &scope, &trk).expect("seal");
 
-        let via_scope = open_trk(&sk, &scope, &sealed.encapped_key_bytes, &sealed.ciphertext_bytes)
-            .expect("open via scope");
+        let via_scope = open_trk(
+            &sk,
+            &scope,
+            &sealed.encapped_key_bytes,
+            &sealed.ciphertext_bytes,
+        )
+        .expect("open via scope");
         let info = root_grant_info(&scope);
-        assert_eq!(info, sealed.hpke_info_bytes, "sealed record must carry the same info");
-        let via_info = open_trk_with_info(&sk, &info, &sealed.encapped_key_bytes, &sealed.ciphertext_bytes)
-            .expect("open via info");
+        assert_eq!(
+            info, sealed.hpke_info_bytes,
+            "sealed record must carry the same info"
+        );
+        let via_info = open_trk_with_info(
+            &sk,
+            &info,
+            &sealed.encapped_key_bytes,
+            &sealed.ciphertext_bytes,
+        )
+        .expect("open via info");
 
         assert_eq!(&via_scope[..], &trk[..]);
         assert_eq!(&via_info[..], &via_scope[..]);
@@ -721,7 +734,13 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 0x01;
         assert!(
-            open_trk_with_info(&sk, &bad, &sealed.encapped_key_bytes, &sealed.ciphertext_bytes).is_err(),
+            open_trk_with_info(
+                &sk,
+                &bad,
+                &sealed.encapped_key_bytes,
+                &sealed.ciphertext_bytes
+            )
+            .is_err(),
             "altered info must not open the grant"
         );
     }

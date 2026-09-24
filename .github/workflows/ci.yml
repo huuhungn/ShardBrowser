@@ -138,6 +138,18 @@ jobs:
 
       - name: Set up Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # Cheap and first: a formatting slip is reported in seconds rather than
+      # after the Tauri dependencies, the build, and the browser download.
+      # Covers every crate in the tree, since each has its own manifest.
+      - name: Rust formatting
+        run: |
+          cargo fmt --check --manifest-path src-tauri/Cargo.toml
+          cargo fmt --check --manifest-path shared/Cargo.toml
+          cargo fmt --check --manifest-path server/Cargo.toml
+          cargo fmt --check --manifest-path sdks/rust/Cargo.toml
 
       - name: Install Tauri build dependencies
         run: |

@@ -72,10 +72,7 @@ impl std::fmt::Display for FleetError {
             Self::AlreadyLeased => write!(f, "profile is already checked out"),
             Self::NoSuchLease => write!(f, "no live lease with that id"),
             Self::LeaseExpired => write!(f, "lease has expired"),
-            Self::StaleFencingToken {
-                presented,
-                current,
-            } => write!(
+            Self::StaleFencingToken { presented, current } => write!(
                 f,
                 "stale fencing token: presented {presented}, live lease holds {current}"
             ),
@@ -84,13 +81,15 @@ impl std::fmt::Display for FleetError {
                 "version conflict: commit is based on {base}, profile is at {current}"
             ),
             Self::SessionNotOpen => write!(f, "upload session is not open"),
-            Self::SizeMismatch { declared, received } => write!(
-                f,
-                "size mismatch: declared {declared}, received {received}"
-            ),
+            Self::SizeMismatch { declared, received } => {
+                write!(f, "size mismatch: declared {declared}, received {received}")
+            }
             Self::ContentHashMismatch => write!(f, "staged content hash does not match manifest"),
             Self::ChunkOutOfOrder { expected, got } => {
-                write!(f, "chunk out of order: expected offset {expected}, got {got}")
+                write!(
+                    f,
+                    "chunk out of order: expected offset {expected}, got {got}"
+                )
             }
             Self::DeclaredSizeExceeded { declared, would_be } => write!(
                 f,
@@ -688,11 +687,7 @@ pub async fn resolve_download(
 ///
 /// Downloads are ranged so a large profile never has to be held in memory on
 /// either side. The caller loops until it has `container_size` bytes.
-pub async fn read_range(
-    path: &Path,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>, FleetError> {
+pub async fn read_range(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, FleetError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let mut f = tokio::fs::File::open(path)
@@ -861,7 +856,11 @@ mod tests {
             .unwrap();
         }
 
-        Harness { db, root, _dir: dir }
+        Harness {
+            db,
+            root,
+            _dir: dir,
+        }
     }
 
     struct ManifestOwned {
@@ -959,7 +958,15 @@ mod tests {
         offset: i64,
         bytes: &[u8],
     ) -> Result<i64, FleetError> {
-        append_chunk(&h.db, &TENANT, &session, offset, bytes, "2026-09-02T00:00:01+00:00").await
+        append_chunk(
+            &h.db,
+            &TENANT,
+            &session,
+            offset,
+            bytes,
+            "2026-09-02T00:00:01+00:00",
+        )
+        .await
     }
 
     async fn commit_at(
@@ -968,7 +975,16 @@ mod tests {
         m: &ManifestOwned,
         now: &str,
     ) -> Result<Committed, FleetError> {
-        commit_upload(&h.db, &h.root, &TENANT, &PROFILE, &session, &input_of(m), now).await
+        commit_upload(
+            &h.db,
+            &h.root,
+            &TENANT,
+            &PROFILE,
+            &session,
+            &input_of(m),
+            now,
+        )
+        .await
     }
 
     async fn commit(
@@ -987,7 +1003,15 @@ mod tests {
 
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
 
         // Uneven chunks: offset bookkeeping must not assume a fixed size.
         let mut offset = 0i64;
@@ -1000,7 +1024,9 @@ mod tests {
         let committed = commit(&h, session, &m).await.unwrap();
         assert_eq!(committed.version, 1);
 
-        let target = resolve_download(&h.db, &TENANT, &PROFILE, None).await.unwrap();
+        let target = resolve_download(&h.db, &TENANT, &PROFILE, None)
+            .await
+            .unwrap();
         assert_eq!(target.container_size, payload.len() as i64);
         assert_eq!(target.container_sha256, m.container_sha256);
         assert_eq!(target.exact_signed_container_bytes, m.manifest_bytes);
@@ -1008,7 +1034,9 @@ mod tests {
         let mut got = Vec::new();
         let mut at = 0u64;
         while (got.len() as i64) < target.container_size {
-            let part = read_range(Path::new(&target.blob_path), at, 1000).await.unwrap();
+            let part = read_range(Path::new(&target.blob_path), at, 1000)
+                .await
+                .unwrap();
             if part.is_empty() {
                 break;
             }
@@ -1049,7 +1077,15 @@ mod tests {
         let payload = b"stale-holder-payload".to_vec();
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, session, 0, &payload).await.unwrap();
 
         release_lease(&h.db, &TENANT, &lease.id, "2026-09-02T00:20:00+00:00")
@@ -1071,7 +1107,15 @@ mod tests {
         let payload = b"expired".to_vec();
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, session, 0, &payload).await.unwrap();
 
         let err = commit_at(
@@ -1098,7 +1142,9 @@ mod tests {
         let s1 = [20u8; 16];
         open_session(&h, s1, l1.id, l1.fencing_token, 1, p1.len() as i64).await;
         append(&h, s1, 0, &p1).await.unwrap();
-        commit(&h, s1, &manifest_for(&p1, 0, [30u8; 16])).await.unwrap();
+        commit(&h, s1, &manifest_for(&p1, 0, [30u8; 16]))
+            .await
+            .unwrap();
         release_lease(&h.db, &TENANT, &l1.id, "2026-09-02T00:31:00+00:00")
             .await
             .unwrap();
@@ -1118,11 +1164,19 @@ mod tests {
         .await
         .expect_err("must refuse");
         assert!(
-            matches!(err, FleetError::VersionConflict { base: 0, current: 1 }),
+            matches!(
+                err,
+                FleetError::VersionConflict {
+                    base: 0,
+                    current: 1
+                }
+            ),
             "expected VersionConflict base 0 current 1, got {err:?}"
         );
 
-        let target = resolve_download(&h.db, &TENANT, &PROFILE, None).await.unwrap();
+        let target = resolve_download(&h.db, &TENANT, &PROFILE, None)
+            .await
+            .unwrap();
         assert_eq!(
             target.container_size,
             p1.len() as i64,
@@ -1136,7 +1190,15 @@ mod tests {
         let payload = b"the-real-bytes".to_vec();
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, session, 0, &payload).await.unwrap();
 
         // Same length, different content: the size check cannot catch this.
@@ -1166,7 +1228,15 @@ mod tests {
         let payload = b"0123456789".to_vec();
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, session, 0, &payload[..4]).await.unwrap();
 
         let err = commit(&h, session, &manifest_for(&payload, 0, [30u8; 16]))
@@ -1217,7 +1287,9 @@ mod tests {
         let session = [20u8; 16];
         open_session(&h, session, lease.id, lease.fencing_token, 1, 4).await;
 
-        let err = append(&h, session, 0, b"aaaaaaaa").await.expect_err("too big");
+        let err = append(&h, session, 0, b"aaaaaaaa")
+            .await
+            .expect_err("too big");
         assert!(
             matches!(
                 err,
@@ -1237,7 +1309,15 @@ mod tests {
         let payload = b"tenant-a-container".to_vec();
         let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
         let session = [20u8; 16];
-        open_session(&h, session, lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            session,
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, session, 0, &payload).await.unwrap();
         commit(&h, session, &manifest_for(&payload, 0, [30u8; 16]))
             .await
@@ -1458,7 +1538,10 @@ mod tests {
         let b = device_cycle(&h, [11; 16], DEVICE_B, [21; 16], [31; 16], 1, &b_payload)
             .await
             .expect("device B publish");
-        assert_eq!(b.version, 2, "the second device advances the version by one");
+        assert_eq!(
+            b.version, 2,
+            "the second device advances the version by one"
+        );
         assert_eq!(current_version(&h, &TENANT).await, 2);
 
         // Both versions stay downloadable byte-for-byte: publishing a new
@@ -1468,10 +1551,18 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("resolve v{version}: {e:?}"));
             assert_eq!(t.version, version);
-            let bytes = read_range(std::path::Path::new(&t.blob_path), 0, t.container_size as usize)
-                .await
-                .unwrap();
-            assert_eq!(bytes.as_slice(), expected.as_slice(), "version {version} bytes");
+            let bytes = read_range(
+                std::path::Path::new(&t.blob_path),
+                0,
+                t.container_size as usize,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                bytes.as_slice(),
+                expected.as_slice(),
+                "version {version} bytes"
+            );
         }
     }
 
@@ -1589,7 +1680,15 @@ mod tests {
         let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
 
         let lease = acquire(&h, [10; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
-        open_session(&h, [20; 16], lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            [20; 16],
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
 
         // A chunk that skips ahead leaves a hole; it must be refused outright.
         match append(&h, [20; 16], 100, &payload[..50]).await {
@@ -1659,7 +1758,15 @@ mod tests {
         let payload = vec![3u8; 1024];
 
         let lease = acquire(&h, [10; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
-        open_session(&h, [20; 16], lease.id, lease.fencing_token, 1, payload.len() as i64).await;
+        open_session(
+            &h,
+            [20; 16],
+            lease.id,
+            lease.fencing_token,
+            1,
+            payload.len() as i64,
+        )
+        .await;
         append(&h, [20; 16], 0, &payload).await.unwrap();
 
         // Manifest describes different bytes than were uploaded.
@@ -1673,7 +1780,11 @@ mod tests {
             "expected ContentHashMismatch, got {err:?}"
         );
 
-        assert_eq!(current_version(&h, &TENANT).await, 0, "version must not move");
+        assert_eq!(
+            current_version(&h, &TENANT).await,
+            0,
+            "version must not move"
+        );
         let manifests: i64 =
             sqlx::query("SELECT COUNT(*) FROM v2_snapshot_manifests WHERE tenant_id = ?")
                 .bind(TENANT.as_slice())
@@ -1755,9 +1866,13 @@ mod tests {
         let t = resolve_download(&reopened, &TENANT, &PROFILE, None)
             .await
             .expect("resolve after restart");
-        let bytes = read_range(std::path::Path::new(&t.blob_path), 0, t.container_size as usize)
-            .await
-            .unwrap();
+        let bytes = read_range(
+            std::path::Path::new(&t.blob_path),
+            0,
+            t.container_size as usize,
+        )
+        .await
+        .unwrap();
         assert_eq!(bytes, payload, "blob must survive a restart");
 
         reopened.close().await;

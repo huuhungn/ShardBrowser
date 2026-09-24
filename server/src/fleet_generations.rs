@@ -131,13 +131,12 @@ pub async fn begin_first_generation(
     // A fleet key must be anchored to the root generation that authorises
     // custody. Without an active root, no custodian could be verified, so the
     // fleet key would rest on nothing.
-    let root_generation: Option<i64> = sqlx::query_scalar(
-        "SELECT active_root_generation FROM v2_tenants WHERE id = ?1",
-    )
-    .bind(tenant_id.as_slice())
-    .fetch_optional(db)
-    .await?
-    .flatten();
+    let root_generation: Option<i64> =
+        sqlx::query_scalar("SELECT active_root_generation FROM v2_tenants WHERE id = ?1")
+            .bind(tenant_id.as_slice())
+            .fetch_optional(db)
+            .await?
+            .flatten();
     let Some(root_generation) = root_generation else {
         return Err(AppError::Conflict(
             "tenant has no active root generation; activate one before creating a fleet key".into(),
