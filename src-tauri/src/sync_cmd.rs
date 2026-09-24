@@ -52,19 +52,16 @@ pub struct RemoteSnapshot {
 fn ready_config() -> Result<team_config::TeamConfig, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if c.server_url.is_empty() {
-        return Err("no team server configured — set one in Settings".into());
+        return Err(crate::errcode::code("sync.noTeamServer"));
     }
     if !c.is_enrolled() {
-        return Err("this device is not enrolled — enroll it in Settings".into());
+        return Err(crate::errcode::code("sync.deviceNotEnrolled"));
     }
     if !c.can_sync() {
         // An older enrollment predates storing the account id. It cannot be
         // reconstructed locally, and guessing one would fail server-side
         // authorization anyway.
-        return Err(
-            "this device was enrolled before profile sync existed — re-enroll it in Settings"
-                .into(),
-        );
+        return Err(crate::errcode::code("sync.enrolledBeforeSyncExisted"));
     }
     Ok(c)
 }
@@ -98,14 +95,17 @@ pub async fn profile_sync_push(
 ) -> Result<PushResult, String> {
     // Running-state first: a user whose profile is running must be told to
     // stop it, not sent to fix server settings that were never the problem.
-    let _claim = profile::begin_user_mutation([&profile_id], "push this profile to the team")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionPushToTeam"),
+    )
+    .map_err(|error| error.to_string())?;
     let c = ready_config()?;
-    profile::load_raw(&profile_id).map_err(|_| "no such profile".to_string())?;
+    profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if !udd.exists() {
-        return Err("this profile has no data to push yet".into());
+        return Err(crate::errcode::code("sync.noDataToPush"));
     }
 
     // Prefer the fleet key this device collected from its grant: it is the
@@ -133,7 +133,7 @@ pub async fn profile_sync_push(
         None => shardx_core::backup_file::seal_profile(&seal_profile_id, &udd, &passphrase),
     })
     .await
-    .map_err(|e| format!("seal task failed: {e}"))?
+    .map_err(|e| crate::errcode::code_with("sync.sealTaskFailed", &[("error", &e.to_string())]))?
     .map_err(|e| format!("{e:#}"))?;
 
     let signer = c.signing_key().map_err(|e| e.to_string())?;
@@ -182,10 +182,13 @@ pub async fn profile_sync_push(
 /// transfer cannot leave a half-written profile behind.
 #[tauri::command]
 pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result<u64, String> {
-    let _claim = profile::begin_user_mutation([&profile_id], "pull this profile from the team")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionPullFromTeam"),
+    )
+    .map_err(|error| error.to_string())?;
     let c = ready_config()?;
-    profile::load_raw(&profile_id).map_err(|_| "no such profile".to_string())?;
+    profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
 
@@ -198,7 +201,9 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
     if head.version == 0 {
-        return Err("the team server has no snapshot for this profile yet".into());
+        return Err(crate::errcode::code(
+            "profile.theTeamServerHasNoSnapshotForThisProfi",
+        ));
     }
 
     let container = client
@@ -232,7 +237,7 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         }))
     })
     .await
-    .map_err(|e| format!("restore task failed: {e}"))?
+    .map_err(|e| crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())]))?
     .map_err(|e| format!("{e:#}"))
 }
 

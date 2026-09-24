@@ -338,8 +338,10 @@ fn validated_api_fingerprint(
 
 /// Persist verbatim (enrich=false); proxy_id binds, proxy string upserts+tests.
 async fn persist_created(folder_override: Option<String>, body: CreateReq) -> ApiResult {
-    let _claim = crate::profile::begin_profile_creation("create a profile")
-        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let _claim = crate::profile::begin_profile_creation(&crate::errcode::code(
+        "profile.actionCreateProfile",
+    ))
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     let mut cfg = validated_api_fingerprint(&body.fingerprint, &body.custom_fonts)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     if let Some(n) = body.name.as_ref() {
@@ -526,12 +528,12 @@ mod temp_profile_tests {
 
         let claim = crate::profile::begin_user_mutation(
             ["api-profile-busy-status-test"],
-            "edit this profile",
+            &crate::errcode::code("profile.actionEditProfile"),
         )
         .unwrap();
         let busy = crate::profile::begin_user_mutation(
             ["api-profile-busy-status-test"],
-            "edit this profile",
+            &crate::errcode::code("profile.actionEditProfile"),
         )
         .unwrap_err();
         assert_eq!(
@@ -624,8 +626,10 @@ mod temp_profile_tests {
 
 /// Temporary profile (hidden, auto-deleted on close); pair with /start.
 async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
-    let _claim = crate::profile::begin_profile_creation("create a temporary profile")
-        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let _claim = crate::profile::begin_profile_creation(&crate::errcode::code(
+        "profile.actionCreateTempProfile",
+    ))
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     let fid = match body.fingerprint_id {
         Some(f) => f,
         None => random_fingerprint_for(body.platform.as_deref())?,
@@ -679,8 +683,11 @@ async fn create_temporary(Json(body): Json<TempReq>) -> ApiResult {
 /// Into the trash, like the UI's delete. Temporary profiles are torn down by
 /// the Tracker and never reach it.
 async fn delete_profile(Path(id): Path<String>) -> ApiResult {
-    let _claim = crate::profile::begin_user_mutation([&id], "delete this profile")
-        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let _claim = crate::profile::begin_user_mutation(
+        [&id],
+        &crate::errcode::code("profile.actionDeleteProfile"),
+    )
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     crate::trash::move_to_trash(&id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     crate::notify_store_changed("profiles");
@@ -729,8 +736,11 @@ fn validate_extension_ids(ids: &[String]) -> Result<(), ApiError> {
 
 /// Edit profile; only provided fields change. Returns the updated profile.
 async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiResult {
-    let _claim = crate::profile::begin_user_mutation([&id], "modify this profile")
-        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let _claim = crate::profile::begin_user_mutation(
+        [&id],
+        &crate::errcode::code("profile.actionModifyProfile"),
+    )
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     let mut stored =
         crate::profile::load_raw(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -1118,8 +1128,11 @@ struct ImportCookiesReq {
 }
 
 async fn import_cookies(Path(id): Path<String>, Json(body): Json<ImportCookiesReq>) -> ApiResult {
-    let _claim = crate::profile::begin_user_mutation([&id], "import cookies")
-        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let _claim = crate::profile::begin_user_mutation(
+        [&id],
+        &crate::errcode::code("profile.actionImportCookies"),
+    )
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     let n = crate::cookies::import(&id, &body.cookies)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "imported": n })))

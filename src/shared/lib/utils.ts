@@ -113,7 +113,7 @@ export const readTextFile = (path: string) => invoke<string>("read_text_file", {
  * Unknown codes fall through to the English sentence the backend sent, so a
  * missing key degrades to today's behaviour rather than to an empty toast.
  */
-export const localiseBackendError = (text: string): string =>
+export const localiseBackendError = (text: string, depth = 0): string =>
   text.replace(/\[\[shardx:([a-zA-Z0-9_.]+)((?:\|[a-zA-Z0-9_]+=[^\]|]*)*)\]\]/g, (_whole, key, rawArgs) => {
     const vars: Record<string, string> = {};
     for (const pair of String(rawArgs).split("|")) {
@@ -134,7 +134,15 @@ export const localiseBackendError = (text: string): string =>
     // showing "[[shardx:no.such.code]]" to an operator is the worst outcome,
     // so fall back to the marker's trailing prose when the Rust side supplied
     // any, and to a plain apology when it did not.
-    if (translated !== key) return translated;
+    if (translated !== key) {
+      // An argument can itself be a marker — a label spliced into a sentence,
+      // as `profile.rs` does with `{action}`. Substituting it introduces a
+      // marker this pass has already scanned past, so translate the result
+      // again. The depth ceiling mirrors MAX_MARKER_DEPTH in errcode.rs.
+      return depth < 4 && translated.includes("[[shardx:")
+        ? localiseBackendError(translated, depth + 1)
+        : translated;
+    }
     const englishFallback = String(vars.en ?? "").trim();
     return englishFallback || t("errors.unknownBackend");
   });

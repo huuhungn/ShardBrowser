@@ -126,7 +126,7 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     if name.chars().any(char::is_control) {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name cannot contain control characters",
+            crate::errcode::code("profile.nameControlChars"),
         ));
     }
     if name
@@ -136,7 +136,7 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name cannot end with a dot or space",
+            crate::errcode::code("profile.nameTrailingDotSpace"),
         ));
     }
 
@@ -144,25 +144,28 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     if normalized.is_empty() {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name is required",
+            crate::errcode::code("profile.nameRequired"),
         ));
     }
     if normalized.chars().count() > MAX_PROFILE_NAME_CHARS {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            format!("Profile name must be at most {MAX_PROFILE_NAME_CHARS} characters"),
+            crate::errcode::code_with(
+                "profile.nameTooLong",
+                &[("max", &MAX_PROFILE_NAME_CHARS.to_string())],
+            ),
         ));
     }
     if normalized.contains(['/', '\\']) {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name cannot contain path separators",
+            crate::errcode::code("profile.namePathSeparators"),
         ));
     }
     if normalized == "." || normalized == ".." {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name cannot be '.' or '..'",
+            crate::errcode::code("profile.nameDotOnly"),
         ));
     }
     if normalized
@@ -171,7 +174,7 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name contains characters reserved by Windows",
+            crate::errcode::code("profile.nameReservedChars"),
         ));
     }
 
@@ -187,7 +190,7 @@ pub fn normalize_profile_name(name: &str) -> Result<String> {
     if reserved {
         return Err(profile_error(
             ProfileErrorKind::InvalidName,
-            "Profile name is reserved by Windows",
+            crate::errcode::code("profile.nameReservedWord"),
         ));
     }
 
@@ -278,7 +281,7 @@ fn ensure_profile_name_available(name: &str, exclude_id: Option<&str>) -> Result
         if profile_names_collide(name, &existing_name) {
             return Err(profile_error(
                 ProfileErrorKind::NameConflict,
-                format!("Another profile already uses the name '{name}'"),
+                crate::errcode::code_with("profile.nameTaken", &[("name", name)]),
             ));
         }
     }
@@ -312,7 +315,7 @@ pub fn prepare_import_batch(profiles: &mut [StoredProfile]) -> Result<()> {
         {
             return Err(profile_error(
                 ProfileErrorKind::NameConflict,
-                format!("Another profile already uses the name '{normalized}'"),
+                crate::errcode::code_with("profile.nameTaken", &[("name", &normalized)]),
             ));
         }
         stored
@@ -368,26 +371,26 @@ where
     let mut claims = lifecycle_claims().lock().map_err(|_| {
         profile_error(
             ProfileErrorKind::Busy,
-            "Profile lifecycle lock is unavailable",
+            crate::errcode::code("profile.lifecycleLockUnavailable"),
         )
     })?;
     if claims.contains_key(GLOBAL_FOLDER_CLAIM) {
         return Err(profile_error(
             ProfileErrorKind::Busy,
-            format!("Profiles are being reorganized; retry {action}"),
+            crate::errcode::code_with("profile.busyReorganizing", &[("action", action)]),
         ));
     }
     for key in &keys {
         if claims.contains_key(key) {
             return Err(profile_error(
                 ProfileErrorKind::Busy,
-                format!("Profile is being launched or modified; retry {action}"),
+                crate::errcode::code_with("profile.busyOne", &[("action", action)]),
             ));
         }
         if key != PROFILE_NAME_CLAIM && crate::process::Tracker::shared().is_running(key) {
             return Err(profile_error(
                 ProfileErrorKind::Running,
-                format!("Stop the running browser before you {action}"),
+                crate::errcode::code_with("profile.stopRunningBrowser", &[("action", action)]),
             ));
         }
     }
@@ -416,7 +419,10 @@ pub fn begin_profile_creation(action: &str) -> Result<ProfileClaimGuard> {
 }
 
 pub fn begin_clone_mutation(profile_id: &str) -> Result<ProfileClaimGuard> {
-    begin_user_mutation([profile_id], "clone this profile")
+    begin_user_mutation(
+        [profile_id],
+        &crate::errcode::code("profile.actionCloneProfile"),
+    )
 }
 
 pub fn begin_profile_launch(profile_id: &str) -> Result<ProfileClaimGuard> {
@@ -431,13 +437,13 @@ fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard
     let mut claims = lifecycle_claims().lock().map_err(|_| {
         profile_error(
             ProfileErrorKind::Busy,
-            "Profile lifecycle lock is unavailable",
+            crate::errcode::code("profile.lifecycleLockUnavailable"),
         )
     })?;
     if !claims.is_empty() {
         return Err(profile_error(
             ProfileErrorKind::Busy,
-            format!("Profiles are being launched or modified; retry {action}"),
+            crate::errcode::code_with("profile.busyMany", &[("action", action)]),
         ));
     }
     claims.insert(GLOBAL_FOLDER_CLAIM.to_string(), ProfileClaimKind::Mutation);
@@ -451,7 +457,7 @@ fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard
         if crate::process::Tracker::shared().is_running(profile_id) {
             return Err(profile_error(
                 ProfileErrorKind::Running,
-                format!("Stop every running browser before you {action}"),
+                crate::errcode::code_with("profile.stopEveryBrowser", &[("action", action)]),
             ));
         }
     }
@@ -494,9 +500,10 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
             if let Some(ts) = mtime {
                 stored.meta.created_at = Some(ts);
                 if !stored.meta.id.is_empty() {
-                    if let Ok(_claim) =
-                        begin_user_mutation([&stored.meta.id], "backfill profile metadata")
-                    {
+                    if let Ok(_claim) = begin_user_mutation(
+                        [&stored.meta.id],
+                        &crate::errcode::code("profile.actionBackfillMetadata"),
+                    ) {
                         if let Ok(mut current) = load_raw(&stored.meta.id) {
                             if current.meta.created_at.is_none() {
                                 current.meta.created_at = stored.meta.created_at.clone();
@@ -775,10 +782,12 @@ pub fn delete(id: &str) -> Result<()> {
     if udd.exists() {
         fs::remove_dir_all(&udd).with_context(|| {
             if config_deleted {
-                format!(
-                    "profile config {} was deleted, but user data cleanup failed for {}",
-                    path.display(),
-                    udd.display()
+                crate::errcode::code_with(
+                    "profile.configDeletedCleanupFailed",
+                    &[
+                        ("config", &path.display().to_string()),
+                        ("data", &udd.display().to_string()),
+                    ],
                 )
             } else {
                 format!("delete profile user data {}", udd.display())
@@ -870,7 +879,7 @@ fn next_available_clone_name(source_name: &str) -> Result<String> {
     }
     Err(profile_error(
         ProfileErrorKind::NameConflict,
-        "Unable to allocate a unique name for the cloned profile",
+        crate::errcode::code("profile.cloneNameExhausted"),
     ))
 }
 
@@ -906,7 +915,7 @@ pub fn profile_ids_in_folder(name: &str) -> Result<Vec<String>> {
 
 /// Retag profiles from folder `old` to `new`; returns count.
 pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
-    let _claim = begin_folder_mutation(old, "rename this folder")?;
+    let _claim = begin_folder_mutation(old, &crate::errcode::code("profile.actionRenameFolder"))?;
     let new = new.trim();
     let mut writes = Vec::new();
     for (path, mut stored) in strict_profile_records()? {
@@ -924,7 +933,13 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
     let total = writes.len();
     for (applied, (path, body)) in writes.into_iter().enumerate() {
         atomic_write(&path, &body).with_context(|| {
-            format!("folder rename partially applied ({applied}/{total} profiles updated)")
+            crate::errcode::code_with(
+                "profile.folderRenamePartial",
+                &[
+                    ("applied", &applied.to_string()),
+                    ("total", &total.to_string()),
+                ],
+            )
         })?;
     }
     Ok(total)
@@ -932,7 +947,7 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
 
 /// Delete folder; `delete_profiles` true removes, false unfiles. Returns count.
 pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
-    let _claim = begin_folder_mutation(name, "delete this folder")?;
+    let _claim = begin_folder_mutation(name, &crate::errcode::code("profile.actionDeleteFolder"))?;
     let mut targets = Vec::new();
     for (path, mut stored) in strict_profile_records()? {
         if stored.meta.folder == name {
@@ -963,7 +978,13 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
             }
         };
         result.with_context(|| {
-            format!("folder deletion partially applied ({applied}/{total} profiles updated)")
+            crate::errcode::code_with(
+                "profile.folderDeletePartial",
+                &[
+                    ("applied", &applied.to_string()),
+                    ("total", &total.to_string()),
+                ],
+            )
         })?;
     }
     Ok(total)
@@ -1147,14 +1168,21 @@ mod tests {
         let tracker = crate::process::Tracker::shared();
         tracker.set_running_for_test(profile_id, true);
 
-        let error = match begin_user_mutation([profile_id], "edit this profile") {
+        let error = match begin_user_mutation(
+            [profile_id],
+            &crate::errcode::code("profile.actionEditProfile"),
+        ) {
             Ok(_) => panic!("running profile mutation must fail closed"),
             Err(error) => error,
         };
         assert_eq!(profile_error_kind(&error), Some(ProfileErrorKind::Running));
 
         tracker.set_running_for_test(profile_id, false);
-        assert!(begin_user_mutation([profile_id], "edit this profile").is_ok());
+        assert!(begin_user_mutation(
+            [profile_id],
+            &crate::errcode::code("profile.actionEditProfile")
+        )
+        .is_ok());
     }
 
     #[test]

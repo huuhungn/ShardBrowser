@@ -53,8 +53,11 @@ pub async fn profile_backup_create(
 ) -> Result<BackupResult, String> {
     // Same claim as delete/clone: a torn backup of a live profile is worse
     // than no backup, because it looks like a valid one.
-    let _claim = profile::begin_user_mutation([&profile_id], "back up this profile")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionBackUpProfile"),
+    )
+    .map_err(|error| error.to_string())?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if !udd.exists() {
@@ -92,13 +95,15 @@ pub async fn profile_backup_restore(
     src_path: String,
     passphrase: String,
 ) -> Result<u64, String> {
-    let _claim = profile::begin_user_mutation([&profile_id], "restore this profile from a backup")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionRestoreFromBackup"),
+    )
+    .map_err(|error| error.to_string())?;
 
     // Restoring into a profile the app does not know about would leave data on
     // disk with no entry in the list, so require the profile to exist first.
-    profile::load_raw(&profile_id)
-        .map_err(|_| crate::errcode::code("profile.backupNoSuchProfile"))?;
+    profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     let src = PathBuf::from(&src_path);
