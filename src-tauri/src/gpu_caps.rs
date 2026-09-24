@@ -76,7 +76,7 @@ pub struct Compat {
 fn cache_path() -> Result<std::path::PathBuf> {
     Ok(store::settings_path()?
         .parent()
-        .ok_or_else(|| anyhow!("no config dir"))?
+        .ok_or_else(|| anyhow!(crate::errcode::code("gpu.noConfigDir")))?
         .join("host-gl-caps.json"))
 }
 
@@ -165,11 +165,11 @@ async fn evaluate_in_core(port: u16) -> Result<String> {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let ws_url = ws_url.ok_or_else(|| anyhow!("core did not open a debugging port"))?;
+    let ws_url = ws_url.ok_or_else(|| anyhow!(crate::errcode::code("gpu.noDebuggingPort")))?;
 
     let (mut socket, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
-        .context("connect to the core's debugging port")?;
+        .context(crate::errcode::code("gpu.cannotConnectDebugPort"))?;
     let msg = json!({
         "id": 1,
         "method": "Runtime.evaluate",
@@ -196,10 +196,10 @@ async fn evaluate_in_core(port: u16) -> Result<String> {
             return v["result"]["result"]["value"]
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| anyhow!("probe returned no value"));
+                .ok_or_else(|| anyhow!(crate::errcode::code("gpu.probeReturnedNothing")));
         }
     }
-    Err(anyhow!("probe timed out"))
+    Err(anyhow!(crate::errcode::code("gpu.probeTimedOut")))
 }
 
 /// Ask the engine what this machine supports. Caches; pass force to re-ask.
@@ -209,7 +209,7 @@ pub async fn probe(force: bool) -> Result<HostGlCaps> {
             return Ok(hit);
         }
     }
-    let binary = runtime::binary_path().context("engine is not installed yet")?;
+    let binary = runtime::binary_path().context(crate::errcode::code("gpu.engineNotInstalled"))?;
     let scratch = std::env::temp_dir().join(format!("shardx-glcaps-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch)?;
@@ -248,7 +248,9 @@ pub async fn probe(force: bool) -> Result<HostGlCaps> {
         // std::os::windows::process::CommandExt import is needed here.
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd.spawn().context("start the engine for a GPU probe")?;
+    let mut child = cmd
+        .spawn()
+        .context(crate::errcode::code("gpu.cannotStartEngineProbe"))?;
 
     let raw = evaluate_in_core(port).await;
     let _ = child.kill().await;
@@ -275,7 +277,7 @@ pub async fn probe(force: bool) -> Result<HostGlCaps> {
         engine_version: runtime::engine_version().unwrap_or_default(),
     };
     if caps.webgl1.is_empty() {
-        anyhow::bail!("the engine reported no WebGL at all");
+        anyhow::bail!(crate::errcode::code("gpu.engineReportedNoWebgl"));
     }
     let _ = std::fs::write(cache_path()?, serde_json::to_string_pretty(&caps)?);
     Ok(caps)

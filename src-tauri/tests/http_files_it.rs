@@ -423,7 +423,7 @@ async fn a_failed_run_does_not_leave_its_session_open() {
     .await
     .unwrap_err();
     assert!(
-        format!("{e:#}").contains("httpOpen"),
+        shardx_launcher_lib::errcode::resolve_to_english(&format!("{e:#}")).contains("httpOpen"),
         "the session should have been closed when the run ended: {e:#}"
     );
 }

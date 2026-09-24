@@ -68,8 +68,9 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
 /// proxy a temporary profile carries. A profile with no proxy at all browses
 /// direct, so calling direct matches it.
 fn client_for(profile_id: &str) -> Result<reqwest::Client> {
-    let stored = profile::load_raw(profile_id)
-        .with_context(|| format!("profile {profile_id} could not be read"))?;
+    let stored = profile::load_raw(profile_id).with_context(|| {
+        crate::errcode::code_with("http.profileUnreadable", &[("profile", profile_id)])
+    })?;
 
     let bound: Option<proxy::ProxyEntry> = stored
         .meta
@@ -87,9 +88,9 @@ fn client_for(profile_id: &str) -> Result<reqwest::Client> {
         // browser itself is launched with, so the two cannot drift apart.
         let url = entry.to_proxy_server_arg();
         let proxy = reqwest::Proxy::all(&url).with_context(|| {
-            format!(
-                "profile {profile_id} is bound to proxy {} which cannot be used for HTTP",
-                entry.name
+            crate::errcode::code_with(
+                "http.proxyUnusable",
+                &[("profile", profile_id), ("proxy", &entry.name)],
             )
         })?;
         builder = builder.proxy(proxy);
@@ -97,7 +98,7 @@ fn client_for(profile_id: &str) -> Result<reqwest::Client> {
 
     builder
         .build()
-        .context("the HTTP client for this profile could not be built")
+        .context(crate::errcode::code("http.clientBuildFailed"))
 }
 
 /// Open a session for a profile, replacing any session it already had.
@@ -121,9 +122,7 @@ fn client(profile_id: &str) -> Result<reqwest::Client> {
         .unwrap()
         .get(profile_id)
         .map(|s| s.client.clone())
-        .ok_or_else(|| {
-            anyhow!("no HTTP session is open for this profile; add an httpOpen block first")
-        })
+        .ok_or_else(|| anyhow!(crate::errcode::code("http.noSessionOpen")))
 }
 
 /// Send one request on the profile's session.
@@ -143,7 +142,7 @@ pub async fn request(
     let method: reqwest::Method = method
         .to_uppercase()
         .parse()
-        .with_context(|| format!("{method} is not an HTTP method"))?;
+        .with_context(|| crate::errcode::code_with("http.notAMethod", &[("method", method)]))?;
 
     let mut req = client.request(method, url);
     for (k, v) in headers {
@@ -156,13 +155,13 @@ pub async fn request(
     let res = req
         .send()
         .await
-        .with_context(|| format!("the request to {url} did not complete"))?;
+        .with_context(|| crate::errcode::code_with("http.requestFailed", &[("url", url)]))?;
 
     let status = res.status().as_u16();
     let full = res
         .text()
         .await
-        .with_context(|| format!("the response from {url} could not be read"))?;
+        .with_context(|| crate::errcode::code_with("http.responseUnreadable", &[("url", url)]))?;
 
     let truncated = full.len() > MAX_BODY;
     let body = if truncated {
@@ -202,7 +201,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            format!("{e:#}").contains("httpOpen"),
+            crate::errcode::resolve_to_english(&format!("{e:#}")).contains("httpOpen"),
             "the error should name the block to add: {e:#}"
         );
     }

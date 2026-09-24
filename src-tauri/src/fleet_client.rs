@@ -181,7 +181,10 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
-        let nonce = decode_hex32(&challenge.nonce, "challenge nonce")?;
+        let nonce = decode_hex32(
+            &challenge.nonce,
+            &crate::errcode::code("fleet.fieldChallengeNonce"),
+        )?;
         let challenge_id = decode_hex16(&challenge.challenge_id, "challenge_id")?;
         let account_id = decode_hex16(&challenge.account_id, "account_id")?;
         let tenant_bytes = decode_hex16(tenant_id, "tenant_id")?;
@@ -474,7 +477,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableUploadBegin"))?;
-        Self::ok_or_err(open, "open upload").await?;
+        Self::ok_or_err(open, "fleet.refusedUploadOpen").await?;
 
         // Staging failure leaves a session the server can discard; nothing is
         // published until commit succeeds.
@@ -506,7 +509,7 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableUploadPublish"))?;
 
-        let body: serde_json::Value = Self::ok_or_err(commit, "commit upload")
+        let body: serde_json::Value = Self::ok_or_err(commit, "fleet.refusedUploadCommit")
             .await?
             .json()
             .await
