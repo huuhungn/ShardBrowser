@@ -39,7 +39,7 @@ pub struct LibraryEntry {
 
 fn safe_id(id: &str) -> Result<String> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
-        anyhow::bail!("invalid fingerprint id");
+        anyhow::bail!(crate::errcode::code("fingerprints.invalidId"));
     }
     Ok(id.to_string())
 }
@@ -139,8 +139,8 @@ pub fn get(id: &str) -> Result<Option<LibraryEntry>> {
 /// returns the saved entry.  If `id` is empty a slug is derived from
 /// `payload.name` (or a UUID if no name).
 pub fn import(json_text: &str, id_hint: Option<String>) -> Result<LibraryEntry> {
-    let payload: Value =
-        serde_json::from_str(json_text).context("not a valid JSON FingerprintConfig")?;
+    let payload: Value = serde_json::from_str(json_text)
+        .context(crate::errcode::code("fingerprints.notValidJsonConfig"))?;
     let raw_id = id_hint.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
         payload
             .get("name")

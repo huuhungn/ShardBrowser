@@ -90,14 +90,16 @@ impl Recorder {
     /// browsers, for the same reason the runner does not.
     pub async fn start(profile_id: &str) -> Result<Self> {
         let rx = cdp::subscribe(profile_id)
-            .context("the profile is not attached — start it before recording traffic")?;
+            .context(crate::errcode::code("traffic.profileNotAttached"))?;
 
         // Enable before anything else: events that fire between attaching and
         // enabling are simply never sent, so a recorder that enabled last
         // would silently miss the first requests of a navigation.
         cdp::page_call(profile_id, "Network.enable", json!({}))
             .await
-            .context("the profile would not report its network activity")?;
+            .context(crate::errcode::code(
+                "traffic.profileRefusedNetworkReporting",
+            ))?;
 
         let log: Arc<Mutex<Log>> = Arc::new(Mutex::new(Log::default()));
         let sink = log.clone();

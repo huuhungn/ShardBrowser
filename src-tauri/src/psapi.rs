@@ -57,7 +57,7 @@ pub async fn call(
 ) -> Result<Value> {
     let key = get_key()?;
     if key.is_empty() {
-        return Err(anyhow!("ProxyShard API key not set"));
+        return Err(anyhow!(crate::errcode::code("psapi.noApiKey")));
     }
     let url = format!("{BASE}{path}");
     let cli = reqwest::Client::builder()
@@ -68,7 +68,12 @@ pub async fn call(
         "POST" => cli.post(&url),
         "PATCH" => cli.patch(&url),
         "DELETE" => cli.delete(&url),
-        other => return Err(anyhow!("unsupported method {other}")),
+        other => {
+            return Err(anyhow!(crate::errcode::code_with(
+                "psapi.unsupportedMethod",
+                &[("method", other)]
+            )))
+        }
     };
     req = req.bearer_auth(&key);
     if !query.is_empty() {
@@ -84,14 +89,17 @@ pub async fn call(
         req = req.json(&serde_json::json!({}));
     }
 
-    let resp = req.send().await.context("request to ProxyShard failed")?;
+    let resp = req
+        .send()
+        .await
+        .context(crate::errcode::code("psapi.requestFailed"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
     if !status.is_success() {
         if status.as_u16() == 401 {
-            return Err(anyhow!("Unauthorized — check your API key"));
+            return Err(anyhow!(crate::errcode::code("psapi.unauthorized")));
         }
         let msg = value
             .get("message")

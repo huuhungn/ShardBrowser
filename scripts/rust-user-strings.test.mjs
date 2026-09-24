@@ -147,12 +147,26 @@ function currentFindings() {
   return out.sort();
 }
 
+/**
+ * Files whose English is deliberate, with the reason recorded in the baseline.
+ * A file earns a place here only by evidence that no operator reads the text as
+ * prose — a script reads it as JSON, or the one caller swallows it into a log.
+ * Keeping the reason next to the exemption is the point: the alternative is a
+ * silent deletion that reads, a year later, exactly like an oversight.
+ */
+function exemptFiles(baseline) {
+  return new Set(Object.keys(baseline.deliberately_english ?? {}));
+}
+
 test("no new English sentence is added to the Rust command surface", () => {
   const baseline = JSON.parse(readFileSync(baselineFile, "utf8"));
   const known = new Set(baseline.strings);
+  const exempt = exemptFiles(baseline);
   const found = currentFindings();
 
-  const added = found.filter((f) => !known.has(f));
+  const added = found.filter(
+    (f) => !known.has(f) && !exempt.has(f.split(":")[0]),
+  );
   assert.deepEqual(
     added,
     [],
@@ -160,6 +174,20 @@ test("no new English sentence is added to the Rust command surface", () => {
       `Vietnamese user reads English. Give the command a stable error code the UI ` +
       `can translate, or add it to ${relative(here, baselineFile)} with a reason.\n` +
       added.map((a) => `  ${a}`).join("\n"),
+  );
+});
+
+test("an exemption names a file that really is still English", () => {
+  const baseline = JSON.parse(readFileSync(baselineFile, "utf8"));
+  const files = new Set(currentFindings().map((f) => f.split(":")[0]));
+
+  const pointless = [...exemptFiles(baseline)].filter((f) => !files.has(f));
+  assert.deepEqual(
+    pointless,
+    [],
+    `These files are listed as deliberately English but no longer return any, so ` +
+      `the exemption now only hides future strings. Drop them from ` +
+      `deliberately_english:\n` + pointless.map((f) => `  ${f}`).join("\n"),
   );
 });
 

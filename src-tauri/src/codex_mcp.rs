@@ -262,9 +262,8 @@ pub async fn status() -> Result<Value, String> {
         ));
     }
 
-    let config: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
-        "Codex CLI returned a response that ShardX could not parse as JSON.".to_string()
-    })?;
+    let config: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| crate::errcode::code("codexMcp.unparseableResponse"))?;
     Ok(codex_mcp_status_from_config(
         &config,
         expected_index_path,

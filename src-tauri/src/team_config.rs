@@ -60,7 +60,8 @@ impl TeamConfig {
 
     /// The device signing key, if enrolled.
     pub fn signing_key(&self) -> Result<Ed25519SigningKey> {
-        let seed = decode_hex32(&self.signing_key_seed).context("device signing key is corrupt")?;
+        let seed = decode_hex32(&self.signing_key_seed)
+            .context(crate::errcode::code("teamConfig.signingKeyCorrupt"))?;
         Ok(Ed25519SigningKey::from_bytes(&seed))
     }
 
@@ -70,7 +71,7 @@ impl TeamConfig {
     /// open grants and must re-enroll.
     pub fn hpke_seed(&self) -> Result<[u8; 32]> {
         decode_hex32(&self.hpke_key_seed)
-            .context("device HPKE key is missing or corrupt; re-enroll this device")
+            .context(crate::errcode::code("teamConfig.hpkeKeyUnusable"))
     }
 
     /// Whether this device can open grants sealed to it.

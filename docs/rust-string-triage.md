@@ -230,3 +230,31 @@ as first written, to show what the heuristic got wrong.
 - cdp lock poisoned
 - cdp lock poisoned
 
+## Closing the sweep
+
+Every string the guard tracked is now either coded or exempt, and the baseline
+list is empty. What the last pass changed about the earlier verdicts:
+
+- `sync_bus.rs` "bind sync bus" was filed under labels that only reach a log.
+  It does not: `lib.rs` starts the bus with `.map_err(|e| e.to_string())`, so a
+  loopback port that will not bind becomes a toast. Coded.
+- `profile_icon.rs` was filed the other way round, as user-facing. Its one
+  caller, `launch.rs`, prints the error with `eprintln!` and launches the
+  profile anyway. The operator gets a profile with no icon and never reads the
+  sentence. Left English, recorded under `deliberately_english`.
+- `api.rs` keeps its 24 strings. Twenty-one answer a script in JSON. The other
+  three land in `ApiRuntimeStatus.error`, and `McpCard.tsx` only tests that
+  field for presence before rendering its own `mcp.bindFailed` — nothing prints
+  the English.
+
+Coding `automation.rs` also exposed a real defect rather than a wording
+problem. `run_automation_project` chose its HTTP status by searching the error
+text for `"no such project"`, so the moment that sentence became a code the
+automation API answered 500 where it had answered 404. Status routing now
+matches on the code through `errcode::has_code`, which compares at a marker
+boundary so one key is never mistaken for a longer one.
+
+The guard grew a `deliberately_english` map keyed by file. An entry states why
+the file's English is correct, and a second test fails when an exempted file
+stops producing English at all, so an exemption cannot quietly become a hiding
+place for new strings.
