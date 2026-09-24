@@ -2,11 +2,12 @@ import { Fragment, useState, type ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button, cn } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
-import { useT } from "../../shared/i18n";
+import { useT, useLang } from "../../shared/i18n";
 import Badge from "../../shared/ui/Badge";
 import { LockedIcon, StarOutlineIcon, ChevronDownIcon } from "../../shared/icons";
 import { withUtm } from "../../shared/lib/utils";
 import data from "./patchlog.json";
+import dataVi from "./patchlog.vi.json";
 
 /** The log is data, in patchlog.json; this module only draws it. */
 
@@ -30,6 +31,19 @@ type Entry = {
 type Release = { version: string; date: string; entries: Entry[] };
 
 const RELEASES = data.releases as Release[];
+/** The same log, in Vietnamese: same ids, same shape, translated prose. */
+const RELEASES_VI = dataVi.releases as Release[];
+
+/**
+ * The log the reader can actually read. Both files carry the same releases in
+ * the same order, so the picker and the selected version keep their meaning
+ * when the language changes under them.
+ */
+function useReleases(): Release[] {
+  const lang = useLang((s) => s.lang);
+  return lang === "vi" ? RELEASES_VI : RELEASES;
+}
+
 /** Newest release, and the one the picker starts on. */
 const LATEST = RELEASES[0];
 
@@ -125,9 +139,11 @@ function Blocks({ blocks }: { blocks: Block[] }) {
 function ReleasePicker({
   value,
   onChange,
+  releases,
 }: {
   value: Release;
-  onChange: (r: Release) => void;
+  onChange: (version: string) => void;
+  releases: Release[];
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -138,7 +154,7 @@ function ReleasePicker({
         onClick={() => setOpen((v) => !v)}
       >
         <span>v{value.version}</span>
-        {value === LATEST && (
+        {value.version === LATEST.version && (
           <Badge color="success" variant="filled" size="small">
             latest
           </Badge>
@@ -158,18 +174,18 @@ function ReleasePicker({
           {/* Click anywhere else and the list goes away. */}
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
           <div className="absolute right-0 z-20 mt-1.5 min-w-[190px] overflow-hidden rounded-xl bg-bg-white-0 p-1 shadow-lg ring-1 ring-stroke-soft-200">
-            {RELEASES.map((r) => (
+            {releases.map((r) => (
               <button
                 key={r.version}
                 type="button"
                 className={cn(
                   "flex w-full cursor-pointer items-center justify-between gap-3 rounded-lg border-0 px-2.5 py-2 text-left text-label-xs transition-colors",
-                  r === value
+                  r.version === value.version
                     ? "bg-primary-alpha-10 text-primary-base"
                     : "bg-transparent text-text-sub-600 hover:bg-bg-weak-50",
                 )}
                 onClick={() => {
-                  onChange(r);
+                  onChange(r.version);
                   setOpen(false);
                 }}
               >
@@ -248,7 +264,11 @@ function EntryCard({ entry }: { entry: Entry }): ReactNode {
 }
 
 export function PatchLogPage() {
-  const [release, setRelease] = useState<Release>(LATEST);
+  const releases = useReleases();
+  // Hold the version, not the object: switching language replaces every
+  // release object, and a reference kept across that swap would stop matching.
+  const [version, setVersion] = useState<string>(LATEST.version);
+  const release = releases.find((r) => r.version === version) ?? releases[0];
   const t = useT();
 
   return (
@@ -257,7 +277,7 @@ export function PatchLogPage() {
 
       <div className="mb-1.5 flex items-start justify-between gap-4">
         <h1 className="m-0 text-title-h5 text-text-strong-950">{t("patchlog.title")}</h1>
-        <ReleasePicker value={release} onChange={setRelease} />
+        <ReleasePicker value={release} onChange={setVersion} releases={releases} />
       </div>
 
       <p className="m-0 mb-3.5 max-w-[70ch] text-paragraph-xs text-text-soft-400">

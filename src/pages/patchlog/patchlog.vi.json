@@ -1,0 +1,948 @@
+{
+  "releases": [
+    {
+      "version": "2.2.7",
+      "date": "2026-09-18",
+      "entries": [
+        {
+          "id": "tables-fit-narrow-windows",
+          "title": "Bảng luôn nằm gọn trong cửa sổ",
+          "lead": "Trên màn hình dọc, nút Start nằm ngoài mép phải mà không có cách nào cuộn tới.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Màn hình dọc chỉ chừa khoảng 780px cho bảng, nhưng bố cục hẹp nhất vẫn yêu cầu 904px. Phần chiều rộng dư ra bị cắt thay vì có thể cuộn, nên nút Start và trình đơn của hàng không chỉ khó tiếp cận — chúng hoàn toàn biến mất."
+            },
+            {
+              "type": "p",
+              "text": "Các cửa sổ hẹp giờ đây sẽ ẩn bớt những cột có thông tin lặp lại ở nơi khác: trước tiên là Ghi chú, sau đó là Thời gian; trên danh sách proxy còn có quốc gia và số hồ sơ đã liên kết. Tên, trạng thái và các thao tác trên hàng vẫn giữ nguyên không gian hiển thị. Nếu cửa sổ vẫn quá hẹp cho phần còn lại, bảng sẽ cuộn ngang thay vì ẩn bất kỳ nội dung nào."
+            },
+            {
+              "type": "note",
+              "text": "Tiêu đề cột cũng đã thẳng hàng trở lại với các hàng khi cửa sổ hẹp hơn 1280px. Trước đây, cột Lần chạy gần nhất bị ẩn trong các hàng nhưng tiêu đề cột vẫn còn."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.6",
+      "date": "2026-09-17",
+      "entries": [
+        {
+          "id": "reopen-the-patch-log",
+          "title": "Ghi chú cập nhật không còn chỉ xem được một lần",
+          "lead": "Trang này chỉ mở một lần sau khi cập nhật; đóng lại là không còn cách nào xem các ghi chú.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Sau khi cập nhật, launcher mở trang này một lần để bạn biết các thay đổi trước khi chúng gây bất ngờ. Nhưng khi đóng trang, bạn không thể mở lại: launcher đã ghi nhận phiên bản nào được hiển thị cho bạn và trang sẽ không tự mở lại nữa."
+            },
+            {
+              "type": "p",
+              "text": "Lần chạy đầu tiên đó thường không phải lúc thích hợp để đọc ghi chú phát hành. Bản cập nhật có thể được cài khi bạn đang làm dở việc, hoặc do người khác cài trên máy dùng chung, và người sử dụng máy sau đó không có cách nào xem lại những gì đã thay đổi."
+            },
+            {
+              "type": "p",
+              "text": "Phần Cài đặt giờ có thẻ Có gì mới cùng một nút để mở lại trang này bất cứ lúc nào. Mục Nhật ký bản vá trên thanh bên vốn luôn dẫn đến đây; nút mới chỉ đơn giản là đặt một lối vào đúng nơi mọi người thường tìm sau khi cập nhật."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.5",
+      "date": "2026-09-17",
+      "entries": [
+        {
+          "id": "stop-button-that-does-nothing",
+          "title": "Trình duyệt đã đóng không còn hiển thị là Đang chạy",
+          "lead": "Hàng đó vẫn sáng cùng nút Stop không có tác dụng, rất lâu sau khi trình duyệt đã đóng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Một hồ sơ có thể vẫn nằm trong danh sách với trạng thái Đang chạy và hiển thị thời gian hoạt động kéo dài hàng giờ, thậm chí hàng ngày, dù trình duyệt của hồ sơ đã đóng. Nhấn Stop hoàn toàn không có tác dụng: không báo lỗi, không thay đổi, hàng đó cứ nằm nguyên."
+            },
+            {
+              "type": "p",
+              "text": "Launcher lưu một bản ghi cho mỗi trình duyệt mà nó khởi chạy và xóa bản ghi khi trình duyệt thoát. Việc xóa là bước cuối cùng, sau khi ghi lại hồ sơ đã chạy trong bao lâu; nếu bước ghi này thất bại, bản ghi vẫn tồn tại dù trình duyệt mà nó mô tả đã đóng. Không có quy trình nào sau đó dọn dẹp bản ghi này."
+            },
+            {
+              "type": "p",
+              "text": "Bản ghi giờ sẽ luôn được xóa dù có lỗi nào khác xảy ra. Nhấn Stop trên hàng có trình duyệt đã đóng sẽ xóa trạng thái của hàng và thông báo cho bạn; nếu launcher hoàn toàn mất dấu các trình duyệt, giờ đây nó cũng sẽ báo rõ thay vì để thông tin cuối cùng mà nó biết bị đóng băng trên màn hình."
+            }
+          ]
+        },
+        {
+          "id": "bulk-start-stop-tells-you",
+          "title": "Khi khởi chạy nhiều hồ sơ cùng lúc, bạn sẽ biết hồ sơ nào thất bại",
+          "lead": "Chọn mười hồ sơ, ba hồ sơ mở được, nhưng không có gì trên màn hình cho biết bảy hồ sơ còn lại đã thất bại.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khi chọn một nhóm hồ sơ rồi khởi chạy, mọi lỗi xảy ra trong quá trình đều bị bỏ qua. Nếu bảy trong số mười hồ sơ không mở được, kết quả trông vẫn hệt như đã thành công hoàn toàn."
+            },
+            {
+              "type": "p",
+              "text": "Giờ đây, cả thao tác khởi chạy lẫn dừng một nhóm hồ sơ được chọn đều báo có bao nhiêu hồ sơ thất bại và lý do, giống như cách launcher vẫn báo khi khởi chạy một hồ sơ riêng lẻ."
+            }
+          ]
+        },
+        {
+          "id": "sync-group-suspend-sticks",
+          "title": "Nhóm đồng bộ đã đóng không còn làm nhóm tiếp theo bị tạm ngưng",
+          "lead": "Việc dùng lại tên nhóm có thể khiến cửa sổ mới bị tạm ngưng ngay khi vừa tham gia.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khi tạm dừng một nhóm đồng bộ rồi đóng mọi cửa sổ trong nhóm, trạng thái tạm dừng vẫn còn dù nhóm không còn tồn tại. Nếu sau đó mở một trình duyệt dưới cùng tên nhóm, trình duyệt sẽ bị tạm ngưng ngay khi tham gia, trong khi nhóm hiển thị trên màn hình lại không cho thấy nội dung nào đang tạm dừng."
+            },
+            {
+              "type": "p",
+              "text": "Giờ đây, khi cửa sổ cuối cùng trong một nhóm đóng lại, toàn bộ trạng thái của nhóm sẽ được xóa: trạng thái tạm dừng, bố cục cửa sổ và thông tin cửa sổ nào đang điều khiển."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.4",
+      "date": "2026-09-09",
+      "entries": [
+        {
+          "id": "sdk-tested-every-platform",
+          "title": "Bộ công cụ dành cho nhà phát triển được kiểm thử trên nền tảng của bạn",
+          "lead": "Bộ công cụ tự động hóa ShardX đã báo vượt qua kiểm tra dù thực tế không chạy kiểm thử nào.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Bộ công cụ dành cho nhà phát triển xử lý những chi tiết khác nhau theo từng hệ điều hành: kích thước màn hình, dung lượng bộ nhớ của máy, tên tệp trình duyệt và nơi lưu các tệp đã tải xuống. Mỗi chi tiết này đi theo một luồng xử lý khác nhau trên Windows, macOS và Linux."
+            },
+            {
+              "type": "p",
+              "text": "Trước đây, không phần nào trong số đó được kiểm tra. Bộ công cụ báo thành công dù hoàn toàn không chạy kiểm thử, khiến các bước kiểm tra hiển thị màu xanh cho phần mã chưa được ai xác minh. Giờ đây có mười hai kiểm thử bao phủ phần này, và từng kiểm thử đều đã được xác nhận là phát hiện được lỗi được cố ý đưa vào đoạn mã mà nó bảo vệ."
+            }
+          ]
+        },
+        {
+          "id": "sdk-checked-before-publishing",
+          "title": "Lỗi riêng của một nền tảng sẽ chặn bản phát hành",
+          "lead": "Các kiểm thử của bộ công cụ giờ chạy trên Windows, macOS và Linux trong quá trình tạo bản phát hành.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Một lỗi chỉ xuất hiện trên một hệ điều hành có thể vượt qua mọi bước kiểm tra được thực hiện trên hệ điều hành khác. Giờ đây, các kiểm thử của bộ công cụ là một phần của quá trình tạo bản phát hành trên cả ba nền tảng, nên lỗi riêng của một nền tảng sẽ chặn việc phát hành thay vì đến máy của bạn."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.3",
+      "date": "2026-09-09",
+      "entries": [
+        {
+          "id": "test-on-windows-too",
+          "title": "Các bước kiểm tra giờ cũng chạy trên Windows",
+          "lead": "Mọi bước kiểm tra tự động đều chạy trên Linux, vì vậy phần dành riêng cho Windows của ứng dụng chưa bao giờ được kiểm thử trên nền tảng mà đa số người dùng sử dụng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Một số phần của launcher hoạt động khác nhau trên từng hệ điều hành: cách lưu khóa bảo vệ cookie, cách dừng tiến trình trình duyệt và cách ứng dụng khởi động cùng Windows. Toàn bộ phần mã đó đi theo luồng xử lý khác trên Windows so với Linux, nhưng chỉ luồng Linux từng được kiểm tra tự động."
+            },
+            {
+              "type": "p",
+              "text": "Các bước kiểm tra Rust giờ cũng chạy trên Windows. Ngay lần chạy đầu tiên, chúng đã thực thi được một kiểm thử chỉ dành cho Windows mà không bước kiểm tra nào trước đây có thể chạy."
+            }
+          ]
+        },
+        {
+          "id": "shared-core-tests-run",
+          "title": "153 kiểm thử chưa từng được chạy",
+          "lead": "Phần lõi dùng chung được tích hợp vào launcher, nhưng bộ kiểm thử riêng của nó chưa bao giờ được các bước kiểm tra tự động thực thi.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Kiểm thử launcher không đồng nghĩa với kiểm thử các thư viện bên trong. Phần lõi dùng chung — xử lý bản chụp hồ sơ, cookie và khóa mã hóa — được biên dịch vào mọi bản dựng, nhưng 153 kiểm thử của nó vẫn không được sử dụng."
+            },
+            {
+              "type": "p",
+              "text": "Việc bật các kiểm thử này đã lập tức phát hiện một vấn đề thực tế: hai kiểm thử bản chụp bị sai trên Linux và macOS vì kiểm tra sự tồn tại của một tệp mà thao tác khôi phục không được phép chuyển giữa các máy. Cả các kiểm thử lẫn quy trình kiểm tra tự động đều đã được sửa."
+            }
+          ]
+        },
+        {
+          "id": "release-stops-earlier",
+          "title": "Bản phát hành sẽ dừng sớm hơn khi thiếu nội dung",
+          "lead": "Trước đây, quá trình phát hành chỉ thất bại sau khi cả ba bộ cài đã được tạo xong.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Nếu thiếu ghi chú phát hành, vấn đề chỉ xuất hiện ở bước cuối cùng, sau khi từng bộ cài cho Windows, macOS và Linux đã được tạo. Bước kiểm tra đó giờ chạy đầu tiên, nên bản phát hành sẽ dừng trong chưa đầy một phút thay vì sau khi hoàn tất toàn bộ bản dựng cho mọi nền tảng."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.2",
+      "date": "2026-09-09",
+      "entries": [
+        {
+          "id": "audit-every-shipped-lockfile",
+          "title": "Kiểm tra bảo mật bao phủ mọi thành phần được phát hành",
+          "lead": "Ba trong số các thành phần của một bản phát hành chưa từng được quét để tìm các lỗ hổng đã biết. Giờ đây, cả tám thành phần đều được quét.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Các bước kiểm tra bản phát hành đã quét năm trong số tám bộ phụ thuộc của kho mã nguồn này. Cả ba bộ bị bỏ qua đều được đưa tới người dùng: bộ công cụ giao diện được biên dịch vào mọi bản dựng, phần lõi dùng chung được liên kết trực tiếp vào launcher và máy chủ nhóm được phát hành cùng launcher. Một lỗ hổng đã biết trong bất kỳ thành phần nào trong số đó cũng có thể được phát hành mà không ai nhận được cảnh báo."
+            },
+            {
+              "type": "p",
+              "text": "Việc bật các bước kiểm tra đã phát hiện ba vấn đề trong máy chủ nhóm; hai vấn đề được sửa trong bản này bằng cách chuyển sang các phiên bản mới hơn. Vấn đề thứ ba chưa có bản sửa lỗi và mã liên quan không bao giờ chạy: nó đi kèm qua trình điều khiển cơ sở dữ liệu cho MySQL mà máy chủ không bật, và bản dựng phát hành không chứa bất kỳ dấu vết nào của nó. Lập luận này đã được ghi vào các bước kiểm tra bản phát hành, vì vậy trường hợp miễn trừ phải được giải trình lại thay vì âm thầm kế thừa."
+            },
+            {
+              "type": "note",
+              "text": "Bản phát hành này không thay đổi bất kỳ hành vi nào mà bạn có thể thấy. Mục đích là bảo đảm bản phát hành tiếp theo không thể âm thầm đưa ra một lỗ hổng đã biết."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.1",
+      "date": "2026-09-09",
+      "entries": [
+        {
+          "id": "zip-extraction-without-adm-zip",
+          "title": "Giải nén tệp lưu trữ runtime an toàn hơn",
+          "lead": "Node SDK đã loại bỏ một thư viện zip cho phép tệp lưu trữ được tạo với chủ đích ghi dữ liệu ra ngoài thư mục đích khi giải nén.",
+          "tag": "fix",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "SDK đã giải nén runtime Windows và gói dấu vân tay bằng **adm-zip**, thư viện này đi theo các đường dẫn mục nhập thoát ra ngoài thư mục đích. Một tệp lưu trữ được tạo để khai thác hành vi đó có thể ghi đè lên mọi tệp mà SDK có quyền ghi."
+            },
+            {
+              "type": "p",
+              "text": "Không có bản phát hành đã vá để nâng cấp lên. 0.6.0 là phiên bản mới nhất, còn quy trình nâng cấp tự động lại đưa phiên bản *lùi* về 0.5.8, vốn có một lỗ hổng nghiêm trọng riêng khiến một tệp lưu trữ nhỏ kích hoạt việc cấp phát 4GB bộ nhớ."
+            },
+            {
+              "type": "p",
+              "text": "Vì vậy, phần phụ thuộc này đã bị loại bỏ. Windows giải nén bằng `tar.exe` đi kèm Windows 10 build 17063 trở lên; macOS và Linux tiếp tục dùng `unzip` của hệ thống như trước đây khi xử lý các gói engine. Cả hai đều không ghi ra ngoài thư mục đích."
+            }
+          ]
+        },
+        {
+          "id": "updater-signature-gate",
+          "title": "Các bản phát hành tự xác minh chữ ký cập nhật",
+          "lead": "Quy trình phát hành giờ kiểm tra mọi chữ ký của trình cập nhật trước khi xuất bản, nên bản tự động cập nhật bị lỗi không thể được phát hành.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tính năng tự động cập nhật từ chối mọi tệp tải xuống có chữ ký không khớp với khóa tích hợp trong ứng dụng. Trước đây, lần kiểm tra đầu tiên chỉ diễn ra trên *máy của bạn* — một manifest được ký bằng khóa sai vẫn có thể được xuất bản bình thường và khiến mọi người mắc kẹt ở phiên bản cũ."
+            },
+            {
+              "type": "p",
+              "text": "Quy trình giờ xác minh chữ ký của từng nền tảng bằng chính khóa đó trước khi tải manifest lên, đồng thời dừng phát hành nếu có bất kỳ chữ ký nào không hợp lệ."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.2.0",
+      "date": "2026-09-09",
+      "entries": [
+        {
+          "id": "hermes-leads-mcp-card",
+          "title": "Hermes được ưu tiên trên thẻ MCP",
+          "lead": "Phần Cài đặt giờ kiểm tra Hermes trước vì Hermes là MCP host chính.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thẻ này từng chọn nút chính chỉ dựa vào Codex, nên **Kiểm tra đăng ký Codex** vẫn nằm ở vị trí đầu ngay cả khi Hermes đã trở thành host cần quan tâm. Thao tác kiểm tra Hermes nằm trong mục *Hành động nâng cao*, phía sau một phần mở rộng mà hầu hết người dùng không bao giờ mở."
+            },
+            {
+              "type": "p",
+              "text": "Hermes giờ chiếm vị trí nút chính, còn Codex được chuyển vào *Hành động nâng cao*. Tại đó, lệnh sửa chữa Codex luôn được cung cấp thay vì chỉ xuất hiện khi launcher đã xác định rằng bản cài đặt bị lỗi."
+            },
+            {
+              "type": "code",
+              "text": "hermes config get mcp_servers.shardbrowser"
+            }
+          ]
+        },
+        {
+          "id": "advanced-actions-stay-closed",
+          "title": "Hành động nâng cao luôn được thu gọn",
+          "lead": "Các hành động MCP phụ vẫn được thu gọn cho đến khi bạn mở chúng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Việc sắp xếp lại thẻ đã đưa các hành động ít dùng hơn vào một phần thu gọn. Một kiểm thử hồi quy giờ xác nhận rằng chúng thực sự bị ẩn khi tải, để thay đổi trong tương lai không thể âm thầm làm chúng hiện trở lại trên thẻ."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.1.2",
+      "date": "2026-09-08",
+      "entries": [
+        {
+          "id": "patch-log-catches-up",
+          "title": "Nhật ký đã ghi nhận 2.1.0 và 2.1.1",
+          "lead": "Bản phát hành này bao gồm hai mục được viết sau khi tag 2.1.1 đã được chốt.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Các mục 2.1.0 và 2.1.1 được đưa vào nhánh chính sau khi những bản phát hành tương ứng đã được build xong, nên ứng dụng đã cài đặt vẫn đánh dấu 2.0.1 là mục mới nhất và không đề cập gì đến hai bản phát hành sau đó."
+            },
+            {
+              "type": "note",
+              "text": "Ứng dụng không có thay đổi nào khác; bản phát hành này chỉ nhằm cập nhật nhật ký."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.1.1",
+      "date": "2026-09-08",
+      "entries": [
+        {
+          "id": "engine-install-guard",
+          "title": "Quá trình cài đặt chờ các hồ sơ đang chạy",
+          "lead": "Bản cập nhật engine không còn cố thay thế các tệp mà một hồ sơ đang chạy vẫn giữ mở.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Việc thay thế engine đòi hỏi phải xóa engine cũ trước. Trên Windows, thao tác này thất bại khi một hồ sơ vẫn đang mở trình duyệt, và engine chỉ được ghi một phần khiến màn hình thiết lập xuất hiện lại sau mỗi lần khởi chạy."
+            },
+            {
+              "type": "p",
+              "text": "Quá trình cài đặt giờ dừng trước khi xóa bất kỳ thứ gì và nêu tên các hồ sơ mà nó đang chờ. Hãy đóng các hồ sơ đó rồi chạy lại để tiếp tục cập nhật."
+            }
+          ]
+        },
+        {
+          "id": "existing-mcp-folder",
+          "title": "Dùng một thư mục MCP hiện có",
+          "lead": "Trỏ launcher tới MCP server bạn đã có thay vì tải xuống một bản sao thứ hai.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Phần Cài đặt có tùy chọn Dùng thư mục MCP hiện có bên cạnh nút tải xuống. Chọn thư mục, launcher sẽ báo cáo phiên bản và trạng thái phần phụ thuộc tại đó."
+            },
+            {
+              "type": "note",
+              "text": "Hữu ích khi MCP server nằm cùng các công cụ khác của bạn thay vì trong thư mục dữ liệu riêng của launcher."
+            }
+          ]
+        },
+        {
+          "id": "verification-to-front",
+          "title": "Đưa tab xác minh ra phía trước",
+          "lead": "Đưa cửa sổ của hồ sơ đang chạy lên trước khi một trang web đang chờ người dùng xác minh.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tùy chọn này có trong menu của hồ sơ khi hồ sơ đang chạy. Nếu hồ sơ chưa chạy, launcher sẽ thông báo rõ thay vì âm thầm thất bại."
+            }
+          ]
+        },
+        {
+          "id": "shortcut-hint-line",
+          "title": "Gợi ý phím tắt tìm kiếm nằm gọn trên một dòng",
+          "lead": "Ctrl K không còn bị ngắt thành một cột hai dòng bên cạnh ô tìm kiếm.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Gợi ý nằm trong một vùng hẹp, và một dấu cách thông thường đã khiến nội dung bị ngắt dòng."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.1.0",
+      "date": "2026-09-08",
+      "entries": [
+        {
+          "id": "team-enrolment",
+          "title": "Đăng ký vào nhóm",
+          "lead": "Đăng ký thiết bị với máy chủ của nhóm để đồng bộ các hồ sơ được mã hóa giữa nhiều máy.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Phần Cài đặt có thêm thẻ Nhóm, gồm URL máy chủ, API token, ID tenant và nhãn thiết bị. Hãy tạo một ID tenant cho nhóm máy mới hoặc dán một ID hiện có để tham gia nhóm máy bạn đang vận hành."
+            },
+            {
+              "type": "note",
+              "text": "Máy chủ chỉ định tuyến bản mã. Máy chủ không bao giờ giữ khóa, nên không thể đọc hồ sơ ngay cả khi muốn."
+            },
+            {
+              "type": "p",
+              "text": "Việc thay đổi máy chủ hoặc tenant sẽ xóa các khóa của thiết bị này, vì các khóa chỉ có ý nghĩa trong nhóm máy đã cấp chúng."
+            }
+          ]
+        },
+        {
+          "id": "encrypted-backup",
+          "title": "Sao lưu hồ sơ được mã hóa",
+          "lead": "Có thể sao lưu và khôi phục hồ sơ dưới dạng bản mã, bằng khóa của nhóm máy của bạn.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Bản sao lưu chứa cookie, dữ liệu lưu trữ và dấu vân tay của hồ sơ. Khi được khôi phục trên một thiết bị đã đăng ký, hồ sơ sẽ được dựng lại đúng như trước mà bản rõ không bao giờ rời khỏi máy."
+            }
+          ]
+        },
+        {
+          "id": "engine-manifest-pin",
+          "title": "Manifest của engine được cố định",
+          "lead": "Launcher kiểm tra hash engine đã công bố trước khi xác định có cần cập nhật hay không.",
+          "scope": "launcher",
+          "tag": "fix",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Phiên bản, bản build engine và hash của tệp lưu trữ được so sánh cùng nhau. Một giá trị cục bộ không xác định không còn bị coi là không khớp, vì vậy launcher ngừng đề xuất bản cập nhật mà nó đã áp dụng."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.0.1",
+      "date": "2026-09-03",
+      "entries": [
+        {
+          "id": "ensemble",
+          "title": "Các cửa sổ đồng bộ",
+          "lead": "Bạn thao tác trong một cửa sổ; mọi cửa sổ khác trong nhóm sẽ lặp lại cùng các thao tác đó trong hồ sơ riêng của mình.",
+          "locked": true,
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Con trỏ, thao tác gõ phím, cuộn, mở và đóng tab, cửa sổ bật lên của tiện ích mở rộng. Đây không phải là bản ghi được phát lại: mỗi cửa sổ thực hiện thao tác bằng mô hình chuyển động riêng, nên các cửa sổ không bao giờ di chuyển giống hệt nhau."
+            },
+            {
+              "type": "p",
+              "text": "Không cần chỉ định cửa sổ dẫn dắt. Cửa sổ bạn đang gõ sẽ là cửa sổ điều khiển, vì đó là cửa sổ nhận dữ liệu nhập thực. Khi bạn chuyển cửa sổ, quyền điều khiển cũng chuyển theo."
+            },
+            {
+              "type": "p",
+              "text": "Trình hỗ trợ điền biểu mẫu được chủ ý loại trừ. Trong một nhóm, mỗi cửa sổ điền cùng một biểu mẫu vào cùng thời điểm bằng danh tính tự tạo riêng, vì vậy việc phản chiếu các lần nhấn phím đó sẽ đưa câu trả lời của một cửa sổ vào trường của tất cả cửa sổ còn lại."
+            },
+            {
+              "type": "p",
+              "text": "Đã sửa: cửa sổ khởi chạy ở trạng thái phóng to, toàn màn hình hoặc thu nhỏ từng bỏ qua bố cục, vì ở các trạng thái này, trạng thái cửa sổ kiểm soát kích thước và vị trí. Giờ đây cửa sổ sẽ thoát khỏi trạng thái đó trước. Bố cục đã chọn cũng được ghi nhớ, nên hồ sơ khởi động xong sau các hồ sơ khác cũng được đặt đúng vị trí."
+            },
+            {
+              "type": "p",
+              "text": "Đã sửa: một tab do trang web mở — `target=_blank` hoặc `window.open` — vẫn còn trong các cửa sổ khác sau khi được đóng. Những tab như vậy không bao giờ được phát đồng bộ, vì mỗi cửa sổ tự mở tab riêng từ cùng một lượt nhấp được phản chiếu, nên không có tên để dùng khi đóng. Giờ đây, tab nhận một tên mà cả hai phía tự xác định độc lập; thao tác đóng cũng mang theo địa chỉ trang để kiểm tra, nên cửa sổ nào tìm thấy nội dung khác dưới tên đó sẽ để nguyên."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "human-type-browser",
+          "title": "Gõ phím như người thật trong trình duyệt",
+          "lead": "Nhấp chuột phải vào một trường và trình duyệt sẽ gõ vào đó như cách một người thực hiện.",
+          "tag": "new",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Menu ngữ cảnh của mọi trường văn bản, ô tìm kiếm hoặc `contenteditable` có thêm hai mục: **Human Type**, dùng để gõ nội dung trong clipboard, và **Fill with generated**, một menu con gồm tám giá trị được tạo cho hồ sơ này — tên, họ, email, tên người dùng, số điện thoại và các giá trị còn lại. Mỗi mục hiển thị giá trị mà nó sẽ gõ."
+            },
+            {
+              "type": "p",
+              "text": "Văn bản không được gán trực tiếp vào phần tử, cũng không được dán. Văn bản được nhập từng phím một, qua đúng đường đi mà bàn phím sử dụng:"
+            },
+            {
+              "type": "list",
+              "items": [
+                "khoảng nghỉ giữa các lần nhấn phím thay đổi thay vì dùng một độ trễ cố định",
+                "thời gian phụ thuộc vào cặp chữ cái — `th` nhanh hơn `qz`, giống như khi một người gõ",
+                "các phím chồng lấn nhau: phím tiếp theo được nhấn xuống trước khi phím trước đó được nhả ra",
+                "độ lệch thời gian theo từng ký tự thuộc riêng về hồ sơ và vẫn được giữ sau khi khởi động lại",
+                "có thể thêm lỗi gõ, được tạo ra rồi sửa bằng một lần nhấn phím backspace thực"
+              ]
+            },
+            {
+              "type": "p",
+              "text": "Con trỏ di chuyển theo cách tương tự, có vượt quá mục tiêu rồi điều chỉnh lại, và mất nhiều thời gian hơn để đến một mục tiêu nhỏ so với một mục tiêu lớn. Các trường mật khẩu bị loại trừ."
+            },
+            {
+              "type": "note",
+              "text": "Không có JavaScript nào được chèn vào. Toàn bộ luồng xử lý nằm trong C++ bên trong tiến trình trình duyệt, nên trang web không thể phát hiện một script vốn chưa từng tồn tại."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "human-type-cdp",
+          "title": "Gõ phím như người thật qua CDP",
+          "lead": "Cùng một engine gõ phím và điều khiển con trỏ, được vận hành từ script.",
+          "tag": "new",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Các lệnh nằm trong domain `Motion` trên browser target. Domain này không xuất hiện trong `/json/protocol` hoặc `Schema.getDomains`, và tên lệnh được chủ ý đặt khác với tên lệnh của các công cụ tự động hóa khác."
+            },
+            {
+              "type": "code",
+              "text": "Motion.createPointer  {x, y, paceScale?, seed?}\nMotion.glideTo        {x, y, targetWidth?}   → {durationMs}\nMotion.tap            {button?, clickCount?}\nMotion.enterText      {text, allowTypos?}    → {durationMs}\nMotion.destroyPointer"
+            },
+            {
+              "type": "p",
+              "text": "Hãy tạo con trỏ trước: một phiên không có con trỏ sẽ trả về lỗi cho mọi lệnh khác thay vì đoán vị trí con trỏ, vì điểm bắt đầu được đoán sẽ tạo ra thời lượng và đường cong sai. Hãy truyền chiều rộng thực của phần tử vào `targetWidth` — chính điều đó khiến thời gian trở nên đáng tin."
+            },
+            {
+              "type": "note",
+              "text": "Ví dụ hoàn chỉnh nằm trong README, phần “Human input over CDP”."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "shardx-camera",
+          "title": "Camera",
+          "lead": "Hồ sơ có một camera ngay cả trên máy không có camera, và camera đó hiển thị ảnh hoặc video bạn chọn.",
+          "tag": "new",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Danh sách camera của máy được thay thế chứ không phải bổ sung. Trang web không bao giờ truy cập được camera thật — điều này quan trọng vì dấu vân tay của hồ sơ đã chỉ định một model camera cụ thể, và việc cung cấp camera của máy host sẽ mâu thuẫn với thông tin đó."
+            },
+            {
+              "type": "p",
+              "text": "Chọn tệp bằng nút điều khiển ở bên trái menu ứng dụng khi trình duyệt đang chạy. Các định dạng PNG, JPEG, MP4, MOV, WebM, Y4M và MJPEG được chấp nhận; định dạng được phát hiện từ nội dung tệp nên phần mở rộng sai không ảnh hưởng. Video được phát lặp, vì vậy một đoạn clip ngắn là đủ."
+            },
+            {
+              "type": "p",
+              "text": "Bảng điều khiển hiển thị khung hình đầu tiên cùng một khung chọn: kéo bên trong để di chuyển, kéo một góc để đổi kích thước, còn các con số bên cạnh cho phép bạn ghi lại cách căn khung và lặp lại chính xác. Khung chọn giữ nguyên tỷ lệ khung hình của camera, nên hình ảnh không bao giờ bị kéo giãn hoặc thêm viền đen. Với ảnh dọc hoặc ảnh vuông, có một hộp kiểm để thay vào đó thu toàn bộ ảnh vừa khung và lấp đầy khoảng trống hai bên."
+            },
+            {
+              "type": "p",
+              "text": "Thứ trang web nhận được là một camera, không phải một tệp:"
+            },
+            {
+              "type": "list",
+              "items": [
+                "tên và ID thiết bị thuộc về hồ sơ, không phải đường dẫn đến tệp của bạn",
+                "một dải độ phân giải thông thường, không chỉ độ phân giải tình cờ trùng với hình ảnh",
+                "pan, tilt và zoom thực sự cắt ảnh, và chỉ được báo là có hỗ trợ khi model mà hồ sơ khai báo có các tính năng đó",
+                "các khung hình mang nhiễu cảm biến nên không có hai khung hình nào giống hệt nhau — trang web so sánh các khung hình liên tiếp sẽ không thấy một hình ảnh đóng băng",
+                "thời gian khung hình dao động một hoặc hai mili giây, giống như phần cứng thực",
+                "không gian màu được thiết lập"
+              ]
+            },
+            {
+              "type": "note",
+              "text": "Khi chưa chọn nội dung nào, camera vẫn hoạt động và hiển thị một khung hình tối thay vì báo lỗi. Một camera được liệt kê nhưng sau đó không bao giờ cung cấp hình ảnh cũng là dấu hiệu có thể bị phát hiện."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "helper",
+          "title": "Trình hỗ trợ điền biểu mẫu",
+          "lead": "Trình duyệt tìm các trường, đưa ra các trường có thể điền và điền chúng chỉ bằng một nút bấm.",
+          "tag": "new",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Được bật riêng cho từng hồ sơ. Trình duyệt theo dõi trang, đưa ra các trường có thể điền và khi bạn nhấn một lần, trình duyệt sẽ gõ lần lượt vào từng trường. Danh tính được tạo ra là cố định theo từng hồ sơ: hồ sơ chính là tài khoản, và một tài khoản có một chủ sở hữu."
+            },
+            {
+              "type": "p",
+              "text": "Ba nguồn được sử dụng, mỗi nguồn trả lời một câu hỏi:"
+            },
+            {
+              "type": "list",
+              "items": [
+                "**Autofill** — một trường là gì: tên, năm sinh hay giới tính.",
+                "**The accessibility tree** — phần tử có còn tồn tại hay không, nằm ở đâu và có được hiển thị hay không. Dữ liệu được đọc mới nhiều lần trong những giây đầu tiên của một bước và được đối chiếu theo ID phần tử thay vì vị trí, vì hai bước của cùng một quy trình đăng ký có thể chiếm cùng một vùng chữ nhật.",
+                "**Focus after the click** — lượt nhấp có trúng đích hay không. Không có thành phần nào trong tiến trình trình duyệt biết nội dung nào được vẽ đè lên nội dung nào, nên nếu một phần tử khác nhận focus, trường đó sẽ bị bỏ qua thay vì gõ một cách mù quáng."
+              ]
+            },
+            {
+              "type": "p",
+              "text": "Các menu thả xuống được dựng từ một `div` và một `ul` mà autofill không thể thấy sẽ được tìm qua accessibility tree rồi điền bằng cách nhấp vào hộp và sau đó nhấp vào tùy chọn."
+            },
+            {
+              "type": "p",
+              "text": "Đã sửa: một quy trình đăng ký chuyển bước ngay trong cùng một tài liệu từng khiến trình hỗ trợ vẫn đưa ra các trường của bước trước, nên thao tác điền đã đưa tên vào hàng ngày tháng. Có ba nguyên nhân: bước cũ vẫn nằm trong bộ nhớ đệm của autofill, các trường cũ được bố trí bên dưới trường mới tại cùng tọa độ, và một bước ban đầu bị ẩn chỉ được phân tích một lần khi tải với mọi trường bị đánh dấu là không thể nhận focus rồi không bao giờ được đọc lại. Giờ đây accessibility tree xử lý cả ba vấn đề."
+            },
+            {
+              "type": "p",
+              "text": "Danh sách trường được đề xuất cũng tự ổn định: trang được kiểm tra nhiều lần trong những giây đầu tiên của một bước, nên biểu mẫu mới chỉ được phân tích một phần sẽ tự sửa lại thay vì chờ bạn tương tác với nội dung nào đó."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "mcp-human",
+          "title": "Thao tác nhập liệu như con người trong MCP",
+          "lead": "Miền Motion được bọc lại để mô hình có thể nhắm vào một phần tử thay vì một tọa độ.",
+          "tag": "new",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "MCP server đi kèm được bổ sung `human_click`, `human_move`, `human_fill` và `human_type`. Các hàm này nhận cùng bộ chọn như những công cụ trình duyệt hiện có; lớp bọc phân giải phần tử, cuộn phần tử vào vùng hiển thị rồi truyền tọa độ cùng chiều rộng thực tế của phần tử cho phần lõi, nhờ đó con trỏ mất nhiều thời gian hơn để tiếp cận một mục tiêu nhỏ."
+            },
+            {
+              "type": "code",
+              "text": "human_fill(profile_id, \"#email\", \"ada@example.com\")\nhuman_fill(profile_id, \"#email\", \"new@…\", clear: true)\nhuman_click(profile_id, \"button[type=submit]\")"
+            },
+            {
+              "type": "p",
+              "text": "`clear` chọn giá trị hiện tại bằng cách nhấp ba lần thay vì dùng phím tắt, vì vậy thao tác xóa cũng tự nhiên như thao tác gõ. Hãy cung cấp `x` và `y` thay cho bộ chọn khi đã biết tọa độ. Các lệnh gọi diễn ra theo thời gian thực và báo cáo thời gian đã dùng để di chuyển cũng như gõ."
+            }
+          ],
+          "scope": "browser"
+        },
+        {
+          "id": "profile-icon",
+          "title": "Biểu tượng cửa sổ theo từng hồ sơ",
+          "lead": "Cửa sổ của mỗi hồ sơ hiển thị tên và màu riêng.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trong Dock, thanh tác vụ và Alt-Tab, bạn có thể thấy mình sắp chuyển sang hồ sơ nào. Tên được hiển thị lớn hết mức có thể, xuống tối đa ba dòng; tên quá dài không thể hiển thị vừa sẽ được rút gọn bằng dấu ba chấm."
+            },
+            {
+              "type": "p",
+              "text": "Biểu tượng có hình dạng theo quy chuẩn riêng của từng hệ thống: hình vuông bo cong kiểu squircle có bóng đổ trên macOS, hình vuông bo góc tràn viền trên Windows và đường viền Adwaita trên Linux."
+            },
+            {
+              "type": "note",
+              "text": "Không cần thiết lập gì. Khi đổi tên hồ sơ, biểu tượng sẽ cập nhật theo ở lần khởi chạy tiếp theo."
+            }
+          ]
+        },
+        {
+          "id": "profile-colour",
+          "title": "Màu hồ sơ",
+          "lead": "Mỗi hồ sơ có một màu, xuất hiện trên biểu tượng cửa sổ và phía sau tên hồ sơ trong omnibox.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Chọn màu trong trình chỉnh sửa hồ sơ. Biểu tượng cửa sổ và pill chứa tên hồ sơ trong omnibox đều dùng màu đó, nên cả hai luôn cho biết nhất quán bạn đang xem hồ sơ nào."
+            },
+            {
+              "type": "p",
+              "text": "Khi để ở chế độ **Auto**, biểu tượng lấy màu từ tên — cùng một hồ sơ luôn có cùng một màu, đồng thời các hồ sơ vẫn có thể được phân biệt ở kích thước 32 px — còn pill giữ màu thanh công cụ của chính trình duyệt và thay đổi theo theme."
+            },
+            {
+              "type": "note",
+              "text": "`color` là một trường khi tạo và chỉnh sửa hồ sơ, vì vậy một loạt hồ sơ được tạo bằng script có thể được phân loại bằng màu."
+            }
+          ]
+        },
+        {
+          "id": "extensions",
+          "title": "Thư viện extension",
+          "lead": "Thêm extension một lần, sau đó chọn riêng cho từng hồ sơ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "**Library → Extensions** → *From link*: cung cấp địa chỉ Web Store để extension tự tải xuống. Chỉ dán id trong địa chỉ cũng được, cũng như dùng liên kết trực tiếp tới tệp `.crx` hoặc `.zip`. Bạn cũng có thể thêm một tệp hoặc một thư mục đã giải nén theo cách tương tự."
+            },
+            {
+              "type": "p",
+              "text": "Mỗi extension hiển thị tên, phiên bản, mô tả và biểu tượng được đọc từ chính extension đó — vì vậy nội dung hiển thị trong lưới chính là nội dung trình duyệt sẽ tải. Trong trình chỉnh sửa hồ sơ, chúng xuất hiện dưới dạng các thẻ: đánh dấu những extension hồ sơ này cần chạy; mỗi hồ sơ có thể mang một bộ extension khác nhau."
+            },
+            {
+              "type": "note",
+              "text": "Khi xóa một extension khỏi thư viện, mọi hồ sơ sẽ ngừng tải extension đó từ lần khởi chạy tiếp theo; hồ sơ chỉ giữ một tham chiếu, không giữ bản sao."
+            },
+            {
+              "type": "note",
+              "text": "Cũng hỗ trợ qua API và MCP: `POST /extensions` nhận cùng loại liên kết, còn `extensions` của hồ sơ là một trường khi tạo và chỉnh sửa."
+            }
+          ]
+        },
+        {
+          "id": "bookmarks",
+          "title": "Dấu trang theo thư mục",
+          "lead": "Trang web được liên kết với một thư mục sẽ xuất hiện trên thanh dấu trang của mọi hồ sơ trong thư mục đó.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "**Library → Bookmarks**: thêm một trang web rồi chọn thư mục. Từ lần khởi chạy tiếp theo, mọi hồ sơ trong thư mục đó sẽ có trang web này trong thư mục trên thanh dấu trang mang tên **ShardX**. Không liên kết với thư mục nào đồng nghĩa áp dụng cho mọi hồ sơ."
+            },
+            {
+              "type": "p",
+              "text": "Chỉ thư mục đó được quản lý. Các dấu trang được lưu bên trong hồ sơ không bị thay đổi; trang web bị xóa tại đây sẽ biến mất khỏi các hồ sơ ở lần khởi chạy tiếp theo."
+            },
+            {
+              "type": "note",
+              "text": "Cũng hỗ trợ qua API và MCP: `GET`/`POST /bookmarks`."
+            }
+          ]
+        },
+        {
+          "id": "trash",
+          "title": "Thùng rác",
+          "lead": "Hồ sơ đã xóa được giữ trong 7 ngày và có thể khôi phục cùng cookie và thông tin đăng nhập.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Xóa hồ sơ giờ đây sẽ chuyển hồ sơ vào **Thùng rác**, có thể khôi phục trong bảy ngày. Những gì được khôi phục là tài khoản — cookie, thông tin đăng nhập đã lưu, dữ liệu trang web, tùy chọn, lịch sử và dấu trang — với cùng id, nên mọi thứ từng tham chiếu đến hồ sơ vẫn trỏ đến đó."
+            },
+            {
+              "type": "p",
+              "text": "Cache không được giữ lại, vì vậy một hồ sơ từng chiếm một gigabyte sẽ chỉ còn vài megabyte trong thùng rác. Xóa một thư mục cùng với các hồ sơ trong đó cũng đi qua thùng rác."
+            },
+            {
+              "type": "note",
+              "text": "Sau bảy ngày, hồ sơ sẽ biến mất. **Dọn sạch thùng rác** sẽ xóa sớm hơn."
+            },
+            {
+              "type": "note",
+              "text": "Bạn cũng có thể thực hiện qua API và MCP: `DELETE /profiles/{id}` lưu trữ hồ sơ, `GET /trash` liệt kê, còn `POST /trash/{id}/restore` khôi phục hồ sơ."
+            }
+          ]
+        },
+        {
+          "id": "data-location",
+          "title": "Vị trí dữ liệu hồ sơ",
+          "lead": "Di chuyển hồ sơ, tiện ích mở rộng và thùng rác sang thư mục hoặc ổ đĩa khác.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "**Cài đặt → Vị trí dữ liệu hồ sơ** → *Thay đổi…* rồi chọn một thư mục trên bất kỳ ổ đĩa nào. Khi di chuyển, thanh tiến trình sẽ hiển thị; không có gì trong thư mục cũ bị xóa cho đến khi mọi tệp đã được chuyển đến và kiểm tra xong, vì vậy nếu thất bại giữa chừng, mọi thứ vẫn nguyên trạng."
+            },
+            {
+              "type": "p",
+              "text": "Không thể khởi chạy hồ sơ trong khi đang di chuyển — kể cả từ API, nên tập lệnh không thể khởi động trình duyệt giữa lúc di chuyển. Trước tiên, hãy đóng mọi hồ sơ đang chạy."
+            },
+            {
+              "type": "note",
+              "text": "Ổ đĩa được gắn ở chế độ chỉ đọc sẽ bị từ chối trước khi có bất kỳ dữ liệu nào được sao chép, thay vì đến giữa chừng mới bị từ chối."
+            }
+          ]
+        },
+        {
+          "id": "extra-args",
+          "title": "Đối số khởi chạy bổ sung",
+          "lead": "Các switch được thêm vào mỗi lần khởi chạy hồ sơ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "**Cài đặt → Đối số khởi chạy bổ sung**, mỗi dòng một đối số hoặc cách nhau bằng dấu cách; hãy đặt trong dấu ngoặc kép nếu giá trị chứa khoảng trắng. Chúng được áp dụng sau cùng, nên switch ở đây cũng ghi đè switch của launcher."
+            },
+            {
+              "type": "note",
+              "text": "Thay vào đó, hãy đặt mọi thứ làm thay đổi những gì một trang có thể đo lường vào hồ sơ. Một switch áp dụng đồng thời cho mọi hồ sơ sẽ khiến tất cả chúng giống nhau."
+            }
+          ]
+        },
+        {
+          "id": "proxy-names",
+          "title": "Tên proxy",
+          "lead": "`host:port:user:pass #facebook` — phần sau dấu thăng là tên của proxy.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tên được hiển thị trước trong danh sách proxy của hồ sơ và trong bảng proxy, còn địa chỉ hiển thị phía sau. Bạn có thể đặt tên khi tạo hoặc chỉnh sửa proxy, hoặc ghi tên vào dòng đang dán. Chức năng nhập hàng loạt sẽ đọc tên này và chức năng xuất sẽ ghi lại tên."
+            },
+            {
+              "type": "note",
+              "text": "Để trống tên thì placeholder của trường sẽ hiển thị địa chỉ mà proxy sẽ dùng làm giá trị mặc định. Quốc gia không phải thông tin bạn cần tự ghi - bài kiểm tra proxy sẽ điền vào."
+            }
+          ]
+        },
+        {
+          "id": "proxy-distribute",
+          "title": "Phân phối proxy",
+          "lead": "Chọn proxy, nhấn Distribute, kiểm tra ghép nối rồi liên kết.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Hộp thoại đặt hai danh sách cạnh nhau và ghép theo vị trí — proxy số 1 với hồ sơ số 1 — để bạn kiểm tra ghép nối trước khi liên kết. Mỗi hồ sơ nhận một proxy: nếu proxy không đủ, các hồ sơ còn lại sẽ được để nguyên thay vì dùng chung một IP."
+            },
+            {
+              "type": "p",
+              "text": "Theo mặc định, thao tác này áp dụng cho các hồ sơ **không có proxy**. Chuyển sang tất cả hồ sơ để gán lại các proxy hiện có; trước khi bạn xác nhận, hộp thoại sẽ cho biết có bao nhiêu liên kết sẽ bị thay thế."
+            }
+          ]
+        },
+        {
+          "id": "editor-proxy",
+          "title": "Thêm proxy từ trình chỉnh sửa hồ sơ",
+          "lead": "Thêm và liên kết proxy từ chính danh sách proxy của hồ sơ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "**Tạo proxy mới** nằm ở đầu danh sách proxy của hồ sơ - đúng nơi bạn đang xem khi nhận ra proxy mình cần không có trong danh sách. Dán một dòng và dòng đó sẽ được đọc giống như khi nhập hàng loạt: `host:port`, `host:port:user:pass`, `user:pass@host:port` hoặc URL `socks5://`, kèm `#name` ở cuối."
+            },
+            {
+              "type": "p",
+              "text": "Nội dung được nhận diện sẽ hiển thị trước khi có bất kỳ dữ liệu nào được lưu. Lưu sẽ thêm proxy vào danh sách proxy và liên kết proxy đó với hồ sơ bạn đang chỉnh sửa."
+            }
+          ]
+        },
+        {
+          "id": "list-work",
+          "title": "Chọn hàng và bộ lọc",
+          "lead": "Shift-click chọn một dải hàng; bộ lọc thu hẹp danh sách hồ sơ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Shift-click sẽ chọn từ hàng cuối cùng bạn đã nhấp đến hàng bạn Shift-click, áp dụng cho cả bảng hồ sơ và proxy, đồng thời có thể thực hiện ở bất kỳ vị trí nào trên hàng chứ không chỉ tại checkbox."
+            },
+            {
+              "type": "p",
+              "text": "Hàng bạn Shift-click sẽ quyết định hướng thao tác: hàng chưa được chọn sẽ chọn toàn bộ dải, còn hàng đã được chọn sẽ bỏ chọn dải đó. Đây cũng là cách hoàn tác một dải đã chọn nhầm."
+            },
+            {
+              "type": "p",
+              "text": "Có thể lọc hồ sơ theo trạng thái đang chạy, theo quốc gia của proxy đã liên kết và theo việc hồ sơ có proxy hay không. Nút bộ lọc hiển thị số lượng để bạn biết khi nào bộ lọc đang ẩn kết quả."
+            }
+          ]
+        },
+        {
+          "id": "temp-noise",
+          "title": "Noise cho hồ sơ tạm thời",
+          "lead": "`POST /profiles/temporary` nhận một khối noise.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Hồ sơ tạm thời giờ đây có thể đặt noise theo từng vector thay vì dùng giá trị mặc định, tức là tắt toàn bộ:"
+            },
+            {
+              "type": "code",
+              "text": "POST /profiles/temporary\n{\n  \"platform\": \"Windows\",\n  \"proxy\": \"socks5://user:pass@host:1080\",\n  \"noise\": {\n    \"canvas\": true,\n    \"webgl\": { \"enabled\": true, \"intensity\": 0.0005 },\n    \"fonts\": true\n  }\n}"
+            },
+            {
+              "type": "p",
+              "text": "`true` bật một vector với cường độ mà giao diện dùng; một khối đầy đủ sẽ đặt chi tiết. Vector nào bạn bỏ trống thì vẫn tắt. Cũng đối số đó đi tới máy chủ MCP đi kèm, dưới dạng `noise` của `create_temporary_profile`."
+            },
+            {
+              "type": "note",
+              "text": "`true` bật một vector với cường độ mà giao diện sử dụng; một khối đầy đủ sẽ đặt các chi tiết. Vector bạn bỏ qua sẽ vẫn tắt. Đối số tương tự cũng được chuyển đến máy chủ MCP đi kèm dưới dạng `noise` của `create_temporary_profile`."
+            }
+          ]
+        },
+        {
+          "id": "fixes",
+          "title": "Bản sửa lỗi",
+          "lead": "Hai nơi mà các danh sách của launcher chưa được cập nhật.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "list",
+              "items": [
+                "**Proxy được thêm trên trang Proxies không xuất hiện trong trình chỉnh sửa hồ sơ** cho đến khi khởi động lại ứng dụng. Giờ đây proxy xuất hiện ngay lập tức, và proxy được liên kết bằng hộp thoại phân phối cũng xuất hiện trong bảng hồ sơ theo cách tương tự.",
+                "**Quốc gia, khu vực và thành phố trong trình tạo dân cư ProxyShard không có chức năng tìm kiếm.** Giờ đây bạn có thể tìm kiếm các mục này, cũng như vị trí trong thẻ mua."
+              ]
+            }
+          ]
+        },
+        {
+          "id": "engine-updates",
+          "title": "Phát hiện cập nhật engine",
+          "lead": "Engine được build lại giờ đây vẫn đến được với bạn ngay cả khi phiên bản Chromium không thay đổi.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tính năng kiểm tra cập nhật trước đây chỉ so sánh phiên bản Chromium, nên bản build engine thứ hai trên cùng một phiên bản - các bản vá mới, cùng upstream, vốn là phần lớn các bản phát hành - không bao giờ được cung cấp. Giờ đây có ba dấu hiệu cho biết engine đã thay đổi: phiên bản Chromium, build stamp mà bản phát hành mang theo và chính tệp lưu trữ."
+            },
+            {
+              "type": "p",
+              "text": "Một bản phát hành cũng có thể nêu phiên bản launcher mà bản đó yêu cầu. Khi bản đó cần phiên bản mới hơn phiên bản bạn đang chạy, cập nhật engine sẽ được giữ lại và bạn sẽ được thông báo về cập nhật launcher thay thế - một trình duyệt mà launcher không thể cấu hình sẽ trông như một hồ sơ bị hỏng chứ không phải một bản cập nhật bị bỏ sót."
+            }
+          ]
+        },
+        {
+          "id": "whats-new",
+          "title": "Nhật ký bản vá sau khi cập nhật",
+          "lead": "Tự động mở trong lần chạy đầu tiên sau khi cập nhật.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Hiển thị một lần cho mỗi phiên bản. Sau đó, ứng dụng sẽ mở ở vị trí như trước đây."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
