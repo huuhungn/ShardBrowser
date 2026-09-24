@@ -120,17 +120,18 @@ pub async fn launch_profile_synced(
     // Strip `_meta` wrapper and resolve "auto" sentinels before serialising.
     let mut raw = stored.config.clone();
     raw.remove("_meta");
-    let launch_options =
-        parse_launch_options(raw.remove("launch")).context("invalid launch options")?;
+    let launch_options = parse_launch_options(raw.remove("launch"))
+        .context(crate::errcode::code("launch.optionsInvalid"))?;
     // Preserve legacy profile data in storage, but do not hand it to the
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
     resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
-    let json = serde_json::to_string(&raw).context("serialize profile")?;
+    let json =
+        serde_json::to_string(&raw).context(crate::errcode::code("launch.serializeProfile"))?;
 
     // Pass fingerprint by file path — inline JSON overflows Windows' 32767-char CreateProcess limit.
     let fp_file = udd.join("fingerprint.json");
-    std::fs::write(&fp_file, &json).context("write fingerprint.json")?;
+    std::fs::write(&fp_file, &json).context(crate::errcode::code("launch.writeFingerprint"))?;
 
     // Pre-warm Widevine CDM to avoid first-DRM-page component-updater stall.
     if let Err(e) = install_widevine(&udd) {
@@ -347,11 +348,13 @@ pub async fn launch_profile_synced(
         // when a Tauri GUI app spawns the engine binary.
         cmd.creation_flags(0x08000000);
     }
-    let mut child = cmd.spawn().context("spawn ShardX")?;
+    let mut child = cmd
+        .spawn()
+        .context(crate::errcode::code("launch.spawnFailed"))?;
     if let Err(error) = profile::touch_launched(profile_id, None) {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        return Err(error).context("persist launch metadata before tracking ShardX");
+        return Err(error).context(crate::errcode::code("launch.persistMetadata"));
     }
     let tracked = Tracker::shared().track(profile_id.to_string(), child, stored.meta.temporary);
     drop(launch_claim);
@@ -393,7 +396,9 @@ fn parse_launch_options(value: Option<Value>) -> Result<LaunchOptions> {
     let Some(value) = value else {
         return Ok(LaunchOptions::default());
     };
-    let obj = value.as_object().context("`launch` must be an object")?;
+    let obj = value
+        .as_object()
+        .context(crate::errcode::code("launch.optionsNotObject"))?;
     Ok(LaunchOptions {
         args: parse_launch_args(obj.get("args"))?,
         extension_dirs: parse_dirs(obj.get("extension_dirs"), "launch.extension_dirs")?,
@@ -401,7 +406,7 @@ fn parse_launch_options(value: Option<Value>) -> Result<LaunchOptions> {
             None | Some(Value::Null) => true,
             Some(v) => v
                 .as_bool()
-                .context("`launch.restore_session` must be a boolean")?,
+                .context(crate::errcode::code("launch.restoreSessionNotBool"))?,
         },
     })
 }
@@ -428,18 +433,23 @@ fn parse_string_list(value: Option<&Value>, label: &str, max_len: usize) -> Resu
     };
     let arr = value
         .as_array()
-        .with_context(|| format!("`{label}` must be an array"))?;
+        .with_context(|| crate::errcode::code_with("launch.listNotArray", &[("label", label)]))?;
     let mut out = Vec::new();
     for item in arr {
         let s = item
             .as_str()
-            .with_context(|| format!("`{label}` entries must be strings"))?
+            .with_context(|| {
+                crate::errcode::code_with("launch.listNotStrings", &[("label", label)])
+            })?
             .trim();
         if s.is_empty() {
             continue;
         }
         if s.len() > max_len || s.chars().any(|c| c.is_control()) {
-            anyhow::bail!("`{label}` contains an invalid string");
+            anyhow::bail!(crate::errcode::code_with(
+                "launch.listBadString",
+                &[("label", label)]
+            ));
         }
         out.push(s.to_string());
     }
@@ -451,14 +461,23 @@ fn parse_dirs(value: Option<&Value>, label: &str) -> Result<Vec<PathBuf>> {
     let mut seen = BTreeSet::new();
     for s in parse_string_list(value, label, 1024)? {
         if s.contains(',') {
-            anyhow::bail!("`{label}` entries cannot contain commas");
+            anyhow::bail!(crate::errcode::code_with(
+                "launch.dirHasComma",
+                &[("label", label)]
+            ));
         }
         let path = PathBuf::from(&s);
         if !path.is_absolute() {
-            anyhow::bail!("`{label}` entries must be absolute paths");
+            anyhow::bail!(crate::errcode::code_with(
+                "launch.dirNotAbsolute",
+                &[("label", label)]
+            ));
         }
         if !path.is_dir() {
-            anyhow::bail!("`{label}` entry is not a directory: {s}");
+            anyhow::bail!(crate::errcode::code_with(
+                "launch.dirMissing",
+                &[("label", label), ("path", &s)],
+            ));
         }
         let canonical = path
             .canonicalize()
@@ -473,10 +492,13 @@ fn parse_dirs(value: Option<&Value>, label: &str) -> Result<Vec<PathBuf>> {
 
 fn sanitize_launch_arg(arg: &str) -> Result<String> {
     if !arg.starts_with("--") || arg == "--" {
-        anyhow::bail!("launch arg `{arg}` must start with `--`");
+        anyhow::bail!(crate::errcode::code_with(
+            "launch.argPrefix",
+            &[("arg", arg)]
+        ));
     }
     if arg.len() > 512 || arg.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        anyhow::bail!("launch arg contains invalid characters");
+        anyhow::bail!(crate::errcode::code("launch.argBadChars"));
     }
     let name = arg[2..]
         .split(['=', ' '])
@@ -485,7 +507,10 @@ fn sanitize_launch_arg(arg: &str) -> Result<String> {
         .trim()
         .to_ascii_lowercase();
     if !SAFE_LAUNCH_SWITCHES.contains(&name.as_str()) {
-        anyhow::bail!("launch switch `--{name}` is not in the safe allowlist");
+        anyhow::bail!(crate::errcode::code_with(
+            "launch.argNotAllowed",
+            &[("name", &name)]
+        ));
     }
     Ok(arg.trim().to_string())
 }
@@ -748,19 +773,22 @@ async fn resolve_auto_fields(
 fn install_widevine(udd: &Path) -> Result<()> {
     let src = store::widevine_cache_dir()?;
     if !src.exists() {
-        anyhow::bail!("cache dir absent ({})", src.display());
+        anyhow::bail!(crate::errcode::code_with(
+            "launch.cacheMissing",
+            &[("path", &src.display().to_string())],
+        ));
     }
     let manifest_path = src.join("manifest.json");
     if !manifest_path.exists() {
         anyhow::bail!(crate::errcode::code("launch.cacheNeedsReseed"));
     }
     let manifest_text = std::fs::read_to_string(&manifest_path)?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(&manifest_text).context("parse widevine manifest.json")?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .context(crate::errcode::code("launch.widevineParse"))?;
     let version = manifest
         .get("version")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("widevine manifest missing `version`"))?;
+        .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("launch.widevineNoVersion")))?;
 
     let widevine_root = udd.join("WidevineCdm");
     let versioned = widevine_root.join(version);

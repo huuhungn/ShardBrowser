@@ -123,7 +123,12 @@ struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        // Commands shared with the interface answer in error codes, because a
+        // toast has to be translated. A script author reading this JSON has no
+        // dictionary, so resolve the marker back to the English this API has
+        // always returned.
+        let message = crate::errcode::resolve_to_english(&self.1);
+        (self.0, Json(json!({ "error": message }))).into_response()
     }
 }
 
@@ -1867,5 +1872,39 @@ mod automation_endpoint_tests {
         ))
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The guarantee that lets the rest of the backend move to error codes.
+    ///
+    /// A command shared between the interface and this API answers with a
+    /// marker so the toast can be translated. A script author has no
+    /// dictionary, so `ApiError` resolves it first. If that ever regresses,
+    /// scripts start seeing `[[shardx:profile.nameTaken]]` where a sentence
+    /// used to be, and only this test would notice.
+    #[tokio::test]
+    async fn an_error_code_reaches_the_caller_as_english_not_a_marker() {
+        let (_store, token, _lock) = scratch_store();
+
+        // An invalid name is the cheapest error that travels the shared
+        // profile path, so it exercises the real conversion rather than a
+        // hand-built ApiError.
+        let (status, body) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "   ", "fingerprint": {} }),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body was {body}");
+        let message = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(!message.is_empty(), "no error text at all: {body}");
+        assert!(
+            !message.contains("[[shardx:"),
+            "a marker leaked to a script author: {message}"
+        );
     }
 }

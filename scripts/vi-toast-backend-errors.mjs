@@ -88,6 +88,20 @@ const CASES = [
   ],
   // Rust text with no code cannot be translated; it must still reach the user.
   ["plain English error", "profile is locked by another device", "as-is"],
+  // A launch failure carrying the operating system's own words. This is the
+  // most common real toast: the operator pressed Start and it did not.
+  [
+    "launch.spawnFailed chain",
+    "[[shardx:launch.spawnFailed]]: Access is denied. (os error 5)",
+    "vi",
+  ],
+  // A profile path error: the argument is a Windows path, which contains
+  // backslashes and a colon, and must survive the marker intact.
+  [
+    "profile.parseRecord with path",
+    "[[shardx:profile.parseRecord|path=C:\\\\Users\\\\a\\\\profiles\\\\x.json]]",
+    "vi",
+  ],
 ];
 
 const browser = await chromium.launch();
