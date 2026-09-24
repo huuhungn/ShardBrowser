@@ -354,6 +354,25 @@ const PROTOCOL_TOKEN = /^(?:[A-Z][a-z0-9]*-)+[A-Z][a-z0-9]*$/;
  */
 const PRODUCT_NAME = /^(?:Chrome|Chromium|ShardX|ProxyShard|ShardX Launcher v)$/;
 
+/**
+ * Letting a label end on a capital catches `Proxy ID` and `Export CSV`, but it
+ * also catches `UDP` and `MCP`, which are the same word in every language. An
+ * acronym carries no lowercase word; a label a translator must touch has at
+ * least one word that continues in lowercase.
+ */
+function hasTranslatableWord(text) {
+  return text
+    .split(/[\s·—–-]+/)
+    .some((w) => /^[A-Za-z][a-z]/.test(w) && w.length > 1);
+}
+
+/**
+ * `Device ID` reads like a label and holds a lowercase word, but it names a
+ * hardware field that stays in English on purpose. Spelled out rather than
+ * inferred, so removing it from the interface also removes it from here.
+ */
+const KEPT_ENGLISH = /^(?:Device ID)$/;
+
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
@@ -371,6 +390,9 @@ function englishInSource(src) {
     // matched nothing and three sentences sat in the badge unread.
     // `=>` ends in `>`, so `() => Promise<void>` looked like a tag holding the
     // word "Promise". The lookbehind keeps a return type from reading as text.
+    // A label can also end on a capital or a digit -- `Proxy ID`, `Window 2` --
+    // so the run no longer has to finish lowercase; hasTranslatableWord keeps
+    // acronyms out.
     // A status word is often lowercase -- `starting...`, `testing...` -- and a
     // sentence can carry a symbol for a button it names, so the run may begin
     // lowercase and hold glyphs like the refresh arrow.
@@ -378,10 +400,12 @@ function englishInSource(src) {
     // word: `‹ Prev`, `Parse →`. They sat outside the character class, so the
     // run never started or never finished and the label went unread.
     for (const m of s.matchAll(
-      /(?<![=-])>\s*([‹›←→«»]?\s*[A-Za-z][a-zA-Z][\w ,.'’·—–↻✓✗-]*?[a-z.!?…·—]\s*[‹›←→«»]?)\s*(?:\{|<)/g,
+      /(?<![=-])>\s*([‹›←→«»]?\s*[A-Za-z][a-zA-Z][\w ,.'’·—–↻✓✗-]*?[a-zA-Z0-9.!?…·—]\s*[‹›←→«»]?)\s*(?:\{|<)/g,
     )) {
       const text = m[1].trim();
-      if (!PRODUCT_NAME.test(text)) found.push(text);
+      if (!PRODUCT_NAME.test(text) && !KEPT_ENGLISH.test(text) && hasTranslatableWord(text)) {
+        found.push(text);
+      }
     }
     // A paragraph long enough to wrap, with a <strong> inside it, matches none
     // of the rules above: the tag breaks the bare-line shape, and each
@@ -804,4 +828,60 @@ test("no translation is frozen at import time", () => {
     [],
     `a module-scope t() keeps the language it was first imported with, so these stay in the old language after a switch:\n${frozen.join("\n")}`,
   );
+});
+
+test("the patch log carries the same releases in both languages", () => {
+  // The page picks a file by language and then draws it without checking, so
+  // a missing entry would silently shorten the log for Vietnamese readers.
+  const logDir = join(here, "..", "src", "pages", "patchlog");
+  const logEn = JSON.parse(readFileSync(join(logDir, "patchlog.json"), "utf8"));
+  const logVi = JSON.parse(readFileSync(join(logDir, "patchlog.vi.json"), "utf8"));
+
+  const shape = (d) =>
+    d.releases.map((r) => ({
+      version: r.version,
+      date: r.date,
+      entries: r.entries.map((e) => ({
+        id: e.id,
+        tag: e.tag,
+        scope: e.scope,
+        locked: e.locked,
+        blocks: e.blocks.map((b) => (b.items ? `list:${b.items.length}` : b.type)),
+      })),
+    }));
+
+  assert.deepEqual(shape(logVi), shape(logEn), "the Vietnamese log drifted from the English one");
+
+  // A code block is a command the reader types; translating it would break it.
+  const codes = (d) =>
+    d.releases.flatMap((r) =>
+      r.entries.flatMap((e) => e.blocks.filter((b) => b.type === "code").map((b) => b.text)),
+    );
+  assert.deepEqual(codes(logVi), codes(logEn), "a command in the log was translated");
+
+  // Prose that never changed is prose nobody translated; prose that went
+  // missing is worse, since the page draws the block regardless and a null
+  // reaches the formatter as a blank screen.
+  const untranslated = [];
+  const missing = [];
+  for (const [ri, r] of logEn.releases.entries()) {
+    for (const [ei, e] of r.entries.entries()) {
+      const v = logVi.releases[ri].entries[ei];
+      for (const [bi, b] of e.blocks.entries()) {
+        const t = v.blocks[bi];
+        if (b.type === "code" || !b.text) continue;
+        const where = `${r.version} ${e.id} block ${bi}`;
+        if (typeof t.text !== "string" || !t.text.trim()) {
+          missing.push(where);
+          continue;
+        }
+        // A short label can legitimately be the same word in both languages.
+        if (b.text === t.text && b.text.split(" ").length > 3) {
+          untranslated.push(where);
+        }
+      }
+    }
+  }
+  assert.deepEqual(missing, [], "these blocks lost their text in Vietnamese");
+  assert.deepEqual(untranslated, [], "these blocks are still in English");
 });
