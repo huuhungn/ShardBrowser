@@ -49,7 +49,7 @@ impl Session {
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
-            .map_err(|_| anyhow!("cdp lock poisoned"))?
+            .map_err(|_| anyhow!(crate::errcode::code("cdp.lockPoisoned")))?
             .insert(id, tx);
 
         let mut msg = json!({ "id": id, "method": method, "params": params });
@@ -58,15 +58,18 @@ impl Session {
         }
         self.out
             .send(Message::Text(msg.to_string()))
-            .map_err(|_| anyhow!("cdp connection closed"))?;
+            .map_err(|_| anyhow!(crate::errcode::code("cdp.connectionClosed")))?;
 
         // A step that hangs forever is worse than one that fails: the run
         // cannot report, retry or stop. Every call is bounded.
         match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(e))) => Err(anyhow!(e)),
-            Ok(Err(_)) => Err(anyhow!("cdp connection closed")),
-            Err(_) => Err(anyhow!("{method} timed out")),
+            Ok(Err(_)) => Err(anyhow!(crate::errcode::code("cdp.connectionClosed"))),
+            Err(_) => Err(anyhow!(crate::errcode::code_with(
+                "cdp.callTimedOut",
+                &[("method", method)]
+            ))),
         }
     }
 
@@ -208,7 +211,7 @@ where
         let targets = session
             .call("Target.getTargets", json!({}), None)
             .await
-            .context("list targets")?;
+            .context(crate::errcode::code("cdp.listTargetsFailed"))?;
         let found = targets
             .get("targetInfos")
             .and_then(|t| t.as_array())
@@ -231,7 +234,7 @@ where
         }
         if std::time::Instant::now() >= deadline {
             detach(&profile_id);
-            return Err(anyhow!("the profile has no page to drive"));
+            return Err(anyhow!(crate::errcode::code("cdp.noPageToDrive")));
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     };
@@ -243,12 +246,12 @@ where
             None,
         )
         .await
-        .context("attach to page")?;
+        .context(crate::errcode::code("cdp.attachToPageFailed"))?;
     let page_session = attached
         .get("sessionId")
         .and_then(|s| s.as_str())
         .map(str::to_string)
-        .context("no session id for the page")?;
+        .context(crate::errcode::code("cdp.noSessionIdForPage"))?;
 
     if let Ok(mut slot) = session.page_session.lock() {
         *slot = Some(page_session.clone());
@@ -264,7 +267,7 @@ where
 
     sessions()
         .lock()
-        .map_err(|_| anyhow!("cdp lock poisoned"))?
+        .map_err(|_| anyhow!(crate::errcode::code("cdp.lockPoisoned")))?
         .insert(profile_id, session);
     Ok(())
 }
@@ -278,14 +281,14 @@ pub fn detach(profile_id: &str) {
 
 /// Send a command to the profile's page.
 pub async fn page_call(profile_id: &str, method: &str, params: Value) -> Result<Value> {
-    let session = get(profile_id).context("this profile is not attached")?;
+    let session = get(profile_id).context(crate::errcode::code("cdp.profileNotAttached"))?;
     let page = session.page();
     session.call(method, params, page).await
 }
 
 /// Send a browser-level command (no page session).
 pub async fn browser_call(profile_id: &str, method: &str, params: Value) -> Result<Value> {
-    let session = get(profile_id).context("this profile is not attached")?;
+    let session = get(profile_id).context(crate::errcode::code("cdp.profileNotAttached"))?;
     session.call(method, params, None).await
 }
 
@@ -352,9 +355,10 @@ mod tests {
         let err = page_call("no-such-profile", "Page.reload", json!({}))
             .await
             .expect_err("a call with no session must fail");
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("not attached"),
-            "the error should say why: {err}"
+            english.contains("not attached"),
+            "the error should say why: {english}"
         );
     }
 
