@@ -320,17 +320,18 @@ pub async fn run(
         .any(|b| b.enabled && needs_browser(&b.kind));
 
     if wants_browser && !cdp::is_attached(profile_id) {
-        return Err(anyhow!(
-            "the profile is not attached — start it before running a project"
-        ));
+        return Err(anyhow!(crate::errcode::code(
+            "runner.profileNotAttachedForProject"
+        )));
     }
     let unknown = unsupported_blocks(project);
     if let Some((id, kind)) = unknown.first() {
         // Refuse rather than skip: a run that quietly omits a step reports a
         // success the operator did not get.
-        return Err(anyhow!(
-            "this build cannot run the {kind:?} block ({id}); remove or disable it first"
-        ));
+        return Err(anyhow!(crate::errcode::code_with(
+            "runner.blockKindUnsupported",
+            &[("kind", &format!("{kind:?}")), ("id", id)]
+        )));
     }
 
     let started = Instant::now();
@@ -353,9 +354,7 @@ pub async fn run(
         project.run.loops
     };
     if project.run.loops == 0 && deadline.is_none() {
-        return Err(anyhow!(
-            "this project loops forever: set a pass count or a time limit"
-        ));
+        return Err(anyhow!(crate::errcode::code("runner.projectLoopsForever")));
     }
 
     'passes: while passes < max_passes {
@@ -776,10 +775,14 @@ async fn perform(
             } else {
                 // Quote both sides: "expected X, saw Y" is the whole reason
                 // the operator opens the report.
-                Err(anyhow!(
-                    "expected {selector} to contain {expected:?}, saw {:?}",
-                    seen.trim()
-                ))
+                Err(anyhow!(crate::errcode::code_with(
+                    "runner.selectorTextMismatch",
+                    &[
+                        ("selector", &selector),
+                        ("expected", &format!("{expected:?}")),
+                        ("seen", &format!("{:?}", seen.trim()))
+                    ]
+                )))
             }
         }
 
@@ -791,9 +794,9 @@ async fn perform(
                 // Silently restarting would throw away what was recorded so
                 // far, and the operator would be asserting against a window
                 // they did not mean.
-                return Err(anyhow!(
-                    "traffic is already being recorded; stop it before starting again"
-                ));
+                return Err(anyhow!(crate::errcode::code(
+                    "runner.trafficAlreadyRecording"
+                )));
             }
             state.traffic = Some(traffic::Recorder::start(profile_id).await?);
             Ok(())
@@ -832,10 +835,13 @@ async fn perform(
                 .collect();
 
             if matched.is_empty() {
-                return Err(anyhow!(
-                    "no request matching {url_part:?} was made ({} recorded so far)",
-                    entries.len()
-                ));
+                return Err(anyhow!(crate::errcode::code_with(
+                    "runner.noRequestMatched",
+                    &[
+                        ("urlPart", &format!("{url_part:?}")),
+                        ("recorded", &entries.len().to_string())
+                    ]
+                )));
             }
 
             // Default to demanding a request that worked: "the page called the
@@ -854,10 +860,11 @@ async fn perform(
                             .iter()
                             .find_map(|e| e.status.map(|s| format!("HTTP {s}")))
                     })
-                    .unwrap_or_else(|| "it never came back".to_string());
-                return Err(anyhow!(
-                    "every request matching {url_part:?} failed — {worst}"
-                ));
+                    .unwrap_or_else(|| crate::errcode::code("runner.requestNeverReturned"));
+                return Err(anyhow!(crate::errcode::code_with(
+                    "runner.everyMatchingRequestFailed",
+                    &[("urlPart", &format!("{url_part:?}")), ("worst", &worst)]
+                )));
             }
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
                 vars.set(name, matched.len().to_string());
@@ -914,19 +921,21 @@ async fn perform(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if expect_ok && !(200..300).contains(&reply.status) {
-                return Err(anyhow!(
-                    "{method} {url} answered HTTP {}, not a success",
-                    reply.status
-                ));
+                return Err(anyhow!(crate::errcode::code_with(
+                    "runner.httpStatusNotSuccess",
+                    &[
+                        ("method", method),
+                        ("url", &url),
+                        ("status", &reply.status.to_string())
+                    ]
+                )));
             }
             Ok(())
         }
 
         "httpClose" => {
             if !crate::http_session::close(profile_id) {
-                return Err(anyhow!(
-                    "no HTTP session is open for this profile; add an \"httpOpen\" block first"
-                ));
+                return Err(anyhow!(crate::errcode::code("runner.noHttpSessionOpen")));
             }
             state.http_open = false;
             Ok(())
@@ -1055,10 +1064,13 @@ async fn perform(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             if rows.len() < least {
-                return Err(anyhow!(
-                    "the query returned {} rows, fewer than the {least} required",
-                    rows.len()
-                ));
+                return Err(anyhow!(crate::errcode::code_with(
+                    "runner.tooFewRows",
+                    &[
+                        ("rows", &rows.len().to_string()),
+                        ("least", &least.to_string())
+                    ]
+                )));
             }
             Ok(())
         }
@@ -1664,9 +1676,10 @@ mod tests {
         let err = run(&p, "no-such-profile", HashMap::new())
             .await
             .expect_err("a run with no browser must fail");
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("not attached"),
-            "the error should say why: {err}"
+            english.contains("not attached"),
+            "the error should say why: {english}"
         );
     }
 
