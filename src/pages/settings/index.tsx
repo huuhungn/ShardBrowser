@@ -91,7 +91,7 @@ export function SettingsPage() {
     try {
       const path = await mcpDownload(dir);
       toast.ok(t("settings.mcp.downloaded", { path }));
-    } catch (e) { toast.err(t("settings.mcp.downloadFailed", { error: String(e) })); }
+    } catch (e) { toast.err(t("settings.mcp.downloadFailed", { error: safeUiError(e) })); }
     finally { setMcpBusy(false); }
   };
   // Adopt an MCP server the operator already has, instead of downloading a

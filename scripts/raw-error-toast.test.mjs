@@ -28,8 +28,14 @@ test("a backend error is never toasted raw", () => {
   for (const file of sources) {
     const lines = readFileSync(file, "utf8").split(/\r?\n/);
     lines.forEach((line, i) => {
-      // `toast.err(String(x))` and `toast.err(`${x}`)` both bypass resolution.
-      if (/toast\.err\(\s*(?:String\(|`)/.test(line)) {
+      // The first shape this guard caught was `toast.err(String(e))`. The
+      // marker leaks just as badly when the raw error is one argument among
+      // several — `toast.err(t("x") + String(e))`, `t("x", { error: String(e) })`
+      // — or when it is stored for later rendering with `setErr(String(e))`.
+      // Match the raw error anywhere in the call, and let `safeUiError` on the
+      // line clear it.
+      const raw = /(?:toast\.err|setErr)\([^;]*(?:String\(|`\$\{|\?\.message)/.test(line);
+      if (raw && !line.includes("safeUiError")) {
         offenders.push(`${file.slice(SRC.length)}:${i + 1}`);
       }
     });

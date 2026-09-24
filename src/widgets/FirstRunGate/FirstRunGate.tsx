@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Alert, Button, ProgressBar } from "@proxyshard/shardx-ui-kit";
 import type { RtStatus, RtProgress } from "../../shared/types";
 import { useT } from "../../shared/i18n";
+import { safeUiError } from "../../shared/lib/utils";
 
 export function FirstRunGate({ children }: { children: ReactNode }) {
   const t = useT();
@@ -49,7 +50,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
       try {
         status = await invoke<RtStatus>("runtime_status");
       } catch (e: any) {
-        if (!cancelled) { setErr(String(e)); setInstalled(false); }
+        if (!cancelled) { setErr(safeUiError(e)); setInstalled(false); }
         checking.current = false;
         return;
       }
@@ -77,7 +78,7 @@ export function FirstRunGate({ children }: { children: ReactNode }) {
         await invoke<RtStatus>("runtime_install", { force: false });
         if (!cancelled) setInstalled(true);
       } catch (e: any) {
-        if (!cancelled) setErr(typeof e === "string" ? e : (e?.message ?? String(e)));
+        if (!cancelled) setErr(safeUiError(e));
       } finally {
         installing.current = false;
         checking.current = false;

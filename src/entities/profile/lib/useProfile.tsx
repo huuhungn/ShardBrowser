@@ -754,7 +754,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const n = await profileImport(arr);
       get().reload();
       toast.ok(t(n === 1 ? "profile.importedProfileOne" : "profile.importedProfileMany", { n }));
-    } catch (e) { toast.err(t("profile.importFailed") + String(e)); }
+    } catch (e) { toast.err(t("profile.importFailed") + safeUiError(e)); }
   },
 }));
 
