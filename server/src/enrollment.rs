@@ -66,14 +66,16 @@ pub fn proof_tbs_bytes(
 ) -> Vec<u8> {
     // Encoding lives in `shared` so the Launcher signs exactly what this
     // verifies; a second copy here would be free to drift.
-    shared::enrollment_proof::enrollment_proof_tbs(&shared::enrollment_proof::EnrollmentProofFields {
-        challenge_id,
-        nonce,
-        tenant_id,
-        account_id,
-        signing_public_key,
-        hpke_public_key,
-    })
+    shared::enrollment_proof::enrollment_proof_tbs(
+        &shared::enrollment_proof::EnrollmentProofFields {
+            challenge_id,
+            nonce,
+            tenant_id,
+            account_id,
+            signing_public_key,
+            hpke_public_key,
+        },
+    )
 }
 
 /// Commitment to the key pair a challenge is issued for.

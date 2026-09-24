@@ -54,12 +54,11 @@ pub async fn begin_first_generation(
     root_key_id: &[u8; 32],
     now: &str,
 ) -> Result<u64, AppError> {
-    let existing: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM v2_root_key_generations WHERE tenant_id = ?1",
-    )
-    .bind(tenant_id.as_slice())
-    .fetch_one(db)
-    .await?;
+    let existing: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM v2_root_key_generations WHERE tenant_id = ?1")
+            .bind(tenant_id.as_slice())
+            .fetch_one(db)
+            .await?;
 
     if existing > 0 {
         return Err(AppError::Conflict(
@@ -67,13 +66,12 @@ pub async fn begin_first_generation(
         ));
     }
 
-    let generation: i64 = sqlx::query_scalar(
-        "SELECT active_root_generation FROM v2_tenants WHERE id = ?1",
-    )
-    .bind(tenant_id.as_slice())
-    .fetch_optional(db)
-    .await?
-    .ok_or_else(|| AppError::BadRequest("tenant does not exist".into()))?;
+    let generation: i64 =
+        sqlx::query_scalar("SELECT active_root_generation FROM v2_tenants WHERE id = ?1")
+            .bind(tenant_id.as_slice())
+            .fetch_optional(db)
+            .await?
+            .ok_or_else(|| AppError::BadRequest("tenant does not exist".into()))?;
 
     sqlx::query(
         "INSERT INTO v2_root_key_generations \

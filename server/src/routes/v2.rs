@@ -32,8 +32,7 @@ fn parse_id16(hex: &str, field: &'static str) -> Result<[u8; 16], AppError> {
 
 /// Parse a 32-byte identifier such as a root key id.
 fn parse_id32(hex: &str, field: &'static str) -> Result<[u8; 32], AppError> {
-    let bytes = decode_hex(hex)
-        .ok_or_else(|| AppError::BadRequest(format!("{field}: not hex")))?;
+    let bytes = decode_hex(hex).ok_or_else(|| AppError::BadRequest(format!("{field}: not hex")))?;
     bytes
         .try_into()
         .map_err(|_| AppError::BadRequest(format!("{field}: expected 32 bytes")))
@@ -680,7 +679,6 @@ async fn account_id_for(
         .map_err(|_| AppError::BadRequest("corrupt account id".into()))
 }
 
-
 // ---------------------------------------------------------------------------
 // Fleet sync transfer
 // ---------------------------------------------------------------------------
@@ -827,7 +825,9 @@ pub async fn open_snapshot_upload(
         .map_err(|_| AppError::BadRequest("intent_hash: must be 32 bytes".into()))?;
 
     if req.declared_size < 0 {
-        return Err(AppError::BadRequest("declared_size must not be negative".into()));
+        return Err(AppError::BadRequest(
+            "declared_size must not be negative".into(),
+        ));
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -954,9 +954,8 @@ pub async fn commit_snapshot_upload(
     // The signature authorizes the values inside the manifest, not whatever the
     // request body happens to repeat. Without this cross-check a caller could
     // present a valid manifest and publish different bytes under it.
-    let signed_mismatch = |field: &str| {
-        AppError::BadRequest(format!("{field} does not match the signed manifest"))
-    };
+    let signed_mismatch =
+        |field: &str| AppError::BadRequest(format!("{field} does not match the signed manifest"));
     if verified.signed_hash32("container_sha256") != Some(container_sha256) {
         return Err(signed_mismatch("container_sha256"));
     }
@@ -1068,7 +1067,6 @@ pub async fn head_snapshot(
         "manifest_hex": hex(&target.exact_signed_container_bytes),
     })))
 }
-
 
 /// Begin the tenant's first root key generation.
 ///
@@ -1331,7 +1329,8 @@ pub async fn get_active_fleet_generation(
     let fleet_id = parse_id16(&fleet_hex, "fleet_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    let active = crate::fleet_generations::active_generation(&app.db, &tenant_id, &fleet_id).await?;
+    let active =
+        crate::fleet_generations::active_generation(&app.db, &tenant_id, &fleet_id).await?;
 
     Ok(axum::Json(match active {
         Some(g) => serde_json::json!({

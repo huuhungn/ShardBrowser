@@ -61,7 +61,13 @@ pub fn host_spec() -> Result<HostSpec> {
         return Ok(HostSpec {
             browser: arc("ShardX-Mac-arm64.zip", "ShardX browser (macOS arm64)"),
             widevine: Some(arc("ShardX-Widevine-Mac-arm64.zip", "Widevine CDM")),
-            binary_subpath: p(&["ShardX-Mac-arm64", "ShardX.app", "Contents", "MacOS", "ShardX"]),
+            binary_subpath: p(&[
+                "ShardX-Mac-arm64",
+                "ShardX.app",
+                "Contents",
+                "MacOS",
+                "ShardX",
+            ]),
             widevine_subpath: p(&[
                 "ShardX-Mac-arm64",
                 "ShardX.app",
@@ -105,7 +111,10 @@ pub fn default_cache_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     #[cfg(target_os = "macos")]
     {
-        return home.join("Library").join("Application Support").join("shardx-sdk");
+        return home
+            .join("Library")
+            .join("Application Support")
+            .join("shardx-sdk");
     }
     #[cfg(target_os = "windows")]
     {
@@ -247,13 +256,14 @@ impl Runtime {
         {
             // Only accept a `<version>.manifest` whose stem parses as a version,
             // so a stray/leftover manifest can't pin a bogus version.
-            for ent in fs::read_dir(self.root.join("ShardX-Windows")).ok()?.flatten() {
+            for ent in fs::read_dir(self.root.join("ShardX-Windows"))
+                .ok()?
+                .flatten()
+            {
                 let p = ent.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("manifest") {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        if stem.contains('.')
-                            && stem.starts_with(|c: char| c.is_ascii_digit())
-                        {
+                        if stem.contains('.') && stem.starts_with(|c: char| c.is_ascii_digit()) {
                             return Some(stem.to_string());
                         }
                     }
@@ -308,7 +318,10 @@ impl Runtime {
         );
         let hash_moved = differs(
             local.browser_etag.clone(),
-            remote.archives.get(&self.spec.browser.key).map(|s| s.as_str()),
+            remote
+                .archives
+                .get(&self.spec.browser.key)
+                .map(|s| s.as_str()),
         );
         version_moved || build_moved || hash_moved
     }
@@ -338,8 +351,7 @@ impl Runtime {
             .chromium_version
             .clone()
             .unwrap_or_else(|| CHROMIUM_VERSION.to_string());
-        *self.grease.lock().unwrap() =
-            (remote.grease_brand.clone(), remote.grease_version.clone());
+        *self.grease.lock().unwrap() = (remote.grease_brand.clone(), remote.grease_version.clone());
         *self.tls.lock().unwrap() = remote.tls.clone();
 
         // Refused rather than installed: this SDK could not configure it.
@@ -486,7 +498,9 @@ impl Runtime {
     }
 
     fn place_widevine(&self) {
-        let Some(wv) = &self.spec.widevine else { return };
+        let Some(wv) = &self.spec.widevine else {
+            return;
+        };
         let wrapper = wv.key.trim_end_matches(".zip");
         let src = self.root.join(wrapper).join("WidevineCdm");
         if !src.exists() {
@@ -637,7 +651,9 @@ fn fix_unix_exec_bits(root: &Path) {
         [0xbe, 0xba, 0xfe, 0xca],
     ];
     fn walk(dir: &Path) {
-        let Ok(entries) = fs::read_dir(dir) else { return };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for ent in entries.flatten() {
             let p = ent.path();
             let Ok(ft) = ent.file_type() else { continue };
@@ -652,7 +668,9 @@ fn fix_unix_exec_bits(root: &Path) {
                 continue;
             }
             let mut head = [0u8; 4];
-            let Ok(mut f) = fs::File::open(&p) else { continue };
+            let Ok(mut f) = fs::File::open(&p) else {
+                continue;
+            };
             if f.read_exact(&mut head).is_err() {
                 continue;
             }
@@ -723,7 +741,11 @@ mod tests {
     #[test]
     fn subpath_components_are_single_segments() {
         let spec = host_spec().expect("host_spec must support the CI runners");
-        for part in spec.binary_subpath.iter().chain(spec.widevine_subpath.iter()) {
+        for part in spec
+            .binary_subpath
+            .iter()
+            .chain(spec.widevine_subpath.iter())
+        {
             assert!(!part.is_empty(), "empty path component");
             assert!(
                 !part.contains('/') && !part.contains('\\'),

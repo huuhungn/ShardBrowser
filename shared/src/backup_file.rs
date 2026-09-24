@@ -90,7 +90,8 @@ pub fn create(
     passphrase: &str,
 ) -> Result<BackupFileInfo> {
     let sealed = seal_profile(profile_id, udd, passphrase)?;
-    write_atomic(dest, &sealed.bytes).with_context(|| format!("write backup to {}", dest.display()))?;
+    write_atomic(dest, &sealed.bytes)
+        .with_context(|| format!("write backup to {}", dest.display()))?;
     Ok(sealed.info)
 }
 
@@ -369,7 +370,10 @@ mod tests {
 
         let sealed = seal_profile_with_fkek("p1", &src, &[0x31u8; 32]).expect("seal");
         let err = open_profile_with_fkek(&sealed.bytes, &dst, &[0x32u8; 32]);
-        assert!(err.is_err(), "a foreign fleet key must not open the snapshot");
+        assert!(
+            err.is_err(),
+            "a foreign fleet key must not open the snapshot"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 

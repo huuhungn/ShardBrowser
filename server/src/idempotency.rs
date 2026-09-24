@@ -196,8 +196,7 @@ pub async fn begin_operation(
         // server-side schema fault, which is how the root key grant ledger bug
         // stayed hidden.
         AppError::Internal(
-            "operation ledger: claim was rejected but no row exists (constraint violation?)"
-                .into(),
+            "operation ledger: claim was rejected but no row exists (constraint violation?)".into(),
         )
     })?;
 

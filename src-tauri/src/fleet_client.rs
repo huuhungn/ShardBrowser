@@ -139,7 +139,10 @@ impl FleetClient {
         // the server's own words, passed through as sent.
         Err(anyhow!(crate::errcode::code_with(
             key,
-            &[("status", &status.as_u16().to_string()), ("detail", &detail)],
+            &[
+                ("status", &status.as_u16().to_string()),
+                ("detail", &detail)
+            ],
         )))
     }
 
@@ -342,7 +345,10 @@ impl FleetClient {
         if out.len() != total {
             bail!(crate::errcode::code_with(
                 "fleet.downloadIncomplete",
-                &[("got", &out.len().to_string()), ("total", &total.to_string())],
+                &[
+                    ("got", &out.len().to_string()),
+                    ("total", &total.to_string())
+                ],
             ));
         }
         Ok(out)
@@ -583,12 +589,19 @@ impl FleetClient {
 
 fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
-        bail!(crate::errcode::code_with("fleet.malformedHex64", &[("field", field)]));
+        bail!(crate::errcode::code_with(
+            "fleet.malformedHex64",
+            &[("field", field)]
+        ));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!(crate::errcode::code_with("fleet.malformedHexDigits", &[("field", field)])))?;
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| {
+            anyhow!(crate::errcode::code_with(
+                "fleet.malformedHexDigits",
+                &[("field", field)]
+            ))
+        })?;
     }
     Ok(out)
 }
@@ -625,12 +638,19 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
-        bail!(crate::errcode::code_with("fleet.malformedHex32", &[("field", field)]));
+        bail!(crate::errcode::code_with(
+            "fleet.malformedHex32",
+            &[("field", field)]
+        ));
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!(crate::errcode::code_with("fleet.malformedHexDigits", &[("field", field)])))?;
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| {
+            anyhow!(crate::errcode::code_with(
+                "fleet.malformedHexDigits",
+                &[("field", field)]
+            ))
+        })?;
     }
     Ok(out)
 }

@@ -94,7 +94,9 @@ pub fn fleet_grant_row_from_record(record: &VerifiedRecord) -> Result<FleetGrant
 
     Ok(FleetGrantRow {
         grant_variant,
-        fleet_id: record.signed_id16("fleet_id").ok_or_else(|| missing("fleet_id"))?,
+        fleet_id: record
+            .signed_id16("fleet_id")
+            .ok_or_else(|| missing("fleet_id"))?,
         fkek_key_id: record
             .signed_hash32("fkek_key_id")
             .ok_or_else(|| missing("fkek_key_id"))?,

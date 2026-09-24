@@ -79,8 +79,14 @@ impl Profile {
     /// p.set_noise(&["canvas"]);          // audio now off again
     /// ```
     pub fn set_noise(&mut self, vectors: &[&str]) -> &mut Self {
-        const NOISE_VECTORS: [&str; 6] =
-            ["canvas", "webgl", "audio", "client_rects", "sensors", "fonts"];
+        const NOISE_VECTORS: [&str; 6] = [
+            "canvas",
+            "webgl",
+            "audio",
+            "client_rects",
+            "sensors",
+            "fonts",
+        ];
         for &v in vectors {
             assert!(NOISE_VECTORS.contains(&v), "unknown noise vector: {v}");
         }
@@ -105,7 +111,9 @@ impl Profile {
             if on {
                 match v {
                     "webgl" => {
-                        block.entry("intensity").or_insert_with(|| Value::from(0.0005));
+                        block
+                            .entry("intensity")
+                            .or_insert_with(|| Value::from(0.0005));
                     }
                     "client_rects" => {
                         block.entry("max_offset").or_insert_with(|| Value::from(1));
@@ -185,7 +193,12 @@ impl FingerprintLibrary {
             .fingerprints_dir()
             .join(format!("{fingerprint_id}.json"));
         if !path.exists() {
-            let sample = self.ids().into_iter().take(10).collect::<Vec<_>>().join(", ");
+            let sample = self
+                .ids()
+                .into_iter()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(anyhow!(
                 "Fingerprint '{fingerprint_id}' not found. Available: {sample}…"
             ));
@@ -241,9 +254,15 @@ pub fn apply_engine_version(
             }
         }
     }
-    if let Some(ch) = config.get_mut("client_hints").and_then(|v| v.as_object_mut()) {
+    if let Some(ch) = config
+        .get_mut("client_hints")
+        .and_then(|v| v.as_object_mut())
+    {
         ch.insert("brand_version".into(), serde_json::json!(major));
-        ch.insert("brand_full_version".into(), serde_json::json!(chromium_version));
+        ch.insert(
+            "brand_full_version".into(),
+            serde_json::json!(chromium_version),
+        );
         if let Some(b) = build {
             ch.insert("chrome_build".into(), serde_json::json!(b));
         }
@@ -255,7 +274,10 @@ pub fn apply_engine_version(
         }
         if let Some(gv) = grease_version {
             ch.insert("grease_version".into(), serde_json::json!(gv));
-            ch.insert("grease_full_version".into(), serde_json::json!(format!("{gv}.0.0.0")));
+            ch.insert(
+                "grease_full_version".into(),
+                serde_json::json!(format!("{gv}.0.0.0")),
+            );
         }
     }
 
@@ -272,7 +294,9 @@ pub fn apply_engine_version(
 /// Per-profile state dir (cookies / IndexedDB / cache), preserved across
 /// launches. Defaults to `<profiles_root>/<id>/`.
 pub fn user_data_dir(runtime: &Runtime, profile_id: &str, base: Option<&Path>) -> Result<PathBuf> {
-    let root = base.map(PathBuf::from).unwrap_or_else(|| runtime.profiles_root());
+    let root = base
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime.profiles_root());
     let d = root.join(profile_id);
     fs::create_dir_all(&d)?;
     Ok(d)
