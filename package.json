@@ -17,6 +17,7 @@
     "test:i18n": "node --test scripts/i18n-locale-parity.test.mjs",
     "test:rust-strings": "node --test scripts/rust-user-strings.test.mjs",
     "test:backend-locale": "node --test scripts/backend-error-locale.test.mjs",
+    "vi:toasts": "node scripts/vi-toast-backend-errors.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },

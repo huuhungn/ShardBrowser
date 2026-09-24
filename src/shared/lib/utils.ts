@@ -114,7 +114,7 @@ export const readTextFile = (path: string) => invoke<string>("read_text_file", {
  * missing key degrades to today's behaviour rather than to an empty toast.
  */
 export const localiseBackendError = (text: string): string =>
-  text.replace(/\[\[shardx:([a-zA-Z0-9_.]+)((?:\|[a-zA-Z0-9_]+=[^\]|]*)*)\]\]/g, (whole, key, rawArgs) => {
+  text.replace(/\[\[shardx:([a-zA-Z0-9_.]+)((?:\|[a-zA-Z0-9_]+=[^\]|]*)*)\]\]/g, (_whole, key, rawArgs) => {
     const vars: Record<string, string> = {};
     for (const pair of String(rawArgs).split("|")) {
       if (!pair) continue;
@@ -123,9 +123,13 @@ export const localiseBackendError = (text: string): string =>
     }
     const translated = t(key, vars);
     // `translate` echoes the key back when it is missing from every
-    // dictionary. Showing "launch.browserMissing" to an operator is worse
-    // than showing the original English, so keep the marker's own text.
-    return translated === key ? whole : translated;
+    // dictionary. A stale or misspelled code must still read as a sentence:
+    // showing "[[shardx:no.such.code]]" to an operator is the worst outcome,
+    // so fall back to the marker's trailing prose when the Rust side supplied
+    // any, and to a plain apology when it did not.
+    if (translated !== key) return translated;
+    const englishFallback = String(vars.en ?? "").trim();
+    return englishFallback || t("errors.unknownBackend");
   });
 
 /**

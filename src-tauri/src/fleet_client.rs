@@ -107,12 +107,12 @@ impl FleetClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
         let base = base_url.trim_end_matches('/').to_string();
         if !(base.starts_with("http://") || base.starts_with("https://")) {
-            bail!("server URL must start with http:// or https://");
+            bail!(crate::errcode::code("fleet.serverUrlScheme"));
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
-            .context("build HTTP client")?;
+            .context(crate::errcode::code("fleet.netClientFailed"))?;
         Ok(Self {
             http,
             base_url: base,
@@ -127,14 +127,20 @@ impl FleetClient {
     /// Turn a non-2xx response into an error that keeps the server reason.
     /// The body carries refusal text (version conflicts, expired leases), no
     /// key material.
-    async fn ok_or_err(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    async fn ok_or_err(res: reqwest::Response, key: &str) -> Result<reqwest::Response> {
         let status = res.status();
         if status.is_success() {
             return Ok(res);
         }
         let body = res.text().await.unwrap_or_default();
         let detail = body.chars().take(300).collect::<String>();
-        Err(anyhow!("{what} failed ({status}): {detail}"))
+        // `key` is the locale key for this exact refusal, so a translator sees
+        // a whole sentence rather than a verb spliced into one. `detail` is
+        // the server's own words, passed through as sent.
+        Err(anyhow!(crate::errcode::code_with(
+            key,
+            &[("status", &status.as_u16().to_string()), ("detail", &detail)],
+        )))
     }
 
     /// Register this device's signing key with the server.
@@ -165,12 +171,12 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("request enrollment challenge")?;
-        let challenge: EnrollmentChallenge = Self::ok_or_err(res, "enrollment challenge")
+            .context(crate::errcode::code("fleet.unreachableRegister"))?;
+        let challenge: EnrollmentChallenge = Self::ok_or_err(res, "fleet.refusedRegister")
             .await?
             .json()
             .await
-            .context("decode enrollment challenge")?;
+            .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
         let nonce = decode_hex32(&challenge.nonce, "challenge nonce")?;
         let challenge_id = decode_hex16(&challenge.challenge_id, "challenge_id")?;
@@ -202,13 +208,13 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("submit enrollment proof")?;
+            .context(crate::errcode::code("fleet.unreachableRegisterFinish"))?;
 
-        Self::ok_or_err(res, "device enrollment")
+        Self::ok_or_err(res, "fleet.refusedRegisterFinish")
             .await?
             .json()
             .await
-            .context("decode enrolled device")
+            .context(crate::errcode::code("fleet.badReplyRegisterFinish"))
     }
 
     pub async fn server_identity(&self) -> Result<ServerIdentity> {
@@ -218,12 +224,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request server identity")?;
-        Self::ok_or_err(res, "server identity")
+            .context(crate::errcode::code("fleet.unreachableIdentity"))?;
+        Self::ok_or_err(res, "fleet.refusedIdentity")
             .await?
             .json()
             .await
-            .context("decode server identity")
+            .context(crate::errcode::code("fleet.badReplyIdentity"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -250,12 +256,12 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("request lease")?;
-        Self::ok_or_err(res, "acquire lease")
+            .context(crate::errcode::code("fleet.unreachableClaim"))?;
+        Self::ok_or_err(res, "fleet.refusedClaim")
             .await?
             .json()
             .await
-            .context("decode lease")
+            .context(crate::errcode::code("fleet.badReplyClaim"))
     }
 
     pub async fn release_lease(&self, tenant_id: &str, lease_id: &str) -> Result<()> {
@@ -266,8 +272,8 @@ impl FleetClient {
             .json(&serde_json::json!({ "tenant_id": tenant_id, "lease_id": lease_id }))
             .send()
             .await
-            .context("release lease")?;
-        Self::ok_or_err(res, "release lease").await?;
+            .context(crate::errcode::code("fleet.unreachableRelease"))?;
+        Self::ok_or_err(res, "fleet.refusedRelease").await?;
         Ok(())
     }
 
@@ -278,12 +284,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request snapshot head")?;
-        Self::ok_or_err(res, "snapshot head")
+            .context(crate::errcode::code("fleet.unreachableHead"))?;
+        Self::ok_or_err(res, "fleet.refusedHead")
             .await?
             .json()
             .await
-            .context("decode snapshot head")
+            .context(crate::errcode::code("fleet.badReplyHead"))
     }
 
     /// Download a published container in ranges.
@@ -316,12 +322,12 @@ impl FleetClient {
                 ])
                 .send()
                 .await
-                .context("request snapshot range")?;
-            let bytes = Self::ok_or_err(res, "download range")
+                .context(crate::errcode::code("fleet.unreachableDownload"))?;
+            let bytes = Self::ok_or_err(res, "fleet.refusedDownload")
                 .await?
                 .bytes()
                 .await
-                .context("read snapshot range")?;
+                .context(crate::errcode::code("fleet.downloadBrokeOff"))?;
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
@@ -334,7 +340,10 @@ impl FleetClient {
         }
 
         if out.len() != total {
-            bail!("downloaded {} bytes, expected {total}", out.len());
+            bail!(crate::errcode::code_with(
+                "fleet.downloadIncomplete",
+                &[("got", &out.len().to_string()), ("total", &total.to_string())],
+            ));
         }
         Ok(out)
     }
@@ -357,12 +366,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request root key grants")?;
-        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "root key grants")
+            .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
+        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedAccountKeys")
             .await?
             .json()
             .await
-            .context("decode root key grants")?;
+            .context(crate::errcode::code("fleet.badReplyAccountKeys"))?;
         Ok(body.grants)
     }
 
@@ -383,12 +392,12 @@ impl FleetClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .context("request fleet key grants")?;
-        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "fleet key grants")
+            .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
+        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedTeamKeys")
             .await?
             .json()
             .await
-            .context("decode fleet key grants")?;
+            .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
         Ok(body.grants)
     }
 
@@ -458,7 +467,7 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("open upload session")?;
+            .context(crate::errcode::code("fleet.unreachableUploadBegin"))?;
         Self::ok_or_err(open, "open upload").await?;
 
         // Staging failure leaves a session the server can discard; nothing is
@@ -489,17 +498,17 @@ impl FleetClient {
             }))
             .send()
             .await
-            .context("commit upload")?;
+            .context(crate::errcode::code("fleet.unreachableUploadPublish"))?;
 
         let body: serde_json::Value = Self::ok_or_err(commit, "commit upload")
             .await?
             .json()
             .await
-            .context("decode commit response")?;
+            .context(crate::errcode::code("fleet.badReplyUploadPublish"))?;
 
         body.get("version")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("commit response did not report a version"))
+            .ok_or_else(|| anyhow!(crate::errcode::code("fleet.commitNoVersion")))
     }
 
     async fn stage_chunks(&self, req: &UploadRequest<'_>, session_id: &str) -> Result<()> {
@@ -518,8 +527,8 @@ impl FleetClient {
                 .body(req.container[offset..end].to_vec())
                 .send()
                 .await
-                .context("send upload chunk")?;
-            Self::ok_or_err(res, "append chunk").await?;
+                .context(crate::errcode::code("fleet.unreachableUploadChunk"))?;
+            Self::ok_or_err(res, "fleet.refusedUploadChunk").await?;
             offset = end;
         }
         Ok(())
@@ -533,8 +542,8 @@ impl FleetClient {
             .json(&serde_json::json!({ "tenant_id": tenant_id, "session_id": session_id }))
             .send()
             .await
-            .context("abort upload")?;
-        Self::ok_or_err(res, "abort upload").await?;
+            .context(crate::errcode::code("fleet.unreachableUploadAbort"))?;
+        Self::ok_or_err(res, "fleet.refusedUploadAbort").await?;
         Ok(())
     }
 
@@ -574,12 +583,12 @@ impl FleetClient {
 
 fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
-        bail!("{field}: must be 64 hex characters");
+        bail!(crate::errcode::code_with("fleet.malformedHex64", &[("field", field)]));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!("{field}: not hex"))?;
+            .map_err(|_| anyhow!(crate::errcode::code_with("fleet.malformedHexDigits", &[("field", field)])))?;
     }
     Ok(out)
 }
@@ -616,12 +625,12 @@ fn hex(bytes: &[u8]) -> String {
 
 fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
-        bail!("{field}: must be 32 hex characters");
+        bail!(crate::errcode::code_with("fleet.malformedHex32", &[("field", field)]));
     }
     let mut out = [0u8; 16];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| anyhow!("{field}: not hex"))?;
+            .map_err(|_| anyhow!(crate::errcode::code_with("fleet.malformedHexDigits", &[("field", field)])))?;
     }
     Ok(out)
 }

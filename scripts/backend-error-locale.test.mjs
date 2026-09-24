@@ -60,10 +60,19 @@ test("arguments fill the locale string's placeholders", () => {
   assert.equal(localiseWith(dict, "[[shardx:test.withArg|name=hồ sơ A]]"), "Không mở được hồ sơ A");
 });
 
-test("an unknown key keeps the English the backend sent", () => {
-  // Better a stale English sentence than "launch.somethingNew" in a toast.
+test("an unknown key never shows the operator a raw marker", () => {
+  // A stale or misspelled code must still read as a sentence. Rendering
+  // "[[shardx:launch.notInAnyDictionary]]" in a toast is the worst outcome,
+  // so an unmapped key falls back to the generic apology.
   const out = localiseWith(vi, "[[shardx:launch.notInAnyDictionary]]");
-  assert.equal(out, "[[shardx:launch.notInAnyDictionary]]");
+  assert.ok(!out.includes("[[shardx:"), `raw marker leaked: ${out}`);
+  assert.equal(out, vi["errors.unknownBackend"]);
+});
+
+test("an unknown key prefers English the backend supplied", () => {
+  // When Rust ships prose alongside the code, that beats the generic text.
+  const out = localiseWith(vi, "[[shardx:some.newCode|en=Disk is full]]");
+  assert.equal(out, "Disk is full");
 });
 
 test("text around the marker survives", () => {
