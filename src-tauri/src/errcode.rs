@@ -194,6 +194,22 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_refusal_still_reaches_a_script_in_english() {
+        // `files.rs` answers both the interface and the HTTP API. The toast
+        // needs a code to translate, but a script author reading the JSON has
+        // no dictionary, and `ApiError::into_response` resolves the code for
+        // them — so the English a script parses must survive coding intact.
+        let coded = code_with(
+            "files.pathMayNotContainDotDot",
+            &[("path", "../outside.txt")],
+        );
+        assert_eq!(
+            resolve_to_english(&coded),
+            "The file path ../outside.txt may not contain '..'."
+        );
+    }
+
+    #[test]
     fn a_value_holding_the_delimiters_survives_the_round_trip() {
         // A CSS selector is the realistic case: it can contain both a pipe and
         // a closing bracket, and it is precisely the part of the message the

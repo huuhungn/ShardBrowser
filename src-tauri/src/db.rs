@@ -244,9 +244,12 @@ mod tests {
         };
         let err = execute(absolute, "create table t (a int)", &[])
             .expect_err("an absolute path must be refused");
+        // The refusal travels as an error code so the interface can translate
+        // it; resolve it back to check the operator is still told why.
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("relative"),
-            "the error should say why: {err}"
+            english.contains("relative"),
+            "the error should say why: {english}"
         );
     }
 

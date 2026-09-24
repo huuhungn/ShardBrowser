@@ -32,9 +32,9 @@ const MAX_READ: u64 = 8 * 1024 * 1024;
 pub fn workspace() -> Result<PathBuf> {
     let dir = store::config_root()?.join("automation-files");
     std::fs::create_dir_all(&dir).with_context(|| {
-        format!(
-            "the automation workspace {} could not be created",
-            dir.display()
+        crate::errcode::code_with(
+            "files.workspaceCouldNotBeCreated",
+            &[("path", &dir.display().to_string())],
         )
     })?;
     Ok(dir)
@@ -47,7 +47,7 @@ pub fn workspace() -> Result<PathBuf> {
 /// path that only escapes once resolved is caught.
 fn resolve(rel: &str) -> Result<PathBuf> {
     if rel.trim().is_empty() {
-        bail!("a file path is required");
+        bail!(crate::errcode::code("files.pathRequired"));
     }
 
     // A Windows path is only made of components on Windows: parsed on Linux,
@@ -55,14 +55,20 @@ fn resolve(rel: &str) -> Result<PathBuf> {
     // so the component walk below would wave it through. Reject the two
     // Windows spellings by hand, on every platform, before parsing.
     if rel.contains('\\') {
-        bail!("a file path must use '/' and stay inside the automation workspace: {rel}");
+        bail!(crate::errcode::code_with(
+            "files.pathMustUseForwardSlash",
+            &[("path", rel)]
+        ));
     }
     let names_a_drive = {
         let b = rel.as_bytes();
         b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
     };
     if names_a_drive {
-        bail!("a file path must be relative to the automation workspace: {rel}");
+        bail!(crate::errcode::code_with(
+            "files.pathMustBeRelative",
+            &[("path", rel)]
+        ));
     }
 
     let candidate = Path::new(rel);
@@ -70,12 +76,18 @@ fn resolve(rel: &str) -> Result<PathBuf> {
         match part {
             Component::Normal(_) | Component::CurDir => {}
             Component::ParentDir => {
-                bail!("a file path may not contain '..': {rel}")
+                bail!(crate::errcode::code_with(
+                    "files.pathMayNotContainDotDot",
+                    &[("path", rel)]
+                ))
             }
             // `C:\`, `\\server\share`, and a leading `/` all leave the
             // workspace by construction.
             Component::RootDir | Component::Prefix(_) => {
-                bail!("a file path must be relative to the automation workspace: {rel}")
+                bail!(crate::errcode::code_with(
+                    "files.pathMustBeRelative",
+                    &[("path", rel)]
+                ))
             }
         }
     }
@@ -101,7 +113,10 @@ fn resolve(rel: &str) -> Result<PathBuf> {
     // out of `Normal` components only.
     if let Ok(real) = normalised.canonicalize() {
         if !real.starts_with(&canonical_root) {
-            bail!("a file path must stay inside the automation workspace: {rel}");
+            bail!(crate::errcode::code_with(
+                "files.pathMustStayInside",
+                &[("path", rel)]
+            ));
         }
     }
 
@@ -109,7 +124,10 @@ fn resolve(rel: &str) -> Result<PathBuf> {
     // refuse rather than follow it.
     if let Ok(meta) = std::fs::symlink_metadata(&normalised) {
         if meta.file_type().is_symlink() {
-            bail!("{rel} is a link; links are not followed inside the workspace");
+            bail!(crate::errcode::code_with(
+                "files.pathIsALink",
+                &[("path", rel)]
+            ));
         }
     }
 
@@ -130,25 +148,32 @@ pub fn read(rel: &str) -> Result<String> {
     let path = resolve(rel)?;
 
     let meta = std::fs::metadata(&path)
-        .with_context(|| format!("{rel} could not be read from the automation workspace"))?;
+        .with_context(|| crate::errcode::code_with("files.couldNotBeRead", &[("path", rel)]))?;
     if meta.len() > MAX_READ {
-        bail!(
-            "{rel} is {} bytes, larger than the {MAX_READ} byte limit for a project file",
-            meta.len()
-        );
+        bail!(crate::errcode::code_with(
+            "files.largerThanReadLimit",
+            &[
+                ("path", rel),
+                ("size", &meta.len().to_string()),
+                ("limit", &MAX_READ.to_string()),
+            ]
+        ));
     }
 
-    std::fs::read_to_string(&path).with_context(|| format!("{rel} is not valid UTF-8 text"))
+    std::fs::read_to_string(&path)
+        .with_context(|| crate::errcode::code_with("files.notValidUtf8", &[("path", rel)]))
 }
 
 /// Write a file in the workspace, replacing what was there.
 pub fn write(rel: &str, contents: &str) -> Result<()> {
     let path = resolve(rel)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("the folder for {rel} could not be created"))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            crate::errcode::code_with("files.folderCouldNotBeCreated", &[("path", rel)])
+        })?;
     }
-    std::fs::write(&path, contents).with_context(|| format!("{rel} could not be written"))
+    std::fs::write(&path, contents)
+        .with_context(|| crate::errcode::code_with("files.couldNotBeWritten", &[("path", rel)]))
 }
 
 /// Append a line to a file in the workspace, creating it when absent.
@@ -160,17 +185,21 @@ pub fn append(rel: &str, contents: &str) -> Result<()> {
 
     let path = resolve(rel)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("the folder for {rel} could not be created"))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            crate::errcode::code_with("files.folderCouldNotBeCreated", &[("path", rel)])
+        })?;
     }
 
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .with_context(|| format!("{rel} could not be opened for appending"))?;
-    f.write_all(contents.as_bytes())
-        .with_context(|| format!("{rel} could not be appended to"))?;
+        .with_context(|| {
+            crate::errcode::code_with("files.couldNotBeOpenedForAppending", &[("path", rel)])
+        })?;
+    f.write_all(contents.as_bytes()).with_context(|| {
+        crate::errcode::code_with("files.couldNotBeAppendedTo", &[("path", rel)])
+    })?;
     Ok(())
 }
 
@@ -185,7 +214,9 @@ pub fn remove(rel: &str) -> Result<()> {
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow!(e)).with_context(|| format!("{rel} could not be removed")),
+        Err(e) => Err(anyhow!(e)).with_context(|| {
+            crate::errcode::code_with("files.couldNotBeRemoved", &[("path", rel)])
+        }),
     }
 }
 
