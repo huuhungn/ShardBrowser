@@ -107,7 +107,7 @@ export function Sidebar() {
       <div className="mt-auto border-t border-stroke-soft-200 pt-2">
         <div className="mb-2.5 flex flex-col gap-[7px] rounded-xl bg-bg-weak-50 p-2.5 ring-1 ring-inset ring-stroke-soft-200">
           <div className="flex items-center justify-between">
-            <span className="text-subheading-2xs text-text-soft-400">Automation API</span>
+            <span className="text-subheading-2xs text-text-soft-400">{t("sidebar.automationApi")}</span>
             {autoUrl && <Badge color="success" variant="filled" size="small" dot>on</Badge>}
           </div>
           {autoUrl ? (

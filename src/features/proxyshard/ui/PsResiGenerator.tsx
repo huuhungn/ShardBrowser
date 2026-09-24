@@ -75,7 +75,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
         setPassword(p);
         if (!p) setPwErr(t("ps.theAPIDidnTReturnAResidentialPasswordF"));
       })
-      .catch((e) => setPwErr(String(e)));
+      .catch((e) => setPwErr(safeUiError(e)));
     psCountries(pt)
       .then((r) => setCountries(r.results ?? []))
       .catch((e) => toast.err(safeUiError(e)));
@@ -259,7 +259,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
         <div className="mono mt-1.5 break-all rounded-8 bg-bg-weak-50 px-[11px] py-[9px] text-paragraph-xs text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
           {relay}:{PS_PORT[proto]}:{sampleUser}:{password ? "••••" : "?"}
         </div>
-        <span className="text-label-sm font-medium text-text-soft-400">Note: new generated proxies will be added to the list on Proxies page.</span>
+        <span className="text-label-sm font-medium text-text-soft-400">{t("ps.resiNote")}</span>
         {pwErr && <p className="m-0 text-paragraph-xs text-text-soft-400">{pwErr}</p>}
       </div>
     </DialogModal>

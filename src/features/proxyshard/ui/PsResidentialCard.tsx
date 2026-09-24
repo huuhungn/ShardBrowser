@@ -84,7 +84,7 @@ export function PsResidentialCard() {
 
       {type !== "unmetered" ? (
         <>
-          {loading && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading…</p>}
+          {loading && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.loading")}</p>}
           {err && !loading && <p className="m-0 text-paragraph-xs text-text-soft-400">{err}</p>}
           {data && !loading && (
             <>

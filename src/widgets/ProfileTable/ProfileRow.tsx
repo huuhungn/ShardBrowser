@@ -227,7 +227,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
                 <span className="mono small text-text-sub-600">{proxy.host}:{proxy.port}</span>
               </span>
             </div>
-          ) : <span className="text-paragraph-xs text-text-soft-400">— direct —</span>}
+          ) : <span className="text-paragraph-xs text-text-soft-400">{t("profileTable.direct")}</span>}
         </div>
         <div
           className="cell-notes min-w-0 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-paragraph-xs text-text-sub-600 transition-colors hover:text-primary-base"

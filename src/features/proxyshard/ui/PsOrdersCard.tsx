@@ -86,7 +86,7 @@ export function PsOrdersCard() {
           </Button>
         </div>
       </div>
-      {loading && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading…</p>}
+      {loading && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.loading")}</p>}
       {!loading && visible.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.noOrdersForThisFilter")}</p>}
       {!loading && visible.length > 0 && (
         <div className="mt-1 overflow-hidden rounded-10 ring-1 ring-inset ring-stroke-soft-200">
@@ -126,9 +126,9 @@ export function PsOrdersCard() {
       )}
       {!loading && (offset > 0 || hasNext) && (
         <div className="mt-3 flex items-center justify-center gap-3.5">
-          <Button variant="neutral" mode="stroke" size="2xsmall" disabled={offset <= 0} onClick={() => go(false)}>‹ Prev</Button>
-          <span className="text-paragraph-xs text-text-soft-400">Page {Math.floor(offset / PS_ORDERS_PAGE) + 1}</span>
-          <Button variant="neutral" mode="stroke" size="2xsmall" disabled={!hasNext} onClick={() => go(true)}>Next ›</Button>
+          <Button variant="neutral" mode="stroke" size="2xsmall" disabled={offset <= 0} onClick={() => go(false)}>{t("ps.prev")}</Button>
+          <span className="text-paragraph-xs text-text-soft-400">{t("ps.pageN", { n: Math.floor(offset / PS_ORDERS_PAGE) + 1 })}</span>
+          <Button variant="neutral" mode="stroke" size="2xsmall" disabled={!hasNext} onClick={() => go(true)}>{t("ps.next")}</Button>
         </div>
       )}
       {importing && (

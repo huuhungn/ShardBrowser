@@ -45,7 +45,7 @@ export const usePsAccount = create<PsAccountStore>((set, get) => ({
             const m = await psMe();
             set({ me: m, status: "ok" });
         } catch (e) {
-            set({ me: null, status: "err", err: String(e) });
+            set({ me: null, status: "err", err: safeUiError(e) });
         }
     },
     saveKey: async (next) => {

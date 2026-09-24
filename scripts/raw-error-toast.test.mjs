@@ -34,7 +34,12 @@ test("a backend error is never toasted raw", () => {
       // — or when it is stored for later rendering with `setErr(String(e))`.
       // Match the raw error anywhere in the call, and let `safeUiError` on the
       // line clear it.
-      const raw = /(?:toast\.err|setErr)\([^;]*(?:String\(|`\$\{|\?\.message)/.test(line);
+      // A fourth shape skips the toast helpers entirely: the error is stashed
+      // in state (`err: String(e)`, `setPwErr(String(e))`) and rendered later,
+      // which leaks the same marker one component away from the catch block.
+      const viaHelper = /(?:toast\.err|set(?:[A-Z]\w*)?(?:Err|Error)\w*)\([^;]*(?:String\(|`\$\{|\?\.message)/.test(line);
+      const viaState = /\b(?:err|error)\s*:\s*(?:String\(|`\$\{)/.test(line);
+      const raw = viaHelper || viaState;
       if (raw && !line.includes("safeUiError")) {
         offenders.push(`${file.slice(SRC.length)}:${i + 1}`);
       }

@@ -53,7 +53,7 @@ export function FolderModal({
               ))}
             </div>
             <div className="my-0.5 flex items-center gap-2.5 text-paragraph-xs text-text-soft-400 [&::before]:h-px [&::before]:flex-1 [&::before]:bg-stroke-soft-200 [&::before]:content-[''] [&::after]:h-px [&::after]:flex-1 [&::after]:bg-stroke-soft-200 [&::after]:content-['']">
-            <span>or create new</span>
+            <span>{t("folders.orCreateNew")}</span>
             </div>
           </>
         )}

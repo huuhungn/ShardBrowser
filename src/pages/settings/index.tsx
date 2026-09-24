@@ -349,7 +349,7 @@ export function SettingsPage() {
                 <span className="text-paragraph-xs text-text-soft-400">{t("settings.api.regenerateHelp")}</span>
               </div>
               <p className="m-0 text-paragraph-xs text-text-soft-400">
-                Send it as <code>Authorization: Bearer &lt;token&gt;</code>.
+                <Rich text={t("settings.api.tokenHelp")} />
               </p>
             </>
           )}

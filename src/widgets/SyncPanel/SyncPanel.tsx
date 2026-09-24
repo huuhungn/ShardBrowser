@@ -84,7 +84,7 @@ export function SyncPanel({ group }: { group: string }) {
           ordinary fleet. */}
       <div className="min-h-0 flex-1 content-start overflow-auto border-t border-stroke-soft-200 px-2 py-1.5">
         {members.length === 0 ? (
-          <div className="text-paragraph-xs text-text-soft-400">starting…</div>
+          <div className="text-paragraph-xs text-text-soft-400">{t("sync.starting")}</div>
         ) : (
           <div className="flex flex-wrap gap-1">
             {members.map((m) => (

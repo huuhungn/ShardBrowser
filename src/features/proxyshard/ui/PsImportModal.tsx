@@ -134,7 +134,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
             {canSetP0f ? t("ps.freeSetSignature", { free }) : " · no free slots (buy more to assign p0f)"}
           </p>
         )}
-        {!items && !err && <p className="m-0 text-paragraph-xs text-text-soft-400">Loading proxies…</p>}
+        {!items && !err && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("proxies.loading")}</p>}
         {err && <p className="m-0 text-paragraph-xs text-text-soft-400">{err}</p>}
         {items && items.length === 0 && <p className="m-0 text-paragraph-xs text-text-soft-400">{t("ps.thisOrderHasNoActiveProxies")}</p>}
         {items && items.length > 0 && (
