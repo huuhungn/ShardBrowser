@@ -7,7 +7,7 @@ import {
 } from "../../../shared/icons";
 import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { toast } from "../../../shared/model/toast";
-import { fmtTs } from "../../../shared/lib/utils";
+import { fmtTs, safeUiError } from "../../../shared/lib/utils";
 import type { ProxyEntry, ProxyTestSnapshot } from "../../../entities/proxy";
 import { proxyHistory } from "../../../entities/proxy";
 import { t } from "../../../shared/i18n";
@@ -80,7 +80,9 @@ export function ProxyInfoPopover({
                   color={latest.udp_ms != null ? "success" : "error"}
                   variant="lighter"
                   size="small"
-                  title={latest.udp_error ?? undefined}
+                  title={
+                    latest.udp_error ? safeUiError(latest.udp_error) : undefined
+                  }
                 >
                   UDP {latest.udp_ms != null ? `${latest.udp_ms} ms` : "✗"}
                 </Badge>

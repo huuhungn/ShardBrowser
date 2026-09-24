@@ -1,6 +1,7 @@
 //! Extension library. Name, description and icon are read out of the extension
 //! itself, so the grid matches what the browser will load.
 
+use crate::errcode;
 use crate::store;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -27,7 +28,7 @@ pub struct ExtensionEntry {
 
 fn dir_for(id: &str) -> Result<PathBuf> {
     if id.is_empty() || id.contains(['/', '\\', '.']) {
-        anyhow::bail!("invalid extension id");
+        anyhow::bail!("{}", errcode::code("extensions.invalidId"));
     }
     Ok(store::extensions_dir()?.join(id))
 }
@@ -212,7 +213,7 @@ pub fn import(src: &Path) -> Result<ExtensionEntry> {
     }
     if !manifest_root(&dst).join("manifest.json").exists() {
         let _ = fs::remove_dir_all(&dst);
-        anyhow::bail!("no manifest.json inside — not an extension");
+        anyhow::bail!("{}", errcode::code("extensions.noManifest"));
     }
     let _ = fs::write(
         dst.join(".added"),
@@ -246,18 +247,18 @@ pub async fn import_url(raw: &str) -> Result<ExtensionEntry> {
     let status = resp.status();
     // The store answers 204 for an id it does not know rather than 404.
     if status == reqwest::StatusCode::NO_CONTENT {
-        anyhow::bail!("the Web Store has no extension with that id");
+        anyhow::bail!("{}", errcode::code("extensions.notInWebStore"));
     }
     let resp = resp
         .error_for_status()
         .with_context(|| format!("fetch {url}"))?;
     let bytes = resp.bytes().await?;
     if bytes.len() < 4 {
-        anyhow::bail!("the link returned nothing to unpack");
+        anyhow::bail!("{}", errcode::code("extensions.emptyDownload"));
     }
     // Say so before unzip does: a page that 200s with HTML is the usual mistake.
     if bytes.starts_with(b"<") {
-        anyhow::bail!("that link is a web page, not an extension file");
+        anyhow::bail!("{}", errcode::code("extensions.linkIsWebPage"));
     }
 
     let tmp =
@@ -273,7 +274,7 @@ pub async fn import_url(raw: &str) -> Result<ExtensionEntry> {
 fn resolve_download_url(raw: &str) -> Result<String> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("no link given");
+        anyhow::bail!("{}", errcode::code("extensions.noLink"));
     }
     if let Some(id) = webstore_id(raw) {
         return Ok(format!(
@@ -283,7 +284,7 @@ fn resolve_download_url(raw: &str) -> Result<String> {
         ));
     }
     if !raw.starts_with("http://") && !raw.starts_with("https://") {
-        anyhow::bail!("that is neither a link nor a Web Store id");
+        anyhow::bail!("{}", errcode::code("extensions.neitherLinkNorId"));
     }
     Ok(raw.to_string())
 }
@@ -316,7 +317,7 @@ fn unpack_archive(src: &Path, dst: &Path) -> Result<()> {
     let bytes = fs::read(src).with_context(|| format!("read {}", src.display()))?;
     let zip_start = crx_payload_offset(&bytes)?;
     let cursor = std::io::Cursor::new(&bytes[zip_start..]);
-    let mut zip = zip::ZipArchive::new(cursor).context("not a zip/crx archive")?;
+    let mut zip = zip::ZipArchive::new(cursor).context(errcode::code("extensions.notAnArchive"))?;
     for i in 0..zip.len() {
         let mut f = zip.by_index(i)?;
         let Some(rel) = f.enclosed_name() else {
@@ -348,10 +349,13 @@ fn crx_payload_offset(bytes: &[u8]) -> Result<usize> {
     let offset = match u32_at(4) {
         2 => 16 + u32_at(8) as usize + u32_at(12) as usize,
         3 => 12 + u32_at(8) as usize,
-        v => anyhow::bail!("unsupported CRX version {v}"),
+        v => anyhow::bail!(
+            "{}",
+            errcode::code_with("extensions.crxVersionUnsupported", &[("v", &v.to_string())])
+        ),
     };
     if offset >= bytes.len() {
-        anyhow::bail!("CRX header runs past the end of the file");
+        anyhow::bail!("{}", errcode::code("extensions.crxHeaderTruncated"));
     }
     Ok(offset)
 }

@@ -21,6 +21,7 @@ import {
 } from "../../entities/automation";
 import { useProfile } from "../../entities/profile";
 import { useT } from "../../shared/i18n";
+import { safeUiError } from "../../shared/lib/utils";
 
 type ParamSpec = {
   key: string;
@@ -286,8 +287,11 @@ function RunPanel({ report }: { report: RunReport }) {
         >
           <span className="text-paragraph-xs text-text-soft-400">{i + 1}</span>
           <span className="truncate text-paragraph-xs text-text-sub-600">{s.kind}</span>
-          <span className="truncate text-paragraph-xs text-text-sub-600" title={s.error ?? ""}>
-            {s.error ?? s.label ?? ""}
+          <span
+            className="truncate text-paragraph-xs text-text-sub-600"
+            title={s.error ? safeUiError(s.error) : ""}
+          >
+            {s.error ? safeUiError(s.error) : (s.label ?? "")}
           </span>
           <span
             className={cn(
