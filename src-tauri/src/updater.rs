@@ -37,7 +37,7 @@ fn lock_pending(state: &PendingUpdate) -> Result<std::sync::MutexGuard<'_, Pendi
     state
         .0
         .lock()
-        .map_err(|_| "Updater state is unavailable.".to_string())
+        .map_err(|_| crate::errcode::code("updater.stateUnavailable"))
 }
 
 #[tauri::command]
@@ -95,7 +95,7 @@ pub async fn launcher_update_download(
         let update = state
             .update
             .clone()
-            .ok_or_else(|| "Check for updates before downloading.".to_string())?;
+            .ok_or_else(|| crate::errcode::code("updater.checkBeforeDownload"))?;
         state.downloading = true;
         update
     };
@@ -142,7 +142,7 @@ pub fn launcher_update_install(pending: State<'_, PendingUpdate>) -> Result<(), 
         let update = state
             .update
             .take()
-            .ok_or_else(|| "Check for updates before installing.".to_string())?;
+            .ok_or_else(|| crate::errcode::code("updater.checkBeforeInstall"))?;
         let bytes = match state.bytes.take() {
             Some(bytes) => bytes,
             None => {

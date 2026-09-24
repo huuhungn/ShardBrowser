@@ -83,24 +83,55 @@ function isUserProse(text) {
   if (/^--?[\w-]+$/.test(withoutPlaceholders)) return false;             // a CLI switch
   const words = withoutPlaceholders.match(/[A-Za-z]{2,}/g) ?? [];
   if (words.length < 2) return false;
-  // Identifier-ish runs (`snake_case_thing`, `camelCaseThing`) are not prose.
-  if (!/\s/.test(withoutPlaceholders)) return false;
+  // Identifier-ish runs (`snake_case_thing`, `camelCaseThing`) are not prose,
+  // and neither is a path or filename that only looks spaced because a
+  // `{placeholder}` sat in the middle of it: `shardx-ext-{}.crx` and
+  // `/user/api/orders/{id}/renew` are one token, not a sentence. Test the
+  // space on the text with placeholders removed rather than blanked.
+  if (!/\s/.test(text.replace(/\{[^}]*\}/g, ""))) return false;
   return true;
 }
 
 const STRING_LITERAL = /"((?:[^"\\]|\\.)*)"/g;
 
+/**
+ * How many lines an error shape keeps looking for its message. `rustfmt` breaks
+ * a long `map_err(|_| profile_error(Kind::Busy, "..."))` across four lines, so
+ * a scan that forgets the keyword at the newline never sees the sentence. Five
+ * is past the widest wrap rustfmt produces here and short enough that the next
+ * unrelated statement does not inherit the shape.
+ */
+const SHAPE_REACH = 5;
+
 function userStringsIn(src) {
   const found = [];
+  // Lines still covered by an error shape seen above, when that line had no
+  // literal of its own to attribute it to.
+  let reach = 0;
   for (const [i, line] of withoutTestModules(src).split("\n").entries()) {
     const s = line.trim();
     if (s.startsWith("//") || s.startsWith("///")) continue;
-    if (LOG_MACRO.test(s)) continue;
-    if (!ERROR_SHAPE.test(s)) continue;
+    if (LOG_MACRO.test(s)) {
+      reach = 0;
+      continue;
+    }
+    const shapeHere = ERROR_SHAPE.test(s);
+    if (shapeHere) reach = SHAPE_REACH;
+    if (!shapeHere && reach === 0) continue;
+    // A builder chain inside an error shape carries its own strings —
+    // `WebviewWindowBuilder::new(...).title("Shard Helper")` sits under an
+    // `if let Err(e)`, but a window title is not an error message.
+    if (!shapeHere && /^\.\w+\(/.test(s)) continue;
+
+    let matched = false;
     for (const m of s.matchAll(STRING_LITERAL)) {
+      matched = true;
       const text = m[1];
       if (isUserProse(text)) found.push({ line: i + 1, text });
     }
+    // A literal answers the shape; so does the end of the statement that
+    // carried it. Anything else is a continuation still worth watching.
+    if (!shapeHere) reach = matched || /;$/.test(s) ? 0 : reach - 1;
   }
   return found;
 }

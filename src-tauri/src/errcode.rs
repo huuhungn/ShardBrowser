@@ -115,6 +115,16 @@ fn dictionary() -> &'static std::collections::HashMap<String, String> {
 /// so a stale code is visible in the API response instead of silently
 /// becoming an empty string.
 pub fn resolve_to_english(text: &str) -> String {
+    resolve_to_english_within(text, 0)
+}
+
+/// A label spliced into another message arrives as a marker inside an
+/// argument, so one pass is not enough: substituting `{action}` can introduce
+/// a marker the scan has already walked past. Resolve the result again, with a
+/// small ceiling so a key that somehow contains its own marker cannot spin.
+const MAX_MARKER_DEPTH: u8 = 4;
+
+fn resolve_to_english_within(text: &str, depth: u8) -> String {
     let dict = dictionary();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -138,6 +148,9 @@ pub fn resolve_to_english(text: &str) -> String {
                 for (name, value) in &args {
                     sentence = sentence.replace(&format!("{{{name}}}"), value);
                 }
+                if depth < MAX_MARKER_DEPTH && sentence.contains("[[shardx:") {
+                    sentence = resolve_to_english_within(&sentence, depth + 1);
+                }
                 out.push_str(&sentence);
             }
             None => {
@@ -159,6 +172,27 @@ pub fn resolve_to_english(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_nested_marker_in_an_argument_is_resolved_too() {
+        // `profile.rs` builds "Stop the running browser before you {action}"
+        // where {action} is itself a translatable label ("delete this
+        // profile"). The label has to arrive as a marker, or half the sentence
+        // stays English; so resolution must keep going after a substitution
+        // instead of emitting the inner marker verbatim.
+        let action = super::code("profile.actionDeleteProfile");
+        let marker = super::code_with("profile.stopRunningBrowser", &[("action", &action)]);
+
+        let resolved = super::resolve_to_english(&marker);
+        assert!(
+            !resolved.contains("[[shardx:"),
+            "inner marker left unresolved: {resolved}"
+        );
+        assert_eq!(
+            resolved,
+            "Stop the running browser before you delete this profile"
+        );
+    }
+
     #[test]
     fn a_value_holding_the_delimiters_survives_the_round_trip() {
         // A CSS selector is the realistic case: it can contain both a pipe and

@@ -31,7 +31,7 @@ function loadLocaliser() {
   const decl = utils
     .slice(start, semi + "\n  });".length)
     .replace(marker, "const localiseBackendError")
-    .replace("(text: string): string =>", "(text) =>")
+    .replace("(text: string, depth = 0): string =>", "(text, depth = 0) =>")
     // The body keeps one type annotation, which plain JS cannot parse.
     .replace("const vars: Record<string, string> = {}", "const vars = {}");
   return new Function("t", `${decl}; return localiseBackendError;`);
@@ -53,6 +53,24 @@ test("a marker becomes the operator's language", () => {
   assert.equal(out, vi["launch.browserMissing"]);
   assert.match(out, /Chưa cài trình duyệt ShardX/);
   assert.doesNotMatch(out, /\[\[shardx:/);
+});
+
+test("a marker nested in an argument is translated too", () => {
+  // `profile.rs` splices a translatable label into a sentence: the operator
+  // must read both halves in their language, not one half plus a raw marker.
+  const dict = {
+    "profile.stopRunningBrowser": "Hãy dừng trình duyệt đang chạy trước khi bạn {action}",
+    "profile.actionDeleteProfile": "xóa hồ sơ này",
+  };
+  // `code_with` percent-escapes `]` in an argument, so the nested marker
+  // arrives as `...actionDeleteProfile%5D%5D` — escaped, the outer marker
+  // still parses as one unit, and unescaping restores the inner one.
+  const out = localiseWith(
+    dict,
+    "[[shardx:profile.stopRunningBrowser|action=[[shardx:profile.actionDeleteProfile%5D%5D]]",
+  );
+  assert.doesNotMatch(out, /\[\[shardx:/);
+  assert.equal(out, "Hãy dừng trình duyệt đang chạy trước khi bạn xóa hồ sơ này");
 });
 
 test("arguments fill the locale string's placeholders", () => {

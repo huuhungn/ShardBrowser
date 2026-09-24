@@ -394,7 +394,10 @@ fn profile_get(id: String) -> Result<Value, String> {
     // Backfill gpu_preset_id for legacy profiles by matching webgl.renderer.
     if stored.meta.gpu_preset_id.is_none() {
         if let Some(gid) = infer_gpu_preset_id(&stored.config) {
-            if let Ok(_claim) = profile::begin_user_mutation([&id], "backfill profile metadata") {
+            if let Ok(_claim) = profile::begin_user_mutation(
+                [&id],
+                &crate::errcode::code("profile.actionBackfillMetadata"),
+            ) {
                 if let Ok(mut current) = profile::load_raw(&id) {
                     if current.meta.gpu_preset_id.is_none() {
                         current.meta.gpu_preset_id = Some(gid);
@@ -762,14 +765,14 @@ pub fn persist_profile_core(
         .map(|s| s.is_empty())
         .unwrap_or(true);
     let _claim = if is_new {
-        profile::begin_profile_creation("create a profile")
+        profile::begin_profile_creation(&crate::errcode::code("profile.actionCreateProfile"))
     } else {
         let id = payload
             .get("_meta")
             .and_then(|meta| meta.get("id"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        profile::begin_user_mutation([id], "modify this profile")
+        profile::begin_user_mutation([id], &crate::errcode::code("profile.actionModifyProfile"))
     }?;
 
     persist_profile_core_claimed(window, payload, enrich)
@@ -830,8 +833,9 @@ pub(crate) fn persist_profile_core_claimed(
 /// Into the trash for a week; only the files carrying the account are kept.
 #[tauri::command]
 fn profile_delete(id: String) -> Result<(), String> {
-    let _claim = profile::begin_user_mutation([&id], "delete this profile")
-        .map_err(|error| error.to_string())?;
+    let _claim =
+        profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionDeleteProfile"))
+            .map_err(|error| error.to_string())?;
     trash::move_to_trash(&id)
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -993,8 +997,11 @@ async fn data_root_migrate(app: tauri::AppHandle, path: String) -> Result<u64, S
 
 #[tauri::command]
 fn profile_bind_proxy(profile_id: String, proxy_id: Option<String>) -> Result<(), String> {
-    let _claim = profile::begin_user_mutation([&profile_id], "change this profile's proxy")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionChangeProxy"),
+    )
+    .map_err(|error| error.to_string())?;
     let mut p = profile::load_raw(&profile_id).map_err(|e| e.to_string())?;
     p.meta.proxy_id = proxy_id;
     profile::save_raw(&mut p).map_err(|e| e.to_string())
@@ -1010,7 +1017,8 @@ fn profile_clone(id: String) -> Result<profile::ProfileMeta, String> {
 #[tauri::command]
 fn profile_import(payloads: Vec<Value>) -> Result<usize, String> {
     let _claim =
-        profile::begin_profile_creation("import profiles").map_err(|error| error.to_string())?;
+        profile::begin_profile_creation(&crate::errcode::code("profile.actionImportProfiles"))
+            .map_err(|error| error.to_string())?;
     let mut stored_profiles: Vec<profile::StoredProfile> = payloads
         .into_iter()
         .map(|payload| serde_json::from_value(payload).map_err(|error| error.to_string()))
@@ -1038,15 +1046,17 @@ fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn profile_set_pin(id: String, pinned: bool) -> Result<(), String> {
-    let _claim = profile::begin_user_mutation([&id], "change this profile's pin")
-        .map_err(|error| error.to_string())?;
+    let _claim =
+        profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionChangePin"))
+            .map_err(|error| error.to_string())?;
     profile::set_pin(&id, pinned).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn profile_set_folder(id: String, folder: String) -> Result<(), String> {
-    let _claim = profile::begin_user_mutation([&id], "move this profile")
-        .map_err(|error| error.to_string())?;
+    let _claim =
+        profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionMoveProfile"))
+            .map_err(|error| error.to_string())?;
     profile::set_folder(&id, &folder).map_err(|e| e.to_string())
 }
 
@@ -1780,8 +1790,11 @@ fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, Str
 
 #[tauri::command]
 fn cookies_import(profile_id: String, cookies: Vec<cookies::Cookie>) -> Result<usize, String> {
-    let _claim = profile::begin_user_mutation([&profile_id], "import cookies")
-        .map_err(|error| error.to_string())?;
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionImportCookies"),
+    )
+    .map_err(|error| error.to_string())?;
     cookies::import(&profile_id, &cookies).map_err(|e| e.to_string())
 }
 
@@ -2347,9 +2360,18 @@ mod profile_mutation_boundary_tests {
 
     fn assert_running_blocked<T>(result: Result<T, String>) {
         let error = result.err().expect("running profile mutation must fail");
+        // The message now travels as an error code, and the action label
+        // inside it as a nested one. Resolve before asserting: the point of
+        // the test is that the operator is told to stop the browser and which
+        // action was refused, which is only legible after resolution.
+        let resolved = crate::errcode::resolve_to_english(&error);
         assert!(
-            error.contains("Stop the running browser"),
-            "expected actionable running-profile error, got: {error}"
+            resolved.contains("Stop the running browser"),
+            "expected actionable running-profile error, got: {resolved}"
+        );
+        assert!(
+            !resolved.contains("[[shardx:"),
+            "the action label was left unresolved: {resolved}"
         );
     }
 
