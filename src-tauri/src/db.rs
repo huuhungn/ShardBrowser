@@ -43,12 +43,20 @@ fn open(name: &str) -> Result<Connection> {
     let path = files::resolve_for_db(name)?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("the folder for {} could not be created", path.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            crate::errcode::code_with(
+                "db.folderCouldNotBeCreated",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
     }
 
-    let conn = Connection::open(&path)
-        .with_context(|| format!("the database {} could not be opened", path.display()))?;
+    let conn = Connection::open(&path).with_context(|| {
+        crate::errcode::code_with(
+            "db.databaseCouldNotBeOpened",
+            &[("path", &path.display().to_string())],
+        )
+    })?;
 
     // A project's own statements must not be able to reach a second file.
     // Allowing zero attached databases makes `attach database 'C:\\...'` fail
@@ -76,13 +84,17 @@ fn bind(params: &[Value]) -> Result<Vec<SqlValue>> {
                 } else if let Some(f) = n.as_f64() {
                     Ok(SqlValue::Real(f))
                 } else {
-                    Err(anyhow!("a parameter number is out of range: {n}"))
+                    Err(anyhow!(crate::errcode::code_with(
+                        "db.parameterNumberOutOfRange",
+                        &[("value", &n.to_string())]
+                    )))
                 }
             }
             Value::String(s) => Ok(SqlValue::Text(s.clone())),
-            other => Err(anyhow!(
-                "a parameter must be a string, number, boolean or null, not {other}"
-            )),
+            other => Err(anyhow!(crate::errcode::code_with(
+                "db.parameterTypeUnsupported",
+                &[("value", &other.to_string())]
+            ))),
         })
         .collect()
 }
@@ -102,7 +114,7 @@ fn single_statement(sql: &str) -> Result<()> {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             ';' if !in_single && !in_double => {
-                bail!("a block runs one statement; remove the ';' and use a second block")
+                bail!(crate::errcode::code("db.oneStatementPerBlock"))
             }
             _ => {}
         }
@@ -117,9 +129,11 @@ pub fn execute(name: &str, sql: &str, params: &[Value]) -> Result<usize> {
     let bound = bind(params)?;
     let changed = conn
         .prepare(sql)
-        .with_context(|| format!("the statement could not be prepared: {sql}"))?
+        .with_context(|| {
+            crate::errcode::code_with("db.statementCouldNotBePrepared", &[("sql", sql)])
+        })?
         .execute(rusqlite::params_from_iter(bound))
-        .with_context(|| format!("the statement failed: {sql}"))?;
+        .with_context(|| crate::errcode::code_with("db.statementFailed", &[("sql", sql)]))?;
     Ok(changed)
 }
 
@@ -129,20 +143,23 @@ pub fn query(name: &str, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
     let conn = open(name)?;
     let bound = bind(params)?;
 
-    let mut stmt = conn
-        .prepare(sql)
-        .with_context(|| format!("the query could not be prepared: {sql}"))?;
+    let mut stmt = conn.prepare(sql).with_context(|| {
+        crate::errcode::code_with("db.queryCouldNotBePrepared", &[("sql", sql)])
+    })?;
 
     let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
 
     let mut rows = stmt
         .query(rusqlite::params_from_iter(bound))
-        .with_context(|| format!("the query failed: {sql}"))?;
+        .with_context(|| crate::errcode::code_with("db.queryFailed", &[("sql", sql)]))?;
 
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         if out.len() >= MAX_ROWS {
-            bail!("the query returned more than {MAX_ROWS} rows; add a limit or a where clause");
+            bail!(crate::errcode::code_with(
+                "db.tooManyRows",
+                &[("limit", &MAX_ROWS.to_string())]
+            ));
         }
         let mut object = Map::new();
         for (i, column) in columns.iter().enumerate() {
@@ -260,9 +277,10 @@ mod tests {
         execute("work.db", "create table t (a int)", &[]).unwrap();
         let err = execute("work.db", "insert into t values (1); drop table t", &[])
             .expect_err("a second statement must be refused");
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("one statement"),
-            "the error should say why: {err}"
+            english.contains("one statement"),
+            "the error should say why: {english}"
         );
 
         // And the table it tried to drop is still there.
@@ -297,9 +315,10 @@ mod tests {
             &[],
         )
         .expect_err("a result past the cap must be refused");
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("more than"),
-            "the error should say why: {err}"
+            english.contains("more than"),
+            "the error should say why: {english}"
         );
     }
 
@@ -351,9 +370,10 @@ mod tests {
             &[json!({ "nested": true })],
         )
         .expect_err("an object parameter must be refused");
+        let english = crate::errcode::resolve_to_english(&err.to_string());
         assert!(
-            err.to_string().contains("must be a string"),
-            "the error should say why: {err}"
+            english.contains("must be a string"),
+            "the error should say why: {english}"
         );
     }
 
