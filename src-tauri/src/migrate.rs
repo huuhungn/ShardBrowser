@@ -37,7 +37,7 @@ fn emit(app: &tauri::AppHandle, p: Progress) {
 /// Move the data root to `dst`. Returns the number of files moved.
 pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     if MIGRATING.swap(true, Ordering::SeqCst) {
-        anyhow::bail!("a migration is already running");
+        anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
     }
     let out = do_run(app, dst);
     MIGRATING.store(false, Ordering::SeqCst);
@@ -60,10 +60,10 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     let src = store::data_root()?;
     let dst = dst.to_path_buf();
     if dst == src {
-        anyhow::bail!("that is already where the data lives");
+        anyhow::bail!(crate::errcode::code("migrate.sameFolder"));
     }
     if dst.starts_with(&src) {
-        anyhow::bail!("the new folder cannot be inside the current one");
+        anyhow::bail!(crate::errcode::code("migrate.nestedFolder"));
     }
     std::fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
     writable(&dst)?;
@@ -143,10 +143,10 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
         let a = std::fs::metadata(from).map(|m| m.len()).unwrap_or(0);
         let b = std::fs::metadata(to).map(|m| m.len()).unwrap_or(u64::MAX);
         if a != b {
-            anyhow::bail!(
-                "{} did not copy cleanly — nothing was deleted",
-                from.display()
-            );
+            anyhow::bail!(crate::errcode::code_with(
+                "migrate.copyIncomplete",
+                &[("path", &from.display().to_string())]
+            ));
         }
     }
 
@@ -195,7 +195,12 @@ fn finish(dst: &Path) -> Result<()> {
 /// read-only looks like an ordinary directory until something is written.
 fn writable(dir: &Path) -> Result<()> {
     let probe = dir.join(".shardx-write-test");
-    std::fs::write(&probe, b"ok").with_context(|| format!("{} is not writable", dir.display()))?;
+    std::fs::write(&probe, b"ok").with_context(|| {
+        crate::errcode::code_with(
+            "migrate.notWritable",
+            &[("path", &dir.display().to_string())],
+        )
+    })?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
 }

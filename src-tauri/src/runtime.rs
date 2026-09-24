@@ -74,7 +74,7 @@ pub fn host_spec() -> Option<PlatformSpec> {
 /// Runtime dir under the platform data dir; kept outside the launcher bundle.
 pub fn runtime_dir() -> Result<PathBuf> {
     Ok(dirs::data_dir()
-        .context("platform data dir not available")?
+        .context(crate::errcode::code("runtime.noPlatformDataDir"))?
         .join("shardx-launcher")
         .join("runtime"))
 }
@@ -630,10 +630,15 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
 
     // Refused rather than installed: this build could not configure it.
     if engine_needs_newer_launcher(&manifest) {
-        return Err(format!(
-            "This engine build needs ShardX Launcher {} or newer — you are on {}. Update the launcher first.",
-            manifest.min_launcher_version.as_deref().unwrap_or("?"),
-            launcher_version(),
+        return Err(crate::errcode::code_with(
+            "runtime.launcherTooOld",
+            &[
+                (
+                    "required",
+                    manifest.min_launcher_version.as_deref().unwrap_or("?"),
+                ),
+                ("current", launcher_version()),
+            ],
         ));
     }
 
@@ -883,21 +888,26 @@ async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) 
                 .arg("-d")
                 .arg(&dest)
                 .output()
-                .map_err(|e| anyhow::anyhow!(
-                    "system `unzip` not found ({e}); install with `apt install unzip` / `brew install unzip`"
-                ))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(crate::errcode::code_with(
+                        "runtime.unzipMissing",
+                        &[("detail", &e.to_string())]
+                    ))
+                })?;
             // unzip exit codes: 0 = clean, 1 = warnings (e.g. archives
             // zipped on Windows have backslashes; extraction still
             // completes correctly), 2+ = real fatal errors per unzip(1).
             let code = out.status.code().unwrap_or(-1);
             if code > 1 {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!(
-                    "unzip failed for {} (exit {}): {}",
-                    zip_path.display(),
-                    code,
-                    stderr.trim()
-                );
+                anyhow::bail!(crate::errcode::code_with(
+                    "runtime.unzipFailed",
+                    &[
+                        ("path", &zip_path.display().to_string()),
+                        ("code", &code.to_string()),
+                        ("detail", stderr.trim())
+                    ]
+                ));
             }
             Ok(())
         }
@@ -998,7 +1008,10 @@ fn place_widevine(base: &Path) -> Result<()> {
     if dst.exists() {
         let _ = fs::remove_dir_all(&dst);
     }
-    fs::create_dir_all(dst.parent().context("widevine parent")?)?;
+    fs::create_dir_all(
+        dst.parent()
+            .context(crate::errcode::code("runtime.noWidevineParent"))?,
+    )?;
     fs::rename(&src, &dst)?;
     let _ = fs::remove_dir(base.join("ShardX-Widevine-Mac-arm64"));
     Ok(())

@@ -227,10 +227,11 @@ mod win {
             )
         };
         if ok == 0 {
-            return Err(anyhow!(
-                "DPAPI {} failed",
-                if protect { "protect" } else { "unprotect" }
-            ));
+            return Err(anyhow!(crate::errcode::code(if protect {
+                "cookies.dpapiProtectFailed"
+            } else {
+                "cookies.dpapiUnprotectFailed"
+            })));
         }
         let out = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
         LocalFree(out_blob.pbData as _);
@@ -252,9 +253,11 @@ mod win {
         if !ls_path.exists() {
             return Ok(None);
         }
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(ls_path).context("read Local State")?)
-                .context("parse Local State")?;
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ls_path)
+                .context(crate::errcode::code("cookies.cannotReadLocalState"))?,
+        )
+        .context(crate::errcode::code("cookies.cannotParseLocalState"))?;
         let enc = match json
             .get("os_crypt")
             .and_then(|o| o.get("encrypted_key"))
@@ -263,9 +266,13 @@ mod win {
             Some(s) => s,
             None => return Ok(None),
         };
-        let blob = STANDARD.decode(enc).context("base64 encrypted_key")?;
+        let blob = STANDARD
+            .decode(enc)
+            .context(crate::errcode::code("cookies.badEncryptedKey"))?;
         if blob.len() <= DPAPI_TAG.len() || &blob[..DPAPI_TAG.len()] != DPAPI_TAG {
-            return Err(anyhow!("encrypted_key missing DPAPI tag"));
+            return Err(anyhow!(crate::errcode::code(
+                "cookies.encryptedKeyMissingDpapiTag"
+            )));
         }
         Ok(Some(unsafe { dpapi(&blob[DPAPI_TAG.len()..], false)? }))
     }

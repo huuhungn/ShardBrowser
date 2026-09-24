@@ -41,12 +41,12 @@ pub async fn download_mcp(dir: &Path) -> Result<PathBuf> {
     let dest = download_destination(dir);
     let bytes = reqwest::get(MCP_ARCHIVE_URL)
         .await
-        .context("download MCP archive")?
+        .context(crate::errcode::code("mcp.cannotDownloadArchive"))?
         .error_for_status()
-        .context("MCP archive request failed")?
+        .context(crate::errcode::code("mcp.archiveRequestRefused"))?
         .bytes()
         .await
-        .context("read MCP archive")?;
+        .context(crate::errcode::code("mcp.cannotReadArchive"))?;
 
     let gz = flate2::read::GzDecoder::new(&bytes[..]);
     let mut archive = tar::Archive::new(gz);
@@ -77,7 +77,7 @@ pub async fn download_mcp(dir: &Path) -> Result<PathBuf> {
         }
     }
     if extracted == 0 {
-        anyhow::bail!("MCP archive contained no files (CDN delivered an empty bundle?)");
+        anyhow::bail!(crate::errcode::code("mcp.archiveEmpty"));
     }
     Ok(dest)
 }
