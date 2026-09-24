@@ -394,7 +394,8 @@ fn mark_pixmap() -> Option<&'static Pixmap> {
                 return None;
             }
             buf.truncate(info.buffer_size());
-            for px in buf.chunks_exact_mut(4) {
+            let (chunks, _) = buf.as_chunks_mut::<4>();
+            for px in chunks {
                 let a = px[3] as u32;
                 for c in px.iter_mut().take(3) {
                     *c = ((*c as u32 * a + 127) / 255) as u8;

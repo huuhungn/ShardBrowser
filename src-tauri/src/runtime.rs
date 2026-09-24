@@ -899,7 +899,7 @@ async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) 
                     stderr.trim()
                 );
             }
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -965,7 +965,7 @@ fn fix_unix_exec_bits(root: &Path) {
             if f.read_exact(&mut head).is_err() {
                 continue;
             }
-            if !magic.iter().any(|m| *m == head) {
+            if !magic.contains(&head) {
                 continue;
             }
             if let Ok(meta) = fs::metadata(&p) {
