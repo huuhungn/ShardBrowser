@@ -92,7 +92,7 @@ impl Bus {
     pub async fn start(token: String) -> Result<Arc<Bus>> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
-            .context("bind sync bus")?;
+            .context(crate::errcode::code("syncBus.cannotBind"))?;
         let port = listener.local_addr()?.port();
         let bus = Arc::new(Bus {
             port,

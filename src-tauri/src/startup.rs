@@ -47,7 +47,7 @@ fn set_registration(app: &AppHandle, enabled: bool) -> Result<(), String> {
         // after an in-place update or when a portable build has moved.
         manager.enable().map_err(|e| e.to_string())?;
         if !manager.is_enabled().map_err(|e| e.to_string())? {
-            return Err("the operating system did not enable the startup entry".into());
+            return Err(crate::errcode::code("startup.osDidNotEnable"));
         }
     } else {
         // A Windows user can disable an existing Run entry in Task Manager.
@@ -60,7 +60,7 @@ fn set_registration(app: &AppHandle, enabled: bool) -> Result<(), String> {
             }
         }
         if manager.is_enabled().map_err(|e| e.to_string())? {
-            return Err("the operating system did not disable the startup entry".into());
+            return Err(crate::errcode::code("startup.osDidNotDisable"));
         }
     }
     Ok(())
@@ -83,9 +83,9 @@ fn sync_restart_registration(enabled: bool) -> Result<(), String> {
     };
 
     if result < 0 {
-        Err(format!(
-            "Windows application restart registration failed (HRESULT 0x{:08X})",
-            result as u32
+        Err(crate::errcode::code_with(
+            "startup.restartRegistrationFailed",
+            &[("hresult", &format!("0x{:08X}", result as u32))],
         ))
     } else {
         Ok(())

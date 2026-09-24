@@ -337,10 +337,13 @@ impl FleetClient {
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
-                bail!(
-                    "server returned no bytes at offset {} of {total}",
-                    out.len()
-                );
+                bail!(crate::errcode::code_with(
+                    "fleet.downloadStalled",
+                    &[
+                        ("offset", &out.len().to_string()),
+                        ("total", &total.to_string())
+                    ]
+                ));
             }
             out.extend_from_slice(&bytes);
         }

@@ -86,17 +86,17 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn decode_key(h: &str) -> Result<[u8; 32]> {
     if !h.len().is_multiple_of(2) {
-        anyhow::bail!("fleet key is not valid hex");
+        anyhow::bail!(crate::errcode::code("fleetKeys.notValidHex"));
     }
     let raw: Vec<u8> = (0..h.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
         .collect::<std::result::Result<_, _>>()
-        .context("fleet key is not valid hex")?;
+        .context(crate::errcode::code("fleetKeys.notValidHex"))?;
     let arr: [u8; 32] = raw
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("fleet key must be 32 bytes"))?;
+        .map_err(|_| anyhow::anyhow!(crate::errcode::code("fleetKeys.wrongLength")))?;
     Ok(arr)
 }
 

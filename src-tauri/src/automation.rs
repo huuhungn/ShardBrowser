@@ -191,7 +191,7 @@ pub fn get(id: &str) -> Result<Project> {
         .projects
         .into_iter()
         .find(|p| p.id == id)
-        .context("no such project")
+        .context(crate::errcode::code("automation.noSuchProject"))
 }
 
 pub fn create(name: &str) -> Result<Project> {
@@ -243,7 +243,7 @@ pub fn duplicate(id: &str) -> Result<Project> {
         .iter()
         .find(|p| p.id == id)
         .cloned()
-        .context("no such project")?;
+        .context(crate::errcode::code("automation.noSuchProject"))?;
     let t = now();
     let copy = Project {
         id: uuid::Uuid::new_v4().to_string(),
@@ -333,11 +333,13 @@ pub fn export(project_id: &str) -> Result<Bundle> {
 /// clobber each other's work.
 pub fn import(bundle: Bundle) -> Result<Project> {
     if bundle.format > BUNDLE_FORMAT {
-        anyhow::bail!(
-            "this project was exported by a newer build (format {}, this build reads {})",
-            bundle.format,
-            BUNDLE_FORMAT
-        );
+        anyhow::bail!(crate::errcode::code_with(
+            "automation.bundleTooNew",
+            &[
+                ("format", &bundle.format.to_string()),
+                ("supported", &BUNDLE_FORMAT.to_string())
+            ]
+        ));
     }
 
     let _g = lock().lock().unwrap();
@@ -466,7 +468,7 @@ mod tests {
         };
         let err = import(bundle).expect_err("a newer format must be refused");
         assert!(
-            err.to_string().contains("newer build"),
+            crate::errcode::resolve_to_english(&err.to_string()).contains("newer build"),
             "the refusal should say why: {err}"
         );
     }

@@ -958,7 +958,7 @@ async fn run_automation_project(Path(id): Path<String>, Json(body): Json<RunReq>
         .await
         .map_err(|e| {
             let text = e.to_string();
-            let code = if text.contains("no such project") {
+            let code = if crate::errcode::has_code(&text, "automation.noSuchProject") {
                 StatusCode::NOT_FOUND
             } else if crate::runner::run_refusal(&e).is_some() {
                 StatusCode::CONFLICT

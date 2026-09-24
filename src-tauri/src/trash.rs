@@ -51,7 +51,7 @@ fn now() -> u64 {
 
 fn paths_for(id: &str) -> Result<(PathBuf, PathBuf)> {
     if id.is_empty() || id.contains(['/', '\\']) {
-        anyhow::bail!("invalid profile id");
+        anyhow::bail!(crate::errcode::code("trash.invalidProfileId"));
     }
     let dir = store::trash_dir()?;
     Ok((
@@ -199,7 +199,7 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
         }
         fs::write(out, buf)?;
     }
-    let mut stored = stored.context("archive has no profile.json")?;
+    let mut stored = stored.context(crate::errcode::code("trash.archiveHasNoProfileJson"))?;
     // save_raw would mint a new id for an empty one; the archive always has it.
     profile::save_raw(&mut stored)?;
 

@@ -26,6 +26,20 @@ pub fn code(key: &str) -> String {
     format!("[[shardx:{key}]]")
 }
 
+/// Whether `text` carries the marker for `key`.
+///
+/// Routing decisions used to match on the English sentence, which quietly
+/// broke the moment that sentence became a code: the automation API answered
+/// 500 for a missing project instead of 404. Match the key instead, and only
+/// at a marker boundary so `a.b` never matches `a.bc`.
+pub fn has_code(text: &str, key: &str) -> bool {
+    let open = format!("[[shardx:{key}");
+    text.match_indices(&open).any(|(i, _)| {
+        let rest = &text[i + open.len()..];
+        rest.starts_with("]]") || rest.starts_with('|')
+    })
+}
+
 /// Marker carrying `name=value` arguments for the locale string's
 /// placeholders.
 ///
@@ -372,5 +386,26 @@ mod tests {
             missing.is_empty(),
             "codes with no en.json entry: {missing:#?}"
         );
+    }
+
+    #[test]
+    fn a_code_is_recognised_only_at_a_marker_boundary() {
+        // Routing used to match the English sentence, so coding a message
+        // silently turned a 404 into a 500. Keys are matched instead.
+        let plain = code("automation.noSuchProject");
+        assert!(has_code(&plain, "automation.noSuchProject"));
+
+        let wrapped = format!(
+            "run failed: {}",
+            code_with("automation.bundleTooNew", &[("format", "2")])
+        );
+        assert!(has_code(&wrapped, "automation.bundleTooNew"));
+
+        // A prefix of a longer key must not count as a match.
+        assert!(!has_code(
+            &code("automation.noSuchProjectFile"),
+            "automation.noSuchProject"
+        ));
+        assert!(!has_code("no such project", "automation.noSuchProject"));
     }
 }
