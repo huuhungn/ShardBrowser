@@ -4,6 +4,7 @@ import { confirmModal } from "../../../shared/lib/confirm";
 import { bookmarkDelete, bookmarkList, bookmarkSave } from "../model/api";
 import type { Bookmark } from "../model/types";
 import { t } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export const emptyBookmark = (folder = ""): Bookmark => ({
   id: "",
@@ -44,12 +45,12 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
       set({ items: await bookmarkList(), status: "ready" });
     } catch (e) {
       set({ status: "error" });
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
   reload: async () => {
     try { set({ items: await bookmarkList() }); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   },
   setEditing: (editing) => set({ editing }),
   setSearch: (search) => set({ search }),
@@ -61,7 +62,7 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
       set({ editing: null });
       await get().reload();
       toast.ok(b.id ? t("bookmarks.bookmarkSaved") : t("bookmarks.bookmarkAdded"));
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   remove: async (b) => {
@@ -74,6 +75,6 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
     try {
       await bookmarkDelete(b.id);
       await get().reload();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 }));

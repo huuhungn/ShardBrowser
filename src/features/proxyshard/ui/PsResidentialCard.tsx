@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, ProgressBar, SegmentControl } from "@proxyshard/shardx-ui-kit";
 import { AddIcon } from "../../../shared/icons";
 import { toast } from "../../../shared/model/toast";
-import { fmtGB } from "../../../shared/lib/utils";
+import { fmtGB, safeUiError } from "../../../shared/lib/utils";
 import type { PsOrder, ResiType } from "../../../entities/proxyshard";
 import { psProfileTraffic, psOrders, psRenew } from "../../../entities/proxyshard";
 import { PsTopupModal } from "./PsTopupModal";
@@ -61,7 +61,7 @@ export function PsResidentialCard() {
       await psRenew(order.order_id);
       toast.ok(t("ps.renewedOrder", { id: order.order_id }));
       loadOrders();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setRenewing(false); }
   };
   const pct = data && data.data > 0 ? Math.min(100, Math.round((data.data_spent / data.data) * 100)) : 0;

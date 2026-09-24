@@ -25,7 +25,7 @@ export function ProxyInfoPopover({
   useEffect(() => {
     proxyHistory(proxy.id)
       .then((h) => setHistory([...h].reverse()))
-      .catch((e) => toast.err(String(e)));
+      .catch((e) => toast.err(safeUiError(e)));
   }, [proxy.id]);
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {

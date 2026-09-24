@@ -11,6 +11,7 @@ import {
   type DataRootInfo, type MigrationProgress,
 } from "../../../entities/settings";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 // Keys, not translated text: this table is built once when the module loads,
 // so holding finished strings would pin the card to whichever language
@@ -61,7 +62,7 @@ export function DataRootCard() {
       const n = await dataRootMigrate(dir);
       toast.ok(t(n === 1 ? "dataRoot.movedOne" : "dataRoot.movedMany", { n }));
     } catch (e) {
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     } finally {
       setProgress(null);
       refresh();

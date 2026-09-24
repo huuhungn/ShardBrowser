@@ -5,7 +5,7 @@ import { NumField } from "../../../shared/ui/NumField";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { ChevronDownIcon, InfoIcon } from "../../../shared/icons";
 import { toast } from "../../../shared/model/toast";
-import { randSid } from "../../../shared/lib/utils";
+import { randSid, safeUiError } from "../../../shared/lib/utils";
 import type { ResiType, PsLoc } from "../../../entities/proxyshard";
 import { PS_PLAN, PS_PROXY_TYPE, PS_RELAYS, PS_PORT, psProfileTraffic, psCountries, psRegions, psCities } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
@@ -78,7 +78,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
       .catch((e) => setPwErr(String(e)));
     psCountries(pt)
       .then((r) => setCountries(r.results ?? []))
-      .catch((e) => toast.err(String(e)));
+      .catch((e) => toast.err(safeUiError(e)));
   }, [pt]);
 
   // Region depends on country; city depends on region.
@@ -127,7 +127,7 @@ export function PsResiGenerator({ type, onClose }: { type: ResiType; onClose: ()
       const added = await proxyBulkSave(entries);
       toast.ok(added > 0 ? t(added === 1 ? "ps.addedProxyOne" : "ps.addedProxyMany", { n: added }) : t("ps.noNewProxiesDuplicates"));
      // onClose();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setSaving(false); }
   };
 

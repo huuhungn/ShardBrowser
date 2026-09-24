@@ -8,6 +8,7 @@ import type { PsOrder, PsActiveProxy } from "../../../entities/proxyshard";
 import { psSignatures, psActive, psOrder, psSignatureSet } from "../../../entities/proxyshard";
 import { proxyBulkSave } from "../../../entities/proxy";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 /// Active-proxy picker: fetch an order's proxies, choose SOCKS5/HTTP and which
 /// IPs to import into the local proxy list (via proxy_bulk_save, which dedups).
@@ -93,7 +94,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         } catch (e) { toast.err(t("ps.signatureError", { error: String(e) })); }
       }
       onClose();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setSaving(false); }
   };
 

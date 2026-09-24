@@ -6,6 +6,7 @@ import { storeBus } from "../../../shared/lib/storeBus";
 import { extensionDelete, extensionImport, extensionImportUrl, extensionList } from "../model/api";
 import type { ExtensionEntry } from "../model/types";
 import { t } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export type ExtensionStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -39,14 +40,14 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       set({ items: await extensionList(), status: "ready" });
     } catch (e) {
       set({ status: "error" });
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
   reload: async () => {
     try {
       set({ items: await extensionList() });
       storeBus.emit("extensions");
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
   setSearch: (search) => set({ search }),
   setLinkOpen: (linkOpen) => set({ linkOpen }),
@@ -111,6 +112,6 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       await extensionDelete(e.id);
       await get().reload();
       toast.ok(t("extensions.extensionRemoved"));
-    } catch (err) { toast.err(String(err)); }
+    } catch (err) { toast.err(safeUiError(err)); }
   },
 }));

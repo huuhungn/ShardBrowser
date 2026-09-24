@@ -6,6 +6,7 @@ import { toast } from "../../../shared/model/toast";
 import type { PsOrder } from "../../../entities/proxyshard";
 import { psSetTag } from "../../../entities/proxyshard";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose: () => void; onDone: () => void }) {
   const t = useT();
@@ -17,7 +18,7 @@ export function PsTagModal({ order, onClose, onDone }: { order: PsOrder; onClose
       await psSetTag(order.order_id, tag.trim() || "none");
       toast.ok(t("ps.tagUpdatedFor", { id: order.order_id }));
       onDone();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setBusy(false); }
   };
   return (
