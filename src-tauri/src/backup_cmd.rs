@@ -58,7 +58,7 @@ pub async fn profile_backup_create(
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if !udd.exists() {
-        return Err("this profile has no data to back up yet".into());
+        return Err(crate::errcode::code("profile.backupNoDataYet"));
     }
     let dest = PathBuf::from(&dest_path);
 
@@ -68,7 +68,9 @@ pub async fn profile_backup_create(
         shardx_core::backup_file::create(&profile_id, &udd, &dest, &passphrase)
     })
     .await
-    .map_err(|e| format!("backup task failed: {e}"))?
+    .map_err(|e| {
+        crate::errcode::code_with("profile.backupTaskFailed", &[("error", &e.to_string())])
+    })?
     .map_err(|e| format!("{e:#}"))?;
 
     Ok(BackupResult {
@@ -95,17 +97,23 @@ pub async fn profile_backup_restore(
 
     // Restoring into a profile the app does not know about would leave data on
     // disk with no entry in the list, so require the profile to exist first.
-    profile::load_raw(&profile_id).map_err(|_| "no such profile".to_string())?;
+    profile::load_raw(&profile_id)
+        .map_err(|_| crate::errcode::code("profile.backupNoSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     let src = PathBuf::from(&src_path);
     if !src.exists() {
-        return Err("backup file not found".into());
+        return Err(crate::errcode::code("profile.backupFileNotFound"));
     }
 
     tokio::task::spawn_blocking(move || shardx_core::backup_file::restore(&src, &udd, &passphrase))
         .await
-        .map_err(|e| format!("restore task failed: {e}"))?
+        .map_err(|e| {
+            crate::errcode::code_with(
+                "profile.backupRestoreTaskFailed",
+                &[("error", &e.to_string())],
+            )
+        })?
         .map_err(|e| format!("{e:#}"))
 }
 
@@ -118,7 +126,12 @@ pub async fn profile_backup_inspect(src_path: String) -> Result<BackupFileSummar
     let src = PathBuf::from(&src_path);
     let info = tokio::task::spawn_blocking(move || shardx_core::backup_file::inspect(&src))
         .await
-        .map_err(|e| format!("inspect task failed: {e}"))?
+        .map_err(|e| {
+            crate::errcode::code_with(
+                "profile.backupInspectTaskFailed",
+                &[("error", &e.to_string())],
+            )
+        })?
         .map_err(|e| format!("{e:#}"))?;
     Ok(BackupFileSummary {
         path: src_path,
