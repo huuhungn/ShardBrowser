@@ -208,7 +208,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             if !first_line.starts_with("HTTP/1.1 200") && !first_line.starts_with("HTTP/1.0 200") {
                 anyhow::bail!(
                     "{}",
-                    errcode::code_with("proxy.connectFailed", &[("first_line", &first_line)])
+                    errcode::code_with("proxy.connectFailed", &[("first_line", first_line)])
                 );
             }
         }

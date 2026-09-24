@@ -1137,7 +1137,7 @@ async fn wait_for_selector(profile_id: &str, selector: &str) -> Result<()> {
                     "runner.waitNoMatch",
                     &[
                         ("seconds", &STEP_TIMEOUT.as_secs().to_string()),
-                        ("selector", &selector)
+                        ("selector", selector),
                     ]
                 )
             ));
