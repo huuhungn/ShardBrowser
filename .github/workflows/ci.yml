@@ -202,6 +202,23 @@ jobs:
           npm run test:rust-strings
           npm run test:backend-locale
 
+      # The three tests above read files. This one renders a real toast from a
+      # real backend error code in a real build, which is the only way to catch
+      # a code that reaches the operator untranslated. It rebuilds production
+      # itself, because test:e2e above leaves dist/ built with the E2E mock.
+      - name: Backend error toasts render in Vietnamese
+        id: vi_toasts
+        run: npm run vi:toasts
+
+      - name: Upload toast screenshots on failure
+        if: failure() && steps.vi_toasts.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: vi-toasts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: vi-toast-shots/
+          if-no-files-found: ignore
+          retention-days: 7
+
       # The release workflow gates on these, but only inside the release job.
       # Running them here keeps zip-extraction regressions from reaching a tag.
       - name: Node SDK tests

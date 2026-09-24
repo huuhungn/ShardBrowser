@@ -13,12 +13,56 @@
 // the Settings button whose catch is `toast.err(String(e))`, the very pattern
 // that looked like a credential leak. What renders is what a user would see.
 import { chromium } from "@playwright/test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 
-const BASE = process.env.VI_BASE ?? "http://127.0.0.1:4199";
 const OUT = process.env.VI_OUT ?? join(process.cwd(), "vi-toast-shots");
 mkdirSync(OUT, { recursive: true });
+
+// Serving whatever is in dist/ is unsafe: `npm run test:e2e` leaves it built
+// with --mode e2e, whose mock bridge answers every invoke with "Unhandled E2E
+// command" — the toast then shows that instead of the translated error, and an
+// earlier version of this script called that a pass. Build production here and
+// refuse to run if the mock is present.
+const run = (cmd, args, opts = {}) =>
+  new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: "inherit", shell: process.platform === "win32", ...opts });
+    p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`))));
+  });
+
+let server;
+const BASE = process.env.VI_BASE;
+if (!BASE) {
+  console.log("building production bundle…");
+  await run("npm", ["run", "build"]);
+  const mocked = readdirSync("dist/assets").filter(
+    (f) => f.endsWith(".js") && readFileSync(join("dist/assets", f), "utf8").includes("Unhandled E2E command"),
+  );
+  if (mocked.length) {
+    console.error(`dist/ still carries the E2E mock (${mocked[0]}); refusing to test against it.`);
+    process.exit(1);
+  }
+  // Run vite.js with this Node directly: `npx` behind a shell makes server.pid
+  // the shell's, so killing it leaves the real preview holding the port and CI
+  // waits forever on an open handle.
+  server = spawn(process.execPath, [join("node_modules", "vite", "bin", "vite.js"), "preview", "--port", "4199", "--strictPort"], {
+    stdio: "ignore",
+  });
+  for (let i = 0; i < 40; i++) {
+    try {
+      await fetch("http://127.0.0.1:4199/");
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+const stopServer = () => {
+  server?.kill();
+};
+
+const TARGET = BASE ?? "http://127.0.0.1:4199";
 
 // Exactly what src-tauri returns today. The proxy URL case proves translation
 // runs before redaction rather than instead of it; the unknown code proves the
@@ -29,6 +73,19 @@ const CASES = [
   ["updater.waitForDownload", "[[shardx:updater.waitForDownload]]", "vi"],
   ["bookmarks.needsUrl+proxy", "[[shardx:bookmarks.needsUrl]] http://alice:S3cret@10.0.0.9:8080", "vi"],
   ["unknown code", "[[shardx:no.such.code]]", "vi"],
+  // A real fleet_client chain: anyhow joins the outer context to the inner
+  // cause, so the marker arrives mid-sentence and must still translate.
+  [
+    "fleet chain mid-sentence",
+    "[[shardx:fleet.unreachableUploadChunk]]: connection refused",
+    "vi",
+  ],
+  // A coded refusal carrying the server's own status and words.
+  [
+    "fleet refusal with args",
+    "[[shardx:fleet.refusedClaim|status=409|detail=held by another device]]",
+    "vi",
+  ],
   // Rust text with no code cannot be translated; it must still reach the user.
   ["plain English error", "profile is locked by another device", "as-is"],
 ];
@@ -53,7 +110,7 @@ await page.addInitScript(() => {
   };
 });
 
-await page.goto(BASE, { waitUntil: "domcontentloaded" });
+await page.goto(TARGET, { waitUntil: "domcontentloaded" });
 
 // The release-star modal covers the screen on first run.
 const star = page.locator('[role="dialog"], .modal').first();
@@ -80,6 +137,7 @@ if (lang !== "vi") {
   console.error(`language did not switch (shardx.lang=${lang}); aborting`);
   await page.screenshot({ path: join(OUT, "switch-failed.png") });
   await browser.close();
+  stopServer();
   process.exit(1);
 }
 
@@ -89,6 +147,7 @@ if (!(await trigger.count())) {
   console.error("could not find the API-token button that raises a toast");
   await page.screenshot({ path: join(OUT, "no-trigger.png") });
   await browser.close();
+  stopServer();
   process.exit(1);
 }
 
@@ -111,12 +170,16 @@ for (const [label, payload, expect] of CASES) {
   // this the script passed while the app served untranslated English.
   const notVi = expect === "vi" && !/[ăâđêôơưàáảãạèéẻẽẹìíỉĩịòóỏõọùúủũụỳýỷỹỵ]/i.test(out);
   const bridgeFail = /Unhandled E2E command|__TAURI|is not a function/i.test(out);
-  if (leaked || rawKey || noToast || notVi || bridgeFail) failures++;
+  // anyhow joins a context to its cause with ": ", so a locale string that ends
+  // in a period renders as ".: connection refused". Catch the seam, not the eye.
+  const doublePunct = /[.!?:]\s*[:;]/.test(out);
+  if (leaked || rawKey || noToast || notVi || bridgeFail || doublePunct) failures++;
 
   console.log(
     `${label.padEnd(26)} -> ${JSON.stringify(out)}` +
       `${leaked ? "  LEAKED" : ""}${rawKey ? "  RAW-KEY" : ""}${noToast ? "  MISSING" : ""}` +
-      `${notVi ? "  NOT-VIETNAMESE" : ""}${bridgeFail ? "  BRIDGE-BROKEN" : ""}`,
+      `${notVi ? "  NOT-VIETNAMESE" : ""}${bridgeFail ? "  BRIDGE-BROKEN" : ""}` +
+      `${doublePunct ? "  DOUBLE-PUNCTUATION" : ""}`,
   );
   const shot = join(OUT, `${label.replace(/[^a-z0-9]+/gi, "-")}.png`);
   // Photograph the error toast itself. A full-page shot also catches the
@@ -138,4 +201,5 @@ console.log(
     : "\nevery backend code rendered as Vietnamese prose, credentials redacted",
 );
 await browser.close();
+stopServer();
 process.exit(failures ? 1 : 0);
