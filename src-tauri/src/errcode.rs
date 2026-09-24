@@ -27,16 +27,39 @@ pub fn code(key: &str) -> String {
 }
 
 /// Marker carrying `name=value` arguments for the locale string's
-/// placeholders. Values may not contain `|` or `]`, which delimit the marker;
-/// callers pass short identifiers (a switch name, a path), never prose.
+/// placeholders.
+///
+/// `|` and `]` delimit the marker, so a value containing either has to be
+/// escaped. Deleting the characters instead, as this once did, silently
+/// corrupts exactly the values worth printing: a CSS selector like
+/// `a[href='/x?a=1|2']` reaches the operator as `a[href='/x?a=12'`, which
+/// points at an element that does not exist. Percent-escaping keeps the value
+/// intact and round-trips through both readers.
 pub fn code_with(key: &str, args: &[(&str, &str)]) -> String {
     let mut out = format!("[[shardx:{key}");
     for (k, v) in args {
-        let safe = v.replace(['|', ']'], "");
-        out.push_str(&format!("|{k}={safe}"));
+        out.push_str(&format!("|{k}={}", escape_value(v)));
     }
     out.push_str("]]");
     out
+}
+
+/// Percent-escape the two delimiters, and `%` itself so the escape is
+/// reversible.
+fn escape_value(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('|', "%7C")
+        .replace(']', "%5D")
+}
+
+/// Undo `escape_value`. `%25` is decoded last so that a literal `%7C` written
+/// by a caller (escaped to `%257C`) does not come back as a delimiter.
+pub fn unescape_value(value: &str) -> String {
+    value
+        .replace("%7C", "|")
+        .replace("%5D", "]")
+        .replace("%25", "%")
 }
 
 /// The interface's English dictionary, compiled in.
@@ -105,7 +128,10 @@ pub fn resolve_to_english(text: &str) -> String {
         let body = &after[..end];
         let mut parts = body.split('|');
         let key = parts.next().unwrap_or_default();
-        let args: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
+        let args: Vec<(&str, String)> = parts
+            .filter_map(|p| p.split_once('='))
+            .map(|(name, value)| (name, unescape_value(value)))
+            .collect();
         match dict.get(key) {
             Some(template) => {
                 let mut sentence = template.clone();
@@ -120,7 +146,7 @@ pub fn resolve_to_english(text: &str) -> String {
                 let fallback = args
                     .iter()
                     .find(|(n, _)| *n == "en")
-                    .map(|(_, v)| *v)
+                    .map(|(_, v)| v.as_str())
                     .unwrap_or(key);
                 out.push_str(fallback);
             }
@@ -133,6 +159,36 @@ pub fn resolve_to_english(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_value_holding_the_delimiters_survives_the_round_trip() {
+        // A CSS selector is the realistic case: it can contain both a pipe and
+        // a closing bracket, and it is precisely the part of the message the
+        // operator needs in order to find the element that did not match.
+        let selector = "a[href='/x?a=1|2']";
+        let marker = super::code_with("runner.clickNoMatch", &[("selector", selector)]);
+
+        // Escaped on the wire, so the marker still parses as one unit.
+        assert!(!marker[..marker.len() - 2].contains(']'));
+        assert_eq!(marker.matches('|').count(), 1);
+
+        // And restored intact for the reader.
+        let body = marker
+            .trim_start_matches("[[shardx:runner.clickNoMatch|")
+            .trim_end_matches("]]");
+        let (_, value) = body.split_once('=').expect("an argument");
+        assert_eq!(super::unescape_value(value), selector);
+    }
+
+    #[test]
+    fn a_literal_percent_escape_is_not_mistaken_for_a_delimiter() {
+        let value = "already%7Cescaped";
+        let marker = super::code_with("runner.clickNoMatch", &[("selector", value)]);
+        let body = marker
+            .trim_start_matches("[[shardx:runner.clickNoMatch|")
+            .trim_end_matches("]]");
+        let (_, encoded) = body.split_once('=').expect("an argument");
+        assert_eq!(super::unescape_value(encoded), value);
+    }
     use super::*;
 
     #[test]
@@ -152,12 +208,16 @@ mod tests {
     }
 
     /// A value containing the delimiters would truncate the marker and leave
-    /// half of it rendered as literal text in the toast.
+    /// half of it rendered as literal text in the toast. It is escaped rather
+    /// than stripped: dropping the characters kept the marker intact but
+    /// quietly changed the value, which for a selector or a path means
+    /// pointing the operator at something that does not exist.
     #[test]
     fn delimiters_in_a_value_cannot_break_the_marker() {
         let m = code_with("k", &[("p", "a|b]c")]);
-        assert_eq!(m, "[[shardx:k|p=abc]]");
+        assert_eq!(m, "[[shardx:k|p=a%7Cb%5Dc]]");
         assert_eq!(m.matches("]]").count(), 1);
+        assert_eq!(unescape_value("a%7Cb%5Dc"), "a|b]c");
     }
 
     #[test]

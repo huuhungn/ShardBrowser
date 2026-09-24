@@ -927,7 +927,10 @@ async fn run_automation_unsaved(Json(body): Json<RunUnsavedReq>) -> ApiResult {
         .await
         .map_err(|e| {
             let text = e.to_string();
-            let code = if text.contains("is not running") || text.contains("debugging port") {
+            // Ask why rather than reading the message: the text is an error
+            // code now, translated for whoever reads it, so there is no
+            // English left to match on.
+            let code = if crate::runner::run_refusal(&e).is_some() {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -947,7 +950,7 @@ async fn run_automation_project(Path(id): Path<String>, Json(body): Json<RunReq>
             let text = e.to_string();
             let code = if text.contains("no such project") {
                 StatusCode::NOT_FOUND
-            } else if text.contains("is not running") || text.contains("debugging port") {
+            } else if crate::runner::run_refusal(&e).is_some() {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR

@@ -7,6 +7,7 @@ import { toast } from "../../../shared/model/toast";
 import type { ProxyEntry, BulkRowState } from "../../../entities/proxy";
 import { proxyBulkParse, proxyBulkSave, proxyFullTest } from "../../../entities/proxy";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
   const t = useT();
@@ -205,7 +206,7 @@ host:8080               # no auth
                       </>
                     )}
                     {r.status === "fail" && (
-                      <Badge color="error" variant="filled" size="small" title={r.error}>{t("proxy.failed")}</Badge>
+                      <Badge color="error" variant="filled" size="small" title={r.error ? safeUiError(r.error) : undefined}>{t("proxy.failed")}</Badge>
                     )}
                   </div>
                   <Button

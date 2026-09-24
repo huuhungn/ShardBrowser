@@ -119,7 +119,14 @@ export const localiseBackendError = (text: string): string =>
     for (const pair of String(rawArgs).split("|")) {
       if (!pair) continue;
       const eq = pair.indexOf("=");
-      if (eq > 0) vars[pair.slice(0, eq)] = pair.slice(eq + 1);
+      // Mirrors `unescape_value` in errcode.rs: `%25` last, so a literal
+      // "%7C" in the value does not decode into a delimiter.
+      if (eq > 0)
+        vars[pair.slice(0, eq)] = pair
+          .slice(eq + 1)
+          .replace(/%7C/g, "|")
+          .replace(/%5D/g, "]")
+          .replace(/%25/g, "%");
     }
     const translated = t(key, vars);
     // `translate` echoes the key back when it is missing from every

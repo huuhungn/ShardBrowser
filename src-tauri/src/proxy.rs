@@ -1,3 +1,4 @@
+use crate::errcode;
 use crate::{settings, store};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -139,7 +140,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
     let addr = format!("{}:{}", entry.host, entry.port);
     let mut stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
         .await
-        .context("connect timeout")??;
+        .context(errcode::code("proxy.connectTimeout"))??;
 
     match entry.kind {
         ProxyKind::Socks5 => {
@@ -156,7 +157,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 anyhow::bail!("not SOCKS5");
             }
             if resp[1] == 0xFF {
-                anyhow::bail!("no acceptable auth method");
+                anyhow::bail!("{}", errcode::code("proxy.authRefused"));
             }
             if auth_method == 0x02 {
                 // RFC 1929 user/pass sub-negotiation
@@ -194,7 +195,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             let head: String = loop {
                 let n = timeout(Duration::from_secs(8), stream.read(&mut tmp))
                     .await
-                    .context("read timeout")??;
+                    .context(errcode::code("proxy.readTimeout"))??;
                 if n == 0 {
                     break String::from_utf8_lossy(&buf).to_string();
                 }
@@ -205,7 +206,10 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             };
             let first_line = head.lines().next().unwrap_or("");
             if !first_line.starts_with("HTTP/1.1 200") && !first_line.starts_with("HTTP/1.0 200") {
-                anyhow::bail!("CONNECT failed: {first_line}");
+                anyhow::bail!(
+                    "{}",
+                    errcode::code_with("proxy.connectFailed", &[("first_line", &first_line)])
+                );
             }
         }
     }
@@ -358,7 +362,7 @@ async fn resolve_stun_ipv4() -> Result<(std::net::Ipv4Addr, u16)> {
             }
         }
     }
-    anyhow::bail!("no STUN server resolved to IPv4")
+    anyhow::bail!("{}", errcode::code("proxy.stunNoIpv4"))
 }
 
 pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
@@ -367,7 +371,7 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     use tokio::time::{timeout, Duration, Instant};
 
     if !matches!(entry.kind, ProxyKind::Socks5) {
-        anyhow::bail!("UDP probe only supported for SOCKS5");
+        anyhow::bail!("{}", errcode::code("proxy.udpOnlySocks5"));
     }
     let started = Instant::now();
     let mut tcp = timeout(
@@ -375,7 +379,7 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
         TcpStream::connect(format!("{}:{}", entry.host, entry.port)),
     )
     .await
-    .context("connect timeout")??;
+    .context(errcode::code("proxy.connectTimeout"))??;
 
     let auth_method: u8 = if entry.username.is_empty() {
         0x00
@@ -386,7 +390,7 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     let mut greet = [0u8; 2];
     tcp.read_exact(&mut greet).await?;
     if greet[1] == 0xFF {
-        anyhow::bail!("no acceptable auth method");
+        anyhow::bail!("{}", errcode::code("proxy.authRefused"));
     }
     if auth_method == 0x02 {
         let mut buf = vec![0x01u8];
@@ -407,7 +411,10 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     let mut hdr = [0u8; 4];
     tcp.read_exact(&mut hdr).await?;
     if hdr[1] != 0x00 {
-        anyhow::bail!("UDP_ASSOCIATE refused (rep={:#x})", hdr[1]);
+        anyhow::bail!(
+            "{}",
+            errcode::code_with("proxy.udpRefused", &[("rep", &format!("{:#x}", hdr[1]))])
+        );
     }
     let bind_addr: SocketAddr = match hdr[3] {
         0x01 => {
@@ -436,13 +443,13 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
                 u16::from_be_bytes(p),
             )
         }
-        _ => anyhow::bail!("unsupported ATYP in UDP reply"),
+        _ => anyhow::bail!("{}", errcode::code("proxy.udpReplyBadAtyp")),
     };
 
     // Probe with STUN binding request (DNS-port-53 often blocked, STUN passes).
     let (stun_ip, stun_port) = resolve_stun_ipv4()
         .await
-        .context("could not resolve a STUN server to probe UDP with")?;
+        .context(errcode::code("proxy.stunUnresolved"))?;
 
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(bind_addr).await?;
@@ -460,9 +467,9 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     let mut buf = vec![0u8; 1500];
     let n = timeout(Duration::from_secs(6), udp.recv(&mut buf))
         .await
-        .context("UDP reply timeout — proxy doesn't relay UDP")??;
+        .context(errcode::code("proxy.udpTimeout"))??;
     if n < 20 {
-        anyhow::bail!("UDP reply too short");
+        anyhow::bail!("{}", errcode::code("proxy.udpReplyTooShort"));
     }
     // RFC 1928: dropping TCP control tears down the relay; keep it alive.
     drop(tcp);
@@ -528,7 +535,7 @@ pub async fn geo_check_via(
                 url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
             format!("{scheme}://{user}:{pass}@{}:{}", entry.host, entry.port)
         };
-        let proxy = reqwest::Proxy::all(&proxy_url).context("bad proxy URL")?;
+        let proxy = reqwest::Proxy::all(&proxy_url).context(errcode::code("proxy.badUrl"))?;
         builder = builder.proxy(proxy);
     } else {
         // Direct check: bypass any system proxy.
