@@ -240,10 +240,18 @@ fn strict_profile_records_in(dir: &std::path::Path) -> Result<Vec<(PathBuf, Stor
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let body = fs::read_to_string(&path)
-            .with_context(|| format!("read profile record {}", path.display()))?;
-        let stored: StoredProfile = serde_json::from_str(&body)
-            .with_context(|| format!("parse profile record {}", path.display()))?;
+        let body = fs::read_to_string(&path).with_context(|| {
+            crate::errcode::code_with(
+                "profile.readRecord",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
+        let stored: StoredProfile = serde_json::from_str(&body).with_context(|| {
+            crate::errcode::code_with(
+                "profile.parseRecord",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
         records.push((path, stored));
     }
     Ok(records)
@@ -452,7 +460,7 @@ fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard
 
 fn path_for(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
-        anyhow::bail!("invalid profile id");
+        anyhow::bail!(crate::errcode::code("profile.invalidId"));
     }
     Ok(store::profiles_dir()?.join(format!("{id}.json")))
 }
@@ -577,13 +585,21 @@ pub fn load_raw(id: &str) -> Result<StoredProfile> {
 }
 
 fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .with_context(|| format!("profile path has no parent: {}", path.display()))?;
+    let parent = path.parent().with_context(|| {
+        crate::errcode::code_with(
+            "profile.pathNoParent",
+            &[("path", &path.display().to_string())],
+        )
+    })?;
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .with_context(|| format!("profile path has no UTF-8 filename: {}", path.display()))?;
+        .with_context(|| {
+            crate::errcode::code_with(
+                "profile.pathNotUtf8",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
     let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut file = fs::OpenOptions::new()
@@ -591,12 +607,24 @@ fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
             .write(true)
             .open(&temporary)
             .with_context(|| format!("create temporary profile record {}", temporary.display()))?;
-        file.write_all(body)
-            .with_context(|| format!("write temporary profile record {}", temporary.display()))?;
-        file.sync_all()
-            .with_context(|| format!("flush temporary profile record {}", temporary.display()))?;
-        replace_file(&temporary, path)
-            .with_context(|| format!("replace profile record {}", path.display()))?;
+        file.write_all(body).with_context(|| {
+            crate::errcode::code_with(
+                "profile.writeTemp",
+                &[("path", &temporary.display().to_string())],
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            crate::errcode::code_with(
+                "profile.flushTemp",
+                &[("path", &temporary.display().to_string())],
+            )
+        })?;
+        replace_file(&temporary, path).with_context(|| {
+            crate::errcode::code_with(
+                "profile.replaceRecord",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
         Ok(())
     })();
     if result.is_err() {
@@ -884,8 +912,12 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
     for (path, mut stored) in strict_profile_records()? {
         if stored.meta.folder == old {
             stored.meta.folder = new.to_string();
-            let body = serde_json::to_vec_pretty(&stored)
-                .with_context(|| format!("serialize profile record {}", path.display()))?;
+            let body = serde_json::to_vec_pretty(&stored).with_context(|| {
+                crate::errcode::code_with(
+                    "profile.serializeRecord",
+                    &[("path", &path.display().to_string())],
+                )
+            })?;
             writes.push((path, body));
         }
     }
@@ -908,8 +940,12 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
                 targets.push((path, stored.meta.id, None));
             } else {
                 stored.meta.folder = String::new();
-                let body = serde_json::to_vec_pretty(&stored)
-                    .with_context(|| format!("serialize profile record {}", path.display()))?;
+                let body = serde_json::to_vec_pretty(&stored).with_context(|| {
+                    crate::errcode::code_with(
+                        "profile.serializeRecord",
+                        &[("path", &path.display().to_string())],
+                    )
+                })?;
                 targets.push((path, stored.meta.id, Some(body)));
             }
         }
@@ -936,7 +972,7 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
 /// Per-profile user-data-dir; created on first call.
 pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
-        anyhow::bail!("invalid profile id");
+        anyhow::bail!(crate::errcode::code("profile.invalidId"));
     }
     let p = store::user_data_root()?.join(id);
     std::fs::create_dir_all(&p)?;
@@ -1133,7 +1169,13 @@ mod tests {
 
         let error = strict_profile_records_in(&dir)
             .expect_err("malformed records must fail the inventory closed");
-        assert!(error.to_string().contains("parse profile record"));
+        // The message is an error code now, so the interface can translate
+        // it. Both halves still matter: the right failure, naming the file
+        // that caused it.
+        assert!(
+            error.to_string().contains("profile.parseRecord"),
+            "wrong failure: {error}"
+        );
         assert!(error.to_string().contains("malformed.json"));
 
         fs::remove_dir_all(dir).unwrap();
