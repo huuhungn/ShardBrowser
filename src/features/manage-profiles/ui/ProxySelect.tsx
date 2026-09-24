@@ -7,6 +7,7 @@ import { proxyBulkParse, proxySave, type ProxyEntry } from "../../../entities/pr
 import { useProfile } from "../../../entities/profile";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 const label = (p: ProxyEntry) =>
   p.name && p.name !== `${p.host}:${p.port}`
@@ -281,7 +282,7 @@ function CreatePanel({ onCancel, onCreated }: {
       // hold the new proxy before it is selected.
       await reloadProfiles();
       onCreated(saved);
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setBusy(false); }
   };
 

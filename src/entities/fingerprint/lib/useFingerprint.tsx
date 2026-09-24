@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "../../../shared/lib/toast";
 import { confirmModal } from "../../../shared/lib/confirm";
-import { readTextFile } from "../../../shared/lib/utils";
+import { readTextFile, safeUiError } from "../../../shared/lib/utils";
 import { profileCreateFromTemplate } from "../../profile/model/api";
 import { FingerprintEntry } from "../model/types";
 import { fingerprintList, fingerprintDelete, fingerprintImport, fingerprintDir } from "../model/api";
@@ -39,13 +39,13 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
             set({ items: await fingerprintList(), status: "ready" });
         } catch (e) {
             set({ status: "error", error: (e as Error).message });
-            toast.err(String(e));
+            toast.err(safeUiError(e));
         }
     },
     reload: async () => {
         try {
             set({ items: await fingerprintList() });
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     setImporterOpen: (importerOpen) => set({ importerOpen }),
 
@@ -54,7 +54,7 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
         try {
             const meta = await profileCreateFromTemplate(id);
             toast.ok(t("fp.createdOpenBrowsers", { name: meta.name }));
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     remove: async (id) => {
         if ((await confirmModal({ title: t("fp.removeFingerprint"), message: t("fp.removeAsk"), danger: true })) !== true) return;
@@ -62,7 +62,7 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
             await fingerprintDelete(id);
             toast.ok(t("fp.removed"));
             get().reload();
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     importJsonFile: async () => {
         const path = await open({
@@ -77,12 +77,12 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
             const e = await fingerprintImport(txt, null);
             toast.ok(t("fp.importedNamed", { label: e.label }));
             get().reload();
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     openLibraryFolder: async () => {
         try {
             // Reveal folder via tauri-plugin-opener.
             await openPath(await fingerprintDir());
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
 }));

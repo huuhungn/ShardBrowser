@@ -9,6 +9,7 @@ import type { ProxyEntry } from "../../../entities/proxy";
 import { proxySave } from "../../../entities/proxy";
 import { psActive, psSignatureSet } from "../../../entities/proxyshard";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function ProxyEditor({ initial, onClose, onSaved }: {
   initial: ProxyEntry;
@@ -52,7 +53,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
       toast.ok(initial.id ? t("proxy.proxySaved") : t("proxy.proxyAdded"));
       onSaved?.(saved);
       onClose();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
   return (
     <DialogModal

@@ -191,7 +191,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       storeBus.on("profiles", () => { void get().reload(); });
     } catch (e) {
       set({ status: "error", error: (e as Error).message });
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
 
@@ -199,7 +199,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     try {
       const [profiles, proxies] = await Promise.all([profileList(), proxyList()]);
       set({ profiles, proxies });
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   // 2s poll for real child status; not optimistic UI state. Uptime is anchored
@@ -400,7 +400,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           get().reload();
         }
       }
-      catch (e) { toast.err(String(e)); }
+      catch (e) { toast.err(safeUiError(e)); }
       return;
     }
     if (get().startBusy.has(p.id)) return;
@@ -434,17 +434,17 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       await profileDelete(id);
       get().reload();
       storeBus.emit("profiles");
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   cloneProfile: async (id) => {
     try { await profileClone(id); get().reload(); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   },
 
   togglePin: async (p) => {
     try { await profileSetPin(p.id, !p.pinned); get().reload(); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   },
 
   // Encrypted single-profile backup to a .shxbak file.
@@ -569,7 +569,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       // Open the containing folder so the user sees exactly where it went.
       const dir = path.replace(/[/\\][^/\\]*$/, "");
       try { await openPath(dir); } catch {}
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   importCookies: async (p) => {
@@ -585,7 +585,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       if (!Array.isArray(cookies)) { toast.err(t("profile.expectedAJSONArrayOfCookies")); return; }
       const n = await cookiesImport(p.id, cookies);
       toast.ok(t(n === 1 ? "profile.importedCookieOne" : "profile.importedCookieMany", { n }));
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   setProfileFolder: async (id, f) => {
@@ -606,7 +606,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       if (f) get().rememberFolder(f);
       get().reload();
       storeBus.emit("profiles");
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   deleteFolder: async (f) => {
@@ -648,7 +648,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           ? t(n === 1 ? "profile.deletedFolderOne" : "profile.deletedFolderMany", { f, n })
           : t(n === 1 ? "profile.removedFolderOne" : "profile.removedFolderMany", { f, n }),
       );
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   createFromTemplate: async (tplId) => {
@@ -660,7 +660,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       // Auto-open the new profile in the editor.
       const stored = await profileGet(meta.id);
       set({ draft: fromStored(stored), expanded: meta.id });
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   syncGroup: null,
@@ -676,7 +676,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       get().clearSelected();
       toast.ok(t("profile.synchronisingProfiles", { n: ids.length }));
     } catch (e) {
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
 
@@ -725,7 +725,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       danger: true,
     })) !== true) return;
     for (const id of ids) {
-      try { await profileDelete(id); } catch (e) { toast.err(String(e)); }
+      try { await profileDelete(id); } catch (e) { toast.err(safeUiError(e)); }
     }
     get().clearSelected();
     get().reload();
@@ -741,7 +741,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const payloads = await Promise.all(ids.map((id) => profileGet(id)));
       await clip.write(JSON.stringify(payloads, null, 2));
       toast.ok(t("common.copiedNToClipboard", { n: payloads.length }));
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   },
 
   // Paste profile JSON from clipboard → fresh profiles.

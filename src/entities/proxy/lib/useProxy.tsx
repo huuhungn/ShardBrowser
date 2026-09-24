@@ -155,7 +155,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         try {
             set({ proxies: await proxyList() });
             set({ profiles: await profileList() });
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     setProxies: (proxies: ProxyEntry[]) => set({ proxies }),
     setSnapshots: (snapshots: Record<string, ProxyTestSnapshot>) => set({ snapshots }),
@@ -208,12 +208,12 @@ export const useProxy = create<ProxyStore>((set, get) => ({
             await proxySave({ ...entry, name: newName });
             get().reload();
             storeBus.emit('proxies');
-        } catch (e) { toast.err(String(e)); }
+        } catch (e) { toast.err(safeUiError(e)); }
     },
     removeProxy: async (id) => {
         if ((await confirmModal({ title: t("proxy.deleteProxy"), message: "Delete this proxy?", danger: true })) !== true) return;
         try { await proxyDelete(id); get().reload(); storeBus.emit('proxies'); toast.ok(t("proxy.proxyDeleted")); }
-        catch (e) { toast.err(String(e)); }
+        catch (e) { toast.err(safeUiError(e)); }
     },
     // Capped-parallel bulk TCP/UDP/geo to avoid socket fan-out.
     bulkTest: async () => {
@@ -241,7 +241,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         if (ids.length === 0) return;
         if ((await confirmModal({ title: t("proxy.deleteProxies"), message: t(ids.length === 1 ? "proxy.deleteAskOne" : "proxy.deleteAskMany", { n: ids.length }), danger: true })) !== true) return;
         for (const id of ids) {
-            try { await proxyDelete(id); } catch (e) { toast.err(String(e)); }
+            try { await proxyDelete(id); } catch (e) { toast.err(safeUiError(e)); }
         }
         get().clearSelected();
         get().reload();
@@ -280,7 +280,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
             try {
                 await profileBindProxy(profileIds[i], picked[i].id);
                 bound++;
-            } catch (e) { toast.err(String(e)); }
+            } catch (e) { toast.err(safeUiError(e)); }
         }
         set({ distributeOpen: false });
         get().reload();

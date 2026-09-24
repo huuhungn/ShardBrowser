@@ -8,6 +8,7 @@ import {
   type TeamStatus,
 } from "../../../entities/team";
 import { t, useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 /** A tenant id is a UUID the operator picks once; typing one by hand is how
  *  two devices end up in different fleets over a mistyped character. */
@@ -61,7 +62,7 @@ export function TeamCard() {
   const run = async (what: string, fn: () => Promise<void>) => {
     setBusy(what);
     try { await fn(); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
     finally { setBusy(null); }
   };
 

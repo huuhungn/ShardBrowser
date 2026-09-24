@@ -3,6 +3,7 @@ import { CopyIcon } from "../icons";
 import { clip } from "../lib/clipboard";
 import { toast } from "../model/toast";
 import { useT } from "../../shared/i18n";
+import { safeUiError } from "../lib/utils";
 
 /// Read-only value with inline copy button — UI-kit Input + icon action.
 export function CopyField({ value, secret }: { value: string; secret?: boolean }) {
@@ -23,7 +24,7 @@ export function CopyField({ value, secret }: { value: string; secret?: boolean }
               await clip.write(value);
               toast.ok(t("ui.copied"));
             } catch (e) {
-              toast.err(String(e));
+              toast.err(safeUiError(e));
             }
           }}
         >

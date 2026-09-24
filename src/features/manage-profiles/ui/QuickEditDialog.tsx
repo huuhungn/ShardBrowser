@@ -5,6 +5,7 @@ import type { ProfileMeta } from "../../../entities/profile";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { profileBindProxy, profileGet, profileSave } from "../../../entities/profile";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function QuickEditDialog({
   kind, profile, proxies, onClose, onSaved,
@@ -24,7 +25,7 @@ export function QuickEditDialog({
       await profileBindProxy(profile.id, proxyId);
       toast.ok(t("profile.proxyUpdated"));
       onSaved();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
 
   const saveNotes = async () => {
@@ -35,7 +36,7 @@ export function QuickEditDialog({
       await profileSave(stored);
       toast.ok(t("profile.notesSaved"));
       onSaved();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
 
   return (

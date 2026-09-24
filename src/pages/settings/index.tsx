@@ -7,13 +7,12 @@ import { Topbar } from "../../shared/ui/Topbar";
 import { CopyField } from "../../shared/ui/CopyField";
 import { toast } from "../../shared/model/toast";
 import { useNav } from "../../shared/model/navigation";
-import { withUtm } from "../../shared/lib/utils";
+import { safeUiError, withUtm } from "../../shared/lib/utils";
 import type { Settings, ApiInfo, StartupStatus, McpStatus, CodexMcpStatus, HermesMcpStatus } from "../../entities/settings";
 import { helperKinds } from "../../entities/settings";
 import { settingsGet, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
   startupStatus, mcpStatus as mcpStatusGet, codexMcpStatus, hermesMcpStatus } from "../../entities/settings";
 import { StartupCard, McpCard } from "../../features/manage-settings";
-import { safeUiError } from "../../shared/lib/utils";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
 import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
 import { Rich } from "../../shared/i18n/Rich";
@@ -80,7 +79,7 @@ export function SettingsPage() {
   }, []);
   const regenToken = async () => {
     try { setApi(await apiRegenerateToken()); toast.ok(t("settings.api.tokenRegenerated")); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   };
 
   const [mcpBusy, setMcpBusy] = useState(false);

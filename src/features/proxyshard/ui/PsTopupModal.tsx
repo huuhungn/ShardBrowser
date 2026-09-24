@@ -6,6 +6,7 @@ import { toast } from "../../../shared/model/toast";
 import type { PsOrder } from "../../../entities/proxyshard";
 import { psAddBandwidth } from "../../../entities/proxyshard";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClose: () => void; onDone: () => void }) {
   const t = useT();
@@ -19,7 +20,7 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
       await psAddBandwidth(order.order_id, amount, promo.trim() || null);
       toast.ok(t("ps.addedGb", { amount, id: order.order_id }));
       onDone();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setBusy(false); }
   };
   return (

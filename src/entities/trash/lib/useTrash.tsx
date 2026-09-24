@@ -5,6 +5,7 @@ import { storeBus } from "../../../shared/lib/storeBus";
 import { trashEmpty, trashList, trashPurge, trashRestore } from "../model/api";
 import type { TrashEntry } from "../model/types";
 import { t } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export type TrashStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -27,11 +28,11 @@ export const useTrash = create<TrashStore>((set, get) => ({
     if (get().status === "loading") return;
     set({ status: "loading" });
     try { set({ items: await trashList(), status: "ready" }); }
-    catch (e) { set({ status: "error" }); toast.err(String(e)); }
+    catch (e) { set({ status: "error" }); toast.err(safeUiError(e)); }
   },
   reload: async () => {
     try { set({ items: await trashList() }); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   },
 
   restore: async (e) => {
@@ -41,7 +42,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
       await get().reload();
       storeBus.emit("profiles");
       toast.ok(t("trash.restoredNamed", { name: meta.name }));
-    } catch (err) { toast.err(String(err)); }
+    } catch (err) { toast.err(safeUiError(err)); }
     finally { set({ busy: null }); }
   },
 
@@ -53,7 +54,7 @@ export const useTrash = create<TrashStore>((set, get) => ({
     });
     if (ok !== true) return;
     try { await trashPurge(e.id); await get().reload(); }
-    catch (err) { toast.err(String(err)); }
+    catch (err) { toast.err(safeUiError(err)); }
   },
 
   empty: async () => {
@@ -69,6 +70,6 @@ export const useTrash = create<TrashStore>((set, get) => ({
       await trashEmpty();
       await get().reload();
       toast.ok(t("trash.deletedCount", { n }));
-    } catch (err) { toast.err(String(err)); }
+    } catch (err) { toast.err(safeUiError(err)); }
   },
 }));

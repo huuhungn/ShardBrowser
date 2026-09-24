@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, Select } from "@proxyshard/shardx-ui-kit";
 import { DownloadIcon, EditIcon, RefreshIcon } from "../../../shared/icons";
 import { toast } from "../../../shared/model/toast";
-import { isDcIsp } from "../../../shared/lib/utils";
+import { isDcIsp, safeUiError } from "../../../shared/lib/utils";
 import type { PsOrder } from "../../../entities/proxyshard";
 import { psOrders, psRenew, usePsAccount } from "../../../entities/proxyshard";
 import { PsImportModal } from "./PsImportModal";
@@ -34,7 +34,7 @@ export function PsOrdersCard() {
       setOrders(r.orders ?? []);
       // `next` is a page URI when more results exist (nullable).
       setHasNext(!!r.next);
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setLoading(false); }
   };
   // Reset to the first page whenever the status filter changes.
@@ -49,7 +49,7 @@ export function PsOrdersCard() {
       toast.ok(t("ps.renewedOrder", { id: o.order_id }));
       load();
       onChanged();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setB(o.order_id, false); }
   };
 

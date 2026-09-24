@@ -9,6 +9,7 @@ import {
 } from "../model/api";
 import type { Block, Project, RunReport } from "../model/types";
 import { t } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 let seq = 0;
 
@@ -81,12 +82,12 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       set({ items: await automationList(), status: "ready" });
     } catch (e) {
       set({ status: "error" });
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
   reload: async () => {
     try { set({ items: await automationList() }); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
   },
   setEditing: (editing) => set({ editing, lastRun: null }),
   patchEditing: (patch) => {
@@ -105,7 +106,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       await get().reload();
       toast.ok(p.id ? t("automation.projectSaved") : t("automation.projectCreated"));
     } catch (e) {
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
 
@@ -125,7 +126,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       await get().reload();
       toast.ok(t("automation.projectDeleted"));
     } catch (e) {
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     }
   },
 
@@ -147,7 +148,7 @@ export const useAutomation = create<AutomationStore>((set, get) => ({
       if (report.ok) toast.ok(t("automation.runFinishedMs", { ms: report.ms }));
       else toast.err(report.stopped_because || t("automation.runFailed"));
     } catch (e) {
-      toast.err(String(e));
+      toast.err(safeUiError(e));
     } finally {
       set({ running: false });
     }

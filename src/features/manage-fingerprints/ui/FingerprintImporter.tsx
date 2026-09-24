@@ -4,6 +4,7 @@ import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import { fingerprintImport } from "../../../entities/fingerprint";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
 
 export function FingerprintImporter({ onClose }: { onClose: () => void }) {
   const t = useT();
@@ -14,7 +15,7 @@ export function FingerprintImporter({ onClose }: { onClose: () => void }) {
       const e = await fingerprintImport(text, name || null);
       toast.ok(t("fp.importedNamed", { label: e.label }));
       onClose();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
   return (
     <DialogModal

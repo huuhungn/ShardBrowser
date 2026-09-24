@@ -6,7 +6,7 @@ import { NumField } from "../../../shared/ui/NumField";
 import { Field } from "../../../shared/ui/Field";
 import { toast } from "../../../shared/model/toast";
 import { confirmModal } from "../../../shared/model/confirm";
-import { fmtCents, isDcIsp, availCode } from "../../../shared/lib/utils";
+import { availCode, fmtCents, isDcIsp, safeUiError } from "../../../shared/lib/utils";
 import type { PsOrder, PsProduct, PsCalc, PsBuyOption } from "../../../entities/proxyshard";
 import { psProducts, psOrders, psAvailableCount, psCalculate, psPurchase, usePsAccount } from "../../../entities/proxyshard";
 import { useT } from "../../../shared/i18n";
@@ -60,7 +60,7 @@ export function PsBuyCard() {
           setCycle(list[0].cycles?.[0] ?? "");
           setCountry(isDcIsp(list[0].name) ? (list[0].locations[0] ?? "") : "");
         }
-      } catch (e) { toast.err(String(e)); }
+      } catch (e) { toast.err(safeUiError(e)); }
       // available-count is best-effort (badge only).
       try {
         const arr = await psAvailableCount();
@@ -124,7 +124,7 @@ export function PsBuyCard() {
     setCalcing(true);
     setCalc(null);
     try { setCalc(await fetchCalc()); }
-    catch (e) { toast.err(String(e)); }
+    catch (e) { toast.err(safeUiError(e)); }
     finally { setCalcing(false); }
   };
 
@@ -161,7 +161,7 @@ export function PsBuyCard() {
       );
       setCalc(null);
       onPurchased();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
     finally { setBuying(false); }
   };
 

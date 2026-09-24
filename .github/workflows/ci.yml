@@ -224,8 +224,9 @@ jobs:
           npm run test:i18n
           npm run test:rust-strings
           npm run test:backend-locale
+          npm run test:raw-error-toast
 
-      # The three tests above read files. This one renders a real toast from a
+      # The four tests above read files. This one renders a real toast from a
       # real backend error code in a real build, which is the only way to catch
       # a code that reaches the operator untranslated. It rebuilds production
       # itself, because test:e2e above leaves dist/ built with the E2E mock.

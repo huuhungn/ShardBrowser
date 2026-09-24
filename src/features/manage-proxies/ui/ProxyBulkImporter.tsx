@@ -22,7 +22,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
       const parsed = await proxyBulkParse(text, kind);
       if (parsed.length === 0) { toast.err(t("proxy.noValidProxyLinesFound")); return; }
       setRows(parsed.map((e) => ({ entry: e, selected: true, status: "idle" })));
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
 
   const testOne = async (idx: number) => {
@@ -72,7 +72,7 @@ export function ProxyBulkImporter({ onClose }: { onClose: () => void }) {
       const n = await proxyBulkSave(entries);
       toast.ok(t(n === 1 ? "proxy.importedOne" : "proxy.importedMany", { n }));
       onClose();
-    } catch (e) { toast.err(String(e)); }
+    } catch (e) { toast.err(safeUiError(e)); }
   };
 
   const allSel = rows.length > 0 && rows.every((r) => r.selected);
