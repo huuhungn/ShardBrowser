@@ -151,17 +151,6 @@ jobs:
           cargo fmt --check --manifest-path server/Cargo.toml
           cargo fmt --check --manifest-path sdks/rust/Cargo.toml
 
-      # Same idea as the formatting step: catch it before the expensive parts
-      # of the job. Slower than fmt because it type-checks, but still far
-      # cheaper than the Tauri build that follows. `--all-targets` so tests and
-      # examples are linted too, not just the library. `sdks/rust` is absent on
-      # purpose: the rust-sdk job already clippies it under both feature sets.
-      - name: Rust lints
-        run: |
-          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path shared/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
-
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
@@ -171,6 +160,17 @@ jobs:
             librsvg2-dev \
             libssl-dev \
             patchelf
+
+      # Runs as soon as the system libraries are here, before npm and the
+      # build: clippy type-checks, so src-tauri needs GTK present, but nothing
+      # it looks at depends on the frontend. `--all-targets` lints tests and
+      # examples too, not just the library. `sdks/rust` is absent on purpose:
+      # the rust-sdk job already clippies it under both feature sets.
+      - name: Rust lints
+        run: |
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path shared/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
 
       - name: Install frontend dependencies
         run: npm ci
