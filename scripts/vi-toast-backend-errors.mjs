@@ -102,6 +102,27 @@ const CASES = [
     "[[shardx:profile.parseRecord|path=C:\\\\Users\\\\a\\\\profiles\\\\x.json]]",
     "vi",
   ],
+  // An automation run refused before it started. This is the reply the HTTP
+  // API turns into a 409, so the same code has to read correctly in the panel.
+  [
+    "runner.profileNotRunning",
+    "[[shardx:runner.profileNotRunning|profile_id=VN Automation 001]]",
+    "vi",
+  ],
+  // Two arguments at once, one of them naming a block kind the operator wrote.
+  [
+    "runner.blockNeedsField",
+    "[[shardx:runner.blockNeedsField|kind=dbQuery|field=sql]]",
+    "vi",
+  ],
+  // A CSS selector containing the pipe that separates arguments. If the
+  // parser splits naively the selector arrives truncated, so the operator is
+  // sent looking at the wrong element.
+  [
+    "runner.clickNoMatch with a pipe in the selector",
+    "[[shardx:runner.clickNoMatch|selector=a[href='/x?a=1%7C2'%5D]]",
+    "vi",
+  ],
 ];
 
 const browser = await chromium.launch();

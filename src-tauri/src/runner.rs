@@ -15,6 +15,7 @@
 
 use crate::automation::{Block, Branch, Project};
 use crate::cdp;
+use crate::errcode;
 use crate::traffic;
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -557,11 +558,16 @@ fn db_params(block: &Block, vars: &Variables) -> Result<Vec<serde_json::Value>> 
                         return Ok(Vec::new());
                     }
                     serde_json::from_str::<Vec<serde_json::Value>>(&expanded)
-                        .context("\"params\" must be a JSON array, e.g. [\"alice\", 1]")?
+                        .context(errcode::code("runner.paramsNotArray"))?
                 }
             }
         }
-        other => return Err(anyhow!("\"params\" must be a JSON array, not {other}")),
+        other => {
+            return Err(anyhow!(
+                "{}",
+                errcode::code_with("runner.paramsWrongType", &[("other", &other.to_string())])
+            ))
+        }
     };
 
     Ok(list
@@ -578,7 +584,12 @@ fn param_text(block: &Block, name: &str, vars: &Variables) -> Result<String> {
         .params
         .get(name)
         .and_then(|v| v.as_str())
-        .with_context(|| format!("the {:?} block needs a {name}", block.kind))?;
+        .with_context(|| {
+            errcode::code_with(
+                "runner.blockNeedsField",
+                &[("kind", &block.kind.to_string()), ("field", name)],
+            )
+        })?;
     Ok(vars.expand(raw))
 }
 
@@ -611,22 +622,29 @@ async fn perform(
             let url = param_text(block, "url", vars)?;
             // Subscribe before navigating, or a fast page can load before we
             // are listening and the step waits out its whole timeout.
-            let watch = cdp::watch(profile_id).context("the profile went away")?;
+            let watch = cdp::watch(profile_id).context(errcode::code("runner.profileGone"))?;
             cdp::page_call(profile_id, "Page.navigate", json!({ "url": url }))
                 .await
                 .with_context(|| format!("navigate to {url}"))?;
             if !watch.until("Page.loadEventFired", STEP_TIMEOUT).await {
-                return Err(anyhow!("{url} did not finish loading in time"));
+                return Err(anyhow!(
+                    "{}",
+                    errcode::code_with("runner.navigateTimeout", &[("url", &url)])
+                ));
             }
             Ok(())
         }
 
         "wait" => {
-            let ms = block
-                .params
-                .get("ms")
-                .and_then(|v| v.as_u64())
-                .context("the \"wait\" block needs an ms")?;
+            let ms =
+                block
+                    .params
+                    .get("ms")
+                    .and_then(|v| v.as_u64())
+                    .context(errcode::code_with(
+                        "runner.blockNeedsField",
+                        &[("kind", "wait"), ("field", "ms")],
+                    ))?;
             tokio::time::sleep(Duration::from_millis(ms)).await;
             Ok(())
         }
@@ -655,7 +673,10 @@ async fn perform(
             if v.as_str() == Some("ok") {
                 Ok(())
             } else {
-                Err(anyhow!("nothing matched {selector} when the click ran"))
+                Err(anyhow!(
+                    "{}",
+                    errcode::code_with("runner.clickNoMatch", &[("selector", &selector)])
+                ))
             }
         }
 
@@ -686,7 +707,8 @@ async fn perform(
                 Ok(())
             } else {
                 Err(anyhow!(
-                    "nothing matched {selector} when the text was typed"
+                    "{}",
+                    errcode::code_with("runner.typeNoMatch", &[("selector", &selector)])
                 ))
             }
         }
@@ -696,7 +718,10 @@ async fn perform(
                 .params
                 .get("name")
                 .and_then(|v| v.as_str())
-                .context("the \"setVariable\" block needs a name")?
+                .context(errcode::code_with(
+                    "runner.blockNeedsField",
+                    &[("kind", "setVariable"), ("field", "name")],
+                ))?
                 .to_string();
             // Copying carries the origin with it. Without this, one
             // `setVariable` launders a page's text into an operator-owned
@@ -721,7 +746,10 @@ async fn perform(
                 .params
                 .get("into")
                 .and_then(|v| v.as_str())
-                .context("the \"readText\" block needs an into")?
+                .context(errcode::code_with(
+                    "runner.blockNeedsField",
+                    &[("kind", "readText"), ("field", "into")],
+                ))?
                 .to_string();
             wait_for_selector(profile_id, &selector).await?;
             let v = evaluate(profile_id, &read_text_expr(&selector)).await?;
@@ -730,7 +758,10 @@ async fn perform(
                     vars.set_from_outside(&into, text.trim());
                     Ok(())
                 }
-                None => Err(anyhow!("nothing matched {selector} to read")),
+                None => Err(anyhow!(
+                    "{}",
+                    errcode::code_with("runner.readNoMatch", &[("selector", &selector)])
+                )),
             }
         }
 
@@ -772,7 +803,7 @@ async fn perform(
             let recorder = state
                 .traffic
                 .take()
-                .context("nothing is being recorded — add a \"recordTraffic\" block first")?;
+                .context(errcode::code("runner.notRecording"))?;
             let dropped = recorder.dropped();
             let entries = recorder.stop().await;
             if let Some(name) = block.params.get("into").and_then(|v| v.as_str()) {
@@ -792,7 +823,7 @@ async fn perform(
             let recorder = state
                 .traffic
                 .as_ref()
-                .context("nothing is being recorded — add a \"recordTraffic\" block first")?;
+                .context(errcode::code("runner.notRecording"))?;
             let url_part = param_text(block, "urlContains", vars)?;
             let entries = recorder.entries();
             let matched: Vec<_> = entries
@@ -904,11 +935,15 @@ async fn perform(
         "readFile" => {
             let path = param_text(block, "path", vars)?;
             let contents = crate::files::read(&path)?;
-            let name = block
-                .params
-                .get("into")
-                .and_then(|v| v.as_str())
-                .context("the \"readFile\" block needs an into")?;
+            let name =
+                block
+                    .params
+                    .get("into")
+                    .and_then(|v| v.as_str())
+                    .context(errcode::code_with(
+                        "runner.blockNeedsField",
+                        &[("kind", "readFile"), ("field", "into")],
+                    ))?;
             vars.set_from_outside(name, contents);
             Ok(())
         }
@@ -938,7 +973,10 @@ async fn perform(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if required && !found {
-                return Err(anyhow!("{path} is not in the automation workspace"));
+                return Err(anyhow!(
+                    "{}",
+                    errcode::code_with("runner.pathOutsideWorkspace", &[("path", &path)])
+                ));
             }
             Ok(())
         }
@@ -950,11 +988,15 @@ async fn perform(
 
         "dbExecute" => {
             let database = param_text(block, "database", vars)?;
-            let raw_sql = block
-                .params
-                .get("sql")
-                .and_then(|v| v.as_str())
-                .context("the \"dbExecute\" block needs a sql")?;
+            let raw_sql =
+                block
+                    .params
+                    .get("sql")
+                    .and_then(|v| v.as_str())
+                    .context(errcode::code_with(
+                        "runner.blockNeedsField",
+                        &[("kind", "dbExecute"), ("field", "sql")],
+                    ))?;
             refuse_outside_sql(raw_sql, vars)?;
             let sql = vars.expand(raw_sql);
             let params = db_params(block, vars)?;
@@ -967,11 +1009,15 @@ async fn perform(
 
         "dbQuery" => {
             let database = param_text(block, "database", vars)?;
-            let raw_sql = block
-                .params
-                .get("sql")
-                .and_then(|v| v.as_str())
-                .context("the \"dbQuery\" block needs a sql")?;
+            let raw_sql =
+                block
+                    .params
+                    .get("sql")
+                    .and_then(|v| v.as_str())
+                    .context(errcode::code_with(
+                        "runner.blockNeedsField",
+                        &[("kind", "dbQuery"), ("field", "sql")],
+                    ))?;
             refuse_outside_sql(raw_sql, vars)?;
             let sql = vars.expand(raw_sql);
             let params = db_params(block, vars)?;
@@ -991,7 +1037,7 @@ async fn perform(
                     .params
                     .get("firstColumn")
                     .and_then(|v| v.as_str())
-                    .context("\"firstInto\" also needs a \"firstColumn\"")?;
+                    .context(errcode::code("runner.firstIntoNeedsColumn"))?;
                 let value = rows
                     .first()
                     .and_then(|row| row.get(column))
@@ -1022,7 +1068,10 @@ async fn perform(
                 .params
                 .get("script")
                 .and_then(|v| v.as_str())
-                .context("the \"evaluate\" block needs a script")?;
+                .context(errcode::code_with(
+                    "runner.blockNeedsField",
+                    &[("kind", "evaluate"), ("field", "script")],
+                ))?;
 
             // Interpolating outside text into a script means the page, the
             // server or the database gets to decide what code runs. Refuse it
@@ -1056,7 +1105,10 @@ async fn perform(
             Ok(())
         }
 
-        other => Err(anyhow!("this build cannot run a {other:?} block")),
+        other => Err(anyhow!(
+            "{}",
+            errcode::code_with("runner.unknownBlock", &[("kind", &format!("{other:?}"))])
+        )),
     }
 }
 
@@ -1080,8 +1132,14 @@ async fn wait_for_selector(profile_id: &str, selector: &str) -> Result<()> {
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "waited {}s but nothing matched {selector}",
-                STEP_TIMEOUT.as_secs()
+                "{}",
+                errcode::code_with(
+                    "runner.waitNoMatch",
+                    &[
+                        ("seconds", &STEP_TIMEOUT.as_secs().to_string()),
+                        ("selector", &selector)
+                    ]
+                )
             ));
         }
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1106,7 +1164,7 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
     let raw = match raw {
         Value::String(s) if !s.trim().is_empty() => {
             parsed =
-                serde_json::from_str::<Value>(s).context("the \"with\" list is not valid JSON")?;
+                serde_json::from_str::<Value>(s).context(errcode::code("runner.withNotJson"))?;
             &parsed
         }
         other => other,
@@ -1118,7 +1176,7 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
             .map(|item| {
                 let name = item
                     .as_str()
-                    .context("every entry in \"with\" must be a variable name")?;
+                    .context(errcode::code("runner.withEntryNotName"))?;
                 Ok((name.to_string(), name.to_string()))
             })
             .collect::<Result<_>>()?,
@@ -1127,12 +1185,12 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
             .map(|(as_name, var)| {
                 let var = var
                     .as_str()
-                    .context("every value in \"with\" must be a variable name")?;
+                    .context(errcode::code("runner.withValueNotName"))?;
                 Ok((as_name.clone(), var.to_string()))
             })
             .collect::<Result<_>>()?,
         Value::Null => return Ok(None),
-        _ => return Err(anyhow!("\"with\" must be a list or an object")),
+        _ => return Err(anyhow!("{}", errcode::code("runner.withWrongShape"))),
     };
 
     if pairs.is_empty() {
@@ -1142,9 +1200,9 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
     pairs
         .iter()
         .map(|(as_name, var)| {
-            let value = vars
-                .get(var)
-                .with_context(|| format!("\"with\" names {var:?}, which no step has set"))?;
+            let value = vars.get(var).with_context(|| {
+                errcode::code_with("runner.withUnknownVar", &[("var", &format!("{var:?}"))])
+            })?;
             Ok((as_name.clone(), value.to_string()))
         })
         .collect::<Result<Vec<_>>>()
@@ -1188,7 +1246,7 @@ async fn evaluate_with(profile_id: &str, body: &str, args: Vec<(String, String)>
         .get("result")
         .and_then(|r| r.get("objectId"))
         .and_then(|id| id.as_str())
-        .context("the page did not return a callable script")?;
+        .context(errcode::code("runner.scriptNotCallable"))?;
 
     let reply = cdp::page_call(
         profile_id,
@@ -1298,6 +1356,51 @@ pub async fn run_unsaved(
     run_guarded(project, profile_id, seed).await
 }
 
+/// Why a run was refused before it started.
+///
+/// The HTTP API has to answer 409 rather than 500 when a profile is simply not
+/// ready, and it used to decide that by searching the message for "is not
+/// running". Once the message became an error code for translation there was
+/// no English left to search, so the reason is carried as a type instead —
+/// the same shape `profile.rs` already uses. A caller asks what went wrong
+/// rather than reading the prose written for a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunRefusal {
+    /// The profile is not running at all.
+    ProfileNotRunning,
+    /// It is running, but without a debugging port to attach to.
+    NoDebuggingPort,
+}
+
+#[derive(Debug)]
+pub struct RunRefusedError {
+    kind: RunRefusal,
+    message: String,
+}
+
+impl std::fmt::Display for RunRefusedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunRefusedError {}
+
+fn refuse(kind: RunRefusal, message: impl Into<String>) -> anyhow::Error {
+    RunRefusedError {
+        kind,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// The reason a run was refused, if it was refused rather than failing.
+pub fn run_refusal(error: &anyhow::Error) -> Option<RunRefusal> {
+    error
+        .downcast_ref::<RunRefusedError>()
+        .map(|error| error.kind)
+}
+
 /// The guards every run passes, whoever asked for it.
 async fn run_guarded(
     project: &Project,
@@ -1313,16 +1416,19 @@ async fn run_guarded(
 
     if wants_browser {
         if !crate::is_profile_running(profile_id) {
-            return Err(anyhow!("profile {profile_id} is not running"));
+            return Err(refuse(
+                RunRefusal::ProfileNotRunning,
+                errcode::code_with("runner.profileNotRunning", &[("profile_id", profile_id)]),
+            ));
         }
 
         if !cdp::is_attached(profile_id) {
             let endpoint = crate::process::Tracker::shared()
                 .cdp(profile_id)
                 .ok_or_else(|| {
-                    anyhow!(
-                        "profile {profile_id} is running without a debugging port; \
-                         restart it to automate it"
+                    refuse(
+                        RunRefusal::NoDebuggingPort,
+                        errcode::code_with("runner.noDebuggingPort", &[("profile_id", profile_id)]),
                     )
                 })?;
             cdp::attach(profile_id.to_string(), endpoint.web_socket_debugger_url).await?;
@@ -1377,17 +1483,40 @@ mod tests {
         let b = block("b1", "assertRequest", json!({ "urlContains": "/login" }));
         let e = perform_alone(&b).await.unwrap_err();
         let msg = format!("{e:#}");
+        // The message is an error code now; the sentence it stands for still
+        // names recordTraffic, which is the part worth asserting.
         assert!(
-            msg.contains("recordTraffic"),
+            msg.contains("runner.notRecording"),
             "the error should name the block that is missing, got: {msg}"
         );
+    }
+
+    #[test]
+    fn a_refusal_is_recognised_without_reading_its_words() {
+        // This is the property the HTTP API depends on for its 409. It used to
+        // hold only because the message happened to contain "is not running",
+        // which stopped being true the moment the message became translatable.
+        let refusal = refuse(
+            RunRefusal::ProfileNotRunning,
+            errcode::code_with("runner.profileNotRunning", &[("profile_id", "p1")]),
+        );
+        assert_eq!(run_refusal(&refusal), Some(RunRefusal::ProfileNotRunning));
+
+        // It survives being wrapped, because anyhow context is how the run
+        // path reports where a failure happened.
+        let wrapped = refusal.context("while starting the run");
+        assert_eq!(run_refusal(&wrapped), Some(RunRefusal::ProfileNotRunning));
+
+        // And an ordinary failure is not mistaken for a refusal.
+        let ordinary = anyhow!("the page crashed");
+        assert_eq!(run_refusal(&ordinary), None);
     }
 
     #[tokio::test]
     async fn stopping_a_recording_that_never_started_says_so() {
         let b = block("b1", "stopTraffic", json!({}));
         let e = perform_alone(&b).await.unwrap_err();
-        assert!(format!("{e:#}").contains("recordTraffic"));
+        assert!(format!("{e:#}").contains("runner.notRecording"));
     }
 
     #[tokio::test]
