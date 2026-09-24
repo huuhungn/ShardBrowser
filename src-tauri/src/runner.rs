@@ -1105,8 +1105,8 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
     let parsed;
     let raw = match raw {
         Value::String(s) if !s.trim().is_empty() => {
-            parsed = serde_json::from_str::<Value>(s)
-                .context("the \"with\" list is not valid JSON")?;
+            parsed =
+                serde_json::from_str::<Value>(s).context("the \"with\" list is not valid JSON")?;
             &parsed
         }
         other => other,
@@ -1157,11 +1157,7 @@ fn bound_arguments(block: &Block, vars: &Variables) -> Result<Option<Vec<(String
 /// CDP as real arguments, so a value containing quotes, newlines or `</script>`
 /// is data on arrival. This is the mechanism that makes refusing interpolation
 /// reasonable: there is somewhere else for the value to go.
-async fn evaluate_with(
-    profile_id: &str,
-    body: &str,
-    args: Vec<(String, String)>,
-) -> Result<Value> {
+async fn evaluate_with(profile_id: &str, body: &str, args: Vec<(String, String)>) -> Result<Value> {
     let names: Vec<&str> = args.iter().map(|(n, _)| n.as_str()).collect();
     for name in &names {
         if !is_js_identifier(name) {
@@ -1544,7 +1540,6 @@ mod tests {
             "the error should say why: {err}"
         );
     }
-
 
     // `expand` trims a placeholder's name before looking it up, so `{{ from_page }}`
     // and `{{from_page}}` substitute the very same value. The provenance check has
