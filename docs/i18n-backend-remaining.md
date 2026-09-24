@@ -38,7 +38,7 @@ English. They are the only baseline strings that are not toast-reachable.
 So the real figure at the time of the survey was **200 toast-reachable
 strings, not 207**. After the `launch.rs` and `profile.rs` pass: **170**.
 
-## The remaining 120, by who actually reads them
+## The remaining 104, by who actually reads them
 
 Ranking by count alone is misleading. `files.rs` has the most strings left, but
 its errors are raised inside automation blocks (`readFile`, `writeFile`) and
@@ -46,17 +46,17 @@ propagate through `runner.rs` into the step table, where the reader is the
 person who wrote the project — the same audience as `db.rs` and
 `http_session.rs`. Those three are one slice, not three.
 
-**Operator-facing (32).** Someone using the interface hits these.
+**Operator-facing (12 left of 35).** Someone using the interface hits these.
 
 | Count | Area | Files |
 |------:|------|-------|
-| 18 | everyday: assorted commands | `lib.rs` |
-| 6 | recovery: backup/restore | `backup_cmd.rs` |
+| ~~18~~ 1 | everyday: assorted commands | `lib.rs` — done except one label |
+| ~~6~~ 0 | recovery: backup/restore | `backup_cmd.rs` — done |
 | 8 | fleet: sync and enrolment | `sync_cmd.rs` |
 | 3 | installer | `updater.rs` |
 
-`sync_cmd.rs` is the strongest candidate: `no team server configured — set one
-in Settings` and `this device is not enrolled — enroll it in Settings` both
+`sync_cmd.rs` is the strongest candidate left: `no team server configured — set
+one in Settings` and `this device is not enrolled — enroll it in Settings` both
 tell an operator where to go, which is exactly the kind of sentence that is
 useless in a language they do not read.
 
@@ -91,10 +91,9 @@ easier. Leave them.
 1. ~~**`launch.rs` (19) and `profile.rs` (11).**~~ Done.
 2. ~~**`proxy.rs` (14) and `extensions.rs` (10).**~~ Done.
 3. ~~**`runner.rs` (26).**~~ Done.
-4. **`sync_cmd.rs` (8), `backup_cmd.rs` (6), `updater.rs` (3).** Operator-facing
-   and instructional — the highest value left.
-5. **`lib.rs` (18).** Operator-facing but scattered across 110 commands, so it
-   is the widest diff for the fewest related strings.
+4. ~~**`sync_cmd.rs` (8), `backup_cmd.rs` (6), `updater.rs` (3).**~~ `backup_cmd.rs`
+   done; `sync_cmd.rs` and `updater.rs` remain and are the highest value left.
+5. ~~**`lib.rs` (18).**~~ Done, except `import profiles` — see below.
 6. **`files.rs` (15), `db.rs` (9), `http_session.rs` (6).** Finishes the
    automation-author surface `runner.rs` started.
 7. Internal breadcrumbs: leave them English.
@@ -171,3 +170,24 @@ Two things to keep in mind when coding a new module:
   importer. A coded message in any of them renders as `[[shardx:...]]`.
 - **`replaceAll` is not available.** The frontend's TS target predates it; use
   a global regex.
+
+## Pitfalls found during the lib.rs/backup_cmd.rs pass
+
+- **A label spliced into someone else's sentence cannot be coded alone.**
+  `lib.rs` passes `"import profiles"` to `profile::begin_profile_creation`,
+  which builds `Profiles are being reorganized; retry {action}`. Coding only
+  the label yields `retry [[shardx:...]]`; coding only the sentence leaves the
+  fragment English. Both sides move together or neither does — the same shape
+  the fleet_client pass warned about, now with a concrete instance.
+- **The guard's `ERROR_SHAPE` regex misses constructor-style errors.** It
+  matches `Err(`, `map_err`, `anyhow!`, `bail!`, `ok_or_else`, `.context(`, and
+  `.with_context(` — so the three `profile_error(kind, format!(...))` calls in
+  `profile.rs` were never in the baseline and a new one would not be caught.
+  Widen the regex when picking that file up.
+- **Check whether a key already exists before adding it.** `fleet.serverUrlScheme`
+  was already in `en.json` with identical wording; a blind insert would have
+  created a second key for one sentence. Make the insert script refuse to
+  overwrite rather than warn.
+- **The locale files are CRLF.** Rewriting them with LF newlines turns a
+  six-line addition into a 1000-line diff. Pass the CRLF newline explicitly
+  when writing the JSON back.

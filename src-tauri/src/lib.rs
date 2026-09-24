@@ -99,7 +99,7 @@ async fn mcp_download(dir: String) -> Result<String, String> {
 #[tauri::command]
 async fn mcp_set_path(dir: String) -> Result<Value, String> {
     let path = mcp_setup::resolve_mcp_dir(std::path::Path::new(&dir))
-        .ok_or_else(|| "Selected folder is not a ShardX MCP server folder.".to_string())?;
+        .ok_or_else(|| crate::errcode::code("mcp.notAServerFolder"))?;
     let path = path.display().to_string();
     let mut s = settings::load().map_err(|e| e.to_string())?;
     s.mcp_path = Some(path.clone());
@@ -1088,7 +1088,7 @@ pub fn merge_library_fingerprint(
 ) -> Result<serde_json::Map<String, Value>, String> {
     let entry = fingerprints::get(template_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("unknown fingerprint id: {template_id}"))?;
+        .ok_or_else(|| crate::errcode::code_with("fp.unknownId", &[("id", template_id)]))?;
 
     let mut merged = serde_json::Map::new();
     merged.insert(
@@ -1172,7 +1172,7 @@ pub struct PresetEnrichPicks {
 fn enrich_picks_for_preset(preset_id: String) -> Result<PresetEnrichPicks, String> {
     let entry = fingerprints::get(&preset_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("unknown fingerprint id: {preset_id}"))?;
+        .ok_or_else(|| crate::errcode::code_with("fp.unknownId", &[("id", &preset_id)]))?;
     let platform = entry
         .payload
         .get("navigator")
@@ -1344,7 +1344,7 @@ fn select_devtools_target(targets: &[Value]) -> Option<&Value> {
 async fn devtools_context(profile_id: String) -> Result<Value, String> {
     let cdp = process::Tracker::shared()
         .cdp(&profile_id)
-        .ok_or_else(|| "Profile is running without CDP. Start it through Automation API or MCP to enable DevTools.".to_string())?;
+        .ok_or_else(|| crate::errcode::code("profile.runningWithoutCdp"))?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
@@ -1383,17 +1383,17 @@ async fn devtools_activate(profile_id: String) -> Result<Value, String> {
         .get("current")
         .filter(|target| !target.is_null())
         .cloned()
-        .ok_or_else(|| "No page target is available for this profile.".to_string())?;
+        .ok_or_else(|| crate::errcode::code("profile.noPageTarget"))?;
     let target_id = target
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| "The selected page target has no id.".to_string())?;
+        .ok_or_else(|| crate::errcode::code("profile.pageTargetHasNoId"))?;
     let cdp_http_url = context
         .get("cdp")
         .and_then(|cdp| cdp.get("http_url"))
         .and_then(Value::as_str)
-        .ok_or_else(|| "The profile has no CDP HTTP URL.".to_string())?;
+        .ok_or_else(|| crate::errcode::code("profile.noCdpHttpUrl"))?;
     let mut activate_url = url::Url::parse(cdp_http_url).map_err(|e| e.to_string())?;
     activate_url.set_path(&format!("/json/activate/{target_id}"));
     activate_url.set_query(None);
@@ -1514,7 +1514,7 @@ async fn launch(profile_id: String) -> Result<u32, String> {
     // UI launches: no CDP, headed. The bus goes along even with no group so the
     // page helper has somewhere to report.
     if migrate::in_progress() {
-        return Err("profiles are being moved — try again when that finishes".into());
+        return Err(crate::errcode::code("profile.beingMovedRetry"));
     }
     let b = bus().await?;
     launch::launch_profile_synced(&profile_id, false, false, None, b.port, &b.token)
@@ -1574,7 +1574,7 @@ async fn sync_launch(
     group: Option<String>,
 ) -> Result<String, String> {
     if profile_ids.len() < 2 {
-        return Err("a group needs at least two profiles".into());
+        return Err(crate::errcode::code("profile.groupNeedsTwo"));
     }
     let group = group.unwrap_or_else(|| "fleet".to_string());
     let b = bus().await?;
@@ -1588,7 +1588,10 @@ async fn sync_launch(
         }
     }
     if failed.len() == profile_ids.len() {
-        return Err(format!("nothing launched — {}", failed.join("; ")));
+        return Err(crate::errcode::code_with(
+            "launch.nothingLaunched",
+            &[("reasons", &failed.join("; "))],
+        ));
     }
     // A partial launch is still a usable group; just say what did not make it.
     if !failed.is_empty() {
@@ -1884,7 +1887,7 @@ fn team_set_connection(
 
     let url = server_url.trim().trim_end_matches('/').to_string();
     if !url.is_empty() && !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("server URL must start with http:// or https://".into());
+        return Err(crate::errcode::code("fleet.serverUrlScheme"));
     }
 
     let server_changed = url != c.server_url || tenant_id.trim() != c.tenant_id;
@@ -1929,7 +1932,7 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
         return Err(crate::errcode::code("fleet.setTenantFirst"));
     }
     if c.is_enrolled() {
-        return Err("this device is already enrolled".into());
+        return Err(crate::errcode::code("fleet.deviceAlreadyEnrolled"));
     }
 
     // Fresh signing key for this device. `getrandom` is a Windows-only
@@ -1948,7 +1951,7 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     let hpke_public: [u8; 32] = hpke_public
         .as_slice()
         .try_into()
-        .map_err(|_| "HPKE public key must be 32 bytes".to_string())?;
+        .map_err(|_| crate::errcode::code("fleet.hpkeKeyLength"))?;
 
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
@@ -1975,9 +1978,11 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     // here and not at the first publish, when a snapshot is already staged.
     let stored = team_config::load()
         .and_then(|s| s.signing_key())
-        .map_err(|e| format!("device key did not round-trip: {e}"))?;
+        .map_err(|e| {
+            crate::errcode::code_with("fleet.deviceKeyRoundTrip", &[("error", &e.to_string())])
+        })?;
     if stored.verifying_key().to_bytes() != signer.verifying_key().to_bytes() {
-        return Err("device key did not round-trip: key mismatch".into());
+        return Err(crate::errcode::code("fleet.deviceKeyMismatch"));
     }
 
     team_config::status().map_err(|e| e.to_string())
@@ -2229,7 +2234,7 @@ async fn ps_set_tag(id: i64, tag: String) -> Result<Value, String> {
 async fn team_collect_custody() -> Result<serde_json::Value, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
-        return Err("this device is not enrolled for fleet operations".into());
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
     let seed = c.hpke_seed().map_err(|e| e.to_string())?;
     let (device_sk, _pk) = shardx_core::grants::derive_keypair(&seed);
@@ -2318,7 +2323,7 @@ async fn team_collect_custody() -> Result<serde_json::Value, String> {
 /// Decode a hex string from the server into bytes.
 fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     if !s.len().is_multiple_of(2) {
-        return Err("malformed hex from server".into());
+        return Err(crate::errcode::code("fleet.malformedHexFromServer"));
     }
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
