@@ -35,7 +35,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         setSigByIp(Object.fromEntries(data.map((d) => [d.ip, d.signature ?? ""])));
         setTag((r.order_tag && r.order_tag !== "none" ? r.order_tag : "") || `order ${order.order_id}`);
       })
-      .catch((e) => setErr(String(e)));
+      .catch((e) => setErr(safeUiError(e)));
     psOrder(order.order_id)
       .then((r) => {
         const o = r.order ?? {};
@@ -91,7 +91,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
         try {
           await psSignatureSet(order.order_id, sigItems);
           toast.ok(t(sigItems.length === 1 ? "ps.setP0fOnOne" : "ps.setP0fOnMany", { n: sigItems.length }));
-        } catch (e) { toast.err(t("ps.signatureError", { error: String(e) })); }
+        } catch (e) { toast.err(t("ps.signatureError", { error: safeUiError(e) })); }
       }
       onClose();
     } catch (e) { toast.err(safeUiError(e)); }

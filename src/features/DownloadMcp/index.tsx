@@ -5,6 +5,7 @@ import { Button } from "@proxyshard/shardx-ui-kit";
 import { DownloadIcon } from "../../shared/icons";
 import { toast } from "../../shared/model/toast";
 import { t } from "../../shared/i18n";
+import { safeUiError } from "../../shared/lib/utils";
 
 export function DownloadMcp() {
   const [mcpBusy, setMcpBusy] = useState(false);
@@ -17,7 +18,7 @@ export function DownloadMcp() {
       const p = await invoke<string>("mcp_download", { dir });
       toast.ok(t("mcp.downloadedTo", { path: p }));
     } catch (e) {
-      toast.err(t("mcp.mcpDownloadFailed") + String(e));
+      toast.err(t("mcp.mcpDownloadFailed") + safeUiError(e));
     } finally {
       setMcpBusy(false);
     }

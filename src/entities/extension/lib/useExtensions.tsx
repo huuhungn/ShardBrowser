@@ -60,7 +60,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
       await get().reload();
       set({ linkOpen: false });
       toast.ok(t("extensions.addedNamed", { name: added.name }));
-    } catch (e) { toast.err(t("extensions.downloadFailed") + String(e)); }
+    } catch (e) { toast.err(t("extensions.downloadFailed") + safeUiError(e)); }
     finally { set({ busy: false }); }
   },
 
@@ -81,7 +81,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
           n: added.length,
         }),
       );
-    } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
+    } catch (e) { toast.err(t("extensions.importFailed") + safeUiError(e)); }
     finally { set({ busy: false }); }
   },
 
@@ -97,7 +97,7 @@ export const useExtensions = create<ExtensionStore>((set, get) => ({
           ? t("extensions.addedNamed", { name: added[0].name })
           : t("extensions.nothingAdded"),
       );
-    } catch (e) { toast.err(t("extensions.importFailed") + String(e)); }
+    } catch (e) { toast.err(t("extensions.importFailed") + safeUiError(e)); }
     finally { set({ busy: false }); }
   },
 

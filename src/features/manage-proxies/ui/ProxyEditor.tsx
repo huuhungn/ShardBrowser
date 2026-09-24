@@ -48,7 +48,7 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
         try {
           await psSignatureSet(orderId, [{ ip: p.host, signature: sig }]);
           toast.ok(t("proxy.p0fSetTo", { sig }));
-        } catch (e) { toast.err("p0f: " + String(e)); }
+        } catch (e) { toast.err("p0f: " + safeUiError(e)); }
       }
       toast.ok(initial.id ? t("proxy.proxySaved") : t("proxy.proxyAdded"));
       onSaved?.(saved);

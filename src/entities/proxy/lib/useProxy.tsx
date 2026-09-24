@@ -264,7 +264,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         const text = lines.join("\n");
         clip.write(text).then(
             () => toast.ok(t("common.copiedNToClipboard", { n: targets.length })),
-            (e) => toast.err(t("proxy.copyFailed") + String(e)),
+            (e) => toast.err(t("proxy.copyFailed") + safeUiError(e)),
         );
     },
     // One proxy per profile, in the order shown, stopping when the proxies run
@@ -298,6 +298,6 @@ export const useProxy = create<ProxyStore>((set, get) => ({
             get().reload();
             storeBus.emit('proxies');
             toast.ok(t(n === 1 ? "proxy.importedOne" : "proxy.importedMany", { n }));
-        } catch (e) { toast.err(t("proxy.importFailed") + String(e)); }
+        } catch (e) { toast.err(t("proxy.importFailed") + safeUiError(e)); }
     },
 }))

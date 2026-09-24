@@ -40,7 +40,7 @@ export function PsResidentialCard() {
     try {
       const r = await psProfileTraffic(t);
       setData({ data: r.data ?? 0, data_remain: r.data_remain ?? 0, data_spent: r.data_spent ?? 0 });
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(safeUiError(e)); }
     finally { setLoading(false); }
   };
   useEffect(() => { loadTraffic(type); }, [type]);
