@@ -982,7 +982,7 @@ fn data_root_get() -> Result<DataRootInfo, String> {
 #[tauri::command]
 async fn data_root_migrate(app: tauri::AppHandle, path: String) -> Result<u64, String> {
     if !process::Tracker::shared().running().is_empty() {
-        return Err(crate::errcode::code("fleet.closeProfilesFirst").into());
+        return Err(crate::errcode::code("fleet.closeProfilesFirst"));
     }
     let dst = std::path::PathBuf::from(&path);
     tauri::async_runtime::spawn_blocking(move || migrate::run(&app, &dst))
@@ -1906,7 +1906,7 @@ fn team_set_connection(
 async fn team_test_connection() -> Result<String, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if c.server_url.is_empty() || c.token.is_empty() {
-        return Err(crate::errcode::code("fleet.setServerAndTokenFirst").into());
+        return Err(crate::errcode::code("fleet.setServerAndTokenFirst"));
     }
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
@@ -1923,10 +1923,10 @@ async fn team_test_connection() -> Result<String, String> {
 async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, String> {
     let mut c = team_config::load().map_err(|e| e.to_string())?;
     if c.server_url.is_empty() || c.token.is_empty() {
-        return Err(crate::errcode::code("fleet.setServerAndTokenFirst").into());
+        return Err(crate::errcode::code("fleet.setServerAndTokenFirst"));
     }
     if c.tenant_id.is_empty() {
-        return Err(crate::errcode::code("fleet.setTenantFirst").into());
+        return Err(crate::errcode::code("fleet.setTenantFirst"));
     }
     if c.is_enrolled() {
         return Err("this device is already enrolled".into());

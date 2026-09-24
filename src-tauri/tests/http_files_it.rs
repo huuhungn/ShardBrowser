@@ -9,6 +9,11 @@
 //!
 //! So the proxy test here runs a real CONNECT proxy in-process and asserts the
 //! request arrived through it.
+// These tests share one scratch directory, so a std Mutex serialises them. The
+// guard is deliberately held across the awaits inside each test: that is what
+// stops a second test from entering the directory mid-run. An async-aware lock
+// would let them interleave, which is the bug this guard exists to prevent.
+#![allow(clippy::await_holding_lock)]
 
 use serde_json::{json, Value};
 use shardx_launcher_lib::automation::{Block, Branch, Project, RunSettings};
@@ -199,7 +204,7 @@ fn start_proxy() -> ProxyServer {
                 continue;
             };
             // Rewrite to origin-form and forward the rest untouched.
-            let rest = req.splitn(2, "\r\n").nth(1).unwrap_or("");
+            let rest = req.split_once("\r\n").map(|x| x.1).unwrap_or("");
             let forwarded = format!("GET {path} HTTP/1.1\r\n{rest}");
             let _ = upstream.write_all(forwarded.as_bytes());
 

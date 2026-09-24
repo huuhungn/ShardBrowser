@@ -162,7 +162,7 @@ pub fn list() -> Result<Vec<TrashEntry>> {
             out.push(e);
         }
     }
-    out.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    out.sort_by_key(|e| std::cmp::Reverse(e.deleted_at));
     Ok(out)
 }
 

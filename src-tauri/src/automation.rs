@@ -24,8 +24,10 @@ use std::sync::{Mutex, OnceLock};
 /// falling through to the next line.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Branch {
     /// Fall through to the step below. The default.
+    #[default]
     Next,
     /// End this profile's whole run.
     Stop,
@@ -36,12 +38,6 @@ pub enum Branch {
     Goto(String),
     /// Try this same step again up to N more times, then take Next.
     Retry(u32),
-}
-
-impl Default for Branch {
-    fn default() -> Self {
-        Branch::Next
-    }
 }
 
 /// One recorded step.

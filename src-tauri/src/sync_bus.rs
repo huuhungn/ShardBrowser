@@ -22,6 +22,9 @@ struct Member {
     tx: mpsc::UnboundedSender<String>,
 }
 
+/// Screen area a layout was applied to: x, y, width, height.
+type Area = (i32, i32, i32, i32);
+
 #[derive(Default)]
 struct State {
     /// group name -> members
@@ -32,7 +35,7 @@ struct State {
     driving: HashMap<String, u64>,
     /// group name -> layout last asked for and the area it used. Remembered so a
     /// window that comes up after the layout was chosen is placed too.
-    arranged: HashMap<String, (Layout, (i32, i32, i32, i32))>,
+    arranged: HashMap<String, (Layout, Area)>,
     /// profile -> what the page helper last found there.
     helper: HashMap<String, serde_json::Value>,
     /// profile -> the field set the panel was dismissed for. Closing the panel
@@ -332,7 +335,7 @@ impl Bus {
             .filter(|(profile, v)| {
                 // Dismissed and still the same offer. A different step asks for
                 // different kinds and so comes back on its own.
-                if st.helper_dismissed.get(*profile) == Some(&Self::helper_key(*v)) {
+                if st.helper_dismissed.get(*profile) == Some(&Self::helper_key(v)) {
                     return false;
                 }
                 let Some(fields) = v.get("fields").and_then(|f| f.as_array()) else {
