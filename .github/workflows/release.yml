@@ -507,8 +507,36 @@ jobs:
           sed -i -e '/@@HIGHLIGHTS@@/r release-highlights.md' -e '/@@HIGHLIGHTS@@/d' release-notes.md
           cat release-notes.md
 
+      # Uploading the assets is the one step that fails for reasons that have
+      # nothing to do with this repository. v2.2.7 published every one of its 20
+      # assets and still ended red: a single asset stalled for 148s of a 197s
+      # step and the run reported "Error saving asset" after the release was
+      # already complete. The same payload took 3.4s on v2.2.8. The action has no
+      # retry or per-asset timeout input, so the retry has to live here.
+      #
+      # Re-running the action is safe: `overwrite_files` defaults to true, so the
+      # second attempt replaces whatever the first one managed to upload rather
+      # than duplicating or rejecting it. `continue-on-error` on the first
+      # attempt keeps a slow upload from failing the release; if the retry also
+      # fails the job still goes red, which is what we want.
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
+        id: publish
+        continue-on-error: true
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ShardX Launcher ${{ needs.validate.outputs.tag }} custom integration
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body_path: release-notes.md
+          files: dist/*
+
+      - name: Retry release upload
+        if: steps.publish.outcome == 'failure'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.validate.outputs.tag }}
           name: ShardX Launcher ${{ needs.validate.outputs.tag }} custom integration
