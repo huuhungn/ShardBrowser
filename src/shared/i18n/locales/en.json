@@ -172,6 +172,8 @@
   "db.tooManyRows": "The query returned more than {limit} rows; add a limit or a where clause.",
   "entity.noUdpSupportQuicHttp3DisabledAtLaunc": "No UDP support — QUIC/HTTP-3 disabled at launch. Click for docs.",
   "errors.unknownBackend": "The Launcher hit an error it could not explain. Check Settings, then try again.",
+  "ext.addOne": "Add one →",
+  "ext.libraryEmptyInline": "No extensions in the library yet.",
   "extensions.addFile": "Add .crx / .zip",
   "extensions.addedMany": "Added {n} extensions",
   "extensions.addedNamed": "Added “{name}”",

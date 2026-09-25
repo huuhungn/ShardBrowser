@@ -172,6 +172,8 @@
   "db.tooManyRows": "Truy vấn trả về hơn {limit} dòng; hãy thêm limit hoặc mệnh đề where.",
   "entity.noUdpSupportQuicHttp3DisabledAtLaunc": "Không hỗ trợ UDP — QUIC/HTTP-3 bị tắt khi khởi chạy. Bấm để xem tài liệu.",
   "errors.unknownBackend": "Lỗi không rõ nguyên nhân từ Launcher. Hãy kiểm tra Cài đặt rồi thử lại.",
+  "ext.addOne": "Thêm một cái →",
+  "ext.libraryEmptyInline": "Thư viện chưa có tiện ích nào.",
   "extensions.addFile": "Thêm .crx / .zip",
   "extensions.addedMany": "Đã thêm {n} tiện ích",
   "extensions.addedNamed": "Đã thêm “{name}”",
