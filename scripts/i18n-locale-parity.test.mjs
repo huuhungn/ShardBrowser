@@ -373,10 +373,41 @@ function hasTranslatableWord(text) {
  */
 const KEPT_ENGLISH = /^(?:Device ID)$/;
 
+/**
+ * A lone lowercase word is usually code, not prose: a CSS unit, a package name,
+ * a file extension, an HTML tag name left in a string. These are the same word
+ * in every language, so a translator has nothing to do with them.
+ */
+const LOWERCASE_CODE =
+  /^(?:npm|npx|node|px|rem|em|vh|vw|ms|kb|mb|gb|js|ts|tsx|jsx|json|html|css|svg|png|jpg|exe|dll|dmg|deb|zip|tar|gz|sh|py|rs|toml|yml|yaml|md|txt|csv|env|git|url|uri|id|ip|dns|ssl|tls|api|mcp|cdp|ua|os|pc|vpn|http|https|socks|ftp|ssh|localhost|true|false|null|undefined|auto|none|inherit|initial|unset|flex|grid|block|inline|hidden|visible|absolute|relative|fixed|sticky|static)$/;
+
+/**
+ * Is the line at `i` a JSX child rather than an attribute?
+ *
+ * A child follows a line that finishes an opening tag or an expression that
+ * opens one: `<Badge …>`, `{cond && (`. An attribute sits among lines that end
+ * on a value or a name, with the tag still unclosed. Walking back to the first
+ * line that carries either shape is enough to tell them apart, and it keeps a
+ * shorthand boolean prop (`open`, `dot`) from reading as a word on screen.
+ */
+function isJsxChild(lines, i) {
+  for (let j = i - 1; j >= 0 && j > i - 12; j -= 1) {
+    const prev = lines[j].trim();
+    if (!prev || prev.startsWith("//")) continue;
+    // An opening tag closed on this line, or a JSX expression opened a block.
+    if (/>$/.test(prev) || /\(\s*$/.test(prev)) return true;
+    // Still inside the attribute list: a prop, or the tag name itself.
+    if (/^<[A-Za-z]/.test(prev) || /=/.test(prev) || /^[a-zA-Z-]+$/.test(prev)) return false;
+    return false;
+  }
+  return false;
+}
+
 /** JSX text nodes and human-facing attributes, with the obvious non-prose out. */
 function englishInSource(src) {
   const found = [];
-  for (const line of readable(src).split("\n")) {
+  const allLines = readable(src).split("\n");
+  for (const [lineNo, line] of allLines.entries()) {
     const s = line.trim();
     // A bare line of prose between tags: "Add block", "No projects yet".
     if (/^[A-Z][a-zA-Z][\w ,.'’·—–-]*[a-z.!?]$/.test(s) && !s.includes("=") && !s.includes("(")) {
@@ -442,6 +473,31 @@ function englishInSource(src) {
       (/…$|\.\.\.$/.test(bare) || /^[A-Za-z'’-]{4,}$/.test(bare)) &&
       !PRODUCT_NAME.test(bare) &&
       !KEPT_ENGLISH.test(bare)
+    ) {
+      found.push(bare);
+    }
+    // Both one-word rules above require a leading capital, and the inline rule
+    // requires two letters before the run — so a lowercase badge word gave the
+    // guard nothing to match. `>on<` in the sidebar and `latest` / `locked` on
+    // the patch log stayed English through a release that translated every
+    // screen around them. A status pill is a word someone reads, whatever its
+    // case, so match a lone lowercase word too.
+    //
+    // A shorthand boolean prop has exactly this shape — `open`, `dot`, `mono`
+    // sit alone on their line inside an attribute list — so the word alone
+    // cannot tell prose from code, and an allow-list of them would need editing
+    // forever. What separates them is position: JSX children follow a line that
+    // *closes* its opening tag, while a prop sits among lines that do not.
+    if (
+      !/[=(){}"`$;:[\]<>]/.test(bare) &&
+      !bare.endsWith(",") &&
+      !bare.includes(" ") &&
+      /^[a-z][a-z'’-]{1,15}$/.test(bare) &&
+      !PRODUCT_NAME.test(bare) &&
+      !KEPT_ENGLISH.test(bare) &&
+      !PROTOCOL_TOKEN.test(bare) &&
+      !LOWERCASE_CODE.test(bare) &&
+      isJsxChild(allLines, lineNo)
     ) {
       found.push(bare);
     }

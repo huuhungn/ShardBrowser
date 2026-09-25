@@ -55,6 +55,16 @@ const SCOPE_KEY: Record<string, string> = {
   launcher: "patchlog.scope.launcher",
 };
 
+/**
+ * The tag is data, and `tagColor` reads its raw value, so translating it in
+ * patchlog.vi.json would decide the badge's colour by a Vietnamese word.
+ * Translate at render instead, exactly as the scope label does.
+ */
+const TAG_KEY: Record<string, string> = {
+  new: "patchlog.tag.new",
+  fix: "patchlog.tag.fix",
+};
+
 /** Inline markup, deliberately tiny: `code`, **strong**, *emphasis*. */
 function Rich({ text }: { text: string }) {
   const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g);
@@ -146,6 +156,7 @@ function ReleasePicker({
   releases: Release[];
 }) {
   const [open, setOpen] = useState(false);
+  const t = useT();
   return (
     <div className="relative">
       <button
@@ -156,7 +167,7 @@ function ReleasePicker({
         <span>v{value.version}</span>
         {value.version === LATEST.version && (
           <Badge color="success" variant="filled" size="small">
-            latest
+            {t("patchlog.latest")}
           </Badge>
         )}
         <span
@@ -243,12 +254,12 @@ function EntryCard({ entry }: { entry: Entry }): ReactNode {
         </span>
         {entry.tag && (
           <Badge color={tagColor(entry.tag)} variant="filled" size="small">
-            {entry.tag}
+            {TAG_KEY[entry.tag] ? t(TAG_KEY[entry.tag]) : entry.tag}
           </Badge>
         )}
         {entry.locked && (
           <Badge color="warning" variant="filled" size="small">
-            locked
+            {t("patchlog.locked")}
           </Badge>
         )}
       </div>
