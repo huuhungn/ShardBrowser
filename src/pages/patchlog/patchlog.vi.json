@@ -1,6 +1,80 @@
 {
   "releases": [
     {
+      "version": "2.2.8",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "vietnamese-interface",
+          "title": "Trình khởi chạy nói tiếng Việt",
+          "lead": "Mọi màn hình, menu và thông báo giờ đọc được bằng tiếng Việt, chọn một lần ở Cài đặt → Ngôn ngữ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Chữ trong giao diện trước đây nằm ngay trong mã, nên chỉ có thể là tiếng Anh. Nay chữ đến từ tệp dịch, và Cài đặt → Ngôn ngữ chuyển giữa tiếng Anh và tiếng Việt. Lụa chọn được giữ lại sau khi khởi động lại."
+            },
+            {
+              "type": "p",
+              "text": "Ngôn ngữ bạn đọc không thuộc dấu vết nhận dạng của trình duyệt. Đổi nó không thay đổi bất cứ thứ gì trang web thấy được, cũng không thay đổi gì của hồ sơ."
+            }
+          ]
+        },
+        {
+          "id": "errors-in-your-language",
+          "title": "Lỗi tự giải thích bằng ngôn ngữ của bạn",
+          "lead": "Hồ sơ không khởi động được trước đây vẫn trả lại tiếng Anh dù giao diện đã là tiếng Việt.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Những câu đó được viết ngay nơi công việc diễn ra — sâu trong bộ máy — rồi đưa lên màn hình khi đã thành câu hoàn chỉnh, nên dịch giao diện không chạm tới. Giờ bộ máy báo chuyện gì đã xảy ra và giao diện viết thành câu — cách duy nhất để cả hai ngôn ngữ nói cùng một điều."
+            },
+            {
+              "type": "p",
+              "text": "Khoảng hai mươi nhóm đã chuyển sang: hồ sơ không khởi động, proxy, tiện ích, sao lưu, cookie, cơ sở dữ liệu, trình chạy tự động, phép thử đồ họa, và tải xuống cùng chuyển đổi bộ máy."
+            },
+            {
+              "type": "p",
+              "text": "Mười hai thông báo còn kèm một dấu hiệu nội bộ bên cạnh. Nó không cho bạn biết điều gì mà còn đẩy phần hữu ích ra khỏi tầm mắt; nó đã được bỏ."
+            }
+          ]
+        },
+        {
+          "id": "labels-that-hid",
+          "title": "Những nhãn tiếng Anh cuối cùng đã được dịch",
+          "lead": "Ba mục menu hồ sơ, hai câu xác nhận và một nút trong Cài đặt ở lại tiếng Anh lâu hơn phần còn lại.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Phép kiểm tìm chữ chưa dịch vẫn tìm câu, mà nhãn thì không phải câu. Một nhãn kết thúc bằng dấu ba chấm, một câu hỏi kết thúc bằng dấu hỏi, và một nút chỉ vỏn một từ đều lọt qua — trong đó có nút Đổi chỗ… ở Cài đặt → Nơi lưu dữ liệu hồ sơ, nút tiếng Anh cuối cùng trên màn hình đó."
+            },
+            {
+              "type": "p",
+              "text": "Những chỗ đó đã được dịch, và phép kiểm giờ nhận ra nhãn qua hình dạng thay vì đếm số từ."
+            }
+          ]
+        },
+        {
+          "id": "patch-log-paths",
+          "title": "Nhật ký vá chỉ đúng thứ có trên màn hình",
+          "lead": "Bốn đường dẫn ở đây gọi tên thẻ Cài đặt bằng một tên mà giao diện chưa bao giờ dùng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Những ghi chú này viết bằng tay, nên một thẻ được đổi tên trong giao diện sẽ bỏ lại chỉ dẫn đứng đó, trỏ tới thứ bạn không tìm thấy. Cách diễn đạt đã được sửa, và một phép kiểm giờ đọc mọi đường dẫn trong nhật ký này và từ chối đường dẫn gọi tên một thẻ không tồn tại — ở cả hai ngôn ngữ."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.7",
       "date": "2026-09-18",
       "entries": [

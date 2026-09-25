@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.2.8
+
+### Added
+
+- The launcher speaks Vietnamese. Every screen, menu, button, toast and error
+  message now comes from a translation file rather than being written into the
+  code, and the language is chosen in Settings under Language. The choice
+  survives a restart. Nothing about a profile changes with it — the interface
+  language is not part of a browser's fingerprint.
+- A profile can be driven through a scripted list of steps, and a probe reports
+  whether a profile's GPU story is internally consistent.
+
+### Fixed
+
+- Errors raised by the engine reach the operator in their own language. A
+  command that failed used to answer in English no matter the setting, because
+  the message was built in Rust and handed straight to the toast. Roughly
+  twenty groups of them were moved across: profiles that will not start,
+  proxies, extensions, backups, cookies, the database, the automation runner,
+  the graphics probe, engine download and migration.
+- Toasts no longer show raw error markers. Twelve of them printed an internal
+  code beside the message, which told the operator nothing and hid the part
+  that mattered.
+- Menu entries and dialog questions that were still English are translated.
+  Three profile-menu items, two confirm questions and one Settings button had
+  been missed because the guard that looks for untranslated text could not see
+  a label ending in `…` or `?`, nor a button whose label is a single word.
+- The patch log reads in Vietnamese, and the paths it tells you to click match
+  the labels actually on screen. Four of them named Settings cards by a name
+  the interface never used, so the instruction pointed at nothing.
+
+### Internal
+
+- The translation guard covers the shapes that hid real text: labels ending in
+  punctuation, single-word buttons, prose in a plain `.ts` module, text frozen
+  at import time, and instructions that quote an interface label. Each rule was
+  checked by breaking it on purpose and confirming the suite fails.
+- CI checks Rust formatting and runs Clippy.
+
 ## v2.2.7
 
 ### Fixed
