@@ -320,6 +320,7 @@
   "fp.removed": "Removed",
   "fp.revealTheOnDiskLibraryFolderDropJson": "Reveal the on-disk library folder; drop JSONs here to add them",
   "fp.unknownId": "No fingerprint with id {id}.",
+  "fp.useTemplate": "Use →",
   "gpu.cannotConnectDebugPort": "The graphics probe could not connect to the engine's debugging port.",
   "gpu.cannotStartEngineProbe": "The engine could not be started for the graphics probe.",
   "gpu.engineNotInstalled": "The engine is not installed yet, so the graphics probe cannot run.",

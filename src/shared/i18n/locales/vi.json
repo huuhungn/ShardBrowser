@@ -320,6 +320,7 @@
   "fp.removed": "Đã gỡ",
   "fp.revealTheOnDiskLibraryFolderDropJson": "Mở thư mục thư viện trên ổ đĩa; thả tệp JSON vào đây để thêm",
   "fp.unknownId": "Không có vân tay nào mang mã {id}.",
+  "fp.useTemplate": "Dùng →",
   "gpu.cannotConnectDebugPort": "Không kết nối được tới cổng gỡ lỗi của lõi trình duyệt để dò đồ họa.",
   "gpu.cannotStartEngineProbe": "Không khởi động được lõi trình duyệt để dò đồ họa.",
   "gpu.engineNotInstalled": "Chưa cài lõi trình duyệt nên chưa dò được đồ họa.",

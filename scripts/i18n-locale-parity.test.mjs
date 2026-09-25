@@ -501,6 +501,26 @@ function englishInSource(src) {
     ) {
       found.push(bare);
     }
+    // Both one-word rules reject any line holding a space, so a word paired
+    // with a decorative glyph -- `Use ->` on the fingerprint cards -- matched
+    // neither: too few words for the three-word rule, too many tokens for the
+    // one-word rules. Strip trailing decoration and re-test the word that is
+    // left, so a label reads the same to the guard whether or not a designer
+    // appended an arrow.
+    const undecorated = bare.replace(/[\s→←↑↓·—–:>»-]+$/u, "");
+    if (
+      undecorated !== bare &&
+      !/[=(){}"`$;[\]<]/.test(bare) &&
+      !/^[a-z]+[A-Z]/.test(undecorated) &&
+      /^[A-Za-z][A-Za-z'’]{2,}$/.test(undecorated) &&
+      !PRODUCT_NAME.test(undecorated) &&
+      !KEPT_ENGLISH.test(undecorated) &&
+      !PROTOCOL_TOKEN.test(undecorated) &&
+      !LOWERCASE_CODE.test(undecorated) &&
+      isJsxChild(allLines, lineNo)
+    ) {
+      found.push(bare);
+    }
     // Prose that is returned or assigned rather than rendered: `return "Could
     // not save"`, `=> "Remove this proxy"`, `const msg = "Nothing to import"`.
     // The bare-line rule above cannot see these, because it rejects any line
