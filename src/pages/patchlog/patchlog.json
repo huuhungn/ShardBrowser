@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.2.10",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "last-english-labels",
+          "title": "The last English left on the screen",
+          "lead": "Three labels stayed English because the check looking for them could not see their shape.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The extension picker's empty state said the library held nothing yet, and offered a link to add one, both in English. Anyone with an empty library meets that screen in the profile editor, so on a fresh install it was the first English anyone read. A button on each fingerprint card said \"Use\" for the same reason."
+            },
+            {
+              "type": "p",
+              "text": "All three hid from the check that looks for untranslated text, each in its own way. A label decorated with an arrow carries too few words to read as a sentence and too many pieces to read as a single word, so it fell between two rules. A sentence ending in a spacing expression looks like code, because the braces and quotes that space it belong to the renderer rather than the reader. The check now strips the decoration and the spacing before deciding, and both labels would have been caught the day they were written."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.9",
       "date": "2026-09-25",
       "entries": [

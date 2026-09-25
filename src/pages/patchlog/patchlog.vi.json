@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.2.10",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "last-english-labels",
+          "title": "Những chữ tiếng Anh cuối cùng còn trên màn hình",
+          "lead": "Ba nhãn còn tiếng Anh vì phép kiểm tra không nhận ra hình dạng của chúng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Màn hình chọn tiện ích khi thư viện còn trống báo rằng chưa có gì, kèm một đường dẫn mời thêm vào, cả hai đều bằng tiếng Anh. Ai có thư viện trống đều gặp màn hình đó trong trình sửa hồ sơ, nên với một máy mới cài thì đây là chữ tiếng Anh đầu tiên người ta đọc. Nút trên mỗi thẻ vân tay ghi \"Use\" cũng vì lý do tương tự."
+            },
+            {
+              "type": "p",
+              "text": "Cả ba đều lọt khỏi phép kiểm tra tìm chữ chưa dịch, mỗi cái theo một cách riêng. Một nhãn có mũi tên trang trí thì quá ít từ để bị coi là câu, lại quá nhiều thành phần để bị coi là một từ, nên rơi vào giữa hai quy tắc. Một câu kết thúc bằng biểu thức tạo khoảng trắng thì trông như mã, bởi dấu ngoặc và dấu nháy ở đó dành cho bộ kết xuất chứ không dành cho người đọc. Giờ phép kiểm tra bỏ phần trang trí và phần khoảng trắng ra trước khi phán xét, nên cả hai nhãn đã bị bắt ngay từ ngày được viết ra."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.9",
       "date": "2026-09-25",
       "entries": [

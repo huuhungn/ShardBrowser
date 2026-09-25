@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.2.10
+
+### Fixed
+
+- The last two English labels in the interface, both in the extension picker's
+  empty state: the line saying the library holds nothing yet, and the link that
+  offers to add one. Anyone whose library is empty opens the profile editor and
+  reads them, so on a fresh install they were the first English on the screen.
+- A button on each fingerprint card that still read "Use" in English. It sat on
+  a screen that was otherwise translated, which made it look like a mistake
+  rather than a choice.
+- The check for untranslated interface text now sees two shapes it used to walk
+  past: a label decorated with an arrow, and a sentence whose trailing spacing
+  expression made the line look like code to the check. Both labels above hid in
+  exactly those blind spots, so each fix came with the rule that would have
+  caught it.
+
 ## v2.2.9
 
 ### Fixed
