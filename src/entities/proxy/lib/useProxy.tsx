@@ -211,7 +211,7 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         } catch (e) { toast.err(safeUiError(e)); }
     },
     removeProxy: async (id) => {
-        if ((await confirmModal({ title: t("proxy.deleteProxy"), message: "Delete this proxy?", danger: true })) !== true) return;
+        if ((await confirmModal({ title: t("proxy.deleteProxy"), message: t("proxy.deleteAskThis"), danger: true })) !== true) return;
         try { await proxyDelete(id); get().reload(); storeBus.emit('proxies'); toast.ok(t("proxy.proxyDeleted")); }
         catch (e) { toast.err(safeUiError(e)); }
     },

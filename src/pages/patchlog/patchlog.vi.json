@@ -763,14 +763,14 @@
         },
         {
           "id": "data-location",
-          "title": "Vị trí dữ liệu hồ sơ",
+          "title": "Nơi lưu dữ liệu hồ sơ",
           "lead": "Di chuyển hồ sơ, tiện ích mở rộng và thùng rác sang thư mục hoặc ổ đĩa khác.",
           "tag": "new",
           "scope": "launcher",
           "blocks": [
             {
               "type": "p",
-              "text": "**Cài đặt → Vị trí dữ liệu hồ sơ** → *Thay đổi…* rồi chọn một thư mục trên bất kỳ ổ đĩa nào. Khi di chuyển, thanh tiến trình sẽ hiển thị; không có gì trong thư mục cũ bị xóa cho đến khi mọi tệp đã được chuyển đến và kiểm tra xong, vì vậy nếu thất bại giữa chừng, mọi thứ vẫn nguyên trạng."
+              "text": "**Cài đặt → Nơi lưu dữ liệu hồ sơ** → *Đổi chỗ…* rồi chọn một thư mục trên bất kỳ ổ đĩa nào. Khi di chuyển, thanh tiến trình sẽ hiển thị; không có gì trong thư mục cũ bị xóa cho đến khi mọi tệp đã được chuyển đến và kiểm tra xong, vì vậy nếu thất bại giữa chừng, mọi thứ vẫn nguyên trạng."
             },
             {
               "type": "p",
@@ -784,14 +784,14 @@
         },
         {
           "id": "extra-args",
-          "title": "Đối số khởi chạy bổ sung",
+          "title": "Tham số khởi chạy thêm",
           "lead": "Các switch được thêm vào mỗi lần khởi chạy hồ sơ.",
           "tag": "new",
           "scope": "launcher",
           "blocks": [
             {
               "type": "p",
-              "text": "**Cài đặt → Đối số khởi chạy bổ sung**, mỗi dòng một đối số hoặc cách nhau bằng dấu cách; hãy đặt trong dấu ngoặc kép nếu giá trị chứa khoảng trắng. Chúng được áp dụng sau cùng, nên switch ở đây cũng ghi đè switch của launcher."
+              "text": "**Cài đặt → Tham số khởi chạy thêm**, mỗi dòng một đối số hoặc cách nhau bằng dấu cách; hãy đặt trong dấu ngoặc kép nếu giá trị chứa khoảng trắng. Chúng được áp dụng sau cùng, nên switch ở đây cũng ghi đè switch của launcher."
             },
             {
               "type": "note",

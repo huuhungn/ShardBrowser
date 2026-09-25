@@ -427,7 +427,7 @@ export const useProfile = create<ProfileStore>((set, get) => ({
   remove: async (id) => {
     if ((await confirmModal({
       title: t("profile.deleteProfile"),
-      message: "Move this profile to the trash? It can be restored there for 7 days.",
+      message: t("profile.trashAskThis"),
       danger: true,
     })) !== true) return;
     try {
