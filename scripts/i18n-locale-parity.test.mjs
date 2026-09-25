@@ -957,15 +957,37 @@ test("every interface path the patch log quotes is a real label", () => {
     const locale = JSON.parse(readFileSync(join(localeDir, localeFile), "utf8"));
     const known = new Set(Object.values(locale).map((v) => String(v)));
 
+    // A path written mid-sentence ("read it under Settings → Language") leaves
+    // the lead-in attached to the first segment and any tail attached to the
+    // last. Those two ends may carry prose; the segments between arrows may
+    // not. So narrow the outer ends to the longest label they end/begin with,
+    // and hold the inner segments to an exact match.
+    const narrow = (seg, take) => {
+      const words = seg.split(/\s+/).filter(Boolean);
+      for (let i = 0; i < words.length; i += 1) {
+        const candidate = take === "suffix"
+          ? words.slice(i).join(" ")
+          : words.slice(0, words.length - i).join(" ");
+        // A path that continues into a clause ("… → Language, which is new")
+        // leaves the comma glued to the label.
+        const trimmed = candidate.replace(/[.,;:!?]+$/, "").trim();
+        if (known.has(trimmed)) return trimmed;
+      }
+      return seg;
+    };
+
     for (const text of texts(log)) {
       for (const run of text.match(ARROW_PATH) ?? []) {
         const segs = segments(run);
         // An arrow can also join two plain words ("old → new"), so only treat a
         // run as a menu path once at least one segment is a real label.
-        if (!segs.some((s) => known.has(s))) continue;
-        for (const s of segs) {
-          if (!known.has(s)) problems.push(`${lang}: "${s}" in ${run.trim()}`);
-        }
+        if (!segs.some((s, i) => known.has(s) || known.has(narrow(s, i === 0 ? "suffix" : "prefix"))))
+          continue;
+        segs.forEach((s, i) => {
+          const resolved =
+            i === 0 ? narrow(s, "suffix") : i === segs.length - 1 ? narrow(s, "prefix") : s;
+          if (!known.has(resolved)) problems.push(`${lang}: "${resolved}" in ${run.trim()}`);
+        });
       }
     }
   }
@@ -984,16 +1006,30 @@ test("every interface path the patch log quotes is a real label", () => {
   const enLocale = JSON.parse(readFileSync(join(localeDir, "en.json"), "utf8"));
   const viLocale = JSON.parse(readFileSync(join(localeDir, "vi.json"), "utf8"));
   const keyByEnglish = new Map(Object.entries(enLocale).map(([k, v]) => [String(v), k]));
+  const keyByViet = new Map(Object.entries(viLocale).map(([k, v]) => [String(v), k]));
 
   const drifted = [];
   for (const [ri, r] of logEnPaths.releases.entries()) {
     for (const [ei, e] of r.entries.entries()) {
-      const key = keyByEnglish.get(e.title);
-      if (!key) continue; // a title that is not a label is free prose
-      const want = viLocale[key];
       const got = logViPaths.releases[ri].entries[ei].title;
-      if (typeof want === "string" && want !== got) {
-        drifted.push(`${r.version} ${e.id}: "${got}" should be "${want}" (${key})`);
+      const key = keyByEnglish.get(e.title);
+      if (key) {
+        const want = viLocale[key];
+        if (typeof want === "string" && want !== got) {
+          drifted.push(`${r.version} ${e.id}: "${got}" should be "${want}" (${key})`);
+        }
+        continue;
+      }
+      // The lookup above starts from English, so renaming the English label
+      // makes it miss and the pair goes unchecked in silence — exactly the
+      // failure the Vietnamese side just had. Come back from the Vietnamese
+      // title: if that one still names a card, the English title is the half
+      // that drifted.
+      const viKey = keyByViet.get(got);
+      if (viKey && enLocale[viKey] !== e.title) {
+        drifted.push(
+          `${r.version} ${e.id}: English title "${e.title}" should be "${enLocale[viKey]}" (${viKey})`,
+        );
       }
     }
   }

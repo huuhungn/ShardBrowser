@@ -3,6 +3,80 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.2.8",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "vietnamese-interface",
+          "title": "The launcher speaks Vietnamese",
+          "lead": "Every screen, menu and message can now be read in Vietnamese, chosen once under Settings → Language.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The interface text used to live in the code, which meant it could only ever be English. It now comes from a translation file, and Settings → Language switches between English and Vietnamese. The choice is remembered across restarts."
+            },
+            {
+              "type": "p",
+              "text": "The language you read the launcher in is not part of a browser's fingerprint. Switching it changes nothing a site can see, and nothing about a profile."
+            }
+          ]
+        },
+        {
+          "id": "errors-in-your-language",
+          "title": "Failures explain themselves in your language",
+          "lead": "A profile that would not start used to answer in English even with the interface set to Vietnamese.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Those sentences were written where the work happens — deep in the engine — and passed to the screen already finished, so translating the interface left them untouched. The engine now reports what went wrong and the interface writes the sentence, which is the only arrangement where both languages can say the same thing."
+            },
+            {
+              "type": "p",
+              "text": "About twenty groups moved across: profiles that will not start, proxies, extensions, backups, cookies, the database, the automation runner, the graphics probe, and engine download and migration."
+            },
+            {
+              "type": "p",
+              "text": "Twelve messages also carried an internal marker next to the text. It told you nothing and pushed the useful part out of view; it is gone."
+            }
+          ]
+        },
+        {
+          "id": "labels-that-hid",
+          "title": "The last English labels are translated",
+          "lead": "Three profile-menu items, two confirmations and one Settings button stayed English longer than the rest.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The check that hunts for untranslated text looked for sentences, and a label is not a sentence. One ending in an ellipsis, a question ending in a question mark, and a button whose whole label is one word all slipped past it — including the Change… button under Settings → Profile data location, which was the last English control on that screen."
+            },
+            {
+              "type": "p",
+              "text": "Those are translated, and the check now recognises a label by its shape rather than by counting words."
+            }
+          ]
+        },
+        {
+          "id": "patch-log-paths",
+          "title": "The patch log points at what is really on screen",
+          "lead": "Four click paths here named Settings cards by a name the interface never used.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "These notes are written by hand, so a card renamed in the interface left the instruction behind, pointing at something you could not find. The wording is corrected, and a test now reads every path in this log and refuses one that names a card which does not exist — in either language."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.7",
       "date": "2026-09-18",
       "entries": [
