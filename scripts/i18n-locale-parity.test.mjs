@@ -455,8 +455,13 @@ function englishInSource(src) {
 // that claimed to be finished: the text never appears as a JSX child, only as
 // a value in a table the component maps over. Menus, filter options, confirm
 // dialogs and file pickers are all built this way, so they get their own check.
+// The trailing `…` of a menu entry that opens a dialog ("Move to folder…") is
+// part of the label, so it has to be inside the character class: without it the
+// pattern stopped one character short of the closing quote and matched nothing,
+// which is how three hardcoded entries sat in the profile menu between two
+// translated ones.
 const PROSE_PROP =
-  /\b(label|title|placeholder|heading|confirmLabel|cancelLabel|emptyText|message)\s*:\s*"([A-Z][A-Za-z0-9 ,.'()/-]{2,})"/g;
+  /\b(label|title|placeholder|heading|confirmLabel|cancelLabel|emptyText|message)\s*:\s*"([A-Z][A-Za-z0-9 ,.'()/…-]{2,})"/g;
 
 function englishInProps(src) {
   const out = [];
