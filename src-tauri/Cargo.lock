@@ -4538,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "shardx-launcher"
-version = "2.2.8"
+version = "2.2.9"
 dependencies = [
  "ab_glyph",
  "aes",
