@@ -232,6 +232,34 @@ test("choosing a language translates what has been moved into locales", async ({
   await expect(page.getByText(/settings\.[a-z]+\./)).toHaveCount(0);
 });
 
+test("the profile row menu opens in Vietnamese", async ({ page }) => {
+  // These three entries were hardcoded English long after the rest of the row
+  // moved into locales/, because the scan that guards labels could not see a
+  // string ending in "…". The menu is built on click, so only opening it proves
+  // the keys are wired — reading the locale file proves nothing.
+  await gotoMocked(page);
+  await page.getByRole("button", { name: "Settings" }).click();
+  const picker = page.getByRole("combobox", { name: "Language" });
+  await picker.click();
+  await page.getByRole("option", { name: "Tiếng Việt" }).click();
+
+  await page.getByRole("button", { name: "Trình duyệt" }).click();
+  const row = page.getByText("VN Automation 001 - No Proxy");
+  await expect(row).toBeVisible();
+
+  await page.getByRole("button", { name: /Thêm thao tác cho hồ sơ/ }).first().click();
+
+  const menu = page.getByRole("button", { name: "Chuyển vào thư mục…", exact: true });
+  await expect(menu).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sao lưu (đã mã hoá)…", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Khôi phục từ bản sao lưu…", exact: true })).toBeVisible();
+
+  // And nothing beside them is still English.
+  await expect(page.getByText("Move to folder…")).toHaveCount(0);
+  await expect(page.getByText("Back up (encrypted)…")).toHaveCount(0);
+  await expect(page.getByText("Restore from backup…")).toHaveCount(0);
+});
+
 test("startup setting registers the Launcher while MCP stays client-spawned", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Settings" }).click();

@@ -426,6 +426,25 @@ function englishInSource(src) {
     ) {
       found.push(bare);
     }
+    // The rule above wants three words, so a one-word button sitting alone on
+    // its line ("Change…") was invisible — that is how the only English control
+    // on the settings screen survived. A single capitalised word is ambiguous by
+    // nature, so require the shape of a control: at least four letters, or a
+    // trailing ellipsis marking a button that opens a dialog. That admits
+    // "Change…" and "Reveal" while leaving the swatch glyph "A" alone.
+    if (
+      !/[=(){}"`$;:[\]<>]/.test(bare) &&
+      !bare.endsWith(",") &&
+      !/^[a-z]+[A-Z]/.test(bare) &&
+      /^[A-Z]/.test(bare) &&
+      !bare.includes(" ") &&
+      /^[A-Za-z][A-Za-z'’-]*(?:…|\.\.\.)?$/.test(bare) &&
+      (/…$|\.\.\.$/.test(bare) || /^[A-Za-z'’-]{4,}$/.test(bare)) &&
+      !PRODUCT_NAME.test(bare) &&
+      !KEPT_ENGLISH.test(bare)
+    ) {
+      found.push(bare);
+    }
     // Prose that is returned or assigned rather than rendered: `return "Could
     // not save"`, `=> "Remove this proxy"`, `const msg = "Nothing to import"`.
     // The bare-line rule above cannot see these, because it rejects any line
@@ -459,9 +478,14 @@ function englishInSource(src) {
 // part of the label, so it has to be inside the character class: without it the
 // pattern stopped one character short of the closing quote and matched nothing,
 // which is how three hardcoded entries sat in the profile menu between two
-// translated ones.
+// translated ones. The same silent failure hid two confirm messages behind a
+// closing `?`, so the class now also carries the punctuation a sentence or a
+// status label actually ends on: `?`, `!`, `:`, `;`, an arrow, a dash, `&`.
+// Every character here is ASCII on purpose. English prose has no diacritics, so
+// leaving them out is what keeps the language picker ("Tiếng Việt", "Türkçe")
+// from being reported as untranslated English.
 const PROSE_PROP =
-  /\b(label|title|placeholder|heading|confirmLabel|cancelLabel|emptyText|message)\s*:\s*"([A-Z][A-Za-z0-9 ,.'()/…-]{2,})"/g;
+  /\b(label|title|placeholder|heading|confirmLabel|cancelLabel|emptyText|message)\s*:\s*"([A-Z][A-Za-z0-9 ,.:;?!&%+—–→·'()/…-]{2,})"/g;
 
 function englishInProps(src) {
   const out = [];
@@ -889,4 +913,93 @@ test("the patch log carries the same releases in both languages", () => {
   }
   assert.deepEqual(missing, [], "these blocks lost their text in Vietnamese");
   assert.deepEqual(untranslated, [], "these blocks are still in English");
+});
+
+test("every interface path the patch log quotes is a real label", () => {
+  // The log tells people where to click ("Thư viện → Tiện ích"). Nothing links
+  // that prose to the sidebar, so retranslating a label silently turns the
+  // instruction into a lie — which is how two paths ended up naming settings
+  // cards that do not exist in Vietnamese. Check each segment against the
+  // locale it is written in.
+  const logDir = join(here, "..", "src", "pages", "patchlog");
+  const localeDir = join(here, "..", "src", "shared", "i18n", "locales");
+  const pairs = [
+    ["en", "patchlog.json", "en.json"],
+    ["vi", "patchlog.vi.json", "vi.json"],
+  ];
+
+  // A run of segments joined by arrows; emphasis around a segment is markdown,
+  // not part of the label.
+  const ARROW_PATH = /(?:\*{1,2}|_)?[^*_`→\n]+(?:\s*→\s*(?:\*{1,2}|_)?[^*_`→\n]+(?:\*{1,2}|_)?)+/g;
+  const segments = (run) =>
+    run
+      .split("→")
+      .map((s) =>
+        s
+          .replace(/[*_]+/g, "")
+          .replace(/[`"“”]/g, "")
+          .trim()
+          .replace(/[.,;:!?]+$/, "")
+          .trim(),
+      )
+      .filter(Boolean);
+
+  const texts = (node, out = []) => {
+    if (typeof node === "string") out.push(node);
+    else if (Array.isArray(node)) node.forEach((v) => texts(v, out));
+    else if (node && typeof node === "object") Object.values(node).forEach((v) => texts(v, out));
+    return out;
+  };
+
+  const problems = [];
+  for (const [lang, logFile, localeFile] of pairs) {
+    const log = JSON.parse(readFileSync(join(logDir, logFile), "utf8"));
+    const locale = JSON.parse(readFileSync(join(localeDir, localeFile), "utf8"));
+    const known = new Set(Object.values(locale).map((v) => String(v)));
+
+    for (const text of texts(log)) {
+      for (const run of text.match(ARROW_PATH) ?? []) {
+        const segs = segments(run);
+        // An arrow can also join two plain words ("old → new"), so only treat a
+        // run as a menu path once at least one segment is a real label.
+        if (!segs.some((s) => known.has(s))) continue;
+        for (const s of segs) {
+          if (!known.has(s)) problems.push(`${lang}: "${s}" in ${run.trim()}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    problems,
+    [],
+    `these interface paths name labels that do not exist:\n  ${problems.join("\n  ")}`,
+  );
+
+  // An entry title often is the card it describes ("Extra launch arguments"),
+  // and then the Vietnamese title has to be that card's Vietnamese name rather
+  // than a fresh translation of the same words. The arrow check above cannot see
+  // these, because a title carries no arrow — which is how two of them drifted.
+  const logEnPaths = JSON.parse(readFileSync(join(logDir, "patchlog.json"), "utf8"));
+  const logViPaths = JSON.parse(readFileSync(join(logDir, "patchlog.vi.json"), "utf8"));
+  const enLocale = JSON.parse(readFileSync(join(localeDir, "en.json"), "utf8"));
+  const viLocale = JSON.parse(readFileSync(join(localeDir, "vi.json"), "utf8"));
+  const keyByEnglish = new Map(Object.entries(enLocale).map(([k, v]) => [String(v), k]));
+
+  const drifted = [];
+  for (const [ri, r] of logEnPaths.releases.entries()) {
+    for (const [ei, e] of r.entries.entries()) {
+      const key = keyByEnglish.get(e.title);
+      if (!key) continue; // a title that is not a label is free prose
+      const want = viLocale[key];
+      const got = logViPaths.releases[ri].entries[ei].title;
+      if (typeof want === "string" && want !== got) {
+        drifted.push(`${r.version} ${e.id}: "${got}" should be "${want}" (${key})`);
+      }
+    }
+  }
+  assert.deepEqual(
+    drifted,
+    [],
+    `these entry titles name a card but not by its real name:\n  ${drifted.join("\n  ")}`,
+  );
 });

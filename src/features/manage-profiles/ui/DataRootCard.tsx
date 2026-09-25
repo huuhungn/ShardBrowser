@@ -97,7 +97,7 @@ export function DataRootCard() {
             leftIcon={<FolderIcon className="size-4" />}
             onClick={move}
           >
-            Change…
+            {t("dataRoot.change")}
           </Button>
         </div>
       </label>
