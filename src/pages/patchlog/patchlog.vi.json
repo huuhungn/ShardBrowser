@@ -608,8 +608,8 @@
               "type": "list",
               "items": [
                 "**Autofill** — một trường là gì: tên, năm sinh hay giới tính.",
-                "**The accessibility tree** — phần tử có còn tồn tại hay không, nằm ở đâu và có được hiển thị hay không. Dữ liệu được đọc mới nhiều lần trong những giây đầu tiên của một bước và được đối chiếu theo ID phần tử thay vì vị trí, vì hai bước của cùng một quy trình đăng ký có thể chiếm cùng một vùng chữ nhật.",
-                "**Focus after the click** — lượt nhấp có trúng đích hay không. Không có thành phần nào trong tiến trình trình duyệt biết nội dung nào được vẽ đè lên nội dung nào, nên nếu một phần tử khác nhận focus, trường đó sẽ bị bỏ qua thay vì gõ một cách mù quáng."
+                "**Cây trợ năng** — phần tử có còn tồn tại hay không, nằm ở đâu và có được hiển thị hay không. Dữ liệu được đọc mới nhiều lần trong những giây đầu tiên của một bước và được đối chiếu theo ID phần tử thay vì vị trí, vì hai bước của cùng một quy trình đăng ký có thể chiếm cùng một vùng chữ nhật.",
+                "**Tiêu điểm sau khi nhấp** — lượt nhấp có trúng đích hay không. Không có thành phần nào trong tiến trình trình duyệt biết nội dung nào được vẽ đè lên nội dung nào, nên nếu một phần tử khác nhận focus, trường đó sẽ bị bỏ qua thay vì gõ một cách mù quáng."
               ]
             },
             {
@@ -682,7 +682,7 @@
             },
             {
               "type": "p",
-              "text": "Khi để ở chế độ **Auto**, biểu tượng lấy màu từ tên — cùng một hồ sơ luôn có cùng một màu, đồng thời các hồ sơ vẫn có thể được phân biệt ở kích thước 32 px — còn pill giữ màu thanh công cụ của chính trình duyệt và thay đổi theo theme."
+              "text": "Khi để ở chế độ **Tự động**, biểu tượng lấy màu từ tên — cùng một hồ sơ luôn có cùng một màu, đồng thời các hồ sơ vẫn có thể được phân biệt ở kích thước 32 px — còn pill giữ màu thanh công cụ của chính trình duyệt và thay đổi theo theme."
             },
             {
               "type": "note",
@@ -692,22 +692,22 @@
         },
         {
           "id": "extensions",
-          "title": "Thư viện extension",
-          "lead": "Thêm extension một lần, sau đó chọn riêng cho từng hồ sơ.",
+          "title": "Thư viện tiện ích",
+          "lead": "Thêm tiện ích một lần, sau đó chọn riêng cho từng hồ sơ.",
           "tag": "new",
           "scope": "launcher",
           "blocks": [
             {
               "type": "p",
-              "text": "**Library → Extensions** → *From link*: cung cấp địa chỉ Web Store để extension tự tải xuống. Chỉ dán id trong địa chỉ cũng được, cũng như dùng liên kết trực tiếp tới tệp `.crx` hoặc `.zip`. Bạn cũng có thể thêm một tệp hoặc một thư mục đã giải nén theo cách tương tự."
+              "text": "**Thư viện → Tiện ích** → *Từ liên kết*: cung cấp địa chỉ Web Store để tiện ích tự tải xuống. Chỉ dán id trong địa chỉ cũng được, cũng như dùng liên kết trực tiếp tới tệp `.crx` hoặc `.zip`. Bạn cũng có thể thêm một tệp hoặc một thư mục đã giải nén theo cách tương tự."
             },
             {
               "type": "p",
-              "text": "Mỗi extension hiển thị tên, phiên bản, mô tả và biểu tượng được đọc từ chính extension đó — vì vậy nội dung hiển thị trong lưới chính là nội dung trình duyệt sẽ tải. Trong trình chỉnh sửa hồ sơ, chúng xuất hiện dưới dạng các thẻ: đánh dấu những extension hồ sơ này cần chạy; mỗi hồ sơ có thể mang một bộ extension khác nhau."
+              "text": "Mỗi tiện ích hiển thị tên, phiên bản, mô tả và biểu tượng được đọc từ chính tiện ích đó — vì vậy nội dung hiển thị trong lưới chính là nội dung trình duyệt sẽ tải. Trong trình chỉnh sửa hồ sơ, chúng xuất hiện dưới dạng các thẻ: đánh dấu những tiện ích hồ sơ này cần chạy; mỗi hồ sơ có thể mang một bộ tiện ích khác nhau."
             },
             {
               "type": "note",
-              "text": "Khi xóa một extension khỏi thư viện, mọi hồ sơ sẽ ngừng tải extension đó từ lần khởi chạy tiếp theo; hồ sơ chỉ giữ một tham chiếu, không giữ bản sao."
+              "text": "Khi xóa một tiện ích khỏi thư viện, mọi hồ sơ sẽ ngừng tải tiện ích đó từ lần khởi chạy tiếp theo; hồ sơ chỉ giữ một tham chiếu, không giữ bản sao."
             },
             {
               "type": "note",
@@ -724,7 +724,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "**Library → Bookmarks**: thêm một trang web rồi chọn thư mục. Từ lần khởi chạy tiếp theo, mọi hồ sơ trong thư mục đó sẽ có trang web này trong thư mục trên thanh dấu trang mang tên **ShardX**. Không liên kết với thư mục nào đồng nghĩa áp dụng cho mọi hồ sơ."
+              "text": "**Thư viện → Dấu trang**: thêm một trang web rồi chọn thư mục. Từ lần khởi chạy tiếp theo, mọi hồ sơ trong thư mục đó sẽ có trang web này trong thư mục trên thanh dấu trang mang tên **ShardX**. Không liên kết với thư mục nào đồng nghĩa áp dụng cho mọi hồ sơ."
             },
             {
               "type": "p",
@@ -892,7 +892,7 @@
             },
             {
               "type": "note",
-              "text": "`true` bật một vector với cường độ mà giao diện sử dụng; một khối đầy đủ sẽ đặt các chi tiết. Vector bạn bỏ qua sẽ vẫn tắt. Đối số tương tự cũng được chuyển đến máy chủ MCP đi kèm dưới dạng `noise` của `create_temporary_profile`."
+              "text": "Hãy bỏ `seed` đi. Hai hồ sơ tạm thời tạo cách nhau một giây vẫn nhận vân tay khác nhau."
             }
           ]
         },

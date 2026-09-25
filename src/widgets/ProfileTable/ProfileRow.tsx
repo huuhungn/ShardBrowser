@@ -59,7 +59,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
     { label: t("common.clone"), onClick: () => cloneProfile(p.id) },
     { label: p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop"), onClick: () => togglePin(p) },
     { sep: true, label: "", onClick: () => {} },
-    { label: "Move to folder…", onClick: () => setFolderModal({ profileId: p.id }) },
+    { label: t("profileTable.moveToFolder"), onClick: () => setFolderModal({ profileId: p.id }) },
     ...(p.folder
       ? [{ label: t("profileTable.removeFromFolder"), onClick: () => setProfileFolder(p.id, "") }]
       : []),
@@ -68,12 +68,12 @@ export function ProfileRow({ profile, proxy, onMenu }: {
     // open while it runs. Showing them greyed with the reason beats letting
     // someone click and only then be told to stop the profile.
     {
-      label: "Back up (encrypted)…",
+      label: t("profileTable.backUpEncrypted"),
       onClick: () => backupProfile(p),
       disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
     },
     {
-      label: "Restore from backup…",
+      label: t("profileTable.restoreFromBackup"),
       onClick: () => restoreProfile(p),
       disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
     },
