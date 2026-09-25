@@ -443,7 +443,12 @@ function englishInSource(src) {
     // continuation line starts lowercase and ends mid-sentence. Strip the
     // inline tags and look at what is left — if the line is only words and
     // punctuation, with nothing a compiler would read, it is a sentence.
-    const bare = s.replace(/<\/?(?:strong|em|b|i|code|span|br)\s*\/?>/g, "").trim();
+    // A trailing JSX space expression -- `yet.{" "}` -- puts `{`, `}` and a
+    // quote on the line, and every rule below reads those as code. It is
+    // punctuation for the renderer, not for the reader: drop it first, so a
+    // sentence that wraps into a sibling tag is still a sentence here.
+    const spaced = s.replace(/\{"\s*"\}\s*$/, "").trim();
+    const bare = spaced.replace(/<\/?(?:strong|em|b|i|code|span|br)\s*\/?>/g, "").trim();
     // A trailing comma means this is an import list or a destructured set of
     // props wrapped across lines, not a sentence. Sentences also start with a
     // capital and contain a space; identifier lists rarely do both.
@@ -512,7 +517,10 @@ function englishInSource(src) {
       undecorated !== bare &&
       !/[=(){}"`$;[\]<]/.test(bare) &&
       !/^[a-z]+[A-Z]/.test(undecorated) &&
-      /^[A-Za-z][A-Za-z'’]{2,}$/.test(undecorated) &&
+      // One word was too strict: `Add one ->` carries two, so it slipped past
+      // this rule and the three-word rule at once. Admit a short phrase,
+      // which is what a decorated control actually reads like.
+      /^[A-Za-z][A-Za-z'’]{2,}(?: [A-Za-z][A-Za-z'’]*){0,2}$/.test(undecorated) &&
       !PRODUCT_NAME.test(undecorated) &&
       !KEPT_ENGLISH.test(undecorated) &&
       !PROTOCOL_TOKEN.test(undecorated) &&

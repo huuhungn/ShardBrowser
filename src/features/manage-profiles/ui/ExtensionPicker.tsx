@@ -55,13 +55,13 @@ export function ExtensionPicker({
   if (items.length === 0) {
     return (
       <p className="m-0 text-paragraph-xs text-text-soft-400">
-        No extensions in the library yet.{" "}
+        {t("ext.libraryEmptyInline")}{" "}
         <button
           type="button"
           className="text-primary-base hover:underline"
           onClick={() => go("extensions")}
         >
-          Add one →
+          {t("ext.addOne")}
         </button>
       </p>
     );
