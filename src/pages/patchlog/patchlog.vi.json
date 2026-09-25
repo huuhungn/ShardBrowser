@@ -1,6 +1,63 @@
 {
   "releases": [
     {
+      "version": "2.2.9",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "badge-labels-translated",
+          "title": "Những nhãn nhỏ không ai đọc được bằng tiếng Việt",
+          "lead": "Bốn nhãn nhỏ vẫn giữ tiếng Anh qua một bản phát hành đã dịch mọi màn hình quanh chúng.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Nhãn API ở thanh bên, dấu phiên bản và nhãn đã chốt ở trang lịch sử bản vá được viết thẳng vào mã thay vì đọc từ tệp dịch. Chúng ngắn đến mức các bước kiểm tìm chữ chưa dịch đi ngang qua mà không thấy, nên chúng giữ nguyên tiếng Anh trong khi mọi màn hình quanh chúng đã đổi ngôn ngữ."
+            },
+            {
+              "type": "p",
+              "text": "Nhãn phân loại của từng mục giờ cũng đọc ra thành chữ. Màu của chúng vẫn lấy từ giá trị lưu cùng mục, nên dịch nhãn chỉ đổi điều bạn đọc chứ không đổi điều bạn thấy."
+            }
+          ]
+        },
+        {
+          "id": "guard-reads-short-labels",
+          "title": "Bước kiểm đi ngang qua chính điểm mù của nó",
+          "lead": "Một nhãn phải mở đầu bằng chữ hoa và đứng riêng một dòng mới được để ý. Nhãn viết thường không đạt cả hai.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Một luật đòi chữ hoa mở đầu, nên một từ viết thường như dấu phiên bản ở trang lịch sử bản vá hoàn toàn vô hình với nó. Luật còn lại đòi có hai ký tự trước khi đoạn chữ bắt đầu, nên một nhãn nằm giữa hai thẻ trên cùng một dòng cũng lọt qua. Cả hai luật đều đang tìm văn xuôi và không thấy gì để khớp."
+            },
+            {
+              "type": "p",
+              "text": "Một từ ngắn viết thường vốn đã nhập nhằng: nó đọc y như nhau dù là nhãn cho người đọc hay một tuỳ chọn mã truyền đi. Điều phân biệt chúng là vị trí, nên bước kiểm giờ đọc dòng phía trên để tách nhãn khỏi tuỳ chọn, và giữ một danh sách những từ mang nghĩa như nhau trong mọi ngôn ngữ."
+            }
+          ]
+        },
+        {
+          "id": "release-upload-retry",
+          "title": "Một lần tải lên chậm không còn làm đổ bản phát hành đã xong",
+          "lead": "Bản 2.2.7 đã đăng đủ cả hai mươi tệp mà vẫn báo thất bại.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Một tệp nghẽn 148 giây trong một bước dài 197 giây, và lượt chạy báo lỗi sau khi bản phát hành đã hoàn tất. Cùng bộ tệp đó chỉ mất 3,4 giây ở bản kế tiếp, đó mới là dáng của một lần tải lên khoẻ mạnh và là điều khiến lần thất bại trước đáng đọc lại lần nữa."
+            },
+            {
+              "type": "p",
+              "text": "Việc tải lên giờ được thử lần thứ hai khi lần đầu thất bại, và phiên bản công cụ làm việc đó được ghi lại chính xác thay vì đi theo nó khi nó dịch chuyển. Lần thử thứ hai ghi đè phần lần đầu gửi được, nên không có tệp nào lên hai lần, và một bản phát hành thật sự không đăng được thì vẫn báo thất bại."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.8",
       "date": "2026-09-25",
       "entries": [

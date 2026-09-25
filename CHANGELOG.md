@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.2.9
+
+### Fixed
+
+- Four small labels that stayed English through a release that translated every
+  screen around them: the sidebar's API pill, the patch log's version marker and
+  its locked badge, and the tags on each patch log entry. They were written into
+  the code rather than read from a translation file. An entry tag's colour still
+  comes from the value stored with the entry, so translating the label changes
+  what you read without changing what you see.
+- The check for untranslated interface text no longer walks past short labels.
+  One rule wanted a leading capital, so a lowercase badge was invisible to it;
+  another wanted two letters before the text began, so a pill sitting between
+  its tags on one line slipped through. The check now reads the line above to
+  tell a label someone reads from a setting the code passes along.
+- A slow asset upload no longer fails a release that already published. Version
+  2.2.7 uploaded all twenty of its files and still reported failure: one file
+  stalled for 148 seconds of a 197 second step, and the error arrived after the
+  work was done. The upload is now retried once, and the action that performs it
+  is pinned to an exact revision rather than a moving tag. A retry replaces what
+  the first attempt sent, so nothing uploads twice, and a release that genuinely
+  cannot publish still reports failure.
+
 ## v2.2.8
 
 ### Added

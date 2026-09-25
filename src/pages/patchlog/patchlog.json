@@ -3,6 +3,63 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.2.9",
+      "date": "2026-09-25",
+      "entries": [
+        {
+          "id": "badge-labels-translated",
+          "title": "The badges nobody could read in Vietnamese",
+          "lead": "Four small labels stayed English through a release that translated every screen around them.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The sidebar's API pill, the patch log's version marker and its locked badge were written straight into the code rather than read from a translation file. They were short enough that the checks looking for untranslated text walked past them, so they kept their English while the screens around them changed language."
+            },
+            {
+              "type": "p",
+              "text": "The entry tags now read as words too. Their colour still comes from the value stored with the entry, so translating the label changes what you read without changing what you see."
+            }
+          ]
+        },
+        {
+          "id": "guard-reads-short-labels",
+          "title": "The check that walked past its own blind spot",
+          "lead": "A label had to start with a capital and stand on its own line to be noticed. Lowercase badges did neither.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "One rule wanted a leading capital, so a lowercase word like the patch log's version marker was invisible to it. Another wanted two letters before the text began, so a pill sitting between its tags on a single line slipped through as well. Both rules were looking for prose and found nothing to match."
+            },
+            {
+              "type": "p",
+              "text": "A short lowercase word is ambiguous by nature: it reads the same whether it is a label someone reads or a setting the code passes along. What separates them is where they sit, so the check now reads the line above to tell a label from a setting, and keeps a list of words that mean the same thing in every language."
+            }
+          ]
+        },
+        {
+          "id": "release-upload-retry",
+          "title": "A slow upload no longer fails a finished release",
+          "lead": "Version 2.2.7 published every one of its twenty files and still reported failure.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "One file stalled for 148 seconds of a 197 second step and the run reported an error after the release was already complete. The same files took 3.4 seconds on the next version, which is what a healthy upload looks like and what made the earlier failure worth reading twice."
+            },
+            {
+              "type": "p",
+              "text": "The upload is now attempted a second time when the first one fails, and the version of the tool doing it is recorded exactly rather than followed as it moves. A second attempt replaces what the first one managed to send, so nothing is uploaded twice, and a release that genuinely cannot be published still reports failure."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.8",
       "date": "2026-09-25",
       "entries": [
