@@ -11,7 +11,7 @@ export function FingerprintCardActions({ entry }: { entry: FingerprintEntry }) {
   return (
     <>
       <Button variant="neutral" mode="stroke" size="2xsmall" onClick={() => useTemplate(entry.id)}>
-        Use →
+        {t("fp.useTemplate")}
       </Button>
       {entry.builtin ? (
         <Badge color="gray" variant="lighter" size="small" className="ml-auto">{t("fp.builtIn")}</Badge>
