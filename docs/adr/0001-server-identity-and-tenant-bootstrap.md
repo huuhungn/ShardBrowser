@@ -354,13 +354,16 @@ Settled by choosing Option A: the first owner is a **fresh v2 account**
 only the pre-activation meaning of `active_root_generation`. It does not
 approve a first-device issuer exception, implement the CLI, or clear G2.
 
-**Plan boundary.** Plan L1056 (section 7.3) lists the column but specifies
+**Plan boundary.** Plan L1056 (section 7.1) lists the column but specifies
 neither nullability nor an initial value. Plan L812–L819 requires creation of
 generation `0` as `PREPARING`, not `ACTIVE`, together with the exact
 self-grant, audit and idempotency response. Activation waits for readback,
 HPKE unwrap/key-ID verification and recovery readiness. L824–L828 also
 forbids using a PREPARING root for snapshots/fleet rotation. Choosing NULL
 is new ADR design; those ceremony requirements are already settled by S6.
+The pointer must still participate in the plan's instance boundary: root rows,
+grants and lookups are keyed by `server_instance_id` + `tenant_id` (L1071–L1073,
+L1095, L1101). A nullable generation number alone is not that boundary.
 
 **Recommendation.** Make the column nullable with no numeric default. Keep
 its non-negative `i64` range check for non-NULL values. NULL means **no
@@ -388,6 +391,12 @@ failure, not permission to repair the pointer silently.
 - `server/migrations/0004_v2_team_fleet.sql:38` rejects NULL and negative
   values. This proposal requires a forward migration; do not edit a shipped
   migration or instruct an operator to insert NULL into today's schema.
+- The frozen plan also requires `server_instance_id` in root-generation and
+  grant keys/FKs (L1071–L1073, L1095, L1101). The forward migration must add or
+  reconcile that composite boundary before this pointer can authorize any
+  root. It must cover the root rows, grants, activation lookup and every
+  downstream fleet/upload/snapshot reference; tenant-only compatibility is
+  not acceptable.
 - `server/src/generations.rs:69-89` reads the pointer as `i64` and uses it
   as the first generation number. The eventual bootstrap path must instead
   create exact generation `0` within the S6 transaction and distinguish a
@@ -443,9 +452,15 @@ or mismatched pointers; migration preserves child rows and legitimate ACTIVE
 tenants while refusing inconsistent ones. Add rotation coverage proving the
 pointer remains `N` until the atomic `N+1` activation (L824–L828, L943, L946).
 
-**Scope conclusion.** This proposal resolves the design gap needed for the
-G2-06 bootstrap-generation target and G2-16/G2-18 lifecycle targets; their
-verifier statuses remain unchanged (S6; plan L812–L819, L943, L946, L1056).
+**Scope conclusion.** This proposal resolves only the pre-activation pointer
+semantics needed by the G2-06 bootstrap-generation target and G2-16/G2-18
+lifecycle targets; it does **not** resolve those verifier rows or change their
+statuses (S6; plan L812–L819, L943, L946, L1056). The exact payloads,
+composite instance-bound schema, self-grant, readback, recovery, idempotency
+and audit evidence remain required by the plan and are absent from the current
+G2 verdict (G2-06 FAIL; G2-16 BLOCKED, V160, V170). The current
+`begin_first_generation` and activation code therefore cannot be treated as
+implementation of the full contract.
 Plan L1091 already specifies the `v2_audit_events` fields: the remaining
 question is how the offline operator maps to its actor/action fields and
 how to migrate/write it, not whether to invent a new audit schema. The
@@ -618,3 +633,7 @@ text and needs Architect review.
   caller obligations and required tests. Q3 proposal not yet accepted; full
   ADR approval and independent G2 PASS remain outstanding. First Git snapshot
   of this draft is limited to this ADR; no runtime or migration changes.
+- 2026-10-03: independent review found and this draft corrected the plan
+  section citation (L1056 is section 7.1), added the required composite
+  `server_instance_id` boundary to the migration contract, and narrowed the
+  Q3 conclusion so it does not claim to resolve G2-06/G2-16/G2-18.
