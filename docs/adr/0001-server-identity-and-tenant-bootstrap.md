@@ -6,9 +6,9 @@
 - **Deciders:** user + Architect review (pending)
 - **User decisions so far:** Q1 P1 (record format, parser rules, identity-root
   config and write procedure) accepted 2026-10-03. Q2 entry point = Option A
-  (offline operator CLI, server stopped), chosen 2026-10-03. The Q1 restore
-  manifest, Q3 sub-questions and Q4 stay open; Q3 now has a nullable-pointer
-  proposal awaiting acceptance.
+  (offline operator CLI, server stopped), chosen 2026-10-03. Q3 nullable
+  active pointer until generation `0` activation accepted 2026-10-03. The Q1
+  restore manifest, remaining Q3 sub-questions and Q4 stay open.
 
 ## How to read this draft
 
@@ -339,8 +339,8 @@ operator action that a fresh install can tell apart from a lost authority.
 - `v2_tenants.active_root_generation` is `NOT NULL`
   (`server/migrations/0004_v2_team_fleet.sql:38`) but generation `0` does not
   exist until the root bootstrap runs. The plan does not specify the pointer
-  before activation. The proposal below answers this for `tenant create`
-  (Option A, command 3), but is not yet accepted.
+  before activation. The decision below, accepted 2026-10-03, answers this
+  for `tenant create` (Option A, command 3); implementation remains gated.
 - The plan's login endpoint `POST /v2/auth/login` (L1122) is not in the
   router at `8d07f0d` (`server/src/routes/mod.rs`). Option A, step 4,
   depends on it.
@@ -348,11 +348,15 @@ operator action that a fresh install can tell apart from a lost authority.
 Settled by choosing Option A: the first owner is a **fresh v2 account**
 (`legacy_user_id` NULL), not a bridged v1 admin.
 
-#### Q3 proposal: nullable active pointer until activation
+#### Q3 decision: nullable active pointer until activation (accepted)
 
-**Status: proposed on 2026-10-03; awaiting user acceptance.** This resolves
-only the pre-activation meaning of `active_root_generation`. It does not
-approve a first-device issuer exception, implement the CLI, or clear G2.
+**Status: accepted by the user on 2026-10-03.** Acceptance covers keeping
+`active_root_generation = NULL` before generation `0` is successfully
+activated, including while it is `PREPARING`, and setting the pointer to `0`
+atomically with activation. Generation `0` is a valid active generation,
+not an unset sentinel. This settles only this Q3 sub-question; it does not
+approve a first-device issuer exception, the full ADR, implementation of the
+CLI or migration, or clear G2.
 
 **Plan boundary.** Plan L1056 (section 7.1) lists the column but specifies
 neither nullability nor an initial value. Plan L812–L819 requires creation of
@@ -365,7 +369,7 @@ The pointer must still participate in the plan's instance boundary: root rows,
 grants and lookups are keyed by `server_instance_id` + `tenant_id` (L1071–L1073,
 L1095, L1101). A nullable generation number alone is not that boundary.
 
-**Recommendation.** Make the column nullable with no numeric default. Keep
+**Decision (accepted).** Make the column nullable with no numeric default. Keep
 its non-negative `i64` range check for non-NULL values. NULL means **no
 ACTIVE root generation**, not necessarily that bootstrap has never started.
 Do not use `0` or `-1` as an unset sentinel, pre-create an empty generation,
@@ -389,7 +393,7 @@ failure, not permission to repair the pointer silently.
 **Current-code consequences (design only, source `8d07f0d`).**
 
 - `server/migrations/0004_v2_team_fleet.sql:38` rejects NULL and negative
-  values. This proposal requires a forward migration; do not edit a shipped
+  values. This decision requires a forward migration; do not edit a shipped
   migration or instruct an operator to insert NULL into today's schema.
 - The frozen plan also requires `server_instance_id` in root-generation and
   grant keys/FKs (L1071–L1073, L1095, L1101). The forward migration must add or
@@ -452,7 +456,7 @@ or mismatched pointers; migration preserves child rows and legitimate ACTIVE
 tenants while refusing inconsistent ones. Add rotation coverage proving the
 pointer remains `N` until the atomic `N+1` activation (L824–L828, L943, L946).
 
-**Scope conclusion.** This proposal resolves only the pre-activation pointer
+**Scope conclusion.** This accepted decision resolves only the pre-activation pointer
 semantics needed by the G2-06 bootstrap-generation target and G2-16/G2-18
 lifecycle targets; it does **not** resolve those verifier rows or change their
 statuses (S6; plan L812–L819, L943, L946, L1056). The exact payloads,
@@ -465,7 +469,7 @@ Plan L1091 already specifies the `v2_audit_events` fields: the remaining
 question is how the offline operator maps to its actor/action fields and
 how to migrate/write it, not whether to invent a new audit schema. The
 first-device approval issuer, missing login implementation, Q1 restore
-manifest and Q4 scope remain outside this pointer proposal.
+manifest and Q4 scope remain outside this pointer decision.
 
 ### Q4. Where G2-27 belongs
 
@@ -517,9 +521,10 @@ running the server as now. New subcommands:
      `v2_accounts` row (`legacy_user_id` NULL, Argon2 hash as in
      `server/src/auth.rs:23-25`) and the `owner` membership in
      `v2_tenant_memberships`, plus an audit row.
-   - Q3 proposes `active_root_generation = NULL` until activation, pending
-     acceptance and a forward migration. Do not insert NULL into today's
-     NOT NULL schema. Offline audit actor/action mapping also remains open:
+   - Q3 accepts `active_root_generation = NULL` until generation `0`
+     activation. A forward migration and implementation verification remain
+     required; do not insert NULL into today's NOT NULL schema. Offline audit
+     actor/action mapping also remains open:
      the plan specifies `v2_audit_events` (L1091), but only v1 `audit_log`
      exists in the current migrations.
    - Prints the tenant ID.
@@ -612,7 +617,8 @@ text and needs Architect review.
   the P1 format and the Option A startup rules.
 - The P1 format is accepted; its design fixtures are not G2 completion. G2
   needs official golden vectors generated from the Rust implementation, plus
-  the negative cases listed under P1. The Q3 pointer proposal remains unapproved.
+  the negative cases listed under P1. The Q3 pointer decision is accepted,
+  but neither that acceptance nor these fixtures establish G2 PASS.
 - G2-64 clears only when an independent rerun reports PASS for every row. This
   ADR cannot clear it.
 - Production v2 code stays closed until G2 `PASS` (L198).
@@ -637,3 +643,9 @@ text and needs Architect review.
   section citation (L1056 is section 7.1), added the required composite
   `server_instance_id` boundary to the migration contract, and narrowed the
   Q3 conclusion so it does not claim to resolve G2-06/G2-16/G2-18.
+- 2026-10-03: user accepted the Q3 nullable-pointer decision: NULL until
+  generation `0` activation, including during PREPARING; activation sets
+  pointer `0` and state ACTIVE atomically. Earlier pending-acceptance entries
+  above are historical. Remaining Q3 questions, full ADR approval, migration
+  design/verification and the independent G2 gate stay open. No runtime or
+  migration changes accompany this acceptance.
