@@ -7,8 +7,11 @@
 - **User decisions so far:** Q1 P1 (record format, parser rules, identity-root
   config and write procedure) accepted 2026-10-03. Q2 entry point = Option A
   (offline operator CLI, server stopped), chosen 2026-10-03. Q3 nullable
-  active pointer until generation `0` activation accepted 2026-10-03. The Q1
-  restore manifest, remaining Q3 sub-questions and Q4 stay open.
+  active pointer until generation `0` activation accepted 2026-10-03. Q3 D1
+  (one-time first-device approval) and D2 (ACTIVE root custodian issues
+  capability grants) accepted 2026-10-04; D3 (offline audit actor mapping)
+  remains proposed. The Q1 restore manifest, remaining Q3 sub-questions and
+  Q4 stay open.
 
 ## How to read this draft
 
@@ -335,7 +338,9 @@ operator action that a fresh install can tell apart from a lost authority.
   rule found none. The code reads a `v2_tenant_issuers` trust set
   (`server/src/routes/v2.rs:78`; table at
   `server/migrations/0004_v2_team_fleet.sql:356`) that is not in the plan and
-  has no production writer.
+  has no production writer. D1/D2 under "First-device trust anchor" below
+  were accepted by the user on 2026-10-04; D3 and Architect review remain
+  open. User acceptance does not close the independent G2 gate.
 - `v2_tenants.active_root_generation` is `NOT NULL`
   (`server/migrations/0004_v2_team_fleet.sql:38`) but generation `0` does not
   exist until the root bootstrap runs. The plan does not specify the pointer
@@ -524,7 +529,7 @@ running the server as now. New subcommands:
    - Q3 accepts `active_root_generation = NULL` until generation `0`
      activation. A forward migration and implementation verification remain
      required; do not insert NULL into today's NOT NULL schema. Offline audit
-     actor/action mapping also remains open:
+     actor/action mapping also remains open (proposal D3 below):
      the plan specifies `v2_audit_events` (L1091), but only v1 `audit_log`
      exists in the current migrations.
    - Prints the tenant ID.
@@ -601,14 +606,233 @@ record.
 | Reuses the existing v1 login and the `legacy_user_id` bridge already in the schema. | "Empty DB" becomes the signal that minting a new authority is allowed. After losing both the identity root and the DB, the server silently mints a new identity. Clients would see the instance change (L375), but the server side does not fail closed as L2258 intends. |
 | One step from login to a usable tenant. | Merges the server operator (v1 admin) into the tenant owner. |
 
-### First device approval issuer (open, part of Q3)
+## First-device trust anchor (part of Q3)
 
-Option A does not answer this: the first `DeviceApprovalV2` still needs an
-issuer rule. A candidate that mirrors L815–L816: let the first device
-self-sign its approval, accepted only under the same emptiness conditions as
-the root bootstrap (L812–L814) and only after the operator confirms its
-signing and HPKE fingerprints out of band. This candidate is **not** plan
-text and needs Architect review.
+**Status: D1 and D2 accepted by the user on 2026-10-04; D3 proposed.**
+D1 accepts the one-time self-issued first approval only after the durable
+offline confirmation and
+emptiness/session/device guards described below. D2 accepts the ACTIVE
+`root.custody` issuer rule for `TenantCapabilityGrantV2`; it does not allow
+operating capability issuance before root activation. The PREPARING root
+self-grant still follows S6 (L812–L819). D3 remains proposed, and Architect
+review plus G2 `PASS` remain required before implementation.
+
+**Accepted consequences.** The forward design must add a pending device state
+and a durable first-device confirmation record; enforce the one-time D1
+transaction and its exact idempotency/audit behavior; and enforce D2 only for
+an ACTIVE, non-revoked root custodian with the live session/device checks.
+Pinning key IDs at `tenant create` is analyzed below at the user's request;
+it has not been accepted as a replacement for D1 or rejected by the user.
+D1–D3 are ADR design choices, not pre-existing plan text.
+
+**Plan facts.**
+
+- After the PoP, enrollment stores a **pending** device (L369). Later devices
+  need an owner- or root-signed approval and key grant (L257).
+- Every `DeviceApprovalV2` / `TenantCapabilityGrantV2` issuer key must be
+  found in the same tenant/epoch with a "suitable" capability (L427).
+  `device.approve` is an explicit capability. Capabilities are deny-by-default,
+  and `owner` implies none of them (L220, L1067).
+- Approval and capability mutations check live role/session/capability state
+  and persist the mutation, idempotency response and audit in one transaction
+  (L1107). Endpoints: `POST /v2/devices/{id}/approve` (L1125) and
+  `POST /v2/capability-grants` (L1126).
+- `FirstRootSelfGrant` needs an exact active `DeviceApprovalV2` for its subject
+  (L774, L814) and operator-confirmed OOB signing+HPKE fingerprints (L257,
+  L370, L815). Its issuer key is the subject's own signing key (L815–L816).
+  Bootstrap must not go through any generic admin/grant path (L1130).
+
+**Gap.** In a new tenant no device holds `device.approve` or any other
+capability, so neither the first `DeviceApprovalV2` nor the first
+`TenantCapabilityGrantV2` has a valid issuer. The plan allows self-issuing
+only for the root self-grant. Root custody does not imply `device.approve`,
+so the same loop blocks approving the second device. The plan also maps no
+record type to the capability that may issue it ("suitable", L427). Finally,
+L815 requires an operator confirmation that the server can check, but the
+plan does not say how that confirmation becomes durable state.
+
+**Current code (source `8d07f0d`; `server/` and `shared/` unchanged at
+`ff9de4f`).** Evidence for the design, not fixes. Implementation stays closed
+until G2 `PASS`.
+
+- Issuer trust comes from `v2_tenant_issuers` (`server/src/routes/v2.rs:77-78`;
+  `server/migrations/0004_v2_team_fleet.sql:356`). That table is not in the
+  plan, and its only writer is a test fixture (`server/tests/v2_e2e.rs:138`).
+- Enrollment inserts the device as `active` (`server/src/enrollment.rs:264`).
+  `v2_devices.status` allows only `active`/`revoked` (`0004:84`). The pending
+  state from L369 does not exist.
+- `present_device_approval` (`server/src/routes/v2.rs:173-226`) verifies the
+  record and consumes its replay ID. It writes no `v2_device_approvals` row,
+  changes no device status and checks neither `device.approve` nor live role.
+  It logs to v1 `audit_log` outside any transaction and ignores write errors
+  (`server/src/audit.rs:22`). `present_capability_grant` (`v2.rs:274-322`)
+  has the same shape. None of this meets L1107.
+
+**D1 (accepted 2026-10-04). One-time self-issued first approval, gated by
+an offline confirmation.**
+
+1. The owner logs in and enrolls the first device; it stays **pending**.
+2. The operator stops the server and runs
+   `shardx-team-server tenant confirm-first-device --tenant <slug> --device <id>`
+   under the Option A lock. The CLI shows the pending device's full signing
+   and HPKE key IDs. The operator enters both values as read from the client
+   screen, and they must match exactly. In one transaction the CLI writes a
+   confirmation row bound to `server_instance_id`, `restore_epoch`, tenant,
+   account, device and both key IDs, plus audit. It refuses if the tenant
+   already has any approval, capability grant, root generation, root grant or
+   confirmation row.
+3. After restart, `POST /v2/devices/{id}/approve` accepts a `DeviceApprovalV2`
+   whose `issuer_signing_key_id` equals the subject signing key only if,
+   inside `BEGIN IMMEDIATE`: the unconsumed confirmation matches the subject
+   exactly; no approval, capability grant, root generation or root grant
+   exists, and there is no other confirmation row; the live session is
+   the tenant's single owner on that same device; and scope is
+   `tenant`/`tenant_id` with `approved_use = team.device`. That transaction
+   persists the approval, moves the device from pending to active, consumes
+   the confirmation, and writes audit and the exact idempotency response. A
+   later attempt to create another self-issued approval is rejected. The
+   exact-response retry contract remains a review obligation below.
+
+The S6 root bootstrap can then require this exact approval (L814) and reuse
+the same confirmed fingerprints (L815) instead of a second confirmation.
+Pinning at `tenant create` would move this confirmation before enrollment.
+The alternative analysis below distinguishes the operational ordering from
+the cryptographic requirements; it does not supersede accepted D1.
+
+**D2 (accepted 2026-10-04). Who may issue `TenantCapabilityGrantV2`.** Only a
+device holding `root.custody` in the tenant's **ACTIVE** root generation may
+issue these grants, with a live session and a non-revoked grant (the same
+checks as L820–L822).
+After activation, the first device signs its own operating capabilities
+(`device.approve` and so on) as the root custodian. This creates no second
+bootstrap exception for capability issuance: the device signs for itself
+under the normal D2 issuer rule. Operating capability grants wait until
+readback and recovery readiness have activated the root. `root.custody`
+itself is still granted only through the S6 root endpoints (L1130). Not recommended: a closed set of
+self-issued capabilities during bootstrap. That adds a mutable bootstrap
+window that must be tracked and closed. Still open under either option: the
+exact `Capability` value set (L481). Grant issuance by `tenant.manage`
+holders without ACTIVE root custody is not authorized by accepted D2; it
+would require a separate proposed amendment.
+
+**D3 (proposed). Offline audit actor.** CLI actions write `v2_audit_events`
+(L1091) with `actor_account_id` and `actor_device_id` NULL,
+`reason_code = offline_operator_cli`, a CLI-generated `request_id` and the
+specific action (`tenant.create`, `tenant.first_device_confirm`). Create no
+synthetic operator account. This needs both actor columns nullable in the
+forward migration. Network actions always carry the live account and device.
+
+**Verification before full ADR approval.** Self-issued approval is rejected
+without a confirmation, with mismatched key IDs, under a different
+session/account/device, on a second creation attempt, or once any
+approval/grant/root row exists. After a crash, the device is either pending
+with an unconsumed confirmation, or active with that confirmation consumed
+and its approval committed; never half-applied. Root-issued capability grants
+are rejected before activation and from PREPARING/RETIRED generations or
+revoked custodians.
+
+### Alternative analysis: pin both key IDs at `tenant create`
+
+**Analysis requested 2026-10-04; not a replacement decision.** D1 remains
+accepted. The alternative is feasible in principle, but changes when the
+operator confirms the first device and requires an explicit pre-enrollment
+reservation contract. It is not a way to skip approval, PoP, or root bootstrap.
+
+**What the sources establish.** `signing_key_id` and `hpke_key_id` are
+role-separated hashes of public-key bytes; their functions take no instance,
+epoch, tenant or device ID (`shared/src/keys.rs:54-55,87-94`). The client
+already passes its signer and HPKE public key into enrollment
+(`src-tauri/src/fleet_client.rs:157-174`). This shows that computing the two
+IDs before enrollment is possible, not that an offline key-preparation UI or
+safe persistent bootstrap workflow has been implemented. The current route
+mints `device_id` only during enrollment (`server/src/routes/v2.rs:613-626`).
+These source references are unchanged between `8d07f0d` and `ff9de4f`.
+
+Plan L256 orders HTTPS connection and instance pinning before key generation
+and challenge issuance. An offline-preparation variant would change that
+journey, but the key-ID functions do not impose that order. Nor must all
+variants create keys before the first HTTPS connection: the client could pin
+the initialized server and prepare its keys before the operator stops it for
+`tenant create`. That requires splitting identity discovery/key preparation
+from tenant login. The earlier statement that early pinning necessarily
+precedes the first connection, and should be rejected for that reason alone,
+was too strong. Any changed journey still needs Architect review.
+
+**Required contract if this alternative is adopted (not frozen design).**
+
+1. Initialize and verify the instance through Option A. The client prepares
+   its separate signing and HPKE keys, keeps both private keys locally, and
+   exposes only public IDs/keys for OOB confirmation. Independently compare
+   the instance identity with `identity show`; bare key IDs identify keys,
+   not the intended server. Public-key-only input is consistent with the
+   metadata boundary in L364.
+2. While stopped and under the Option A lock, `tenant create` would create
+   tenant, owner, audit and a one-use reservation atomically. Bind it to the
+   verified `server_instance_id`, `restore_epoch`, new tenant ID, new owner
+   account ID, and both full key IDs with fixed suite/encoding rules. Compare
+   both IDs with the intended client's OOB display, not merely with another
+   copy of the same imported file. A self-signed preparation file can prove
+   possession of its signing key; it cannot establish operator trust in that
+   key by itself. Import no private keys.
+3. Do not invent a device ID or create an already-approved device at tenant
+   creation. After normal live owner login and enrollment PoP, recompute both
+   IDs from the submitted public keys, compare them with the reservation,
+   and atomically bind it to that exact pending device. A concurrent device,
+   wrong account/tenant/instance/epoch, or a mismatch in either key must not
+   win the reservation. It cannot be first-device-wins or a general issuer
+   allowlist. Challenge/PoP requirements in L369/L1124 still apply; matching
+   a public HPKE key ID is not proof of possession of its private key.
+4. Permit the same narrowly scoped first self-issued `DeviceApprovalV2`
+   only for the bound device, consuming the reservation with approval,
+   activation of the device, exact stored response and audit. Preserve D1's
+   no-prior-approval/capability/root guards. No root generation, root grant,
+   operating capability or trusted-issuer row is created by `tenant create`.
+   Root self-grant, HPKE readback and recovery readiness remain separate
+   requirements (L774, L812–L819); D2 is unchanged.
+5. Specify expiration, cancellation/replacement after a typo or lost keys,
+   response-loss retries, race handling and restore invalidation before
+   implementation. Old pins must not silently become valid in a new epoch
+   or reopen after consumption. Retain auditable tombstones; do not use
+   delete/reinsert or an unrestricted force option to reset bootstrap. D3's
+   offline actor representation still needs approval under either design.
+
+| Consideration | Accepted D1: confirm after enrollment | Pin at tenant creation |
+|---|---|---|
+| Additional downtime | Requires an extra server stop/start after the device becomes pending. | Can avoid that extra cycle if keys are ready during the already-offline tenant creation. Option A itself still requires a stopped server. |
+| Binding at operator confirmation | Exact pending account/device, current epoch and both key IDs already exist. | Tenant/owner IDs become known in the creation transaction; the future device ID needs a later one-time binding. |
+| Client preparation | Follows the L256–L257 connection/enrollment sequence. | Needs a supported pre-enrollment key-preparation/persistence workflow and OOB exchange. |
+| Trust established | Operator confirms both keys for the enrolled subject; live checks still apply. | Operator pre-authorizes both keys for one future subject; possession and live checks still apply. No inherent cryptographic upgrade. |
+| Failure handling | Must define confirmation recovery and exact retries. | Also needs reservation expiry, key-loss/typo replacement and atomic binding under competing enrollments. |
+| Root/capability boundary | No root activation or operating grant merely from approval. | Identical boundary; pre-pinning does not permit early root/capability issuance. |
+
+**Recommendation.** Keep D1 for the first implementation: it binds the trust
+ceremony to an actual enrolled subject and avoids adding pre-enrollment
+reservation states while G2 is still open. Reconsider early pinning if the
+additional server-wide stop for each new tenant is an unacceptable operational
+cost and the client can safely prepare/store keys before enrollment. If
+adopted, replace D1 explicitly rather than quietly adding a second bootstrap
+path; freeze and verify its reservation lifecycle first.
+
+### Review obligations retained after D1/D2 acceptance
+
+These are unresolved implementation contracts, not permission to weaken the
+accepted one-time trust boundary:
+
+- Define D1's confirmation schema/constraints and the login-to-pending-device
+  session binding. The required confirmation must be present, while prior
+  approvals/grants/root rows and any other confirmation must be absent.
+- Distinguish an exact retry after response loss from a second creation
+  attempt. The former needs a specified stored-response lookup and live-auth
+  policy; the latter must never create another approval or reopen bootstrap.
+- Define how the consumed confirmation remains linked to the exact active
+  approval for S6 OOB verification without becoming reusable authorization;
+  specify cancellation, revocation, epoch change and crash/recovery behavior.
+- Freeze the remaining capability value/scope rules and prove D2's ACTIVE
+  issuer checks. Acceptance does not expand `tenant.manage` into an issuer
+  privilege or let a generic capability grant create `root.custody`.
+- Resolve D3, login, forward migration/reconciliation and the remaining
+  Q1/Q4 contracts. Neither this analysis nor user acceptance changes the
+  independent G2-06 FAIL / G2-16 and G2-18 BLOCKED verdicts.
 
 ## Consequences once approved
 
@@ -649,3 +873,13 @@ text and needs Architect review.
   above are historical. Remaining Q3 questions, full ADR approval, migration
   design/verification and the independent G2 gate stay open. No runtime or
   migration changes accompany this acceptance.
+- 2026-10-04: user accepted D1 (one-time self-issued first approval after
+  durable offline key/fingerprint confirmation and emptiness/session/device
+  guards) and D2 (only an ACTIVE, non-revoked `root.custody` holder issues
+  `TenantCapabilityGrantV2`). D3 remains proposed. Clarified that D1's
+  emptiness check excludes its own required confirmation, and that D2
+  gates operating grants, not the PREPARING root self-grant. Analyzed
+  tenant-create pinning without accepting or rejecting it on the user's
+  behalf; corrected the earlier claim that the key-creation order alone
+  rules it out. Acceptance changes only this ADR; implementation remains
+  gated by Architect review and G2 `PASS`.
