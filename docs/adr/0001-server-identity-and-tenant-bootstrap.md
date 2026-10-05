@@ -691,7 +691,9 @@ an offline confirmation.**
    persists the approval, moves the device from pending to active, consumes
    the confirmation, and writes audit and the exact idempotency response. A
    later attempt to create another self-issued approval is rejected. The
-   exact-response retry contract remains a review obligation below.
+   exact-response retry contract is specified in R3 below. R1-R4 are the
+   proposed normative refinements submitted for a second Architect review;
+   they retain D1/D2 and do not claim user acceptance of a new decision.
 
 The S6 root bootstrap can then require this exact approval (L814) and reuse
 the same confirmed fingerprints (L815) instead of a second confirmation.
@@ -730,6 +732,442 @@ with an unconsumed confirmation, or active with that confirmation consumed
 and its approval committed; never half-applied. Root-issued capability grants
 are rejected before activation and from PREPARING/RETIRED generations or
 revoked custodians.
+
+### R1. Confirmation lifetime and exact S6 evidence (P1-01)
+
+**Proposed contract refinement for re-review, not an implemented migration.**
+D1 fixes the one-time intent; the following storage/state choices are new ADR
+policy. Plan L373-L376 supplies the restore/trusted-control-plane boundary;
+L774 and L812-L819 require the exact approval and OOB evidence for S6.
+
+**Representation and constraints.** Introduce forward-only
+`v2_bootstrap_guards` with primary key `(server_instance_id, tenant_id)` and
+state `unused|reserved|consumed|closed|recovery_required`. `tenant create`
+creates `unused` together with the fresh tenant, owner and structured audit.
+It is never inferred from an empty approval table. Introduce
+`v2_first_device_confirmations` with primary key `(server_instance_id,
+tenant_id)` (deliberately **not** epoch-scoped), unique `confirmation_id`
+within the instance, and these required fields:
+
+| Fields | Representation / invariant |
+|---|---|
+| `confirmation_id`, `server_instance_id`, `tenant_id`, `account_id`, `device_id`, `request_id` | 16-byte IDs; instance/tenant/account/device composite FKs, no cascading deletion of confirmation/history |
+| `restore_epoch`, `confirmed_at_ms` | Nonnegative integers, bounded to SQLite signed-64 range; time is Unix milliseconds |
+| `signing_key_id`, `hpke_key_id` | 32-byte, role-separated IDs, rederived under R4; unequal |
+| `signing_public_key`, `hpke_public_key` | Immutable validated raw 32-byte Ed25519 and X25519 encodings, respectively |
+| `signing_suite`, `hpke_suite` | Pinned suite `1` for Ed25519 and HPKE base X25519/HKDF-SHA256/ChaCha20-Poly1305; unknown suites fail closed |
+| `state` | `pending`, `consumed`, `cancelled` or `invalidated`; immutable subject/context/key tuple |
+| `consumed_at_ms`, `approval_replay_id`, `approval_payload_sha256`, `approval_signed_container_hash`, `approval_outer_sha256` | All absent until consumption, all required on `consumed`; hashes 32 bytes, replay ID 16 bytes; immutable afterwards |
+| `terminal_at_ms`, `terminal_reason` | Required only on cancelled/invalidated; closed reasons `operator_cancelled`, `device_revoked`, `epoch_changed`, `integrity_failure` |
+
+The consumed linkage has a restrictive composite FK to the exact approval
+(instance, tenant, payload domain `shardx.auth.device-approval.v2`, replay ID).
+`approval_replay_id` names the plan's `DeviceApprovalV2.replay_id`; there is
+**no separate mutable approval ID** (plan L463-L467). All three stored hashes
+must match re-parsed approval bytes, not just an FK or indexed columns.
+`historical` is a read-only classification of a terminal row or a row from
+an earlier epoch, not a state which permits replacement. Retain tombstones,
+bytes and structured audit for the lifetime of the tenant/instance. No API,
+CLI force flag, tenant re-enable, deletion/reinsertion or epoch transition
+may set a used/closed guard back to `unused`.
+
+**Transitions.** Both CLI and online checks reject guard/confirmation state
+inconsistency rather than repairing it from apparent table emptiness.
+
+| Before | Operation and complete result |
+|---|---|
+| `unused`, no confirmation | Offline confirm checks the external identity/mirror under the Option A exclusive lock, fresh-tenant provenance, one current active owner, exact pending device and both R4 key derivations. In one transaction insert pending confirmation + audit and change guard to `reserved`. All approval/capability/root-generation/root-grant rows, including revoked/history rows, must be absent. |
+| `reserved` + `pending` | R2/R3 approval transaction requires exact current instance/epoch/owner/device/keys, the sole confirmation and no prior approval/grant/root rows. Insert exact approval, consume confirmation/linkage, set guard `consumed`, set device active, persist exact response and structured audit together under `BEGIN IMMEDIATE`. |
+| `reserved` + `pending` | Offline `tenant cancel-first-device` under the same lock and identity checks sets cancelled + guard `closed` and audit atomically. Revocation of the pending device sets invalidated/device_revoked + `closed` with the revocation transaction. No replacement confirmation, including for the same fingerprints. |
+| `consumed` | Later approval/device revocation closes live authority, not history. Keep the consumed link and guard; S6 must reject revoked/expired authority. Repeated confirmation or a new self-approval is permanently denied. |
+| Any inconsistent/unproven state | Enter operational `recovery_required`; no bootstrap writes or key release. Preserve original rows and diagnosis; do not invent missing confirmation or approval history. |
+
+There is **no time expiry for an offline confirmation** in this refinement.
+It remains usable only while every live R2/R3 predicate and epoch/key equality
+holds; signed approval validity and short-lived sessions/challenges still
+expire. A mistyped fingerprint comparison writes nothing and can be retried.
+After successful confirmation, key loss, cancellation or revocation closes
+this bootstrap opportunity. Recovery requires trusted operator investigation;
+if no valid history/key can be recovered, explicitly create a different tenant
+ID and perform the full OOB ceremony again. This never transfers old authority
+or data automatically and never resets this tenant. Expiring/replacing a
+confirmation would require a separate reviewed policy, not an implicit retry.
+
+**Restore and S6.** A recognized epoch increase invalidates pending
+confirmations (guard becomes `closed`); consumed/cancelled/invalidated rows
+remain historical and cannot reopen bootstrap. Do not rewrite their epoch,
+keys, hashes or signed claims. Before enabling restored v2 writes, reconcile
+guards, confirmations, approval bytes, mutation receipts and audit from trusted
+operator restore evidence. Missing evidence, a pre-confirmation backup whose
+later history is unknown, or contradictory guard/linkage means
+`recovery_required`, never `unused`. An empty restored DB is not fresh setup.
+Existing consumed/root state follows the reviewed restore-transition rules;
+this refinement authorizes no new gen-0 bootstrap in a different epoch. The
+Q1 manifest implementation remains open; this is its mandatory fail-closed
+bootstrap-history invariant, not a new external transparency ledger. Selective
+same-epoch malicious rollback is still outside plan L376's guarantee.
+
+On first S6 creation, reverify the exact linked active approval, its signature,
+all equality columns, validity/revocation, same subject and current context;
+require the consumed confirmation's tuple and three hashes to match it.
+The link is evidence that these same two keys were confirmed, **not** another
+consumable permission. S6 still enforces empty root state, exact gen-0,
+`FirstRootSelfGrant`, HPKE readback/recovery readiness and atomic generation
+creation. No second device, approval or replacement grant can borrow this OOB
+record. Later generation/restore actions use their normal plan predicates.
+
+Offline success is reported only after commit. If the CLI loses its response,
+re-running confirm refuses (no insert/update); a new read-only
+`tenant first-device-status` under the Option A lock reports the existing
+confirmation ID, tuple, state and consumed replay/hash linkage after identity
+and R4 verification. It prints no token/private key. The operator compares it
+with the intended client tuple. It never repairs or reissues confirmation.
+Audit/storage failure aborts the entire CLI or online mutation. A crash leaves
+either the complete pre-state or complete committed post-state, not half of
+an approval. Offline actor-column mapping is still conditional on D3; neither
+NULL network actors nor best-effort `audit::log` are allowed as a shortcut.
+
+### R2. Account login to proof-bound pending-device session (P1-02)
+
+**Proposed bridge, not current runtime behavior.** Plan L368-L370 requires
+separate signing and HPKE PoP; L1122-L1124 supplies login/enrollment endpoints.
+At source `62979f2`, `AuthUser` loads v1 users (`server/src/auth.rs:139-160`),
+`/v2/auth/login` is absent (`server/src/routes/mod.rs:18-38`), and
+`v2_sessions.device_id` is NOT NULL/FK-bound (`0004_v2_team_fleet.sql:93-103`).
+Account IDs must never stand in for device IDs; do not copy the account-as-
+device placeholder in `server/src/routes/v2.rs:446-458`.
+
+**Principal classes and promotion.** `/v2/auth/login` authenticates the fresh
+v2 account in the named tenant, verifies current active account/membership and
+issues an account-only pre-device ticket, not a `v2_sessions` row. Store its
+random 32-byte opaque token only as SHA-256 in a separate
+`v2_pre_device_sessions` table with random 16-byte ID, instance/epoch/tenant/
+account, account token-version, created/expiry/revocation/consumption times.
+TTL is 10 minutes, non-refreshable. It may only use `/v2/me`, logout, enrollment
+challenge/proof, and the two device-session proof endpoints below. It grants
+no approval, root action, ordinary mutation or operating capability. Login
+and challenge creation are rate-limited by tenant/account and source; tickets,
+nonces and proof secrets never enter audit/logs.
+
+Enrollment requires this ticket and fresh `CanonicalCborV2` signing proof
+binding server instance, epoch, tenant, account, ticket ID, challenge ID,
+nonce, both suite IDs, raw public keys, both correctly derived key IDs and
+expiry. The server owns challenge fields; proof submission must equal the
+stored challenge. Define the new closed `EnrollmentBindingV2` map with exactly
+`domain="shardx.auth.enrollment-binding.v2"`, `version=2`,
+`server_instance_id`, `restore_epoch`, `tenant_id`, `account_id`,
+`pre_device_session_id`, `challenge_id`, `nonce`, `signing_suite`,
+`signing_public_key`, `signing_key_id`, `hpke_suite`, `hpke_public_key`,
+`hpke_key_id`, `expires_at_ms`. IDs/nonce are 16 bytes, keys/IDs are 32 bytes,
+suites U16, epoch/time U64 in storage range; canonical map cap is 4096 bytes.
+Sign
+`ASCII("SHARDX-ENROLLMENT-BINDING-V2\0") || u32be(len(map_bytes)) || map_bytes`
+with the candidate Ed25519 key. This replaces, not silently reinterprets, the
+current proof that only signs tenant/account and public keys
+(`shared/src/enrollment_proof.rs:17-43`). Challenge TTL is 120 seconds and
+consumption, server-generated device ID, pending device and audit are atomic.
+A collision never overwrites an existing device. Re-fetch owned enrollment
+status via `/v2/me` after response loss; do not create an active session or
+retry enrollment as a duplicate insert. Proof over both commitments proves
+only the signing private key; it does **not** prove the HPKE private key.
+
+**Selected separate HPKE PoP.** Add
+`POST /v2/auth/device-session-challenges` and
+`POST /v2/auth/device-session-proofs`, authenticated only by the pre-device
+ticket. The supplied device ID must resolve to the ticket's own tenant/account
+and revalidated keys; D1 requires pending status. After restart or session
+loss, credentials produce a new ticket and these endpoints bind a new session
+to the same enrolled device without re-enrollment. For an already active
+device they require its still-valid, non-revoked approval before promotion.
+
+The challenge is a closed `DeviceSessionBindingV2` map containing exactly
+`domain="shardx.auth.device-session-binding.v2"`, `version=2`,
+`server_instance_id`, `restore_epoch`, `tenant_id`, `account_id`,
+`pre_device_session_id`, `device_id`, `challenge_id`, `nonce`,
+`signing_suite`, `signing_public_key`, `signing_key_id`, `hpke_suite`,
+`hpke_public_key`, `hpke_key_id`, `expires_at_ms`; types/bounds match the
+enrollment map. Canonical bytes are capped at 4096 bytes. The server generates
+a fresh random 32-byte secret `s`, stores only `SHA256(s)` alongside that exact
+binding, ticket ID and unused/expiry state, and HPKE-seals `s` to the candidate
+HPKE public key. Use RFC 9180 base mode, DHKEM(X25519,HKDF-SHA256), HKDF-SHA256,
+ChaCha20-Poly1305 (mode 0, KEM 0x0020, KDF 0x0001, AEAD 0x0003), with
+`info=ASCII("SHARDX-DEVICE-SESSION-HPKE-POP-V2\0")` and
+`aad=exact_binding_bytes`. Return exact binding, encapsulated key (32 bytes)
+and ciphertext (48 bytes). Reject invalid/low-order X25519 keys and failed
+encapsulation; never fall back to plaintext. The client verifies the pinned
+instance/epoch, complete binding and suite before decrypting.
+
+The client returns challenge ID, decrypted `s` and a 64-byte Ed25519 signature
+over
+`ASCII("SHARDX-DEVICE-SESSION-POP-V2\0") || u32be(len(binding)) || binding || s`.
+The proof endpoint compares `SHA256(s)` in constant time, verifies the
+signature with the stored signing key and rechecks current context, ticket,
+account/token-version/membership, device status and both key derivations in
+one `BEGIN IMMEDIATE`. Challenge TTL is 120 seconds; revoke/expire it on use,
+logout, key/status change or epoch change. A proof bound to a different ticket,
+device, account or epoch fails; a replay cannot mint another session.
+
+Success atomically consumes challenge **and ticket**, records both-PoP time,
+and inserts the actual-device FK-bound session plus structured audit. Use
+random opaque 32-byte access and refresh tokens, storing only hashes. Access
+TTL is 5 minutes; pending/setup refresh has an absolute 30-minute bound from
+PoP, rotates single-use refresh tokens and rechecks all live predicates.
+Neither refresh nor credentials alone can change the bound device/keys. All
+sessions store immutable instance/epoch/tenant/account/device/key IDs,
+account token-version and PoP evidence, expiry/revocation and class
+`pending_setup|root_setup|ordinary`. `/v2/me` returns that binding/class from
+current rows; no success token is returned before commit. If promotion's
+response is lost, acquire a new ticket and redo both proofs; any orphan
+session remains limited and expires, never an account-only fallback.
+
+**Same-transaction permissions.** D1 approval requires an unexpired,
+unrevoked `pending_setup` session with both PoPs, current active account and
+exactly one active owner membership (that account), the R1 confirmed pending
+device and exact instance/epoch/keys. D1 approval makes the device active and
+moves that session to `root_setup` atomically. Other pending sessions are not
+silently promoted; refresh/proof may derive setup class only from that same
+valid approval. Gen-0 create/self-grant/readback/ack/activate are allowed for
+this exact approved subject via S6, without first requiring an operating
+capability. They still validate S6/R1 and live session/approval in each
+transaction. Setup never allows generic grants, profile/fleet writes or
+`tenant.manage` privilege escalation. After root activation, the normal D2
+ACTIVE, acknowledged, valid, non-revoked custody-grant checks authorize
+capability issuance; ordinary operations additionally require their exact
+live capabilities/roles. Session class alone is never an authorization.
+Approval/device revocation, account disablement, membership change, credential
+version change or epoch mismatch immediately prevents session use/refresh.
+
+### R3. Approval request identity and exact response replay (P1-03)
+
+**Single replay authority.** Plan L1107 requires the approval mutation, exact
+response and structured audit to commit together; plan L1090 makes
+`v2_idempotency` the common durable request/response ledger. R3 therefore
+uses **`v2_idempotency` as the sole approval replay-response authority**.
+There is no separate approval operations or receipt table. The approval route
+in plan L1125 continues to receive **exact
+`SignedAuthorizationRecordV2<DeviceApprovalV2>` outer bytes**, not a new
+wrapper or mutable approval ID: content type `application/cbor`, no content
+encoding, canonical bounded parsing and a 262144-byte body cap. Like `COMMIT`
+(plan L955-L956, L1090), approval is a stored operation that is **not**
+wrapped in `IdempotentMutationRequestV2`/`IdempotentStoredResponseV2`; the
+closed wire enum at plan L913 stays unchanged. This is a proposed amendment
+to plan §5.6.5, §7.3 and §10.2, effective only if this ADR is approved:
+
+- The stored `v2_idempotency.operation_kind` domain is the L913 wire values,
+  `COMMIT`, and storage-only `DEVICE_APPROVE`. No common wire request may
+  carry `DEVICE_APPROVE`.
+- `v2_idempotency` gains `approval_payload_domain`, `restore_epoch`,
+  `actor_account_id` and `subject_device_id`. A table `CHECK` requires all
+  four iff `operation_kind='DEVICE_APPROVE'` and all four NULL otherwise.
+
+| `DEVICE_APPROVE` column(s) | Value / constraint |
+|---|---|
+| PK `(server_instance_id, tenant_id, actor_device_id, operation_scope, idempotency_key)` | Plan L1090 key; scope fixed `tenant.device-approve.v2`; key is the approval payload `replay_id` |
+| `approval_payload_domain` | Fixed `shardx.auth.device-approval.v2` |
+| `restore_epoch`, `actor_account_id`, `subject_device_id` | Epoch U64 in storage range; 16-byte IDs; subject equals the approval subject and route path |
+| `canonical_request_hash` | Request digest defined below |
+| `exact_request_bytes`, `exact_request_bytes_sha256` | Exact signed-container body, 1..262144 bytes, and its SHA-256; both equal the approval row's exact container bytes/hash |
+| `status` | `succeeded` only; inserted solely by the committing transaction, never `in_flight` or `failed` |
+| `response_record_type`, `exact_response_bytes`, `exact_response_bytes_sha256` | `DeviceApprovalReceiptV2`; exact receipt bytes (at most 4096) and SHA-256, all NOT NULL |
+| `retained_until` | Retention floor below |
+| Composite FK `(tenant_id, approval_payload_domain, idempotency_key)` | References plan L1062's unique `v2_device_approvals(tenant_id, payload_domain, replay_id)` with `ON DELETE RESTRICT`; NULL for other kinds, so they are unaffected |
+| Partial UNIQUE `(tenant_id, approval_payload_domain, idempotency_key)` for `DEVICE_APPROVE` | At most one actor/operation row per approval replay ID |
+
+The global replay reservation is the plan's approval key itself
+(`(tenant_id,payload_domain,replay_id)`, plan L409-L410, L1062) plus its
+retained tombstone. Another actor presenting the same replay ID hits that
+reservation and cannot create a second row. Today's `v2_operations`
+(`server/migrations/0004_v2_team_fleet.sql:309-326`) and `v2_replay_ledger`
+(`:376-387`) are baseline runtime storage, not approval replay authorities.
+A forward migration, never an edit of `0004`, creates the plan-conformant
+table. If `v2_replay_ledger` is kept, it is written in the same transaction
+and checked equal; any disagreement is an integrity failure, never a source
+of a response. No receipt is migrated from `v2_operations`, because the
+current route stores none (`server/src/routes/v2.rs:168-199`).
+
+Define the request digest as
+`SHA256(ASCII("SHARDX-DEVICE-APPROVE-REQUEST-V2\0") || instance16 ||
+u64be(epoch) || tenant16 || actor_account16 || actor_device16 ||
+subject_device16 || u32be(len(body)) || body)`.
+Route, actor, payload subject, domain/version and stored equality columns
+must agree. The fixed operation scope is part of lookup; the digest is a
+comparison value, **not** part of the key, so a changed request cannot create
+an additional operation under the same identity.
+
+Success returns HTTP `201` (implied by `DEVICE_APPROVE` + `succeeded`; no
+other status is stored), content type `application/cbor`, and a closed
+canonical `DeviceApprovalReceiptV2` map with exactly
+`domain="shardx.auth.device-approval-receipt.v2"`, `version=2`,
+`server_instance_id`, `restore_epoch`, `tenant_id`, `actor_account_id`,
+`actor_device_id`, `subject_device_id`, `approval_replay_id`, `request_hash`,
+`approval_payload_sha256`, `approval_signed_container_hash`,
+`approval_outer_sha256`, `confirmation_id`, `committed_at_ms`,
+`outcome="succeeded"`. `confirmation_id` is required for D1 and omitted for
+ordinary approvals; no other optional/unknown fields. IDs are 16 bytes,
+hashes 32 bytes, epoch/time U64 in storage range. Replay reparses the stored
+receipt and compares every field/hash with the row and approval. Never
+regenerate a receipt, timestamp or serialized body. These bytes acknowledge
+a past transaction, not current authorization; clients must query current
+state before operating.
+
+**Retention and GC.** At commit set
+`retained_until = approval.not_after_ms + authorization_replay_retention`,
+the plan L409-L410 tombstone floor; after `not_after_ms` the approval cannot
+pass step 2's live checks anyway. GC runs under `BEGIN IMMEDIATE`, deletes
+only `DEVICE_APPROVE` rows with `retained_until <= server_now`, and never
+deletes or rewrites the approval row, its tombstone, R1 confirmation linkage
+or audit; the RESTRICT FK prevents deleting the approval first. After GC, or
+for a legacy approval without a stored receipt, the same replay ID hits the
+approval reservation and is rejected (`409 IDEMPOTENCY_MISMATCH`, no response
+bytes); the client re-reads current state. Response expiry never turns the
+key into permission to create anything (plan L1422). D1 history lives in the
+R1 confirmation and approval rows for the tenant lifetime and does not depend
+on receipt retention.
+
+**Order under `BEGIN IMMEDIATE`.** Before response lookup, authenticate the
+current device-bound session in the current instance/epoch; recheck active
+account/membership, role, expiry/revocation and exact actor/key binding. Then:
+
+1. Bound/canonical-parse the request and compute exact digests. A payload
+   instance or epoch different from the current context is rejected first
+   (step-independent errors below). Find the `v2_idempotency` row by the
+   unique identity above. Same identity with changed bytes, path, subject,
+   actor-account or digest is `409 IDEMPOTENCY_MISMATCH` (plan §8.2) without
+   mutation. A reserved approval replay ID under another actor also
+   conflicts; no response is disclosed to that actor.
+2. For an exact hit, verify the row against its FK approval: request
+   bytes/hashes, receipt reparse and every receipt field/hash. Any mismatch
+   is `422 MUTATION_RESPONSE_MISMATCH`, closes the tenant approval path as
+   `recovery_required`, writes nothing and returns no success. Then require a
+   live non-revoked/unexpired approval/device and current actor
+   authorization. D1 retry needs the same account/device still the sole
+   owner with setup or stronger device session; ordinary approval retry needs
+   its normal live role and `device.approve` authority. The session ID may
+   differ after R2 re-authentication; the authenticated actor/key tuple may
+   not. Return the stored type/bytes without any write, **before**
+   first-creation emptiness/pending/unconsumed guards. Later root/grant rows
+   therefore do not break a valid response-loss retry. Do not reuse
+   first-creation issuer discovery to reject the exact committed
+   self-approval merely because bootstrap has ended.
+3. For a miss, check the approval reservation and verify the signed record,
+   validity/all-column equality, live issuer authority and path subject. For
+   D1 also apply all R1/R2 sole-owner, confirmed pending device, unconsumed
+   tuple and historical-emptiness guards. A consumed/closed guard or another
+   replay ID never opens a new exception. For ordinary approval apply normal
+   capability/role checks; self-signing is not an exception after D1.
+4. In one transaction insert the approval row (the reservation), the
+   `DEVICE_APPROVE` `v2_idempotency` row with exact receipt, structured audit,
+   any retained baseline ledger row, and all R1/R2 confirmation/guard/device/
+   session transitions. Any failure rolls back all effects. No provisional
+   success response or best-effort audit. Concurrent identical requests
+   serialize to one commit and exact replay; conflicting bytes or a competing
+   device cannot win a second approval.
+
+**Crash, restart and restore.** Step 4 is the only write, so a crash leaves
+either no approval and no row, or both with their audit and transitions.
+Before v2 writes open (startup, after the forward migration, after a
+recognized restore), an integrity pass under the exclusive lock verifies
+every `DEVICE_APPROVE` row: FK target present, every equality/hash/receipt
+field matching, receipt epoch equal to row epoch. A failure marks the
+affected tenant's approval path `recovery_required` (as in R1/R4) with no
+deletion, regeneration or fallback creation. An approval without a row
+(legacy, GC'd or restored without it) is valid history with no replay. A
+retained row from an earlier epoch can only yield `STALE_CONTEXT`. R1 governs
+D1 guard/confirmation reconciliation; same-epoch selective rollback remains
+outside plan L376's guarantee.
+
+Expired/revoked sessions receive `401` and must reauthenticate with both PoPs;
+revoked/expired approval, device, owner membership or issuer authority receives
+`403`. Epoch mismatch receives `409 STALE_CONTEXT`, no historical success
+or epoch rewrite; instance mismatch is denied. New identity after consumed
+confirmation receives `409 FIRST_DEVICE_ALREADY_CLOSED`. `STALE_CONTEXT` and
+`FIRST_DEVICE_ALREADY_CLOSED` are proposed additions to plan §8.2. Invalid
+bytes or binding receive `400`; signed-claim equality failures keep plan
+`AUTH_CLAIM_COLUMN_MISMATCH`. Errors never return an old success or recreate
+authorization. R1 defines CLI lost-response handling; it is readback, not
+another confirmation mutation.
+
+### R4. Key-ID derivation and forward reconciliation (P1-04)
+
+**Verified defect and authority.** At source `62979f2`,
+`server/src/enrollment.rs:241` stores `signing_key_id(req.hpke_public_key)`
+in the HPKE-ID column; `shared/src/keys.rs:54-55,87-94` defines distinct
+signing and HPKE domains. The local uncommitted compatibility fix is not
+migration evidence. For validated raw 32-byte keys and the pinned suites,
+authoritative IDs are respectively `signing_key_id(signing_public_key)` and
+`hpke_key_id(hpke_public_key)`, i.e. SHA-256 of the appropriate ASCII domain
+including NUL, `u32be(32)` and raw public-key bytes. Stored IDs are indexed
+claims to compare with that derivation, never independent authority.
+
+Enrollment, device-session PoP, offline display/confirmation, approval, S6,
+activation, restore reconciliation and key-release paths must check both
+IDs, raw key encodings/suites and complete context equality. A mismatch is
+not a valid fingerprint for an operator to bless. CLI display fails closed
+with reconciliation required instead of asking the operator to confirm an
+opaque wrong ID. Existing signed-container equality checks remain necessary;
+correcting an index does not correct bytes already signed with a wrong ID.
+
+Extend the Q3 forward-migration obligations (above) as follows. Do not edit
+shipped migration `0004` or its checksum. First inventory rows under exclusive
+maintenance/Option A lock; classify by recomputed IDs and traverse every
+instance/tenant/device/key reference, including sessions, enrollment/PoP
+challenges, confirmations, approvals, capability/root/fleet grants, root and
+fleet generations, recovery metadata and downstream snapshot/upload refs.
+Preserve exact old bytes, IDs, hashes and audit in a reconciliation report
+before any permitted repair. The migration cannot infer a legacy instance
+from a convenient tenant-only join; use trusted provenance or quarantine.
+
+| Cohort | Permitted result |
+|---|---|
+| Valid encodings/suites, both IDs correct, exact referenced signed claims consistent | Keep bytes/IDs; preserve all child references, uniqueness and instance/tenant composite FKs. This alone does not prove enrollment PoP or active status. |
+| Legitimately pending, never confirmed/approved/trusted setup; wrong-domain HPKE ID only; no signed or trusted references | Under one audited forward repair transaction, recompute the ID, verify new ID/raw-key uniqueness, invalidate old challenges/pre-device/device sessions, and require both PoPs anew. No device-ID change or automatic active promotion. Then a fresh OOB ceremony may proceed only if R1 guard/provenance still says unused. |
+| Any confirmation, consumed history, signed approval/grant, trusted/active use, or ambiguous legacy active row | Quarantine device and every affected authorization/key-release path; revoke sessions atomically, preserve original signed bytes and IDs. No in-place relabeling of signed claims, no blessing by operator confirmation. Recovery needs trusted operator review and ordinary re-enrollment/reissuance by a valid issuer; if no such authority exists, a distinct new tenant/full bootstrap, not a reset of D1. |
+| Invalid/unknown key encoding/suite, collision, missing instance provenance, incomplete reference inventory or contradictory history | Fail closed as recovery required; do not auto-fix, drop conflicting children or manufacture a new ID. |
+
+Today's writer inserts `active` without the planned pending/PoP contract;
+therefore an old `active` row cannot be automatically downgraded to the safe
+pending cohort merely because approval tables are empty. Legacy equality
+`stored_hpke_id == signing_key_id(hpke_public_key)` identifies the bug, not
+proof that the row was never trusted. Forward repair is restartable: a crash
+commits the complete audited per-cohort transition or none; a second run
+checks the recorded result rather than rewriting signed history. Run FK,
+uniqueness and full-reference checks before opening v2 writes. Recognized
+epoch change invalidates old sessions/challenges and invokes R1 history
+reconciliation, but never changes key IDs (which are not epoch-derived).
+
+### R5. Required design cases for R1-R4 re-review
+
+These are test obligations for the gated G2 rewrite, **not passed tests**:
+
+- Same-device concurrent identical approval yields one commit and exact
+  receipt; different bytes at that identity conflict; another device, owner,
+  account, path, replay ID or confirmation cannot win another D1 approval.
+- Fingerprint typo writes nothing; confirmed key loss/cancel/revoked pending
+  device closes the attempt; later approval revocation preserves consumed
+  history and denies S6/retry, never reopening bootstrap.
+- Account-only ticket, guessed device ID, signing-only PoP, wrong HPKE key,
+  altered binding, stale epoch, consumed challenge/ticket and expired session
+  cannot authorize approval. Correct proof survives restart/re-login through
+  new challenge, not placeholder identity or account-only promotion.
+- Approval response loss permits byte-identical same-actor replay after root
+  rows exist. Expired session needs fresh both-key PoP; revoked approval,
+  altered actor keys, missing live authority or epoch change never receives
+  historical success. CLI response loss is verified via read-only status.
+- Audit, receipt, FK or storage failure rolls back every transition; crash
+  before/after commit exposes complete pre/post-state. Truncated/corrupt
+  receipt or confirmation-to-approval hash mismatch fails closed.
+- `DEVICE_APPROVE` rows: NULL/non-NULL extension-column `CHECK`, RESTRICT FK
+  and partial uniqueness reject inconsistent rows; no common wire request
+  can carry `DEVICE_APPROVE`; a disagreeing baseline ledger row yields no
+  response. GC before/after `retained_until` and legacy approvals without a
+  row reject the replay ID without a receipt; the startup/restore integrity
+  pass marks a corrupted row `recovery_required` without deletion.
+- Restored pre-confirmation/consumed/terminal snapshots and missing history
+  exercise R1 recovery-required/closed outcomes; no epoch rewrite or
+  empty-table reset. Same-epoch malicious rollback is not claimed detected.
+- Wrong-domain legacy IDs cover pure pending and signed/active cohorts,
+  collisions, every child-reference class, ambiguous instance provenance,
+  re-run/crash safety and activation/restore/key-release quarantine.
 
 ### Alternative analysis: pin both key IDs at `tenant create`
 
@@ -815,24 +1253,30 @@ path; freeze and verify its reservation lifecycle first.
 
 ### Review obligations retained after D1/D2 acceptance
 
-These are unresolved implementation contracts, not permission to weaken the
-accepted one-time trust boundary:
+R1-R4 propose the four missing P1 contracts; R5 enumerates their required
+negative/race/recovery cases. They await independent re-review, not silent
+promotion to accepted or implemented status. Remaining obligations are:
 
-- Define D1's confirmation schema/constraints and the login-to-pending-device
-  session binding. The required confirmation must be present, while prior
-  approvals/grants/root rows and any other confirmation must be absent.
-- Distinguish an exact retry after response loss from a second creation
-  attempt. The former needs a specified stored-response lookup and live-auth
-  policy; the latter must never create another approval or reopen bootstrap.
-- Define how the consumed confirmation remains linked to the exact active
-  approval for S6 OOB verification without becoming reusable authorization;
-  specify cancellation, revocation, epoch change and crash/recovery behavior.
-- Freeze the remaining capability value/scope rules and prove D2's ACTIVE
-  issuer checks. Acceptance does not expand `tenant.manage` into an issuer
-  privilege or let a generic capability grant create `root.custody`.
-- Resolve D3, login, forward migration/reconciliation and the remaining
-  Q1/Q4 contracts. Neither this analysis nor user acceptance changes the
-  independent G2-06 FAIL / G2-16 and G2-18 BLOCKED verdicts.
+- Independently review R1 confirmation lifetime/S6 linkage, R2 both-key
+  authentication bridge, R3 exact retry ordering, and R4 reconciliation.
+  Runtime/migration behavior must later prove these contracts under G2.
+- Freeze the remaining capability value/scope rules and prove D2's complete
+  issuer predicate in the mutation transaction: exact issuer key/device,
+  current instance/epoch, valid acknowledged non-revoked custody grant,
+  ACTIVE pointer/row agreement, live role/session and revocation races.
+  R2 separates gen-0 setup from ordinary operating capabilities; acceptance
+  does not make `tenant.manage` an issuer privilege or let generic grants
+  create `root.custody` (retained Architect P2-01).
+- Resolve D3 and the structured-audit schema: target/outcome/action enums,
+  request attribution, offline-only actor nullability and transaction-local
+  fail-closed insertions. Network callers cannot supply NULL actor identity;
+  R1/R3 require rollback on audit failure, not today's best-effort logger
+  (retained Architect P2-02).
+- Resolve remaining Q1 restore-manifest and Q4 contracts. R1 supplies mandatory
+  fail-closed history invariants, not a complete restore implementation.
+- Distinguish design fixtures/contract review from implementation evidence
+  (retained Architect P2-03). Independent G2-06 FAIL / G2-16 and G2-18 BLOCKED
+  remain unchanged. Architect approval alone cannot authorize production.
 
 ## Consequences once approved
 
@@ -848,6 +1292,27 @@ accepted one-time trust boundary:
 - Production v2 code stays closed until G2 `PASS` (L198).
 
 ## Revision log
+
+- 2026-10-04 (second-review candidate): added R1-R4 in response to Architect
+  P1-01 through P1-04 at `62979f2`, plus R5 required design cases. These are
+  proposed refinements of accepted D1/D2, not changes to user decisions or
+  runtime/migrations. R1 chooses a permanent per-instance/tenant guard with
+  no confirmation expiry/reset; R2 separates account tickets from both-key
+  proof-bound sessions; R3 chooses a separate exact signed-body approval
+  receipt ledger rather than extending the frozen common operation enum;
+  R4 treats rederived key IDs as authoritative and quarantines signed/ambiguous
+  historical data. Retained P2, D3, Q1/Q4 and independent G2 obligations remain
+  open. This entry records submission scope, not a second review verdict.
+- 2026-10-04 (third-review candidate): second review
+  (`.hermes/evidence/team-production/adr0001-rereview-6312978a1807/architect-review.md`)
+  approved R1, R2 and R4 and returned REVISE for R3: the separate approval
+  ledger was not reconciled with plan `v2_idempotency`, retention/GC,
+  recovery and authoritative replay. R3 now makes `v2_idempotency` the sole
+  replay authority with a storage-only `DEVICE_APPROVE` kind, constrained
+  approval columns, RESTRICT FK to the approval reservation, retention floor
+  `not_after_ms + authorization_replay_retention`, GC, crash/restart/restore
+  integrity rules and plan §8.2 error codes; R5 gains matching cases. These
+  are proposed plan amendments pending the third review, not accepted policy.
 
 - 2026-10-03: first draft. Settled points only; Q1–Q4 open; options A/B
   proposed for Q2/Q3.
