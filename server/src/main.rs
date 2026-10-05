@@ -13,6 +13,7 @@ mod fleet_grants;
 mod generations;
 mod grants;
 mod idempotency;
+mod identity_record;
 mod models;
 mod ratelimit;
 mod routes;
