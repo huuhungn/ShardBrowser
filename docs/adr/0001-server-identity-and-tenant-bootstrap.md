@@ -1081,9 +1081,20 @@ revoked/expired approval, device, owner membership or issuer authority receives
 `403`. Epoch mismatch receives `409 STALE_CONTEXT`, no historical success
 or epoch rewrite; instance mismatch is denied. New identity after consumed
 confirmation receives `409 FIRST_DEVICE_ALREADY_CLOSED`. `STALE_CONTEXT` and
-`FIRST_DEVICE_ALREADY_CLOSED` are proposed additions to plan §8.2. Invalid
-bytes or binding receive `400`; signed-claim equality failures keep plan
-`AUTH_CLAIM_COLUMN_MISMATCH`. Errors never return an old success or recreate
+`FIRST_DEVICE_ALREADY_CLOSED` are proposed additions to plan §8.2. HTTP `400`
+covers only a malformed transport or request shape, or a request/path binding
+that plan §8.2 does not already name. It is not a fallback for a parsed
+signed record. Plan §8.2 keeps its own status and code for each named class:
+`422` for `NON_CANONICAL_RECORD`, `SIGNATURE_INVALID`,
+`SIGNED_BYTES_MISMATCH`, `SIGNED_CONTAINER_HASH_MISMATCH`,
+`AUTH_CLAIM_COLUMN_MISMATCH`, `KEY_SUBSTITUTION_DETECTED`,
+`HEAD_ROLLBACK_DETECTED`, `WIRE_INTEGER_OUT_OF_RANGE`, and the existing
+`MUTATION_RESPONSE_MISMATCH`; `409` for `IDEMPOTENCY_MISMATCH`,
+`STALE_CONTEXT`, and `FIRST_DEVICE_ALREADY_CLOSED`; `401` and `403` as stated
+above. HPKE suite, info, encapped-key, or wrapped-key mismatch stays
+`422 AUTH_CLAIM_COLUMN_MISMATCH` (plan L1233). A client treats an unknown
+code or an HTTP status that disagrees with its code as fail-closed
+(plan L1247). Errors never return an old success or recreate
 authorization. R1 defines CLI lost-response handling; it is readback, not
 another confirmation mutation.
 
@@ -1155,7 +1166,13 @@ These are test obligations for the gated G2 rewrite, **not passed tests**:
   historical success. CLI response loss is verified via read-only status.
 - Audit, receipt, FK or storage failure rolls back every transition; crash
   before/after commit exposes complete pre/post-state. Truncated/corrupt
-  receipt or confirmation-to-approval hash mismatch fails closed.
+  receipt or confirmation-to-approval hash mismatch fails closed with
+  `422 MUTATION_RESPONSE_MISMATCH` and no success body.
+- A parsed signed record keeps its plan §8.2 code: noncanonical bytes,
+  invalid signature, signed-byte or container-hash mismatch, claim-column
+  mismatch, key substitution, head rollback, and an out-of-range wire
+  integer are `422`, never the generic `400`. HTTP `400` is only an
+  unparseable transport or request shape, or an unnamed path binding.
 - `DEVICE_APPROVE` rows: NULL/non-NULL extension-column `CHECK`, RESTRICT FK
   and partial uniqueness reject inconsistent rows; no common wire request
   can carry `DEVICE_APPROVE`; a disagreeing baseline ledger row yields no
@@ -1313,6 +1330,15 @@ promotion to accepted or implemented status. Remaining obligations are:
   `not_after_ms + authorization_replay_retention`, GC, crash/restart/restore
   integrity rules and plan §8.2 error codes; R5 gains matching cases. These
   are proposed plan amendments pending the third review, not accepted policy.
+- 2026-10-04 (P2-04 confirmation candidate): third review
+  (`docs/adr/reviews/0001-architect-review-3-a2d92d2d5510.md`, committed at
+  `3f9f157`) approved all four P1 contracts and raised nonblocking P2-04.
+  R3 now limits HTTP `400` to a malformed transport or request shape, or an
+  unnamed request/path binding. Parsed signed-record failures keep the exact
+  plan §8.2 `422` codes, including `AUTH_CLAIM_COLUMN_MISMATCH` and
+  `WIRE_INTEGER_OUT_OF_RANGE`. R5 adds the matching cases. This narrows the
+  error contract only; it does not change R1-R4 authority, retention, or
+  replay ordering.
 
 - 2026-10-03: first draft. Settled points only; Q1–Q4 open; options A/B
   proposed for Q2/Q3.
