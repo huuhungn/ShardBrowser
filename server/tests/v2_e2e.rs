@@ -1002,6 +1002,32 @@ async fn device_enrollment_requires_proof_of_possession() {
     let device_id = enrolled["device_id"].as_str().unwrap().to_string();
     assert_eq!(device_id.len(), 32, "device id should be a 16-byte hex id");
 
+    // Enrollment must use the same domain-separated ids as the grant codecs.
+    // Successful enrollment alone did not catch HPKE keys being assigned a
+    // signing-key id, which makes later recipient bindings disagree.
+    let expected_signing_id = shared::keys::signing_key_id(&device_vk);
+    let expected_hpke_id = shared::keys::hpke_key_id(&hpke_pk);
+    assert_eq!(enrolled["signing_key_id"], hex(&expected_signing_id));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}/shardx.db",
+            data.display().to_string().replace('\\', "/")
+        ))
+        .await
+        .unwrap();
+    let stored: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT signing_key_id, hpke_key_id FROM v2_devices WHERE tenant_id = ? AND id = ?",
+    )
+    .bind(TENANT_A.as_slice())
+    .bind(decode_hex_str(&device_id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.0, expected_signing_id);
+    assert_eq!(stored.1, expected_hpke_id);
+    pool.close().await;
+
     // The challenge is single-use: replaying the same valid proof must fail,
     // or an intercepted proof could enroll a second device.
     let replay = cl
@@ -1057,6 +1083,123 @@ fn enrollment_proof_bytes(
         ("signing_public_key".into(), c::b(signing_public_key)),
         ("hpke_public_key".into(), c::b(hpke_public_key)),
     ]))
+}
+
+#[tokio::test]
+async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
+    let port = 38138u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-hpke-upgrade-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let cl = client();
+    wait_health(&cl, port).await;
+    let admin = token(&cl, port, "admin", "secret").await;
+    let user_id = admin_user_id(&cl, port, &admin).await;
+    let sk_a = Ed25519SigningKey::from_bytes(&[11u8; 32]);
+    let sk_b = Ed25519SigningKey::from_bytes(&[22u8; 32]);
+    seed(&data, &user_id, &sk_a, &sk_b).await;
+
+    let original_signer = Ed25519SigningKey::from_bytes(&[0x45u8; 32]);
+    let (_, hpke_pk) = shared::grants::derive_keypair(&[0x56u8; 32]);
+    let hpke_pk: [u8; 32] = hpke_pk.try_into().unwrap();
+    let (original_device, _) =
+        enroll(&cl, port, &admin, &TENANT_A, &original_signer, &hpke_pk).await;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}/shardx.db",
+            data.display().to_string().replace('\\', "/")
+        ))
+        .await
+        .unwrap();
+    let replacement_signer = Ed25519SigningKey::from_bytes(&[0x46u8; 32]);
+    let replacement_vk = replacement_signer.verifying_key().to_bytes();
+
+    // Model an upgrade without rewriting existing ids in the product path.
+    // Both current and historical rows must reject reusing the same HPKE key.
+    for legacy in [false, true] {
+        let stored_id = if legacy {
+            shared::keys::signing_key_id(&hpke_pk)
+        } else {
+            shared::keys::hpke_key_id(&hpke_pk)
+        };
+        sqlx::query("UPDATE v2_devices SET hpke_key_id = ? WHERE tenant_id = ? AND id = ?")
+            .bind(stored_id.as_slice())
+            .bind(TENANT_A.as_slice())
+            .bind(&original_device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ch_res = cl
+            .post(format!("{}/v2/devices/enrollment-challenges", base(port)))
+            .bearer_auth(&admin)
+            .json(&json!({
+                "tenant_id": hex(&TENANT_A),
+                "signing_public_key": hex(&replacement_vk),
+                "hpke_public_key": hex(&hpke_pk),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(ch_res.status().is_success());
+        let ch: Value = ch_res.json().await.unwrap();
+        let challenge_id = decode_hex_str(ch["challenge_id"].as_str().unwrap());
+        let nonce = decode_hex_str(ch["nonce"].as_str().unwrap());
+        let account_id = decode_hex_str(ch["account_id"].as_str().unwrap());
+        let tbs = enrollment_proof_bytes(
+            &challenge_id,
+            &nonce,
+            &TENANT_A,
+            &account_id,
+            &replacement_vk,
+            &hpke_pk,
+        );
+        let res = cl
+            .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
+            .bearer_auth(&admin)
+            .json(&json!({
+                "tenant_id": hex(&TENANT_A),
+                "challenge_id": hex(&challenge_id),
+                "nonce": hex(&nonce),
+                "signing_public_key": hex(&replacement_vk),
+                "hpke_public_key": hex(&hpke_pk),
+                "proof_signature": hex(&shared::signing::sign_tbs(&replacement_signer, &tbs)),
+                "label_ciphertext": hex(b"duplicate-key-upgrade-fixture"),
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(status, 400, "duplicate HPKE key accepted (legacy={legacy})");
+        assert_eq!(body["error"], "device is already enrolled in this tenant");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM v2_devices WHERE tenant_id = ?")
+            .bind(TENANT_A.as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "a refused enrollment must not insert a device");
+        let after: Vec<u8> =
+            sqlx::query_scalar("SELECT hpke_key_id FROM v2_devices WHERE tenant_id = ? AND id = ?")
+                .bind(TENANT_A.as_slice())
+                .bind(&original_device)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after, stored_id, "refusal must not rewrite historical ids");
+        let consumed: Option<String> = sqlx::query_scalar(
+            "SELECT consumed_at FROM v2_enrollment_challenges WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(TENANT_A.as_slice())
+        .bind(&challenge_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            consumed.is_none(),
+            "refused duplicate must roll back the challenge claim"
+        );
+    }
+    pool.close().await;
 }
 
 /// Build a signed tenant-root-key-grant record.
