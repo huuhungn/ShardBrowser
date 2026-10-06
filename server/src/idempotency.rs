@@ -279,7 +279,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        shardx_team_server::run_migrations_fk_safe(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO v2_tenants (id, slug, status, active_root_generation, created_at)
              VALUES (?, 'acme', 'active', 1, '2026-01-01T00:00:00+00:00')",
@@ -346,7 +348,9 @@ mod tests {
             .connect("sqlite::memory:?cache=shared")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        shardx_team_server::run_migrations_fk_safe(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO v2_tenants (id, slug, status, active_root_generation, created_at)
              VALUES (?, 'acme', 'active', 1, '2026-01-01T00:00:00+00:00')",

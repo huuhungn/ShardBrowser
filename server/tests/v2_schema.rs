@@ -29,7 +29,9 @@ async fn pool() -> SqlitePool {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    shardx_team_server::run_migrations_fk_safe(&pool)
+        .await
+        .unwrap();
     pool
 }
 

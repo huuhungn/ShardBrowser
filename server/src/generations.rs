@@ -40,9 +40,8 @@ pub struct Generation {
 /// Begin the tenant's first root key generation, in PREPARING.
 ///
 /// The generation number is the one the tenant already advertises in
-/// `v2_tenants.active_root_generation`, so a bootstrapped tenant does not end
-/// up with a lifecycle row numbered differently from the column every other
-/// query reads.
+/// `v2_tenants.active_root_generation`. A genesis tenant stores NULL there,
+/// which means generation 0; a later activation writes the real number.
 ///
 /// Only the first generation is creatable here: a later one is a rotation,
 /// which must carry the previous generation forward and is out of scope.
@@ -66,12 +65,23 @@ pub async fn begin_first_generation(
         ));
     }
 
-    let generation: i64 =
+    let advertised: Option<i64> =
         sqlx::query_scalar("SELECT active_root_generation FROM v2_tenants WHERE id = ?1")
             .bind(tenant_id.as_slice())
             .fetch_optional(db)
             .await?
-            .ok_or_else(|| AppError::BadRequest("tenant does not exist".into()))?;
+            .flatten();
+    if advertised.is_none()
+        && sqlx::query_scalar::<_, i64>("SELECT count(*) FROM v2_tenants WHERE id = ?1")
+            .bind(tenant_id.as_slice())
+            .fetch_one(db)
+            .await?
+            == 0
+    {
+        return Err(AppError::BadRequest("tenant does not exist".into()));
+    }
+    // NULL is the pre-activation pointer from ADR 0001 Q3, not a missing row.
+    let generation = advertised.unwrap_or(0);
 
     sqlx::query(
         "INSERT INTO v2_root_key_generations \
@@ -300,4 +310,55 @@ pub async fn activate_generation(
     tx.commit().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn genesis_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        shardx_team_server::run_migrations_fk_safe(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn null_pointer_begins_generation_zero() {
+        let pool = genesis_pool().await;
+        sqlx::query(
+            "INSERT INTO v2_tenants (id, slug, status, created_at) VALUES (?, 'genesis', 'active', 'now')",
+        )
+        .bind(vec![1u8; 16])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let generation = begin_first_generation(&pool, &[1u8; 16], &[2u8; 32], "now")
+            .await
+            .unwrap();
+        assert_eq!(generation, 0);
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT generation FROM v2_root_key_generations WHERE tenant_id = ?",
+        )
+        .bind(vec![1u8; 16])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0);
+
+        let missing = begin_first_generation(&pool, &[9u8; 16], &[3u8; 32], "now")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, AppError::BadRequest(message) if message == "tenant does not exist")
+        );
+    }
 }

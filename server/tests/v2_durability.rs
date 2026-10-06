@@ -32,7 +32,9 @@ async fn open(path: &std::path::Path) -> SqlitePool {
         .connect_with(opts)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    shardx_team_server::run_migrations_fk_safe(&pool)
+        .await
+        .unwrap();
     pool
 }
 
