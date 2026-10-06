@@ -4577,11 +4577,13 @@ dependencies = [
  "tempfile",
  "tiny-skia",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower",
  "tungstenite",
  "url",
  "uuid",
+ "webpki-roots",
  "windows-sys 0.59.0",
  "zip 2.4.2",
 ]

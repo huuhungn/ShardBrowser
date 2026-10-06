@@ -78,11 +78,24 @@ impl Tracker {
     }
 
     /// Take a spawned child + monitor it; entry removed on exit/kill.
+    #[cfg(test)]
     pub fn track(
+        &'static self,
+        profile_id: String,
+        child: Child,
+        temporary: bool,
+    ) -> TrackedProcess {
+        self.track_with_relay(profile_id, child, temporary, None)
+    }
+
+    /// [`Tracker::track`], keeping `relay` open exactly as long as the child
+    /// runs: the engine's only route to its proxy, closed when it exits.
+    pub fn track_with_relay(
         &'static self,
         profile_id: String,
         mut child: Child,
         temporary: bool,
+        relay: Option<crate::proxy_relay::RelayHandle>,
     ) -> TrackedProcess {
         let pid = child.id().unwrap_or(0);
         let launch_instance_token = uuid::Uuid::new_v4().to_string();
@@ -141,6 +154,7 @@ impl Tracker {
                     }
                 }
             }
+            drop(relay);
             // Bump the persisted total runtime; non-temporary only (temp
             // profiles get deleted next line so their counter is moot).
             // Every step below is best-effort: a panic here used to abort the

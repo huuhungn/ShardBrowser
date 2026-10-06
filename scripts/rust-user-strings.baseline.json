@@ -4,6 +4,7 @@
     "api.rs": "Automation API answers a script in JSON, and three fields feed ApiRuntimeStatus.error, which the interface only tests for presence before showing its own mcp.bindFailed string. Nothing here is read by an operator as prose.",
     "store.rs": "config_root fails only when the OS has no config directory, which is before there is a window to show a toast in.",
     "profile_icon.rs": "ensure_icon has one caller, launch.rs, which logs the error with eprintln! and launches the profile anyway. The operator sees a missing icon, never the sentence.",
+    "proxy_relay.rs": "Only start() returns an error to a command, and it uses the launch.proxyRelayFailed and proxy.credentialsTooLong codes. Every other error ends one engine connection inside the relay task, which discards it; the engine sees a closed socket, never the sentence.",
     "proxy_auth_engine_tests.rs": "Declared #[cfg(test)] in lib.rs: an opt-in real-engine regression that is never compiled into the app."
   },
   "strings": []

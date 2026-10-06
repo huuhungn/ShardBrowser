@@ -36,6 +36,7 @@ mod profile;
 mod proxy;
 #[cfg(test)]
 mod proxy_auth_engine_tests;
+mod proxy_relay;
 mod psapi;
 mod runtime;
 mod settings;
