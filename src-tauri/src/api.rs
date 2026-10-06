@@ -702,7 +702,8 @@ struct EditReq {
     folder: Option<String>,
     /// "" unbinds.
     proxy_id: Option<String>,
-    /// Proxy string: stored + tested, then bound.
+    /// Proxy string: stored + tested, then bound. A new password for the
+    /// endpoint and login already bound updates that proxy in place.
     proxy: Option<String>,
     /// `#rrggbb`; "" goes back to the name-derived colour.
     color: Option<String>,
@@ -771,7 +772,9 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
                 format!("unparseable proxy: {pstr}"),
             )
         })?;
-        let s = crate::proxy::upsert_dedup(entry)
+        // A new password for the proxy this profile already uses updates that
+        // proxy; it does not leave the old one behind with a stale password.
+        let s = crate::proxy::upsert_for_binding(entry, stored.meta.proxy_id.as_deref())
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = crate::proxy::full_test(&s).await;
         stored.meta.proxy_id = Some(s.id);
