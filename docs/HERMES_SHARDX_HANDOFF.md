@@ -2,6 +2,95 @@
 
 Last verified: 2026-09-19 (Hermes Desktop as the MCP host)
 
+## Upstream and community fork review (2026-10-06)
+
+Read-only review against `origin/main` (`8d07f0d`). Nothing below is ported yet.
+
+- **Do not merge `upstream/main` wholesale.** The fork is 99 commits ahead and
+  17 behind; `git cherry` finds none of the 17 patch-equivalent, and 606 files
+  changed on both sides since the merge base. Port by feature, with tests.
+- **Already covered or not applicable:** upstream `bdc94ca` (the fork has no
+  fleet window and `helper_show` is already `async`); issue #83 (`fromStored`
+  already reads `platform_version`); PR #89 (the Node SDK has no `adm-zip`).
+- **Candidates, in order:**
+  1. Issue #100: a comma in a proxy username fails auth. The Python SDK's
+     `to_arg()` and the launcher's `to_proxy_server_arg()` emit `%2C`, and the
+     launcher's `form_urlencoded` also turns a space into `+`. Whether the
+     engine decodes either form is unverified; test against a real proxy first.
+  2. Issue #95: Motion needs `--shardx-automation`, which neither SDK passes.
+     Keep it opt-in; issue #96 reports runaway key repeat in headless mode.
+  3. Mak4rX fork: bulk create, per-profile start pages, and remembered window
+     size. Re-implement from the idea; the code base has diverged.
+  4. Issue #101: a "bring window to front" action. `devtools_activate` covers
+     only the verification tab today.
+  5. PR #85: add the password to the proxy duplicate key. Decide first whether
+     changing a password should update the entry or create a new one.
+- **Skip:** CarterLeeAlt (layout polish), latondev account-registration
+  automation, and the kumanode performance PRs (#88/#93, closed unmerged, 10k+
+  lines). Measure before borrowing any of the kumanode performance ideas.
+
+## Team/Fleet production gate check (2026-10-02 UTC)
+
+The version/runtime inventory below is historical, not a fresh installation
+attestation. The production completion check used source `8d07f0d` (v2.2.10)
+on the local `team-custody-production` branch. Do not equate that launcher
+release with completion of the encrypted Team/Fleet plan.
+
+- **Fresh setup is blocked:** an isolated server with a new data directory and
+  no SQL seed returned `200` for health and synthetic admin login, then `400`
+  with `server identity is not initialised` for `/v2/server-identity`. The
+  disposable process was stopped and its data removed. The server startup
+  (`server/src/main.rs`) initializes the database and admin, but does not
+  provision the v2 identity/tenant/fleet path. Seeded integration tests do not
+  prove fresh production setup. Do not repair an operator's database by hand
+  to claim this gate passed.
+- **Local enrollment fix, not released:** `server/src/enrollment.rs` now derives
+  HPKE key IDs using the HPKE domain rather than the signing-key domain.
+  Duplicate detection also compares the HPKE public key, so historical rows
+  with the old ID cannot permit a second enrollment of the same key. The
+  regression test in `server/tests/v2_e2e.rs` failed with `201` on the legacy
+  duplicate before the compatibility fix, then passed expecting `400`; it
+  also checks that refusal inserts no device, consumes no challenge and
+  rewrites no historical ID. Existing stored IDs/grants are not migrated by
+  this patch; their broader compatibility remains a separate verification.
+- **Observed verification:** all server tests passed (`103`, one ignored),
+  shared tests passed (`139`, one ignored), and the two launcher fleet
+  integration binaries passed (`4`). Ignored tests are not passed gates.
+  Targeted rustfmt and `git diff --check` passed. UI-kit and application builds
+  passed against existing dependencies using explicit `npm --ignore-scripts
+  --prefix ui-kit run build:lib` then `npm --ignore-scripts run build`.
+  The ordinary `npm run build` prebuild stopped at `npm ci` with
+  `EALLOWSCRIPTS` from the host's allow-scripts setting; a fresh dependency
+  install was therefore not verified. No global npm configuration was changed.
+- **Release boundary:** canonical plan section 17.2 and the persisted design
+  consensus require an independent G2 evidence verdict before production
+  implementation, followed by G0-G7 and the separate named-operator P-OP
+  drills. This run has not established G2 PASS. Independent gate/security
+  review is pending. No commit, push, release, install, live data migration
+  or real-profile modification was performed for these fixes.
+- **G2 rerun is not a G2 verdict (2026-10-03):** the `.omx/spikes/g2-v0.2.x`
+  harness reran 76 PASS / 0 FAIL and matches the stored report hash after
+  removing one blank line. The harness does not link `server/` or `shared/`,
+  so it does not verify the enrollment fix. The G2 evidence file contradicts
+  itself (header: not independently verified, latest verdict FAIL; section 1:
+  PASS). The plan's G2 row also requires external-epoch evidence, which the
+  spike does not contain. Treat G2 as BLOCKED until a clean independent
+  verdict covers every row.
+- **Missing design, not just missing code:** the plan fixes the restore order
+  for the external identity record but not its byte layout, how a fresh
+  instance creates epoch 0, or how the first tenant and owner account are
+  created. No server code writes `v2_server_state` or implements the
+  `EPOCH_AUTHORITY_*` errors. Implemented v2 routes also differ from the
+  plan's route list (for example tenant-scoped root generations, device
+  revoke, root-grant ack/revoke, lease renew/force-expire and restore-epoch
+  transitions). These need an Architect decision before implementation.
+
+Session-local reproducibility records (ignored by Git):
+`.hermes/plans/team-custody-production-checkpoint.md` and
+`.hermes/evidence/team-production/fresh-server-probe.json`. The next owner must
+resolve the G2 evidence gate and implement/test the fresh setup path without
+bypassing custody, identity or restore-epoch contracts.
+
 ## Repository and runtime map
 
 | Purpose | Path / branch |
