@@ -97,6 +97,37 @@ async fn serve(expected: Option<String>, counts: Arc<Counts>) -> (u16, ListenerT
     (port, ListenerTask(task))
 }
 
+const NAV_ATTEMPTS: usize = 3;
+
+async fn navigate_and_read(id: &str, target: u16) -> anyhow::Result<bool> {
+    let navigation = cdp::page_call(
+        id,
+        "Page.navigate",
+        json!({ "url": format!("http://127.0.0.1:{target}/issue100-target") }),
+    )
+    .await?;
+    if navigation.get("errorText").is_some() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        return Ok(false);
+    }
+    for _ in 0..50 {
+        let value = cdp::page_call(
+            id,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.body ? document.body.innerText : ''",
+                "returnByValue": true
+            }),
+        )
+        .await?;
+        if value["result"]["value"].as_str() == Some(BODY) {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(false)
+}
+
 async fn run_case(label: &str, comma: bool) -> anyhow::Result<()> {
     let counts = Arc::new(Counts::default());
     let mut username = uuid::Uuid::new_v4().simple().to_string();
@@ -132,31 +163,14 @@ async fn run_case(label: &str, comma: bool) -> anyhow::Result<()> {
             .map(|c| c.web_socket_debugger_url.clone())
             .ok_or_else(|| anyhow::anyhow!("CDP did not start"))?;
         cdp::attach(id.clone(), ws).await?;
-        let navigation = cdp::page_call(
-            &id,
-            "Page.navigate",
-            json!({
-                "url": format!("http://127.0.0.1:{target}/issue100-target")
-            }),
-        )
-        .await?;
-        if navigation.get("errorText").is_some() {
-            return Ok(false);
-        }
-        for _ in 0..50 {
-            let value = cdp::page_call(
-                &id,
-                "Runtime.evaluate",
-                json!({
-                    "expression": "document.body ? document.body.innerText : ''",
-                    "returnByValue": true
-                }),
-            )
-            .await?;
-            if value["result"]["value"].as_str() == Some(BODY) {
+        // The engine can fail its first proxy challenge while its own startup
+        // requests race the navigation (seen with plain credentials too), so
+        // retry a few times. A credential the proxy rejects fails every try.
+        for attempt in 1..=NAV_ATTEMPTS {
+            if navigate_and_read(&id, target).await? {
+                eprintln!("issue100 {label}: loaded on attempt {attempt}");
                 return Ok(true);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(false)
     }
