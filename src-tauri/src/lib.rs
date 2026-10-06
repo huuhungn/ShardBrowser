@@ -34,6 +34,8 @@ mod migrate;
 mod process;
 mod profile;
 mod proxy;
+#[cfg(test)]
+mod proxy_auth_engine_tests;
 mod psapi;
 mod runtime;
 mod settings;
