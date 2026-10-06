@@ -458,7 +458,7 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
     } else if let Some(pstr) = body.proxy.as_ref() {
         let entry = crate::proxy::parse_single(pstr)
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("unparseable proxy: {pstr}")))?;
-        let s = crate::proxy::upsert_dedup(entry)
+        let s = crate::proxy::upsert_for_binding(entry, stored.meta.proxy_id.as_deref())
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = crate::proxy::full_test(&s).await;
         stored.meta.proxy_id = Some(s.id);

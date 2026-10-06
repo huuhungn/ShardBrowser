@@ -120,6 +120,36 @@ pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     Ok(entry)
 }
 
+/// Where `entry` lands when a profile already bound to `bound_id` is given it.
+///
+/// Same rule as `upsert_dedup`: an exact copy already in the store is reused,
+/// anything else is added. Returns the entry the profile should be bound to
+/// and whether the store changed.
+fn place_for_binding(
+    store: &mut Vec<ProxyEntry>,
+    mut entry: ProxyEntry,
+    _bound_id: Option<&str>,
+) -> (ProxyEntry, bool) {
+    if let Some(existing) = store.iter().find(|p| p.same_connection(&entry)) {
+        return (existing.clone(), false);
+    }
+    if entry.id.is_empty() {
+        entry.id = uuid::Uuid::new_v4().to_string();
+    }
+    store.push(entry.clone());
+    (entry, true)
+}
+
+/// `upsert_dedup` for a profile that may already be bound to a proxy.
+pub fn upsert_for_binding(entry: ProxyEntry, bound_id: Option<&str>) -> Result<ProxyEntry> {
+    let mut s = load()?;
+    let (placed, changed) = place_for_binding(&mut s.proxies, entry, bound_id);
+    if changed {
+        save(&s)?;
+    }
+    Ok(placed)
+}
+
 pub fn delete(id: &str) -> Result<()> {
     let mut s = load()?;
     s.proxies.retain(|p| p.id != id);
@@ -986,6 +1016,77 @@ mod tests {
         assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 1);
         assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 0);
         assert_eq!(store.len(), 1);
+    }
+
+    fn stored(id: &str, user: &str, pass: &str) -> ProxyEntry {
+        ProxyEntry {
+            id: id.into(),
+            name: "kept name".into(),
+            country: "PL".into(),
+            notes: "kept note".into(),
+            ..entry(user, pass)
+        }
+    }
+
+    /// A new password for the bound endpoint and login is a change to that
+    /// proxy: same id, same metadata, new password, nothing added.
+    #[test]
+    fn a_new_password_updates_the_bound_entry() {
+        let mut store = vec![stored("bound", "user", "old")];
+        let (placed, changed) = place_for_binding(&mut store, entry("user", "new"), Some("bound"));
+        assert!(changed);
+        assert_eq!(store.len(), 1);
+        assert_eq!(placed.id, "bound");
+        assert_eq!(store[0].password, "new");
+        assert_eq!(
+            (
+                store[0].name.as_str(),
+                store[0].country.as_str(),
+                store[0].notes.as_str()
+            ),
+            ("kept name", "PL", "kept note")
+        );
+    }
+
+    /// An exact copy elsewhere in the store wins: rebinding to it creates
+    /// nothing, and the bound entry is not turned into a second copy of it.
+    #[test]
+    fn an_exact_copy_is_reused_before_the_bound_entry_is_touched() {
+        let mut store = vec![
+            stored("bound", "user", "old"),
+            stored("other", "user", "new"),
+        ];
+        let (placed, changed) = place_for_binding(&mut store, entry("user", "new"), Some("bound"));
+        assert!(!changed);
+        assert_eq!(placed.id, "other");
+        assert_eq!(store.len(), 2);
+        assert_eq!(store[0].password, "old");
+    }
+
+    /// Only the password is a change in place. Another login, another scheme,
+    /// or no bound entry at all is a different proxy and is added.
+    #[test]
+    fn anything_but_the_password_is_still_a_new_proxy() {
+        let mut other_user = vec![stored("bound", "user", "old")];
+        let (placed, _) =
+            place_for_binding(&mut other_user, entry("someone", "new"), Some("bound"));
+        assert_ne!(placed.id, "bound");
+        assert_eq!(other_user.len(), 2);
+        assert_eq!(other_user[0].password, "old");
+
+        let mut other_scheme = vec![stored("bound", "user", "old")];
+        let http = ProxyEntry {
+            kind: ProxyKind::Http,
+            ..entry("user", "new")
+        };
+        place_for_binding(&mut other_scheme, http, Some("bound"));
+        assert_eq!(other_scheme.len(), 2);
+        assert_eq!(other_scheme[0].password, "old");
+
+        let mut unbound = vec![stored("kept", "user", "old")];
+        place_for_binding(&mut unbound, entry("user", "new"), None);
+        assert_eq!(unbound.len(), 2, "with no binding, #72 still applies");
+        assert_eq!(unbound[0].password, "old");
     }
 
     /// `bulk_save` used to ignore `kind`, so an HTTP and a SOCKS5 entry on one
