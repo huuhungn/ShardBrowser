@@ -47,6 +47,14 @@ impl ProxyEntry {
             && self.password == other.password
     }
 
+    /// Same endpoint and the same login; the password may differ.
+    fn same_login(&self, other: &ProxyEntry) -> bool {
+        self.kind == other.kind
+            && self.host == other.host
+            && self.port == other.port
+            && self.username == other.username
+    }
+
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port` for ShardX.
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
@@ -122,16 +130,27 @@ pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
 
 /// Where `entry` lands when a profile already bound to `bound_id` is given it.
 ///
-/// Same rule as `upsert_dedup`: an exact copy already in the store is reused,
-/// anything else is added. Returns the entry the profile should be bound to
-/// and whether the store changed.
+/// An exact copy already in the store is reused, as in `upsert_dedup`. Failing
+/// that, when the bound entry is the same endpoint and login with another
+/// password, the new password is a change to that proxy rather than a second
+/// one: the bound entry takes it and keeps its id, name, country and notes, so
+/// the profile stays bound and nothing is left behind with the old password.
+/// Anything else is a different proxy and is added. Returns the entry the
+/// profile should be bound to and whether the store changed.
 fn place_for_binding(
     store: &mut Vec<ProxyEntry>,
     mut entry: ProxyEntry,
-    _bound_id: Option<&str>,
+    bound_id: Option<&str>,
 ) -> (ProxyEntry, bool) {
     if let Some(existing) = store.iter().find(|p| p.same_connection(&entry)) {
         return (existing.clone(), false);
+    }
+    let bound = bound_id
+        .filter(|id| !id.is_empty())
+        .and_then(|id| store.iter_mut().find(|p| p.id == id));
+    if let Some(bound) = bound.filter(|p| p.same_login(&entry)) {
+        bound.password = entry.password;
+        return (bound.clone(), true);
     }
     if entry.id.is_empty() {
         entry.id = uuid::Uuid::new_v4().to_string();
@@ -140,7 +159,8 @@ fn place_for_binding(
     (entry, true)
 }
 
-/// `upsert_dedup` for a profile that may already be bound to a proxy.
+/// `upsert_dedup` for a profile that may already be bound to a proxy; a new
+/// password for the bound endpoint and login updates that proxy in place.
 pub fn upsert_for_binding(entry: ProxyEntry, bound_id: Option<&str>) -> Result<ProxyEntry> {
     let mut s = load()?;
     let (placed, changed) = place_for_binding(&mut s.proxies, entry, bound_id);
