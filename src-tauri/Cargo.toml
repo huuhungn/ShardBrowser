@@ -35,6 +35,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json", "cookies"] }
 base64 = "0.22"
+# Proxy relay (#100) dials HTTPS proxies itself; same versions and ring
+# backend reqwest's rustls-tls already locks, so no new crates.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 # Local automation HTTP API (axum) + JWT bearer auth.
 axum = "0.7"
 jsonwebtoken = "9"

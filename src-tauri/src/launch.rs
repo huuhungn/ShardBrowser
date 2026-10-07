@@ -231,8 +231,23 @@ pub async fn launch_profile_synced(
         cmd.arg("--hide-crash-restore-bubble");
     }
 
+    // Credentials the engine cannot carry inline go through a loopback relay
+    // (#100); it must outlive the spawn, so the tracker takes it below.
+    let mut proxy_relay = None;
     if let Some(p) = bound_proxy.as_ref() {
-        cmd.arg(format!("--proxy-server={}", p.to_proxy_server_arg()));
+        let proxy_arg = if crate::proxy_relay::needs_relay(p) {
+            let relay = crate::proxy_relay::start(p.clone()).await?;
+            let arg = relay.proxy_server_arg();
+            eprintln!(
+                "[launcher] proxy {} credentials need escaping; engine uses a loopback relay",
+                p.host
+            );
+            proxy_relay = Some(relay);
+            arg
+        } else {
+            p.to_proxy_server_arg()
+        };
+        cmd.arg(format!("--proxy-server={proxy_arg}"));
 
         // QUIC: enable only when proxy UDP relay verified; rely on Alt-Svc upgrade path.
         if proxy_udp_ok {
@@ -356,7 +371,12 @@ pub async fn launch_profile_synced(
         let _ = child.wait().await;
         return Err(error).context(crate::errcode::code("launch.persistMetadata"));
     }
-    let tracked = Tracker::shared().track(profile_id.to_string(), child, stored.meta.temporary);
+    let tracked = Tracker::shared().track_with_relay(
+        profile_id.to_string(),
+        child,
+        stored.meta.temporary,
+        proxy_relay,
+    );
     drop(launch_claim);
 
     let cdp = if enable_cdp {

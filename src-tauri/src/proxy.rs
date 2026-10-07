@@ -54,6 +54,39 @@ impl ProxyEntry {
             format!("{scheme}://{user}:{pass}@{host_port}")
         }
     }
+
+    /// Proxy URL for the launcher's own `reqwest` clients. `reqwest`
+    /// percent-decodes the userinfo, so every byte outside the unreserved set
+    /// is written as `%XX` — `form_urlencoded` turns a space into `+`, which
+    /// `reqwest` would then send literally. `socks_scheme` picks `socks5` or
+    /// `socks5h` for SOCKS5 entries.
+    pub fn reqwest_proxy_url(&self, socks_scheme: &str) -> String {
+        let scheme = match self.kind {
+            ProxyKind::Socks5 => socks_scheme,
+            ProxyKind::Http => "http",
+            ProxyKind::Https => "https",
+        };
+        let host_port = format!("{}:{}", self.host, self.port);
+        if self.username.is_empty() && self.password.is_empty() {
+            return format!("{scheme}://{host_port}");
+        }
+        let encode = |s: &str| {
+            s.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>()
+        };
+        format!(
+            "{scheme}://{}:{}@{host_port}",
+            encode(&self.username),
+            encode(&self.password)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -521,20 +554,8 @@ pub async fn geo_check_via(
 
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8));
     if let Some(entry) = entry {
-        let scheme = match entry.kind {
-            ProxyKind::Socks5 => "socks5h", // DNS via proxy
-            ProxyKind::Http => "http",
-            ProxyKind::Https => "https",
-        };
-        let proxy_url = if entry.username.is_empty() && entry.password.is_empty() {
-            format!("{scheme}://{}:{}", entry.host, entry.port)
-        } else {
-            let user =
-                url::form_urlencoded::byte_serialize(entry.username.as_bytes()).collect::<String>();
-            let pass =
-                url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
-            format!("{scheme}://{user}:{pass}@{}:{}", entry.host, entry.port)
-        };
+        // socks5h: DNS via proxy.
+        let proxy_url = entry.reqwest_proxy_url("socks5h");
         let proxy = reqwest::Proxy::all(&proxy_url).context(errcode::code("proxy.badUrl"))?;
         builder = builder.proxy(proxy);
     } else {
