@@ -104,6 +104,26 @@ fn new_profile_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+/// Claim `hz` as the display refresh rate; refuses anything outside 24..=480.
+fn set_refresh_rate(config: &mut Value, hz: u32) -> Result<()> {
+    if !(24..=480).contains(&hz) {
+        anyhow::bail!("refresh_rate must be 24..480, got {hz}");
+    }
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("fingerprint config is not an object"))?;
+    let screen = obj
+        .entry("screen")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    match screen.as_object_mut() {
+        Some(o) => {
+            o.insert("refresh_rate".into(), serde_json::json!(hz));
+            Ok(())
+        }
+        None => anyhow::bail!("`screen` is not an object"),
+    }
+}
+
 /// Top-level façade — bundles the runtime, fingerprint library, and browser
 /// launcher. Mirrors the Python `ShardX` class / Node `ShardX`.
 pub struct ShardX {
@@ -163,6 +183,21 @@ impl ShardX {
     /// hardware + platform_version under a fresh unique id, and frozen to disk.
     /// Pass the returned profile straight to `launch` / `session`.
     pub async fn create_profile(&self, template: Option<&str>) -> Result<Profile> {
+        self.create_profile_with(template, None).await
+    }
+
+    /// `create_profile` plus the claimed display refresh rate in Hz.
+    ///
+    /// No web API reports the refresh rate; a page measures it by timing
+    /// requestAnimationFrame. Leaving it out is not neutral — the engine then
+    /// claims 60, which is what most machines report, rather than the host's
+    /// own screen. Frames can only be slowed, so a rate above the host's panel
+    /// runs at the panel's.
+    pub async fn create_profile_with(
+        &self,
+        template: Option<&str>,
+        refresh_rate: Option<u32>,
+    ) -> Result<Profile> {
         self.runtime.install(false).await?;
         let mut config = match template {
             Some(id) => self.library.load(id)?.config,
@@ -172,6 +207,9 @@ impl ShardX {
         // Seed hardware by the new id so the pick is stable across reopens.
         randomize_hardware(&mut config, Some(&id));
         randomize_platform_version(&mut config);
+        if let Some(hz) = refresh_rate {
+            set_refresh_rate(&mut config, hz)?;
+        }
         let profile = Profile::new(config, Some(id));
         self.save_profile(&profile)?;
         Ok(profile)
@@ -313,5 +351,26 @@ impl ShardX {
                 WebRtcMode::TcpOnly
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_refresh_rate;
+    use serde_json::json;
+
+    #[test]
+    fn refresh_rate_is_bounded_and_merged_into_screen() {
+        let mut cfg = json!({ "screen": { "width": 1920 } });
+        set_refresh_rate(&mut cfg, 144).unwrap();
+        assert_eq!(cfg["screen"], json!({ "width": 1920, "refresh_rate": 144 }));
+
+        let mut bare = json!({});
+        set_refresh_rate(&mut bare, 24).unwrap();
+        set_refresh_rate(&mut bare, 480).unwrap();
+        assert_eq!(bare["screen"]["refresh_rate"], json!(480));
+
+        assert!(set_refresh_rate(&mut json!({}), 23).is_err());
+        assert!(set_refresh_rate(&mut json!({}), 481).is_err());
     }
 }
