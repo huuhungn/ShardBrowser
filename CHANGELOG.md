@@ -79,6 +79,10 @@ its source and the reason for what was left out, is in
   published after 2.2.10.
 - The Rust SDK's minimum Rust version is now 1.88, the oldest `zip` 9 builds
   on; no `zip` release below 9 carries the fix.
+- The release audit ignores the same three advisories for the `zip` 4 that
+  `tauri-plugin-updater` still pulls: the updater extracts only payloads whose
+  signature it has already checked, and this launcher's Windows payload is not
+  a zip. A check fails the release if any other crate brings in a `zip` below 9.
 
 ### Internal
 
