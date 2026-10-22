@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Installing a launcher update, or restarting for one, now waits until the
+  browsers ShardX started are closed, as quitting already does. Before, the
+  update ended the launcher and left those browsers running without it.
+
+### Internal
+
+- The release RustSec step fails when it cannot read any `zip` version from
+  the launcher lockfile, instead of skipping the check that guards its
+  `zip` ignores.
+
 ## v2.3.0
 
 A catch-up release: the browser engine moves to Chromium 156, and the launcher

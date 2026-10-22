@@ -1243,5 +1243,6 @@
   "updater.stateUnavailable": "Trình cập nhật không phản hồi.",
   "updater.statusAria": "Trạng thái cập nhật ShardX Launcher: {status}",
   "updater.upToDate": "đã là bản mới nhất",
-  "updater.waitForDownload": "Hãy đợi tải xong bản cập nhật rồi mới cài."
+  "updater.waitForDownload": "Hãy đợi tải xong bản cập nhật rồi mới cài.",
+  "updater.closeBrowsersFirst": "Hãy đóng {n} trình duyệt do ShardX mở trước khi cài bản cập nhật; thoát lúc này sẽ để chúng chạy tiếp mà không còn launcher quản lý."
 }
