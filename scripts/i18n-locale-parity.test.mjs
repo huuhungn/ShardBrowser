@@ -1123,3 +1123,34 @@ test("every interface path the patch log quotes is a real label", () => {
     `these entry titles name a card but not by its real name:\n  ${drifted.join("\n  ")}`,
   );
 });
+
+// A label chosen by a condition never sits alone between tags, and a toast
+// raised from a store never sits in JSX at all, so every rule above walked past
+// `isStarting ? "Starting…" : t("…")` on the profile row and
+// `toast.ok("That browser had already exited; …")` in the profile store until
+// 2.3.0. Read the branch of a ternary and the argument of a toast call as text.
+const PROSE_BRANCH =
+  /(?:\?\s*|toast\.(?:ok|err|info)\(\s*)"([A-Z][a-zA-Z][\w ,.;:'’()+—–-]*[a-z.!?…])"/g;
+
+test("no conditional label or toast call holds English prose", () => {
+  const offenders = [];
+  for (const root of uiRoots) {
+    for (const file of tsxFilesUnder(root)) {
+      const where = relative(join(here, "..", "src"), file).replace(/\\/g, "/");
+      for (const line of readable(readFileSync(file, "utf8")).split("\n")) {
+        for (const m of line.matchAll(PROSE_BRANCH)) {
+          const text = m[1];
+          if (NOT_PROSE.has(text) || PROTOCOL_TOKEN.test(text) || PRODUCT_NAME.test(text)) continue;
+          // An identifier (`WEBGL_compressed_texture_astc`) is not prose.
+          if (text.includes("_")) continue;
+          offenders.push(`${where}: ${text}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `these conditional labels and toasts are English text rather than t("…") keys:\n  ${offenders.join("\n  ")}`,
+  );
+});

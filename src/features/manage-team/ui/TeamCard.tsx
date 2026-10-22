@@ -169,7 +169,7 @@ export function TeamCard() {
           {busy === "save" ? t("common.saving") : t("team.saveConnection")}
         </Button>
         <Button size="small" mode="stroke" disabled={!!busy || !connected} onClick={test}>
-          {busy === "test" ? "Testing…" : t("team.testConnection")}
+          {busy === "test" ? t("busy.testing") : t("team.testConnection")}
         </Button>
       </div>
 
@@ -186,7 +186,7 @@ export function TeamCard() {
               />
               <div>
                 <Button size="small" disabled={!!busy || !connected} onClick={enroll}>
-                  {busy === "enroll" ? "Enrolling…" : t("team.enrolThisDevice")}
+                  {busy === "enroll" ? t("busy.enrolling") : t("team.enrolThisDevice")}
                 </Button>
               </div>
               {!connected && (
@@ -206,7 +206,7 @@ export function TeamCard() {
                 <>
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
-                      {busy === "collect" ? "Collecting…" : t("team.collectKeyCustody")}
+                      {busy === "collect" ? t("busy.collecting") : t("team.collectKeyCustody")}
                     </Button>
                   </div>
                   <p className="m-0 text-paragraph-xs text-text-soft-400">
