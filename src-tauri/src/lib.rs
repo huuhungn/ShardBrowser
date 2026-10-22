@@ -26,6 +26,11 @@ pub mod traffic;
 /// whether a runtime is installed before probing it. The `runtime` module
 /// itself stays private; only this one fact is worth exposing.
 pub fn runtime_binary_path_for_tests() -> anyhow::Result<std::path::PathBuf> {
+    // Lets the engine probes run against a candidate engine before it replaces
+    // the installed one.
+    if let Some(bin) = std::env::var_os("SHARDX_TEST_ENGINE") {
+        return Ok(bin.into());
+    }
     runtime::binary_path()
 }
 
