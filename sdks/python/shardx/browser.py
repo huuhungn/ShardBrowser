@@ -157,7 +157,7 @@ class Browser:
         )
         apply_noise_seeds(profile.config, profile.id)
         fp_file = udd / "fingerprint.json"
-        fp_file.write_text(json.dumps(profile.config))
+        fp_file.write_text(json.dumps(profile.config), encoding="utf-8")
 
         argv: list[str] = [
             str(self.runtime.binary_path),
@@ -245,7 +245,7 @@ def _read_cdp_endpoint(udd: Path, timeout: float) -> Optional[str]:
     while time.monotonic() < deadline:
         if marker.exists():
             try:
-                port = int(marker.read_text().splitlines()[0].strip())
+                port = int(marker.read_text(encoding="utf-8").splitlines()[0].strip())
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2.0) as r:
                     data = json.loads(r.read())
                     return data.get("webSocketDebuggerUrl")

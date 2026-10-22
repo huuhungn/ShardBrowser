@@ -262,7 +262,7 @@ class Runtime:
         """Build stamp on disk: `<engine>/shardx-build` when the archive ships
         one, else what was recorded at install time."""
         try:
-            stamp = (self.root / self._spec.binary_subpath[0] / "shardx-build").read_text().strip()
+            stamp = (self.root / self._spec.binary_subpath[0] / "shardx-build").read_text(encoding="utf-8").strip()
             if stamp:
                 return stamp
         except OSError:
@@ -280,12 +280,12 @@ class Runtime:
 
     def _load_manifest(self) -> dict:
         try:
-            return json.loads(self.manifest_path.read_text())
+            return json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
 
     def _save_manifest(self, m: dict) -> None:
-        self.manifest_path.write_text(json.dumps(m, indent=2))
+        self.manifest_path.write_text(json.dumps(m, indent=2), encoding="utf-8")
 
     # ---- install ----
 
