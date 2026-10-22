@@ -41,11 +41,7 @@ impl ProxyEntry {
     /// session or the routing, so the same host/port/user with a different
     /// password is a different exit.
     fn same_connection(&self, other: &ProxyEntry) -> bool {
-        self.kind == other.kind
-            && self.host == other.host
-            && self.port == other.port
-            && self.username == other.username
-            && self.password == other.password
+        self.same_login(other) && self.password == other.password
     }
 
     /// Same endpoint and the same login; the password may differ.

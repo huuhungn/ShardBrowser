@@ -1243,5 +1243,6 @@
   "updater.stateUnavailable": "The updater is not responding.",
   "updater.statusAria": "ShardX Launcher update status: {status}",
   "updater.upToDate": "up to date",
-  "updater.waitForDownload": "Wait for the update to finish downloading before installing."
+  "updater.waitForDownload": "Wait for the update to finish downloading before installing.",
+  "updater.closeBrowsersFirst": "Close the {n} browsers ShardX started before installing the update; quitting now would leave them running without the launcher."
 }
