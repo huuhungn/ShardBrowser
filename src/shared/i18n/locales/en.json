@@ -1009,6 +1009,7 @@
   "runner.withUnknownVar": "\"with\" names {var}, which no step has set",
   "runner.withValueNotName": "Every value in \"with\" must be a variable name",
   "runner.withWrongShape": "\"with\" must be a list or an object",
+  "runtime.archiveIncomplete": "The downloaded engine has no browser in it, so the engine already installed was kept. Try the update again.",
   "runtime.launcherTooOld": "This engine build needs ShardX Launcher {required} or newer, and you are on {current}. Update the launcher first.",
   "runtime.noPlatformDataDir": "This system has no application data folder for the engine to live in.",
   "runtime.noWidevineParent": "The Widevine destination folder has no parent to create.",

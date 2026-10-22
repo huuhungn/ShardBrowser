@@ -1009,6 +1009,7 @@
   "runner.withUnknownVar": "\"with\" gọi tên {var}, nhưng chưa bước nào đặt biến này",
   "runner.withValueNotName": "Mọi giá trị trong \"with\" phải là tên biến",
   "runner.withWrongShape": "\"with\" phải là danh sách hoặc đối tượng",
+  "runtime.archiveIncomplete": "Bản engine vừa tải không có trình duyệt bên trong, nên engine đang cài được giữ nguyên. Hãy thử cập nhật lại.",
   "runtime.launcherTooOld": "Bản lõi trình duyệt này cần ShardX Launcher {required} trở lên, máy đang dùng {current}. Hãy cập nhật launcher trước.",
   "runtime.noPlatformDataDir": "Máy này không có thư mục dữ liệu ứng dụng để chứa lõi trình duyệt.",
   "runtime.noWidevineParent": "Thư mục đích của Widevine không có thư mục cha để tạo.",
