@@ -81,6 +81,23 @@ export class Profile {
     return (nav?.["platform"] as string | undefined) ?? "";
   }
 
+  /** A device whose primary input is a finger. */
+  get claimsMobile(): boolean {
+    const ch = this.config["client_hints"] as Record<string, unknown> | undefined;
+    if (ch?.["mobile"] === true) return true;
+    const chPlatform = String(ch?.["platform"] ?? "").toLowerCase();
+    if (chPlatform.startsWith("android")) return true;
+    const nav = this.config["navigator"] as Record<string, unknown> | undefined;
+    return String(nav?.["user_agent"] ?? "").toLowerCase().includes("android");
+  }
+
+  /** Desktop Linux. Android is excluded: its platform is Linux too, and a phone has WebGPU. */
+  get claimsLinuxDesktop(): boolean {
+    if (this.claimsMobile) return false;
+    const p = this.platform.toLowerCase();
+    return p.startsWith("linux") || p.startsWith("x11");
+  }
+
   get hasWebGPU(): boolean {
     const wgp = this.config["webgpu"] as Record<string, unknown> | null | undefined;
     if (!wgp) return false;
@@ -123,7 +140,7 @@ export class FingerprintLibrary {
 
 /**
  * Normalise a profile config's spoofed Chrome version to `chromiumVersion`
- * (e.g. "152.0.7977.65") so it always matches the running engine — bumps
+ * (e.g. "156.0.8078.48") so it always matches the running engine — bumps
  * `navigator.user_agent` (Chrome/<major>.0.0.0) and the version fields in
  * `client_hints`: brand_version / brand_full_version / chrome_build /
  * chrome_patch (derived from the version) plus, when supplied, grease_brand /

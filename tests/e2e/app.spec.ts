@@ -83,6 +83,37 @@ test("desktop-wide actions, theme, and launch errors remain visible", async ({ p
   await expect(page.locator(".toast-err")).toHaveAttribute("role", "alert");
 });
 
+test("a start that is still on its way can be cancelled", async ({ page }) => {
+  await page.setViewportSize({ width: 1720, height: 1000 });
+  await gotoMocked(page, "/?e2e=slow-launch");
+
+  const profileName = "VN Automation 001 - No Proxy";
+  const start = page.getByRole("button", { name: `Start profile ${profileName}` });
+  await start.click();
+  // Still starting: the same button now cancels instead of sitting disabled.
+  await expect(start).toBeEnabled();
+  await expect(start).toHaveText("Cancel");
+  await start.click();
+
+  await expect(page.locator(".toast-ok").last()).toContainText("Start cancelled");
+  await expect(start).toHaveText("Start");
+  // A cancel is a choice, not a failure: nothing is left on the row.
+  await expect(page.locator(".launch-error-inline")).toHaveCount(0);
+});
+
+test("quitting while browsers run says why it was refused", async ({ page }) => {
+  await gotoMocked(page);
+  await expect(page.getByRole("button", { name: /^Start profile / }).first()).toBeVisible();
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("plugin:event|emit", {
+        event: "launcher:exit-blocked",
+        payload: { running_count: 2 },
+      }),
+  );
+  await expect(page.locator(".toast-err").last()).toContainText("2 browsers");
+});
+
 test("legacy custom-font metadata survives an ordinary profile edit but stays hidden", async ({ page }) => {
   await gotoMocked(page);
 

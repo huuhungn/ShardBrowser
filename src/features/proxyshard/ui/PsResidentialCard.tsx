@@ -127,7 +127,7 @@ export function PsResidentialCard() {
             title={order ? undefined : t("ps.noUnmeteredOrderFound")}
             onClick={renew}
           >
-            {renewing ? "Renewing…" : t("ps.renew")}
+            {renewing ? t("busy.renewing") : t("ps.renew")}
           </Button>
         )}
         <Button variant="primary" mode="filled" size="small" onClick={() => setGenOpen(true)}>

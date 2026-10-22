@@ -14,7 +14,7 @@ import type { ProfileMeta, ProfileForm } from "../model/types";
 import {
   profileList, profileGet, profileSave, profileValidateName, profileDelete, profileClone,
   profileSetPin, profileSetFolder, profileBindProxy, profileImport,
-  profileCreateFromTemplate, processList, processKill, launch, syncLaunch,
+  profileCreateFromTemplate, processList, processKill, launch, launchCancel, syncLaunch,
   folderDelete, cookiesExportToFile, cookiesImport,
   profileSyncStatus, profileSyncPush, profileSyncPull,
   profileBackupCreate, profileBackupInspect, profileBackupRestore,
@@ -396,14 +396,19 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           const cdp = { ...get().runningCdp };
           delete cdp[p.id];
           set({ running: next, runningCdp: cdp });
-          toast.ok("That browser had already exited; cleared its status");
+          toast.ok(t("profile.alreadyExitedCleared"));
           get().reload();
         }
       }
       catch (e) { toast.err(safeUiError(e)); }
       return;
     }
-    if (get().startBusy.has(p.id)) return;
+    // Pressed again while still starting: cancel. The pending launch() then
+    // fails with launch.cancelled, which the catch below reads as a choice.
+    if (get().startBusy.has(p.id)) {
+      try { await launchCancel(p.id); } catch (e) { toast.err(safeUiError(e)); }
+      return;
+    }
     // A new attempt supersedes the previous failure.
     const cleared = { ...get().launchError };
     delete cleared[p.id];
@@ -412,6 +417,10 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       await launch(p.id);
       // Don't optimistically flip `running`; the 2s poll picks up the new child.
     } catch (e) {
+      if (String(e).includes("launch.cancelled")) {
+        toast.ok(t("profile.startCancelled"));
+        return;
+      }
       // A toast disappears; a failed launch needs to stay readable on the row
       // that failed, next to the button the user just pressed.
       const message = safeUiError(e);

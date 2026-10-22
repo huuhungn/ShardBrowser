@@ -72,10 +72,10 @@ export function McpCard({
   // One primary action, chosen by what is actually missing. Hermes is the
   // primary host, so its check leads; Codex stays available under Advanced.
   const primary = !hermesChecked
-    ? { label: busy ? "Checking Hermes…" : t("mcp.checkHermesRegistration"), run: onCheckHermes }
+    ? { label: busy ? t("busy.checkingHermes") : t("mcp.checkHermesRegistration"), run: onCheckHermes }
     : hermesNeedsRepair || hermes?.state === "not_registered"
       ? { label: t("settings.copyHermesAddCommand"), run: copyHermesAdd }
-      : { label: busy ? "Refreshing…" : t("mcp.refreshStatus"), run: onRefresh };
+      : { label: busy ? t("busy.refreshing") : t("mcp.refreshStatus"), run: onRefresh };
 
   const items: [boolean, string, string][] = [
     [filesDownloaded, t("mcp.filesDownloaded"), filesDownloaded ? t("mcp.detected") : t("mcp.notDetected")],
@@ -117,7 +117,7 @@ export function McpCard({
                     : t("mcp.mcpServerNotDownloaded")}
         </strong>
         <span className="text-paragraph-xs text-text-sub-600">
-          {statusError ?? status?.message ?? "Checking MCP status…"}
+          {statusError ?? status?.message ?? t("busy.checkingMcp")}
         </span>
       </div>
 
@@ -173,7 +173,7 @@ export function McpCard({
             {t("settings.copyCodexRepairCommand")}
           </Button>
           <Button size="xsmall" variant="neutral" mode="stroke" disabled={busy} onClick={() => void run(onCheckCodex)}>
-            {busy ? "Checking Codex…" : t("mcp.checkCodexRegistration")}
+            {busy ? t("busy.checkingCodex") : t("mcp.checkCodexRegistration")}
           </Button>
           {primary.label !== t("mcp.copyHermesAddCommand") && (
             <Button size="xsmall" variant="neutral" mode="stroke" onClick={copyHermesAdd} disabled={!hermesChecked}>

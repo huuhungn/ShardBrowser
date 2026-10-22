@@ -5,10 +5,10 @@
 //! run succeeded.
 //!
 //! Deliberately smaller than upstream's runner. Every block here is one this
-//! engine can really perform — nothing depends on the CDP Motion domain, which
-//! build 152.0.7977.65 does not implement (see `tests/motion_protocol_it.rs`).
-//! A block that cannot be honestly executed is not offered at all, rather than
-//! offered and quietly doing nothing.
+//! engine can really perform, and none of them goes through the CDP Motion
+//! domain (it answers only on launches with `--shardx-automation`; see
+//! `tests/motion_protocol_it.rs`). A block that cannot be honestly executed is
+//! not offered at all, rather than offered and quietly doing nothing.
 //!
 //! The walk follows each block's own `on_done` / `on_fail` branch rather than
 //! falling through the list, because that is what the stored project means.
@@ -635,15 +635,22 @@ async fn perform(
         }
 
         "wait" => {
-            let ms =
-                block
-                    .params
-                    .get("ms")
-                    .and_then(|v| v.as_u64())
-                    .context(errcode::code_with(
-                        "runner.blockNeedsField",
-                        &[("kind", "wait"), ("field", "ms")],
-                    ))?;
+            // A number, or text that holds one once expanded, so a delay can
+            // come from a variable: `{{delay}}` after a setVariable (#66).
+            let ms = match block.params.get("ms") {
+                Some(serde_json::Value::String(_)) => param_text(block, "ms", vars)?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as u64),
+                Some(v) => v.as_u64(),
+                None => None,
+            }
+            .context(errcode::code_with(
+                "runner.blockNeedsField",
+                &[("kind", "wait"), ("field", "ms")],
+            ))?;
             tokio::time::sleep(Duration::from_millis(ms)).await;
             Ok(())
         }
@@ -1522,6 +1529,22 @@ mod tests {
         // And an ordinary failure is not mistaken for a refusal.
         let ordinary = anyhow!("the page crashed");
         assert_eq!(run_refusal(&ordinary), None);
+    }
+
+    #[tokio::test]
+    async fn a_wait_takes_its_delay_from_a_variable() {
+        let mut v = vars(&[("delay", "20")]);
+        let mut state = RunState::default();
+        let b = block("b1", "wait", json!({ "ms": "{{delay}}" }));
+        perform(&b, "no-such-profile", &mut v, &mut state)
+            .await
+            .expect("a variable holding a number is a delay");
+
+        let mut v = vars(&[("delay", "soon")]);
+        let e = perform(&b, "no-such-profile", &mut v, &mut state)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("runner.blockNeedsField"));
     }
 
     #[tokio::test]

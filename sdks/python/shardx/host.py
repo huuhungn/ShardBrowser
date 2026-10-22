@@ -33,7 +33,7 @@ def host_ram_gb() -> Optional[int]:
             ).decode().strip()
             return int(int(out) // (1024 ** 3))
         if sys.platform.startswith("linux"):
-            with open("/proc/meminfo", "r") as f:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         kb = int(line.split()[1])

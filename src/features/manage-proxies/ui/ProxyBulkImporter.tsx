@@ -148,7 +148,7 @@ host:8080               # no auth
                   disabled={busy}
                   isLoading={busy}
                 >
-                  {busy ? "Testing…" : t("proxy.testAll")}
+                  {busy ? t("busy.testing") : t("proxy.testAll")}
                 </Button>
                 <Button
                   variant="neutral"

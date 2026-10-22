@@ -1,6 +1,6 @@
 [package]
 name = "shardx-launcher"
-version = "2.2.10"
+version = "2.3.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -57,7 +57,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 # Self-bootstrapping runtime: zip extraction of the chrome bundle
 # downloaded from Cloudflare R2 on first launch (src/runtime.rs).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Per-profile window icon: superellipse + text. Pure Rust, no C deps.
 tiny-skia = "0.11"

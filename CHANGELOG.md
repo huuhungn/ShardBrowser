@@ -1,5 +1,114 @@
 # Changelog
 
+## v2.3.0
+
+A catch-up release: the browser engine moves to Chromium 156, and the launcher
+fixes and features worth having from upstream ProxyShard v2.0.2 to v2.1.0 and
+from other forks are brought onto this fork's own interface. Every item, with
+its source and the reason for what was left out, is in
+`docs/V2.3_PORT_LEDGER.md`.
+
+### Added
+
+- The engine is Chromium 156.0.8078.48 (upstream v2.1.0). Profiles report
+  Chrome 156 in the user agent, client hints and TLS handshake, and pick up the
+  engine's own fixes: canvas, WebGL, SVG and text measurements that no longer
+  disagree with each other, form error messages in the profile's language,
+  clicks that reach embedded frames on mobile profiles, and proxy logins with
+  special characters. The new engine downloads once, the first time the
+  launcher starts after the update; profiles keep their data.
+- A profile that is still starting (a slow proxy check, a geo lookup) can be
+  cancelled from the same button before its browser opens.
+- The SDKs (Node, Python, Rust) are 2.1.0: they read this fork's engine
+  manifest, carry upstream's `Motion` wrappers for human-like pointer, keyboard
+  and touch input, keep WebGPU on desktop Linux profiles, and can claim a
+  display refresh rate when creating a profile.
+
+### Fixed
+
+- Human clicks and typing over CDP. The engine only answers its `Motion` domain
+  when launched with `--shardx-automation`, which this launcher never passed, so
+  the MCP `human_click` and `human_type` tools failed on every profile. The
+  earlier conclusion that the engine lacked the domain came from a probe with
+  the same omission; the probe now uses the launcher's own switches.
+- A failed engine download no longer leaves the computer with no browser. The
+  new engine is unpacked beside the old one and swapped in only when complete,
+  and a swap cut short is undone at the next start.
+- The launcher window no longer stays blank on a network that accepts
+  connections but never answers (#114 upstream): the engine manifest check
+  gives up after a few seconds.
+- A profile whose browser is still open is no longer shown as idle on Windows
+  (#109 upstream). Chromium can hand a launch to another process and exit; the
+  launcher now follows the profile's own lock, keeps Stop working, keeps its
+  proxy relay open, and refuses to start a profile already open in a browser it
+  did not start.
+- One unreadable byte in `settings.json` no longer wipes your settings. The
+  launcher runs on defaults for that session, says so in Settings, and refuses
+  to write over the file — it held where your profiles live and the API key.
+  Files saved by PowerShell with a byte-order mark or as UTF-16 now read.
+- A profile without its own window size opens inside the screen it claims
+  instead of filling the real monitor (#67 upstream), and a screen that fits the
+  monitor is kept on Windows and Linux rather than replaced by the monitor's.
+- A SOCKS5 proxy that accepts the sign-in but cannot reach the internet now
+  fails its test; the test used to stop after the greeting. The whole test is
+  also bounded.
+- A profile with no proxy goes direct instead of through whatever proxy the
+  operating system is set to, which disagreed with the timezone and location
+  worked out for it. A proxy named in the global extra arguments still wins.
+- A UDP check that fails keeps QUIC and proxied WebRTC off, instead of trusting
+  an older passing result.
+- Starting with CDP waits up to 30 seconds for the debugging address, not six.
+- The automation Wait step takes its delay from a variable (#66 upstream).
+- Pasting from an empty clipboard says the clipboard is empty instead of
+  showing a system error.
+- Updating a proxy's password through the API updates the proxy the profile is
+  bound to, and proxies that differ only by password or scheme are no longer
+  merged on import (#72 upstream, from upstream PR #85 by aleekaz).
+- Labels that were still English: the profile row's Starting and Cancel states,
+  thirteen busy labels in Settings, Team and ProxyShard cards, and a profile
+  store toast.
+- The macOS menu bar icon follows the light and dark bar.
+
+### Security
+
+- `zip` 9.0.5 replaces 2.x in the launcher and the Rust SDK (RUSTSEC-2026-0367,
+  -0368, -0369: extraction could follow symlinks out of the destination or keep
+  SUID bits). The engine archive extracts byte-for-byte as before.
+- `quinn-proto` 0.11.19, `rustls` 0.23.46, `rustls-webpki` 0.103.16 and
+  `webpki-roots` 1.0.10 in the launcher and the team server, for the advisories
+  published after 2.2.10.
+- The Rust SDK's minimum Rust version is now 1.88, the oldest `zip` 9 builds
+  on; no `zip` release below 9 carries the fix.
+- npm advisories published since 2.2.10 are patched in every package. The
+  MCP server moves to `@modelcontextprotocol/sdk` 1.32.1, with `proxy-addr`,
+  `hono`, `ip-address` and `fast-uri` on fixed releases; the Node SDK takes
+  `ip-address` 10.7.4. Build tooling: `vite-plugin-dts` 5 for the UI kit's
+  type declarations (output unchanged apart from quote style), and
+  `@parcel/watcher` 2.6.0 under the Tailwind CLI, which drops the vulnerable
+  `micromatch`/`braces` chain.
+- The release audit ignores the same three advisories for the `zip` 4 that
+  `tauri-plugin-updater` still pulls: the updater extracts only payloads whose
+  signature it has already checked, and this launcher's Windows payload is not
+  a zip. A check fails the release if any other crate brings in a `zip` below 9.
+
+### Internal
+
+- The locale guard also reads labels chosen by a condition and messages passed
+  straight to a toast; that rule found the thirteen labels above.
+- Engine probes can run against a candidate engine before it is installed
+  (`SHARDX_TEST_ENGINE`); the whole engine suite passed on Chromium 156.
+- Python bytecode caches are no longer tracked in Git.
+
+### Credits
+
+Ported or adapted, all MIT-licensed like this fork: ProxyShard/ShardBrowser
+v2.0.2–v2.1.0 (Chromium 156 manifest, settings protection, window from screen,
+CDP wait, lock check, cancel-start, proxy checker, clipboard, tray icon, SDK
+Motion wrappers); aleekaz (upstream PR #85, proxy duplicate check);
+CarterLeeAlt/ShardBrowser (`--no-proxy-server` for direct profiles, UDP fail
+closed, block quitting while browsers run); phuducnguyen/ShardBrowser (engine
+replaced by rename).
+
 ## v2.2.10
 
 ### Fixed

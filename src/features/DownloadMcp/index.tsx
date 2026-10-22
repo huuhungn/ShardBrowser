@@ -34,7 +34,7 @@ export function DownloadMcp() {
       leftIcon={<DownloadIcon className="size-4" />}
       onClick={downloadMcp}
     >
-      {mcpBusy ? "Downloading…" : t("mcp.downloadMCP")}
+      {mcpBusy ? t("busy.downloading") : t("mcp.downloadMCP")}
     </Button>
   );
 }

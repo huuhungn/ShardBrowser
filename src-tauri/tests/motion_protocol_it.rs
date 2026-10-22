@@ -1,19 +1,16 @@
-// Does the installed engine carry the Motion domain?
+// Does the installed engine carry the Motion domain, and does the launcher
+// unlock it?
 //
-// Upstream ships Node, Python and Rust SDKs around a browser-level CDP domain
-// called `Motion` -- human pointer curves, keystroke timing, finger gestures.
-// The domain is deliberately absent from Schema.getDomains and /json/protocol
-// so a page cannot enumerate it, which means the only honest way to know
-// whether an engine implements it is to call it and read the error.
+// `Motion` is a browser-level CDP domain -- human pointer curves, keystroke
+// timing, finger gestures -- that the MCP server's human_click/human_type tools
+// and the upstream SDKs drive. It is deliberately absent from Schema.getDomains
+// and /json/protocol, so the only honest test is to call it and read the error.
 //
-// This probe exists so the answer is a test result rather than an assumption.
-// Porting those SDKs against an engine without the domain would ship three
-// libraries of dead code whose every call fails at runtime.
-//
-// Today the answer is no: the engine this fork installs does not implement it.
-// The test therefore records the current state and, more usefully, tells us the
-// day an engine update changes it -- at which point the SDK port moves from
-// speculative to justified.
+// An earlier version of this probe launched the engine without
+// `--shardx-automation` and concluded the domain did not exist. The engine gates
+// the domain behind that switch: without it every method answers "wasn't found".
+// The probe now launches with exactly the switches the launcher passes for a
+// CDP launch, so dropping the switch from the launcher fails it.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -36,7 +33,7 @@ impl Drop for Engine {
 
 /// Start the installed engine with a throwaway profile and return the
 /// browser-level websocket URL. `None` when no engine is installed.
-fn launch() -> Option<(Engine, String)> {
+fn launch(cdp_args: &[&str]) -> Option<(Engine, String)> {
     let bin = shardx_launcher_lib::runtime_binary_path_for_tests().ok()?;
     if !bin.exists() {
         return None;
@@ -53,7 +50,7 @@ fn launch() -> Option<(Engine, String)> {
 
     let mut child = Command::new(&bin)
         .arg(format!("--user-data-dir={}", udd.display()))
-        .arg("--remote-debugging-port=0")
+        .args(cdp_args)
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--window-position=-32000,-32000")
@@ -100,59 +97,69 @@ fn call(ws_url: &str, method: &str, params: Value) -> Value {
     Value::Null
 }
 
-/// True when the engine answered "no such method", in whatever wording.
-fn method_missing(reply: &Value) -> bool {
+/// True when the engine answered "no such method" for this exact method. Other
+/// errors ("Invalid parameters", "createPointer first") prove the method exists.
+fn method_missing(reply: &Value, method: &str) -> bool {
     let msg = reply["error"]["message"].as_str().unwrap_or("");
-    msg.contains("wasn't found")
-        || msg.contains("was not found")
-        || msg.contains("not found")
-        || msg.contains("Unknown method")
+    msg.contains(&format!("'{method}' wasn't found"))
 }
 
-/// The eleven methods the upstream SDKs drive. Kept in one place so the port
-/// decision is about a measured surface, not a remembered one.
+/// The methods the MCP server and the upstream SDKs call, taken from
+/// upstream's `sdks/node/src/motion.ts` rather than guessed.
 const MOTION_METHODS: &[&str] = &[
     "Motion.createPointer",
-    "Motion.movePointer",
-    "Motion.pressPointer",
-    "Motion.releasePointer",
-    "Motion.scroll",
-    "Motion.typeText",
-    "Motion.pressKey",
-    "Motion.createFinger",
+    "Motion.destroyPointer",
+    "Motion.glideTo",
     "Motion.tap",
-    "Motion.swipe",
+    "Motion.dragTo",
+    "Motion.wheel",
+    "Motion.enterText",
+    "Motion.pressKey",
+    "Motion.touchTap",
+    "Motion.touchSwipe",
+    "Motion.touchDrag",
+    "Motion.touchLongPress",
+    "Motion.pinch",
     "Motion.setOrientation",
 ];
 
+fn missing_methods(ws: &str) -> Vec<&'static str> {
+    MOTION_METHODS
+        .iter()
+        .copied()
+        .filter(|m| method_missing(&call(ws, m, json!({})), m))
+        .collect()
+}
+
 #[test]
-fn the_motion_domain_is_absent_from_this_engine() {
-    let Some((_engine, ws)) = launch() else {
+fn a_cdp_launch_unlocks_the_motion_domain() {
+    let Some((_engine, ws)) = launch(shardx_launcher_lib::cdp_launch_args_for_tests()) else {
         eprintln!("no engine installed; skipping");
         return;
     };
 
-    let mut present = Vec::new();
-    for method in MOTION_METHODS {
-        let reply = call(&ws, method, json!({}));
-        if !method_missing(&reply) {
-            present.push(*method);
-        }
-    }
-
-    // Read this failure as good news, not a broken test: the engine grew the
-    // domain, so the Motion SDK port is now worth doing. Port it, then invert
-    // this assertion to guard the surface the SDK depends on.
+    let missing = missing_methods(&ws);
     assert!(
-        present.is_empty(),
-        "the engine now implements Motion ({present:?}) -- the SDK port is unblocked, \
-         see the handoff note on Motion"
+        missing.is_empty(),
+        "a profile started with CDP cannot reach {missing:?}; human_click and          human_type fail on it"
     );
 }
 
 #[test]
+fn the_automation_switch_is_what_unlocks_it() {
+    // Same launch minus the switch: if the domain were always on, the switch
+    // and the test above would prove nothing.
+    let Some((_engine, ws)) = launch(&["--remote-debugging-port=0"]) else {
+        eprintln!("no engine installed; skipping");
+        return;
+    };
+
+    assert_eq!(missing_methods(&ws).len(), MOTION_METHODS.len());
+}
+
+#[test]
 fn the_motion_domain_stays_out_of_the_advertised_protocol() {
-    let Some((_engine, ws)) = launch() else {
+    let Some((_engine, ws)) = launch(shardx_launcher_lib::cdp_launch_args_for_tests()) else {
         eprintln!("no engine installed; skipping");
         return;
     };
@@ -170,7 +177,6 @@ fn the_motion_domain_stays_out_of_the_advertised_protocol() {
 
     assert!(
         !advertised,
-        "Motion is discoverable through Schema.getDomains, which makes the \
-         engine identifiable by protocol enumeration"
+        "Motion is discoverable through Schema.getDomains, which makes the          engine identifiable by protocol enumeration"
     );
 }

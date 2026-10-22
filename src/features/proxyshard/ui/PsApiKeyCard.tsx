@@ -73,7 +73,7 @@ export function PsApiKeyCard() {
           disabled={!key || status === "checking"}
           isLoading={status === "checking"}
         >
-          {status === "checking" ? "Checking…" : t("ps.test")}
+          {status === "checking" ? t("busy.checking") : t("ps.test")}
         </Button>
       </div>
       <PsConnectionBadge status={status} me={me} err={err} hasKey={!!key} />

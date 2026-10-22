@@ -26,7 +26,18 @@ pub mod traffic;
 /// whether a runtime is installed before probing it. The `runtime` module
 /// itself stays private; only this one fact is worth exposing.
 pub fn runtime_binary_path_for_tests() -> anyhow::Result<std::path::PathBuf> {
+    // Lets the engine probes run against a candidate engine before it replaces
+    // the installed one.
+    if let Some(bin) = std::env::var_os("SHARDX_TEST_ENGINE") {
+        return Ok(bin.into());
+    }
     runtime::binary_path()
+}
+
+/// The switches the launcher adds when CDP is on, so the engine probe tests
+/// exactly what a launch passes.
+pub fn cdp_launch_args_for_tests() -> &'static [&'static str] {
+    &launch::CDP_ARGS
 }
 
 mod mcp_setup;
@@ -638,8 +649,10 @@ pub(crate) fn randomize_hardware(payload: &mut serde_json::Map<String, Value>) {
 }
 
 /// Clamp profile.screen to the real display when it's smaller than the FP claim.
-/// On Win/Linux always use the real display (presets rarely match user monitors).
-fn clamp_screen_to_real_display(
+/// A claim the display can hold is kept on every platform: replacing it with
+/// the host's monitor made every profile on one machine report the same screen
+/// (upstream 6c3f65a, "screen kept when it fits").
+pub(crate) fn clamp_screen_to_real_display(
     window: &tauri::WebviewWindow,
     payload: &mut serde_json::Map<String, Value>,
 ) {
@@ -683,10 +696,9 @@ fn clamp_screen_to_real_display(
     if fp_w <= 0 || fp_h <= 0 {
         return;
     }
-    // macOS keeps curated FP unless real display smaller; Win/Linux always uses real.
-    if cfg!(target_os = "macos") && real_w >= fp_w && real_h >= fp_h {
+    if real_w >= fp_w && real_h >= fp_h {
         eprintln!(
-            "[launcher] display: real {real_w}x{real_h} >= fp {fp_w}x{fp_h} — keeping FP screen (macOS)"
+            "[launcher] display: real {real_w}x{real_h} >= fp {fp_w}x{fp_h} — keeping FP screen"
         );
         return;
     }
@@ -1044,7 +1056,11 @@ fn clipboard_write(app: tauri::AppHandle, text: String) -> Result<(), String> {
 #[tauri::command]
 fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    app.clipboard().read_text().map_err(|e| e.to_string())
+    // An empty clipboard is an empty string, not a failure. The platform
+    // reports "nothing to read" as an error (a bare "unknown error" on macOS),
+    // and callers already say "the clipboard is empty" in the operator's
+    // language for "" (upstream 081770c, "clipboard-empty").
+    Ok(app.clipboard().read_text().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -1522,6 +1538,13 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
 
 // ---- Launcher ----
 
+/// Cancel a launch still on its way: the pending `launch` call fails with
+/// `launch.cancelled` and no browser starts.
+#[tauri::command]
+fn launch_cancel(profile_id: String) {
+    launch::cancel(&profile_id);
+}
+
 #[tauri::command]
 async fn launch(profile_id: String) -> Result<u32, String> {
     // UI launches: no CDP, headed. The bus goes along even with no group so the
@@ -1806,6 +1829,12 @@ fn cookies_import(profile_id: String, cookies: Vec<cookies::Cookie>) -> Result<u
 #[tauri::command]
 fn settings_get() -> Result<settings::Settings, String> {
     settings::load().map_err(|e| e.to_string())
+}
+
+/// Why the settings file could not be read, for the Settings banner.
+#[tauri::command]
+fn settings_load_error() -> Option<String> {
+    settings::load_error()
 }
 
 #[tauri::command]
@@ -2348,6 +2377,24 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Bring the main window back from the tray / minimized state and focus it.
+/// Refuse a real exit while a browser this launcher started is still open
+/// (CarterLeeAlt 031fdee): quitting would orphan its proxy relay and leave the
+/// profile looking idle to the next start. The backend tracker decides, not the
+/// window's two-second poll. Shows the window and tells it why.
+fn block_exit_if_browsers_running(app: &tauri::AppHandle) -> bool {
+    use tauri::Emitter;
+    let running_count = process::Tracker::shared().running().len();
+    if running_count == 0 {
+        return false;
+    }
+    show_main_window(app);
+    let _ = app.emit(
+        "launcher:exit-blocked",
+        serde_json::json!({ "running_count": running_count }),
+    );
+    true
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("main") {
@@ -2449,6 +2496,11 @@ pub fn run() {
                 if window.label() == "main" && to_tray {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if window.label() == "main"
+                    && block_exit_if_browsers_running(tauri::Manager::app_handle(window))
+                {
+                    // Without minimize-to-tray, closing the window quits.
+                    api.prevent_close();
                 }
             }
         })
@@ -2538,6 +2590,8 @@ pub fn run() {
             proxy_bulk_save,
             launch,
             settings_get,
+            settings_load_error,
+            launch_cancel,
             settings_save,
             startup_status,
             api_info,
@@ -2608,14 +2662,19 @@ pub fn run() {
                 let quit = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show, &quit])?;
                 if let Some(icon) = app.default_window_icon().cloned() {
-                    TrayIconBuilder::with_id("main")
-                        .icon(icon)
+                    let builder = TrayIconBuilder::with_id("main").icon(icon);
+                    // The macOS menu bar wants a stencil drawn from the icon's
+                    // shape alone, so it is dark on a light bar and light on a
+                    // dark one instead of staying purple (upstream 6c3f65a).
+                    #[cfg(target_os = "macos")]
+                    let builder = builder.icon_as_template(true);
+                    builder
                         .tooltip("ShardX Launcher")
                         .menu(&menu)
                         .show_menu_on_left_click(false)
                         .on_menu_event(|app, e| match e.id.as_ref() {
                             "tray_show" => show_main_window(app),
-                            "tray_quit" => app.exit(0),
+                            "tray_quit" if !block_exit_if_browsers_running(app) => app.exit(0),
                             _ => {}
                         })
                         .on_tray_icon_event(|tray, e| {

@@ -24,7 +24,7 @@ jobs:
           components: clippy
 
       - name: Set up Rust SDK MSRV
-        uses: dtolnay/rust-toolchain@1.74.1
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Rust SDK stable checks
         run: |
@@ -44,8 +44,8 @@ jobs:
         run: |
           rm -f sdks/rust/Cargo.lock
           cargo +stable generate-lockfile --manifest-path sdks/rust/Cargo.toml
-          cargo +1.74.1 test --locked --manifest-path sdks/rust/Cargo.toml --all-features
-          cargo +1.74.1 test --locked --manifest-path sdks/rust/Cargo.toml --no-default-features
+          cargo +1.88.0 test --locked --manifest-path sdks/rust/Cargo.toml --all-features
+          cargo +1.88.0 test --locked --manifest-path sdks/rust/Cargo.toml --no-default-features
 
   # Every runner above is Linux, so the cfg(windows) half of the codebase --
   # os_crypt key handling, cookie decryption, process control, autostart --

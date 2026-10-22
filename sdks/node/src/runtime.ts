@@ -11,13 +11,13 @@ import { Readable } from "node:stream";
 import { spawnSync } from "node:child_process";
 
 export const PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-export const CHROMIUM_VERSION = "152.0.7977.65";
+export const CHROMIUM_VERSION = "156.0.8078.48";
 /** This SDK's own version, compared against the manifest's `min_sdk_version`. */
-export const SDK_VERSION = "2.0.2";
+export const SDK_VERSION = "2.1.0";
 // Version manifest (GitHub raw) — one tiny GET yields every archive's current
 // etag, so we never poll R2/S3 (no per-archive HEAD). Changed archives are then
 // pulled from PUB_BASE.
-export const MANIFEST_URL = "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json";
+export const MANIFEST_URL = "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 
 export function defaultCacheDir(): string {
   const plat = osPlatform();

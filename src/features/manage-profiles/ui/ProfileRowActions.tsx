@@ -46,10 +46,9 @@ export function ProfileRowActions({ profile, onMore }: {
         }
         onClick={() => startStop(p)}
         aria-label={`${isRunning ? t("profileTable.stop") : t("profileTable.start")} profile ${p.name}`}
-        disabled={!isRunning && isStarting}
-        title={!isRunning && isStarting ? "Starting (UDP probe + geo + spawn)…" : undefined}
+        title={!isRunning && isStarting ? t("profileTable.startingHint") : undefined}
       >
-        {isRunning ? t("profileTable.stop") : isStarting ? "Starting…" : t("profileTable.start")}
+        {isRunning ? t("profileTable.stop") : isStarting ? t("profileTable.cancelStart") : t("profileTable.start")}
       </Button>
       {wide && <Button
         variant={p.pinned ? "primary" : "neutral"}

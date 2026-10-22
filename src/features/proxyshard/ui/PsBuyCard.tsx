@@ -204,7 +204,7 @@ export function PsBuyCard() {
                   onChange={setCountry}
                   placeholder={t("ps.pickACountry")}
                   isSearchable
-                  searchPlaceholder="Search locations…"
+                  searchPlaceholder={t("ps.searchLocations")}
                   options={(product?.locations ?? []).map((l) => ({ value: l, label: l }))}
                 />
               </label>
@@ -231,7 +231,7 @@ export function PsBuyCard() {
           )}
           <div className="mt-1 flex items-center gap-3">
             <Button variant="neutral" mode="stroke" size="small" onClick={calculate} disabled={calcing || !productName} isLoading={calcing}>
-              {calcing ? "Calculating…" : t("ps.calculatePrice")}
+              {calcing ? t("busy.calculating") : t("ps.calculatePrice")}
             </Button>
             {calc && (
               <span className="ml-auto inline-flex items-center gap-2">
@@ -244,7 +244,7 @@ export function PsBuyCard() {
               </span>
             )}
             <Button variant="primary" mode="filled" size="small" onClick={buy} disabled={buying || !productName} isLoading={buying}>
-              {buying ? "Buying…" : t("ps.buy")}
+              {buying ? t("busy.buying") : t("ps.buy")}
             </Button>
           </div>
         </div>

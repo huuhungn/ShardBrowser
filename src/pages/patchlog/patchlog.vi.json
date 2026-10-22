@@ -1,6 +1,83 @@
 {
   "releases": [
     {
+      "version": "2.3.0",
+      "date": "2026-10-22",
+      "entries": [
+        {
+          "id": "chromium-156",
+          "title": "Trình duyệt đã lên Chromium 156",
+          "lead": "Hồ sơ báo Chrome 156 và có các bản sửa engine từ ProxyShard 2.1.0.",
+          "tag": "new",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "User agent, client hints và bắt tay TLS của mọi hồ sơ chuyển sang Chrome 156 ở lần đầu mở launcher sau khi cập nhật. Engine mới chỉ tải một lần; hồ sơ vẫn giữ cookie, đăng nhập và lịch sử."
+            },
+            {
+              "type": "p",
+              "text": "Tải hỏng không còn làm máy mất trình duyệt. Engine mới được giải nén cạnh bản cũ và chỉ thay vào khi đã đầy đủ; nếu việc thay bị ngắt giữa chừng thì lần mở sau sẽ hoàn tác."
+            },
+            {
+              "type": "note",
+              "text": "Hồ sơ không dùng proxy giờ luôn đi thẳng. Trước đây nó đi theo proxy đặt trong Windows, lệch với múi giờ và vị trí đã tính cho hồ sơ. Proxy ghi trong tham số bổ sung chung vẫn được ưu tiên."
+            }
+          ]
+        },
+        {
+          "id": "human-input",
+          "title": "Nhấp và gõ kiểu người thật chạy được qua CDP",
+          "lead": "Công cụ MCP human_click và human_type lại gọi được miền Motion của engine.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Engine chỉ trả lời miền Motion khi trình duyệt được mở kèm một công tắc tự động hóa mà launcher này chưa từng truyền, nên mọi cú nhấp và phím gõ kiểu người đều hỏng. Giờ mọi lần mở để tự động hóa đều truyền công tắc đó, và một bài kiểm tra mở engine đúng cách ấy để chứng minh miền này trả lời."
+            }
+          ]
+        },
+        {
+          "id": "cancel-start",
+          "title": "Huỷ một lần khởi động quá lâu",
+          "lead": "Khi hồ sơ còn đang khởi động, nút của nó dùng để huỷ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Kiểm tra proxy hoặc tra vị trí chậm có thể giữ hồ sơ ở trạng thái đang khởi động rất lâu. Bấm lại nút để huỷ; không trình duyệt nào mở và hàng đó không để lại lỗi."
+            },
+            {
+              "type": "p",
+              "text": "Launcher cũng không chịu thoát từ khay hệ thống hay khi đóng cửa sổ nếu còn trình duyệt do nó mở đang chạy, và cho biết còn bao nhiêu cái."
+            }
+          ]
+        },
+        {
+          "id": "reliability-2-3",
+          "title": "Ít cách làm mất hồ sơ hay cài đặt hơn",
+          "lead": "Các bản sửa lấy từ ProxyShard và từ các fork khác.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "list",
+              "items": [
+                "Hồ sơ còn mở trình duyệt không còn hiện là đang nghỉ, và nút Dừng vẫn đóng được nó.",
+                "Một byte hỏng trong file cài đặt không còn xoá sạch cài đặt; ứng dụng báo lỗi và để nguyên file.",
+                "Cửa sổ không còn trắng trơn trên mạng không bao giờ trả lời.",
+                "Proxy SOCKS5 không ra được internet giờ sẽ trượt bài kiểm tra.",
+                "Hồ sơ không có kích thước cửa sổ riêng sẽ mở vừa trong màn hình nó khai báo.",
+                "Đổi mật khẩu proxy qua API vẫn giữ hồ sơ gắn với proxy đó."
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.10",
       "date": "2026-09-25",
       "entries": [
