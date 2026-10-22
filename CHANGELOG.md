@@ -79,6 +79,13 @@ its source and the reason for what was left out, is in
   published after 2.2.10.
 - The Rust SDK's minimum Rust version is now 1.88, the oldest `zip` 9 builds
   on; no `zip` release below 9 carries the fix.
+- npm advisories published since 2.2.10 are patched in every package. The
+  MCP server moves to `@modelcontextprotocol/sdk` 1.32.1, with `proxy-addr`,
+  `hono`, `ip-address` and `fast-uri` on fixed releases; the Node SDK takes
+  `ip-address` 10.7.4. Build tooling: `vite-plugin-dts` 5 for the UI kit's
+  type declarations (output unchanged apart from quote style), and
+  `@parcel/watcher` 2.6.0 under the Tailwind CLI, which drops the vulnerable
+  `micromatch`/`braces` chain.
 - The release audit ignores the same three advisories for the `zip` 4 that
   `tauri-plugin-updater` still pulls: the updater extracts only payloads whose
   signature it has already checked, and this launcher's Windows payload is not

@@ -44,5 +44,8 @@
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
     "vite": "^6.4.3"
+  },
+  "overrides": {
+    "@parcel/watcher": "^2.6.0"
   }
 }
