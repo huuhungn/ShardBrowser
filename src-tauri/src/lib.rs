@@ -649,8 +649,10 @@ pub(crate) fn randomize_hardware(payload: &mut serde_json::Map<String, Value>) {
 }
 
 /// Clamp profile.screen to the real display when it's smaller than the FP claim.
-/// On Win/Linux always use the real display (presets rarely match user monitors).
-fn clamp_screen_to_real_display(
+/// A claim the display can hold is kept on every platform: replacing it with
+/// the host's monitor made every profile on one machine report the same screen
+/// (upstream 6c3f65a, "screen kept when it fits").
+pub(crate) fn clamp_screen_to_real_display(
     window: &tauri::WebviewWindow,
     payload: &mut serde_json::Map<String, Value>,
 ) {
@@ -694,10 +696,9 @@ fn clamp_screen_to_real_display(
     if fp_w <= 0 || fp_h <= 0 {
         return;
     }
-    // macOS keeps curated FP unless real display smaller; Win/Linux always uses real.
-    if cfg!(target_os = "macos") && real_w >= fp_w && real_h >= fp_h {
+    if real_w >= fp_w && real_h >= fp_h {
         eprintln!(
-            "[launcher] display: real {real_w}x{real_h} >= fp {fp_w}x{fp_h} — keeping FP screen (macOS)"
+            "[launcher] display: real {real_w}x{real_h} >= fp {fp_w}x{fp_h} — keeping FP screen"
         );
         return;
     }

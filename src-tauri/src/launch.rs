@@ -72,6 +72,61 @@ pub(crate) const CDP_ARGS: [&str; 3] = [
     "--shardx-automation",
 ];
 
+/// A window to go with the claimed screen (#67). Without one the engine passes
+/// no --window-size and Chromium uses the REAL monitor's work area, so a
+/// profile claiming 1920x1080 opened in a window sized for the host and sitting
+/// outside its own claimed screen. A profile that names a usable window keeps
+/// it. Derived per launch, never written back, so the stored profile (and team
+/// sync) is untouched. Ported from upstream 081770c.
+fn fill_window_from_screen(raw: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(scr) = raw.get("screen").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let w = scr.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+    let h = scr.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let avail_w = scr
+        .get("avail_width")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(w)
+        .max(1);
+    let avail_h = scr
+        .get("avail_height")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(h)
+        .max(1);
+    let names_a_window = raw
+        .get("window")
+        .and_then(|v| v.as_object())
+        .is_some_and(|win| {
+            win.get("outer_width").and_then(|v| v.as_i64()).unwrap_or(0) > 0
+                && win
+                    .get("outer_height")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0
+        });
+    if names_a_window {
+        return;
+    }
+    let outer_h = (avail_h - 1).max(1);
+    raw.insert(
+        "window".into(),
+        serde_json::json!({
+            "outer_width": avail_w,
+            "outer_height": outer_h,
+            "inner_width": avail_w,
+            "inner_height": (outer_h - 87).max(1),
+        }),
+    );
+    eprintln!(
+        "[launcher] display: profile named no window — derived {avail_w}x{outer_h} \
+         from its claimed {w}x{h} screen"
+    );
+}
+
 pub async fn launch_profile(
     profile_id: &str,
     enable_cdp: bool,
@@ -118,12 +173,16 @@ pub async fn launch_profile_synced(
                     true
                 }
                 Err(e) => {
-                    let cached = proxy::latest_test(&p.id).and_then(|s| s.udp_ms).is_some();
+                    // Fail closed. A cached pass is no evidence: a proxy edited
+                    // in place keeps its test history, and a VPN can make UDP
+                    // look fine at test time. Enabling QUIC/WebRTC on a relay
+                    // that drops UDP leaks or stalls the profile (CarterLeeAlt
+                    // 5b418a9; upstream 6c3f65a "udp-test-vpn").
                     eprintln!(
-                        "[launcher] UDP probe failed for proxy {} ({e}); using cached={cached}",
+                        "[launcher] UDP probe failed for proxy {} ({e}); QUIC and proxied WebRTC stay off",
                         p.host
                     );
-                    cached
+                    false
                 }
             }
         } else {
@@ -142,6 +201,20 @@ pub async fn launch_profile_synced(
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
     resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    fill_window_from_screen(&mut raw);
+    // The claimed screen still has to fit this monitor: the profile may have
+    // moved to a smaller machine since it was created, and a window cannot be
+    // larger than the screen it opens on. A display that holds the claim
+    // leaves it untouched. "Real screen" mode hands the host's screen to the
+    // engine instead, so there is nothing to fit.
+    let real_screen = settings::load()
+        .map(|s| s.screen_resolution_mode.as_deref() == Some("real"))
+        .unwrap_or(false);
+    if !real_screen {
+        if let Some(w) = crate::main_window() {
+            crate::clamp_screen_to_real_display(&w, &mut raw);
+        }
+    }
     let json =
         serde_json::to_string(&raw).context(crate::errcode::code("launch.serializeProfile"))?;
 
@@ -279,6 +352,14 @@ pub async fn launch_profile_synced(
                 p.host
             );
         }
+    } else if !names_a_proxy(&settings::load().map(|s| s.extra_args).unwrap_or_default()) {
+        // No proxy bound means direct, not "whatever the OS is set to". Without
+        // this, Chromium follows a system proxy (Clash, v2rayN, a corporate PAC)
+        // while timezone and geo were resolved from the direct IP, so the
+        // profile's exit IP and its claimed location disagree (CarterLeeAlt
+        // a673138). An operator who routes through a proxy on purpose names it
+        // in the global extra arguments, which this leaves alone.
+        cmd.arg("--no-proxy-server");
     }
 
     // WebRTC IP policy: block / tcp_only / auto (auto = relay if UDP, else tcp_only).
@@ -575,9 +656,25 @@ const SAFE_LAUNCH_SWITCHES: &[&str] = &[
 ];
 
 /// Poll `<udd>/DevToolsActivePort` for ~6s; line 1 = port, line 2 = ws path.
+/// Whether the operator's extra arguments choose a proxy themselves.
+fn names_a_proxy(extra_args: &str) -> bool {
+    settings::parse_extra_args(extra_args).iter().any(|a| {
+        ["--proxy-server", "--proxy-pac-url", "--proxy-auto-detect"]
+            .iter()
+            .any(|p| a.starts_with(p))
+    })
+}
+
+/// How long a launch waits for the browser to publish its debugging port. Six
+/// seconds was not enough for a cold engine behind a slow proxy, and the start
+/// then reported no CDP for a browser that came up moments later (upstream
+/// 6c3f65a, "start-cdp-wait").
+const CDP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
     let file = udd.join("DevToolsActivePort");
-    for _ in 0..60 {
+    let deadline = std::time::Instant::now() + CDP_WAIT;
+    while std::time::Instant::now() < deadline {
         if let Ok(txt) = std::fs::read_to_string(&file) {
             let mut lines = txt.lines();
             if let (Some(port_s), Some(path)) = (lines.next(), lines.next()) {
@@ -907,6 +1004,87 @@ fn host_locale() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod direct_profile_tests {
+    use super::names_a_proxy;
+
+    #[test]
+    fn only_an_operator_proxy_switch_keeps_the_system_route() {
+        assert!(!names_a_proxy(""));
+        assert!(!names_a_proxy("--mute-audio --lang=en"));
+        assert!(names_a_proxy(
+            "--mute-audio --proxy-server=http://10.0.0.1:3128"
+        ));
+        assert!(names_a_proxy("--proxy-pac-url=http://corp/proxy.pac"));
+    }
+}
+
+#[cfg(test)]
+mod window_from_screen_tests {
+    use super::fill_window_from_screen;
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn derives_a_window_from_the_claimed_screen() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1920, "height": 1080,
+                        "avail_width": 1920, "avail_height": 1032 }
+        }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1920);
+        assert_eq!(w["outer_height"], 1031);
+        assert_eq!(w["inner_width"], 1920);
+        assert_eq!(w["inner_height"], 944);
+    }
+
+    #[test]
+    fn leaves_a_profile_that_names_its_own_window() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1920, "height": 1080,
+                        "avail_width": 1920, "avail_height": 1032 },
+            "window": { "outer_width": 1280, "outer_height": 800,
+                        "inner_width": 1280, "inner_height": 713 }
+        }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1280, "a captured window must survive");
+        assert_eq!(w["inner_height"], 713);
+    }
+
+    #[test]
+    fn falls_back_to_the_full_screen_when_avail_is_absent() {
+        let mut raw = obj(json!({ "screen": { "width": 1366, "height": 768 } }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1366);
+        assert_eq!(w["outer_height"], 767);
+    }
+
+    #[test]
+    fn does_nothing_without_a_screen() {
+        let mut raw = obj(json!({ "name": "no screen here" }));
+        fill_window_from_screen(&mut raw);
+        assert!(raw.get("window").is_none());
+    }
+
+    #[test]
+    fn an_empty_window_block_is_still_filled() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1600, "height": 900,
+                        "avail_width": 1600, "avail_height": 860 },
+            "window": {}
+        }));
+        fill_window_from_screen(&mut raw);
+        assert_eq!(raw["window"]["outer_width"], 1600);
+        assert_eq!(raw["window"]["outer_height"], 859);
+    }
 }
 
 #[cfg(test)]
