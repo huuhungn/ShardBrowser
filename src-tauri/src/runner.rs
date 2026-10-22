@@ -5,10 +5,10 @@
 //! run succeeded.
 //!
 //! Deliberately smaller than upstream's runner. Every block here is one this
-//! engine can really perform — nothing depends on the CDP Motion domain, which
-//! build 152.0.7977.65 does not implement (see `tests/motion_protocol_it.rs`).
-//! A block that cannot be honestly executed is not offered at all, rather than
-//! offered and quietly doing nothing.
+//! engine can really perform, and none of them goes through the CDP Motion
+//! domain (it answers only on launches with `--shardx-automation`; see
+//! `tests/motion_protocol_it.rs`). A block that cannot be honestly executed is
+//! not offered at all, rather than offered and quietly doing nothing.
 //!
 //! The walk follows each block's own `on_done` / `on_fail` branch rather than
 //! falling through the list, because that is what the stored project means.

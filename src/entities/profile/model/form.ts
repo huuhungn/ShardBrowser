@@ -14,7 +14,7 @@ export const defaultForm = (): ProfileForm => ({
   // Empty until snapped to gpusForOs[0] by useEffect.
   gpu_preset_id: "",
   user_agent:
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
   hardware_concurrency: 8,
   device_memory: 16,
   // Empty = inherit donor; setGpu refreshes via enrich_picks_for_preset.
