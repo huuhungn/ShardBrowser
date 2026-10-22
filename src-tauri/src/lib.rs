@@ -1819,6 +1819,12 @@ fn settings_get() -> Result<settings::Settings, String> {
     settings::load().map_err(|e| e.to_string())
 }
 
+/// Why the settings file could not be read, for the Settings banner.
+#[tauri::command]
+fn settings_load_error() -> Option<String> {
+    settings::load_error()
+}
+
 #[tauri::command]
 fn settings_save(app: tauri::AppHandle, mut value: settings::Settings) -> Result<(), String> {
     // Owned by the migration, not the form — which round-trips the whole struct
@@ -2549,6 +2555,7 @@ pub fn run() {
             proxy_bulk_save,
             launch,
             settings_get,
+            settings_load_error,
             settings_save,
             startup_status,
             api_info,

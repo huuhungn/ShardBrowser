@@ -263,6 +263,8 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return null;
     case "settings_get":
       return settings;
+    case "settings_load_error":
+      return null;
     case "settings_save":
       Object.assign(settings, (payload as { value?: typeof settings } | undefined)?.value);
       return null;
