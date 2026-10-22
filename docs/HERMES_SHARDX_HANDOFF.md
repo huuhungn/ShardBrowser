@@ -128,8 +128,12 @@ reloads the tool schema.
 
 ## Secret and profile boundaries
 
-- `SHARDX_TOKEN` is a Windows User environment variable. It is intentionally
-  absent from `config.toml`; never print or copy its value into logs or docs.
+- `SHARDX_TOKEN` lives in the Hermes `.env` (`%LOCALAPPDATA%\hermes\.env`), not
+  in a Windows User environment variable. Hermes passes a stdio MCP server only
+  a safe baseline plus that server's own `env:` block, so
+  `mcp_servers.shardbrowser.env` in `config.yaml` must reference it as
+  `SHARDX_TOKEN: ${SHARDX_TOKEN}`. Use the long-lived token from Settings →
+  Automation API; never print or copy its value into logs or docs.
 - Never expose cookies, proxy credentials, profile storage, profile notes, or
   full fingerprint payloads.
 - Reuse the canonical profile for smoke tests and restore its prior running or
@@ -582,7 +586,11 @@ git -C $env:USERPROFILE\Documents\GitHub\ShardBrowser status --short --branch
 hermes mcp test shardbrowser
 ```
 
-Then call `health_check`, confirm the version, and use `list_running`. For a
+Then call `health_check`, confirm the version and `authenticated: true`, and use
+`list_running`. `hermes -z` runs through the gateway, which keeps its MCP
+processes: after changing the token or the runtime, send `/reload-mcp` (in Git
+Bash, set `MSYS_NO_PATHCONV=1` so the slash is not turned into a path) and
+check that `token_present` is true. For a
 navigation smoke test, call `safe_open_url` on `https://example.com/` and verify
 `Example Domain`; restore the profile's prior state. For DevTools QA, read
 `docs/CODEX_DEVTOOLS_QA.md` (kept under its original filename; the procedure is
