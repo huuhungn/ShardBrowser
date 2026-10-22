@@ -24,6 +24,97 @@ fn taskkill_profile_process(pid: u32, force_tree: bool) {
         .status();
 }
 
+/// Whether a browser holds `udd`, read the way Chromium reads it. Windows:
+/// Chromium keeps `lockfile` open, shared for reading only, while the profile
+/// runs and deletes it on close, so an open that shares nothing fails with a
+/// sharing violation (32). Ported from upstream's `reset::lock_is_live`.
+#[cfg(windows)]
+pub(crate) fn lock_is_live(udd: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    let lock = udd.join("lockfile");
+    if std::fs::symlink_metadata(&lock).is_err() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&lock)
+    {
+        Ok(_) => false,
+        Err(e) => e.raw_os_error() == Some(32),
+    }
+}
+
+/// Unix: a `SingletonLock` link to "<host>-<pid>"; live while that pid is.
+/// The host is not trusted alone (macOS renames the computer with the
+/// network), so a live pid counts on any host, as Chromium's own check does.
+#[cfg(unix)]
+pub(crate) fn lock_is_live(udd: &std::path::Path) -> bool {
+    lock_pid(udd).is_some_and(|pid| {
+        // SAFETY: signal 0 delivers nothing; it only asks whether the pid exists.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    })
+}
+
+#[cfg(unix)]
+fn lock_pid(udd: &std::path::Path) -> Option<i32> {
+    let target = std::fs::read_link(udd.join("SingletonLock")).ok()?;
+    let (host, pid) = target.to_str()?.rsplit_once('-')?;
+    let pid = pid.parse::<i32>().ok()?;
+    (!host.is_empty() && pid > 0).then_some(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn lock_is_live(_udd: &std::path::Path) -> bool {
+    false
+}
+
+/// Stop a browser that holds `udd` but is not the child we started, so Stop
+/// still works on a profile whose launch was handed over.
+async fn stop_lock_holder(udd: &std::path::Path) {
+    #[cfg(unix)]
+    if let Some(pid) = lock_pid(udd) {
+        // SAFETY: a pid read from the profile's own lock; SIGTERM lets it flush.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    #[cfg(windows)]
+    for pid in browser_pids_for(udd) {
+        taskkill_profile_process(pid, false);
+    }
+    for _ in 0..10 {
+        if !lock_is_live(udd) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    #[cfg(windows)]
+    for pid in browser_pids_for(udd) {
+        taskkill_profile_process(pid, true);
+    }
+}
+
+/// Browser (not renderer/GPU) processes whose command line names `udd`.
+#[cfg(windows)]
+fn browser_pids_for(udd: &std::path::Path) -> Vec<u32> {
+    use std::os::windows::process::CommandExt;
+    // The path travels in an environment variable, never inside the script,
+    // so no character in it can change what PowerShell runs.
+    let script = "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" |         Where-Object { $_.CommandLine -and $_.CommandLine.Contains($env:SHARDX_UDD)         -and -not $_.CommandLine.Contains('--type=') } | ForEach-Object { $_.ProcessId }";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("SHARDX_UDD", udd.as_os_str())
+        .creation_flags(0x08000000)
+        .output();
+    out.map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 pub struct Tracker {
     inner: Mutex<HashMap<String, ChildEntry>>,
 }
@@ -85,17 +176,20 @@ impl Tracker {
         child: Child,
         temporary: bool,
     ) -> TrackedProcess {
-        self.track_with_relay(profile_id, child, temporary, None)
+        self.track_with_relay(profile_id, child, temporary, None, None)
     }
 
-    /// [`Tracker::track`], keeping `relay` open exactly as long as the child
-    /// runs: the engine's only route to its proxy, closed when it exits.
+    /// [`Tracker::track`], keeping `relay` open exactly as long as the browser
+    /// runs: the engine's only route to its proxy, closed when it exits. `udd`
+    /// is the profile's user-data dir, whose lock says whether a browser still
+    /// holds it after the child we started has gone.
     pub fn track_with_relay(
         &'static self,
         profile_id: String,
         mut child: Child,
         temporary: bool,
         relay: Option<crate::proxy_relay::RelayHandle>,
+        udd: Option<std::path::PathBuf>,
     ) -> TrackedProcess {
         let pid = child.id().unwrap_or(0);
         let launch_instance_token = uuid::Uuid::new_v4().to_string();
@@ -121,9 +215,11 @@ impl Tracker {
         let started_at = Instant::now();
         let tracked_launch_instance_token = launch_instance_token.clone();
         tokio::spawn(async move {
+            let mut stopped = false;
             tokio::select! {
                 _ = child.wait() => {}
                 _ = rx.recv() => {
+                    stopped = true;
                     #[cfg(unix)]
                     {
                         if let Some(p) = child.id() {
@@ -151,6 +247,29 @@ impl Tracker {
                         }
                         let _ = child.kill().await;
                         let _ = child.wait().await;
+                    }
+                }
+            }
+            // The process we started is gone, which is not the same as the
+            // browser being gone (#109). A launcher running as administrator
+            // makes Chromium on Windows restart itself without those rights,
+            // and a browser left by an earlier launcher run takes over a new
+            // launch through Chromium's singleton; either way our child exits
+            // at once while the real browser carries on. Dropping the entry
+            // then showed the open profile as Idle, offered no Stop, and closed
+            // the proxy relay under it. The profile's lock is the answer
+            // Chromium itself reads, so wait on it, and still honour Stop.
+            if !stopped {
+                if let Some(udd) = udd.as_deref() {
+                    let step = std::time::Duration::from_secs(2);
+                    let mut waited = std::time::Duration::ZERO;
+                    // A lock nobody releases must not pin a profile to Running
+                    // for the rest of the session.
+                    while lock_is_live(udd) && waited < std::time::Duration::from_secs(12 * 3600) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(step) => waited += step,
+                            Some(()) = rx.recv() => stop_lock_holder(udd).await,
+                        }
                     }
                 }
             }
@@ -481,6 +600,91 @@ mod tests {
 
         assert_eq!(outcome, KillOutcome::Stopped { pid: 111 });
         assert_eq!(owned_killer.recv().await, Some(()));
+    }
+
+    /// Hold the profile lock the way a running browser does.
+    #[cfg(windows)]
+    fn hold_lock(udd: &std::path::Path) -> Box<dyn std::any::Any> {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_SHARE_READ only, as Chromium opens it.
+        Box::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(1)
+                .open(udd.join("lockfile"))
+                .expect("open lockfile"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn hold_lock(udd: &std::path::Path) -> Box<dyn std::any::Any> {
+        struct Link(std::path::PathBuf);
+        impl Drop for Link {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let link = udd.join("SingletonLock");
+        std::os::unix::fs::symlink(format!("testhost-{}", std::process::id()), &link)
+            .expect("plant SingletonLock");
+        Box::new(Link(link))
+    }
+
+    #[test]
+    fn a_held_profile_lock_reads_as_live_and_a_released_one_does_not() {
+        let udd = tempfile::tempdir().unwrap();
+        assert!(!super::lock_is_live(udd.path()), "no lock at all");
+
+        let held = hold_lock(udd.path());
+        assert!(super::lock_is_live(udd.path()));
+
+        drop(held);
+        assert!(!super::lock_is_live(udd.path()));
+    }
+
+    /// #109: the child exits at once (a handed-over launch) while a browser
+    /// still holds the profile. The profile must stay Running until the lock
+    /// goes, not drop to Idle with its window open.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_handed_over_browser_keeps_the_profile_running_until_its_lock_goes() {
+        let udd = tempfile::tempdir().unwrap();
+        let held = hold_lock(udd.path());
+        let profile_id = format!("process-handover-{}", uuid::Uuid::new_v4());
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/C", "exit", "0"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        let child = command.spawn().expect("spawn immediate exit child");
+        Tracker::shared().track_with_relay(
+            profile_id.clone(),
+            child,
+            false,
+            None,
+            Some(udd.path().to_path_buf()),
+        );
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            Tracker::shared().is_running(&profile_id),
+            "the profile dropped to Idle while its browser held the lock"
+        );
+
+        drop(held);
+        for _ in 0..100 {
+            if !Tracker::shared().is_running(&profile_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the entry outlived the lock: {profile_id}");
     }
 
     #[test]

@@ -397,6 +397,7 @@
   "launch.nothingLaunched": "Không có gì khởi động được — {reasons}",
   "launch.optionsInvalid": "Thiết lập khởi động của hồ sơ này không hợp lệ",
   "launch.optionsNotObject": "Thiết lập khởi động của hồ sơ này bị hỏng",
+  "launch.openElsewhere": "Profile này đang mở trong một trình duyệt không do launcher khởi động. Hãy đóng cửa sổ đó trước.",
   "launch.persistMetadata": "Đã mở trình duyệt nhưng không ghi lại được",
   "launch.proxyRelayFailed": "Không khởi động được bộ chuyển tiếp proxy cục bộ cho hồ sơ này",
   "launch.restoreSessionNotBool": "Thiết lập khôi phục thẻ bị hỏng — hãy chọn lại trong hồ sơ",

@@ -94,6 +94,12 @@ pub async fn launch_profile_synced(
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;
+    // A browser this launcher did not start (an earlier launcher run, or one
+    // started by hand) already holds the profile; a new launch would only be
+    // handed over to it and exit.
+    if crate::process::lock_is_live(&udd) {
+        anyhow::bail!(crate::errcode::code("launch.openElsewhere"));
+    }
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
@@ -385,6 +391,7 @@ pub async fn launch_profile_synced(
         child,
         stored.meta.temporary,
         proxy_relay,
+        Some(udd.clone()),
     );
     drop(launch_claim);
 

@@ -397,6 +397,7 @@
   "launch.nothingLaunched": "Nothing started — {reasons}",
   "launch.optionsInvalid": "This profile's start-up settings are not valid",
   "launch.optionsNotObject": "This profile's start-up settings are damaged",
+  "launch.openElsewhere": "This profile is already open in a browser the launcher did not start. Close that window first.",
   "launch.persistMetadata": "Started the browser but could not record it",
   "launch.proxyRelayFailed": "Could not start the local proxy relay for this profile",
   "launch.restoreSessionNotBool": "The restore-tabs setting is damaged — set it again in the profile",
