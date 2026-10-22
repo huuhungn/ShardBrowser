@@ -165,7 +165,9 @@ class Browser:
             f"--user-data-dir={udd}",
             "--no-first-run",
         ]
-        if not profile.has_webgpu:
+        # A Linux profile keeps navigator.gpu and answers the adapter request
+        # with nothing, as Chrome on Linux does; the switch removes the object.
+        if not profile.has_webgpu and not profile.claims_linux_desktop:
             argv.append("--disable-features=WebGPU")
         if not headless and not cdp:
             argv += ["--restore-last-session", "--hide-crash-restore-bubble"]
@@ -196,7 +198,17 @@ class Browser:
                 argv.append(f"--shardx-webrtc-public-ip={ip}")
         if cdp:
             (udd / "DevToolsActivePort").unlink(missing_ok=True)
-            argv += ["--remote-debugging-port=0", "--remote-allow-origins=*"]
+            # Gates the Motion domain, which every synthesised click and
+            # keystroke goes through. Without it `Motion.createPointer` comes
+            # back as "wasn't found": the domain is not merely disabled, it is
+            # absent from Schema.getDomains and /json/protocol, which is what
+            # keeps it free when nobody uses it. The launcher passes the same
+            # flag whenever it opens a profile for automation.
+            argv += [
+                "--remote-debugging-port=0",
+                "--remote-allow-origins=*",
+                "--shardx-automation",
+            ]
         if headless:
             argv.append("--headless=new")
         if extra_args:

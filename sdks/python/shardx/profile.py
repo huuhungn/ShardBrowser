@@ -84,6 +84,26 @@ class Profile:
         return self.config.get("navigator", {}).get("platform", "")
 
     @property
+    def claims_mobile(self) -> bool:
+        """A device whose primary input is a finger."""
+        ch = self.config.get("client_hints") or {}
+        if ch.get("mobile") is True:
+            return True
+        if str(ch.get("platform") or "").lower().startswith("android"):
+            return True
+        nav = self.config.get("navigator") or {}
+        return "android" in str(nav.get("user_agent") or "").lower()
+
+    @property
+    def claims_linux_desktop(self) -> bool:
+        """Desktop Linux. Android is excluded: its platform is Linux too."""
+        if self.claims_mobile:
+            return False
+        nav = self.config.get("navigator") or {}
+        p = str(nav.get("platform") or "").lower()
+        return p.startswith("linux") or p.startswith("x11")
+
+    @property
     def has_webgpu(self) -> bool:
         wgp = self.config.get("webgpu")
         return wgp is not None and bool(wgp.get("limits"))

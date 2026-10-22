@@ -204,7 +204,10 @@ impl Browser {
             format!("--user-data-dir={}", udd.display()),
             "--no-first-run".into(),
         ];
-        if !profile.has_webgpu() {
+        // A profile claiming desktop Linux keeps navigator.gpu and answers the
+        // adapter request with nothing, which is what Chrome on Linux does;
+        // disabling the feature would remove the object as well.
+        if !profile.has_webgpu() && !profile.claims_linux_desktop() {
             argv.push("--disable-features=WebGPU".into());
         }
         if !opts.headless && !opts.cdp {
@@ -258,6 +261,13 @@ impl Browser {
             let _ = std::fs::remove_file(&marker);
             argv.push("--remote-debugging-port=0".into());
             argv.push("--remote-allow-origins=*".into());
+            // Gates the Motion domain, which every synthesised click and
+            // keystroke goes through. Without it `Motion.createPointer` comes
+            // back as "wasn't found": the domain is absent from
+            // Schema.getDomains and /json/protocol rather than merely
+            // disabled, which is what keeps it free when nobody uses it. The
+            // launcher passes the same flag.
+            argv.push("--shardx-automation".into());
         }
         if opts.headless {
             argv.push("--headless=new".into());

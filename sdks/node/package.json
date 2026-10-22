@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test test/runtime-zip.test.mjs",
+    "test": "npm run build && node --test test/runtime-zip.test.mjs test/launch-args.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "engines": {

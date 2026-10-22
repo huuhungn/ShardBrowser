@@ -81,6 +81,23 @@ export class Profile {
     return (nav?.["platform"] as string | undefined) ?? "";
   }
 
+  /** A device whose primary input is a finger. */
+  get claimsMobile(): boolean {
+    const ch = this.config["client_hints"] as Record<string, unknown> | undefined;
+    if (ch?.["mobile"] === true) return true;
+    const chPlatform = String(ch?.["platform"] ?? "").toLowerCase();
+    if (chPlatform.startsWith("android")) return true;
+    const nav = this.config["navigator"] as Record<string, unknown> | undefined;
+    return String(nav?.["user_agent"] ?? "").toLowerCase().includes("android");
+  }
+
+  /** Desktop Linux. Android is excluded: its platform is Linux too, and a phone has WebGPU. */
+  get claimsLinuxDesktop(): boolean {
+    if (this.claimsMobile) return false;
+    const p = this.platform.toLowerCase();
+    return p.startsWith("linux") || p.startsWith("x11");
+  }
+
   get hasWebGPU(): boolean {
     const wgp = this.config["webgpu"] as Record<string, unknown> | null | undefined;
     if (!wgp) return false;

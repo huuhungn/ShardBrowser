@@ -19,6 +19,18 @@ import { parseProxy, probeUdp, proxyToArg, type ParsedProxy } from "./proxy.js";
 import type { Runtime } from "./runtime.js";
 import { applyScreenStrategy, defaultScreenModeFor, type ScreenStrategy } from "./screen.js";
 
+/** Switches a CDP launch adds. `--shardx-automation` gates the Motion domain,
+ *  which every synthesised click and keystroke goes through. Without it
+ *  `Motion.createPointer` comes back as "wasn't found": the domain is absent
+ *  from Schema.getDomains and /json/protocol rather than merely disabled,
+ *  which is what keeps it free when nobody uses it. The launcher passes the
+ *  same flag. */
+export const CDP_ARGS: readonly string[] = [
+  "--remote-debugging-port=0",
+  "--remote-allow-origins=*",
+  "--shardx-automation",
+];
+
 export type WebRtcMode   = "auto" | "block" | "tcp_only";
 /** Legacy alias retained for back-compat; prefer `ScreenStrategy`. */
 export type ScreenMode   = ScreenStrategy;
@@ -149,7 +161,10 @@ export class Browser {
       `--user-data-dir=${udd}`,
       "--no-first-run",
     ];
-    if (!profile.hasWebGPU) argv.push("--disable-features=WebGPU");
+    // A Linux profile keeps navigator.gpu and answers the adapter request with
+    // nothing, as Chrome on Linux does; the switch would remove the object too.
+    if (!profile.hasWebGPU && !profile.claimsLinuxDesktop)
+      argv.push("--disable-features=WebGPU");
     if (!opts.headless && !opts.cdp) {
       argv.push("--restore-last-session", "--hide-crash-restore-bubble");
     }
@@ -183,7 +198,7 @@ export class Browser {
     const cdpMarker = join(udd, "DevToolsActivePort");
     if (opts.cdp) {
       if (existsSync(cdpMarker)) rmSync(cdpMarker, { force: true });
-      argv.push("--remote-debugging-port=0", "--remote-allow-origins=*");
+      argv.push(...CDP_ARGS);
     }
     if (opts.headless) argv.push("--headless=new");
     if (opts.extraArgs) argv.push(...opts.extraArgs);
