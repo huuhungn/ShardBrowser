@@ -1056,7 +1056,11 @@ fn clipboard_write(app: tauri::AppHandle, text: String) -> Result<(), String> {
 #[tauri::command]
 fn clipboard_read(app: tauri::AppHandle) -> Result<String, String> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
-    app.clipboard().read_text().map_err(|e| e.to_string())
+    // An empty clipboard is an empty string, not a failure. The platform
+    // reports "nothing to read" as an error (a bare "unknown error" on macOS),
+    // and callers already say "the clipboard is empty" in the operator's
+    // language for "" (upstream 081770c, "clipboard-empty").
+    Ok(app.clipboard().read_text().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -2627,8 +2631,13 @@ pub fn run() {
                 let quit = MenuItem::with_id(app, "tray_quit", "Quit", true, None::<&str>)?;
                 let menu = Menu::with_items(app, &[&show, &quit])?;
                 if let Some(icon) = app.default_window_icon().cloned() {
-                    TrayIconBuilder::with_id("main")
-                        .icon(icon)
+                    let builder = TrayIconBuilder::with_id("main").icon(icon);
+                    // The macOS menu bar wants a stencil drawn from the icon's
+                    // shape alone, so it is dark on a light bar and light on a
+                    // dark one instead of staying purple (upstream 6c3f65a).
+                    #[cfg(target_os = "macos")]
+                    let builder = builder.icon_as_template(true);
+                    builder
                         .tooltip("ShardX Launcher")
                         .menu(&menu)
                         .show_menu_on_left_click(false)
