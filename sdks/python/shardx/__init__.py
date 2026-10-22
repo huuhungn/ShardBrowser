@@ -41,6 +41,7 @@ from patchright.async_api import Browser as PatchrightBrowser, async_playwright
 from .auto_resolve import has_auto_fields, resolve_auto_fields
 from .browser import Browser, BrowserSession
 from .geo import GeoInfo, geo_check_via
+from .motion import Motion
 from .host import (
     host_logical_cores,
     host_ram_bucket_gb,
@@ -262,5 +263,6 @@ __all__ = [
     "apply_screen_strategy", "default_mode_for",
     "GeoInfo", "geo_check_via",
     "has_auto_fields", "resolve_auto_fields",
+    "Motion",
 ]
 __version__ = "2.1.0"

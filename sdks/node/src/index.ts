@@ -233,3 +233,5 @@ export type { ScreenStrategy } from "./screen.js";
 export { geoCheckVia } from "./geo.js";
 export type { GeoInfo, GeoProvider } from "./geo.js";
 export { hasAutoFields, resolveAutoFields } from "./autoResolve.js";
+export { Motion } from "./motion.js";
+export type { MouseButton, ScreenAngle, OrientationResult } from "./motion.js";

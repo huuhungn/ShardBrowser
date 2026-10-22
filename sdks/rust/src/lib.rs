@@ -39,6 +39,8 @@ mod browser;
 mod control;
 mod geo;
 mod host;
+#[cfg(feature = "control")]
+pub mod motion;
 mod profile;
 mod proxy;
 mod randomize;
@@ -61,6 +63,8 @@ pub use chromiumoxide;
 pub use control::Session;
 pub use geo::{geo_check_via, GeoInfo};
 pub use host::{host_logical_cores, host_ram_bucket_gb, host_ram_gb, host_screen_size, Size};
+#[cfg(feature = "control")]
+pub use motion::Motion;
 pub use profile::{apply_engine_version, user_data_dir, FingerprintLibrary, Profile};
 pub use proxy::{parse_proxy, probe_udp, proxy_to_arg, ParsedProxy, ProxyScheme};
 pub use randomize::{
