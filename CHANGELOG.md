@@ -69,6 +69,17 @@ its source and the reason for what was left out, is in
   store toast.
 - The macOS menu bar icon follows the light and dark bar.
 
+### Security
+
+- `zip` 9.0.5 replaces 2.x in the launcher and the Rust SDK (RUSTSEC-2026-0367,
+  -0368, -0369: extraction could follow symlinks out of the destination or keep
+  SUID bits). The engine archive extracts byte-for-byte as before.
+- `quinn-proto` 0.11.19, `rustls` 0.23.46, `rustls-webpki` 0.103.16 and
+  `webpki-roots` 1.0.10 in the launcher and the team server, for the advisories
+  published after 2.2.10.
+- The Rust SDK's minimum Rust version is now 1.88, the oldest `zip` 9 builds
+  on; no `zip` release below 9 carries the fix.
+
 ### Internal
 
 - The locale guard also reads labels chosen by a condition and messages passed
