@@ -29,6 +29,12 @@ pub fn runtime_binary_path_for_tests() -> anyhow::Result<std::path::PathBuf> {
     runtime::binary_path()
 }
 
+/// The switches the launcher adds when CDP is on, so the engine probe tests
+/// exactly what a launch passes.
+pub fn cdp_launch_args_for_tests() -> &'static [&'static str] {
+    &launch::CDP_ARGS
+}
+
 mod mcp_setup;
 mod migrate;
 mod process;

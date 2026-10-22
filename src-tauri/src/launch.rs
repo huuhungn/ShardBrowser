@@ -62,6 +62,16 @@ pub fn resolve_binary() -> Result<PathBuf> {
     anyhow::bail!(crate::errcode::code("launch.browserMissing"))
 }
 
+/// Switches for a CDP-enabled launch. `--shardx-automation` gates the engine's
+/// `Motion` domain, which human clicks and typing go through; without it every
+/// `Motion.*` call answers "wasn't found". Unused, it costs nothing: the domain
+/// stays out of `Schema.getDomains` either way.
+pub(crate) const CDP_ARGS: [&str; 3] = [
+    "--remote-debugging-port=0",
+    "--remote-allow-origins=*",
+    "--shardx-automation",
+];
+
 pub async fn launch_profile(
     profile_id: &str,
     enable_cdp: bool,
@@ -343,8 +353,7 @@ pub async fn launch_profile_synced(
     // CDP: port=0 makes Chrome pick free port and write DevToolsActivePort.
     if enable_cdp {
         let _ = std::fs::remove_file(udd.join("DevToolsActivePort"));
-        cmd.arg("--remote-debugging-port=0");
-        cmd.arg("--remote-allow-origins=*");
+        cmd.args(CDP_ARGS);
     }
 
     if headless {
