@@ -263,4 +263,4 @@ __all__ = [
     "GeoInfo", "geo_check_via",
     "has_auto_fields", "resolve_auto_fields",
 ]
-__version__ = "2.0.2"
+__version__ = "2.1.0"

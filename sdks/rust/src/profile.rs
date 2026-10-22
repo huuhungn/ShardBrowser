@@ -208,7 +208,7 @@ impl FingerprintLibrary {
 }
 
 /// Normalise a profile config's spoofed Chrome version to `chromium_version`
-/// (e.g. "152.0.7977.65") so it always matches the running engine — bumps
+/// (e.g. "156.0.8078.48") so it always matches the running engine — bumps
 /// `navigator.user_agent` (Chrome/<major>.0.0.0) and the version fields in
 /// `client_hints`: brand_version / brand_full_version / chrome_build /
 /// chrome_patch (derived from the version) plus, when supplied, grease_brand /
