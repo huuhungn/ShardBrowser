@@ -2377,6 +2377,24 @@ fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Bring the main window back from the tray / minimized state and focus it.
+/// Refuse a real exit while a browser this launcher started is still open
+/// (CarterLeeAlt 031fdee): quitting would orphan its proxy relay and leave the
+/// profile looking idle to the next start. The backend tracker decides, not the
+/// window's two-second poll. Shows the window and tells it why.
+fn block_exit_if_browsers_running(app: &tauri::AppHandle) -> bool {
+    use tauri::Emitter;
+    let running_count = process::Tracker::shared().running().len();
+    if running_count == 0 {
+        return false;
+    }
+    show_main_window(app);
+    let _ = app.emit(
+        "launcher:exit-blocked",
+        serde_json::json!({ "running_count": running_count }),
+    );
+    true
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("main") {
@@ -2478,6 +2496,11 @@ pub fn run() {
                 if window.label() == "main" && to_tray {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if window.label() == "main"
+                    && block_exit_if_browsers_running(tauri::Manager::app_handle(window))
+                {
+                    // Without minimize-to-tray, closing the window quits.
+                    api.prevent_close();
                 }
             }
         })
@@ -2651,7 +2674,7 @@ pub fn run() {
                         .show_menu_on_left_click(false)
                         .on_menu_event(|app, e| match e.id.as_ref() {
                             "tray_show" => show_main_window(app),
-                            "tray_quit" => app.exit(0),
+                            "tray_quit" if !block_exit_if_browsers_running(app) => app.exit(0),
                             _ => {}
                         })
                         .on_tray_icon_event(|tray, e| {

@@ -1,4 +1,5 @@
 {
+  "app.exitBlocked": "ShardX cannot quit while {n} browsers it started are still open. Close them first, then quit again.",
   "automation.addBlock": "Add block",
   "automation.blockMany": "{n} blocks",
   "automation.blockOne": "{n} block",

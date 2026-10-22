@@ -1,4 +1,5 @@
 {
+  "app.exitBlocked": "ShardX chưa thể thoát vì còn {n} trình duyệt do nó mở đang chạy. Hãy đóng chúng trước rồi thoát lại.",
   "automation.addBlock": "Thêm bước",
   "automation.blockMany": "{n} bước",
   "automation.blockOne": "{n} bước",
