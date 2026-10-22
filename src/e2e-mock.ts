@@ -28,6 +28,9 @@ type Proxy = {
 const params = new URLSearchParams(location.search);
 const scenario = params.get("e2e") ?? "default";
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// "slow-launch": a launch that sits in Starting until it is cancelled, the way
+// one behind a slow proxy does.
+let cancelPendingLaunch: (() => void) | null = null;
 
 const fixtureProfiles: Profile[] = [
   {
@@ -426,7 +429,14 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       count("RestartRequests");
       return null;
     case "launch":
+      if (scenario === "slow-launch") {
+        await new Promise<void>((resolve) => { cancelPendingLaunch = resolve; });
+        throw new Error("launch.cancelled");
+      }
       throw new Error("fixture browser launch failed");
+    case "launch_cancel":
+      cancelPendingLaunch?.();
+      return null;
     case "ps_get_key":
       return "";
     case "clipboard_write":

@@ -1538,6 +1538,13 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
 
 // ---- Launcher ----
 
+/// Cancel a launch still on its way: the pending `launch` call fails with
+/// `launch.cancelled` and no browser starts.
+#[tauri::command]
+fn launch_cancel(profile_id: String) {
+    launch::cancel(&profile_id);
+}
+
 #[tauri::command]
 async fn launch(profile_id: String) -> Result<u32, String> {
     // UI launches: no CDP, headed. The bus goes along even with no group so the
@@ -2561,6 +2568,7 @@ pub fn run() {
             launch,
             settings_get,
             settings_load_error,
+            launch_cancel,
             settings_save,
             startup_status,
             api_info,

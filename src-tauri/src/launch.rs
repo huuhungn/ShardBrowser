@@ -146,6 +146,7 @@ pub async fn launch_profile_synced(
     bus_token: &str,
 ) -> Result<LaunchOutcome> {
     let launch_claim = profile::begin_profile_launch(profile_id)?;
+    let _cancel_scope = CancelScope::start(profile_id);
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;
@@ -459,6 +460,10 @@ pub async fn launch_profile_synced(
         // when a Tauri GUI app spawns the engine binary.
         cmd.creation_flags(0x08000000);
     }
+    // The proxy probe and the geo lookup are the slow part; a cancel made while
+    // they ran stops here, before any browser exists. The relay, if one was
+    // started, closes when it drops on the way out.
+    check_cancel(profile_id)?;
     let mut child = cmd
         .spawn()
         .context(crate::errcode::code("launch.spawnFailed"))?;
@@ -656,6 +661,56 @@ const SAFE_LAUNCH_SWITCHES: &[&str] = &[
 ];
 
 /// Poll `<udd>/DevToolsActivePort` for ~6s; line 1 = port, line 2 = ws path.
+/// Profiles whose launch was cancelled while still on its way (upstream
+/// 081770c, "cancel-start"). A launch behind a slow proxy can sit in Starting
+/// for a long while; the probes finish their call and the launch stops at the
+/// last look before the browser would start. One that already started its
+/// browser is past cancelling: Stop handles that one.
+static CANCELS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn cancel(profile_id: &str) {
+    let mut c = CANCELS.lock().unwrap_or_else(|p| p.into_inner());
+    if !c.iter().any(|p| p == profile_id) {
+        c.push(profile_id.to_string());
+    }
+}
+
+fn check_cancel(profile_id: &str) -> Result<()> {
+    let hit = CANCELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|p| p == profile_id);
+    if hit {
+        anyhow::bail!(crate::errcode::code("launch.cancelled"));
+    }
+    Ok(())
+}
+
+/// Clears a profile's cancel when its launch starts and when it ends, however
+/// it ends: a cancel is for the launch that was on its way, never the next one.
+struct CancelScope(String);
+
+impl CancelScope {
+    fn start(profile_id: &str) -> Self {
+        Self::clear(profile_id);
+        CancelScope(profile_id.to_string())
+    }
+
+    fn clear(profile_id: &str) {
+        CANCELS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|p| p != profile_id);
+    }
+}
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        Self::clear(&self.0);
+    }
+}
+
 /// Whether the operator's extra arguments choose a proxy themselves.
 fn names_a_proxy(extra_args: &str) -> bool {
     settings::parse_extra_args(extra_args).iter().any(|a| {
@@ -1004,6 +1059,27 @@ fn host_locale() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::{cancel, check_cancel, CancelScope};
+
+    #[test]
+    fn a_cancel_stops_only_the_launch_it_was_made_for() {
+        let id = "cancel-test-profile";
+        let scope = CancelScope::start(id);
+        assert!(check_cancel(id).is_ok());
+        cancel(id);
+        let err = check_cancel(id).unwrap_err().to_string();
+        assert!(err.contains("launch.cancelled"), "{err}");
+        assert!(check_cancel("another-profile").is_ok());
+        drop(scope);
+        // Late, after that launch returned: the next launch starts clean.
+        cancel(id);
+        let _next = CancelScope::start(id);
+        assert!(check_cancel(id).is_ok());
+    }
 }
 
 #[cfg(test)]

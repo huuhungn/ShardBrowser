@@ -31,6 +31,8 @@ export const devtoolsActivate = (profileId: string) =>
   invoke<DevtoolsTarget>("devtools_activate", { profileId });
 export const processKill = (profileId: string) => invoke<boolean>("process_kill", { profileId });
 export const launch = (profileId: string) => invoke<number>("launch", { profileId });
+/** Stop a launch that has not started its browser yet. */
+export const launchCancel = (profileId: string) => invoke("launch_cancel", { profileId });
 
 /** A group of profiles that mirror each other's input. Returns the group name. */
 export const syncLaunch = (profileIds: string[], group?: string) =>
