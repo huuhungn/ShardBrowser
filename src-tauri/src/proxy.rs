@@ -221,7 +221,17 @@ pub fn get(id: &str) -> Result<Option<ProxyEntry>> {
 }
 
 /// SOCKS5/HTTP CONNECT probe; returns RTT in ms on success.
+/// The whole test, greeting to reply: a proxy that accepts and then stalls must
+/// fail rather than hold the Test button forever.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
+    tokio::time::timeout(TEST_DEADLINE, probe_inner(entry))
+        .await
+        .context(errcode::code("proxy.readTimeout"))?
+}
+
+async fn probe_inner(entry: &ProxyEntry) -> Result<u128> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::time::{timeout, Duration, Instant};
@@ -244,7 +254,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
             if resp[0] != 0x05 {
-                anyhow::bail!("not SOCKS5");
+                anyhow::bail!("{}", errcode::code("proxy.notSocks5"));
             }
             if resp[1] == 0xFF {
                 anyhow::bail!("{}", errcode::code("proxy.authRefused"));
@@ -260,8 +270,25 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 let mut auth_resp = [0u8; 2];
                 stream.read_exact(&mut auth_resp).await?;
                 if auth_resp[1] != 0x00 {
-                    anyhow::bail!("auth failed");
+                    anyhow::bail!("{}", errcode::code("proxy.authRefused"));
                 }
+            }
+            // A greeting proves only that something speaks SOCKS5 on the port.
+            // Ask it to reach a real host, as the browser will; a proxy whose
+            // upstream is dead used to pass here (upstream 081770c,
+            // "proxy-checker").
+            let host = b"example.com";
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+            req.extend_from_slice(host);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            stream.write_all(&req).await?;
+            let mut reply = [0u8; 2];
+            stream.read_exact(&mut reply).await?;
+            if reply[1] != 0x00 {
+                anyhow::bail!(
+                    "{}",
+                    errcode::code_with("proxy.socksRefused", &[("code", &reply[1].to_string())])
+                );
             }
         }
         ProxyKind::Http | ProxyKind::Https => {
@@ -1001,6 +1028,62 @@ mod tests {
             country: String::new(),
             notes: String::new(),
         }
+    }
+
+    /// A one-connection SOCKS5 server on loopback: no-auth greeting, then
+    /// answers the CONNECT with `reply` (0x00 = succeeded, 0x05 = refused),
+    /// or never answers it when `reply` is None.
+    async fn socks5_server(reply: Option<u8>) -> ProxyEntry {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            s.read_exact(&mut greet).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 256];
+            let _ = s.read(&mut req).await;
+            match reply {
+                Some(rep) => {
+                    let _ = s
+                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+                None => tokio::time::sleep(std::time::Duration::from_secs(120)).await,
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        ProxyEntry {
+            host: "127.0.0.1".into(),
+            port,
+            ..entry("", "")
+        }
+    }
+
+    /// A SOCKS5 proxy that takes the sign-in but cannot reach anything used to
+    /// test as working: the probe stopped after the greeting.
+    #[tokio::test]
+    async fn a_socks5_proxy_that_refuses_the_connect_fails_its_test() {
+        let p = socks5_server(Some(0x05)).await;
+        let err = probe(&p)
+            .await
+            .expect_err("a refused CONNECT is a dead proxy");
+        assert!(format!("{err:#}").contains("proxy.socksRefused"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_socks5_proxy_that_connects_passes_its_test() {
+        let p = socks5_server(Some(0x00)).await;
+        probe(&p).await.expect("CONNECT succeeded");
+    }
+
+    #[tokio::test]
+    async fn a_socks5_proxy_that_never_answers_the_connect_times_out() {
+        let p = socks5_server(None).await;
+        let started = std::time::Instant::now();
+        assert!(probe(&p).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     /// #72: the password carries the session with some providers, so two

@@ -801,6 +801,8 @@
   "proxy.donTChange": "Don't change",
   "proxy.editProxy": "Edit proxy",
   "proxy.everyFolder": "Every folder",
+  "proxy.notSocks5": "The server on that port does not speak SOCKS5",
+  "proxy.socksRefused": "The proxy accepted the sign-in but could not reach the internet (SOCKS5 reply {code})",
   "proxy.export": "Export",
   "proxy.failed": "Failed",
   "proxy.http": "HTTP",

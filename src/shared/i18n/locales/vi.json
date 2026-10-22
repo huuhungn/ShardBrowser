@@ -801,6 +801,8 @@
   "proxy.donTChange": "Giữ nguyên",
   "proxy.editProxy": "Sửa proxy",
   "proxy.everyFolder": "Mọi thư mục",
+  "proxy.notSocks5": "Máy chủ ở cổng đó không dùng giao thức SOCKS5",
+  "proxy.socksRefused": "Proxy nhận đăng nhập nhưng không ra được internet (SOCKS5 trả mã {code})",
   "proxy.export": "Xuất",
   "proxy.failed": "Thất bại",
   "proxy.http": "HTTP",
