@@ -799,17 +799,18 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
         stored.meta.extensions = ids.clone();
     }
 
+    // First, so a refused tag list writes nothing; save_raw then carries the
+    // new tags from disk.
+    if let Some(tags) = body.tags.as_ref() {
+        crate::profile::set_tags(&id, tags)
+            .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    }
     crate::profile::save_raw(&mut stored)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     // set_folder handles unfile; save_raw keeps the existing folder when empty.
     if let Some(f) = body.folder.as_ref() {
         crate::profile::set_folder(&id, f)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    // save_raw carries tags through edits; set_tags is what changes them.
-    if let Some(tags) = body.tags.as_ref() {
-        crate::profile::set_tags(&id, tags)
-            .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     }
 
     let updated = crate::profile::load_raw(&id)
@@ -2083,6 +2084,28 @@ mod profile_proxy_password_tests {
         ))
         .await;
         assert_eq!(untouched["_meta"]["tags"], json!(["VIP", "New"]));
+
+        // Past the cap the whole edit is refused, notes included.
+        let many: Vec<String> = (0..=crate::profile::MAX_TAGS_PER_PROFILE)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let (status, _) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "not saved", "tags": many }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, after) = send(authed(
+            "GET",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(after["notes"], json!("again"));
+        assert_eq!(after["_meta"]["tags"], json!(["VIP", "New"]));
 
         let (status, tags) = send(authed("GET", "/tags", &token, Value::Null)).await;
         assert_eq!(status, StatusCode::OK, "body was {tags}");

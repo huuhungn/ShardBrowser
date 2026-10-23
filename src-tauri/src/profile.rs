@@ -90,6 +90,8 @@ fn is_false(b: &bool) -> bool {
 
 pub const MAX_PROFILE_NAME_CHARS: usize = 128;
 pub const MAX_TAG_NAME_CHARS: usize = 32;
+/// Far above any real use; bounds the quadratic duplicate check on API input.
+pub const MAX_TAGS_PER_PROFILE: usize = 64;
 const PROFILE_NAME_CLAIM: &str = "\0profile-name-namespace";
 /// Held by folder and tag rename/delete, which rewrite many profiles at once.
 const GLOBAL_FOLDER_CLAIM: &str = "\0folder-mutation";
@@ -776,6 +778,7 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     }
     // A new or imported profile may bring tags spelled differently from ours.
     if is_new && !stored.meta.tags.is_empty() {
+        ensure_tag_count(&stored.meta.tags)?;
         stored.meta.tags = canonical_tags(&stored.meta.tags, &tag_names_in_use()?);
     }
     // The id is now final (freshly minted for new profiles, carried through for
@@ -1145,8 +1148,22 @@ pub fn list_tags() -> Result<Vec<TagInfo>> {
     Ok(out)
 }
 
+fn ensure_tag_count(tags: &[String]) -> Result<()> {
+    if tags.len() > MAX_TAGS_PER_PROFILE {
+        return Err(profile_error(
+            ProfileErrorKind::InvalidName,
+            crate::errcode::code_with(
+                "profile.tooManyTags",
+                &[("max", &MAX_TAGS_PER_PROFILE.to_string())],
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Replace a profile's tags; returns them as stored.
 pub fn set_tags(id: &str, tags: &[String]) -> Result<Vec<String>> {
+    ensure_tag_count(tags)?;
     let mut p = load_raw(id)?;
     p.meta.tags = canonical_tags(tags, &tag_names_in_use()?);
     let path = path_for(&p.meta.id)?;

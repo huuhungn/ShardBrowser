@@ -1330,6 +1330,7 @@ components:
             Tag names. Each is trimmed, inner whitespace collapsed and capped at
             32 characters; a name matching an existing tag case-insensitively
             takes that tag's spelling. Duplicates and empty names are dropped.
+            At most 64.
           example: ["Client A", "warm-up"]
         fingerprint:
           allOf: [{ $ref: "#/components/schemas/Fingerprint" }]
@@ -1360,7 +1361,8 @@ components:
           items: { type: string }
           description: |
             Replaces the whole list; `[]` clears it. Normalized as on create.
-            Refused with 409 while the profile runs, like every other edit.
+            More than 64 tags is a 400 and nothing is saved. Refused with 409
+            while the profile runs, like every other edit.
         fingerprint:
           allOf: [{ $ref: "#/components/schemas/Fingerprint" }]
           description: When present, REPLACES the stored fingerprint verbatim.
