@@ -515,6 +515,7 @@ test("tags reach the rows, the search and the filter, and survive rename, delete
   await page.getByRole("button", { name: "Filters" }).click();
   await page.getByRole("combobox", { name: "Tag", exact: true }).click();
   await page.getByRole("option", { name: "Client A" }).click();
+  await expect(page.getByText(alpha)).toBeVisible();
   await expect(page.getByText("Beta Research")).toHaveCount(0);
   await page.getByRole("button", { name: "Clear filters" }).click();
   await expect(page.getByText("Beta Research")).toBeVisible();
@@ -528,13 +529,13 @@ test("tags reach the rows, the search and the filter, and survive rename, delete
   const rows = page.getByTestId("tag-row");
   await expect(rows).toHaveCount(1);
   await expect(rows.first()).toContainText("Profiles: 1");
-  await rows.first().getByRole("button", { name: "Rename" }).click();
+  await rows.first().getByRole("button", { name: "Rename Client A" }).click();
   await page.getByRole("textbox", { name: "Rename" }).fill("Client B");
   await page.getByRole("textbox", { name: "Rename" }).press("Enter");
   await expect(rows.first()).toContainText("Client B");
   await expect(page.getByText("Client A")).toHaveCount(0);
 
-  await rows.first().getByRole("button", { name: "Delete" }).click();
+  await rows.first().getByRole("button", { name: "Delete Client B" }).click();
   await expect(rows).toHaveCount(0);
   await page.getByRole("status").filter({ hasText: "“Client B” was deleted." }).getByRole("button", { name: "Undo" }).click();
   await expect(rows).toHaveCount(1);
@@ -542,4 +543,11 @@ test("tags reach the rows, the search and the filter, and survive rename, delete
 
   await page.getByRole("button", { name: "Browsers" }).click();
   await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client B");
+
+  // A name typed but not yet entered is saved with the rest.
+  await page.getByRole("button", { name: `More actions for profile ${alpha}` }).click();
+  await page.getByRole("button", { name: "Edit tags" }).click();
+  await page.getByRole("textbox", { name: "Add a tag" }).fill("Typed");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client BTyped");
 });

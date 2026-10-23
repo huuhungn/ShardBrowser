@@ -1,16 +1,25 @@
-import { useState } from "react";
 import { Input } from "@proxyshard/shardx-ui-kit";
 import { TagChip, cleanTag, sameTag, useTags } from "../../../entities/tag";
 import { useT } from "../../../shared/i18n";
 
+/// Adds `query` to `tags` the way Enter would; callers saving the field use it
+/// so a name typed but not yet entered is not lost.
+export function withPendingTag(tags: string[], query: string, known: { name: string }[]): string[] {
+  const clean = cleanTag(query);
+  if (!clean || tags.some((v) => sameTag(v, clean))) return tags;
+  // Reuse the spelling already in use, as the launcher would.
+  return [...tags, known.find((k) => sameTag(k.name, clean))?.name ?? clean];
+}
+
 /// Chips for the profile's tags plus a box that adds one on Enter, offering existing tags.
-export function TagsField({ value, onChange }: {
+export function TagsField({ value, onChange, query, onQuery }: {
   value: string[];
   onChange: (tags: string[]) => void;
+  query: string;
+  onQuery: (query: string) => void;
 }) {
   const t = useT();
   const known = useTags((s) => s.tags);
-  const [query, setQuery] = useState("");
   const q = cleanTag(query);
   const suggestions = known
     .filter((k) => !value.some((v) => sameTag(v, k.name)))
@@ -18,12 +27,8 @@ export function TagsField({ value, onChange }: {
     .slice(0, 8);
 
   const add = (name: string) => {
-    const clean = cleanTag(name);
-    if (!clean || value.some((v) => sameTag(v, clean))) { setQuery(""); return; }
-    // Reuse the spelling already in use, as the launcher would.
-    const spelled = known.find((k) => sameTag(k.name, clean))?.name ?? clean;
-    onChange([...value, spelled]);
-    setQuery("");
+    onChange(withPendingTag(value, name, known));
+    onQuery("");
   };
 
   return (
@@ -49,7 +54,7 @@ export function TagsField({ value, onChange }: {
         value={query}
         maxLength={64}
         placeholder={t("tag.typeToCreate")}
-        onChange={(e) => setQuery(e.target.value)}
+        onChange={(e) => onQuery(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") { e.preventDefault(); add(query); }
         }}

@@ -9,13 +9,15 @@ export type TagColor = (typeof TAG_COLORS)[number];
 /// Mirrors the launcher's normalize_tag: trim, collapse whitespace, 32 characters.
 export const TAG_NAME_MAX = 32;
 export const cleanTag = (name: string) =>
-  [...name.trim().replace(/\s+/g, " ")].slice(0, TAG_NAME_MAX).join("").trimEnd();
+  [...name.replace(/[\s\p{Cc}]+/gu, " ").trim()].slice(0, TAG_NAME_MAX).join("").trimEnd();
 export const sameTag = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
-/// A stored color, else one derived from the name so a tag keeps it across reloads.
-export function tagColor(name: string, tags: TagInfo[]): string {
+/// A stored palette color, else one derived from the name so it stays put across
+/// reloads. A color the API stored outside the palette is treated as none.
+export function tagColor(name: string, tags: TagInfo[]): TagColor {
   const stored = tags.find((t) => sameTag(t.name, name))?.color;
-  if (stored) return stored;
+  const known = TAG_COLORS.find((c) => c === stored);
+  if (known) return known;
   let h = 0;
   for (const ch of name.toLowerCase()) h = (h * 31 + ch.codePointAt(0)!) >>> 0;
   return TAG_COLORS[h % TAG_COLORS.length];

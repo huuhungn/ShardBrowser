@@ -4,7 +4,8 @@ import { toast } from "../../../shared/model/toast";
 import type { ProfileMeta } from "../../../entities/profile";
 import type { ProxyEntry } from "../../../entities/proxy";
 import { profileBindProxy, profileGet, profileSave, profileSetTags } from "../../../entities/profile";
-import { TagsField } from "./TagsField";
+import { useTags } from "../../../entities/tag";
+import { TagsField, withPendingTag } from "./TagsField";
 import { useT } from "../../../shared/i18n";
 import { safeUiError } from "../../../shared/lib/utils";
 
@@ -21,6 +22,8 @@ export function QuickEditDialog({
   const [proxyId, setProxyId] = useState<string | null>(profile.proxy_id);
   const [notes, setNotes] = useState(profile.notes);
   const [tags, setTags] = useState(profile.tags);
+  const [tagQuery, setTagQuery] = useState("");
+  const knownTags = useTags((s) => s.tags);
 
   const saveProxy = async () => {
     try {
@@ -43,7 +46,7 @@ export function QuickEditDialog({
 
   const saveTags = async () => {
     try {
-      await profileSetTags(profile.id, tags);
+      await profileSetTags(profile.id, withPendingTag(tags, tagQuery, knownTags));
       toast.ok(t("tag.saved"));
       onSaved();
     } catch (e) { toast.err(safeUiError(e)); }
@@ -79,7 +82,7 @@ export function QuickEditDialog({
             ]}
           />
         ) : kind === "tags" ? (
-          <TagsField value={tags} onChange={setTags} />
+          <TagsField value={tags} onChange={setTags} query={tagQuery} onQuery={setTagQuery} />
         ) : (
           <Textarea
             label={t("common.notes")}

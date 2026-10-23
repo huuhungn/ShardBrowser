@@ -4,7 +4,7 @@ import { FilterIcon } from "../../../shared/icons";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { useProfile, useProfileCountries } from "../../../entities/profile";
-import { useTags } from "../../../entities/tag";
+import { sameTag, useTags } from "../../../entities/tag";
 import { useT } from "../../../shared/i18n";
 
 /** Status / proxy country / bound-or-direct, behind one button with a count. */
@@ -59,7 +59,8 @@ export function ProfileFilterBar() {
                 { value: "direct", label: t("profile.direct") },
               ]}
             />
-            {tags.length > 0 && (
+            {/* Kept while a filter is set, so a tag renamed away can still be cleared here. */}
+            {(tags.length > 0 || filters.tag) && (
               <CSSelect
                 title={t("tag.tag")}
                 value={filters.tag}
@@ -68,6 +69,9 @@ export function ProfileFilterBar() {
                 options={[
                   { value: "", label: t("tag.anyTag") },
                   ...tags.map((x) => ({ value: x.name, label: x.name })),
+                  ...(filters.tag && !tags.some((x) => sameTag(x.name, filters.tag))
+                    ? [{ value: filters.tag, label: filters.tag }]
+                    : []),
                 ]}
               />
             )}

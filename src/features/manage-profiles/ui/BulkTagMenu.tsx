@@ -13,6 +13,8 @@ export function BulkTagMenu() {
   const profiles = useProfile((s) => s.profiles);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  // A second toggle before the first reloads would read stale tags.
+  const [busy, setBusy] = useState(false);
 
   const chosen = profiles.filter((p) => selected.has(p.id));
   const carrying = (name: string) => chosen.filter((p) => p.tags.some((x) => sameTag(x, name))).length;
@@ -21,12 +23,23 @@ export function BulkTagMenu() {
     if (!clean) return;
     setOpen(false);
     setQuery("");
-    void bulkToggleTag(clean);
+    setBusy(true);
+    void bulkToggleTag(clean).finally(() => setBusy(false));
   };
 
   return (
     <div className="relative">
-      <Button variant="neutral" mode="stroke" className="pr-3" size="2xsmall" onClick={() => setOpen((v) => !v)}>
+      <Button
+        variant="neutral"
+        mode="stroke"
+        className="pr-3"
+        size="2xsmall"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        disabled={busy}
+        isLoading={busy}
+        onClick={() => setOpen((v) => !v)}
+      >
         {t("tag.tagSelection")}
       </Button>
       {open && (
@@ -36,6 +49,7 @@ export function BulkTagMenu() {
             role="dialog"
             aria-label={t("tag.tagSelection")}
             className="absolute left-0 z-20 mt-1.5 flex w-[260px] flex-col gap-2 rounded-xl bg-bg-white-0 p-3 shadow-[var(--shadow-md)] ring-1 ring-stroke-soft-200"
+            onKeyDown={(e) => { if (e.key === "Escape") setOpen(false); }}
           >
             <span className="text-paragraph-xs text-text-soft-400">{t("tag.toggleHint")}</span>
             <div className="flex max-h-[200px] flex-col gap-1 overflow-y-auto">
@@ -64,7 +78,6 @@ export function BulkTagMenu() {
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") apply(query);
-                if (e.key === "Escape") setOpen(false);
               }}
             />
           </div>
