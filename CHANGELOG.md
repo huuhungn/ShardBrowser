@@ -17,6 +17,19 @@ The update from 2.3.0 is still installed by 2.3.0, which does not wait yet:
 close your profiles before you install it. The wait applies from the next
 update on.
 
+### Known issues
+
+Both come from engine build 1 and need a new engine build; checked on this
+fork on 2026-10-23.
+
+- With audio noise turned on, the engine changes every sample of an
+  `AudioBuffer` the page filled itself, and shifts a constant signal (0.5
+  reads back as 0.50001335), so a page can detect it with a single read
+  (upstream #120). Audio noise is off by default.
+- `window.chrome` on an ordinary page lists `csi`, `loadTimes` and a `runtime`
+  key with no value, where stock Chrome lists `app`, `csi` and `loadTimes`
+  (upstream #118 reports a populated `runtime` on the same build).
+
 ### Internal
 
 - The release RustSec step fails when it cannot read any `zip` version from
