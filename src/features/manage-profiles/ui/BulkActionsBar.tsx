@@ -10,6 +10,7 @@ import {
 import { useProfile } from "../../../entities/profile";
 import { useNav } from "../../../shared/model/navigation";
 import { useT } from "../../../shared/i18n";
+import { BulkTagMenu } from "./BulkTagMenu";
 
 export function BulkActionsBar() {
   const t = useT();
@@ -46,6 +47,7 @@ export function BulkActionsBar() {
         </Button>
       )}
       <Button variant="neutral" mode="stroke" className="pr-2" size="2xsmall" leftIcon={<StopIcon className="size-3.5" />} onClick={bulkStop}>{t("profile.stop")}</Button>
+      <BulkTagMenu />
       <Button variant="neutral" mode="stroke" className="pl-2" size="2xsmall" leftIcon={<UploadIcon className="size-3.5" />} onClick={bulkExport}>{t("profile.export")}</Button>
       <Button variant="error" mode="stroke" className="pr-2" size="2xsmall" leftIcon={<DeleteIcon className="size-3.5" />} onClick={bulkDelete}>{t("profile.delete")}</Button>
       <Button variant="neutral" mode="ghost" className="pr-2" size="2xsmall" onClick={clearSelected}>{t("profile.clear")}</Button>

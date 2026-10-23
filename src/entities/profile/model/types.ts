@@ -19,6 +19,8 @@ export type ProfileMeta = {
   color: string | null;
   /// Extension ids from the library, loaded at launch.
   extensions: string[];
+  /// Tag names as the launcher normalized them; colors come from the tag store.
+  tags: string[];
 };
 
 export type ProfileForm = {
