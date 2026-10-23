@@ -1649,20 +1649,25 @@ mod automation_endpoint_tests {
     /// The store root is process-global, so these tests hold a lock for the
     /// duration: without it, two tests racing on the same root see each
     /// other's projects and the failure looks like a routing bug.
-    pub(super) fn scratch_store() -> (
-        tempfile::TempDir,
-        String,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let guard = crate::store::config_root_test_lock()
+    pub(super) fn scratch_store() -> (tempfile::TempDir, String, ScratchLocks) {
+        let config = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Creating, editing or running a profile takes lifecycle claims, which
+        // the claim tests assert are free; without this they race.
+        let lifecycle = crate::profile::lifecycle_test_guard();
         let dir = tempfile::tempdir().expect("a scratch config root");
         crate::store::set_config_root(Some(dir.path().to_path_buf()));
         super::set_secret(SECRET);
         let token = super::long_lived_token(SECRET).expect("mint a token");
-        (dir, token, guard)
+        (dir, token, ScratchLocks(config, lifecycle))
     }
+
+    /// Held for a test's duration; see `scratch_store`.
+    pub(super) struct ScratchLocks(
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
 
     pub(super) async fn send(request: Request<Body>) -> (StatusCode, Value) {
         let response = router().oneshot(request).await.expect("route the request");
