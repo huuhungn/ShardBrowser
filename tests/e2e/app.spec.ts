@@ -490,3 +490,56 @@ test("the search shortcut hint stays on one line", async ({ page }) => {
       .filter((h) => h.height > h.lineHeight * 1.4));
   expect(wrapped).toEqual([]);
 });
+
+test("tags reach the rows, the search and the filter, and survive rename, delete with undo and a reload", async ({ page }) => {
+  await gotoMocked(page);
+  const alpha = "VN Automation 001 - No Proxy";
+  const alphaRow = page.locator(".cell-name", { has: page.getByText(alpha) });
+  const betaRow = page.locator(".cell-name", { has: page.getByText("Beta Research") });
+
+  // Beta runs in the fixture, so the bulk tag skips it and says so.
+  await page.getByRole("checkbox", { name: `Select profile ${alpha}` }).check();
+  await page.getByRole("checkbox", { name: "Select profile Beta Research" }).check();
+  await page.getByRole("button", { name: "Tag", exact: true }).click();
+  await page.getByRole("textbox", { name: "New tag" }).fill("  Client   A ");
+  await page.getByRole("textbox", { name: "New tag" }).press("Enter");
+  await expect(page.getByText("Skipped 1 running profiles; stop them to change their tags.")).toBeVisible();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client A");
+  await expect(betaRow.getByTestId("row-tags")).toHaveCount(0);
+
+  await page.getByRole("searchbox", { name: "Search Browsers" }).fill("client");
+  await expect(page.getByText(alpha)).toBeVisible();
+  await expect(page.getByText("Beta Research")).toHaveCount(0);
+  await page.getByRole("searchbox", { name: "Search Browsers" }).fill("");
+
+  await page.getByRole("button", { name: "Filters" }).click();
+  await page.getByRole("combobox", { name: "Tag", exact: true }).click();
+  await page.getByRole("option", { name: "Client A" }).click();
+  await expect(page.getByText("Beta Research")).toHaveCount(0);
+  await page.getByRole("button", { name: "Clear filters" }).click();
+  await expect(page.getByText("Beta Research")).toBeVisible();
+
+  await page.reload();
+  // A reload can land on the patch log; the tags are what matters here.
+  await page.getByRole("button", { name: "Browsers" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client A");
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  const rows = page.getByTestId("tag-row");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Profiles: 1");
+  await rows.first().getByRole("button", { name: "Rename" }).click();
+  await page.getByRole("textbox", { name: "Rename" }).fill("Client B");
+  await page.getByRole("textbox", { name: "Rename" }).press("Enter");
+  await expect(rows.first()).toContainText("Client B");
+  await expect(page.getByText("Client A")).toHaveCount(0);
+
+  await rows.first().getByRole("button", { name: "Delete" }).click();
+  await expect(rows).toHaveCount(0);
+  await page.getByRole("status").filter({ hasText: "“Client B” was deleted." }).getByRole("button", { name: "Undo" }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Profiles: 1");
+
+  await page.getByRole("button", { name: "Browsers" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client B");
+});

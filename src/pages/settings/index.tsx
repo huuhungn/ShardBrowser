@@ -12,7 +12,7 @@ import type { Settings, ApiInfo, StartupStatus, McpStatus, CodexMcpStatus, Herme
 import { helperKinds } from "../../entities/settings";
 import { settingsGet, settingsLoadError, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
   startupStatus, mcpStatus as mcpStatusGet, codexMcpStatus, hermesMcpStatus } from "../../entities/settings";
-import { StartupCard, McpCard } from "../../features/manage-settings";
+import { StartupCard, McpCard, TagsCard } from "../../features/manage-settings";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
 import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
 import { Rich } from "../../shared/i18n/Rich";
@@ -186,6 +186,10 @@ export function SettingsPage() {
             {t("settings.mcp.currentFolder")} <code>{mcp.path}</code>
           </p>
         )}
+      </SettingsCard>
+
+      <SettingsCard title={t("settings.tags.title")}>
+        <TagsCard />
       </SettingsCard>
 
       <SettingsCard title={t("settings.team.title")}>

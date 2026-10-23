@@ -4,6 +4,7 @@ import { FilterIcon } from "../../../shared/icons";
 import { CSSelect } from "../../../shared/ui/CSSelect";
 import { CountryFlag } from "../../../shared/ui/CountryFlag";
 import { useProfile, useProfileCountries } from "../../../entities/profile";
+import { useTags } from "../../../entities/tag";
 import { useT } from "../../../shared/i18n";
 
 /** Status / proxy country / bound-or-direct, behind one button with a count. */
@@ -13,12 +14,14 @@ export function ProfileFilterBar() {
   const setFilters = useProfile((s) => s.setFilters);
   const clearFilters = useProfile((s) => s.clearFilters);
   const countries = useProfileCountries();
+  const tags = useTags((s) => s.tags);
   const [open, setOpen] = useState(false);
 
   const active =
     (filters.status !== "all" ? 1 : 0) +
     (filters.country ? 1 : 0) +
-    (filters.proxy !== "all" ? 1 : 0);
+    (filters.proxy !== "all" ? 1 : 0) +
+    (filters.tag ? 1 : 0);
 
   return (
     <div className="relative">
@@ -56,6 +59,18 @@ export function ProfileFilterBar() {
                 { value: "direct", label: t("profile.direct") },
               ]}
             />
+            {tags.length > 0 && (
+              <CSSelect
+                title={t("tag.tag")}
+                value={filters.tag}
+                onChange={(v) => setFilters({ tag: v })}
+                isSearchable={tags.length > 8}
+                options={[
+                  { value: "", label: t("tag.anyTag") },
+                  ...tags.map((x) => ({ value: x.name, label: x.name })),
+                ]}
+              />
+            )}
             <label className="flex flex-col gap-1">
               <CSSelect
                 title={t("profile.proxyCountry")}

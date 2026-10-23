@@ -11,6 +11,7 @@ type Profile = {
   pinned: boolean;
   folder: string;
   total_runtime_ms: number;
+  tags: string[];
 };
 
 type Proxy = {
@@ -43,6 +44,7 @@ const fixtureProfiles: Profile[] = [
     pinned: true,
     folder: "QA",
     total_runtime_ms: 120_000,
+    tags: [],
   },
   {
     id: "profile-beta",
@@ -54,9 +56,56 @@ const fixtureProfiles: Profile[] = [
     pinned: false,
     folder: "",
     total_runtime_ms: 0,
+    tags: [],
   },
 ];
 const profiles = scenario === "profiles-empty" ? [] : fixtureProfiles;
+
+// Tags behave like the launcher's: names on each profile, colors on the side,
+// kept in sessionStorage so a reload shows what was saved.
+type TagState = { byProfile: Record<string, string[]>; colors: Record<string, string> };
+const TAGS_KEY = "e2e-tags";
+const tagState: TagState = JSON.parse(sessionStorage.getItem(TAGS_KEY) ?? '{"byProfile":{},"colors":{}}');
+const saveTags = () => sessionStorage.setItem(TAGS_KEY, JSON.stringify(tagState));
+const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+const clean = (name: string) => [...name.trim().replace(/\s+/g, " ")].slice(0, 32).join("").trimEnd();
+for (const profile of profiles) profile.tags = tagState.byProfile[profile.id] ?? [];
+function setProfileTags(id: string, tags: string[]) {
+  const known = [...profiles.flatMap((p) => p.tags), ...Object.keys(tagState.colors)];
+  const out: string[] = [];
+  for (const raw of tags) {
+    const name = clean(raw);
+    if (!name || out.some((x) => same(x, name))) continue;
+    out.push(known.find((k) => same(k, name)) ?? name);
+  }
+  const profile = profiles.find((p) => p.id === id);
+  if (profile) profile.tags = out;
+  tagState.byProfile[id] = out;
+  saveTags();
+  return out;
+}
+function takeColor(name: string) {
+  const key = Object.keys(tagState.colors).find((k) => same(k, name));
+  if (!key) return undefined;
+  const color = tagState.colors[key];
+  delete tagState.colors[key];
+  return color;
+}
+function listTags() {
+  const out: { name: string; color: string | null; count: number }[] = [];
+  for (const name of profiles.flatMap((p) => p.tags)) {
+    const hit = out.find((x) => same(x.name, name));
+    if (hit) hit.count += 1;
+    else out.push({ name, color: null, count: 1 });
+  }
+  for (const name of Object.keys(tagState.colors)) {
+    if (!out.some((x) => same(x.name, name))) out.push({ name, color: null, count: 0 });
+  }
+  for (const x of out) {
+    x.color = Object.entries(tagState.colors).find(([k]) => same(k, x.name))?.[1] ?? null;
+  }
+  return out.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+}
 
 const proxies: Proxy[] = scenario === "proxies-empty" ? [] : [
   {
@@ -437,6 +486,36 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     case "launch_cancel":
       cancelPendingLaunch?.();
       return null;
+    case "profile_set_tags": {
+      const { id, tags } = payload as { id: string; tags: string[] };
+      return setProfileTags(id, tags);
+    }
+    case "tags_list":
+      return listTags();
+    case "tag_recolor": {
+      const { name, color } = payload as { name: string; color: string | null };
+      const spelled = listTags().find((x) => same(x.name, name))?.name ?? clean(name);
+      takeColor(spelled);
+      if (color) tagState.colors[spelled] = color;
+      saveTags();
+      return null;
+    }
+    case "tag_rename":
+    case "tag_delete": {
+      const { old, new: renamed, name } = payload as { old?: string; new?: string; name?: string };
+      const target = old ?? name ?? "";
+      let n = 0;
+      for (const profile of profiles) {
+        if (!profile.tags.some((x) => same(x, target))) continue;
+        n += 1;
+        const next = profile.tags.flatMap((x) => (same(x, target) ? (renamed ? [renamed] : []) : [x]));
+        setProfileTags(profile.id, next);
+      }
+      const color = takeColor(target);
+      if (renamed && color) tagState.colors[clean(renamed)] = color;
+      saveTags();
+      return n;
+    }
     case "ps_get_key":
       return "";
     case "clipboard_write":
