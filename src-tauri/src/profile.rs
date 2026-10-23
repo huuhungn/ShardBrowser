@@ -1,7 +1,7 @@
 use crate::store;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,6 +29,9 @@ pub struct ProfileMeta {
     /// Extension ids from the library, loaded at launch.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Tag names, normalized by `normalize_tag`; colors live in `tags.json`.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// On-disk `<profiles_dir>/<id>.json`: FingerprintConfig + `_meta` envelope.
@@ -76,6 +79,9 @@ pub struct StoredMeta {
     /// Extension ids from the library.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<String>,
+    /// Owned by set_tags / rename_tag / delete_tag; edits carry it through.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -83,6 +89,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 pub const MAX_PROFILE_NAME_CHARS: usize = 128;
+pub const MAX_TAG_NAME_CHARS: usize = 32;
 const PROFILE_NAME_CLAIM: &str = "\0profile-name-namespace";
 const GLOBAL_FOLDER_CLAIM: &str = "\0folder-mutation";
 
@@ -433,7 +440,11 @@ pub fn begin_profile_launch(profile_id: &str) -> Result<ProfileClaimGuard> {
     )
 }
 
-fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard> {
+/// Claim every profile for a folder or tag change; `affected` is read under the claim.
+fn begin_bulk_mutation(
+    action: &str,
+    affected: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<ProfileClaimGuard> {
     let mut claims = lifecycle_claims().lock().map_err(|_| {
         profile_error(
             ProfileErrorKind::Busy,
@@ -452,7 +463,7 @@ fn begin_folder_mutation(folder: &str, action: &str) -> Result<ProfileClaimGuard
     let guard = ProfileClaimGuard {
         keys: vec![GLOBAL_FOLDER_CLAIM.to_string()],
     };
-    let profile_ids = profile_ids_in_folder(folder)?;
+    let profile_ids = affected()?;
     for profile_id in &profile_ids {
         if crate::process::Tracker::shared().is_running(profile_id) {
             return Err(profile_error(
@@ -542,6 +553,7 @@ pub fn list_all() -> Result<Vec<ProfileMeta>> {
             total_runtime_ms: stored.meta.total_runtime_ms,
             color: stored.meta.color,
             extensions: stored.meta.extensions,
+            tags: stored.meta.tags,
         });
     }
     // Pinned first, then newest-first by created_at; name fallback for same-second ties.
@@ -736,14 +748,15 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     if is_new {
         stored.meta.id = uuid::Uuid::new_v4().to_string();
     }
-    // Carry created_at/pinned/folder/last_launched_at through edits.
-    // pinned and folder are owned by set_pin/set_folder respectively.
+    // Carry created_at/pinned/folder/tags/last_launched_at through edits.
+    // pinned, folder and tags are owned by set_pin/set_folder/set_tags.
     if !is_new {
         if let Ok(existing) = load_raw(&stored.meta.id) {
             if stored.meta.created_at.is_none() {
                 stored.meta.created_at = existing.meta.created_at;
             }
             stored.meta.pinned = existing.meta.pinned;
+            stored.meta.tags = existing.meta.tags;
             if stored.meta.folder.is_empty() {
                 stored.meta.folder = existing.meta.folder;
             }
@@ -759,6 +772,10 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     }
     if stored.meta.created_at.is_none() {
         stored.meta.created_at = Some(chrono_now_iso());
+    }
+    // A new or imported profile may bring tags spelled differently from ours.
+    if is_new && !stored.meta.tags.is_empty() {
+        stored.meta.tags = canonical_tags(&stored.meta.tags, &tag_names_in_use()?);
     }
     // The id is now final (freshly minted for new profiles, carried through for
     // edits) — derive per-profile noise seeds from it so each profile gets a
@@ -857,6 +874,7 @@ pub fn clone_profile(id: &str) -> Result<ProfileMeta> {
         total_runtime_ms: 0,
         color: src.meta.color,
         extensions: src.meta.extensions,
+        tags: src.meta.tags,
     })
 }
 
@@ -915,7 +933,9 @@ pub fn profile_ids_in_folder(name: &str) -> Result<Vec<String>> {
 
 /// Retag profiles from folder `old` to `new`; returns count.
 pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
-    let _claim = begin_folder_mutation(old, &crate::errcode::code("profile.actionRenameFolder"))?;
+    let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionRenameFolder"), || {
+        profile_ids_in_folder(old)
+    })?;
     let new = new.trim();
     let mut writes = Vec::new();
     for (path, mut stored) in strict_profile_records()? {
@@ -947,7 +967,9 @@ pub fn rename_folder(old: &str, new: &str) -> Result<usize> {
 
 /// Delete folder; `delete_profiles` true removes, false unfiles. Returns count.
 pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
-    let _claim = begin_folder_mutation(name, &crate::errcode::code("profile.actionDeleteFolder"))?;
+    let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionDeleteFolder"), || {
+        profile_ids_in_folder(name)
+    })?;
     let mut targets = Vec::new();
     for (path, mut stored) in strict_profile_records()? {
         if stored.meta.folder == name {
@@ -986,6 +1008,250 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
                 ],
             )
         })?;
+    }
+    Ok(total)
+}
+
+/// One tag as the tag manager shows it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TagInfo {
+    pub name: String,
+    /// Palette id; None = the interface picks one.
+    pub color: Option<String>,
+    /// Profiles carrying it; 0 for a tag that only has a color so far.
+    pub count: usize,
+}
+
+/// Trim, collapse inner whitespace and cap at MAX_TAG_NAME_CHARS; None when empty.
+pub fn normalize_tag(name: &str) -> Option<String> {
+    let joined = name
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let capped: String = joined.chars().take(MAX_TAG_NAME_CHARS).collect();
+    let capped = capped.trim_end();
+    (!capped.is_empty()).then(|| capped.to_string())
+}
+
+fn same_tag(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// Normalize, drop case-insensitive duplicates, and reuse the spelling in `known`.
+fn canonical_tags(tags: &[String], known: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags.iter().filter_map(|tag| normalize_tag(tag)) {
+        if out.iter().any(|kept| same_tag(kept, &tag)) {
+            continue;
+        }
+        let spelled = known.iter().find(|name| same_tag(name, &tag)).cloned();
+        out.push(spelled.unwrap_or(tag));
+    }
+    out
+}
+
+/// Every tag on a profile or in tags.json; the first spelling seen wins.
+fn tag_names_in_use() -> Result<Vec<String>> {
+    let on_profiles = strict_profile_records()?
+        .into_iter()
+        .flat_map(|(_, stored)| stored.meta.tags);
+    let colored = read_tag_colors()?.into_keys();
+    let mut names: Vec<String> = Vec::new();
+    for name in on_profiles.chain(colored) {
+        if !names.iter().any(|kept| same_tag(kept, &name)) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Serializes read-modify-write of tags.json.
+fn tag_colors_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read_tag_colors() -> Result<BTreeMap<String, String>> {
+    let path = store::tags_path()?;
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                crate::errcode::code_with(
+                    "profile.tagColorsUnreadable",
+                    &[("path", &path.display().to_string())],
+                )
+            })
+        }
+    };
+    serde_json::from_str(&body).with_context(|| {
+        crate::errcode::code_with(
+            "profile.tagColorsDamaged",
+            &[("path", &path.display().to_string())],
+        )
+    })
+}
+
+fn write_tag_colors(colors: &BTreeMap<String, String>) -> Result<()> {
+    atomic_write(&store::tags_path()?, &serde_json::to_vec_pretty(colors)?)
+}
+
+fn take_tag_color(colors: &mut BTreeMap<String, String>, name: &str) -> Option<String> {
+    let key = colors.keys().find(|key| same_tag(key, name))?.clone();
+    colors.remove(&key)
+}
+
+/// Lowercase palette id such as `teal`; the palette itself is the interface's.
+fn valid_tag_color(color: &str) -> bool {
+    (1..=16).contains(&color.len())
+        && color
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Tags in use or colored, sorted by name, with how many profiles carry each.
+pub fn list_tags() -> Result<Vec<TagInfo>> {
+    let colors = read_tag_colors()?;
+    let mut out: Vec<TagInfo> = Vec::new();
+    for tag in list_all()?.into_iter().flat_map(|meta| meta.tags) {
+        match out.iter_mut().find(|info| same_tag(&info.name, &tag)) {
+            Some(info) => info.count += 1,
+            None => out.push(TagInfo {
+                name: tag,
+                color: None,
+                count: 1,
+            }),
+        }
+    }
+    for name in colors.keys() {
+        if !out.iter().any(|info| same_tag(&info.name, name)) {
+            out.push(TagInfo {
+                name: name.clone(),
+                color: None,
+                count: 0,
+            });
+        }
+    }
+    for info in &mut out {
+        info.color = colors
+            .iter()
+            .find(|(key, _)| same_tag(key, &info.name))
+            .map(|(_, color)| color.clone());
+    }
+    out.sort_by_key(|info| info.name.to_lowercase());
+    Ok(out)
+}
+
+/// Replace a profile's tags; returns them as stored.
+pub fn set_tags(id: &str, tags: &[String]) -> Result<Vec<String>> {
+    let mut p = load_raw(id)?;
+    p.meta.tags = canonical_tags(tags, &tag_names_in_use()?);
+    let path = path_for(&p.meta.id)?;
+    let body = serde_json::to_string_pretty(&p)?;
+    atomic_write(&path, body.as_bytes())?;
+    Ok(p.meta.tags)
+}
+
+/// Set or clear a tag's color. Coloring an unused name creates an empty tag.
+pub fn recolor_tag(name: &str, color: Option<&str>) -> Result<()> {
+    let name = normalize_tag(name).with_context(|| crate::errcode::code("profile.tagNameEmpty"))?;
+    if color.is_some_and(|color| !valid_tag_color(color)) {
+        anyhow::bail!(crate::errcode::code("profile.tagColorInvalid"));
+    }
+    let name = canonical_tags(&[name], &tag_names_in_use()?).remove(0);
+    let _lock = tag_colors_lock();
+    let mut colors = read_tag_colors()?;
+    take_tag_color(&mut colors, &name);
+    if let Some(color) = color {
+        colors.insert(name, color.to_string());
+    }
+    write_tag_colors(&colors)
+}
+
+pub fn profile_ids_with_tag(name: &str) -> Result<Vec<String>> {
+    Ok(strict_profile_records()?
+        .into_iter()
+        .filter(|(_, stored)| !stored.meta.id.is_empty())
+        .filter(|(_, stored)| stored.meta.tags.iter().any(|tag| same_tag(tag, name)))
+        .map(|(_, stored)| stored.meta.id)
+        .collect())
+}
+
+/// Swap tag `old` for `new` (None drops it) on every profile; returns count.
+fn rewrite_tag(old: &str, new: Option<&str>, partial: &str) -> Result<usize> {
+    let mut writes = Vec::new();
+    for (path, mut stored) in strict_profile_records()? {
+        if !stored.meta.tags.iter().any(|tag| same_tag(tag, old)) {
+            continue;
+        }
+        let replaced: Vec<String> = stored
+            .meta
+            .tags
+            .iter()
+            .filter_map(|tag| match same_tag(tag, old) {
+                true => new.map(str::to_string),
+                false => Some(tag.clone()),
+            })
+            .collect();
+        // Renaming into a tag the profile already has merges the two.
+        stored.meta.tags = canonical_tags(&replaced, &[]);
+        let body = serde_json::to_vec_pretty(&stored).with_context(|| {
+            crate::errcode::code_with(
+                "profile.serializeRecord",
+                &[("path", &path.display().to_string())],
+            )
+        })?;
+        writes.push((path, body));
+    }
+    let total = writes.len();
+    for (applied, (path, body)) in writes.into_iter().enumerate() {
+        atomic_write(&path, &body).with_context(|| {
+            crate::errcode::code_with(
+                partial,
+                &[
+                    ("applied", &applied.to_string()),
+                    ("total", &total.to_string()),
+                ],
+            )
+        })?;
+    }
+    Ok(total)
+}
+
+/// Rename a tag everywhere, merging into an existing tag of that name; returns count.
+pub fn rename_tag(old: &str, new: &str) -> Result<usize> {
+    let new = normalize_tag(new).with_context(|| crate::errcode::code("profile.tagNameEmpty"))?;
+    let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionRenameTag"), || {
+        profile_ids_with_tag(old)
+    })?;
+    let merge_into = tag_names_in_use()?
+        .into_iter()
+        .find(|name| same_tag(name, &new) && !same_tag(name, old));
+    let new = merge_into.unwrap_or(new);
+    let total = rewrite_tag(old, Some(&new), "profile.tagRenamePartial")?;
+    let _lock = tag_colors_lock();
+    let mut colors = read_tag_colors()?;
+    if let Some(color) = take_tag_color(&mut colors, old) {
+        if !colors.keys().any(|key| same_tag(key, &new)) {
+            colors.insert(new, color);
+        }
+        write_tag_colors(&colors)?;
+    }
+    Ok(total)
+}
+
+/// Remove a tag from every profile and forget its color; returns count.
+pub fn delete_tag(name: &str) -> Result<usize> {
+    let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionDeleteTag"), || {
+        profile_ids_with_tag(name)
+    })?;
+    let total = rewrite_tag(name, None, "profile.tagDeletePartial")?;
+    let _lock = tag_colors_lock();
+    let mut colors = read_tag_colors()?;
+    if take_tag_color(&mut colors, name).is_some() {
+        write_tag_colors(&colors)?;
     }
     Ok(total)
 }
@@ -1230,5 +1496,205 @@ mod tests {
         assert!(leftovers.is_empty());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Scratch config root, never the operator's profiles. Holds both locks the
+    /// tag code touches: the config root and the lifecycle claim map.
+    fn scratch_profiles() -> (
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lifecycle = lifecycle_test_guard();
+        let dir = tempfile::tempdir().expect("a scratch config root");
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        (dir, config, lifecycle)
+    }
+
+    fn new_profile(name: &str, tags: &[&str]) -> String {
+        let mut stored = StoredProfile::default();
+        stored.meta.tags = tags.iter().map(|tag| tag.to_string()).collect();
+        stored
+            .config
+            .insert("name".into(), serde_json::Value::String(name.into()));
+        save_raw(&mut stored).unwrap();
+        stored.meta.id
+    }
+
+    fn tags_of(id: &str) -> Vec<String> {
+        load_raw(id).unwrap().meta.tags
+    }
+
+    #[test]
+    fn tag_names_are_trimmed_collapsed_and_capped() {
+        assert_eq!(
+            normalize_tag("  Khách   hàng\tVIP ").as_deref(),
+            Some("Khách hàng VIP")
+        );
+        assert_eq!(normalize_tag("a\u{0}b").as_deref(), Some("a b"));
+        assert_eq!(normalize_tag(" \t\n"), None);
+        let long = format!("{} tail", "x".repeat(MAX_TAG_NAME_CHARS - 1));
+        assert_eq!(
+            normalize_tag(&long),
+            Some("x".repeat(MAX_TAG_NAME_CHARS - 1))
+        );
+        assert_eq!(
+            normalize_tag(&"ệ".repeat(40)).map(|tag| tag.chars().count()),
+            Some(MAX_TAG_NAME_CHARS)
+        );
+    }
+
+    #[test]
+    fn a_profile_saved_before_tags_reads_and_saves_unchanged() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = "legacy-without-tags";
+        let path = store::profiles_dir().unwrap().join(format!("{id}.json"));
+        let legacy = serde_json::json!({
+            "_meta": { "id": id, "folder": "Old", "created_at": "@1" },
+            "name": "Legacy",
+        });
+        fs::write(&path, legacy.to_string()).unwrap();
+
+        let listed = list_all().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].tags.is_empty());
+        let mut stored = load_raw(id).unwrap();
+        save_raw(&mut stored).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            saved["_meta"].get("tags").is_none(),
+            "an untagged profile grew a tags key"
+        );
+        assert_eq!(saved["_meta"]["folder"], "Old");
+    }
+
+    #[test]
+    fn tags_reuse_the_existing_spelling_and_drop_case_duplicates() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let first = new_profile("First", &["Work"]);
+        let second = new_profile("Second", &[]);
+
+        let stored = set_tags(
+            &second,
+            &[
+                "work".into(),
+                "  WORK ".into(),
+                "Client   A".into(),
+                " ".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(stored, ["Work", "Client A"]);
+        assert_eq!(tags_of(&second), ["Work", "Client A"]);
+        assert_eq!(tags_of(&first), ["Work"]);
+        // An imported profile spelled differently joins the same tag.
+        let imported = new_profile("Imported", &["client a", "work"]);
+        assert_eq!(tags_of(&imported), ["Client A", "Work"]);
+    }
+
+    #[test]
+    fn an_edit_without_tags_keeps_the_profiles_tags() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Edited", &["Keep"]);
+        // What the editor sends: its own _meta, which knows nothing of tags.
+        let mut edit: StoredProfile = serde_json::from_value(serde_json::json!({
+            "_meta": { "id": id },
+            "name": "Edited again",
+        }))
+        .unwrap();
+        save_raw(&mut edit).unwrap();
+        assert_eq!(tags_of(&id), ["Keep"]);
+    }
+
+    #[test]
+    fn renaming_and_deleting_a_tag_reaches_every_profile_and_its_color() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let a = new_profile("A", &["Old", "Other"]);
+        let b = new_profile("B", &["old"]);
+        let c = new_profile("C", &["Other"]);
+        recolor_tag("OLD", Some("teal")).unwrap();
+
+        assert_eq!(rename_tag("old", "  New  ").unwrap(), 2);
+        assert_eq!(tags_of(&a), ["New", "Other"]);
+        assert_eq!(tags_of(&b), ["New"]);
+        assert_eq!(tags_of(&c), ["Other"]);
+        let tags = list_tags().unwrap();
+        let names: Vec<_> = tags
+            .iter()
+            .map(|tag| (tag.name.as_str(), tag.count))
+            .collect();
+        assert_eq!(names, [("New", 2), ("Other", 2)]);
+        assert_eq!(
+            tags[0].color.as_deref(),
+            Some("teal"),
+            "the color stayed behind"
+        );
+
+        // Renaming into a tag that exists merges, keeping that tag's spelling.
+        assert_eq!(rename_tag("New", "other").unwrap(), 2);
+        assert_eq!(tags_of(&a), ["Other"]);
+        assert_eq!(tags_of(&b), ["Other"]);
+
+        assert_eq!(delete_tag("OTHER").unwrap(), 3);
+        for id in [&a, &b, &c] {
+            assert!(tags_of(id).is_empty());
+        }
+        assert!(
+            list_tags().unwrap().is_empty(),
+            "the color outlived the tag"
+        );
+        assert!(rename_tag("x", " ").is_err());
+    }
+
+    #[test]
+    fn a_color_alone_creates_a_tag_and_must_be_a_palette_id() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        recolor_tag("Later", Some("rose")).unwrap();
+        assert_eq!(
+            list_tags().unwrap(),
+            [TagInfo {
+                name: "Later".into(),
+                color: Some("rose".into()),
+                count: 0
+            }]
+        );
+        assert!(recolor_tag("Later", Some("#ff0000")).is_err());
+        assert!(recolor_tag("Later", Some("Rose")).is_err());
+        recolor_tag("later", None).unwrap();
+        assert!(list_tags().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tag_change_refuses_while_a_tagged_profile_runs() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Running", &["Live"]);
+        let tracker = crate::process::Tracker::shared();
+        tracker.set_running_for_test(&id, true);
+        let rename = rename_tag("Live", "Dead");
+        let delete = delete_tag("Live");
+        tracker.set_running_for_test(&id, false);
+
+        for result in [rename, delete] {
+            let error = result.expect_err("a running profile's tags must not change");
+            assert_eq!(profile_error_kind(&error), Some(ProfileErrorKind::Running));
+        }
+        assert_eq!(tags_of(&id), ["Live"]);
+    }
+
+    #[test]
+    fn a_profile_restored_from_the_trash_keeps_its_tags() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Trashed", &["Keep me"]);
+        crate::trash::move_to_trash(&id).unwrap();
+        assert!(list_all().unwrap().is_empty());
+
+        let restored = crate::trash::restore(&id).unwrap();
+        assert_eq!(restored.tags, ["Keep me"]);
+        assert_eq!(tags_of(&id), ["Keep me"]);
     }
 }

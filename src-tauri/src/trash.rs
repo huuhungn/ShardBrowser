@@ -228,6 +228,7 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
         total_runtime_ms: stored.meta.total_runtime_ms,
         color: stored.meta.color.clone(),
         extensions: stored.meta.extensions.clone(),
+        tags: stored.meta.tags.clone(),
     })
 }
 

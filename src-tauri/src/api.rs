@@ -243,6 +243,7 @@ async fn list_profiles() -> ApiResult {
                 "created_at": m.created_at,
                 "pinned": m.pinned,
                 "folder": m.folder,
+                "tags": m.tags,
                 "color": m.color,
                 "extensions": m.extensions,
                 "running": r.is_some(),
@@ -2003,5 +2004,28 @@ mod profile_proxy_password_tests {
         ))
         .await;
         assert_eq!(profile_now["_meta"]["proxy_id"], json!(bound));
+    }
+
+    #[tokio::test]
+    async fn the_profile_list_carries_each_profiles_tags() {
+        let (_store, token, _lock) = scratch_store();
+        let (status, created) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "tagged", "fingerprint": {} }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {created}");
+        let id = created["id"].as_str().expect("a profile id").to_string();
+
+        let (_, before) = send(authed("GET", "/profiles", &token, Value::Null)).await;
+        assert_eq!(before[0]["tags"], json!([]));
+
+        crate::profile::set_tags(&id, &["Client A".to_string()]).expect("tag the profile");
+        let (status, after) = send(authed("GET", "/profiles", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::OK, "body was {after}");
+        assert_eq!(after[0]["id"], json!(id));
+        assert_eq!(after[0]["tags"], json!(["Client A"]));
     }
 }
