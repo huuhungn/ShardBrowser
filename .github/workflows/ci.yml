@@ -3,16 +3,23 @@ name: CI
 on:
   push:
     branches:
-      - '**'
+      - main
   pull_request:
 
 permissions:
   contents: read
 
+# A newer push to a PR cancels its older run. Each main run gets its own group,
+# so no merge commit loses its CI run to a later one.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   rust-sdk:
     runs-on: ubuntu-22.04
     name: Rust SDK stable and MSRV
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -54,6 +61,7 @@ jobs:
   windows-rust:
     runs-on: windows-latest
     name: Rust tests on Windows
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -94,6 +102,7 @@ jobs:
   macos-check:
     runs-on: macos-14
     name: Rust compiles on macOS
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -125,6 +134,7 @@ jobs:
   checks:
     runs-on: ubuntu-22.04
     name: frontend, Rust, and MCP checks
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
