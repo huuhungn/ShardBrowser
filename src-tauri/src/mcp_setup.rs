@@ -122,19 +122,16 @@ pub fn dependencies_installed(dir: &Path) -> bool {
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
     !dependencies.is_empty()
         && dependencies.keys().all(|name| {
-            let manifest = dir
-                .join("node_modules")
-                .join(Path::new(name))
-                .join("package.json");
+            let package_dir = dir.join("node_modules").join(Path::new(name));
             let Some(locked) = lock.as_ref().and_then(|lock| {
                 lock.get("packages")?
                     .get(format!("node_modules/{name}"))?
                     .get("version")?
                     .as_str()
             }) else {
-                return manifest.is_file();
+                return package_dir.join("package.json").is_file();
             };
-            package_version(manifest.parent().unwrap()).as_deref() == Some(locked)
+            package_version(&package_dir).as_deref() == Some(locked)
         })
 }
 
@@ -225,7 +222,7 @@ mod tests {
                 "dependencies": {
                     "@modelcontextprotocol/sdk": "^1",
                     "patchright": "^1",
-                    "zod": "^3"
+                    "zod": "^4"
                 }
             }"#,
         )
@@ -242,14 +239,34 @@ mod tests {
         // A repair keeps node_modules: a version the new lockfile does not pin is missing.
         std::fs::write(
             dir.join("package-lock.json"),
-            r#"{ "packages": { "node_modules/zod": { "version": "4.6.7" } } }"#,
+            r#"{ "packages": {
+                "node_modules/@modelcontextprotocol/sdk": { "version": "1.32.1" },
+                "node_modules/patchright": { "version": "1.61.1" },
+                "node_modules/zod": { "version": "4.6.7" }
+            } }"#,
         )
         .unwrap();
-        let zod = dir.join("node_modules").join("zod").join("package.json");
-        std::fs::write(&zod, r#"{ "version": "3.25.76" }"#).unwrap();
+        let manifest = |name: &str| {
+            dir.join("node_modules")
+                .join(Path::new(name))
+                .join("package.json")
+        };
+        std::fs::write(
+            manifest("@modelcontextprotocol/sdk"),
+            r#"{ "version": "1.32.1" }"#,
+        )
+        .unwrap();
+        std::fs::write(manifest("patchright"), r#"{ "version": "1.61.1" }"#).unwrap();
+        std::fs::write(manifest("zod"), r#"{ "version": "3.25.76" }"#).unwrap();
         assert!(!dependencies_installed(&dir));
-        std::fs::write(&zod, r#"{ "version": "4.6.7" }"#).unwrap();
+        std::fs::write(manifest("zod"), r#"{ "version": "4.6.7" }"#).unwrap();
         assert!(dependencies_installed(&dir));
+        std::fs::write(
+            manifest("@modelcontextprotocol/sdk"),
+            r#"{ "version": "1.29.0" }"#,
+        )
+        .unwrap();
+        assert!(!dependencies_installed(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
