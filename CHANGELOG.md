@@ -29,6 +29,13 @@ A feature release: profile tags. The browser engine is unchanged
   profile counts at `GET /tags`. The MCP server's `list_profiles` passes the
   field through unchanged.
 
+### Security
+
+- The MCP server moves to `zod` 4.6.7 (GHSA-mrhx-c7xc-m3w5; no 3.x release
+  carries the fix). Its 114 tools and their required arguments are unchanged;
+  the published input schemas no longer set `additionalProperties: false`, so
+  they only accept more.
+
 ### Before you update
 
 Version 2.3.x does not know about tags. If you go back to it, each profile
