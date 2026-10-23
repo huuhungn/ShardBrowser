@@ -100,7 +100,10 @@ pub fn package_version(dir: &Path) -> Option<String> {
 /// True when every runtime dependency declared by the downloaded MCP package
 /// has a package manifest under node_modules. This intentionally checks the
 /// package's own dependency list so future archive updates do not require a
-/// matching Launcher code change.
+/// matching Launcher code change. When the folder has a package-lock.json, the
+/// installed version must also match the locked one: a repair overwrites the
+/// files but keeps node_modules, and the new index.js may not run on the old
+/// dependencies.
 pub fn dependencies_installed(dir: &Path) -> bool {
     if !is_mcp_dir(dir) {
         return false;
@@ -114,12 +117,24 @@ pub fn dependencies_installed(dir: &Path) -> bool {
     let Some(dependencies) = package.get("dependencies").and_then(|v| v.as_object()) else {
         return false;
     };
+    let lock = std::fs::read_to_string(dir.join("package-lock.json"))
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
     !dependencies.is_empty()
         && dependencies.keys().all(|name| {
-            dir.join("node_modules")
+            let manifest = dir
+                .join("node_modules")
                 .join(Path::new(name))
-                .join("package.json")
-                .is_file()
+                .join("package.json");
+            let Some(locked) = lock.as_ref().and_then(|lock| {
+                lock.get("packages")?
+                    .get(format!("node_modules/{name}"))?
+                    .get("version")?
+                    .as_str()
+            }) else {
+                return manifest.is_file();
+            };
+            package_version(manifest.parent().unwrap()).as_deref() == Some(locked)
         })
 }
 
@@ -222,6 +237,18 @@ mod tests {
             std::fs::create_dir_all(&package_dir).unwrap();
             std::fs::write(package_dir.join("package.json"), "{}").unwrap();
         }
+        assert!(dependencies_installed(&dir));
+
+        // A repair keeps node_modules: a version the new lockfile does not pin is missing.
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{ "packages": { "node_modules/zod": { "version": "4.6.7" } } }"#,
+        )
+        .unwrap();
+        let zod = dir.join("node_modules").join("zod").join("package.json");
+        std::fs::write(&zod, r#"{ "version": "3.25.76" }"#).unwrap();
+        assert!(!dependencies_installed(&dir));
+        std::fs::write(&zod, r#"{ "version": "4.6.7" }"#).unwrap();
         assert!(dependencies_installed(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);

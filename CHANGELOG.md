@@ -32,9 +32,12 @@ A feature release: profile tags. The browser engine is unchanged
 ### Security
 
 - The MCP server moves to `zod` 4.6.7 (GHSA-mrhx-c7xc-m3w5; no 3.x release
-  carries the fix). Its 114 tools and their required arguments are unchanged;
-  the published input schemas no longer set `additionalProperties: false`, so
-  they only accept more.
+  carries the fix). Its 114 tools and their required arguments are unchanged.
+  The published input schemas no longer set `additionalProperties: false`;
+  integer arguments are now limited to the safe-integer range (±2^53 − 1).
+  After downloading or repairing the MCP files, run `npm ci` in that folder:
+  the new server does not start on the old dependencies, and **Settings → MCP server**
+  now says `npm ci` is required until it is done.
 
 ### Before you update
 
