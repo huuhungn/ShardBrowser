@@ -127,6 +127,11 @@ pub fn bookmarks_path() -> Result<PathBuf> {
     Ok(config_root()?.join("bookmarks.json"))
 }
 
+/// Profile tag colors, `{ "<tag>": "<palette id>" }`; the tags live on each profile.
+pub fn tags_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("tags.json"))
+}
+
 /// ProxyShard billing-API config (Bearer key). Kept in its own file so the
 /// Settings page (which round-trips the whole Settings struct) can never
 /// clobber the saved key.

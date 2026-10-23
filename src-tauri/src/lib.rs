@@ -842,6 +842,7 @@ pub(crate) fn persist_profile_core_claimed(
         total_runtime_ms: stored.meta.total_runtime_ms,
         color: stored.meta.color,
         extensions: stored.meta.extensions,
+        tags: stored.meta.tags,
     })
 }
 
@@ -1077,6 +1078,38 @@ fn profile_set_folder(id: String, folder: String) -> Result<(), String> {
         profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionMoveProfile"))
             .map_err(|error| error.to_string())?;
     profile::set_folder(&id, &folder).map_err(|e| e.to_string())
+}
+
+/// Replace a profile's tags; returns them normalized.
+#[tauri::command]
+fn profile_set_tags(id: String, tags: Vec<String>) -> Result<Vec<String>, String> {
+    let _claim =
+        profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionChangeTags"))
+            .map_err(|error| error.to_string())?;
+    profile::set_tags(&id, &tags).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn tags_list() -> Result<Vec<profile::TagInfo>, String> {
+    profile::list_tags().map_err(|e| e.to_string())
+}
+
+/// Rename a tag on every profile; returns count.
+#[tauri::command]
+fn tag_rename(old: String, new: String) -> Result<usize, String> {
+    profile::rename_tag(&old, &new).map_err(|e| e.to_string())
+}
+
+/// `color` None clears it.
+#[tauri::command]
+fn tag_recolor(name: String, color: Option<String>) -> Result<(), String> {
+    profile::recolor_tag(&name, color.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Remove a tag from every profile; returns count.
+#[tauri::command]
+fn tag_delete(name: String) -> Result<usize, String> {
+    profile::delete_tag(&name).map_err(|e| e.to_string())
 }
 
 /// Rename folder (retag profiles); returns count.
@@ -2450,6 +2483,10 @@ mod profile_mutation_boundary_tests {
             profile_id.to_string(),
             "folder".to_string(),
         ));
+        assert_running_blocked(profile_set_tags(
+            profile_id.to_string(),
+            vec!["tag".to_string()],
+        ));
         assert_running_blocked(cookies_import(profile_id.to_string(), Vec::new()));
 
         // Sync reads and writes the profile directory exactly as backup and
@@ -2561,6 +2598,11 @@ pub fn run() {
             profile_set_folder,
             folder_rename,
             folder_delete,
+            profile_set_tags,
+            tags_list,
+            tag_rename,
+            tag_recolor,
+            tag_delete,
             host_platform,
             profile_create_from_template,
             enrich_picks_for_preset,
