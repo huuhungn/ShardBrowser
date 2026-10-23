@@ -100,7 +100,10 @@ pub fn package_version(dir: &Path) -> Option<String> {
 /// True when every runtime dependency declared by the downloaded MCP package
 /// has a package manifest under node_modules. This intentionally checks the
 /// package's own dependency list so future archive updates do not require a
-/// matching Launcher code change.
+/// matching Launcher code change. When the folder has a package-lock.json, the
+/// installed version must also match the locked one: a repair overwrites the
+/// files but keeps node_modules, and the new index.js may not run on the old
+/// dependencies.
 pub fn dependencies_installed(dir: &Path) -> bool {
     if !is_mcp_dir(dir) {
         return false;
@@ -114,12 +117,21 @@ pub fn dependencies_installed(dir: &Path) -> bool {
     let Some(dependencies) = package.get("dependencies").and_then(|v| v.as_object()) else {
         return false;
     };
+    let lock = std::fs::read_to_string(dir.join("package-lock.json"))
+        .ok()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
     !dependencies.is_empty()
         && dependencies.keys().all(|name| {
-            dir.join("node_modules")
-                .join(Path::new(name))
-                .join("package.json")
-                .is_file()
+            let package_dir = dir.join("node_modules").join(Path::new(name));
+            let Some(locked) = lock.as_ref().and_then(|lock| {
+                lock.get("packages")?
+                    .get(format!("node_modules/{name}"))?
+                    .get("version")?
+                    .as_str()
+            }) else {
+                return package_dir.join("package.json").is_file();
+            };
+            package_version(&package_dir).as_deref() == Some(locked)
         })
 }
 
@@ -210,7 +222,7 @@ mod tests {
                 "dependencies": {
                     "@modelcontextprotocol/sdk": "^1",
                     "patchright": "^1",
-                    "zod": "^3"
+                    "zod": "^4"
                 }
             }"#,
         )
@@ -223,6 +235,38 @@ mod tests {
             std::fs::write(package_dir.join("package.json"), "{}").unwrap();
         }
         assert!(dependencies_installed(&dir));
+
+        // A repair keeps node_modules: a version the new lockfile does not pin is missing.
+        std::fs::write(
+            dir.join("package-lock.json"),
+            r#"{ "packages": {
+                "node_modules/@modelcontextprotocol/sdk": { "version": "1.32.1" },
+                "node_modules/patchright": { "version": "1.61.1" },
+                "node_modules/zod": { "version": "4.6.7" }
+            } }"#,
+        )
+        .unwrap();
+        let manifest = |name: &str| {
+            dir.join("node_modules")
+                .join(Path::new(name))
+                .join("package.json")
+        };
+        std::fs::write(
+            manifest("@modelcontextprotocol/sdk"),
+            r#"{ "version": "1.32.1" }"#,
+        )
+        .unwrap();
+        std::fs::write(manifest("patchright"), r#"{ "version": "1.61.1" }"#).unwrap();
+        std::fs::write(manifest("zod"), r#"{ "version": "3.25.76" }"#).unwrap();
+        assert!(!dependencies_installed(&dir));
+        std::fs::write(manifest("zod"), r#"{ "version": "4.6.7" }"#).unwrap();
+        assert!(dependencies_installed(&dir));
+        std::fs::write(
+            manifest("@modelcontextprotocol/sdk"),
+            r#"{ "version": "1.29.0" }"#,
+        )
+        .unwrap();
+        assert!(!dependencies_installed(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
