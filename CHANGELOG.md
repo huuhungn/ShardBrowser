@@ -1,12 +1,21 @@
 # Changelog
 
-## Unreleased
+## v2.3.1
+
+A fix release on top of 2.3.0. The browser engine is unchanged
+(Chromium 156.0.8078.48, engine build 1).
 
 ### Fixed
 
 - Installing a launcher update, or restarting for one, now waits until the
   browsers ShardX started are closed, as quitting already does. Before, the
   update ended the launcher and left those browsers running without it.
+
+### Before you update
+
+The update from 2.3.0 is still installed by 2.3.0, which does not wait yet:
+close your profiles before you install it. The wait applies from the next
+update on.
 
 ### Internal
 
