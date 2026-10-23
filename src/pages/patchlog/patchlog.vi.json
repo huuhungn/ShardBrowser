@@ -1,6 +1,38 @@
 {
   "releases": [
     {
+      "version": "2.4.0",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "profile-tags",
+          "title": "Gắn tag cho hồ sơ",
+          "lead": "Gom nhóm hồ sơ xuyên thư mục bằng tag, tìm và lọc được.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Mỗi hồ sơ vẫn nằm trong một thư mục, và giờ có thể mang thêm bao nhiêu tag tuỳ ý. Tag hiện thành chip dưới tên hồ sơ, ô tìm kiếm khớp cả tên tag, và Bộ lọc có thêm mục lọc theo Tag."
+            },
+            {
+              "type": "list",
+              "items": [
+                "Sửa tag của một hồ sơ từ menu của hàng, hoặc bấm vào các chip của nó.",
+                "Chọn nhiều hồ sơ rồi bấm Gắn tag trên thanh chọn để thêm một tag cho tất cả, hoặc bỏ tag đó khi mọi hồ sơ đều đã có. Hồ sơ đang chạy được bỏ qua.",
+                "Cài đặt → Tag cho phép đổi tên, đổi màu và xoá tag, và có thể hoàn tác khi xoá.",
+                "Automation API trả về tag của mọi hồ sơ, nhận tag khi tạo và sửa hồ sơ, và liệt kê tag tại GET /tags."
+              ]
+            },
+            {
+              "type": "note",
+              "text": "Tag được lưu trong file của từng hồ sơ. Nếu quay về 2.3.x, hồ sơ sẽ mất tag vào lần đầu 2.3.x lưu hoặc khởi động nó."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.3.1",
       "date": "2026-10-23",
       "entries": [

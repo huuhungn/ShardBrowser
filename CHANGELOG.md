@@ -1,5 +1,46 @@
 # Changelog
 
+## v2.4.0
+
+A feature release: profile tags. The browser engine is unchanged
+(Chromium 156.0.8078.48, engine build 1).
+
+### Added
+
+- Profiles can carry tags. A profile still lives in one folder, and can now
+  have any number of tags as well. They show as chips under the profile name,
+  the search box matches them, and **Filters** has a **Tag** filter.
+  - Edit a profile's tags from its row menu (**Edit tags**), or by clicking its
+    chips. With several profiles selected, **Tag** on the selection bar adds a
+    tag to all of them, or removes it when they all have it.
+  - **Settings → Tags** lists every tag with how many profiles carry it, and
+    renames, recolors and deletes tags. A delete can be undone until the next
+    change.
+  - Names are trimmed, cut to 32 characters and matched case-insensitively,
+    so "client a" joins an existing "Client A". Renaming a tag to the name of
+    another one merges the two.
+  - Tags are stored in each profile's file, next to its folder, so backups,
+    export and import, and the trash keep them. Colors are kept in `tags.json`
+    in the settings folder.
+  - A running profile's tags cannot change, as with its folder: stop it first.
+    A change to several profiles skips the running ones and says how many.
+- The Automation API returns `tags` on every profile, accepts `tags` on
+  `POST /profiles` and `PATCH /profiles/{id}`, and lists tags with their
+  profile counts at `GET /tags`. The MCP server's `list_profiles` passes the
+  field through unchanged.
+
+### Before you update
+
+Version 2.3.x does not know about tags. If you go back to it, each profile
+keeps its tags in its file only until 2.3.x saves that profile again (an edit,
+a proxy change or a launch), which drops them.
+
+### Known issues
+
+The two engine build 1 issues listed under v2.3.1 (audio noise on a filled
+`AudioBuffer`, upstream #120; the `window.chrome` keys, upstream #118) still
+apply; they need a new engine build.
+
 ## v2.3.1
 
 A fix release on top of 2.3.0. The browser engine is unchanged

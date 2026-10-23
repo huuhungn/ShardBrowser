@@ -3,6 +3,38 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.0",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "profile-tags",
+          "title": "Tag your profiles",
+          "lead": "Group profiles across folders with tags you can search and filter.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A profile still lives in one folder, and can now carry any number of tags as well. They show as chips under its name, the search box matches them, and Filters has a Tag filter."
+            },
+            {
+              "type": "list",
+              "items": [
+                "Edit a profile's tags from its row menu, or by clicking its chips.",
+                "Select several profiles and use Tag on the selection bar to add a tag to all of them, or remove it when they all have it. Running profiles are skipped.",
+                "Settings → Tags renames, recolors and deletes tags, and a delete can be undone.",
+                "The Automation API returns tags on every profile, takes them on create and edit, and lists them at GET /tags."
+              ]
+            },
+            {
+              "type": "note",
+              "text": "Tags are kept in each profile's file. If you go back to 2.3.x, a profile loses its tags the next time 2.3.x saves or launches it."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.3.1",
       "date": "2026-10-23",
       "entries": [
