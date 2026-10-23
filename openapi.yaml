@@ -102,6 +102,7 @@ tags:
   - name: Fingerprints
   - name: Profiles
   - name: Folders
+  - name: Tags
   - name: Proxies
   - name: Extensions
   - name: Bookmarks
@@ -658,6 +659,24 @@ paths:
                 type: array
                 items: { type: string }
                 example: ["work", "scrapers"]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /tags:
+    get:
+      tags: [Tags]
+      summary: List tags
+      description: |
+        Every tag on a persistent profile or with a stored color, sorted by
+        name, with how many profiles carry it. Tag names match
+        case-insensitively; rename, recolor and delete are in the launcher.
+      responses:
+        "200":
+          description: Tags.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/TagInfo" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /folders/{folder}:
@@ -1304,6 +1323,14 @@ components:
             Extension-library ids (`GET /extensions`), loaded at launch. An id
             the library does not hold is a 400 rather than a profile that
             silently starts without it.
+        tags:
+          type: array
+          items: { type: string }
+          description: |
+            Tag names. Each is trimmed, inner whitespace collapsed and capped at
+            32 characters; a name matching an existing tag case-insensitively
+            takes that tag's spelling. Duplicates and empty names are dropped.
+          example: ["Client A", "warm-up"]
         fingerprint:
           allOf: [{ $ref: "#/components/schemas/Fingerprint" }]
           description: Stored verbatim. Get one from /fingerprint/new and edit as needed.
@@ -1328,6 +1355,12 @@ components:
           type: array
           items: { type: string }
           description: Replaces the whole list; `[]` loads none.
+        tags:
+          type: array
+          items: { type: string }
+          description: |
+            Replaces the whole list; `[]` clears it. Normalized as on create.
+            Refused with 409 while the profile runs, like every other edit.
         fingerprint:
           allOf: [{ $ref: "#/components/schemas/Fingerprint" }]
           description: When present, REPLACES the stored fingerprint verbatim.
@@ -1488,6 +1521,22 @@ components:
           type: array
           items: { type: string }
           description: Extension-library ids loaded at launch.
+        tags:
+          type: array
+          items: { type: string }
+          description: Tag names as stored (see `GET /tags` for colors and counts).
+
+    TagInfo:
+      type: object
+      properties:
+        name: { type: string }
+        color:
+          type: string
+          nullable: true
+          description: Palette id such as `teal`; `null` means the launcher derives one from the name.
+        count:
+          type: integer
+          description: Profiles carrying the tag; 0 for a tag that so far only has a color.
 
     ProfileListItem:
       allOf:
@@ -1520,6 +1569,10 @@ components:
             created_at: { type: string, nullable: true }
             pinned: { type: boolean }
             folder: { type: string }
+            tags:
+              type: array
+              items: { type: string }
+              description: Absent when the profile has no tags.
             temporary: { type: boolean }
         running: { type: boolean }
         cdp:

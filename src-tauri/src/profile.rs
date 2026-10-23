@@ -91,6 +91,7 @@ fn is_false(b: &bool) -> bool {
 pub const MAX_PROFILE_NAME_CHARS: usize = 128;
 pub const MAX_TAG_NAME_CHARS: usize = 32;
 const PROFILE_NAME_CLAIM: &str = "\0profile-name-namespace";
+/// Held by folder and tag rename/delete, which rewrite many profiles at once.
 const GLOBAL_FOLDER_CLAIM: &str = "\0folder-mutation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,8 +1161,10 @@ pub fn recolor_tag(name: &str, color: Option<&str>) -> Result<()> {
     if color.is_some_and(|color| !valid_tag_color(color)) {
         anyhow::bail!(crate::errcode::code("profile.tagColorInvalid"));
     }
-    let name = canonical_tags(&[name], &tag_names_in_use()?).remove(0);
+    // Rename and delete hold this across their rewrite, so the spelling read
+    // below never sees a half-renamed tag.
     let _lock = tag_colors_lock();
+    let name = canonical_tags(&[name], &tag_names_in_use()?).remove(0);
     let mut colors = read_tag_colors()?;
     take_tag_color(&mut colors, &name);
     if let Some(color) = color {
@@ -1222,16 +1225,18 @@ fn rewrite_tag(old: &str, new: Option<&str>, partial: &str) -> Result<usize> {
 
 /// Rename a tag everywhere, merging into an existing tag of that name; returns count.
 pub fn rename_tag(old: &str, new: &str) -> Result<usize> {
+    let old = &normalize_tag(old).unwrap_or_default();
     let new = normalize_tag(new).with_context(|| crate::errcode::code("profile.tagNameEmpty"))?;
     let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionRenameTag"), || {
         profile_ids_with_tag(old)
     })?;
+    // Held across the rewrite so a recolor waits for the new name.
+    let _lock = tag_colors_lock();
     let merge_into = tag_names_in_use()?
         .into_iter()
         .find(|name| same_tag(name, &new) && !same_tag(name, old));
     let new = merge_into.unwrap_or(new);
     let total = rewrite_tag(old, Some(&new), "profile.tagRenamePartial")?;
-    let _lock = tag_colors_lock();
     let mut colors = read_tag_colors()?;
     if let Some(color) = take_tag_color(&mut colors, old) {
         if !colors.keys().any(|key| same_tag(key, &new)) {
@@ -1244,11 +1249,12 @@ pub fn rename_tag(old: &str, new: &str) -> Result<usize> {
 
 /// Remove a tag from every profile and forget its color; returns count.
 pub fn delete_tag(name: &str) -> Result<usize> {
+    let name = &normalize_tag(name).unwrap_or_default();
     let _claim = begin_bulk_mutation(&crate::errcode::code("profile.actionDeleteTag"), || {
         profile_ids_with_tag(name)
     })?;
-    let total = rewrite_tag(name, None, "profile.tagDeletePartial")?;
     let _lock = tag_colors_lock();
+    let total = rewrite_tag(name, None, "profile.tagDeletePartial")?;
     let mut colors = read_tag_colors()?;
     if take_tag_color(&mut colors, name).is_some() {
         write_tag_colors(&colors)?;
@@ -1696,5 +1702,15 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    #[test]
+    fn rename_and_delete_accept_the_name_as_typed() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Typed", &["Client A"]);
+        assert_eq!(rename_tag("  client   a ", "Client B").unwrap(), 1);
+        assert_eq!(tags_of(&id), ["Client B"]);
+        assert_eq!(delete_tag(" CLIENT  B").unwrap(), 1);
+        assert!(tags_of(&id).is_empty());
     }
 }
