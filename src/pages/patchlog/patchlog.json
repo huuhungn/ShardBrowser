@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.3.1",
+      "date": "2026-10-23",
+      "entries": [
+        {
+          "id": "update-waits-for-browsers",
+          "title": "Updates wait for your browsers to close",
+          "lead": "Installing an update no longer leaves running browsers behind.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Installing a launcher update, or restarting for one, now waits until the browsers ShardX started are closed, as quitting already does. Before, the update ended the launcher and left those browsers running without it."
+            },
+            {
+              "type": "note",
+              "text": "The update from 2.3.0 to this version still runs the 2.3.0 installer, so close your profiles before you install it. The wait applies from the next update on."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.3.0",
       "date": "2026-10-22",
       "entries": [

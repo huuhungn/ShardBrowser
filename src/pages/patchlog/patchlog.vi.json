@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.3.1",
+      "date": "2026-10-23",
+      "entries": [
+        {
+          "id": "update-waits-for-browsers",
+          "title": "Cập nhật chờ bạn đóng trình duyệt",
+          "lead": "Cài bản cập nhật không còn bỏ lại các trình duyệt đang chạy.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khi cài bản cập nhật launcher, hoặc khởi động lại để cập nhật, launcher giờ chờ tới khi các trình duyệt do ShardX mở đã đóng, giống như khi thoát. Trước đây, bản cập nhật tắt launcher và để các trình duyệt đó chạy mà không còn launcher quản lý."
+            },
+            {
+              "type": "note",
+              "text": "Lần cập nhật từ 2.3.0 lên bản này vẫn chạy trình cài của 2.3.0, nên hãy đóng các hồ sơ trước khi cài. Việc chờ có hiệu lực từ lần cập nhật sau."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.3.0",
       "date": "2026-10-22",
       "entries": [
