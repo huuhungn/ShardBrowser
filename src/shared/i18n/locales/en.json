@@ -715,6 +715,7 @@
   "profile.thisReplacesTheCurrentProfileDataWithT": "This replaces the current profile data with the team's copy. ",
   "profile.throughAProxy": "Through a proxy",
   "profile.timezone": "Timezone",
+  "profile.tooManyTags": "A profile can have at most {max} tags.",
   "profile.trashAskMany": "Move {n} profiles to the trash? They can be restored there for 7 days.",
   "profile.trashAskOne": "Move {n} profile to the trash? It can be restored there for 7 days.",
   "profile.startCancelled": "Start cancelled; no browser was opened",

@@ -306,6 +306,8 @@ struct CreateReq {
     color: Option<String>,
     /// Extension-library ids to load at launch (`GET /extensions`).
     extensions: Option<Vec<String>>,
+    /// Tag names; normalized and matched to existing tags case-insensitively.
+    tags: Option<Vec<String>>,
     fingerprint: Value,
     launch: Option<Value>,
     /// Reserved for backward-compatible error reporting; not implemented.
@@ -368,6 +370,10 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
     if let Some(ids) = body.extensions.as_ref() {
         validate_extension_ids(ids)?;
         meta["extensions"] = json!(ids);
+    }
+    // save_raw normalizes a new profile's tags.
+    if let Some(tags) = body.tags.as_ref() {
+        meta["tags"] = json!(tags);
     }
     if let Some(pid) = body.proxy_id.as_ref() {
         meta["proxy_id"] = json!(pid);
@@ -710,6 +716,8 @@ struct EditReq {
     color: Option<String>,
     /// Replaces the whole list; `[]` loads none.
     extensions: Option<Vec<String>>,
+    /// Replaces the whole list; `[]` clears it.
+    tags: Option<Vec<String>>,
     /// Replace stored fingerprint verbatim.
     fingerprint: Option<Value>,
 }
@@ -791,6 +799,12 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
         stored.meta.extensions = ids.clone();
     }
 
+    // First, so a refused tag list writes nothing; save_raw then carries the
+    // new tags from disk.
+    if let Some(tags) = body.tags.as_ref() {
+        crate::profile::set_tags(&id, tags)
+            .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    }
     crate::profile::save_raw(&mut stored)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     // set_folder handles unfile; save_raw keeps the existing folder when empty.
@@ -1377,6 +1391,12 @@ async fn purge_trash(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "purged": true, "id": id })))
 }
 
+async fn list_tags() -> ApiResult {
+    let tags = crate::profile::list_tags()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!(tags)))
+}
+
 async fn list_folders() -> ApiResult {
     let metas = crate::profile::list_all()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1478,6 +1498,7 @@ fn router() -> Router {
             get(export_cookies).post(import_cookies),
         )
         .route("/folders", get(list_folders))
+        .route("/tags", get(list_tags))
         .route(
             "/folders/:folder",
             patch(rename_folder_ep).delete(delete_folder_ep),
@@ -1628,20 +1649,25 @@ mod automation_endpoint_tests {
     /// The store root is process-global, so these tests hold a lock for the
     /// duration: without it, two tests racing on the same root see each
     /// other's projects and the failure looks like a routing bug.
-    pub(super) fn scratch_store() -> (
-        tempfile::TempDir,
-        String,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let guard = crate::store::config_root_test_lock()
+    pub(super) fn scratch_store() -> (tempfile::TempDir, String, ScratchLocks) {
+        let config = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Creating, editing or running a profile takes lifecycle claims, which
+        // the claim tests assert are free; without this they race.
+        let lifecycle = crate::profile::lifecycle_test_guard();
         let dir = tempfile::tempdir().expect("a scratch config root");
         crate::store::set_config_root(Some(dir.path().to_path_buf()));
         super::set_secret(SECRET);
         let token = super::long_lived_token(SECRET).expect("mint a token");
-        (dir, token, guard)
+        (dir, token, ScratchLocks(config, lifecycle))
     }
+
+    /// Held for a test's duration; see `scratch_store`.
+    pub(super) struct ScratchLocks(
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
 
     pub(super) async fn send(request: Request<Body>) -> (StatusCode, Value) {
         let response = router().oneshot(request).await.expect("route the request");
@@ -2027,5 +2053,83 @@ mod profile_proxy_password_tests {
         assert_eq!(status, StatusCode::OK, "body was {after}");
         assert_eq!(after[0]["id"], json!(id));
         assert_eq!(after[0]["tags"], json!(["Client A"]));
+    }
+
+    #[tokio::test]
+    async fn tags_go_in_on_create_change_on_edit_and_list_with_counts() {
+        let (_store, token, _lock) = scratch_store();
+        let (status, created) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "tagged on create", "fingerprint": {}, "tags": ["  Client   A ", "client a", "VIP"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {created}");
+        assert_eq!(created["tags"], json!(["Client A", "VIP"]));
+        let id = created["id"].as_str().expect("a profile id").to_string();
+
+        let (status, edited) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "kept", "tags": ["vip", "New"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {edited}");
+        assert_eq!(edited["_meta"]["tags"], json!(["VIP", "New"]));
+        assert_eq!(edited["notes"], json!("kept"));
+
+        // An edit that does not mention tags leaves them alone.
+        let (_, untouched) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "again" }),
+        ))
+        .await;
+        assert_eq!(untouched["_meta"]["tags"], json!(["VIP", "New"]));
+
+        // Past the cap the whole edit is refused, notes included.
+        let many: Vec<String> = (0..=crate::profile::MAX_TAGS_PER_PROFILE)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let (status, _) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "not saved", "tags": many }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, after) = send(authed(
+            "GET",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(after["notes"], json!("again"));
+        assert_eq!(after["_meta"]["tags"], json!(["VIP", "New"]));
+
+        let (status, tags) = send(authed("GET", "/tags", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::OK, "body was {tags}");
+        assert_eq!(
+            tags,
+            json!([
+                { "name": "New", "color": null, "count": 1 },
+                { "name": "VIP", "color": null, "count": 1 },
+            ])
+        );
+
+        let (status, _) = send(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/tags")
+                .body(axum::body::Body::empty())
+                .expect("build the request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

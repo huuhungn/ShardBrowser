@@ -715,6 +715,7 @@
   "profile.thisReplacesTheCurrentProfileDataWithT": "Thao tác này thay dữ liệu hồ sơ hiện tại bằng bản của nhóm. ",
   "profile.throughAProxy": "Qua proxy",
   "profile.timezone": "Múi giờ",
+  "profile.tooManyTags": "Mỗi hồ sơ có tối đa {max} tag.",
   "profile.trashAskMany": "Chuyển {n} hồ sơ vào thùng rác? Có thể khôi phục trong 7 ngày.",
   "profile.trashAskOne": "Chuyển {n} hồ sơ vào thùng rác? Có thể khôi phục trong 7 ngày.",
   "profile.startCancelled": "Đã huỷ khởi động; không có trình duyệt nào được mở",
