@@ -35,6 +35,10 @@ fork on 2026-10-23.
 - The release RustSec step fails when it cannot read any `zip` version from
   the launcher lockfile, instead of skipping the check that guards its
   `zip` ignores.
+- `ctutils` is updated from 0.4.2 to 0.4.5 in the launcher, `shared` and
+  `server` lockfiles for RUSTSEC-2026-0385 (non-constant-time mask generation
+  and `u128` comparisons). It reaches the launcher through the Ed25519, HPKE
+  and ChaCha20-Poly1305 crates.
 
 ## v2.3.0
 
