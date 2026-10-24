@@ -1,17 +1,19 @@
 # ADR 0001: Server identity authority and first-tenant bootstrap
 
-- **Status:** Draft with partial decisions accepted; the full ADR is not approved.
+- **Status:** Accepted for development on 2026-10-25. Releasing any v2 code
+  built on it still requires an independent G2 `PASS`.
 - **Date:** 2026-10-03
 - **Source commit:** `8d07f0d` (v2.2.10), branch `team-custody-production`
-- **Deciders:** user + Architect review (pending)
+- **Deciders:** user (the 2026-10-25 decisions were delegated to the
+  assistant) + Architect review 4 (APPROVE of `8ee333…`)
 - **User decisions so far:** Q1 P1 (record format, parser rules, identity-root
   config and write procedure) accepted 2026-10-03. Q2 entry point = Option A
   (offline operator CLI, server stopped), chosen 2026-10-03. Q3 nullable
   active pointer until generation `0` activation accepted 2026-10-03. Q3 D1
   (one-time first-device approval) and D2 (ACTIVE root custodian issues
-  capability grants) accepted 2026-10-04; D3 (offline audit actor mapping)
-  remains proposed. The Q1 restore manifest, remaining Q3 sub-questions and
-  Q4 stay open.
+  capability grants) accepted 2026-10-04. On 2026-10-25: D3 (offline audit
+  actor mapping) accepted, Q4 decided (G2-27 leaves this ADR), and the Q1
+  restore manifest deferred to the backup/restore ADR.
 
 ## How to read this draft
 
@@ -21,9 +23,10 @@ listed as questions. Where the user has decided a question, or where a
 concrete design is proposed, the text labels it "Decided" or "proposed", so
 plan text and new design are never mixed.
 
-Approving this ADR does not open production implementation. The plan staffs
-production work only after a verifier confirms G2 `PASS` (plan L198), and the
-current independent G2 verdict is FAIL.
+Accepting this ADR opens development of the identity and bootstrap code on
+the `team-custody-production` branch. It does not open a release: the plan
+ships production work only after a verifier confirms G2 `PASS` (plan L198),
+and the current independent G2 verdict is FAIL.
 
 ### Sources
 
@@ -311,8 +314,11 @@ external_record_sha256 = 828ad5d4dedb26d228160aad1d9118be1495cb975730c3324e3ae0b
 
 #### Still open under Q1
 
-- Restore-preparation manifest format (L2251). P1 acceptance does not
-  define it or close the restore crash-recovery proof obligations.
+- Restore-preparation manifest format (L2251). **Deferred (2026-10-25)** to
+  the backup/restore ADR. P1 acceptance does not define it or close the
+  restore crash-recovery proof obligations, so code built on this ADR offers
+  no restore entry point: the CLI and the server refuse a restore until that
+  ADR defines the manifest.
 
 ### Q2. Who creates epoch 0, and through which entry point
 
@@ -339,8 +345,8 @@ operator action that a fresh install can tell apart from a lost authority.
   (`server/src/routes/v2.rs:78`; table at
   `server/migrations/0004_v2_team_fleet.sql:356`) that is not in the plan and
   has no production writer. D1/D2 under "First-device trust anchor" below
-  were accepted by the user on 2026-10-04; D3 and Architect review remain
-  open. User acceptance does not close the independent G2 gate.
+  were accepted by the user on 2026-10-04 and D3 on 2026-10-25; Architect
+  review 4 approved the design. Neither closes the independent G2 gate.
 - `v2_tenants.active_root_generation` is `NOT NULL`
   (`server/migrations/0004_v2_team_fleet.sql:38`) but generation `0` does not
   exist until the root bootstrap runs. The plan does not specify the pointer
@@ -479,9 +485,9 @@ manifest and Q4 scope remain outside this pointer decision.
 ### Q4. Where G2-27 belongs
 
 G2-27 is about the envelope STREAM framing (L1299–L1348, L2333–L2334, L2445,
-L2464), not about server identity or bootstrap. Proposal: move it to a
-separate ADR for envelope v2 / STREAM, and keep this ADR limited to identity
-and bootstrap.
+L2464), not about server identity or bootstrap. **Decided (2026-10-25):**
+G2-27 moves to a separate ADR for envelope v2 / STREAM, and this ADR stays
+limited to identity and bootstrap.
 
 ## Decision for Q2: Option A — offline operator CLI
 
@@ -529,7 +535,7 @@ running the server as now. New subcommands:
    - Q3 accepts `active_root_generation = NULL` until generation `0`
      activation. A forward migration and implementation verification remain
      required; do not insert NULL into today's NOT NULL schema. Offline audit
-     actor/action mapping also remains open (proposal D3 below):
+     actor/action mapping follows D3 below (accepted 2026-10-25):
      the plan specifies `v2_audit_events` (L1091), but only v1 `audit_log`
      exists in the current migrations.
    - Prints the tenant ID.
@@ -608,14 +614,14 @@ record.
 
 ## First-device trust anchor (part of Q3)
 
-**Status: D1 and D2 accepted by the user on 2026-10-04; D3 proposed.**
+**Status: D1 and D2 accepted by the user on 2026-10-04; D3 accepted on 2026-10-25.**
 D1 accepts the one-time self-issued first approval only after the durable
 offline confirmation and
 emptiness/session/device guards described below. D2 accepts the ACTIVE
 `root.custody` issuer rule for `TenantCapabilityGrantV2`; it does not allow
 operating capability issuance before root activation. The PREPARING root
-self-grant still follows S6 (L812–L819). D3 remains proposed, and Architect
-review plus G2 `PASS` remain required before implementation.
+self-grant still follows S6 (L812–L819). D3 was accepted on 2026-10-25;
+G2 `PASS` remains required before any release.
 
 **Accepted consequences.** The forward design must add a pending device state
 and a durable first-device confirmation record; enforce the one-time D1
@@ -717,7 +723,7 @@ exact `Capability` value set (L481). Grant issuance by `tenant.manage`
 holders without ACTIVE root custody is not authorized by accepted D2; it
 would require a separate proposed amendment.
 
-**D3 (proposed). Offline audit actor.** CLI actions write `v2_audit_events`
+**D3 (accepted 2026-10-25). Offline audit actor.** CLI actions write `v2_audit_events`
 (L1091) with `actor_account_id` and `actor_device_id` NULL,
 `reason_code = offline_operator_cli`, a CLI-generated `request_id` and the
 specific action (`tenant.create`, `tenant.first_device_confirm`). Create no
@@ -824,7 +830,7 @@ and R4 verification. It prints no token/private key. The operator compares it
 with the intended client tuple. It never repairs or reissues confirmation.
 Audit/storage failure aborts the entire CLI or online mutation. A crash leaves
 either the complete pre-state or complete committed post-state, not half of
-an approval. Offline actor-column mapping is still conditional on D3; neither
+an approval. Offline actor-column mapping follows D3; neither
 NULL network actors nor best-effort `audit::log` are allowed as a shortcut.
 
 ### R2. Account login to proof-bound pending-device session (P1-02)
@@ -1306,9 +1312,17 @@ promotion to accepted or implemented status. Remaining obligations are:
   but neither that acceptance nor these fixtures establish G2 PASS.
 - G2-64 clears only when an independent rerun reports PASS for every row. This
   ADR cannot clear it.
-- Production v2 code stays closed until G2 `PASS` (L198).
+- Production v2 code is not released until G2 `PASS` (L198).
 
 ## Revision log
+
+- 2026-10-25: the user delegated the remaining decisions. D3 accepted as
+  written; Q4 decided (G2-27 moves to an envelope v2 / STREAM ADR); the Q1
+  restore manifest deferred to the backup/restore ADR, with no restore entry
+  point until then. Status moves to accepted for development. R1-R4 keep
+  their Architect approvals and their implementation proof obligations; the
+  retained P2-01 to P2-03 obligations and the independent G2 gate are
+  unchanged, and no v2 code built on this ADR is released before G2 `PASS`.
 
 - 2026-10-04 (second-review candidate): added R1-R4 in response to Architect
   P1-01 through P1-04 at `62979f2`, plus R5 required design cases. These are
