@@ -72,8 +72,17 @@ export class ShardX {
   /** Create a new persistent profile from a library template (or a random one
    *  when `template` is omitted), enriched with randomized hardware +
    *  platform_version under a fresh unique id, and frozen to disk. Launch it
-   *  with `launch(profile, { randomize: false })`. */
-  async createProfile(template?: string, opts: { platform?: string } = {}): Promise<Profile> {
+   *  with `launch(profile, { randomize: false })`.
+   *
+   *  `refreshRate` is how often the claimed display refreshes, in Hz. No web
+   *  API reports it; a page measures it by timing requestAnimationFrame, so
+   *  leaving it out is not neutral — the engine then claims 60, what most
+   *  machines report, rather than the host's own screen. Frames can only be
+   *  slowed, so a rate above the host's panel runs at the panel's. */
+  async createProfile(
+    template?: string,
+    opts: { platform?: string; refreshRate?: number } = {},
+  ): Promise<Profile> {
     await this.runtime.install();
     const src = template == null
       ? await this.randomProfile({ platform: opts.platform })
@@ -83,6 +92,13 @@ export class ShardX {
     // Seed hardware by the new id so the pick is stable across reopens.
     randomizeHardware(profile.config, id);
     randomizePlatformVersion(profile.config);
+    if (opts.refreshRate != null) {
+      if (!Number.isInteger(opts.refreshRate) || opts.refreshRate < 24 || opts.refreshRate > 480) {
+        throw new Error(`refreshRate must be an integer 24..480, got ${opts.refreshRate}`);
+      }
+      const cfg = profile.config as Record<string, any>;
+      cfg.screen = { ...(cfg.screen || {}), refresh_rate: opts.refreshRate };
+    }
     this.saveProfile(profile);
     return profile;
   }
@@ -233,3 +249,5 @@ export type { ScreenStrategy } from "./screen.js";
 export { geoCheckVia } from "./geo.js";
 export type { GeoInfo, GeoProvider } from "./geo.js";
 export { hasAutoFields, resolveAutoFields } from "./autoResolve.js";
+export { Motion } from "./motion.js";
+export type { MouseButton, ScreenAngle, OrientationResult } from "./motion.js";

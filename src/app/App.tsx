@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 
 import { TitleBar } from "../widgets/TitleBar/TitleBar";
 import { Sidebar } from "../widgets/Sidebar/Sidebar";
@@ -23,12 +24,29 @@ import { PatchLogPage } from "../pages/patchlog";
 import { useNav } from "../shared/model/navigation";
 
 import { useTeam } from "../entities/team";
+import { toast } from "../shared/model/toast";
+import { t } from "../shared/i18n";
 
 export function App() {
   const section = useNav((s) => s.section);
   // Profile rows ask whether team actions apply; load it once here.
   const loadTeam = useTeam((s) => s.refresh);
   useEffect(() => { void loadTeam(); }, [loadTeam]);
+  // The backend refuses to quit while a browser it started is open.
+  useEffect(() => {
+    let disposed = false;
+    let un: (() => void) | undefined;
+    listen<{ running_count: number }>("launcher:exit-blocked", ({ payload }) => {
+      toast.err(t("app.exitBlocked", { n: payload.running_count }));
+    }).then((fn) => {
+      if (disposed) fn();
+      else un = fn;
+    });
+    return () => {
+      disposed = true;
+      un?.();
+    };
+  }, []);
 
   return (
     <>

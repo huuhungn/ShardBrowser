@@ -18,7 +18,7 @@ const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
-pub const CHROMIUM_VERSION: &str = "152.0.7977.65";
+pub const CHROMIUM_VERSION: &str = "156.0.8078.48";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ArchiveSpec {
@@ -81,18 +81,23 @@ pub fn runtime_dir() -> Result<PathBuf> {
 
 /// Path to the chrome binary inside the extracted runtime.
 pub fn binary_path() -> Result<PathBuf> {
-    let base = runtime_dir()?;
+    Ok(runtime_dir()?.join(binary_rel()))
+}
+
+/// The chrome binary relative to the runtime dir (or to a staging dir).
+fn binary_rel() -> PathBuf {
     #[cfg(target_os = "macos")]
-    return Ok(base
-        .join("ShardX-Mac-arm64")
+    return Path::new("ShardX-Mac-arm64")
         .join("ShardX.app")
         .join("Contents")
         .join("MacOS")
-        .join("ShardX"));
+        .join("ShardX");
     #[cfg(target_os = "windows")]
-    return Ok(base.join("ShardX-Windows").join("chrome.exe"));
+    return Path::new("ShardX-Windows").join("chrome.exe");
     #[cfg(target_os = "linux")]
-    return Ok(base.join("ShardX-Linux").join("chrome"));
+    return Path::new("ShardX-Linux").join("chrome");
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    return Path::new(engine_root_dir()).join("chrome");
 }
 
 fn manifest_path() -> Result<PathBuf> {
@@ -111,6 +116,12 @@ fn engine_root_dir() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     return "ShardX-Engine";
 }
+
+/// A new engine is extracted here, beside the one in use, and swapped in only
+/// once it is complete. The previous engine waits in `ENGINE_OLD` until the new
+/// one is in place, so a broken download never leaves the host without one.
+const ENGINE_STAGING: &str = ".engine-staging";
+const ENGINE_OLD: &str = ".engine-old";
 
 // Bundled fingerprint library (cross-platform); seeds fingerprints dir on first run.
 const FINGERPRINTS_ARCHIVE_KEY: &str = "ShardX-Fingerprints.zip";
@@ -292,8 +303,22 @@ struct RemoteManifest {
 /// archive's current etag + the chromium version, so install/status never poll
 /// R2/S3 per-archive. Empty/None when unreachable.
 async fn fetch_manifest() -> RemoteManifest {
-    async fn inner() -> Option<RemoteManifest> {
-        let resp = reqwest::Client::new().get(MANIFEST_URL).send().await.ok()?;
+    fetch_manifest_from(MANIFEST_URL).await
+}
+
+async fn fetch_manifest_from(url: &str) -> RemoteManifest {
+    async fn inner(url: &str) -> Option<RemoteManifest> {
+        // Bounded: the first-run gate waits on this, and a network that accepts
+        // and never answers would otherwise keep the window blank (#114).
+        let resp = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .ok()?
+            .get(url)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -323,7 +348,7 @@ async fn fetch_manifest() -> RemoteManifest {
             min_launcher_version: str_field("min_launcher_version"),
         })
     }
-    inner().await.unwrap_or_default()
+    inner(url).await.unwrap_or_default()
 }
 
 /// Migrate every `*.json` in `dir` to a new engine descriptor: bump
@@ -549,6 +574,9 @@ fn engine_outdated(local: &Manifest, remote: &RemoteManifest, browser_key: &str)
 
 #[tauri::command]
 pub async fn runtime_status() -> Result<RuntimeStatus, String> {
+    if let Ok(base) = runtime_dir() {
+        recover_interrupted_swap(&base);
+    }
     let spec = host_spec();
     let installed = binary_path().map(|p| p.exists()).unwrap_or(false);
     let mut m = load_manifest();
@@ -662,14 +690,14 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         }
     }
 
+    recover_interrupted_swap(&base);
     let browser_etag = if need_browser {
-        // Wipe the old engine tree first. The archive extracts *over* the
-        // existing dir but never deletes files the new version dropped — most
-        // critically the previous `<version>.manifest`, which lingers beside the
-        // new one and poisons version detection into an endless re-download (and
-        // stale DLLs/.so could be loaded). Applies to win + linux + mac alike.
-        let _ = fs::remove_dir_all(base.join(engine_root_dir()));
-        download_and_extract(&window, &spec.browser, &base)
+        // A clean tree, never an extract over the old one: that would keep files
+        // the new version dropped -- above all the previous `<version>.manifest`,
+        // which poisons version detection into an endless re-download. The new
+        // tree is built in staging and swapped in, so the old engine survives a
+        // download or extract that fails.
+        install_engine(&window, &spec.browser, &base)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -814,10 +842,80 @@ async fn install_fingerprints(
     Ok(Some(etag))
 }
 
+/// Download and extract the engine into staging, then swap it in.
+async fn install_engine(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
+    let staging = base.join(ENGINE_STAGING);
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)?;
+    let result = match download_and_extract(window, spec, &staging).await {
+        Ok(etag) => swap_engine(base, &staging).map(|()| etag),
+        Err(e) => Err(e),
+    };
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
+/// Replace the live engine with the one extracted in `staging`, by rename.
+/// Refuses an extract that holds no browser binary, and puts the old engine
+/// back when the second rename fails, so every failure leaves a working engine.
+fn swap_engine(base: &Path, staging: &Path) -> Result<()> {
+    if !staging.join(binary_rel()).is_file() {
+        anyhow::bail!(crate::errcode::code("runtime.archiveIncomplete"));
+    }
+    let live = base.join(engine_root_dir());
+    let old = base.join(ENGINE_OLD);
+    let _ = fs::remove_dir_all(&old);
+    let had_old = live.exists();
+    if had_old {
+        // On Windows a still-running engine refuses here (os error 32), before
+        // anything has moved.
+        fs::rename(&live, &old)?;
+    }
+    if let Err(e) = fs::rename(staging.join(engine_root_dir()), &live) {
+        if had_old {
+            let _ = fs::rename(&old, &live);
+        }
+        return Err(e.into());
+    }
+    // Whatever else the archive holds at its top level lands beside the engine,
+    // as the old extract-in-place did.
+    for ent in fs::read_dir(staging)?.flatten() {
+        if ent.path().extension().and_then(|e| e.to_str()) == Some("tmp") {
+            continue;
+        }
+        let dst = base.join(ent.file_name());
+        if dst.is_dir() {
+            let _ = fs::remove_dir_all(&dst);
+        }
+        fs::rename(ent.path(), &dst)?;
+    }
+    let _ = fs::remove_dir_all(&old);
+    Ok(())
+}
+
+/// A launcher that died between the two renames of `swap_engine` leaves the
+/// old engine parked in `ENGINE_OLD` and none live; put it back.
+fn recover_interrupted_swap(base: &Path) {
+    let live = base.join(engine_root_dir());
+    let old = base.join(ENGINE_OLD);
+    let inside = binary_rel()
+        .strip_prefix(engine_root_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    if !live.exists() && old.join(inside).is_file() {
+        let _ = fs::rename(&old, &live);
+    }
+}
+
 /// Stream archive → temp file → extract; emits `runtime:progress` events.
 async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
     let url = format!("{PUB_BASE}/{}", spec.key);
-    let mut resp = reqwest::Client::new()
+    // No total timeout -- the archive is hundreds of megabytes on any link --
+    // but a stalled connection fails instead of hanging the setup screen.
+    let mut resp = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .build()?
         .get(&url)
         .send()
         .await?
@@ -1052,6 +1150,81 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #114: a network that accepts the connection and never answers used to
+    /// hold the first-run gate, and with it the whole window, indefinitely.
+    #[tokio::test]
+    async fn a_manifest_host_that_never_answers_gives_up() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/runtime.json", listener.local_addr().unwrap());
+        let _held = std::thread::spawn(move || {
+            let conns: Vec<_> = listener.incoming().take(1).collect();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            drop(conns);
+        });
+
+        let started = std::time::Instant::now();
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            fetch_manifest_from(&url),
+        )
+        .await
+        .expect("fetch_manifest must give up on its own");
+
+        assert!(got.archives.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_complete_engine_replaces_the_old_one() {
+        let base = tempfile::tempdir().unwrap();
+        let staging = base.path().join(ENGINE_STAGING);
+        plant(base.path(), "old");
+        plant(&staging, "new");
+
+        swap_engine(base.path(), &staging).unwrap();
+
+        assert_eq!(read_bin(base.path()), "new");
+        assert!(!base.path().join(ENGINE_OLD).exists());
+    }
+
+    #[test]
+    fn an_extract_without_a_browser_leaves_the_old_engine() {
+        let base = tempfile::tempdir().unwrap();
+        let staging = base.path().join(ENGINE_STAGING);
+        plant(base.path(), "old");
+        fs::create_dir_all(staging.join(engine_root_dir())).unwrap();
+
+        let err = swap_engine(base.path(), &staging).unwrap_err();
+
+        assert!(err.to_string().contains("runtime.archiveIncomplete"));
+        assert_eq!(read_bin(base.path()), "old");
+    }
+
+    #[test]
+    fn a_swap_cut_short_is_undone_on_the_next_check() {
+        let base = tempfile::tempdir().unwrap();
+        plant(base.path(), "old");
+        fs::rename(
+            base.path().join(engine_root_dir()),
+            base.path().join(ENGINE_OLD),
+        )
+        .unwrap();
+
+        recover_interrupted_swap(base.path());
+
+        assert_eq!(read_bin(base.path()), "old");
+    }
+
+    fn plant(root: &Path, body: &str) {
+        let bin = root.join(binary_rel());
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(bin, body).unwrap();
+    }
+
+    fn read_bin(root: &Path) -> String {
+        fs::read_to_string(root.join(binary_rel())).unwrap()
+    }
 
     #[test]
     fn a_free_engine_has_no_complaint() {

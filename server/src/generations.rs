@@ -323,9 +323,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        shardx_team_server::run_migrations_fk_safe(&pool)
-            .await
-            .unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
         pool
     }
 

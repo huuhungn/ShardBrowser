@@ -29,7 +29,7 @@ export function PsTopupModal({ order, onClose, onDone }: { order: PsOrder; onClo
       onClose={onClose}
       title={t("ps.addTraffic")}
       subtitle={t("ps.productOrder", { product: order.product_name, id: order.order_id })}
-      confirmLabel={busy ? "Buying…" : `Buy ${amount} GB`}
+      confirmLabel={busy ? t("busy.buying") : t("ps.buyNGb", { n: amount })}
       onConfirm={submit}
       isLoading={busy}
       cancelLabel={t("common.cancel")}

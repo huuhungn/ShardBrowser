@@ -134,6 +134,39 @@ impl Profile {
             .to_string()
     }
 
+    /// Whether the profile claims a device whose primary input is a finger.
+    pub fn claims_mobile(&self) -> bool {
+        let s = |path: [&str; 2]| {
+            self.config
+                .get(path[0])
+                .and_then(|v| v.get(path[1]))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
+        if self
+            .config
+            .get("client_hints")
+            .and_then(|c| c.get("mobile"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        s(["client_hints", "platform"]).starts_with("android")
+            || s(["navigator", "user_agent"]).contains("android")
+    }
+
+    /// Whether the profile claims a DESKTOP Linux machine. Android is excluded:
+    /// its platform string is Linux too, and a phone does have WebGPU.
+    pub fn claims_linux_desktop(&self) -> bool {
+        if self.claims_mobile() {
+            return false;
+        }
+        let platform = self.platform().to_ascii_lowercase();
+        platform.starts_with("linux") || platform.starts_with("x11")
+    }
+
     pub fn has_webgpu(&self) -> bool {
         self.config
             .get("webgpu")
@@ -208,7 +241,7 @@ impl FingerprintLibrary {
 }
 
 /// Normalise a profile config's spoofed Chrome version to `chromium_version`
-/// (e.g. "152.0.7977.65") so it always matches the running engine — bumps
+/// (e.g. "156.0.8078.48") so it always matches the running engine — bumps
 /// `navigator.user_agent` (Chrome/<major>.0.0.0) and the version fields in
 /// `client_hints`: brand_version / brand_full_version / chrome_build /
 /// chrome_patch (derived from the version) plus, when supplied, grease_brand /
@@ -300,4 +333,36 @@ pub fn user_data_dir(runtime: &Runtime, profile_id: &str, base: Option<&Path>) -
     let d = root.join(profile_id);
     fs::create_dir_all(&d)?;
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Profile;
+    use serde_json::json;
+
+    fn profile(config: serde_json::Value) -> Profile {
+        Profile::new(config, Some("t".into()))
+    }
+
+    #[test]
+    fn desktop_linux_is_claimed_by_its_platform() {
+        let p = profile(json!({ "navigator": { "platform": "Linux x86_64" } }));
+        assert!(p.claims_linux_desktop());
+        assert!(!p.claims_mobile());
+        let p = profile(json!({ "navigator": { "platform": "Win32" } }));
+        assert!(!p.claims_linux_desktop());
+    }
+
+    #[test]
+    fn android_is_mobile_not_desktop_linux() {
+        for cfg in [
+            json!({ "navigator": { "platform": "Linux armv81" }, "client_hints": { "mobile": true } }),
+            json!({ "navigator": { "platform": "Linux armv81" }, "client_hints": { "platform": "Android" } }),
+            json!({ "navigator": { "platform": "Linux armv81", "user_agent": "Mozilla/5.0 (Linux; Android 14)" } }),
+        ] {
+            let p = profile(cfg);
+            assert!(p.claims_mobile());
+            assert!(!p.claims_linux_desktop());
+        }
+    }
 }

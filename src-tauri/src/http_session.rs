@@ -84,9 +84,9 @@ fn client_for(profile_id: &str) -> Result<reqwest::Client> {
         .cookie_store(true);
 
     if let Some(entry) = bound.as_ref() {
-        // `to_proxy_server_arg` percent-encodes credentials and is what the
-        // browser itself is launched with, so the two cannot drift apart.
-        let url = entry.to_proxy_server_arg();
+        // The engine itself may go through the #100 relay; this client talks
+        // to the proxy directly with the same stored credentials.
+        let url = entry.reqwest_proxy_url("socks5");
         let proxy = reqwest::Proxy::all(&url).with_context(|| {
             crate::errcode::code_with(
                 "http.proxyUnusable",

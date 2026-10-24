@@ -19,13 +19,13 @@ from typing import Callable, Optional
 import httpx
 
 PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev"
-CHROMIUM_VERSION = "152.0.7977.65"
+CHROMIUM_VERSION = "156.0.8078.48"
 # This SDK's own version, compared against the manifest's `min_sdk_version`.
-SDK_VERSION = "2.0.2"
+SDK_VERSION = "2.1.0"
 # Version manifest (GitHub raw) — one tiny GET tells us every archive's current
 # etag, so we never poll R2/S3 (no per-archive HEAD). Updated archives are then
 # pulled from PUB_BASE only when their etag changed.
-MANIFEST_URL = "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json"
+MANIFEST_URL = "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json"
 
 # Default cache: ~/Library/Application Support/shardx-sdk (mac),
 # %LOCALAPPDATA%\shardx-sdk (win), ~/.cache/shardx-sdk (linux).
@@ -99,7 +99,7 @@ def apply_engine_version(
     tls: Optional[dict] = None,
 ) -> None:
     """Normalise a profile config's spoofed Chrome version to `chromium_version`
-    (e.g. "152.0.7977.65") so it always matches the running engine — bumps
+    (e.g. "156.0.8078.48") so it always matches the running engine — bumps
     `navigator.user_agent` (Chrome/<major>.0.0.0) and the version fields in
     `client_hints`: brand_version / brand_full_version / chrome_build /
     chrome_patch (derived from the version) plus, when supplied, grease_brand /
@@ -262,7 +262,7 @@ class Runtime:
         """Build stamp on disk: `<engine>/shardx-build` when the archive ships
         one, else what was recorded at install time."""
         try:
-            stamp = (self.root / self._spec.binary_subpath[0] / "shardx-build").read_text().strip()
+            stamp = (self.root / self._spec.binary_subpath[0] / "shardx-build").read_text(encoding="utf-8").strip()
             if stamp:
                 return stamp
         except OSError:
@@ -280,12 +280,12 @@ class Runtime:
 
     def _load_manifest(self) -> dict:
         try:
-            return json.loads(self.manifest_path.read_text())
+            return json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
 
     def _save_manifest(self, m: dict) -> None:
-        self.manifest_path.write_text(json.dumps(m, indent=2))
+        self.manifest_path.write_text(json.dumps(m, indent=2), encoding="utf-8")
 
     # ---- install ----
 

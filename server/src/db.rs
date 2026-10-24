@@ -23,10 +23,7 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
 
-    // 0009 rebuilds v2_tenants and refuses to run while foreign keys are on.
-    // sqlx 0.8 opens a transaction before the SQL file, so the pragma has to
-    // be cleared on this connection before Migrator::run starts.
-    shardx_team_server::run_migrations_fk_safe(&pool).await?;
+    shardx_team_server::run_migrations(&pool).await?;
     Ok(pool)
 }
 
@@ -191,9 +188,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        shardx_team_server::run_migrations_fk_safe(&pool)
-            .await
-            .unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
         pool
     }
 

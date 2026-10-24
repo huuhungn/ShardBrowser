@@ -1,6 +1,6 @@
 [package]
 name = "shardx-launcher"
-version = "2.2.10"
+version = "2.4.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -35,6 +35,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "json", "cookies"] }
 base64 = "0.22"
+# Proxy relay (#100) dials HTTPS proxies itself; same versions and ring
+# backend reqwest's rustls-tls already locks, so no new crates.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 # Local automation HTTP API (axum) + JWT bearer auth.
 axum = "0.7"
 jsonwebtoken = "9"
@@ -53,7 +57,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 # Self-bootstrapping runtime: zip extraction of the chrome bundle
 # downloaded from Cloudflare R2 on first launch (src/runtime.rs).
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Per-profile window icon: superellipse + text. Pure Rust, no C deps.
 tiny-skia = "0.11"

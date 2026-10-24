@@ -41,6 +41,7 @@ from patchright.async_api import Browser as PatchrightBrowser, async_playwright
 from .auto_resolve import has_auto_fields, resolve_auto_fields
 from .browser import Browser, BrowserSession
 from .geo import GeoInfo, geo_check_via
+from .motion import Motion
 from .host import (
     host_logical_cores,
     host_ram_bucket_gb,
@@ -102,12 +103,22 @@ class ShardX:
     # you can reopen the exact same profile later or delete it.
 
     def create_profile(
-        self, template: Optional[str] = None, *, platform: Optional[str] = None
+        self,
+        template: Optional[str] = None,
+        *,
+        platform: Optional[str] = None,
+        refresh_rate: Optional[int] = None,
     ) -> Profile:
         """Create a new persistent profile from a library template (or a random
         one when `template` is None), enriched with randomized hardware +
         platform_version under a fresh unique id, and frozen to disk. Launch it
-        with `launch(profile, randomize=False)`."""
+        with `launch(profile, randomize=False)`.
+
+        `refresh_rate` is how often the claimed display refreshes, in Hz. No web
+        API reports it; a page measures it by timing requestAnimationFrame, so
+        leaving it out is not neutral — the engine then claims 60, which is what
+        most machines report, instead of the host's own screen. Frames can only
+        be slowed, so a rate above the host's panel runs at the panel's."""
         self.runtime.install()
         if template is None:
             config = dict(self.random_profile(platform=platform).config)
@@ -117,6 +128,16 @@ class ShardX:
         # Seed hardware by the new id so the pick is stable across reopens.
         randomize_hardware(config, profile_id=pid)
         randomize_platform_version(config)
+        if refresh_rate is not None:
+            if (
+                isinstance(refresh_rate, bool)
+                or not isinstance(refresh_rate, int)
+                or not 24 <= refresh_rate <= 480
+            ):
+                raise ValueError(f"refresh_rate must be an integer 24..480, got {refresh_rate!r}")
+            screen = dict(config.get("screen") or {})
+            screen["refresh_rate"] = refresh_rate
+            config["screen"] = screen
         profile = Profile(config, id=pid)
         self.save_profile(profile)
         return profile
@@ -262,5 +283,6 @@ __all__ = [
     "apply_screen_strategy", "default_mode_for",
     "GeoInfo", "geo_check_via",
     "has_auto_fields", "resolve_auto_fields",
+    "Motion",
 ]
-__version__ = "2.0.2"
+__version__ = "2.1.0"

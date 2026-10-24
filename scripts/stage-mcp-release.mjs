@@ -7,6 +7,7 @@ export const MCP_RELEASE_FILES = [
   "challenge.js",
   "challenge.test.js",
   "contract.test.js",
+  "fixtures/v0.1.28-tools.json",
   "safe-open-lifecycle.js",
   "safe-open-lifecycle.test.js",
   "verification-checkpoint.js",

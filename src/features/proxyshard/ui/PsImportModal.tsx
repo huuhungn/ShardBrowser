@@ -104,7 +104,7 @@ export function PsImportModal({ order, onClose }: { order: PsOrder; onClose: () 
       onClose={onClose}
       title={t("ps.addProxiesTitle", { product: order.product_name, id: order.order_id })}
       maxWidthClassName="max-w-[880px]"
-      confirmLabel={saving ? "Adding…" : `Add ${sel.size}`}
+      confirmLabel={saving ? t("busy.adding") : t("ps.addN", { n: sel.size })}
       onConfirm={save}
       isLoading={saving}
       isDisabled={saving || !items || sel.size === 0}

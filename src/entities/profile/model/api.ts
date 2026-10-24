@@ -11,6 +11,8 @@ export const profileDelete = (id: string) => invoke("profile_delete", { id });
 export const profileClone = (id: string) => invoke<ProfileMeta>("profile_clone", { id });
 export const profileSetPin = (id: string, pinned: boolean) => invoke("profile_set_pin", { id, pinned });
 export const profileSetFolder = (id: string, folder: string) => invoke("profile_set_folder", { id, folder });
+/** Returns the tags as stored: trimmed, deduplicated, spelled like existing tags. */
+export const profileSetTags = (id: string, tags: string[]) => invoke<string[]>("profile_set_tags", { id, tags });
 export const profileBindProxy = (profileId: string, proxyId: string | null) => invoke("profile_bind_proxy", { profileId, proxyId });
 export const profileImport = (payloads: any[]) => invoke<number>("profile_import", { payloads });
 export const profileCreateFromTemplate = (templateId: string) => invoke<ProfileMeta>("profile_create_from_template", { templateId });
@@ -31,6 +33,8 @@ export const devtoolsActivate = (profileId: string) =>
   invoke<DevtoolsTarget>("devtools_activate", { profileId });
 export const processKill = (profileId: string) => invoke<boolean>("process_kill", { profileId });
 export const launch = (profileId: string) => invoke<number>("launch", { profileId });
+/** Stop a launch that has not started its browser yet. */
+export const launchCancel = (profileId: string) => invoke("launch_cancel", { profileId });
 
 /** A group of profiles that mirror each other's input. Returns the group name. */
 export const syncLaunch = (profileIds: string[], group?: string) =>

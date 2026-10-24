@@ -36,6 +36,22 @@ pub struct ProxyEntry {
 }
 
 impl ProxyEntry {
+    /// Two entries are the same proxy only when the whole connection tuple
+    /// matches. The password is part of it: with some providers it carries the
+    /// session or the routing, so the same host/port/user with a different
+    /// password is a different exit.
+    fn same_connection(&self, other: &ProxyEntry) -> bool {
+        self.same_login(other) && self.password == other.password
+    }
+
+    /// Same endpoint and the same login; the password may differ.
+    fn same_login(&self, other: &ProxyEntry) -> bool {
+        self.kind == other.kind
+            && self.host == other.host
+            && self.port == other.port
+            && self.username == other.username
+    }
+
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port` for ShardX.
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
@@ -53,6 +69,39 @@ impl ProxyEntry {
                 url::form_urlencoded::byte_serialize(self.password.as_bytes()).collect::<String>();
             format!("{scheme}://{user}:{pass}@{host_port}")
         }
+    }
+
+    /// Proxy URL for the launcher's own `reqwest` clients. `reqwest`
+    /// percent-decodes the userinfo, so every byte outside the unreserved set
+    /// is written as `%XX` — `form_urlencoded` turns a space into `+`, which
+    /// `reqwest` would then send literally. `socks_scheme` picks `socks5` or
+    /// `socks5h` for SOCKS5 entries.
+    pub fn reqwest_proxy_url(&self, socks_scheme: &str) -> String {
+        let scheme = match self.kind {
+            ProxyKind::Socks5 => socks_scheme,
+            ProxyKind::Http => "http",
+            ProxyKind::Https => "https",
+        };
+        let host_port = format!("{}:{}", self.host, self.port);
+        if self.username.is_empty() && self.password.is_empty() {
+            return format!("{scheme}://{host_port}");
+        }
+        let encode = |s: &str| {
+            s.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>()
+        };
+        format!(
+            "{scheme}://{}:{}@{host_port}",
+            encode(&self.username),
+            encode(&self.password)
+        )
     }
 }
 
@@ -95,15 +144,10 @@ pub fn upsert(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     Ok(entry)
 }
 
-/// Upsert that reuses an entry with the same kind/host/port/username.
+/// Upsert that reuses an entry with the same connection tuple.
 pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     let mut s = load()?;
-    if let Some(existing) = s.proxies.iter().find(|p| {
-        p.kind == entry.kind
-            && p.host == entry.host
-            && p.port == entry.port
-            && p.username == entry.username
-    }) {
+    if let Some(existing) = s.proxies.iter().find(|p| p.same_connection(&entry)) {
         return Ok(existing.clone());
     }
     if entry.id.is_empty() {
@@ -112,6 +156,48 @@ pub fn upsert_dedup(mut entry: ProxyEntry) -> Result<ProxyEntry> {
     s.proxies.push(entry.clone());
     save(&s)?;
     Ok(entry)
+}
+
+/// Where `entry` lands when a profile already bound to `bound_id` is given it.
+///
+/// An exact copy already in the store is reused, as in `upsert_dedup`. Failing
+/// that, when the bound entry is the same endpoint and login with another
+/// password, the new password is a change to that proxy rather than a second
+/// one: the bound entry takes it and keeps its id, name, country and notes, so
+/// the profile stays bound and nothing is left behind with the old password.
+/// Anything else is a different proxy and is added. Returns the entry the
+/// profile should be bound to and whether the store changed.
+fn place_for_binding(
+    store: &mut Vec<ProxyEntry>,
+    mut entry: ProxyEntry,
+    bound_id: Option<&str>,
+) -> (ProxyEntry, bool) {
+    if let Some(existing) = store.iter().find(|p| p.same_connection(&entry)) {
+        return (existing.clone(), false);
+    }
+    let bound = bound_id
+        .filter(|id| !id.is_empty())
+        .and_then(|id| store.iter_mut().find(|p| p.id == id));
+    if let Some(bound) = bound.filter(|p| p.same_login(&entry)) {
+        bound.password = entry.password;
+        return (bound.clone(), true);
+    }
+    if entry.id.is_empty() {
+        entry.id = uuid::Uuid::new_v4().to_string();
+    }
+    store.push(entry.clone());
+    (entry, true)
+}
+
+/// `upsert_dedup` for a profile that may already be bound to a proxy; a new
+/// password for the bound endpoint and login updates that proxy in place.
+pub fn upsert_for_binding(entry: ProxyEntry, bound_id: Option<&str>) -> Result<ProxyEntry> {
+    let mut s = load()?;
+    let (placed, changed) = place_for_binding(&mut s.proxies, entry, bound_id);
+    if changed {
+        save(&s)?;
+    }
+    Ok(placed)
 }
 
 pub fn delete(id: &str) -> Result<()> {
@@ -131,7 +217,17 @@ pub fn get(id: &str) -> Result<Option<ProxyEntry>> {
 }
 
 /// SOCKS5/HTTP CONNECT probe; returns RTT in ms on success.
+/// The whole test, greeting to reply: a proxy that accepts and then stalls must
+/// fail rather than hold the Test button forever.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
+    tokio::time::timeout(TEST_DEADLINE, probe_inner(entry))
+        .await
+        .context(errcode::code("proxy.readTimeout"))?
+}
+
+async fn probe_inner(entry: &ProxyEntry) -> Result<u128> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::time::{timeout, Duration, Instant};
@@ -154,7 +250,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
             if resp[0] != 0x05 {
-                anyhow::bail!("not SOCKS5");
+                anyhow::bail!("{}", errcode::code("proxy.notSocks5"));
             }
             if resp[1] == 0xFF {
                 anyhow::bail!("{}", errcode::code("proxy.authRefused"));
@@ -170,8 +266,25 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 let mut auth_resp = [0u8; 2];
                 stream.read_exact(&mut auth_resp).await?;
                 if auth_resp[1] != 0x00 {
-                    anyhow::bail!("auth failed");
+                    anyhow::bail!("{}", errcode::code("proxy.authRefused"));
                 }
+            }
+            // A greeting proves only that something speaks SOCKS5 on the port.
+            // Ask it to reach a real host, as the browser will; a proxy whose
+            // upstream is dead used to pass here (upstream 081770c,
+            // "proxy-checker").
+            let host = b"example.com";
+            let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+            req.extend_from_slice(host);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            stream.write_all(&req).await?;
+            let mut reply = [0u8; 2];
+            stream.read_exact(&mut reply).await?;
+            if reply[1] != 0x00 {
+                anyhow::bail!(
+                    "{}",
+                    errcode::code_with("proxy.socksRefused", &[("code", &reply[1].to_string())])
+                );
             }
         }
         ProxyKind::Http | ProxyKind::Https => {
@@ -322,24 +435,28 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
     })
 }
 
-/// Save many entries; returns count actually persisted (deduped on host:port:user).
-pub fn bulk_save(entries: Vec<ProxyEntry>) -> Result<usize> {
-    let mut store_data = load()?;
+/// Append the entries that are not already present; returns how many landed.
+/// Split out of `bulk_save` so the rule can be tested without a store on disk.
+fn append_new(existing: &mut Vec<ProxyEntry>, incoming: Vec<ProxyEntry>) -> usize {
     let mut added = 0usize;
-    for mut e in entries {
-        let dup = store_data
-            .proxies
-            .iter()
-            .any(|x| x.host == e.host && x.port == e.port && x.username == e.username);
-        if dup {
+    for mut e in incoming {
+        if existing.iter().any(|x| x.same_connection(&e)) {
             continue;
         }
         if e.id.is_empty() {
             e.id = uuid::Uuid::new_v4().to_string();
         }
-        store_data.proxies.push(e);
+        existing.push(e);
         added += 1;
     }
+    added
+}
+
+/// Save many entries; returns count actually persisted. Same duplicate rule as
+/// `upsert_dedup`, so a bulk import and an API add agree about what is a copy.
+pub fn bulk_save(entries: Vec<ProxyEntry>) -> Result<usize> {
+    let mut store_data = load()?;
+    let added = append_new(&mut store_data.proxies, entries);
     save(&store_data)?;
     Ok(added)
 }
@@ -521,20 +638,8 @@ pub async fn geo_check_via(
 
     let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8));
     if let Some(entry) = entry {
-        let scheme = match entry.kind {
-            ProxyKind::Socks5 => "socks5h", // DNS via proxy
-            ProxyKind::Http => "http",
-            ProxyKind::Https => "https",
-        };
-        let proxy_url = if entry.username.is_empty() && entry.password.is_empty() {
-            format!("{scheme}://{}:{}", entry.host, entry.port)
-        } else {
-            let user =
-                url::form_urlencoded::byte_serialize(entry.username.as_bytes()).collect::<String>();
-            let pass =
-                url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
-            format!("{scheme}://{user}:{pass}@{}:{}", entry.host, entry.port)
-        };
+        // socks5h: DNS via proxy.
+        let proxy_url = entry.reqwest_proxy_url("socks5h");
         let proxy = reqwest::Proxy::all(&proxy_url).context(errcode::code("proxy.badUrl"))?;
         builder = builder.proxy(proxy);
     } else {
@@ -905,7 +1010,185 @@ pub fn country_to_timezone(cc: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bulk, ProxyKind};
+    use super::*;
+
+    fn entry(user: &str, pass: &str) -> ProxyEntry {
+        ProxyEntry {
+            id: String::new(),
+            name: format!("{user}@proxy.example.com"),
+            kind: ProxyKind::Socks5,
+            host: "proxy.example.com".into(),
+            port: 1080,
+            username: user.into(),
+            password: pass.into(),
+            country: String::new(),
+            notes: String::new(),
+        }
+    }
+
+    /// A one-connection SOCKS5 server on loopback: no-auth greeting, then
+    /// answers the CONNECT with `reply` (0x00 = succeeded, 0x05 = refused),
+    /// or never answers it when `reply` is None.
+    async fn socks5_server(reply: Option<u8>) -> ProxyEntry {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            s.read_exact(&mut greet).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 256];
+            let _ = s.read(&mut req).await;
+            match reply {
+                Some(rep) => {
+                    let _ = s
+                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+                None => tokio::time::sleep(std::time::Duration::from_secs(120)).await,
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        ProxyEntry {
+            host: "127.0.0.1".into(),
+            port,
+            ..entry("", "")
+        }
+    }
+
+    /// A SOCKS5 proxy that takes the sign-in but cannot reach anything used to
+    /// test as working: the probe stopped after the greeting.
+    #[tokio::test]
+    async fn a_socks5_proxy_that_refuses_the_connect_fails_its_test() {
+        let p = socks5_server(Some(0x05)).await;
+        let err = probe(&p)
+            .await
+            .expect_err("a refused CONNECT is a dead proxy");
+        assert!(format!("{err:#}").contains("proxy.socksRefused"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_socks5_proxy_that_connects_passes_its_test() {
+        let p = socks5_server(Some(0x00)).await;
+        probe(&p).await.expect("CONNECT succeeded");
+    }
+
+    #[tokio::test]
+    async fn a_socks5_proxy_that_never_answers_the_connect_times_out() {
+        let p = socks5_server(None).await;
+        let started = std::time::Instant::now();
+        assert!(probe(&p).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    /// #72: the password carries the session with some providers, so two
+    /// entries that differ only there are two proxies, not one.
+    #[test]
+    fn a_different_password_is_a_different_proxy() {
+        let mut store = Vec::new();
+        let added = append_new(
+            &mut store,
+            vec![entry("user", "pass-a"), entry("user", "pass-b")],
+        );
+        assert_eq!(added, 2);
+        assert_eq!(store.len(), 2);
+        assert_ne!(store[0].id, store[1].id);
+    }
+
+    /// The other half: an exact copy is still skipped.
+    #[test]
+    fn an_identical_entry_is_still_skipped() {
+        let mut store = Vec::new();
+        assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 1);
+        assert_eq!(append_new(&mut store, vec![entry("user", "pass")]), 0);
+        assert_eq!(store.len(), 1);
+    }
+
+    fn stored(id: &str, user: &str, pass: &str) -> ProxyEntry {
+        ProxyEntry {
+            id: id.into(),
+            name: "kept name".into(),
+            country: "PL".into(),
+            notes: "kept note".into(),
+            ..entry(user, pass)
+        }
+    }
+
+    /// A new password for the bound endpoint and login is a change to that
+    /// proxy: same id, same metadata, new password, nothing added.
+    #[test]
+    fn a_new_password_updates_the_bound_entry() {
+        let mut store = vec![stored("bound", "user", "old")];
+        let (placed, changed) = place_for_binding(&mut store, entry("user", "new"), Some("bound"));
+        assert!(changed);
+        assert_eq!(store.len(), 1);
+        assert_eq!(placed.id, "bound");
+        assert_eq!(store[0].password, "new");
+        assert_eq!(
+            (
+                store[0].name.as_str(),
+                store[0].country.as_str(),
+                store[0].notes.as_str()
+            ),
+            ("kept name", "PL", "kept note")
+        );
+    }
+
+    /// An exact copy elsewhere in the store wins: rebinding to it creates
+    /// nothing, and the bound entry is not turned into a second copy of it.
+    #[test]
+    fn an_exact_copy_is_reused_before_the_bound_entry_is_touched() {
+        let mut store = vec![
+            stored("bound", "user", "old"),
+            stored("other", "user", "new"),
+        ];
+        let (placed, changed) = place_for_binding(&mut store, entry("user", "new"), Some("bound"));
+        assert!(!changed);
+        assert_eq!(placed.id, "other");
+        assert_eq!(store.len(), 2);
+        assert_eq!(store[0].password, "old");
+    }
+
+    /// Only the password is a change in place. Another login, another scheme,
+    /// or no bound entry at all is a different proxy and is added.
+    #[test]
+    fn anything_but_the_password_is_still_a_new_proxy() {
+        let mut other_user = vec![stored("bound", "user", "old")];
+        let (placed, _) =
+            place_for_binding(&mut other_user, entry("someone", "new"), Some("bound"));
+        assert_ne!(placed.id, "bound");
+        assert_eq!(other_user.len(), 2);
+        assert_eq!(other_user[0].password, "old");
+
+        let mut other_scheme = vec![stored("bound", "user", "old")];
+        let http = ProxyEntry {
+            kind: ProxyKind::Http,
+            ..entry("user", "new")
+        };
+        place_for_binding(&mut other_scheme, http, Some("bound"));
+        assert_eq!(other_scheme.len(), 2);
+        assert_eq!(other_scheme[0].password, "old");
+
+        let mut unbound = vec![stored("kept", "user", "old")];
+        place_for_binding(&mut unbound, entry("user", "new"), None);
+        assert_eq!(unbound.len(), 2, "with no binding, #72 still applies");
+        assert_eq!(unbound[0].password, "old");
+    }
+
+    /// `bulk_save` used to ignore `kind`, so an HTTP and a SOCKS5 entry on one
+    /// endpoint collapsed into whichever was imported first.
+    #[test]
+    fn the_scheme_is_part_of_the_identity() {
+        let socks = entry("user", "pass");
+        let mut http = entry("user", "pass");
+        http.kind = ProxyKind::Http;
+        assert!(!socks.same_connection(&http));
+
+        let mut store = Vec::new();
+        assert_eq!(append_new(&mut store, vec![socks.clone(), http]), 2);
+        assert_eq!(append_new(&mut store, vec![socks]), 0);
+    }
 
     #[test]
     fn bulk_import_accepts_name_tag() {

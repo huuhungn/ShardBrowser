@@ -1,7 +1,7 @@
 # Independent third Architect review: ADR 0001
 
 - **Review date:** 2026-10-04
-- **Reviewed source:** isolated archive snapshot `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-rereview-a2d92d2d5510` of baseline commit `62979f297e44fc92e592e75ac1b3b3b903462f29`, with only `docs/adr/0001-server-identity-and-tenant-bootstrap.md` overlaid as the review candidate. The archive is not a Git checkout; this review does not claim its HEAD is a new commit.
+- **Reviewed source:** isolated archive snapshot `<reviewer-scratch>/adr0001-rereview-a2d92d2d5510` of baseline commit `62979f297e44fc92e592e75ac1b3b3b903462f29`, with only `docs/adr/0001-server-identity-and-tenant-bootstrap.md` overlaid as the review candidate. The archive is not a Git checkout; this review does not claim its HEAD is a new commit.
 - **ADR SHA-256:** `a2d92d2d5510b0fc1733e687d998870eb82abb97cf1d923cdc7678f28f4885f7` (**1,350 lines**).
 - **Frozen plan SHA-256:** `a4a136c9ff0358fdce0967f7c09d7f7a744bbf33aac3db2ce8475972453eb813`.
 - **Independent G2 verdict SHA-256:** `392ad5b34a0ea5efd2b514f85fd57e2a92451e6e97434792b376c3179a03bd1f`.

@@ -3,14 +3,16 @@ import { DialogModal, Select, Textarea } from "@proxyshard/shardx-ui-kit";
 import { toast } from "../../../shared/model/toast";
 import type { ProfileMeta } from "../../../entities/profile";
 import type { ProxyEntry } from "../../../entities/proxy";
-import { profileBindProxy, profileGet, profileSave } from "../../../entities/profile";
+import { profileBindProxy, profileGet, profileSave, profileSetTags } from "../../../entities/profile";
+import { useTags } from "../../../entities/tag";
+import { TagsField, withPendingTag } from "./TagsField";
 import { useT } from "../../../shared/i18n";
 import { safeUiError } from "../../../shared/lib/utils";
 
 export function QuickEditDialog({
   kind, profile, proxies, onClose, onSaved,
 }: {
-  kind: "proxy" | "notes";
+  kind: "proxy" | "notes" | "tags";
   profile: ProfileMeta;
   proxies: ProxyEntry[];
   onClose: () => void;
@@ -19,6 +21,9 @@ export function QuickEditDialog({
   const t = useT();
   const [proxyId, setProxyId] = useState<string | null>(profile.proxy_id);
   const [notes, setNotes] = useState(profile.notes);
+  const [tags, setTags] = useState(profile.tags);
+  const [tagQuery, setTagQuery] = useState("");
+  const knownTags = useTags((s) => s.tags);
 
   const saveProxy = async () => {
     try {
@@ -39,13 +44,24 @@ export function QuickEditDialog({
     } catch (e) { toast.err(safeUiError(e)); }
   };
 
+  const saveTags = async () => {
+    try {
+      await profileSetTags(profile.id, withPendingTag(tags, tagQuery, knownTags));
+      toast.ok(t("tag.saved"));
+      onSaved();
+    } catch (e) { toast.err(safeUiError(e)); }
+  };
+
+  const title = kind === "proxy" ? t("profile.bindProxy") : kind === "notes" ? t("profile.editNotes") : t("tag.editTags");
+  const save = kind === "proxy" ? saveProxy : kind === "notes" ? saveNotes : saveTags;
+
   return (
     <DialogModal
       open
       onClose={onClose}
-      title={`${kind === "proxy" ? t("profile.bindProxy") : t("profile.editNotes")} — ${profile.name}`}
+      title={`${title} — ${profile.name}`}
       confirmLabel={t("common.save")}
-      onConfirm={kind === "proxy" ? saveProxy : saveNotes}
+      onConfirm={save}
       cancelLabel={t("common.cancel")}
       onCancel={onClose}
     >
@@ -65,6 +81,8 @@ export function QuickEditDialog({
               })),
             ]}
           />
+        ) : kind === "tags" ? (
+          <TagsField value={tags} onChange={setTags} query={tagQuery} onQuery={setTagQuery} />
         ) : (
           <Textarea
             label={t("common.notes")}

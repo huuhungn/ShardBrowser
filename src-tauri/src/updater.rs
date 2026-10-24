@@ -134,6 +134,7 @@ pub async fn launcher_update_download(
 
 #[tauri::command]
 pub fn launcher_update_install(pending: State<'_, PendingUpdate>) -> Result<(), String> {
+    refuse_while_browsers_run(crate::process::Tracker::shared().running().len())?;
     let (update, bytes) = {
         let mut state = lock_pending(&pending)?;
         if state.downloading {
@@ -163,8 +164,33 @@ pub fn launcher_update_install(pending: State<'_, PendingUpdate>) -> Result<(), 
 }
 
 #[tauri::command]
-pub fn launcher_update_restart(app: AppHandle) {
+pub fn launcher_update_restart(app: AppHandle) -> Result<(), String> {
+    refuse_while_browsers_run(crate::process::Tracker::shared().running().len())?;
     app.restart();
+}
+
+/// Installing or restarting ends this process, which would orphan the browsers it started.
+fn refuse_while_browsers_run(running: usize) -> Result<(), String> {
+    if running == 0 {
+        return Ok(());
+    }
+    Err(crate::errcode::code_with(
+        "updater.closeBrowsersFirst",
+        &[("n", &running.to_string())],
+    ))
+}
+
+#[cfg(test)]
+mod refuse_tests {
+    #[test]
+    fn an_update_waits_until_no_browser_runs() {
+        assert!(super::refuse_while_browsers_run(0).is_ok());
+        let err = super::refuse_while_browsers_run(2).unwrap_err();
+        assert!(
+            err.contains("updater.closeBrowsersFirst") && err.contains("n=2"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(test)]

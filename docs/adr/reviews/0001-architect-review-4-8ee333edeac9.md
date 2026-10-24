@@ -9,9 +9,9 @@
 
 | Artifact | Identity | SHA-256 |
 |---|---|---|
-| Candidate ADR | `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-rereview-8ee333edeac9/docs/adr/0001-server-identity-and-tenant-bootstrap.md` | `8ee333edeac94378fe210258808248ad32f85b0261d0691220b48944973c5d68` |
-| Frozen plan | `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-rereview-8ee333edeac9/.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md` | `a4a136c9ff0358fdce0967f7c09d7f7a744bbf33aac3db2ce8475972453eb813` |
-| Prior review | `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-rereview-8ee333edeac9/docs/adr/reviews/0001-architect-review-3-a2d92d2d5510.md` | `69bb2088c20954a48221efb695c33adafa5348fed945d008500224c606250feb` |
+| Candidate ADR | `<reviewer-scratch>/adr0001-rereview-8ee333edeac9/docs/adr/0001-server-identity-and-tenant-bootstrap.md` | `8ee333edeac94378fe210258808248ad32f85b0261d0691220b48944973c5d68` |
+| Frozen plan | `<reviewer-scratch>/adr0001-rereview-8ee333edeac9/.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md` | `a4a136c9ff0358fdce0967f7c09d7f7a744bbf33aac3db2ce8475972453eb813` |
+| Prior review | `<reviewer-scratch>/adr0001-rereview-8ee333edeac9/docs/adr/reviews/0001-architect-review-3-a2d92d2d5510.md` | `69bb2088c20954a48221efb695c33adafa5348fed945d008500224c606250feb` |
 | Baseline approved commit | Provided review identity | `3f9f1573b99340474662720c19b0873adcc03ff7` |
 | Baseline ADR | Provided review identity | `a2d92d2d5510b0fc1733e687d998870eb82abb97cf1d923cdc7678f28f4885f7` |
 

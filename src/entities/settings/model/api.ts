@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Settings, ApiInfo, DataRootInfo, StartupStatus, McpStatus, CodexMcpStatus, HermesMcpStatus } from "./types";
 
 export const settingsGet = () => invoke<Settings>("settings_get");
+/** Why settings.json could not be read; null while it reads fine. */
+export const settingsLoadError = () => invoke<string | null>("settings_load_error");
 export const settingsSave = (value: Settings) => invoke("settings_save", { value });
 export const apiInfo = () => invoke<ApiInfo>("api_info");
 export const apiRegenerateToken = () => invoke<ApiInfo>("api_regenerate_token");

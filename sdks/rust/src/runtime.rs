@@ -14,13 +14,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 pub const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-pub const CHROMIUM_VERSION: &str = "152.0.7977.65";
+pub const CHROMIUM_VERSION: &str = "156.0.8078.48";
 /// This SDK's own version, compared against the manifest's `min_sdk_version`.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Version manifest (GitHub raw) — one tiny GET yields every archive's current
 /// etag, so we never poll R2/S3 (no per-archive HEAD).
 pub const MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json";
+    "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 
 const FINGERPRINTS_KEY: &str = "ShardX-Fingerprints.zip";
 const FINGERPRINTS_TOP_DIR: &str = "shardx-fingerprints";

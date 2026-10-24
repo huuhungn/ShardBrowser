@@ -1,6 +1,161 @@
 {
   "releases": [
     {
+      "version": "2.4.1",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "narrow-window-toolbar",
+          "title": "Thanh công cụ vừa cửa sổ hẹp",
+          "lead": "Chọn hồ sơ không còn đẩy nút ra khỏi màn hình.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khi chọn hồ sơ trong cửa sổ hẹp, thanh công cụ từng đẩy nút Từ mẫu và Hồ sơ mới ra khỏi màn hình và bóp hẹp các tab thư mục. Giờ nó xuống dưới hàng tab và tự xuống dòng. Thanh công cụ ở trang Proxy cũng tự xuống dòng như vậy."
+            },
+            {
+              "type": "note",
+              "text": "Bản này cũng có bản vá bảo mật cho hai thư viện: body-parser trong máy chủ MCP và undici trong Node SDK. Engine trình duyệt không đổi."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.0",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "profile-tags",
+          "title": "Gắn tag cho hồ sơ",
+          "lead": "Gom nhóm hồ sơ xuyên thư mục bằng tag, tìm và lọc được.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Mỗi hồ sơ vẫn nằm trong một thư mục, và giờ có thể mang thêm bao nhiêu tag tuỳ ý. Tag hiện thành chip dưới tên hồ sơ, ô tìm kiếm khớp cả tên tag, và Bộ lọc có thêm mục lọc theo Tag."
+            },
+            {
+              "type": "list",
+              "items": [
+                "Sửa tag của một hồ sơ từ menu của hàng, hoặc bấm vào các chip của nó.",
+                "Chọn nhiều hồ sơ rồi bấm Gắn tag trên thanh chọn để thêm một tag cho tất cả, hoặc bỏ tag đó khi mọi hồ sơ đều đã có. Hồ sơ đang chạy được bỏ qua.",
+                "Cài đặt → Tag cho phép đổi tên, đổi màu và xoá tag, và có thể hoàn tác khi xoá.",
+                "Automation API trả về tag của mọi hồ sơ, nhận tag khi tạo và sửa hồ sơ, và liệt kê tag tại GET /tags."
+              ]
+            },
+            {
+              "type": "note",
+              "text": "Tag được lưu trong file của từng hồ sơ. Nếu quay về 2.3.x, hồ sơ sẽ mất tag vào lần đầu 2.3.x lưu hoặc khởi động nó."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.3.1",
+      "date": "2026-10-23",
+      "entries": [
+        {
+          "id": "update-waits-for-browsers",
+          "title": "Cập nhật chờ bạn đóng trình duyệt",
+          "lead": "Cài bản cập nhật không còn bỏ lại các trình duyệt đang chạy.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khi cài bản cập nhật launcher, hoặc khởi động lại để cập nhật, launcher giờ chờ tới khi các trình duyệt do ShardX mở đã đóng, giống như khi thoát. Trước đây, bản cập nhật tắt launcher và để các trình duyệt đó chạy mà không còn launcher quản lý."
+            },
+            {
+              "type": "note",
+              "text": "Lần cập nhật từ 2.3.0 lên bản này vẫn chạy trình cài của 2.3.0, nên hãy đóng các hồ sơ trước khi cài. Việc chờ có hiệu lực từ lần cập nhật sau."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.3.0",
+      "date": "2026-10-22",
+      "entries": [
+        {
+          "id": "chromium-156",
+          "title": "Trình duyệt đã lên Chromium 156",
+          "lead": "Hồ sơ báo Chrome 156 và có các bản sửa engine từ ProxyShard 2.1.0.",
+          "tag": "new",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "User agent, client hints và bắt tay TLS của mọi hồ sơ chuyển sang Chrome 156 ở lần đầu mở launcher sau khi cập nhật. Engine mới chỉ tải một lần; hồ sơ vẫn giữ cookie, đăng nhập và lịch sử."
+            },
+            {
+              "type": "p",
+              "text": "Tải hỏng không còn làm máy mất trình duyệt. Engine mới được giải nén cạnh bản cũ và chỉ thay vào khi đã đầy đủ; nếu việc thay bị ngắt giữa chừng thì lần mở sau sẽ hoàn tác."
+            },
+            {
+              "type": "note",
+              "text": "Hồ sơ không dùng proxy giờ luôn đi thẳng. Trước đây nó đi theo proxy đặt trong Windows, lệch với múi giờ và vị trí đã tính cho hồ sơ. Proxy ghi trong tham số bổ sung chung vẫn được ưu tiên."
+            }
+          ]
+        },
+        {
+          "id": "human-input",
+          "title": "Nhấp và gõ kiểu người thật chạy được qua CDP",
+          "lead": "Công cụ MCP human_click và human_type lại gọi được miền Motion của engine.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Engine chỉ trả lời miền Motion khi trình duyệt được mở kèm một công tắc tự động hóa mà launcher này chưa từng truyền, nên mọi cú nhấp và phím gõ kiểu người đều hỏng. Giờ mọi lần mở để tự động hóa đều truyền công tắc đó, và một bài kiểm tra mở engine đúng cách ấy để chứng minh miền này trả lời."
+            }
+          ]
+        },
+        {
+          "id": "cancel-start",
+          "title": "Huỷ một lần khởi động quá lâu",
+          "lead": "Khi hồ sơ còn đang khởi động, nút của nó dùng để huỷ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Kiểm tra proxy hoặc tra vị trí chậm có thể giữ hồ sơ ở trạng thái đang khởi động rất lâu. Bấm lại nút để huỷ; không trình duyệt nào mở và hàng đó không để lại lỗi."
+            },
+            {
+              "type": "p",
+              "text": "Launcher cũng không chịu thoát từ khay hệ thống hay khi đóng cửa sổ nếu còn trình duyệt do nó mở đang chạy, và cho biết còn bao nhiêu cái."
+            }
+          ]
+        },
+        {
+          "id": "reliability-2-3",
+          "title": "Ít cách làm mất hồ sơ hay cài đặt hơn",
+          "lead": "Các bản sửa lấy từ ProxyShard và từ các fork khác.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "list",
+              "items": [
+                "Hồ sơ còn mở trình duyệt không còn hiện là đang nghỉ, và nút Dừng vẫn đóng được nó.",
+                "Một byte hỏng trong file cài đặt không còn xoá sạch cài đặt; ứng dụng báo lỗi và để nguyên file.",
+                "Cửa sổ không còn trắng trơn trên mạng không bao giờ trả lời.",
+                "Proxy SOCKS5 không ra được internet giờ sẽ trượt bài kiểm tra.",
+                "Hồ sơ không có kích thước cửa sổ riêng sẽ mở vừa trong màn hình nó khai báo.",
+                "Đổi mật khẩu proxy qua API vẫn giữ hồ sơ gắn với proxy đó."
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.10",
       "date": "2026-09-25",
       "entries": [

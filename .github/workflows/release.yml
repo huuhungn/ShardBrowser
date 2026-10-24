@@ -48,7 +48,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Set up Rust SDK MSRV
-        uses: dtolnay/rust-toolchain@1.74.1
+        uses: dtolnay/rust-toolchain@1.88.0
 
       - name: Install frontend dependencies
         run: npm ci
@@ -83,9 +83,34 @@ jobs:
           # proc-macro that generates bindings at compile time, so the
           # parser never runs in a shipped binary. Drop these once a
           # wayland-scanner release relaxes the pin.
+          #
+          # RUSTSEC-2026-0367/0368/0369 (zip < 9) are ignored because
+          # tauri-plugin-updater, up to 2.14.0, still pulls zip 4. Its zip
+          # path runs only on Windows and only when the update payload is a
+          # zip; ours is a setup .exe. Either way the plugin extracts nothing
+          # until download() has checked the payload's minisign signature
+          # against the key in tauri.conf.json. The launcher's own zip is 9.
+          # The loop keeps that true: every zip below 9 must reach the
+          # lockfile through the updater alone. Drop all of this once an
+          # updater release moves to zip 9.
+          zips=$(awk '/^name = "zip"$/ { getline; gsub(/version = |"/, ""); print }' src-tauri/Cargo.lock)
+          # An empty parse would skip the check yet keep the ignores below.
+          [ -n "$zips" ] || { echo "no zip version found in src-tauri/Cargo.lock"; exit 1; }
+          for v in $zips; do
+            case "$v" in 9.*|[1-9][0-9]*.*) continue ;; esac
+            dependents=$(cargo +stable tree -q --manifest-path src-tauri/Cargo.toml --locked \
+              -i "zip@$v" --depth 1 --prefix none --target all | tail -n +2 | awk '{print $1}' | sort -u)
+            if [ "$dependents" != "tauri-plugin-updater" ]; then
+              echo "zip $v is reached by: $dependents"
+              exit 1
+            fi
+          done
           cargo +stable audit --file src-tauri/Cargo.lock \
             --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0367 \
+            --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369
           # shared builds into the launcher as shardx-core, and server is
           # published as a release asset, so both ship and both are audited.
           cargo +stable audit --file shared/Cargo.lock
@@ -102,8 +127,8 @@ jobs:
         run: |
           rm -f sdks/rust/Cargo.lock
           cargo +stable generate-lockfile --manifest-path sdks/rust/Cargo.toml
-          cargo +1.74.1 test --locked --manifest-path sdks/rust/Cargo.toml --all-features
-          cargo +1.74.1 test --locked --manifest-path sdks/rust/Cargo.toml --no-default-features
+          cargo +1.88.0 test --locked --manifest-path sdks/rust/Cargo.toml --all-features
+          cargo +1.88.0 test --locked --manifest-path sdks/rust/Cargo.toml --no-default-features
 
       - name: Install Linux dependencies for updater key verification
         run: |

@@ -2,7 +2,7 @@
 
 - **Review date:** 2026-10-04
 - **Reviewed commit:** `62979f297e44fc92e592e75ac1b3b3b903462f29`
-- **Review worktree:** `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-arch-review-62979f2`
+- **Review worktree:** `<reviewer-scratch>/adr0001-arch-review-62979f2`
 - **ADR:** `docs/adr/0001-server-identity-and-tenant-bootstrap.md`
 - **ADR SHA-256:** `0193e580bedc83987fb47a75f812ef2dc42e7760c975f2787bfe4d5b304b4402`
 - **Frozen plan SHA-256:** `a4a136c9ff0358fdce0967f7c09d7f7a744bbf33aac3db2ce8475972453eb813`
@@ -23,7 +23,7 @@
 ## Evidence conventions and scope
 
 - **ADR `:<line>`** means the ADR path above; **plan L<n>** means `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md`.
-- **V<n>** means line n of `C:/Users/Administrator/AppData/Local/hermes/cache/scratch/adr0001-arch-review-62979f2-out/g2-independent-verdict-2026-10-03.md`.
+- **V<n>** means line n of `<reviewer-scratch>/adr0001-arch-review-62979f2-out/g2-independent-verdict-2026-10-03.md`.
 - **VERIFIED** means independently read from the indicated frozen source. **INFERRED** means a consequence or risk deduced from those reads, not a reproduced exploit.
 - Exact artifact hashes and HEAD were checked. `git status --porcelain` initially returned no changes. Read-only diffs from both `8d07f0d` and `ff9de4f` to reviewed HEAD returned no paths under `server/`, `shared/`, or `src-tauri/`.
 - All 885 ADR lines were read, including S1-S7, Q1-Q4, the Option A commands, D1-D3, alternative analysis, obligations, consequences and revision history. The frozen plan, open questions, Architect v1-v6, final Critic review and consensus record were read at the relevant source sections; prior approval was not treated as approval of this ADR.

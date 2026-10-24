@@ -83,6 +83,37 @@ test("desktop-wide actions, theme, and launch errors remain visible", async ({ p
   await expect(page.locator(".toast-err")).toHaveAttribute("role", "alert");
 });
 
+test("a start that is still on its way can be cancelled", async ({ page }) => {
+  await page.setViewportSize({ width: 1720, height: 1000 });
+  await gotoMocked(page, "/?e2e=slow-launch");
+
+  const profileName = "VN Automation 001 - No Proxy";
+  const start = page.getByRole("button", { name: `Start profile ${profileName}` });
+  await start.click();
+  // Still starting: the same button now cancels instead of sitting disabled.
+  await expect(start).toBeEnabled();
+  await expect(start).toHaveText("Cancel");
+  await start.click();
+
+  await expect(page.locator(".toast-ok").last()).toContainText("Start cancelled");
+  await expect(start).toHaveText("Start");
+  // A cancel is a choice, not a failure: nothing is left on the row.
+  await expect(page.locator(".launch-error-inline")).toHaveCount(0);
+});
+
+test("quitting while browsers run says why it was refused", async ({ page }) => {
+  await gotoMocked(page);
+  await expect(page.getByRole("button", { name: /^Start profile / }).first()).toBeVisible();
+  await page.evaluate(() =>
+    (window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } })
+      .__TAURI_INTERNALS__.invoke("plugin:event|emit", {
+        event: "launcher:exit-blocked",
+        payload: { running_count: 2 },
+      }),
+  );
+  await expect(page.locator(".toast-err").last()).toContainText("2 browsers");
+});
+
 test("legacy custom-font metadata survives an ordinary profile edit but stays hidden", async ({ page }) => {
   await gotoMocked(page);
 
@@ -459,3 +490,90 @@ test("the search shortcut hint stays on one line", async ({ page }) => {
       .filter((h) => h.height > h.lineHeight * 1.4));
   expect(wrapped).toEqual([]);
 });
+
+test("tags reach the rows, the search and the filter, and survive rename, delete with undo and a reload", async ({ page }) => {
+  await gotoMocked(page);
+  const alpha = "VN Automation 001 - No Proxy";
+  const alphaRow = page.locator(".cell-name", { has: page.getByText(alpha) });
+  const betaRow = page.locator(".cell-name", { has: page.getByText("Beta Research") });
+
+  // Beta runs in the fixture, so the bulk tag skips it and says so.
+  await page.getByRole("checkbox", { name: `Select profile ${alpha}` }).check();
+  await page.getByRole("checkbox", { name: "Select profile Beta Research" }).check();
+  await page.getByRole("button", { name: "Tag", exact: true }).click();
+  await page.getByRole("textbox", { name: "New tag" }).fill("  Client   A ");
+  await page.getByRole("textbox", { name: "New tag" }).press("Enter");
+  await expect(page.getByText("Skipped 1 running profiles; stop them to change their tags.")).toBeVisible();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client A");
+  await expect(betaRow.getByTestId("row-tags")).toHaveCount(0);
+
+  await page.getByRole("searchbox", { name: "Search Browsers" }).fill("client");
+  await expect(page.getByText(alpha)).toBeVisible();
+  await expect(page.getByText("Beta Research")).toHaveCount(0);
+  await page.getByRole("searchbox", { name: "Search Browsers" }).fill("");
+
+  await page.getByRole("button", { name: "Filters" }).click();
+  await page.getByRole("combobox", { name: "Tag", exact: true }).click();
+  await page.getByRole("option", { name: "Client A" }).click();
+  await expect(page.getByText(alpha)).toBeVisible();
+  await expect(page.getByText("Beta Research")).toHaveCount(0);
+  await page.getByRole("button", { name: "Clear filters" }).click();
+  await expect(page.getByText("Beta Research")).toBeVisible();
+
+  await page.reload();
+  // A reload can land on the patch log; the tags are what matters here.
+  await page.getByRole("button", { name: "Browsers" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client A");
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  const rows = page.getByTestId("tag-row");
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Profiles: 1");
+  await rows.first().getByRole("button", { name: "Rename Client A" }).click();
+  await page.getByRole("textbox", { name: "Rename" }).fill("Client B");
+  await page.getByRole("textbox", { name: "Rename" }).press("Enter");
+  await expect(rows.first()).toContainText("Client B");
+  await expect(page.getByText("Client A")).toHaveCount(0);
+
+  await rows.first().getByRole("button", { name: "Delete Client B" }).click();
+  await expect(rows).toHaveCount(0);
+  await page.getByRole("status").filter({ hasText: "“Client B” was deleted." }).getByRole("button", { name: "Undo" }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText("Profiles: 1");
+
+  await page.getByRole("button", { name: "Browsers" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client B");
+
+  // A name typed but not yet entered is saved with the rest.
+  await page.getByRole("button", { name: `More actions for profile ${alpha}` }).click();
+  await page.getByRole("button", { name: "Edit tags" }).click();
+  await page.getByRole("textbox", { name: "Add a tag" }).fill("Typed");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client BTyped");
+});
+
+// tauri.conf.json sets minWidth 1280. Each case once pushed buttons off screen
+// or squeezed the folder tabs under them.
+for (const [width, pick] of [[1280, "one"], [1280, "all"], [1296, "one"], [1440, "all"]] as const) {
+  test(`the selection bar keeps the header usable at ${width}px with ${pick} selected`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await gotoMocked(page);
+    if (pick === "all") await page.getByRole("checkbox", { name: "Select all profiles on this page" }).check();
+    else await page.getByRole("checkbox", { name: "Select profile Beta Research" }).check();
+    await expect(page.getByText(pick === "all" ? "2 selected" : "1 selected")).toBeVisible();
+
+    const hidden = await page.evaluate(() => {
+      const header = document.querySelector("[data-testid=browsers-header]")!;
+      const bounds = header.getBoundingClientRect();
+      return [...header.querySelectorAll("button")]
+        .filter((b) => {
+          const r = b.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return r.right > bounds.right + 0.5 || r.left < bounds.left - 0.5 || !(hit && b.contains(hit));
+        })
+        .map((b) => b.textContent?.trim() || b.getAttribute("aria-label"));
+    });
+    expect(hidden).toEqual([]);
+    await expect(page.getByRole("button", { name: "New profile" })).toBeInViewport({ ratio: 1 });
+  });
+}

@@ -6,6 +6,7 @@ import type { ContextItem } from "../../shared/types";
 import { CountryFlag } from "../../shared/ui/CountryFlag";
 import { fmtTs, fmtUptime } from "../../shared/lib/utils";
 import { useProfile, type ProfileMeta } from "../../entities/profile";
+import { TagChip } from "../../entities/tag";
 import { useTeam, canSyncProfiles, syncBlockedReason } from "../../entities/team";
 import type { ProxyEntry } from "../../entities/proxy";
 import { ProfileInlineEditor, ProfileRowActions } from "../../features/manage-profiles";
@@ -60,6 +61,11 @@ export function ProfileRow({ profile, proxy, onMenu }: {
     { label: p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop"), onClick: () => togglePin(p) },
     { sep: true, label: "", onClick: () => {} },
     { label: t("profileTable.moveToFolder"), onClick: () => setFolderModal({ profileId: p.id }) },
+    {
+      label: t("tag.editTags"),
+      onClick: () => setQuickEdit({ kind: "tags", profile: p }),
+      disabledReason: isRunning ? t("profileTable.stopTheProfileFirst") : undefined,
+    },
     ...(p.folder
       ? [{ label: t("profileTable.removeFromFolder"), onClick: () => setProfileFolder(p.id, "") }]
       : []),
@@ -196,7 +202,23 @@ export function ProfileRow({ profile, proxy, onMenu }: {
               {launchError}
             </div>
           )}
-          <div className="mono mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap text-[10.5px] text-text-disabled-300">{p.id.slice(0, 8)}</div>
+          <div className="mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap">
+            <span className="mono shrink-0 text-[10.5px] text-text-disabled-300">{p.id.slice(0, 8)}</span>
+            {p.tags.length > 0 && (
+              <span
+                className="row-tags flex min-w-0 items-center gap-1 overflow-hidden"
+                data-testid="row-tags"
+                title={p.tags.join(", ")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!shiftPress.current && !isRunning) setQuickEdit({ kind: "tags", profile: p });
+                }}
+              >
+                {p.tags.slice(0, 3).map((name) => <TagChip key={name} name={name} />)}
+                {p.tags.length > 3 && <span className="tag-chip" data-color="gray">+{p.tags.length - 3}</span>}
+              </span>
+            )}
+          </div>
         </div>
         <div>
           <Badge color={isRunning ? "success" : "gray"} variant='filled' size="small" dot>

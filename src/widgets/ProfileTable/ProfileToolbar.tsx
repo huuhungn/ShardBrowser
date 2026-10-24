@@ -8,7 +8,9 @@ import {
 
 export function ProfileToolbar() {
   return (
-    <div className="flex items-center flex-none gap-2">
+    // Wraps under the folder tabs, then onto more lines, when a selection
+    // makes it wider than the window (minWidth 1280) leaves room for.
+    <div className="ml-auto flex max-w-full flex-none flex-wrap items-center justify-end gap-2">
       <BulkActionsBar />
       <ProfileFilterBar />
       <ImportProfilesButton />

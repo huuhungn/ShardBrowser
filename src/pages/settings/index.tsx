@@ -10,9 +10,9 @@ import { useNav } from "../../shared/model/navigation";
 import { safeUiError, withUtm } from "../../shared/lib/utils";
 import type { Settings, ApiInfo, StartupStatus, McpStatus, CodexMcpStatus, HermesMcpStatus } from "../../entities/settings";
 import { helperKinds } from "../../entities/settings";
-import { settingsGet, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
+import { settingsGet, settingsLoadError, settingsSave, apiInfo, apiRegenerateToken, mcpDownload, mcpSetPath,
   startupStatus, mcpStatus as mcpStatusGet, codexMcpStatus, hermesMcpStatus } from "../../entities/settings";
-import { StartupCard, McpCard } from "../../features/manage-settings";
+import { StartupCard, McpCard, TagsCard } from "../../features/manage-settings";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
 import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
 import { Rich } from "../../shared/i18n/Rich";
@@ -53,6 +53,7 @@ export function SettingsPage() {
   const [codexError, setCodexError] = useState<string | null>(null);
   const [hermes, setHermes] = useState<HermesMcpStatus | null>(null);
   const [hermesError, setHermesError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const refreshApi = () => apiInfo().then(setApi).catch(() => {});
   const refreshStartup = () =>
@@ -73,6 +74,7 @@ export function SettingsPage() {
 
   useEffect(() => {
     settingsGet().then((v) => { setS(v); setBaseline(v); });
+    settingsLoadError().then(setLoadError).catch(() => {});
     void refreshApi();
     void refreshStartup();
     void refreshMcp();
@@ -128,6 +130,15 @@ export function SettingsPage() {
         <h1 className="m-0 text-title-h5 text-text-strong-950">{t("settings.title")}</h1>
       </div>
 
+      {loadError && (
+        <p
+          role="alert"
+          className="m-0 mb-3.5 rounded-lg bg-warning-alpha-16 p-3 text-paragraph-sm text-text-strong-950 ring-1 ring-inset ring-warning-base/30"
+        >
+          {t("settings.loadErrorBanner", { detail: loadError })}
+        </p>
+      )}
+
       <SettingsCard title={t("settings.startup.title")}>
         <StartupCard settings={s} onChange={setS} status={startup} error={startupError} />
       </SettingsCard>
@@ -175,6 +186,10 @@ export function SettingsPage() {
             {t("settings.mcp.currentFolder")} <code>{mcp.path}</code>
           </p>
         )}
+      </SettingsCard>
+
+      <SettingsCard title={t("settings.tags.title")}>
+        <TagsCard />
       </SettingsCard>
 
       <SettingsCard title={t("settings.team.title")}>

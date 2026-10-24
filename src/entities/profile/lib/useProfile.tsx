@@ -10,11 +10,12 @@ import { readTextFile, fmtBytes, safeUiError } from "../../../shared/lib/utils";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { proxyList, type ProxyEntry } from "../../proxy";
 import { fingerprintList, type FingerprintEntry } from "../../fingerprint";
+import { sameTag, useTags } from "../../tag";
 import type { ProfileMeta, ProfileForm } from "../model/types";
 import {
   profileList, profileGet, profileSave, profileValidateName, profileDelete, profileClone,
-  profileSetPin, profileSetFolder, profileBindProxy, profileImport,
-  profileCreateFromTemplate, processList, processKill, launch, syncLaunch,
+  profileSetPin, profileSetFolder, profileSetTags, profileBindProxy, profileImport,
+  profileCreateFromTemplate, processList, processKill, launch, launchCancel, syncLaunch,
   folderDelete, cookiesExportToFile, cookiesImport,
   profileSyncStatus, profileSyncPush, profileSyncPull,
   profileBackupCreate, profileBackupInspect, profileBackupRestore,
@@ -30,7 +31,7 @@ const loadFolderRegistry = (): string[] => {
   catch { return []; }
 };
 
-export type QuickEditTarget = { kind: "proxy" | "notes"; profile: ProfileMeta };
+export type QuickEditTarget = { kind: "proxy" | "notes" | "tags"; profile: ProfileMeta };
 export type FolderModalTarget = { profileId: string | null };
 
 /** Narrows the list beyond the folder tab and the search box. */
@@ -40,9 +41,11 @@ export type ProfileFilters = {
   country: string;
   /** "bound" = has a proxy, "direct" = none. */
   proxy: "all" | "bound" | "direct";
+  /** Tag name, or "" for any. */
+  tag: string;
 };
 
-export const emptyFilters = (): ProfileFilters => ({ status: "all", country: "", proxy: "all" });
+export const emptyFilters = (): ProfileFilters => ({ status: "all", country: "", proxy: "all", tag: "" });
 
 export type ProfileStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -128,6 +131,8 @@ export type ProfileStore = {
   importCookies: (p: ProfileMeta) => Promise<void>;
 
   setProfileFolder: (id: string, f: string) => Promise<void>;
+  /** Adds `tag` to the selection, or removes it when every selected profile has it. */
+  bulkToggleTag: (tag: string) => Promise<void>;
   deleteFolder: (f: string) => Promise<void>;
   createFromTemplate: (tplId: string) => Promise<void>;
 
@@ -200,6 +205,8 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const [profiles, proxies] = await Promise.all([profileList(), proxyList()]);
       set({ profiles, proxies });
     } catch (e) { toast.err(safeUiError(e)); }
+    // Tag counts follow the profiles, so they are re-read with them.
+    void useTags.getState().reload();
   },
 
   // 2s poll for real child status; not optimistic UI state. Uptime is anchored
@@ -396,14 +403,19 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           const cdp = { ...get().runningCdp };
           delete cdp[p.id];
           set({ running: next, runningCdp: cdp });
-          toast.ok("That browser had already exited; cleared its status");
+          toast.ok(t("profile.alreadyExitedCleared"));
           get().reload();
         }
       }
       catch (e) { toast.err(safeUiError(e)); }
       return;
     }
-    if (get().startBusy.has(p.id)) return;
+    // Pressed again while still starting: cancel. The pending launch() then
+    // fails with launch.cancelled, which the catch below reads as a choice.
+    if (get().startBusy.has(p.id)) {
+      try { await launchCancel(p.id); } catch (e) { toast.err(safeUiError(e)); }
+      return;
+    }
     // A new attempt supersedes the previous failure.
     const cleared = { ...get().launchError };
     delete cleared[p.id];
@@ -412,6 +424,10 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       await launch(p.id);
       // Don't optimistically flip `running`; the 2s poll picks up the new child.
     } catch (e) {
+      if (String(e).includes("launch.cancelled")) {
+        toast.ok(t("profile.startCancelled"));
+        return;
+      }
       // A toast disappears; a failed launch needs to stay readable on the row
       // that failed, next to the button the user just pressed.
       const message = safeUiError(e);
@@ -609,6 +625,25 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     } catch (e) { toast.err(safeUiError(e)); }
   },
 
+  bulkToggleTag: async (tag) => {
+    const { selected, running, profiles } = get();
+    const chosen = profiles.filter((p) => selected.has(p.id));
+    const removing = chosen.length > 0 && chosen.every((p) => p.tags.some((x) => sameTag(x, tag)));
+    // A running profile's file is locked against edits, as for folders.
+    const skipped = chosen.filter((p) => running[p.id]).length;
+    const failures: string[] = [];
+    for (const p of chosen) {
+      if (running[p.id]) continue;
+      const next = removing ? p.tags.filter((x) => !sameTag(x, tag)) : [...p.tags, tag];
+      try { await profileSetTags(p.id, next); }
+      catch (e) { failures.push(safeUiError(e)); }
+    }
+    await get().reload();
+    storeBus.emit("profiles");
+    if (skipped) toast.info(t("tag.skippedRunning", { n: skipped }));
+    if (failures.length) toast.err(t("tag.couldNotTag", { n: failures.length, err: failures[0] }));
+  },
+
   deleteFolder: async (f) => {
     const count = get().profiles.filter((p) => p.folder === f).length;
     // Three outcomes: delete profiles, unfile, cancel.
@@ -779,7 +814,10 @@ export function applyProfileFilters(
   const byId = new Map(proxies.map((p) => [p.id, p]));
   return profiles.filter((p) => {
     if (folder !== "all" && p.folder !== folder) return false;
-    if (q && !p.name.toLowerCase().includes(q) && !p.notes.toLowerCase().includes(q)) return false;
+    const tags = p.tags;
+    if (q && !p.name.toLowerCase().includes(q) && !p.notes.toLowerCase().includes(q)
+      && !tags.some((x) => x.toLowerCase().includes(q))) return false;
+    if (filters.tag && !tags.some((x) => sameTag(x, filters.tag))) return false;
     if (filters.proxy === "bound" && !p.proxy_id) return false;
     if (filters.proxy === "direct" && p.proxy_id) return false;
     if (filters.country) {

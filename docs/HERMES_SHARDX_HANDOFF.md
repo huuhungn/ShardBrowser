@@ -217,8 +217,12 @@ reloads the tool schema.
 
 ## Secret and profile boundaries
 
-- `SHARDX_TOKEN` is a Windows User environment variable. It is intentionally
-  absent from `config.toml`; never print or copy its value into logs or docs.
+- `SHARDX_TOKEN` lives in the Hermes `.env` (`%LOCALAPPDATA%\hermes\.env`), not
+  in a Windows User environment variable. Hermes passes a stdio MCP server only
+  a safe baseline plus that server's own `env:` block, so
+  `mcp_servers.shardbrowser.env` in `config.yaml` must reference it as
+  `SHARDX_TOKEN: ${SHARDX_TOKEN}`. Use the long-lived token from Settings →
+  Automation API; never print or copy its value into logs or docs.
 - Never expose cookies, proxy credentials, profile storage, profile notes, or
   full fingerprint payloads.
 - Reuse the canonical profile for smoke tests and restore its prior running or
@@ -429,22 +433,28 @@ the network voices alone, and leaves a locale untouched when its voice names are
 not known rather than inventing one. An en-US profile now reports David, Mark
 and Zira.
 
-### Motion domain: probed, not ported
+### Motion domain: gated by `--shardx-automation` (corrected in 2.3.0)
 
 Upstream ships Node, Python and Rust SDKs over a browser-level CDP domain called
 `Motion` (human pointer curves, keystroke timing, finger gestures, orientation).
 The domain is deliberately absent from `Schema.getDomains` and `/json/protocol`,
 so the only honest test is to call it and read the error.
 
-**This engine does not implement it.** All eleven documented methods answer
-`'Motion.<method>' wasn't found`, on both the browser and page targets. Porting
-the SDKs now would ship three libraries whose every call fails at runtime.
+The September note here said the engine does not implement it. That was wrong:
+the probe launched the engine without `--shardx-automation`, the switch the
+engine has gated the domain behind since upstream 2.0.2, and it also guessed
+method names. Every CDP launch from this launcher lacked the switch too, so the
+MCP `human_click`/`human_type` tools could not reach `Motion.*` either.
 
-`src-tauri/tests/motion_protocol_it.rs` records that state and watches for the
-day it changes: if an engine update adds the domain, the first test fails and
-the SDK port becomes justified. The second test asserts the domain stays out of
-`Schema.getDomains` whether or not it is implemented — an enumerable private
-domain is itself a fingerprint.
+Since 2.3.0 the launcher passes the switch on every CDP launch
+(`launch::CDP_ARGS`), the SDKs do the same and carry upstream's Motion wrappers,
+and `src-tauri/tests/motion_protocol_it.rs` launches the engine with exactly the
+launcher's CDP switches. It asserts the 14 methods upstream's SDK calls exist,
+that the same launch without the switch hides all of them, and that the domain
+stays out of `Schema.getDomains`. Verified on 152.0.7977.65 build 4 and on
+156.0.8078.48 build 1; removing the switch from `CDP_ARGS` fails the first test.
+Run the probes against a candidate engine before it is installed with
+`SHARDX_TEST_ENGINE=<path to chrome.exe>`.
 
 ### Variable provenance, and what it unblocks
 
@@ -665,7 +675,11 @@ git -C $env:USERPROFILE\Documents\GitHub\ShardBrowser status --short --branch
 hermes mcp test shardbrowser
 ```
 
-Then call `health_check`, confirm the version, and use `list_running`. For a
+Then call `health_check`, confirm the version and `authenticated: true`, and use
+`list_running`. `hermes -z` runs through the gateway, which keeps its MCP
+processes: after changing the token or the runtime, send `/reload-mcp` (in Git
+Bash, set `MSYS_NO_PATHCONV=1` so the slash is not turned into a path) and
+check that `token_present` is true. For a
 navigation smoke test, call `safe_open_url` on `https://example.com/` and verify
 `Example Domain`; restore the profile's prior state. For DevTools QA, read
 `docs/CODEX_DEVTOOLS_QA.md` (kept under its original filename; the procedure is

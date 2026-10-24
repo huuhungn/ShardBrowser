@@ -1,5 +1,5 @@
 //! Regression tests for the schema-only 0009 upgrade.
-use shardx_team_server::run_migrations_fk_safe;
+use shardx_team_server::run_migrations;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::borrow::Cow;
@@ -34,7 +34,7 @@ async fn fk_on(pool: &SqlitePool) {
 #[tokio::test]
 async fn upgrade_accepts_null_without_a_numeric_default() {
     let pool = before_0009().await;
-    run_migrations_fk_safe(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
     sqlx::query("INSERT INTO v2_tenants (id, slug, status, created_at) VALUES (?, 'fresh', 'active', 'now')")
         .bind(vec![1u8; 16]).execute(&pool).await.unwrap();
     let generation: Option<i64> =
@@ -104,7 +104,7 @@ async fn raw_migrator_refuses_fk_on_without_changing_data() {
         8
     );
     fk_on(&pool).await;
-    run_migrations_fk_safe(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
     fk_on(&pool).await;
 }
 
@@ -153,7 +153,7 @@ async fn upgrade_preserves_every_existing_row() {
     seed_populated(&pool).await;
     let before = snapshot(&pool).await;
 
-    run_migrations_fk_safe(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
 
     let after = snapshot(&pool).await;
     assert_eq!(before.len(), after.len());

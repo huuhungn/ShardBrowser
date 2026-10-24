@@ -925,7 +925,7 @@ server.tool(
     // Extension-library ids; see list_extensions.
     extensions: z.array(z.string()).optional(),
     fingerprint: z.any().optional(),
-    launch: z.record(z.any()).optional(),
+    launch: z.record(z.string(), z.any()).optional(),
   },
   async ({ name, notes, folder, proxy, proxy_id, platform, color, extensions, fingerprint, launch }) => {
     if (!fingerprint) {
@@ -947,13 +947,13 @@ server.tool(
     fingerprint_id: z.string().optional(),
     platform: z.enum(["Windows", "macOS", "Linux"]).optional(),
     proxy: z.string().optional(),
-    noise: z.record(z.any()).optional(),
-    launch: z.record(z.any()).optional(),
+    launch: z.record(z.string(), z.any()).optional(),
     name: z.string().optional(),
     folder: z.string().optional(),
     // `{canvas: true}` or a full block; omitted vectors stay off.
     noise: z
-      .record(
+      // partialRecord: zod 4 makes an enum-keyed record require every key.
+      .partialRecord(
         z.enum(["canvas", "webgl", "audio", "client_rects", "sensors", "fonts"]),
         z.union([
           z.boolean(),
@@ -1777,7 +1777,7 @@ server.tool(
 server.tool(
   "browser_set_extra_headers",
   "Set extra HTTP headers sent on every request (e.g. Authorization). Empty object clears.",
-  { profile_id: z.string(), headers: z.record(z.string()) },
+  { profile_id: z.string(), headers: z.record(z.string(), z.string()) },
   async ({ profile_id, headers }) => {
     await (await pageFor(profile_id)).setExtraHTTPHeaders(headers);
     return text({ headers: Object.keys(headers) });
@@ -2013,7 +2013,7 @@ server.tool(
   {
     profile_id: z.string(),
     url_pattern: z.string(),
-    headers: z.record(z.string()).optional(),
+    headers: z.record(z.string(), z.string()).optional(),
     post_data: z.string().optional(),
     abort: z.boolean().optional(),
   },
@@ -2211,7 +2211,7 @@ server.tool(
     exact: z.boolean().optional(),
     headless: z.boolean().optional(),
     keep_running: z.boolean().optional(),
-    variables: z.record(z.string()).optional(),
+    variables: z.record(z.string(), z.string()).optional(),
   },
   async ({ project_id, profile_id, profile_query, exact, headless, keep_running, variables }) => {
     const profile = await resolveProfile({ profile_id, profile_query, exact });

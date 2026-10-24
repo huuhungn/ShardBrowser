@@ -3,6 +3,161 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.1",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "narrow-window-toolbar",
+          "title": "The toolbar fits a narrow window",
+          "lead": "Selecting profiles no longer pushes buttons off screen.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "With profiles selected in a narrow window, the toolbar pushed From template and New profile off screen and squeezed the folder tabs. It now moves under the tabs and wraps instead. The Proxies page toolbar wraps the same way."
+            },
+            {
+              "type": "note",
+              "text": "Also in this release: security updates for two dependencies, body-parser in the MCP server and undici in the Node SDK. The browser engine is unchanged."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.0",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "profile-tags",
+          "title": "Tag your profiles",
+          "lead": "Group profiles across folders with tags you can search and filter.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A profile still lives in one folder, and can now carry any number of tags as well. They show as chips under its name, the search box matches them, and Filters has a Tag filter."
+            },
+            {
+              "type": "list",
+              "items": [
+                "Edit a profile's tags from its row menu, or by clicking its chips.",
+                "Select several profiles and use Tag on the selection bar to add a tag to all of them, or remove it when they all have it. Running profiles are skipped.",
+                "Settings → Tags renames, recolors and deletes tags, and a delete can be undone.",
+                "The Automation API returns tags on every profile, takes them on create and edit, and lists them at GET /tags."
+              ]
+            },
+            {
+              "type": "note",
+              "text": "Tags are kept in each profile's file. If you go back to 2.3.x, a profile loses its tags the next time 2.3.x saves or launches it."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.3.1",
+      "date": "2026-10-23",
+      "entries": [
+        {
+          "id": "update-waits-for-browsers",
+          "title": "Updates wait for your browsers to close",
+          "lead": "Installing an update no longer leaves running browsers behind.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Installing a launcher update, or restarting for one, now waits until the browsers ShardX started are closed, as quitting already does. Before, the update ended the launcher and left those browsers running without it."
+            },
+            {
+              "type": "note",
+              "text": "The update from 2.3.0 to this version still runs the 2.3.0 installer, so close your profiles before you install it. The wait applies from the next update on."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.3.0",
+      "date": "2026-10-22",
+      "entries": [
+        {
+          "id": "chromium-156",
+          "title": "The browser is now Chromium 156",
+          "lead": "Profiles report Chrome 156 and carry the engine fixes from upstream ProxyShard 2.1.0.",
+          "tag": "new",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The user agent, client hints and TLS handshake of every profile move to Chrome 156 the first time the launcher starts after this update. The new engine downloads once; profiles keep their cookies, logins and history."
+            },
+            {
+              "type": "p",
+              "text": "A failed download no longer leaves you without a browser. The new engine is unpacked beside the old one and swapped in only when it is complete, and a swap that was cut short is undone at the next start."
+            },
+            {
+              "type": "note",
+              "text": "A profile without a proxy now always goes direct. It used to follow the proxy set in Windows, which disagreed with the timezone and location worked out for it. A proxy named in the global extra arguments still wins."
+            }
+          ]
+        },
+        {
+          "id": "human-input",
+          "title": "Human clicks and typing work over CDP",
+          "lead": "The MCP human_click and human_type tools reach the engine's Motion domain again.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The engine answers its Motion domain only when the browser is opened with an automation switch this launcher never passed, so every human-like click and keystroke failed. Every automation launch now passes it, and a test opens the engine the same way to prove the domain answers."
+            }
+          ]
+        },
+        {
+          "id": "cancel-start",
+          "title": "Cancel a start that is taking too long",
+          "lead": "While a profile is still starting, its button cancels the start.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A slow proxy check or location lookup can keep a profile in Starting for a long time. Click the button again to cancel; no browser opens and nothing is left on the row."
+            },
+            {
+              "type": "p",
+              "text": "The launcher also refuses to quit from the tray, or by closing its window, while a browser it started is still open, and says how many are still running."
+            }
+          ]
+        },
+        {
+          "id": "reliability-2-3",
+          "title": "Fewer ways to lose a profile or a setting",
+          "lead": "Fixes ported from upstream ProxyShard and from other forks.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "list",
+              "items": [
+                "A profile whose browser is still open is no longer shown as idle, and Stop still closes it.",
+                "One unreadable byte in the settings file no longer resets your settings; the app says so and leaves the file alone.",
+                "The window no longer stays blank on a network that never answers.",
+                "A SOCKS5 proxy that cannot reach the internet now fails its test.",
+                "A profile without its own window size opens inside the screen it claims.",
+                "Changing a proxy's password through the API keeps the profile bound to it."
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.2.10",
       "date": "2026-09-25",
       "entries": [

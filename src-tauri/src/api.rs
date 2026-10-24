@@ -243,6 +243,7 @@ async fn list_profiles() -> ApiResult {
                 "created_at": m.created_at,
                 "pinned": m.pinned,
                 "folder": m.folder,
+                "tags": m.tags,
                 "color": m.color,
                 "extensions": m.extensions,
                 "running": r.is_some(),
@@ -305,6 +306,8 @@ struct CreateReq {
     color: Option<String>,
     /// Extension-library ids to load at launch (`GET /extensions`).
     extensions: Option<Vec<String>>,
+    /// Tag names; normalized and matched to existing tags case-insensitively.
+    tags: Option<Vec<String>>,
     fingerprint: Value,
     launch: Option<Value>,
     /// Reserved for backward-compatible error reporting; not implemented.
@@ -367,6 +370,10 @@ async fn persist_created(folder_override: Option<String>, body: CreateReq) -> Ap
     if let Some(ids) = body.extensions.as_ref() {
         validate_extension_ids(ids)?;
         meta["extensions"] = json!(ids);
+    }
+    // save_raw normalizes a new profile's tags.
+    if let Some(tags) = body.tags.as_ref() {
+        meta["tags"] = json!(tags);
     }
     if let Some(pid) = body.proxy_id.as_ref() {
         meta["proxy_id"] = json!(pid);
@@ -702,12 +709,15 @@ struct EditReq {
     folder: Option<String>,
     /// "" unbinds.
     proxy_id: Option<String>,
-    /// Proxy string: stored + tested, then bound.
+    /// Proxy string: stored + tested, then bound. A new password for the
+    /// endpoint and login already bound updates that proxy in place.
     proxy: Option<String>,
     /// `#rrggbb`; "" goes back to the name-derived colour.
     color: Option<String>,
     /// Replaces the whole list; `[]` loads none.
     extensions: Option<Vec<String>>,
+    /// Replaces the whole list; `[]` clears it.
+    tags: Option<Vec<String>>,
     /// Replace stored fingerprint verbatim.
     fingerprint: Option<Value>,
 }
@@ -771,7 +781,9 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
                 format!("unparseable proxy: {pstr}"),
             )
         })?;
-        let s = crate::proxy::upsert_dedup(entry)
+        // A new password for the proxy this profile already uses updates that
+        // proxy; it does not leave the old one behind with a stale password.
+        let s = crate::proxy::upsert_for_binding(entry, stored.meta.proxy_id.as_deref())
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let _ = crate::proxy::full_test(&s).await;
         stored.meta.proxy_id = Some(s.id);
@@ -787,6 +799,12 @@ async fn edit_profile(Path(id): Path<String>, Json(body): Json<EditReq>) -> ApiR
         stored.meta.extensions = ids.clone();
     }
 
+    // First, so a refused tag list writes nothing; save_raw then carries the
+    // new tags from disk.
+    if let Some(tags) = body.tags.as_ref() {
+        crate::profile::set_tags(&id, tags)
+            .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    }
     crate::profile::save_raw(&mut stored)
         .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
     // set_folder handles unfile; save_raw keeps the existing folder when empty.
@@ -1373,6 +1391,12 @@ async fn purge_trash(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "purged": true, "id": id })))
 }
 
+async fn list_tags() -> ApiResult {
+    let tags = crate::profile::list_tags()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!(tags)))
+}
+
 async fn list_folders() -> ApiResult {
     let metas = crate::profile::list_all()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1474,6 +1498,7 @@ fn router() -> Router {
             get(export_cookies).post(import_cookies),
         )
         .route("/folders", get(list_folders))
+        .route("/tags", get(list_tags))
         .route(
             "/folders/:folder",
             patch(rename_folder_ep).delete(delete_folder_ep),
@@ -1624,22 +1649,27 @@ mod automation_endpoint_tests {
     /// The store root is process-global, so these tests hold a lock for the
     /// duration: without it, two tests racing on the same root see each
     /// other's projects and the failure looks like a routing bug.
-    fn scratch_store() -> (
-        tempfile::TempDir,
-        String,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
-        let guard = crate::store::config_root_test_lock()
+    pub(super) fn scratch_store() -> (tempfile::TempDir, String, ScratchLocks) {
+        let config = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Creating, editing or running a profile takes lifecycle claims, which
+        // the claim tests assert are free; without this they race.
+        let lifecycle = crate::profile::lifecycle_test_guard();
         let dir = tempfile::tempdir().expect("a scratch config root");
         crate::store::set_config_root(Some(dir.path().to_path_buf()));
         super::set_secret(SECRET);
         let token = super::long_lived_token(SECRET).expect("mint a token");
-        (dir, token, guard)
+        (dir, token, ScratchLocks(config, lifecycle))
     }
 
-    async fn send(request: Request<Body>) -> (StatusCode, Value) {
+    /// Held for a test's duration; see `scratch_store`.
+    pub(super) struct ScratchLocks(
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
+
+    pub(super) async fn send(request: Request<Body>) -> (StatusCode, Value) {
         let response = router().oneshot(request).await.expect("route the request");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -1649,7 +1679,7 @@ mod automation_endpoint_tests {
         (status, body)
     }
 
-    fn authed(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
+    pub(super) fn authed(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
         Request::builder()
             .method(method)
             .uri(path)
@@ -1928,5 +1958,178 @@ mod automation_endpoint_tests {
             !message.contains("[[shardx:"),
             "a marker leaked to a script author: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_proxy_password_tests {
+    //! Changing the password of a profile's proxy, through the API.
+    //!
+    //! The duplicate check keys on the whole connection tuple (#72), so a new
+    //! password no longer matches the stored entry. For a profile that is
+    //! already bound to that endpoint and login, the new password is a change
+    //! to the proxy it uses, not a second proxy: the bound entry is updated and
+    //! keeps its id, and no new entry appears in the list.
+
+    // Same reason as the automation tests: the store root is process-global
+    // and the guard is held across the awaits on purpose.
+    #![allow(clippy::await_holding_lock)]
+
+    use super::automation_endpoint_tests::{authed, scratch_store, send};
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
+
+    // Port 9 on loopback refuses at once, so the best-effort test the API runs
+    // after storing a proxy fails fast instead of waiting on the network.
+    const OLD: &str = "http://rebind-user:old-pass@127.0.0.1:9";
+    const NEW: &str = "http://rebind-user:new-pass@127.0.0.1:9";
+
+    async fn profile_bound_to(token: &str, proxy: &str) -> (String, String) {
+        let (status, body) = send(authed(
+            "POST",
+            "/profiles",
+            token,
+            json!({ "name": "proxy password change", "fingerprint": {}, "proxy": proxy }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {body}");
+        let id = body["id"].as_str().expect("a profile id").to_string();
+        let proxy_id = body["proxy_id"]
+            .as_str()
+            .expect("a bound proxy")
+            .to_string();
+        (id, proxy_id)
+    }
+
+    #[tokio::test]
+    async fn a_new_password_updates_the_bound_proxy_instead_of_adding_one() {
+        let (_store, token, _lock) = scratch_store();
+        let (profile, bound) = profile_bound_to(&token, OLD).await;
+
+        let (status, body) = send(authed(
+            "PATCH",
+            &format!("/profiles/{profile}"),
+            &token,
+            json!({ "proxy": NEW }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {body}");
+
+        let proxies = crate::proxy::list().expect("read the proxy store");
+        assert_eq!(proxies.len(), 1, "the password change added a proxy");
+        assert_eq!(proxies[0].id, bound, "the bound proxy was replaced");
+        assert_eq!(
+            proxies[0].password, "new-pass",
+            "the new password was dropped"
+        );
+        let (_, profile_now) = send(authed(
+            "GET",
+            &format!("/profiles/{profile}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(profile_now["_meta"]["proxy_id"], json!(bound));
+    }
+
+    #[tokio::test]
+    async fn the_profile_list_carries_each_profiles_tags() {
+        let (_store, token, _lock) = scratch_store();
+        let (status, created) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "tagged", "fingerprint": {} }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {created}");
+        let id = created["id"].as_str().expect("a profile id").to_string();
+
+        let (_, before) = send(authed("GET", "/profiles", &token, Value::Null)).await;
+        assert_eq!(before[0]["tags"], json!([]));
+
+        crate::profile::set_tags(&id, &["Client A".to_string()]).expect("tag the profile");
+        let (status, after) = send(authed("GET", "/profiles", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::OK, "body was {after}");
+        assert_eq!(after[0]["id"], json!(id));
+        assert_eq!(after[0]["tags"], json!(["Client A"]));
+    }
+
+    #[tokio::test]
+    async fn tags_go_in_on_create_change_on_edit_and_list_with_counts() {
+        let (_store, token, _lock) = scratch_store();
+        let (status, created) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "tagged on create", "fingerprint": {}, "tags": ["  Client   A ", "client a", "VIP"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {created}");
+        assert_eq!(created["tags"], json!(["Client A", "VIP"]));
+        let id = created["id"].as_str().expect("a profile id").to_string();
+
+        let (status, edited) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "kept", "tags": ["vip", "New"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {edited}");
+        assert_eq!(edited["_meta"]["tags"], json!(["VIP", "New"]));
+        assert_eq!(edited["notes"], json!("kept"));
+
+        // An edit that does not mention tags leaves them alone.
+        let (_, untouched) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "again" }),
+        ))
+        .await;
+        assert_eq!(untouched["_meta"]["tags"], json!(["VIP", "New"]));
+
+        // Past the cap the whole edit is refused, notes included.
+        let many: Vec<String> = (0..=crate::profile::MAX_TAGS_PER_PROFILE)
+            .map(|i| format!("t{i}"))
+            .collect();
+        let (status, _) = send(authed(
+            "PATCH",
+            &format!("/profiles/{id}"),
+            &token,
+            json!({ "notes": "not saved", "tags": many }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, after) = send(authed(
+            "GET",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(after["notes"], json!("again"));
+        assert_eq!(after["_meta"]["tags"], json!(["VIP", "New"]));
+
+        let (status, tags) = send(authed("GET", "/tags", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::OK, "body was {tags}");
+        assert_eq!(
+            tags,
+            json!([
+                { "name": "New", "color": null, "count": 1 },
+                { "name": "VIP", "color": null, "count": 1 },
+            ])
+        );
+
+        let (status, _) = send(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/tags")
+                .body(axum::body::Body::empty())
+                .expect("build the request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

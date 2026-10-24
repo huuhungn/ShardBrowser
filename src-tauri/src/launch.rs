@@ -62,6 +62,71 @@ pub fn resolve_binary() -> Result<PathBuf> {
     anyhow::bail!(crate::errcode::code("launch.browserMissing"))
 }
 
+/// Switches for a CDP-enabled launch. `--shardx-automation` gates the engine's
+/// `Motion` domain, which human clicks and typing go through; without it every
+/// `Motion.*` call answers "wasn't found". Unused, it costs nothing: the domain
+/// stays out of `Schema.getDomains` either way.
+pub(crate) const CDP_ARGS: [&str; 3] = [
+    "--remote-debugging-port=0",
+    "--remote-allow-origins=*",
+    "--shardx-automation",
+];
+
+/// A window to go with the claimed screen (#67). Without one the engine passes
+/// no --window-size and Chromium uses the REAL monitor's work area, so a
+/// profile claiming 1920x1080 opened in a window sized for the host and sitting
+/// outside its own claimed screen. A profile that names a usable window keeps
+/// it. Derived per launch, never written back, so the stored profile (and team
+/// sync) is untouched. Ported from upstream 081770c.
+fn fill_window_from_screen(raw: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(scr) = raw.get("screen").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let w = scr.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+    let h = scr.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let avail_w = scr
+        .get("avail_width")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(w)
+        .max(1);
+    let avail_h = scr
+        .get("avail_height")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(h)
+        .max(1);
+    let names_a_window = raw
+        .get("window")
+        .and_then(|v| v.as_object())
+        .is_some_and(|win| {
+            win.get("outer_width").and_then(|v| v.as_i64()).unwrap_or(0) > 0
+                && win
+                    .get("outer_height")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0
+        });
+    if names_a_window {
+        return;
+    }
+    let outer_h = (avail_h - 1).max(1);
+    raw.insert(
+        "window".into(),
+        serde_json::json!({
+            "outer_width": avail_w,
+            "outer_height": outer_h,
+            "inner_width": avail_w,
+            "inner_height": (outer_h - 87).max(1),
+        }),
+    );
+    eprintln!(
+        "[launcher] display: profile named no window — derived {avail_w}x{outer_h} \
+         from its claimed {w}x{h} screen"
+    );
+}
+
 pub async fn launch_profile(
     profile_id: &str,
     enable_cdp: bool,
@@ -81,9 +146,16 @@ pub async fn launch_profile_synced(
     bus_token: &str,
 ) -> Result<LaunchOutcome> {
     let launch_claim = profile::begin_profile_launch(profile_id)?;
+    let _cancel_scope = CancelScope::start(profile_id);
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
     let udd = profile::user_data_dir(profile_id)?;
+    // A browser this launcher did not start (an earlier launcher run, or one
+    // started by hand) already holds the profile; a new launch would only be
+    // handed over to it and exit.
+    if crate::process::lock_is_live(&udd) {
+        anyhow::bail!(crate::errcode::code("launch.openElsewhere"));
+    }
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
     let bound_proxy: Option<proxy::ProxyEntry> = stored
@@ -102,12 +174,16 @@ pub async fn launch_profile_synced(
                     true
                 }
                 Err(e) => {
-                    let cached = proxy::latest_test(&p.id).and_then(|s| s.udp_ms).is_some();
+                    // Fail closed. A cached pass is no evidence: a proxy edited
+                    // in place keeps its test history, and a VPN can make UDP
+                    // look fine at test time. Enabling QUIC/WebRTC on a relay
+                    // that drops UDP leaks or stalls the profile (CarterLeeAlt
+                    // 5b418a9; upstream 6c3f65a "udp-test-vpn").
                     eprintln!(
-                        "[launcher] UDP probe failed for proxy {} ({e}); using cached={cached}",
+                        "[launcher] UDP probe failed for proxy {} ({e}); QUIC and proxied WebRTC stay off",
                         p.host
                     );
-                    cached
+                    false
                 }
             }
         } else {
@@ -126,6 +202,20 @@ pub async fn launch_profile_synced(
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
     resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    fill_window_from_screen(&mut raw);
+    // The claimed screen still has to fit this monitor: the profile may have
+    // moved to a smaller machine since it was created, and a window cannot be
+    // larger than the screen it opens on. A display that holds the claim
+    // leaves it untouched. "Real screen" mode hands the host's screen to the
+    // engine instead, so there is nothing to fit.
+    let real_screen = settings::load()
+        .map(|s| s.screen_resolution_mode.as_deref() == Some("real"))
+        .unwrap_or(false);
+    if !real_screen {
+        if let Some(w) = crate::main_window() {
+            crate::clamp_screen_to_real_display(&w, &mut raw);
+        }
+    }
     let json =
         serde_json::to_string(&raw).context(crate::errcode::code("launch.serializeProfile"))?;
 
@@ -231,8 +321,23 @@ pub async fn launch_profile_synced(
         cmd.arg("--hide-crash-restore-bubble");
     }
 
+    // Credentials the engine cannot carry inline go through a loopback relay
+    // (#100); it must outlive the spawn, so the tracker takes it below.
+    let mut proxy_relay = None;
     if let Some(p) = bound_proxy.as_ref() {
-        cmd.arg(format!("--proxy-server={}", p.to_proxy_server_arg()));
+        let proxy_arg = if crate::proxy_relay::needs_relay(p) {
+            let relay = crate::proxy_relay::start(p.clone()).await?;
+            let arg = relay.proxy_server_arg();
+            eprintln!(
+                "[launcher] proxy {} credentials need escaping; engine uses a loopback relay",
+                p.host
+            );
+            proxy_relay = Some(relay);
+            arg
+        } else {
+            p.to_proxy_server_arg()
+        };
+        cmd.arg(format!("--proxy-server={proxy_arg}"));
 
         // QUIC: enable only when proxy UDP relay verified; rely on Alt-Svc upgrade path.
         if proxy_udp_ok {
@@ -248,6 +353,14 @@ pub async fn launch_profile_synced(
                 p.host
             );
         }
+    } else if !names_a_proxy(&settings::load().map(|s| s.extra_args).unwrap_or_default()) {
+        // No proxy bound means direct, not "whatever the OS is set to". Without
+        // this, Chromium follows a system proxy (Clash, v2rayN, a corporate PAC)
+        // while timezone and geo were resolved from the direct IP, so the
+        // profile's exit IP and its claimed location disagree (CarterLeeAlt
+        // a673138). An operator who routes through a proxy on purpose names it
+        // in the global extra arguments, which this leaves alone.
+        cmd.arg("--no-proxy-server");
     }
 
     // WebRTC IP policy: block / tcp_only / auto (auto = relay if UDP, else tcp_only).
@@ -328,8 +441,7 @@ pub async fn launch_profile_synced(
     // CDP: port=0 makes Chrome pick free port and write DevToolsActivePort.
     if enable_cdp {
         let _ = std::fs::remove_file(udd.join("DevToolsActivePort"));
-        cmd.arg("--remote-debugging-port=0");
-        cmd.arg("--remote-allow-origins=*");
+        cmd.args(CDP_ARGS);
     }
 
     if headless {
@@ -348,6 +460,10 @@ pub async fn launch_profile_synced(
         // when a Tauri GUI app spawns the engine binary.
         cmd.creation_flags(0x08000000);
     }
+    // The proxy probe and the geo lookup are the slow part; a cancel made while
+    // they ran stops here, before any browser exists. The relay, if one was
+    // started, closes when it drops on the way out.
+    check_cancel(profile_id)?;
     let mut child = cmd
         .spawn()
         .context(crate::errcode::code("launch.spawnFailed"))?;
@@ -356,7 +472,13 @@ pub async fn launch_profile_synced(
         let _ = child.wait().await;
         return Err(error).context(crate::errcode::code("launch.persistMetadata"));
     }
-    let tracked = Tracker::shared().track(profile_id.to_string(), child, stored.meta.temporary);
+    let tracked = Tracker::shared().track_with_relay(
+        profile_id.to_string(),
+        child,
+        stored.meta.temporary,
+        proxy_relay,
+        Some(udd.clone()),
+    );
     drop(launch_claim);
 
     let cdp = if enable_cdp {
@@ -539,9 +661,75 @@ const SAFE_LAUNCH_SWITCHES: &[&str] = &[
 ];
 
 /// Poll `<udd>/DevToolsActivePort` for ~6s; line 1 = port, line 2 = ws path.
+/// Profiles whose launch was cancelled while still on its way (upstream
+/// 081770c, "cancel-start"). A launch behind a slow proxy can sit in Starting
+/// for a long while; the probes finish their call and the launch stops at the
+/// last look before the browser would start. One that already started its
+/// browser is past cancelling: Stop handles that one.
+static CANCELS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn cancel(profile_id: &str) {
+    let mut c = CANCELS.lock().unwrap_or_else(|p| p.into_inner());
+    if !c.iter().any(|p| p == profile_id) {
+        c.push(profile_id.to_string());
+    }
+}
+
+fn check_cancel(profile_id: &str) -> Result<()> {
+    let hit = CANCELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|p| p == profile_id);
+    if hit {
+        anyhow::bail!(crate::errcode::code("launch.cancelled"));
+    }
+    Ok(())
+}
+
+/// Clears a profile's cancel when its launch starts and when it ends, however
+/// it ends: a cancel is for the launch that was on its way, never the next one.
+struct CancelScope(String);
+
+impl CancelScope {
+    fn start(profile_id: &str) -> Self {
+        Self::clear(profile_id);
+        CancelScope(profile_id.to_string())
+    }
+
+    fn clear(profile_id: &str) {
+        CANCELS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|p| p != profile_id);
+    }
+}
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        Self::clear(&self.0);
+    }
+}
+
+/// Whether the operator's extra arguments choose a proxy themselves.
+fn names_a_proxy(extra_args: &str) -> bool {
+    settings::parse_extra_args(extra_args).iter().any(|a| {
+        ["--proxy-server", "--proxy-pac-url", "--proxy-auto-detect"]
+            .iter()
+            .any(|p| a.starts_with(p))
+    })
+}
+
+/// How long a launch waits for the browser to publish its debugging port. Six
+/// seconds was not enough for a cold engine behind a slow proxy, and the start
+/// then reported no CDP for a browser that came up moments later (upstream
+/// 6c3f65a, "start-cdp-wait").
+const CDP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn read_devtools_endpoint(udd: &Path) -> Option<process::CdpInfo> {
     let file = udd.join("DevToolsActivePort");
-    for _ in 0..60 {
+    let deadline = std::time::Instant::now() + CDP_WAIT;
+    while std::time::Instant::now() < deadline {
         if let Ok(txt) = std::fs::read_to_string(&file) {
             let mut lines = txt.lines();
             if let (Some(port_s), Some(path)) = (lines.next(), lines.next()) {
@@ -871,6 +1059,108 @@ fn host_locale() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::{cancel, check_cancel, CancelScope};
+
+    #[test]
+    fn a_cancel_stops_only_the_launch_it_was_made_for() {
+        let id = "cancel-test-profile";
+        let scope = CancelScope::start(id);
+        assert!(check_cancel(id).is_ok());
+        cancel(id);
+        let err = check_cancel(id).unwrap_err().to_string();
+        assert!(err.contains("launch.cancelled"), "{err}");
+        assert!(check_cancel("another-profile").is_ok());
+        drop(scope);
+        // Late, after that launch returned: the next launch starts clean.
+        cancel(id);
+        let _next = CancelScope::start(id);
+        assert!(check_cancel(id).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod direct_profile_tests {
+    use super::names_a_proxy;
+
+    #[test]
+    fn only_an_operator_proxy_switch_keeps_the_system_route() {
+        assert!(!names_a_proxy(""));
+        assert!(!names_a_proxy("--mute-audio --lang=en"));
+        assert!(names_a_proxy(
+            "--mute-audio --proxy-server=http://10.0.0.1:3128"
+        ));
+        assert!(names_a_proxy("--proxy-pac-url=http://corp/proxy.pac"));
+    }
+}
+
+#[cfg(test)]
+mod window_from_screen_tests {
+    use super::fill_window_from_screen;
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn derives_a_window_from_the_claimed_screen() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1920, "height": 1080,
+                        "avail_width": 1920, "avail_height": 1032 }
+        }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1920);
+        assert_eq!(w["outer_height"], 1031);
+        assert_eq!(w["inner_width"], 1920);
+        assert_eq!(w["inner_height"], 944);
+    }
+
+    #[test]
+    fn leaves_a_profile_that_names_its_own_window() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1920, "height": 1080,
+                        "avail_width": 1920, "avail_height": 1032 },
+            "window": { "outer_width": 1280, "outer_height": 800,
+                        "inner_width": 1280, "inner_height": 713 }
+        }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1280, "a captured window must survive");
+        assert_eq!(w["inner_height"], 713);
+    }
+
+    #[test]
+    fn falls_back_to_the_full_screen_when_avail_is_absent() {
+        let mut raw = obj(json!({ "screen": { "width": 1366, "height": 768 } }));
+        fill_window_from_screen(&mut raw);
+        let w = raw["window"].as_object().unwrap();
+        assert_eq!(w["outer_width"], 1366);
+        assert_eq!(w["outer_height"], 767);
+    }
+
+    #[test]
+    fn does_nothing_without_a_screen() {
+        let mut raw = obj(json!({ "name": "no screen here" }));
+        fill_window_from_screen(&mut raw);
+        assert!(raw.get("window").is_none());
+    }
+
+    #[test]
+    fn an_empty_window_block_is_still_filled() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1600, "height": 900,
+                        "avail_width": 1600, "avail_height": 860 },
+            "window": {}
+        }));
+        fill_window_from_screen(&mut raw);
+        assert_eq!(raw["window"]["outer_width"], 1600);
+        assert_eq!(raw["window"]["outer_height"], 859);
+    }
 }
 
 #[cfg(test)]

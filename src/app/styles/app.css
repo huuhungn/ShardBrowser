@@ -121,6 +121,58 @@
   }
 }
 
+/* Profile tag chips and color swatches. data-color is a palette id from
+   entities/tag (TAG_COLORS); each picks one hue, mixed for the theme. */
+.tag-chip,
+.tag-swatch {
+  --tag: #8b90a0;
+}
+[data-color="red"] { --tag: #e5484d; }
+[data-color="orange"] { --tag: #f76b15; }
+[data-color="yellow"] { --tag: #d6a400; }
+[data-color="green"] { --tag: #30a46c; }
+[data-color="teal"] { --tag: #12a594; }
+[data-color="blue"] { --tag: #3e7bfa; }
+[data-color="purple"] { --tag: #8e4ec6; }
+.tag-chip {
+  display: inline-flex;
+  max-width: 120px;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  line-height: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: color-mix(in srgb, var(--tag) 70%, white);
+  background: color-mix(in srgb, var(--tag) 20%, transparent);
+}
+:root[data-theme="light"] .tag-chip {
+  color: color-mix(in srgb, var(--tag) 75%, black);
+  background: color-mix(in srgb, var(--tag) 14%, transparent);
+}
+.tag-chip-x {
+  margin-left: 1px;
+  line-height: 1;
+  opacity: 0.7;
+}
+.tag-chip-x:hover {
+  opacity: 1;
+}
+.tag-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--tag);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tag) 60%, black);
+}
+.tag-swatch-on {
+  outline: 2px solid var(--color-primary-base);
+  outline-offset: 1px;
+}
+
 /* Drag ghost chip (created via JS in the Browsers page onDragStart) */
 .drag-chip {
   position: absolute;
