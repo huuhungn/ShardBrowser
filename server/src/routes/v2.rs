@@ -368,6 +368,7 @@ pub async fn present_tenant_root_key_grant(
     // replay id is claimed so a rejected grant does not burn one.
     crate::generations::check_grant_against_generation(
         &app.db,
+        &ctx.server_instance_id,
         &tenant_id,
         &row.grant_variant,
         row.root_generation,
@@ -1097,6 +1098,7 @@ pub async fn begin_root_generation(
 
     let generation = crate::generations::begin_first_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &root_key_id,
         &util::now_rfc3339(),
@@ -1125,6 +1127,7 @@ pub async fn activate_root_generation(
 
     crate::generations::activate_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         req.generation,
         &util::now_rfc3339(),
@@ -1146,7 +1149,9 @@ pub async fn get_active_root_generation(
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    match crate::generations::active_generation(&app.db, &tenant_id).await? {
+    match crate::generations::active_generation(&app.db, &verified_instance(&app)?, &tenant_id)
+        .await?
+    {
         Some(g) => Ok(axum::Json(serde_json::json!({
             "active": true,
             "generation": g.generation,
@@ -1287,6 +1292,7 @@ pub async fn begin_fleet_generation(
 
     let generation = crate::fleet_generations::begin_first_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &fleet_id,
         &fkek_key_id,
@@ -1314,6 +1320,7 @@ pub async fn activate_fleet_generation(
 
     crate::fleet_generations::activate_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &fleet_id,
         req.generation,
@@ -1341,8 +1348,13 @@ pub async fn get_active_fleet_generation(
     let fleet_id = parse_id16(&fleet_hex, "fleet_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    let active =
-        crate::fleet_generations::active_generation(&app.db, &tenant_id, &fleet_id).await?;
+    let active = crate::fleet_generations::active_generation(
+        &app.db,
+        &verified_instance(&app)?,
+        &tenant_id,
+        &fleet_id,
+    )
+    .await?;
 
     Ok(axum::Json(match active {
         Some(g) => serde_json::json!({
@@ -1384,6 +1396,7 @@ pub async fn present_fleet_key_grant(
 
     crate::fleet_generations::check_grant_against_generation(
         &app.db,
+        &ctx.server_instance_id,
         &tenant_id,
         &row.fleet_id,
         row.fleet_generation,

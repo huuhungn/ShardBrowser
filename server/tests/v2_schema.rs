@@ -438,6 +438,18 @@ async fn a_grant_cannot_name_a_device_from_another_tenant() {
     .execute(&pool)
     .await
     .unwrap();
+    // The generation the grant names exists, so only the device can fail.
+    sqlx::query(
+        "INSERT INTO v2_root_key_generations
+            (server_instance_id, tenant_id, generation, root_key_id, state, created_at)
+         VALUES (?, ?, 1, ?, 'ACTIVE', '2026-09-02T00:00:00+00:00')",
+    )
+    .bind(id(80))
+    .bind(id(1))
+    .bind(key32(5))
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Tenant 1 tries to issue a root-key grant to tenant 2's device.
     let err = sqlx::query(
