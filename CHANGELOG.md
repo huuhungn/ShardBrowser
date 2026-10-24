@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- npm advisories published after 2.4.0: the MCP server takes `body-parser`
+  2.4.0 (GHSA-27r3-jxmh-p828, a denial of service through trailing bytes after
+  a compressed request body; the server talks over stdio and parses no HTTP
+  bodies), with `qs` 6.16.1 and `content-type` 2.1.0. The Node SDK takes
+  `undici` 6.29.1.
+
+### Internal
+
+- The MCP contract test checks every tool in the v0.1.28 fixture: none may be
+  removed, lose an argument, change an argument's type or gain a required one.
+  The MCP release archive now ships the fixture so the test runs there too.
+
 ## v2.4.0
 
 A feature release: profile tags. The browser engine is unchanged
