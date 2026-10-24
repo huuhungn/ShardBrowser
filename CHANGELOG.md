@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Selecting profiles in a narrow window no longer pushes **From template** and
+  **New profile** off screen or squeezes the folder tabs: the toolbar moves
+  under the tabs and wraps instead. The Proxies page toolbar wraps the same way.
+
 ### Security
 
 - npm advisories published after 2.4.0: the MCP server takes `body-parser`
