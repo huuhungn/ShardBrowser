@@ -23,7 +23,7 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
 
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    shardx_team_server::run_migrations(&pool).await?;
     Ok(pool)
 }
 
@@ -188,7 +188,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
         pool
     }
 
