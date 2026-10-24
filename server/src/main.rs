@@ -32,8 +32,15 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let command = match cli::parse(&args) {
+    // Non-UTF-8 arguments are a usage error, not a panic.
+    let args: Result<Vec<String>, _> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect();
+    let command = match args
+        .map_err(|_| "arguments must be valid UTF-8".to_string())
+        .and_then(|args| cli::parse(&args))
+    {
         Ok(command) => command,
         Err(e) => {
             eprintln!("{e}\n\n{}", cli::USAGE);

@@ -167,6 +167,64 @@ async fn v2_state(c: &reqwest::Client, port: u16, token: &str) -> (u16, Value, u
 }
 
 #[test]
+fn a_non_utf8_argument_is_a_usage_error() {
+    #[cfg(unix)]
+    let arg = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(b"\xff").to_os_string()
+    };
+    #[cfg(windows)]
+    let arg = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800])
+    };
+    let out = bin().arg("identity").arg(arg).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("usage:"));
+}
+
+/// A symlinked record could point into the data directory's rollback scope,
+/// so it is refused even when the file it names is a valid record.
+#[test]
+fn a_symlinked_record_is_refused() {
+    let d = dirs("symlink");
+    assert!(cli(&d, &["identity", "init"]).status.success());
+    let record = d.identity.join(RECORD);
+    let target = d.data.join("moved-record.bin");
+    std::fs::rename(&record, &target).unwrap();
+
+    // Any non-regular entry is refused the same way; a directory needs no
+    // privilege to create, so this part runs everywhere.
+    std::fs::create_dir(&record).unwrap();
+    let out = cli(&d, &["identity", "show"]);
+    assert_eq!(field(&out, "status"), "EPOCH_AUTHORITY_CORRUPT");
+    assert!(field(&out, "reason").contains("not a regular file"));
+    std::fs::remove_dir(&record).unwrap();
+
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &record);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&target, &record);
+    if let Err(e) = linked {
+        // Windows needs Developer Mode or a privilege to create symlinks.
+        eprintln!("skipping: cannot create a symlink here: {e}");
+        return;
+    }
+    let out = cli(&d, &["identity", "show"]);
+    assert_eq!(field(&out, "status"), "EPOCH_AUTHORITY_CORRUPT");
+    assert!(
+        field(&out, "reason").contains("not a regular file"),
+        "{}",
+        stdout(&out)
+    );
+
+    // The same bytes as a regular file verify.
+    std::fs::remove_file(&record).unwrap();
+    std::fs::rename(&target, &record).unwrap();
+    assert_eq!(field(&cli(&d, &["identity", "show"]), "status"), "OK");
+}
+
+#[test]
 fn unknown_commands_print_usage_and_fail() {
     for args in [
         &["identity"][..],
@@ -678,12 +736,15 @@ async fn tenant_create_refuses_before_identity_init() {
         "{}",
         stderr(&out)
     );
-    // Refused before migrating: the database holds no schema, let alone rows.
-    let pool = db(&d).await;
-    assert_eq!(count(&pool, "sqlite_master").await, 0);
+    // A refusal creates nothing beside the lock file it held: no database
+    // file, no blob directory.
+    let entries: Vec<String> = std::fs::read_dir(&d.data)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, ["shardx.lock"]);
 
     // A database migrated by the server, but never initialised, is refused too.
-    pool.close().await;
     migrated(&d).await.close().await;
     let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!out.status.success());

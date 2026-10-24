@@ -107,24 +107,23 @@ fn is_network_path(path: &Path) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_network_path(path: &Path) -> bool {
-    const NETWORK_FS: &[&str] = &[
-        "nfs",
-        "nfs4",
-        "cifs",
-        "smb3",
-        "smbfs",
-        "ncpfs",
-        "afs",
-        "ceph",
-        "glusterfs",
-        "fuse.sshfs",
-        "fuse.davfs2",
+    // Unreadable mounts mean unknown, and unknown is treated as remote.
+    std::fs::read_to_string("/proc/self/mounts").map_or(true, |m| !on_local_fs(&m, path))
+}
+
+/// Whether the mount holding `path` is a local disk filesystem, per a
+/// `/proc/self/mounts` listing. An allowlist: remote FUSE (rclone, s3fs,
+/// gcsfuse), 9p, virtiofs and Docker Desktop host shares all differ by name,
+/// and a type nobody listed must fail closed (L2335).
+#[cfg(any(target_os = "linux", test))]
+fn on_local_fs(mounts: &str, path: &Path) -> bool {
+    const LOCAL_FS: &[&str] = &[
+        "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "bcachefs",
+        // Memory-backed and container-layer mounts are local, though tmpfs loses
+        // the record on reboot, which then fails closed as MISSING.
+        "tmpfs", "overlay",
     ];
-    // Unknown is treated as remote: the record's durability cannot be assumed.
-    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
-        return true;
-    };
-    let mut best: Option<(usize, String)> = None;
+    let mut best: Option<(usize, &str)> = None;
     for line in mounts.lines() {
         let mut fields = line.split(' ');
         let (Some(_), Some(mount), Some(fstype)) = (fields.next(), fields.next(), fields.next())
@@ -132,15 +131,16 @@ fn is_network_path(path: &Path) -> bool {
             continue;
         };
         let mount = unescape_mount(mount);
-        if path.starts_with(&mount) && best.as_ref().is_none_or(|(len, _)| mount.len() >= *len) {
-            best = Some((mount.len(), fstype.to_string()));
+        // Later lines shadow earlier ones on the same mount point.
+        if path.starts_with(&mount) && best.is_none_or(|(len, _)| mount.len() >= len) {
+            best = Some((mount.len(), fstype));
         }
     }
-    best.is_none_or(|(_, fstype)| NETWORK_FS.contains(&fstype.as_str()))
+    best.is_some_and(|(_, fstype)| LOCAL_FS.contains(&fstype))
 }
 
 /// `/proc/self/mounts` writes space, tab, newline and backslash as `\ooo`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn unescape_mount(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -174,30 +174,82 @@ fn is_network_path(_path: &Path) -> bool {
 
 /// Read and parse the record under the P1 rules. Reads at most one byte past
 /// the fixed size, so an oversized file is rejected without loading it.
+///
+/// The record must be a regular file in the identity directory itself. A
+/// symlink (or any other non-regular entry) is `EPOCH_AUTHORITY_CORRUPT`, the
+/// same as any other entry that is not a valid record: it could point back
+/// into the data directory's rollback scope, which preflight keeps the
+/// directory out of (S1).
 fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Refusal> {
     let path = dir.join(RECORD_FILE);
-    let mut bytes = Vec::with_capacity(RECORD_LEN + 1);
-    let read = std::fs::File::open(&path)
-        .and_then(|f| f.take(RECORD_LEN as u64 + 1).read_to_end(&mut bytes));
-    match read {
-        Ok(_) => {}
+    let unreadable = |e: std::io::Error| {
+        refuse(
+            ReasonCode::Corrupt,
+            format!("cannot read {}: {e}", path.display()),
+        )
+    };
+    let not_regular = || {
+        refuse(
+            ReasonCode::Corrupt,
+            format!("{} is not a regular file", path.display()),
+        )
+    };
+    let entry = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(refuse(
                 ReasonCode::Missing,
                 format!("{} does not exist", path.display()),
             ))
         }
-        Err(e) => {
-            return Err(refuse(
-                ReasonCode::Corrupt,
-                format!("cannot read {}: {e}", path.display()),
-            ))
-        }
+        Err(e) => return Err(unreadable(e)),
+    };
+    if !entry.file_type().is_file() {
+        return Err(not_regular());
     }
+    let file = open_no_follow(&path).map_err(unreadable)?;
+    // Checked again on the open handle, so a swap after the first check fails.
+    let opened = file.metadata().map_err(unreadable)?;
+    if !opened.file_type().is_file() || !same_file(&entry, &opened) {
+        return Err(not_regular());
+    }
+    let mut bytes = Vec::with_capacity(RECORD_LEN + 1);
+    file.take(RECORD_LEN as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
     let record = identity_record::parse(&bytes)
         .map_err(|r| refuse(ReasonCode::Corrupt, format!("record rejected: {r:?}")))?;
     let fixed: [u8; RECORD_LEN] = bytes.try_into().expect("parse checked the length");
     Ok((record, identity_record::external_record_sha256(&fixed)))
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(windows)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Opens a reparse point itself rather than its target, so the handle's
+    // metadata shows a link that replaced the file after the first check.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    // The handle was opened without following links; its own check suffices.
+    true
 }
 
 /// Compare a parsed record with the mirror, following the plan's startup
@@ -317,8 +369,14 @@ async fn ensure_no_rows(pool: &SqlitePool, table: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// temp -> flush -> fsync -> atomic replace -> fsync the directory (plan
+/// temp -> flush -> fsync -> atomic install -> fsync the directory (plan
 /// L1055, L2252).
+///
+/// The install is a hard link, which fails if the record exists, instead of a
+/// rename, which would replace it: the lock covers one data directory, so two
+/// inits sharing an identity directory could otherwise overwrite each other's
+/// record between the absence check and here. A filesystem without hard links
+/// fails init rather than weakening this.
 fn write_record(dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = dir.join(TMP_FILE);
     let written = std::fs::OpenOptions::new()
@@ -338,8 +396,17 @@ fn write_record(dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         }
         return Err(e).with_context(|| format!("writing {}", tmp.display()));
     }
-    std::fs::rename(&tmp, dir.join(RECORD_FILE))
-        .with_context(|| format!("replacing {}", dir.join(RECORD_FILE).display()))?;
+    let record = dir.join(RECORD_FILE);
+    let installed = std::fs::hard_link(&tmp, &record);
+    // The temp file is ours either way; a leftover would block the next init.
+    let removed = std::fs::remove_file(&tmp);
+    match installed {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            anyhow::bail!("refusing: {} already exists", record.display())
+        }
+        other => other.with_context(|| format!("installing {}", record.display()))?,
+    }
+    removed.with_context(|| format!("removing {}", tmp.display()))?;
     sync_dir(dir).with_context(|| format!("fsync of {}", dir.display()))
 }
 
@@ -431,17 +498,21 @@ async fn open_read_only(cfg: &Config) -> anyhow::Result<Option<SqlitePool>> {
     Ok(Some(SqlitePool::connect_with(opts).await?))
 }
 
+/// The mirror read without creating or changing anything, for commands that
+/// must verify before they write.
+pub async fn read_mirror_read_only(cfg: &Config) -> anyhow::Result<Option<Mirror>> {
+    let Some(pool) = open_read_only(cfg).await? else {
+        return Ok(None);
+    };
+    let mirror = read_mirror(&pool).await?;
+    pool.close().await;
+    Ok(mirror)
+}
+
 /// `identity show`: report whether the record verifies against the mirror.
 /// Read-only; returns whether it verified.
 pub async fn show(cfg: &Config) -> anyhow::Result<bool> {
-    let mirror = match open_read_only(cfg).await? {
-        Some(pool) => {
-            let mirror = read_mirror(&pool).await?;
-            pool.close().await;
-            mirror
-        }
-        None => None,
-    };
+    let mirror = read_mirror_read_only(cfg).await?;
     match authority(cfg, mirror.as_ref()) {
         Ok(v) => {
             println!("status=OK");
@@ -541,10 +612,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn mount_fields_are_unescaped() {
         assert_eq!(unescape_mount(r"/mnt/a\040b"), "/mnt/a b");
         assert_eq!(unescape_mount(r"/plain"), "/plain");
+    }
+
+    #[test]
+    fn only_listed_local_filesystems_count_as_local() {
+        let mounts = "\
+overlay / overlay rw,relatime 0 0
+/dev/sda1 /identity ext4 rw,relatime 0 0
+server:/export /nfs nfs4 rw 0 0
+remote: /rclone fuse.rclone rw 0 0
+bucket /s3 fuse.s3fs rw 0 0
+bucket /gcs fuse.gcsfuse rw 0 0
+drvfs /mnt/c 9p rw 0 0
+grpcfuse /host fakeowner rw 0 0
+/dev/sdb1 /mnt/with\\040space xfs rw 0 0
+/dev/sdc1 /nfs/local btrfs rw 0 0
+";
+        let local = |p: &str| on_local_fs(mounts, Path::new(p));
+        assert!(local("/identity/dir"));
+        assert!(local("/var/lib/x"), "the container root is overlay");
+        assert!(local("/mnt/with space/id"));
+        assert!(local("/nfs/local/id"), "the longest mount prefix decides");
+        for remote in [
+            "/nfs/id",
+            "/rclone/id",
+            "/s3/id",
+            "/gcs/id",
+            "/mnt/c/id",
+            "/host/id",
+        ] {
+            assert!(!local(remote), "{remote}");
+        }
+        assert!(
+            !on_local_fs("", Path::new("/identity")),
+            "unknown is remote"
+        );
+        // A later mount on the same point shadows the earlier one.
+        let shadowed = "/dev/sda1 /identity ext4 rw 0 0\nserver:/x /identity nfs rw 0 0\n";
+        assert!(!on_local_fs(shadowed, Path::new("/identity/x")));
+    }
+
+    #[test]
+    fn install_never_replaces_a_record_that_appeared_after_the_check() {
+        let dir = std::env::temp_dir().join(format!("shardx-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Another init sharing this directory got here first.
+        std::fs::write(dir.join(RECORD_FILE), b"theirs").unwrap();
+        let err = write_record(&dir, b"ours").unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read(dir.join(RECORD_FILE)).unwrap(), b"theirs");
+        assert!(!dir.join(TMP_FILE).exists());
+
+        std::fs::remove_file(dir.join(RECORD_FILE)).unwrap();
+        write_record(&dir, b"ours").unwrap();
+        assert_eq!(std::fs::read(dir.join(RECORD_FILE)).unwrap(), b"ours");
+        assert!(!dir.join(TMP_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,6 +6,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::Context;
+use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::{auth, db, identity, util};
@@ -122,6 +123,18 @@ fn valid_slug(slug: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// v1 bounds usernames only by non-emptiness; this is the bound for v2 owners.
+const MAX_USERNAME_CHARS: usize = 64;
+
+/// Stored exactly as given, so reject what would make two names look alike
+/// or break a log line.
+fn valid_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_USERNAME_CHARS
+        && name.trim() == name
+        && !name.chars().any(char::is_control)
+}
+
 /// `tenant create` (ADR 0001 Option A, command 3). The caller holds the lock.
 async fn tenant_create(
     cfg: &Config,
@@ -133,15 +146,15 @@ async fn tenant_create(
         valid_slug(slug),
         "--slug must be 1-63 characters of a-z, 0-9 and '-', not starting with '-'"
     );
-    // Same rule as v1 user creation.
     anyhow::ensure!(
-        !owner_username.trim().is_empty(),
-        "--owner-username must not be empty"
+        valid_username(owner_username),
+        "--owner-username must be 1-{MAX_USERNAME_CHARS} characters with no control \
+         characters and no leading or trailing whitespace"
     );
 
-    // Verify before migrating, so a refusal changes nothing.
-    let pool = db::open_pool(cfg).await?;
-    let mirror = identity::read_mirror(&pool).await?;
+    // Verify through a read-only open first, so a refusal creates nothing:
+    // no database file, no blob directory, no migration.
+    let mirror = identity::read_mirror_read_only(cfg).await?;
     identity::authority(cfg, mirror.as_ref()).map_err(|r| {
         anyhow::anyhow!(
             "refusing: the server identity does not verify ({}: {}); run `identity show`",
@@ -149,9 +162,9 @@ async fn tenant_create(
             r.detail
         )
     })?;
-    shardx_team_server::run_migrations(&pool).await?;
+    let pool = db::init_pool(cfg).await?;
 
-    let password = read_password(password_stdin)?;
+    let password = read_password(password_stdin).await?;
     anyhow::ensure!(
         !db::is_weak_password(&password),
         "refusing a weak owner password: use at least 8 characters and not a well-known \
@@ -224,43 +237,58 @@ async fn tenant_create(
 
 /// Read the owner password from stdin (`--password-stdin`) or a hidden
 /// prompt. Refuses rather than blocks when there is no terminal to prompt on.
-fn read_password(from_stdin: bool) -> anyhow::Result<String> {
-    let stdin = std::io::stdin();
+///
+/// Every buffer that holds the password is zeroed when dropped.
+// shortcut: copies std keeps out of reach (stdin's internal buffer, and old
+// allocations if a line outgrows the reserved capacity) are not zeroed;
+// fixing that needs a raw terminal reader.
+async fn read_password(from_stdin: bool) -> anyhow::Result<Zeroizing<String>> {
     if from_stdin {
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line)?;
-        return Ok(trim_line_end(line));
+        return read_line();
     }
     anyhow::ensure!(
-        stdin.is_terminal(),
+        std::io::stdin().is_terminal(),
         "stdin is not a terminal; pass --password-stdin to read the owner password from stdin"
     );
-    let first = prompt_hidden("Owner password: ")?;
-    let second = prompt_hidden("Repeat owner password: ")?;
-    anyhow::ensure!(first == second, "the two passwords do not match");
+    let first = prompt_hidden("Owner password: ").await?;
+    let second = prompt_hidden("Repeat owner password: ").await?;
+    anyhow::ensure!(*first == *second, "the two passwords do not match");
     Ok(first)
 }
 
-fn trim_line_end(mut line: String) -> String {
+/// One line from stdin without its line ending.
+fn read_line() -> anyhow::Result<Zeroizing<String>> {
+    let mut line = Zeroizing::new(String::with_capacity(256));
+    std::io::stdin().lock().read_line(&mut line)?;
     if line.ends_with('\n') {
         line.pop();
         if line.ends_with('\r') {
             line.pop();
         }
     }
-    line
+    Ok(line)
 }
 
-fn prompt_hidden(prompt: &str) -> anyhow::Result<String> {
+/// Prompt with echo off. Ctrl-C during the prompt restores echo before the
+/// process exits; other ways of dying mid-prompt (SIGTERM, SIGHUP, a kill)
+/// can leave it off, see the README.
+async fn prompt_hidden(prompt: &str) -> anyhow::Result<Zeroizing<String>> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
     let echo = EchoOff::new()?;
-    let mut line = String::new();
-    let read = std::io::stdin().lock().read_line(&mut line);
+    let read = tokio::task::spawn_blocking(read_line);
+    let line = tokio::select! {
+        line = read => line.context("password prompt")?,
+        _ = tokio::signal::ctrl_c() => {
+            drop(echo);
+            eprintln!();
+            // Exit here: returning would wait on the blocked stdin read.
+            std::process::exit(130);
+        }
+    };
     drop(echo);
     eprintln!();
-    read?;
-    Ok(trim_line_end(line))
+    line
 }
 
 /// Terminal echo off for the guard's lifetime. Without it the password
@@ -375,6 +403,32 @@ mod tests {
         ] {
             let err = parse(&args(bad)).unwrap_err();
             assert!(!err.contains("hunter2"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn owner_usernames_are_bounded_and_printable() {
+        let longest = "a".repeat(MAX_USERNAME_CHARS);
+        for ok in [
+            "alice",
+            "Alice Smith",
+            "ann.o'neil",
+            &longest,
+            "\u{e9}lodie",
+        ] {
+            assert!(valid_username(ok), "{ok:?}");
+        }
+        let too_long = "a".repeat(MAX_USERNAME_CHARS + 1);
+        for bad in [
+            "",
+            " alice",
+            "alice ",
+            "\talice",
+            "al\nice",
+            "al\u{7}ice",
+            &too_long,
+        ] {
+            assert!(!valid_username(bad), "{bad:?}");
         }
     }
 
