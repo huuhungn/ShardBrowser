@@ -6,12 +6,16 @@ pub mod proxies;
 pub mod users;
 pub mod v2;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::Method;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::auth;
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
@@ -121,7 +125,21 @@ pub fn router(state: AppState) -> Router {
         // proxies
         .route("/proxies", get(proxies::list).post(proxies::create))
         .route("/proxies/:id", delete(proxies::delete))
+        .layer(middleware::from_fn_with_state(state.clone(), v2_write_gate))
         .with_state(state)
+}
+
+/// Refuse every state-changing v2 request while the identity authority is
+/// unverified. Keyed on the path prefix rather than per handler, so a new v2
+/// route is gated without anyone remembering to.
+async fn v2_write_gate(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    let read_only = matches!(*req.method(), Method::GET | Method::HEAD);
+    if !read_only && req.uri().path().starts_with("/v2/") {
+        if let Err(refusal) = app.authority.as_ref() {
+            return AppError::EpochAuthority(refusal.code).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn health() -> Json<Value> {

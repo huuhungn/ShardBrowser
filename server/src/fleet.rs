@@ -821,7 +821,7 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        shardx_team_server::run_migrations(&db).await.unwrap();
 
         for (t, slug) in [(TENANT, "acme"), (OTHER_TENANT, "other")] {
             sqlx::query(

@@ -11,6 +11,9 @@
 //! the generation becomes ACTIVE only once that device has proven it can
 //! unwrap what it filed. Rotation and revocation are specified in the plan but
 //! are not implemented here.
+//!
+//! Rows and lookups are keyed by `server_instance_id + tenant_id` like the
+//! root generations they rest on.
 
 use crate::error::AppError;
 use sqlx::{Row, SqlitePool};
@@ -37,6 +40,7 @@ pub struct FleetGeneration {
 /// Read one generation.
 pub async fn get_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     generation: u64,
@@ -44,11 +48,12 @@ pub async fn get_generation(
     let row = sqlx::query(
         "SELECT generation, fkek_key_id, state, created_at, activated_at \
          FROM v2_fleet_key_generations \
-         WHERE tenant_id = ?1 AND fleet_id = ?2 AND generation = ?3",
+         WHERE server_instance_id = ?4 AND tenant_id = ?1 AND fleet_id = ?2 AND generation = ?3",
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
     .bind(generation as i64)
+    .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
 
@@ -74,17 +79,19 @@ pub async fn get_generation(
 /// to a weaker key path.
 pub async fn active_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
 ) -> Result<Option<FleetGeneration>, AppError> {
     let row = sqlx::query(
         "SELECT generation, fkek_key_id, state, created_at, activated_at \
          FROM v2_fleet_key_generations \
-         WHERE tenant_id = ?1 AND fleet_id = ?2 AND state = ?3",
+         WHERE server_instance_id = ?4 AND tenant_id = ?1 AND fleet_id = ?2 AND state = ?3",
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
     .bind(STATE_ACTIVE)
+    .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
 
@@ -110,6 +117,7 @@ pub async fn active_generation(
 /// leaving snapshots encrypted under a key no surviving grant covers.
 pub async fn begin_first_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     fkek_key_id: &[u8; 32],
@@ -142,6 +150,17 @@ pub async fn begin_first_generation(
             "tenant has no active root generation; activate one before creating a fleet key".into(),
         ));
     };
+    // The pointer alone is not proof (ADR 0001 Q3): it must name this
+    // instance's ACTIVE row.
+    let anchored =
+        crate::generations::get_generation(db, instance, tenant_id, root_generation as u64)
+            .await?
+            .is_some_and(|g| g.state == crate::generations::STATE_ACTIVE);
+    if !anchored {
+        return Err(AppError::Conflict(
+            "the tenant's root pointer does not name an active root generation".into(),
+        ));
+    }
 
     let existing: Option<i64> = sqlx::query_scalar(
         "SELECT generation FROM v2_fleet_key_generations \
@@ -160,8 +179,9 @@ pub async fn begin_first_generation(
 
     sqlx::query(
         "INSERT INTO v2_fleet_key_generations \
-         (tenant_id, fleet_id, generation, fkek_key_id, root_generation, state, created_at) \
-         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6)",
+         (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id, root_generation, \
+          state, created_at) \
+         VALUES (?7, ?1, ?2, 1, ?3, ?4, ?5, ?6)",
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
@@ -169,6 +189,7 @@ pub async fn begin_first_generation(
     .bind(root_generation)
     .bind(STATE_PREPARING)
     .bind(now)
+    .bind(instance.as_slice())
     .execute(db)
     .await?;
 
@@ -178,19 +199,21 @@ pub async fn begin_first_generation(
 /// Whether this fleet generation already has its first self-grant.
 pub async fn has_self_grant(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     generation: u64,
 ) -> Result<bool, AppError> {
     let row = sqlx::query(
         "SELECT 1 FROM v2_fleet_key_grants \
-         WHERE tenant_id = ?1 AND fleet_id = ?2 AND fleet_generation = ?3 \
-           AND grant_variant = ?4 LIMIT 1",
+         WHERE server_instance_id = ?5 AND tenant_id = ?1 AND fleet_id = ?2 \
+           AND fleet_generation = ?3 AND grant_variant = ?4 LIMIT 1",
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
     .bind(generation as i64)
     .bind(VARIANT_FIRST_SELF)
+    .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
     Ok(row.is_some())
@@ -203,13 +226,14 @@ pub async fn has_self_grant(
 /// custodian grants only follow one.
 pub async fn check_grant_against_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     generation: u64,
     fkek_key_id: &[u8; 32],
     grant_variant: &str,
 ) -> Result<(), AppError> {
-    let Some(gen) = get_generation(db, tenant_id, fleet_id, generation).await? else {
+    let Some(gen) = get_generation(db, instance, tenant_id, fleet_id, generation).await? else {
         return Err(AppError::Conflict(
             "fleet key generation does not exist for this fleet".into(),
         ));
@@ -235,7 +259,7 @@ pub async fn check_grant_against_generation(
                 "a first self-grant is only valid while the generation is preparing".into(),
             ));
         }
-        if has_self_grant(db, tenant_id, fleet_id, generation).await? {
+        if has_self_grant(db, instance, tenant_id, fleet_id, generation).await? {
             return Err(AppError::Conflict(
                 "fleet generation already has a first self-grant".into(),
             ));
@@ -260,12 +284,14 @@ pub async fn check_grant_against_generation(
 /// itself out by sealing to a key it has already lost.
 pub async fn activate_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     generation: u64,
     now: &str,
 ) -> Result<(), AppError> {
-    let Some(existing) = get_generation(db, tenant_id, fleet_id, generation).await? else {
+    let Some(existing) = get_generation(db, instance, tenant_id, fleet_id, generation).await?
+    else {
         return Err(AppError::Conflict(
             "fleet key generation does not exist for this fleet".into(),
         ));
@@ -283,7 +309,7 @@ pub async fn activate_generation(
         ));
     }
 
-    if !has_self_grant(db, tenant_id, fleet_id, generation).await? {
+    if !has_self_grant(db, instance, tenant_id, fleet_id, generation).await? {
         return Err(AppError::Conflict(
             "cannot activate a fleet key generation with no first self-grant".into(),
         ));
@@ -291,15 +317,65 @@ pub async fn activate_generation(
 
     sqlx::query(
         "UPDATE v2_fleet_key_generations SET state = ?1, activated_at = ?2 \
-         WHERE tenant_id = ?3 AND fleet_id = ?4 AND generation = ?5",
+         WHERE server_instance_id = ?6 AND tenant_id = ?3 AND fleet_id = ?4 AND generation = ?5",
     )
     .bind(STATE_ACTIVE)
     .bind(now)
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
     .bind(generation as i64)
+    .bind(instance.as_slice())
     .execute(db)
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    const INSTANCE: [u8; 16] = [7; 16];
+    const TENANT: [u8; 16] = [1; 16];
+    const FLEET: [u8; 16] = [2; 16];
+
+    #[tokio::test]
+    async fn a_fleet_key_needs_the_pointer_to_name_this_instances_active_root() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
+        for sql in [
+            "INSERT INTO v2_tenants (id, slug, status, active_root_generation, created_at)              VALUES (?2, 't', 'active', 0, 'now')",
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)              VALUES (?3, ?2, 'f', 'active', 'now')",
+            "INSERT INTO v2_root_key_generations              (server_instance_id, tenant_id, generation, root_key_id, state, created_at)              VALUES (?1, ?2, 0, x'0909090909090909090909090909090909090909090909090909090909090909',                      'PREPARING', 'now')",
+        ] {
+            sqlx::query(sql)
+                .bind(INSTANCE.as_slice())
+                .bind(TENANT.as_slice())
+                .bind(FLEET.as_slice())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let begin = |instance: [u8; 16]| {
+            let pool = pool.clone();
+            async move {
+                begin_first_generation(&pool, &instance, &TENANT, &FLEET, &[3; 32], "now").await
+            }
+        };
+
+        // A non-NULL pointer naming a PREPARING row is not an active root.
+        assert!(matches!(begin(INSTANCE).await, Err(AppError::Conflict(_))));
+        sqlx::query("UPDATE v2_root_key_generations SET state = 'ACTIVE'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Another instance's view of the same tenant has no such root.
+        assert!(matches!(begin([8; 16]).await, Err(AppError::Conflict(_))));
+        assert_eq!(begin(INSTANCE).await.unwrap(), 1);
+    }
 }

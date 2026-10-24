@@ -130,6 +130,7 @@ mod tests {
             snapshot_keep: 5,
             max_snapshot_bytes: 1024,
             trust_proxy: false,
+            identity_dir: None,
         }
     }
 
@@ -156,7 +157,7 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO snapshots (env_id, version, blob_path, sha256, size, created_by, created_at) \
              VALUES ('env1', 1, ?, 'x', 1, 'u', 'now')",
@@ -191,7 +192,7 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
         // Make the referenced-set query fail.
         sqlx::query("DROP TABLE snapshots")
             .execute(&pool)

@@ -16,6 +16,9 @@
 //! records the *lifecycle* the column cannot express — that a generation is
 //! being prepared, which root key it commits to, and whether anyone has proven
 //! they can open it. Activation writes both, so the two never disagree.
+//!
+//! Every row and lookup is keyed by `server_instance_id + tenant_id` (plan
+//! 7.2/7.4): callers pass the instance the startup check verified.
 
 use crate::error::AppError;
 use sqlx::{Row, SqlitePool};
@@ -40,9 +43,8 @@ pub struct Generation {
 /// Begin the tenant's first root key generation, in PREPARING.
 ///
 /// The generation number is the one the tenant already advertises in
-/// `v2_tenants.active_root_generation`, so a bootstrapped tenant does not end
-/// up with a lifecycle row numbered differently from the column every other
-/// query reads.
+/// `v2_tenants.active_root_generation`. A genesis tenant stores NULL there,
+/// which means generation 0; a later activation writes the real number.
 ///
 /// Only the first generation is creatable here: a later one is a rotation,
 /// which must carry the previous generation forward and is out of scope.
@@ -50,10 +52,13 @@ pub struct Generation {
 /// key for a tenant that may already have devices holding the first one.
 pub async fn begin_first_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     root_key_id: &[u8; 32],
     now: &str,
 ) -> Result<u64, AppError> {
+    // Any instance counts: the tenant row is not instance-scoped, so neither
+    // is the question whether it already began a generation.
     let existing: i64 =
         sqlx::query_scalar("SELECT count(*) FROM v2_root_key_generations WHERE tenant_id = ?1")
             .bind(tenant_id.as_slice())
@@ -66,23 +71,35 @@ pub async fn begin_first_generation(
         ));
     }
 
-    let generation: i64 =
+    let advertised: Option<i64> =
         sqlx::query_scalar("SELECT active_root_generation FROM v2_tenants WHERE id = ?1")
             .bind(tenant_id.as_slice())
             .fetch_optional(db)
             .await?
-            .ok_or_else(|| AppError::BadRequest("tenant does not exist".into()))?;
+            .flatten();
+    if advertised.is_none()
+        && sqlx::query_scalar::<_, i64>("SELECT count(*) FROM v2_tenants WHERE id = ?1")
+            .bind(tenant_id.as_slice())
+            .fetch_one(db)
+            .await?
+            == 0
+    {
+        return Err(AppError::BadRequest("tenant does not exist".into()));
+    }
+    // NULL is the pre-activation pointer from ADR 0001 Q3, not a missing row.
+    let generation = advertised.unwrap_or(0);
 
     sqlx::query(
         "INSERT INTO v2_root_key_generations \
-         (tenant_id, generation, root_key_id, state, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         (server_instance_id, tenant_id, generation, root_key_id, state, created_at) \
+         VALUES (?6, ?1, ?2, ?3, ?4, ?5)",
     )
     .bind(tenant_id.as_slice())
     .bind(generation)
     .bind(root_key_id.as_slice())
     .bind(STATE_PREPARING)
     .bind(now)
+    .bind(instance.as_slice())
     .execute(db)
     .await?;
 
@@ -92,15 +109,18 @@ pub async fn begin_first_generation(
 /// Look up one generation.
 pub async fn get_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     generation: u64,
 ) -> Result<Option<Generation>, AppError> {
     let row = sqlx::query(
         "SELECT generation, root_key_id, state, created_at, activated_at \
-         FROM v2_root_key_generations WHERE tenant_id = ?1 AND generation = ?2",
+         FROM v2_root_key_generations \
+         WHERE server_instance_id = ?3 AND tenant_id = ?1 AND generation = ?2",
     )
     .bind(tenant_id.as_slice())
     .bind(generation as i64)
+    .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
 
@@ -126,14 +146,17 @@ pub async fn get_generation(
 /// silently falling back to an older key path.
 pub async fn active_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
 ) -> Result<Option<Generation>, AppError> {
     let row = sqlx::query(
         "SELECT generation, root_key_id, state, created_at, activated_at \
-         FROM v2_root_key_generations WHERE tenant_id = ?1 AND state = ?2",
+         FROM v2_root_key_generations \
+         WHERE server_instance_id = ?3 AND tenant_id = ?1 AND state = ?2",
     )
     .bind(tenant_id.as_slice())
     .bind(STATE_ACTIVE)
+    .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
 
@@ -153,12 +176,18 @@ pub async fn active_generation(
 }
 
 /// Whether this tenant already has a FirstRootSelfGrant on file.
-pub async fn has_self_grant(db: &SqlitePool, tenant_id: &[u8; 16]) -> Result<bool, AppError> {
+pub async fn has_self_grant(
+    db: &SqlitePool,
+    instance: &[u8; 16],
+    tenant_id: &[u8; 16],
+) -> Result<bool, AppError> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM v2_tenant_root_key_grants \
-         WHERE tenant_id = ?1 AND grant_variant = 'FirstRootSelfGrant'",
+         WHERE server_instance_id = ?2 AND tenant_id = ?1 \
+           AND grant_variant = 'FirstRootSelfGrant'",
     )
     .bind(tenant_id.as_slice())
+    .bind(instance.as_slice())
     .fetch_one(db)
     .await?;
     Ok(n > 0)
@@ -180,12 +209,13 @@ pub async fn has_self_grant(db: &SqlitePool, tenant_id: &[u8; 16]) -> Result<boo
 ///     custodian-issued grant is for.
 pub async fn check_grant_against_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     grant_variant: &str,
     root_generation: u64,
     root_key_id: &[u8; 32],
 ) -> Result<(), AppError> {
-    let Some(generation) = get_generation(db, tenant_id, root_generation).await? else {
+    let Some(generation) = get_generation(db, instance, tenant_id, root_generation).await? else {
         return Err(AppError::BadRequest(format!(
             "root generation {root_generation} does not exist for this tenant"
         )));
@@ -209,7 +239,7 @@ pub async fn check_grant_against_generation(
                 "a first self-grant is only valid while the generation is preparing".into(),
             ));
         }
-        if has_self_grant(db, tenant_id).await? {
+        if has_self_grant(db, instance, tenant_id).await? {
             return Err(AppError::Conflict(
                 "tenant already has a first root self-grant".into(),
             ));
@@ -236,11 +266,12 @@ pub async fn check_grant_against_generation(
 /// only then activates.
 pub async fn activate_generation(
     db: &SqlitePool,
+    instance: &[u8; 16],
     tenant_id: &[u8; 16],
     generation: u64,
     now: &str,
 ) -> Result<(), AppError> {
-    let Some(existing) = get_generation(db, tenant_id, generation).await? else {
+    let Some(existing) = get_generation(db, instance, tenant_id, generation).await? else {
         return Err(AppError::BadRequest(
             "root generation does not exist for this tenant".into(),
         ));
@@ -259,7 +290,7 @@ pub async fn activate_generation(
 
     // Activation without a filed self-grant would produce an active generation
     // that no device can open.
-    if !has_self_grant(db, tenant_id).await? {
+    if !has_self_grant(db, instance, tenant_id).await? {
         return Err(AppError::Conflict(
             "cannot activate a generation with no root key grant on file".into(),
         ));
@@ -272,13 +303,14 @@ pub async fn activate_generation(
 
     let result = sqlx::query(
         "UPDATE v2_root_key_generations SET state = ?1, activated_at = ?2 \
-         WHERE tenant_id = ?3 AND generation = ?4 AND state = ?5",
+         WHERE server_instance_id = ?6 AND tenant_id = ?3 AND generation = ?4 AND state = ?5",
     )
     .bind(STATE_ACTIVE)
     .bind(now)
     .bind(tenant_id.as_slice())
     .bind(generation as i64)
     .bind(STATE_PREPARING)
+    .bind(instance.as_slice())
     .execute(&mut *tx)
     .await?;
 
@@ -300,4 +332,53 @@ pub async fn activate_generation(
     tx.commit().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn genesis_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        shardx_team_server::run_migrations(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn null_pointer_begins_generation_zero() {
+        let pool = genesis_pool().await;
+        sqlx::query(
+            "INSERT INTO v2_tenants (id, slug, status, created_at) VALUES (?, 'genesis', 'active', 'now')",
+        )
+        .bind(vec![1u8; 16])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let generation = begin_first_generation(&pool, &[7u8; 16], &[1u8; 16], &[2u8; 32], "now")
+            .await
+            .unwrap();
+        assert_eq!(generation, 0);
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT generation FROM v2_root_key_generations WHERE tenant_id = ?",
+        )
+        .bind(vec![1u8; 16])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0);
+
+        let missing = begin_first_generation(&pool, &[7u8; 16], &[9u8; 16], &[3u8; 32], "now")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, AppError::BadRequest(message) if message == "tenant does not exist")
+        );
+    }
 }

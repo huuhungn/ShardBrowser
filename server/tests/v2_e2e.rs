@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Executor;
 
+use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
 use shared::canonical as c;
 use shared::signing::{build_signed_container, identity_key_id, Ed25519SigningKey};
 
@@ -49,12 +50,46 @@ async fn wait_health(c: &reqwest::Client, port: u16) {
     panic!("server did not become healthy on port {port}");
 }
 
-fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
+/// Start the server with a verified identity: an epoch-0 record for
+/// `INSTANCE` and its mirror, provisioned before startup as `identity init`
+/// would, so the records these tests sign bind to a known instance.
+async fn spawn_server(data: &std::path::Path, port: u16) -> ServerGuard {
     let _ = std::fs::remove_dir_all(data);
+    let identity = data.with_extension("identity");
+    let _ = std::fs::remove_dir_all(&identity);
+    std::fs::create_dir_all(data).unwrap();
+    std::fs::create_dir_all(&identity).unwrap();
+
+    let bytes = IdentityRecordV2::genesis(INSTANCE, 1_790_985_600_000)
+        .encode()
+        .unwrap();
+    std::fs::write(identity.join("identity-record-v2.bin"), bytes).unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}/shardx.db?mode=rwc",
+            data.to_string_lossy().replace('\\', "/")
+        ))
+        .await
+        .expect("create server db");
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO v2_server_state
+             (singleton, server_instance_id, restore_epoch, external_record_sha256, updated_at)
+         VALUES (1, ?, 0, ?, '2026-01-01T00:00:00Z')",
+    )
+    .bind(INSTANCE.as_slice())
+    .bind(external_record_sha256(&bytes).as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
     let bin = env!("CARGO_BIN_EXE_shardx-team-server");
     let child = Command::new(bin)
         .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
         .env("SHARDX_DATA_DIR", data)
+        .env("SHARDX_IDENTITY_DIR", &identity)
         .env("SHARDX_TOKEN_SECRET", "e2e-v2-secret")
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "secret")
@@ -84,8 +119,7 @@ const INSTANCE: [u8; 16] = [7u8; 16];
 const TENANT_A: [u8; 16] = [0xAAu8; 16];
 const TENANT_B: [u8; 16] = [0xBBu8; 16];
 
-/// Seed the v2 tables the endpoints read: server identity, two tenants, an
-/// issuer per tenant, and a v2 account linked to the v1 admin user.
+/// Seed the v2 tables the endpoints read: two tenants, an issuer per tenant, and a v2 account linked to the v1 admin user.
 ///
 /// Done directly against the database because there is no provisioning API
 /// yet; the point of these tests is the request path, not provisioning.
@@ -106,17 +140,6 @@ async fn seed(
         .expect("open server db");
 
     pool.execute("PRAGMA foreign_keys = ON").await.unwrap();
-
-    sqlx::query(
-        "INSERT OR REPLACE INTO v2_server_state
-             (singleton, server_instance_id, restore_epoch, external_record_sha256, updated_at)
-         VALUES (1, ?, 0, ?, '2026-01-01T00:00:00Z')",
-    )
-    .bind(INSTANCE.as_slice())
-    .bind([0u8; 32].as_slice())
-    .execute(&pool)
-    .await
-    .unwrap();
 
     for (tid, sk) in [(TENANT_A, key_a), (TENANT_B, key_b)] {
         // The issuer is keyed by its derived identity id — the same value the
@@ -216,7 +239,7 @@ async fn admin_user_id(c: &reqwest::Client, port: u16, tok: &str) -> String {
 async fn v2_authorization_holds_over_http() {
     let port = 38111u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -361,7 +384,7 @@ async fn v2_authorization_holds_over_http() {
 async fn v2_operations_replay_the_stored_response() {
     let port = 38112u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2op-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -446,7 +469,7 @@ async fn v2_operations_replay_the_stored_response() {
 async fn server_identity_reports_the_values_records_bind_to() {
     let port = 38113u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2id-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -493,7 +516,7 @@ async fn server_identity_reports_the_values_records_bind_to() {
 async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
     let port = 38114u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-manifest-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -696,7 +719,7 @@ async fn seed_profile(data: &std::path::Path, fleet: &[u8; 16], profile: &[u8; 1
 async fn a_body_that_contradicts_the_signed_manifest_is_refused() {
     let port = 38115u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-mismatch-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -844,7 +867,7 @@ async fn a_body_that_contradicts_the_signed_manifest_is_refused() {
 async fn a_member_outside_the_tenant_cannot_lease_its_profiles() {
     let port = 38117u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-crosstenant-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -908,7 +931,7 @@ async fn a_member_outside_the_tenant_cannot_lease_its_profiles() {
 async fn device_enrollment_requires_proof_of_possession() {
     let port = 38118u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-enroll-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1089,7 +1112,7 @@ fn enrollment_proof_bytes(
 async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
     let port = 38138u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-hpke-upgrade-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
     let admin = token(&cl, port, "admin", "secret").await;
@@ -1391,7 +1414,7 @@ async fn enroll(
 async fn a_filed_root_key_grant_comes_back_sealed_to_its_device() {
     let port = 38119u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-grant-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1553,7 +1576,7 @@ async fn a_filed_root_key_grant_comes_back_sealed_to_its_device() {
 async fn a_root_key_grant_replay_id_is_claimed_exactly_once() {
     let port = 38120u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-grantreplay-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1712,7 +1735,7 @@ async fn a_root_key_grant_replay_id_is_claimed_exactly_once() {
 async fn an_unknown_grant_variant_is_refused_before_it_reaches_the_database() {
     let port = 38121u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-variant-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1789,7 +1812,7 @@ async fn an_unknown_grant_variant_is_refused_before_it_reaches_the_database() {
 async fn a_grant_for_an_unknown_generation_is_refused() {
     let port = 38122u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-nogen-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1860,7 +1883,7 @@ async fn a_grant_for_an_unknown_generation_is_refused() {
 async fn a_second_first_root_self_grant_is_refused() {
     let port = 38123u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-twoself-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -1941,7 +1964,7 @@ async fn a_second_first_root_self_grant_is_refused() {
 async fn a_generation_cannot_activate_without_a_grant() {
     let port = 38124u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-noact-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2005,7 +2028,7 @@ async fn a_generation_cannot_activate_without_a_grant() {
 async fn an_outsider_cannot_begin_a_generation() {
     let port = 38125u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-genout-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2058,7 +2081,7 @@ async fn an_outsider_cannot_begin_a_generation() {
 async fn a_grant_wrapping_a_different_key_than_its_generation_is_refused() {
     let port = 38126u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-wrongkey-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2368,7 +2391,7 @@ async fn fleet_fixture(
 async fn a_fleet_key_grant_round_trips_to_its_device() {
     let port = 38131u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-rt-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2464,7 +2487,7 @@ async fn a_fleet_key_grant_round_trips_to_its_device() {
 async fn a_fleet_generation_cannot_activate_without_a_self_grant() {
     let port = 38132u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-act-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2523,7 +2546,7 @@ async fn a_fleet_grant_wrapping_a_different_key_is_refused() {
     let port = 38133u16;
     let data =
         std::env::temp_dir().join(format!("shardx-e2e-fleet-mismatch-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2582,7 +2605,7 @@ async fn a_fleet_grant_wrapping_a_different_key_is_refused() {
 async fn the_first_fleet_grant_must_be_a_unique_self_grant() {
     let port = 38134u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-first-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 
@@ -2711,7 +2734,7 @@ async fn the_first_fleet_grant_must_be_a_unique_self_grant() {
 async fn a_fleet_grant_claiming_another_capability_is_refused() {
     let port = 38137u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-cap-{}", std::process::id()));
-    let _guard = spawn_server(&data, port);
+    let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
 

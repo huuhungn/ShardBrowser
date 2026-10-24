@@ -29,7 +29,7 @@ async fn pool() -> SqlitePool {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
     pool
 }
 
@@ -438,6 +438,18 @@ async fn a_grant_cannot_name_a_device_from_another_tenant() {
     .execute(&pool)
     .await
     .unwrap();
+    // The generation the grant names exists, so only the device can fail.
+    sqlx::query(
+        "INSERT INTO v2_root_key_generations
+            (server_instance_id, tenant_id, generation, root_key_id, state, created_at)
+         VALUES (?, ?, 1, ?, 'ACTIVE', '2026-09-02T00:00:00+00:00')",
+    )
+    .bind(id(80))
+    .bind(id(1))
+    .bind(key32(5))
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Tenant 1 tries to issue a root-key grant to tenant 2's device.
     let err = sqlx::query(
@@ -523,4 +535,50 @@ async fn server_state_mirror_holds_at_most_one_row() {
     insert(1).execute(&pool).await.unwrap();
     let err = insert(2).execute(&pool).await.unwrap_err();
     assert_eq!(err_code(err), SQLITE_CONSTRAINT_PRIMARYKEY);
+}
+
+#[tokio::test]
+async fn only_offline_operator_audit_rows_may_omit_the_actor() {
+    // ADR 0001 D3: NULL actors mean an offline operator command, and nothing
+    // else may record an anonymous actor.
+    let pool = pool().await;
+    seed_tenant(&pool, 1).await;
+    let insert = |n: u8, actor: Option<u8>, device: Option<u8>, reason: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO v2_audit_events (tenant_id, id, actor_account_id, actor_device_id,
+                action, target_type, target_id, outcome, reason_code, request_id, created_at)
+             VALUES (?, ?, ?, ?, 'tenant.create', 'tenant', ?, 'success', ?, ?,
+                '2026-09-02T00:00:00+00:00')",
+        )
+        .bind(id(1))
+        .bind(id(n))
+        .bind(actor.map(id))
+        .bind(device.map(id))
+        .bind(id(1))
+        .bind(reason)
+        .bind(id(90 + n))
+    };
+
+    insert(1, None, None, Some("offline_operator_cli"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert(2, Some(3), Some(4), None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (n, actor, device, reason) in [
+        (5, None, None, None),
+        (6, None, None, Some("other")),
+        (7, Some(3), None, None),
+        (8, None, Some(4), Some("offline_operator_cli")),
+        (9, Some(3), Some(4), Some("offline_operator_cli")),
+    ] {
+        let err = insert(n, actor, device, reason)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(err_code(err), SQLITE_CONSTRAINT_CHECK, "row {n}");
+    }
 }
