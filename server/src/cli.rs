@@ -139,7 +139,8 @@ async fn tenant_create(
         "--owner-username must not be empty"
     );
 
-    let pool = db::init_pool(cfg).await?;
+    // Verify before migrating, so a refusal changes nothing.
+    let pool = db::open_pool(cfg).await?;
     let mirror = identity::read_mirror(&pool).await?;
     identity::authority(cfg, mirror.as_ref()).map_err(|r| {
         anyhow::anyhow!(
@@ -148,6 +149,7 @@ async fn tenant_create(
             r.detail
         )
     })?;
+    shardx_team_server::run_migrations(&pool).await?;
 
     let password = read_password(password_stdin)?;
     anyhow::ensure!(

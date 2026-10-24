@@ -276,6 +276,23 @@ async fn init_refuses_existing_state_and_writes_nothing() {
 }
 
 #[test]
+fn init_requires_an_identity_directory() {
+    let d = dirs("unset");
+    let out = bin()
+        .args(["identity", "init"])
+        .env("SHARDX_DATA_DIR", &d.data)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("SHARDX_IDENTITY_DIR must be set"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!d.data.join("shardx.db").exists());
+}
+
+#[test]
 fn init_refuses_an_identity_directory_inside_the_data_directory() {
     let d = dirs("inside");
     let inside = Dirs {
@@ -661,6 +678,15 @@ async fn tenant_create_refuses_before_identity_init() {
         "{}",
         stderr(&out)
     );
+    // Refused before migrating: the database holds no schema, let alone rows.
+    let pool = db(&d).await;
+    assert_eq!(count(&pool, "sqlite_master").await, 0);
+
+    // A database migrated by the server, but never initialised, is refused too.
+    pool.close().await;
+    migrated(&d).await.close().await;
+    let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
+    assert!(!out.status.success());
     assert_eq!(tenant_rows(&d).await, [0; 4]);
 }
 
