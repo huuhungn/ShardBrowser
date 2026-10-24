@@ -31,6 +31,10 @@ The two engine build 1 issues listed under v2.3.1 (audio noise on a filled
 `AudioBuffer`, upstream #120; the `window.chrome` keys, upstream #118) still
 apply; they need a new engine build.
 
+A team server database created by 2.4.2 does not open in the 2.4.1 Windows
+team server, which accepts only the line endings it was built with. A database
+the 2.4.1 Windows server created still opens in it after 2.4.2 has run on it.
+
 ## v2.4.1
 
 A fix and security release. The browser engine is unchanged
