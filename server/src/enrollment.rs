@@ -26,7 +26,7 @@ use argon2::password_hash::rand_core::{OsRng, RngCore};
 use sqlx::{Row, SqlitePool};
 
 use shared::canonical as c;
-use shared::keys::signing_key_id;
+use shared::keys::{hpke_key_id, signing_key_id};
 use shared::signing::verify_tbs;
 
 /// Suite identifiers recorded alongside an enrolled key.
@@ -238,18 +238,20 @@ pub async fn enroll_device(
     }
 
     let signing_kid = signing_key_id(req.signing_public_key);
-    let hpke_kid = signing_key_id(req.hpke_public_key);
+    let hpke_kid = hpke_key_id(req.hpke_public_key);
 
-    // Refuse a duplicate explicitly. Without this the unique index still
-    // stops it, but the caller gets a raw SQLite message naming tables and
-    // columns, which is both unhelpful and more than a client should learn.
+    // Refuse duplicates without disclosing database internals. Compare the
+    // HPKE public key too: earlier releases stored its id using the signing
+    // domain, so the id-only unique index cannot detect that historical key.
+    // Do not rewrite historical ids here; signed grants may refer to them.
     let existing = sqlx::query(
         "SELECT 1 FROM v2_devices
-         WHERE tenant_id = ? AND (signing_key_id = ? OR hpke_key_id = ?)",
+         WHERE tenant_id = ? AND (signing_key_id = ? OR hpke_key_id = ? OR hpke_public_key = ?)",
     )
     .bind(req.tenant_id.as_slice())
     .bind(signing_kid.as_slice())
     .bind(hpke_kid.as_slice())
+    .bind(req.hpke_public_key.as_slice())
     .fetch_optional(&mut *tx)
     .await?;
     if existing.is_some() {
