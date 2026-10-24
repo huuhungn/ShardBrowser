@@ -13,7 +13,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Khi chọn hồ sơ trong cửa sổ hẹp nhất, thanh công cụ từng đẩy nút Từ mẫu và Hồ sơ mới ra khỏi màn hình và bóp hẹp các tab thư mục. Giờ nó xuống dưới hàng tab và tự xuống dòng. Thanh công cụ ở trang Proxy cũng vậy."
+              "text": "Khi chọn hồ sơ trong cửa sổ hẹp, thanh công cụ từng đẩy nút Từ mẫu và Hồ sơ mới ra khỏi màn hình và bóp hẹp các tab thư mục. Giờ nó xuống dưới hàng tab và tự xuống dòng. Thanh công cụ ở trang Proxy cũng tự xuống dòng như vậy."
             },
             {
               "type": "note",

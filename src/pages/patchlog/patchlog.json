@@ -15,7 +15,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "With profiles selected in the narrowest window, the toolbar pushed From template and New profile off screen and squeezed the folder tabs. It now moves under the tabs and wraps instead. The Proxies page toolbar wraps the same way."
+              "text": "With profiles selected in a narrow window, the toolbar pushed From template and New profile off screen and squeezed the folder tabs. It now moves under the tabs and wraps instead. The Proxies page toolbar wraps the same way."
             },
             {
               "type": "note",

@@ -17,7 +17,8 @@ A fix and security release. The browser engine is unchanged
   2.4.0 (GHSA-27r3-jxmh-p828, a denial of service through trailing bytes after
   a compressed request body; the server talks over stdio and parses no HTTP
   bodies), with `qs` 6.16.1 and `content-type` 2.1.0. The Node SDK takes
-  `undici` 6.29.1 (GHSA-4qv8-2p9j-2685, GHSA-xjj6-f33q-929c).
+  `undici` 6.29.1 (GHSA-4qv8-2p9j-2685, GHSA-xjj6-f33q-929c) and now requires
+  at least that version.
 
 ### Internal
 
@@ -28,8 +29,9 @@ A fix and security release. The browser engine is unchanged
 
 ### Known issues
 
-The two engine build 1 issues listed under v2.3.1 still apply; they need a new
-engine build.
+The two engine build 1 issues listed under v2.3.1 (audio noise on a filled
+`AudioBuffer`, upstream #120; the `window.chrome` keys, upstream #118) still
+apply; they need a new engine build.
 
 ## v2.4.0
 
