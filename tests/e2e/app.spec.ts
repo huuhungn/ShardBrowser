@@ -563,7 +563,7 @@ for (const [width, pick] of [[1280, "one"], [1280, "all"], [1296, "one"], [1440,
     await expect(page.getByText(pick === "all" ? "2 selected" : "1 selected")).toBeVisible();
 
     const hidden = await page.evaluate(() => {
-      const header = document.querySelector("main section h1")!.parentElement!.parentElement!;
+      const header = document.querySelector("[data-testid=browsers-header]")!;
       const bounds = header.getBoundingClientRect();
       return [...header.querySelectorAll("button")]
         .filter((b) => {

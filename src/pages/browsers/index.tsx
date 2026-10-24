@@ -37,8 +37,8 @@ export function BrowsersPage() {
 
       <BrowsersMetrics />
 
-      <div className="mb-3.5 flex flex-wrap items-end justify-between gap-4">
-        <div className="flex min-w-0 flex-[1_1_12rem] flex-col gap-3.5">
+      <div data-testid="browsers-header" className="mb-3.5 flex flex-wrap items-end justify-between gap-4">
+        <div className="flex min-w-0 flex-[1_1_24rem] flex-col gap-3.5">
           <h1 className="m-0 text-title-h5 text-text-strong-950">{t("browsers.title")}</h1>
           <FolderTabs />
         </div>
