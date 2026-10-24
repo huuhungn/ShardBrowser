@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.4.2",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "selection-keeps-table-in-place",
+          "title": "Chọn hồ sơ không làm bảng nhảy",
+          "lead": "Các hàng không còn bị đẩy xuống khi bạn tick một hồ sơ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trước đây, tick hồ sơ đầu tiên rồi hồ sơ thứ hai đều đẩy bảng xuống, nên cú bấm thứ hai nếu nhanh có thể rơi vào hàng khác. Giờ thanh chọn nằm cạnh tiêu đề trang và bảng đứng yên. Số hồ sơ đã chọn cũng hiện bằng tiếng Việt."
+            },
+            {
+              "type": "note",
+              "text": "Bản này còn sửa máy chủ nhóm: mở được cơ sở dữ liệu do bản build cho hệ điều hành khác tạo ra, và ghi đúng khoá của thiết bị khi đăng ký. Engine trình duyệt không đổi."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.1",
       "date": "2026-10-24",
       "entries": [

@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.2",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "selection-keeps-table-in-place",
+          "title": "Selecting profiles keeps the table still",
+          "lead": "The rows no longer jump when you tick a profile.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Ticking the first profile, and then a second one, used to push the table down, so a quick second click could land on a different row. The selection bar now sits next to the page title and the table stays where it is. The selection count is shown in your language."
+            },
+            {
+              "type": "note",
+              "text": "Also in this release: the team server opens a database created by a build for another operating system, and records device keys correctly when they enroll. The browser engine is unchanged."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.1",
       "date": "2026-10-24",
       "entries": [

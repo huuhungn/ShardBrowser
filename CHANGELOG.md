@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.4.2
+
+A fix release for the launcher and the team server. The browser engine is
+unchanged (Chromium 156.0.8078.48, engine build 1).
+
+### Fixed
+
+- Selecting profiles no longer moves the profile table. The selection bar now
+  sits in the title row, so a quick second click lands on the row that was
+  under the cursor. The selection count on the Browsers and Proxies pages is
+  translated.
+- Team server: a database created by the Windows build was refused by the
+  Linux and macOS builds, and the other way round, because the migration files
+  were embedded with different line endings and SQLx checksums them. Every
+  build now accepts either and never rewrites the stored checksums, so the
+  previous version can still open the database.
+- Team server: device enrollment derived the stored HPKE key id in the signing
+  domain. New enrollments use the HPKE domain. Existing devices keep their id,
+  and the same HPKE key can no longer be enrolled a second time.
+
+### Internal
+
+- ADR 0001 (draft) on server identity and first-tenant bootstrap is in
+  `docs/adr/`, with its architect reviews.
+
+### Known issues
+
+The two engine build 1 issues listed under v2.3.1 (audio noise on a filled
+`AudioBuffer`, upstream #120; the `window.chrome` keys, upstream #118) still
+apply; they need a new engine build.
+
 ## v2.4.1
 
 A fix and security release. The browser engine is unchanged
