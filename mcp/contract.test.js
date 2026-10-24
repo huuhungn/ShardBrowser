@@ -99,7 +99,12 @@ test("every v0.1.28 tool keeps its arguments and gains no required ones", async 
       assert(now, `v0.1.28 tool removed: ${name}`);
       for (const [arg, schema] of Object.entries(old.properties ?? {})) {
         assert(now.properties?.[arg], `${name}.${arg} removed`);
+        // An argument without a `type` (z.any) is only checked for presence.
         assert.equal(now.properties[arg].type, schema.type, `${name}.${arg} changed type`);
+        assert.equal(now.properties[arg].items?.type, schema.items?.type, `${name}.${arg} changed item type`);
+        for (const value of schema.enum ?? []) {
+          assert(now.properties[arg].enum?.includes(value), `${name}.${arg} no longer accepts ${value}`);
+        }
       }
       const wasRequired = new Set(old.required ?? []);
       for (const arg of now.required ?? []) {

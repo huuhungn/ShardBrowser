@@ -8,12 +8,13 @@
   2.4.0 (GHSA-27r3-jxmh-p828, a denial of service through trailing bytes after
   a compressed request body; the server talks over stdio and parses no HTTP
   bodies), with `qs` 6.16.1 and `content-type` 2.1.0. The Node SDK takes
-  `undici` 6.29.1.
+  `undici` 6.29.1 (GHSA-4qv8-2p9j-2685, GHSA-xjj6-f33q-929c).
 
 ### Internal
 
 - The MCP contract test checks every tool in the v0.1.28 fixture: none may be
-  removed, lose an argument, change an argument's type or gain a required one.
+  removed, lose an argument, change an argument's type or item type, drop an
+  enum value or gain a required argument.
   The MCP release archive now ships the fixture so the test runs there too.
 
 ## v2.4.0
