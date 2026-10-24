@@ -551,3 +551,26 @@ test("tags reach the rows, the search and the filter, and survive rename, delete
   await page.getByRole("button", { name: "Save" }).click();
   await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client BTyped");
 });
+
+test("the selection bar keeps every toolbar button on screen in the narrowest window", async ({ page }) => {
+  // tauri.conf.json sets minWidth 1280: the narrowest window a user can have.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await gotoMocked(page);
+  await page.getByRole("checkbox", { name: "Select all profiles on this page" }).check();
+  await expect(page.getByText("2 selected")).toBeVisible();
+
+  const offscreen = await page.evaluate(() => {
+    const section = document.querySelector("main section") ?? document.querySelector("section")!;
+    const bounds = section.getBoundingClientRect();
+    const toolbar = [...section.querySelectorAll("button")].filter((b) => b.getBoundingClientRect().top < 300);
+    return toolbar
+      .filter((b) => {
+        const r = b.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        return r.right > bounds.right + 0.5 || r.left < bounds.left - 0.5 || !(hit && b.contains(hit));
+      })
+      .map((b) => b.textContent?.trim() || b.getAttribute("aria-label"));
+  });
+  expect(offscreen).toEqual([]);
+  await expect(page.getByRole("button", { name: "New profile" })).toBeInViewport({ ratio: 1 });
+});
