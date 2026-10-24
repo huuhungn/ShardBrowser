@@ -15,6 +15,7 @@ struct TestServer {
     child: Child,
     port: u16,
     data_dir: std::path::PathBuf,
+    identity_dir: std::path::PathBuf,
 }
 
 impl Drop for TestServer {
@@ -22,6 +23,7 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
+        let _ = std::fs::remove_dir_all(&self.identity_dir);
     }
 }
 
@@ -50,11 +52,30 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
     }
     let port = 41500 + (std::process::id() % 300) as u16 + slot * 400;
     let data_dir = std::env::temp_dir().join(format!("shardx-enroll-it-{port}"));
+    let identity_dir = std::env::temp_dir().join(format!("shardx-enroll-it-{port}-identity"));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&identity_dir);
+    std::fs::create_dir_all(&identity_dir).ok()?;
+
+    // v2 answers 423 until the external identity record verifies, so set the
+    // server up the way an operator does before starting it.
+    let init = Command::new(&bin)
+        .args(["identity", "init"])
+        .env("SHARDX_DATA_DIR", &data_dir)
+        .env("SHARDX_IDENTITY_DIR", &identity_dir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    assert!(
+        init.status.success(),
+        "identity init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     let child = Command::new(&bin)
         .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
         .env("SHARDX_DATA_DIR", &data_dir)
+        .env("SHARDX_IDENTITY_DIR", &identity_dir)
         .env("SHARDX_TOKEN_SECRET", "enrollment-integration-secret")
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "enrollment-integration-pass")
@@ -67,6 +88,7 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
         child,
         port,
         data_dir,
+        identity_dir,
     };
 
     // Poll for readiness instead of sleeping a fixed amount.
@@ -123,19 +145,6 @@ async fn seed_tenant(data_dir: &std::path::Path, tenant: &[u8; 16], user_id: &st
     };
     let _ = pool.execute("PRAGMA foreign_keys = ON").await;
 
-    // The server refuses to sign or verify anything before its identity row
-    // exists; a fresh data dir has none.
-    let ok_state = sqlx::query(
-        "INSERT OR REPLACE INTO v2_server_state
-             (singleton, server_instance_id, restore_epoch, external_record_sha256, updated_at)
-         VALUES (1, ?, 0, ?, '2026-01-01T00:00:00Z')",
-    )
-    .bind([0x11u8; 16].as_slice())
-    .bind([0u8; 32].as_slice())
-    .execute(&pool)
-    .await
-    .is_ok();
-
     let ok_tenant = sqlx::query(
         "INSERT OR IGNORE INTO v2_tenants (id, slug, status, active_root_generation, created_at)
          VALUES (?, 'it-tenant', 'active', 1, '2026-01-01T00:00:00Z')",
@@ -158,7 +167,7 @@ async fn seed_tenant(data_dir: &std::path::Path, tenant: &[u8; 16], user_id: &st
     .await
     .is_ok();
 
-    ok_state && ok_tenant && ok_account
+    ok_tenant && ok_account
 }
 
 async fn admin_user_id(port: u16, token: &str) -> Option<String> {

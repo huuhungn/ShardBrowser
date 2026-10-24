@@ -102,16 +102,28 @@ async fn verification_context(
     })
 }
 
+/// The instance id the startup check verified, or the reason it did not.
+fn verified_instance(app: &AppState) -> Result<[u8; 16], AppError> {
+    app.authority
+        .as_ref()
+        .as_ref()
+        .map(|v| v.server_instance_id)
+        .map_err(|r| AppError::EpochAuthority(r.code))
+}
+
 /// Publish the deployment identity a client must bind its signed records to.
 ///
 /// A client cannot construct a valid manifest without `server_instance_id` and
 /// `restore_epoch`. The verifier checks both against live deployment state, so
 /// a client that guesses them produces records the server refuses. Read-only
-/// and derived from the same singleton row the verifier reads.
+/// and derived from the same singleton row the verifier reads. Until the
+/// external record verifies, the mirror is not something a client may pin, so
+/// this reports the reason instead.
 pub async fn server_identity(
     State(app): State<AppState>,
     _user: AuthUser,
 ) -> Result<impl IntoResponse, AppError> {
+    verified_instance(&app)?;
     let row = sqlx::query(
         "SELECT server_instance_id, restore_epoch FROM v2_server_state WHERE singleton = 1",
     )
@@ -356,6 +368,7 @@ pub async fn present_tenant_root_key_grant(
     // replay id is claimed so a rejected grant does not burn one.
     crate::generations::check_grant_against_generation(
         &app.db,
+        &ctx.server_instance_id,
         &tenant_id,
         &row.grant_variant,
         row.root_generation,
@@ -1085,6 +1098,7 @@ pub async fn begin_root_generation(
 
     let generation = crate::generations::begin_first_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &root_key_id,
         &util::now_rfc3339(),
@@ -1113,6 +1127,7 @@ pub async fn activate_root_generation(
 
     crate::generations::activate_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         req.generation,
         &util::now_rfc3339(),
@@ -1134,7 +1149,9 @@ pub async fn get_active_root_generation(
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    match crate::generations::active_generation(&app.db, &tenant_id).await? {
+    match crate::generations::active_generation(&app.db, &verified_instance(&app)?, &tenant_id)
+        .await?
+    {
         Some(g) => Ok(axum::Json(serde_json::json!({
             "active": true,
             "generation": g.generation,
@@ -1275,6 +1292,7 @@ pub async fn begin_fleet_generation(
 
     let generation = crate::fleet_generations::begin_first_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &fleet_id,
         &fkek_key_id,
@@ -1302,6 +1320,7 @@ pub async fn activate_fleet_generation(
 
     crate::fleet_generations::activate_generation(
         &app.db,
+        &verified_instance(&app)?,
         &tenant_id,
         &fleet_id,
         req.generation,
@@ -1329,8 +1348,13 @@ pub async fn get_active_fleet_generation(
     let fleet_id = parse_id16(&fleet_hex, "fleet_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    let active =
-        crate::fleet_generations::active_generation(&app.db, &tenant_id, &fleet_id).await?;
+    let active = crate::fleet_generations::active_generation(
+        &app.db,
+        &verified_instance(&app)?,
+        &tenant_id,
+        &fleet_id,
+    )
+    .await?;
 
     Ok(axum::Json(match active {
         Some(g) => serde_json::json!({
@@ -1372,6 +1396,7 @@ pub async fn present_fleet_key_grant(
 
     crate::fleet_generations::check_grant_against_generation(
         &app.db,
+        &ctx.server_instance_id,
         &tenant_id,
         &row.fleet_id,
         row.fleet_generation,

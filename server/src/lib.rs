@@ -5,6 +5,8 @@ use sha2::{Digest, Sha384};
 use sqlx::migrate::{Migration, Migrator};
 use sqlx::{SqliteConnection, SqlitePool};
 
+pub mod identity_record;
+
 /// Apply the embedded migrations, accepting a database whose applied
 /// migrations were checksummed with the other line ending.
 pub async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {

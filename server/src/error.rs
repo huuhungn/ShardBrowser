@@ -3,6 +3,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+use crate::identity::ReasonCode;
+
 /// Uniform error type for handlers; renders to `{ "error": "..." }`.
 #[derive(Debug)]
 pub enum AppError {
@@ -14,6 +16,9 @@ pub enum AppError {
     Internal(String),
     /// Rate-limited; the value is the Retry-After hint in seconds.
     TooManyRequests(u64),
+    /// The identity authority did not verify at startup, so v2 writes are
+    /// off (plan L1238: HTTP 423 with the reason code).
+    EpochAuthority(ReasonCode),
 }
 
 impl AppError {
@@ -28,6 +33,13 @@ impl AppError {
             AppError::TooManyRequests(_) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "too many attempts; try again later".into(),
+            ),
+            AppError::EpochAuthority(code) => (
+                StatusCode::LOCKED,
+                format!(
+                    "v2 is unavailable until the server identity verifies: {}",
+                    code.as_str()
+                ),
             ),
         }
     }
@@ -45,7 +57,13 @@ impl IntoResponse for AppError {
         } else {
             msg
         };
-        let mut resp = (code, Json(json!({ "error": client_msg }))).into_response();
+        let body = match &self {
+            AppError::EpochAuthority(reason) => {
+                json!({ "error": client_msg, "code": reason.as_str() })
+            }
+            _ => json!({ "error": client_msg }),
+        };
+        let mut resp = (code, Json(body)).into_response();
         if let AppError::TooManyRequests(secs) = self {
             if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
                 resp.headers_mut()
