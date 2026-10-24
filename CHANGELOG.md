@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v2.4.1
+
+A fix and security release. The browser engine is unchanged
+(Chromium 156.0.8078.48, engine build 1).
 
 ### Fixed
 
@@ -22,6 +25,11 @@
   removed, lose an argument, change an argument's type or item type, drop an
   enum value or gain a required argument.
   The MCP release archive now ships the fixture so the test runs there too.
+
+### Known issues
+
+The two engine build 1 issues listed under v2.3.1 still apply; they need a new
+engine build.
 
 ## v2.4.0
 

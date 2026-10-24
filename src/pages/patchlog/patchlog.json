@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.1",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "narrow-window-toolbar",
+          "title": "The toolbar fits a narrow window",
+          "lead": "Selecting profiles no longer pushes buttons off screen.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "With profiles selected in the narrowest window, the toolbar pushed From template and New profile off screen and squeezed the folder tabs. It now moves under the tabs and wraps instead. The Proxies page toolbar wraps the same way."
+            },
+            {
+              "type": "note",
+              "text": "Also in this release: security updates for two dependencies, body-parser in the MCP server and undici in the Node SDK. The browser engine is unchanged."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.0",
       "date": "2026-10-24",
       "entries": [
