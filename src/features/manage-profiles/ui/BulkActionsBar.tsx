@@ -26,7 +26,7 @@ export function BulkActionsBar() {
 
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-8 bg-primary-alpha-10 py-1 pl-3 pr-1 text-label-xs text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-      <span>{count} selected</span>
+      <span>{t("profile.selectedCount", { n: count })}</span>
       <Button variant="neutral" mode='stroke' className="pr-4" size="2xsmall" leftIcon={<PlayIcon className="size-3.5" />} onClick={bulkLaunch}>{t("profile.launch")}</Button>
       {/* Meaningless for a single profile, so it only appears for a group.
           Locked for now — the button explains itself in the patch log. */}

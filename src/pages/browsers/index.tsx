@@ -8,6 +8,7 @@ import { FolderTabs } from "../../widgets/ProfileTable/FolderTabs";
 import { ProfileToolbar } from "../../widgets/ProfileTable/ProfileToolbar";
 import { ProfileTable } from "../../widgets/ProfileTable/ProfileTable";
 import {
+  BulkActionsBar,
   ProfileTemplatePicker,
   ProfileFolderModal,
   ProfileQuickEdit,
@@ -37,12 +38,19 @@ export function BrowsersPage() {
 
       <BrowsersMetrics />
 
-      <div data-testid="browsers-header" className="mb-3.5 flex flex-wrap items-end justify-between gap-4">
-        <div className="flex min-w-0 flex-[1_1_24rem] flex-col gap-3.5">
+      <div data-testid="browsers-header" className="mb-3.5 flex flex-col gap-3.5">
+        {/* The selection bar shares the title row, which has room for it at
+            minWidth 1280, so selecting a profile does not push the table down. */}
+        <div className="flex min-h-8 flex-wrap items-center justify-between gap-x-4 gap-y-2">
           <h1 className="m-0 text-title-h5 text-text-strong-950">{t("browsers.title")}</h1>
-          <FolderTabs />
+          <BulkActionsBar />
         </div>
-        <ProfileToolbar />
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div className="min-w-0 flex-[1_1_24rem]">
+            <FolderTabs />
+          </div>
+          <ProfileToolbar />
+        </div>
       </div>
 
       {status === "loading" && (

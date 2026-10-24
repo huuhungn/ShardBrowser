@@ -577,3 +577,22 @@ for (const [width, pick] of [[1280, "one"], [1280, "all"], [1296, "one"], [1440,
     await expect(page.getByRole("button", { name: "New profile" })).toBeInViewport({ ratio: 1 });
   });
 }
+
+// A second quick click landed on the wrong row because the table moved down
+// when the selection bar appeared, and again when "Launch synced" joined it.
+test("selecting profiles does not move the table at 1280px", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await gotoMocked(page);
+  const selectAll = page.getByRole("checkbox", { name: "Select all profiles on this page" });
+  const top = async () => (await selectAll.boundingBox())!.y;
+  const before = await top();
+
+  await page.getByRole("checkbox", { name: "Select profile Beta Research" }).check();
+  await expect(page.getByText("1 selected")).toBeVisible();
+  expect(await top()).toBe(before);
+
+  await selectAll.check();
+  await expect(page.getByText("2 selected")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Launch synced/ })).toBeVisible();
+  expect(await top()).toBe(before);
+});
