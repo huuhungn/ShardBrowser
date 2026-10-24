@@ -77,6 +77,45 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
   }
 });
 
+// Clients written against v0.1.28 must keep working: no tool or argument they
+// rely on may disappear, change type, or become required.
+test("every v0.1.28 tool keeps its arguments and gains no required ones", async () => {
+  const fixture = JSON.parse(await readFile(path.join(dir, "fixtures", "v0.1.28-tools.json"), "utf8"));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(dir, "index.js")],
+    cwd: dir,
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "shardx-contract-test", version: "1.0.0" });
+
+  try {
+    await client.connect(transport);
+    const { tools } = await client.listTools();
+    const current = new Map(tools.map((tool) => [tool.name, tool.inputSchema]));
+    assert.equal(fixture.tools.length, fixture.toolCount);
+    for (const { name, inputSchema: old } of fixture.tools) {
+      const now = current.get(name);
+      assert(now, `v0.1.28 tool removed: ${name}`);
+      for (const [arg, schema] of Object.entries(old.properties ?? {})) {
+        assert(now.properties?.[arg], `${name}.${arg} removed`);
+        // An argument without a `type` (z.any) is only checked for presence.
+        assert.equal(now.properties[arg].type, schema.type, `${name}.${arg} changed type`);
+        assert.equal(now.properties[arg].items?.type, schema.items?.type, `${name}.${arg} changed item type`);
+        for (const value of schema.enum ?? []) {
+          assert(now.properties[arg].enum?.includes(value), `${name}.${arg} no longer accepts ${value}`);
+        }
+      }
+      const wasRequired = new Set(old.required ?? []);
+      for (const arg of now.required ?? []) {
+        assert(wasRequired.has(arg), `${name}.${arg} became required`);
+      }
+    }
+  } finally {
+    await client.close();
+  }
+});
+
 test("safe_open_url cleanup uses the launch-instance guard and never falls back to PID ownership", async () => {
   const source = await readFile(path.join(dir, "index.js"), "utf8");
 
