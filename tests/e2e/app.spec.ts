@@ -551,3 +551,29 @@ test("tags reach the rows, the search and the filter, and survive rename, delete
   await page.getByRole("button", { name: "Save" }).click();
   await expect(alphaRow.getByTestId("row-tags")).toHaveText("Client BTyped");
 });
+
+// tauri.conf.json sets minWidth 1280. Each case once pushed buttons off screen
+// or squeezed the folder tabs under them.
+for (const [width, pick] of [[1280, "one"], [1280, "all"], [1296, "one"], [1440, "all"]] as const) {
+  test(`the selection bar keeps the header usable at ${width}px with ${pick} selected`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await gotoMocked(page);
+    if (pick === "all") await page.getByRole("checkbox", { name: "Select all profiles on this page" }).check();
+    else await page.getByRole("checkbox", { name: "Select profile Beta Research" }).check();
+    await expect(page.getByText(pick === "all" ? "2 selected" : "1 selected")).toBeVisible();
+
+    const hidden = await page.evaluate(() => {
+      const header = document.querySelector("[data-testid=browsers-header]")!;
+      const bounds = header.getBoundingClientRect();
+      return [...header.querySelectorAll("button")]
+        .filter((b) => {
+          const r = b.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return r.right > bounds.right + 0.5 || r.left < bounds.left - 0.5 || !(hit && b.contains(hit));
+        })
+        .map((b) => b.textContent?.trim() || b.getAttribute("aria-label"));
+    });
+    expect(hidden).toEqual([]);
+    await expect(page.getByRole("button", { name: "New profile" })).toBeInViewport({ ratio: 1 });
+  });
+}
