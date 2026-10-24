@@ -130,6 +130,7 @@ mod tests {
             snapshot_keep: 5,
             max_snapshot_bytes: 1024,
             trust_proxy: false,
+            identity_dir: None,
         }
     }
 

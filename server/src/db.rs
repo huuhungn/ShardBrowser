@@ -9,6 +9,14 @@ use crate::{auth, util};
 
 /// Open (creating if needed) the SQLite DB and run migrations.
 pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
+    let pool = open_pool(cfg).await?;
+    shardx_team_server::run_migrations(&pool).await?;
+    Ok(pool)
+}
+
+/// Open (creating if needed) the SQLite DB without migrating it, so
+/// `identity init` can refuse on existing rows before writing anything.
+pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
     tokio::fs::create_dir_all(&cfg.data_dir).await?;
     tokio::fs::create_dir_all(&cfg.blob_dir).await?;
 
@@ -22,8 +30,6 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .max_connections(8)
         .connect_with(opts)
         .await?;
-
-    shardx_team_server::run_migrations(&pool).await?;
     Ok(pool)
 }
 
@@ -117,7 +123,7 @@ const WEAK_PASSWORDS: &[&str] = &[
 
 /// A password too weak to expose on a public bind: empty, too short, or a known
 /// placeholder.
-fn is_weak_password(pw: &str) -> bool {
+pub fn is_weak_password(pw: &str) -> bool {
     pw.len() < 8 || WEAK_PASSWORDS.iter().any(|w| pw.eq_ignore_ascii_case(w))
 }
 
@@ -178,6 +184,7 @@ mod tests {
             snapshot_keep: 5,
             max_snapshot_bytes: 1024,
             trust_proxy: false,
+            identity_dir: None,
         }
     }
 

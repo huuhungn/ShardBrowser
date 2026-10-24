@@ -2,6 +2,7 @@ mod audit;
 mod auth;
 mod authz;
 mod blob;
+mod cli;
 mod config;
 mod db;
 mod enrollment;
@@ -13,7 +14,7 @@ mod fleet_grants;
 mod generations;
 mod grants;
 mod idempotency;
-mod identity_record;
+mod identity;
 mod models;
 mod ratelimit;
 mod routes;
@@ -31,6 +32,18 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = match cli::parse(&args) {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("{e}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    if command != cli::Command::Serve {
+        return cli::run(command).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -39,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env();
+    let _lock = cli::lock_data_dir(&cfg.data_dir)?;
     if cfg.admin_pass == "admin" {
         tracing::warn!(
             "SHARDX_ADMIN_PASS is the default 'admin' — anyone reaching this \
@@ -49,12 +63,29 @@ async fn main() -> anyhow::Result<()> {
     db::bootstrap_admin(&pool, &cfg).await?;
     blob::gc_orphans(&cfg, &pool).await;
 
+    // The server only reads the record; it never creates or repairs it.
+    let mirror = identity::read_mirror(&pool).await?;
+    let authority = identity::authority(&cfg, mirror.as_ref());
+    match &authority {
+        Ok(v) => tracing::info!(
+            "server identity verified: instance {} epoch {}",
+            identity::hex(&v.server_instance_id),
+            v.restore_epoch
+        ),
+        Err(r) => tracing::warn!(
+            "v2 writes disabled: {}: {}; v1 is unaffected",
+            r.code.as_str(),
+            r.detail
+        ),
+    }
+
     let state = AppState {
         db: pool,
         cfg: cfg.clone(),
         login_throttle: std::sync::Arc::new(ratelimit::LoginThrottle::new()),
         upload_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
         download_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+        authority: std::sync::Arc::new(authority),
     };
     // No CORS layer on purpose: the only client is the desktop launcher
     // (reqwest, no Origin). Browser-origin access stays blocked by default.

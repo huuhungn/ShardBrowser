@@ -1,5 +1,5 @@
 //! Regression tests for the schema-only 0009 upgrade.
-use shardx_team_server::run_migrations;
+use shardx_team_server::{run_migrations, run_migrations_with};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::borrow::Cow;
@@ -153,7 +153,17 @@ async fn upgrade_preserves_every_existing_row() {
     seed_populated(&pool).await;
     let before = snapshot(&pool).await;
 
-    run_migrations(&pool).await.unwrap();
+    // Through 0009 only: later migrations add tables and reconcile pointers,
+    // which their own tests cover.
+    let mut through_0009 = sqlx::migrate!("./migrations");
+    through_0009.migrations = Cow::Owned(
+        through_0009
+            .iter()
+            .filter(|m| m.version <= 9)
+            .cloned()
+            .collect(),
+    );
+    run_migrations_with(&pool, &through_0009).await.unwrap();
 
     let after = snapshot(&pool).await;
     assert_eq!(before.len(), after.len());

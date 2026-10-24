@@ -102,16 +102,28 @@ async fn verification_context(
     })
 }
 
+/// The instance id the startup check verified, or the reason it did not.
+fn verified_instance(app: &AppState) -> Result<[u8; 16], AppError> {
+    app.authority
+        .as_ref()
+        .as_ref()
+        .map(|v| v.server_instance_id)
+        .map_err(|r| AppError::EpochAuthority(r.code))
+}
+
 /// Publish the deployment identity a client must bind its signed records to.
 ///
 /// A client cannot construct a valid manifest without `server_instance_id` and
 /// `restore_epoch`. The verifier checks both against live deployment state, so
 /// a client that guesses them produces records the server refuses. Read-only
-/// and derived from the same singleton row the verifier reads.
+/// and derived from the same singleton row the verifier reads. Until the
+/// external record verifies, the mirror is not something a client may pin, so
+/// this reports the reason instead.
 pub async fn server_identity(
     State(app): State<AppState>,
     _user: AuthUser,
 ) -> Result<impl IntoResponse, AppError> {
+    verified_instance(&app)?;
     let row = sqlx::query(
         "SELECT server_instance_id, restore_epoch FROM v2_server_state WHERE singleton = 1",
     )

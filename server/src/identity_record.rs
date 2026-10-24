@@ -26,10 +26,6 @@
 //! Parsing never repairs anything: every rule failure is reported as a
 //! [`CorruptReason`], which the caller maps to `EPOCH_AUTHORITY_CORRUPT`.
 
-// Wired into startup by the identity-authority slice that follows; until then
-// only the tests exercise it.
-#![allow(dead_code)]
-
 use shared::canonical::{domain_hash, sha256};
 
 /// ASCII magic. Deliberately distinct from the envelope's `"SHARDXBK"`.
