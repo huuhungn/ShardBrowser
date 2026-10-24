@@ -1,0 +1,3 @@
+# SQLx checksums each migration's raw bytes. Keep them identical on every
+# checkout so a server built on Windows and one built on Linux agree.
+server/migrations/*.sql text eol=lf
