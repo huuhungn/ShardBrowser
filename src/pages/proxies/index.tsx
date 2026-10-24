@@ -35,7 +35,7 @@ export function ProxiesPage() {
   return (
     <section className="flex flex-col">
       <Topbar crumbs={[t("nav.workspace"), t("proxies.title")]} search={search} onSearch={setSearch} />
-      <div className="mb-3.5 flex items-end justify-between gap-4">
+      <div className="mb-3.5 flex flex-wrap items-end justify-between gap-4">
         <h1 className="m-0 text-title-h5 text-text-strong-950">{t("proxies.title")}</h1>
         <ProxyToolbar />
       </div>
