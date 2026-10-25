@@ -164,15 +164,23 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
         .bind(&tenant_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE v2_sessions SET revoked_at = ?
-              WHERE tenant_id = ? AND device_id = ? AND revoked_at IS NULL",
-        )
-        .bind(&now)
-        .bind(&tenant_id)
-        .bind(&device_id)
-        .execute(&mut *tx)
-        .await?;
+        // R2: a status change revokes the device's sessions and open proofs.
+        for table in ["v2_sessions", "v2_device_session_challenges"] {
+            let extra = if table == "v2_sessions" {
+                ""
+            } else {
+                " AND consumed_at_ms IS NULL"
+            };
+            sqlx::query(&format!(
+                "UPDATE {table} SET revoked_at_ms = ?
+                  WHERE tenant_id = ? AND device_id = ? AND revoked_at_ms IS NULL{extra}"
+            ))
+            .bind(util::now_ms())
+            .bind(&tenant_id)
+            .bind(&device_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         tracing::warn!(
             reason = fault.reason(),
@@ -407,6 +415,37 @@ mod tests {
         insert_guard(&pool, 1).await;
         let (_, hpk) = keys(5);
         insert_device(&pool, 5, 5, "pending", signing_key_id(&hpk)).await;
+        // A session and an open challenge of that device.
+        for sql in [
+            "INSERT INTO v2_pre_device_sessions (id, token_hash, server_instance_id, \
+             restore_epoch, tenant_id, account_id, account_token_version, created_at_ms, \
+             expires_at_ms) VALUES (x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', randomblob(32), \
+             zeroblob(16), 0, ?1, ?2, 0, 1, 600001)",
+            "INSERT INTO v2_device_session_challenges (id, pre_device_session_id, tenant_id, \
+             account_id, device_id, binding_bytes, secret_hash, created_at_ms, expires_at_ms) \
+             VALUES (x'0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b', x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', \
+             ?1, ?2, ?3, x'aa', zeroblob(32), 1, 120001)",
+            "INSERT INTO v2_device_session_challenges (id, pre_device_session_id, tenant_id, \
+             account_id, device_id, binding_bytes, secret_hash, created_at_ms, expires_at_ms, \
+             consumed_at_ms) VALUES (x'0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c', \
+             x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', ?1, ?2, ?3, x'aa', zeroblob(32), 1, 120001, 2)",
+            "INSERT INTO v2_sessions (id, tenant_id, account_id, device_id, server_instance_id, \
+             restore_epoch, signing_key_id, hpke_key_id, account_token_version, class, \
+             pre_device_session_id, device_session_challenge_id, pop_at_ms, access_token_hash, \
+             access_expires_at_ms, refresh_token_hash, refresh_expires_at_ms, \
+             absolute_expires_at_ms) VALUES (x'0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d', ?1, ?2, ?3, \
+             zeroblob(16), 0, zeroblob(32), randomblob(32), 0, 'pending_setup', \
+             x'0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a', x'0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c', 2, \
+             randomblob(32), 300002, randomblob(32), 1800002, 1800002)",
+        ] {
+            sqlx::query(sql)
+                .bind([1u8; 16].as_slice())
+                .bind([2u8; 16].as_slice())
+                .bind([5u8; 16].as_slice())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         assert_eq!(
             run(&pool, &identity()).await.unwrap().quarantined_devices,
             1
@@ -415,6 +454,16 @@ mod tests {
             guard(&pool).await,
             ("recovery_required".into(), Some("integrity_failure".into()))
         );
+        let revoked: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM v2_sessions WHERE revoked_at_ms IS NOT NULL),
+                    (SELECT count(*) FROM v2_device_session_challenges
+                      WHERE revoked_at_ms IS NOT NULL)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The open challenge and the session end; the consumed challenge stays.
+        assert_eq!(revoked, (1, 1));
 
         // Revoked later, the device is not quarantined again: that second
         // record would collide and stop the server at startup.

@@ -5,6 +5,7 @@ pub mod locks;
 pub mod proxies;
 pub mod users;
 pub mod v2;
+pub mod v2_auth;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::Method;
@@ -33,6 +34,19 @@ pub fn router(state: AppState) -> Router {
         .route("/audit", get(crate::audit::list))
         // v2 team/fleet control plane
         .route("/v2/server-identity", get(v2::server_identity))
+        // v2 accounts and proof-bound device sessions (ADR 0001 R2)
+        .route("/v2/auth/login", post(v2_auth::login))
+        .route(
+            "/v2/auth/device-session-challenges",
+            post(v2_auth::create_device_session_challenge),
+        )
+        .route(
+            "/v2/auth/device-session-proofs",
+            post(v2_auth::prove_device_session),
+        )
+        .route("/v2/auth/refresh", post(v2_auth::refresh))
+        .route("/v2/auth/logout", post(v2_auth::logout))
+        .route("/v2/me", get(v2_auth::me))
         .route(
             "/v2/devices/enrollment-challenges",
             post(v2::create_enrollment_challenge),
