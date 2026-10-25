@@ -22,6 +22,7 @@ pub mod logins;
 pub mod oscrypt;
 pub mod passphrase;
 pub mod portable;
+pub mod session_binding;
 pub mod signing;
 pub mod snapshot;
 pub mod webdata;

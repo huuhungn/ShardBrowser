@@ -86,7 +86,11 @@ pub fn verify_tbs(vk_bytes: &[u8], tbs_bytes: &[u8], sig_bytes: &[u8]) -> Result
 /// are rejected. Every ShardX verifier uses this one rule, so a signature
 /// accepted on one device is accepted on all; other Ed25519 verifiers (cofactored,
 /// ZIP-215) may disagree on edge cases such as speccheck case 4.
-fn verify_message_strict(vk_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<(), SignError> {
+pub(crate) fn verify_message_strict(
+    vk_bytes: &[u8],
+    msg: &[u8],
+    sig_bytes: &[u8],
+) -> Result<(), SignError> {
     let vk_arr: [u8; 32] = vk_bytes.try_into().map_err(|_| SignError::BadLength {
         field: "verifying_key",
         got: vk_bytes.len(),
