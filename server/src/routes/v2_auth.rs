@@ -243,8 +243,32 @@ pub(super) async fn d1_approval_is_live(
     v: &Verified,
     now: i64,
 ) -> Result<bool, AppError> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM v2_device_approvals a
+    Ok(d1_approval_replay_id(
+        conn,
+        tenant_id,
+        device_id,
+        signing_key_id,
+        hpke_key_id,
+        v,
+        now,
+    )
+    .await?
+    .is_some())
+}
+
+/// The replay ID of that live D1 approval, which the first root self-grant
+/// links to (plan 5.6.4 `subject_device_approval_replay_id`).
+pub(super) async fn d1_approval_replay_id(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8; 16],
+    device_id: &[u8; 16],
+    signing_key_id: &[u8; 32],
+    hpke_key_id: &[u8; 32],
+    v: &Verified,
+    now: i64,
+) -> Result<Option<[u8; 16]>, AppError> {
+    let id: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT a.replay_id FROM v2_device_approvals a
            JOIN v2_first_device_confirmations c
              ON c.server_instance_id = a.server_instance_id AND c.tenant_id = a.tenant_id
             AND c.approval_payload_domain = a.payload_domain AND c.approval_replay_id = a.replay_id
@@ -266,8 +290,8 @@ pub(super) async fn d1_approval_is_live(
     .bind(now)
     .bind(now)
     .fetch_optional(&mut *conn)
-    .await?
-    .is_some())
+    .await?;
+    Ok(id.and_then(|id| id.try_into().ok()))
 }
 
 /// The predicates R2 rechecks on every use and refresh: this instance and

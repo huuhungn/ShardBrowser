@@ -108,7 +108,6 @@ pub enum ReplayTable {
     #[cfg(test)]
     DeviceApprovals,
     CapabilityGrants,
-    TenantRootKeyGrants,
     FleetKeyGrants,
 }
 
@@ -118,7 +117,6 @@ impl ReplayTable {
             #[cfg(test)]
             Self::DeviceApprovals => "v2_device_approvals",
             Self::CapabilityGrants => "v2_capability_grants",
-            Self::TenantRootKeyGrants => "v2_tenant_root_key_grants",
             Self::FleetKeyGrants => "v2_fleet_key_grants",
         }
     }

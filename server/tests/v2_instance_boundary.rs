@@ -23,6 +23,10 @@ fn k(n: u8) -> Vec<u8> {
 
 /// A database migrated through 0010, the schema 0011 upgrades.
 async fn before_0011() -> SqlitePool {
+    through(10).await
+}
+
+async fn through(last: i64) -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -32,7 +36,7 @@ async fn before_0011() -> SqlitePool {
     migrator.migrations = Cow::Owned(
         migrator
             .iter()
-            .filter(|m| m.version <= 10)
+            .filter(|m| m.version <= last)
             .cloned()
             .collect(),
     );
@@ -430,11 +434,12 @@ async fn the_raw_migrator_refuses_with_foreign_keys_on() {
 }
 
 /// After the upgrade the boundary holds for new rows too: a grant or a fleet
-/// generation cannot name another instance's root generation.
+/// generation cannot name another instance's root generation. Through 0015,
+/// the last schema with this grant shape; 0016's exact table is checked in
+/// `v2_upgrade_0016.rs`.
 #[tokio::test]
 async fn new_rows_cannot_cross_the_instance_boundary() {
-    let pool = before_0011().await;
-    run_migrations(&pool).await.unwrap();
+    let pool = through(15).await;
     exec(&pool, "PRAGMA foreign_keys = ON").await;
     mirror(&pool, INSTANCE).await;
     tenant(&pool, TENANT, 0).await;

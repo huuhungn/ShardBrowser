@@ -7,6 +7,7 @@ pub mod users;
 pub mod v2;
 pub mod v2_approval;
 pub mod v2_auth;
+pub mod v2_root;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::Method;
@@ -61,16 +62,12 @@ pub fn router(state: AppState) -> Router {
             post(v2_approval::approve_device)
                 .layer(DefaultBodyLimit::max(v2_approval::MAX_APPROVAL_BODY)),
         )
+        .route(
+            "/v2/tenants/:tenant_id/root-key-generations",
+            post(v2_root::create_root_generation)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
         .route("/v2/capability-grants", post(v2::present_capability_grant))
-        .route(
-            "/v2/tenant-root-key-grants",
-            post(v2::present_tenant_root_key_grant),
-        )
-        .route("/v2/root-key-generations", post(v2::begin_root_generation))
-        .route(
-            "/v2/root-key-generations/activate",
-            post(v2::activate_root_generation),
-        )
         .route(
             "/v2/tenants/:tenant_id/root-key-generation",
             get(v2::get_active_root_generation),

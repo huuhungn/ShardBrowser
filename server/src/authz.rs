@@ -21,8 +21,6 @@ use shared::signing::{verify_tbs, SignError};
 pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.authorization.device-approval.v2";
 /// Domain separator for capability grants.
 pub const DOMAIN_CAPABILITY_GRANT: &str = "shardx.authorization.capability-grant.v2";
-/// Domain separator for tenant root key grants.
-pub const DOMAIN_TENANT_ROOT_KEY_GRANT: &str = "shardx.authorization.tenant-root-key-grant.v2";
 
 /// Fleet key grant records. Distinct from the root domain so a root grant
 /// can never be verified as a fleet grant, or the reverse.

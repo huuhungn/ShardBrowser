@@ -147,9 +147,9 @@ async fn ready(c: &reqwest::Client, port: u16) -> String {
 /// Status and reason code of a v2 write and of the identity read.
 async fn v2_state(c: &reqwest::Client, port: u16, token: &str) -> (u16, Value, u16, Value) {
     let write = c
-        .post(format!("http://127.0.0.1:{port}/v2/root-key-generations"))
+        .post(format!("http://127.0.0.1:{port}/v2/fleet-key-generations"))
         .bearer_auth(token)
-        .json(&json!({ "tenant_id": "00", "root_key_id": "00" }))
+        .json(&json!({ "tenant_id": "00", "fleet_id": "00", "fkek_key_id": "00" }))
         .send()
         .await
         .unwrap();
@@ -510,8 +510,7 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
         "/v2/devices/enrollment-proofs",
         "/v2/devices/00000000000000000000000000000000/approve",
         "/v2/capability-grants",
-        "/v2/tenant-root-key-grants",
-        "/v2/root-key-generations/activate",
+        "/v2/tenants/00000000000000000000000000000000/root-key-generations",
         "/v2/fleet-key-grants",
         "/v2/fleet-key-generations",
         "/v2/fleet-key-generations/activate",
@@ -1132,8 +1131,11 @@ async fn confirm_refuses_a_device_that_is_not_a_clean_pending_first_device() {
     let pool = db(&d).await;
     sqlx::query(
         "INSERT INTO v2_root_key_generations \
-         (server_instance_id, tenant_id, generation, root_key_id, state, created_at) \
-         SELECT s.server_instance_id, t.id, 0, zeroblob(32), 'RETIRED', 't' \
+         (server_instance_id, tenant_id, generation, root_key_id, state, created_at, \
+          required_custodian_grant_count, required_custodian_grant_set_hash, \
+          recovery_bundle_sha256) \
+         SELECT s.server_instance_id, t.id, 0, zeroblob(32), 'RETIRED', 't', 1, \
+                zeroblob(32), zeroblob(32) \
          FROM v2_server_state s, v2_tenants t",
     )
     .execute(&pool)

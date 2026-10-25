@@ -351,7 +351,7 @@ mod tests {
         for sql in [
             "INSERT INTO v2_tenants (id, slug, status, active_root_generation, created_at)              VALUES (?2, 't', 'active', 0, 'now')",
             "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)              VALUES (?3, ?2, 'f', 'active', 'now')",
-            "INSERT INTO v2_root_key_generations              (server_instance_id, tenant_id, generation, root_key_id, state, created_at)              VALUES (?1, ?2, 0, x'0909090909090909090909090909090909090909090909090909090909090909',                      'PREPARING', 'now')",
+            "INSERT INTO v2_root_key_generations              (server_instance_id, tenant_id, generation, root_key_id, state, created_at,               required_custodian_grant_count, required_custodian_grant_set_hash,               recovery_bundle_sha256)              VALUES (?1, ?2, 0, x'0909090909090909090909090909090909090909090909090909090909090909',                      'PREPARING', 'now', 1, zeroblob(32), zeroblob(32))",
         ] {
             sqlx::query(sql)
                 .bind(INSTANCE.as_slice())
