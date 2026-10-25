@@ -22,6 +22,10 @@ pub enum AppError {
     /// A refusal with a plan 8.2 wire code (ADR 0001 R3), for clients that
     /// fail closed on a code they do not know.
     Coded(StatusCode, &'static str, String),
+    /// A stored grant that disagrees with its signed container: refused as
+    /// `AUTH_CLAIM_COLUMN_MISMATCH`, and quarantined once the request's own
+    /// transaction has rolled back (plan 5.6.4).
+    Quarantine(Box<crate::quarantine::Mark>),
 }
 
 impl AppError {
@@ -45,6 +49,10 @@ impl AppError {
                 ),
             ),
             AppError::Coded(status, _, m) => (*status, m.clone()),
+            AppError::Quarantine(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "the stored grant does not match its signed container".into(),
+            ),
         }
     }
 }
@@ -66,9 +74,16 @@ impl IntoResponse for AppError {
                 json!({ "error": client_msg, "code": reason.as_str() })
             }
             AppError::Coded(_, code, _) => json!({ "error": client_msg, "code": code }),
+            AppError::Quarantine(_) => {
+                json!({ "error": client_msg, "code": "AUTH_CLAIM_COLUMN_MISMATCH" })
+            }
             _ => json!({ "error": client_msg }),
         };
         let mut resp = (code, Json(body)).into_response();
+        if let AppError::Quarantine(mark) = self {
+            resp.extensions_mut().insert(*mark);
+            return resp;
+        }
         if let AppError::TooManyRequests(secs) = self {
             if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
                 resp.headers_mut()

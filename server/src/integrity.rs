@@ -5,7 +5,9 @@
 //! a device whose stored key IDs do not match its keys is quarantined, a
 //! tenant without a bootstrap guard gets a `recovery_required` one (never
 //! `unused`), a guard that disagrees with its confirmation is moved to
-//! `recovery_required`, and a broken foreign key turns v2 writes off.
+//! `recovery_required`, a stored grant whose row disagrees with its signed
+//! container is quarantined (plan 5.6.4), and a broken foreign key turns v2
+//! writes off.
 
 use anyhow::Result;
 use shared::grants::HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305 as HPKE_SUITE;
@@ -13,7 +15,10 @@ use shared::keys::{hpke_key_id, signing_key_id};
 use shared::signing::{Ed25519VerifyingKey, SIGNATURE_SUITE_ID_ED25519 as SIGNING_SUITE};
 use sqlx::{Row, SqlitePool};
 
+use crate::error::AppError;
 use crate::identity::{ReasonCode, Refusal, Verified};
+use crate::quarantine::{self, Kind, Mark};
+use crate::routes::{v2_capability, v2_root_grants};
 use crate::util;
 
 /// Why a device's stored keys cannot be trusted.
@@ -64,6 +69,7 @@ pub struct Report {
     pub quarantined_devices: usize,
     pub guards_created: usize,
     pub guards_to_recovery: usize,
+    pub quarantined_grants: usize,
     pub foreign_key_violations: usize,
 }
 
@@ -87,6 +93,7 @@ pub async fn run(pool: &SqlitePool, identity: &Verified) -> Result<Report> {
     };
     report.guards_created = create_missing_guards(pool, &identity.server_instance_id).await?;
     report.guards_to_recovery = reconcile_guards(pool).await?;
+    report.quarantined_grants = quarantine_bad_grants(pool, identity).await?;
     report.foreign_key_violations = sqlx::query("SELECT 1 FROM pragma_foreign_key_check")
         .fetch_all(pool)
         .await?
@@ -187,6 +194,66 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
             "quarantined a v2 device whose keys fail the R4 checks"
         );
         quarantined += 1;
+    }
+    Ok(quarantined)
+}
+
+/// Quarantines every root and capability grant of this instance whose row
+/// disagrees with its signed container, through the same checks every request
+/// path uses. Returns how many it newly quarantined.
+async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
+    let instance = v.server_instance_id;
+    let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
+        row.get::<Vec<u8>, _>(col)
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("a grant row has a malformed {col}"))
+    };
+    let mut quarantined = 0;
+    let roots = sqlx::query(
+        "SELECT tenant_id, replay_id, root_generation FROM v2_tenant_root_key_grants
+          WHERE server_instance_id = ?",
+    )
+    .bind(instance.as_slice())
+    .fetch_all(pool)
+    .await?;
+    for row in roots {
+        let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
+        let generation = u64::try_from(row.get::<i64, _>("root_generation"))?;
+        let mut conn = pool.acquire().await?;
+        let checked = v2_root_grants::load_grant(&mut conn, v, &tenant, generation, &replay).await;
+        // The record goes through the pool, so this connection goes back first.
+        drop(conn);
+        match checked {
+            Ok(_) => {}
+            Err(AppError::Quarantine(mark)) => {
+                quarantined += usize::from(quarantine::record(pool, &mark).await?)
+            }
+            Err(e) => anyhow::bail!("checking a root grant failed: {e:?}"),
+        }
+    }
+    let capabilities = sqlx::query(&format!(
+        "SELECT tenant_id, replay_id FROM {} WHERE server_instance_id = ?",
+        v2_capability::TABLE
+    ))
+    .bind(instance.as_slice())
+    .fetch_all(pool)
+    .await?;
+    for row in capabilities {
+        let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
+        let mut conn = pool.acquire().await?;
+        let matches = v2_capability::stored_row_matches(&mut conn, &instance, &tenant, &replay)
+            .await
+            .map_err(|e| anyhow::anyhow!("checking a capability grant failed: {e:?}"))?;
+        drop(conn);
+        if !matches {
+            let mark = Mark {
+                kind: Kind::CapabilityGrant,
+                server_instance_id: instance,
+                tenant_id: tenant,
+                replay_id: replay,
+            };
+            quarantined += usize::from(quarantine::record(pool, &mark).await?);
+        }
     }
     Ok(quarantined)
 }

@@ -30,7 +30,7 @@ pub struct StoredGrant {
 /// generation; a `PREPARING` bootstrap grant is not served here. Replace it
 /// with `GET .../root-key-generations/{g}/grants/{replay_id}` when that lands.
 ///
-/// Revoked grants are excluded. Revocation blocks a device that has not yet
+/// Revoked and quarantined grants are excluded. Revocation blocks a device that has not yet
 /// collected the key; it cannot retract a key already copied, which is why
 /// excluding a device means rotating the generation rather than revoking alone.
 pub async fn grants_for_device(
@@ -44,6 +44,10 @@ pub async fn grants_for_device(
                 exact_signed_container_bytes, created_at
            FROM v2_tenant_root_key_grants r
           WHERE tenant_id = ? AND subject_device_id = ? AND revoked_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM v2_grant_quarantine q
+                             WHERE q.kind = 'root_grant'
+                               AND q.server_instance_id = r.server_instance_id
+                               AND q.tenant_id = r.tenant_id AND q.replay_id = r.replay_id)
             AND EXISTS (SELECT 1 FROM v2_root_key_generations g
                          WHERE g.server_instance_id = r.server_instance_id
                            AND g.tenant_id = r.tenant_id

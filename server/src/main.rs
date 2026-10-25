@@ -17,6 +17,7 @@ mod idempotency;
 mod identity;
 mod integrity;
 mod models;
+mod quarantine;
 mod ratelimit;
 mod routes;
 mod state;

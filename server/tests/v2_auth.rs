@@ -2705,14 +2705,22 @@ async fn bootstrapped(
     server: &mut Server,
     seed: u8,
 ) -> (Device, String, Vec<u8>, RootGenerationTarget) {
+    let (dev, access, container, target, _) = bootstrapped_by(server, seed).await;
+    (dev, access, container, target)
+}
+
+/// [`bootstrapped`], also returning the exact create request.
+async fn bootstrapped_by(
+    server: &mut Server,
+    seed: u8,
+) -> (Device, String, Vec<u8>, RootGenerationTarget, Vec<u8>) {
     let (dev, access) = approved(server, seed).await;
     let container = self_grant(&dev, &TRK, |_| {});
     let create = bootstrap_create(&TRK, container.clone(), |_| {});
-    let (status, body) = server
-        .root(&TENANT, &access, &root_request(0x91, &create))
-        .await;
+    let request = root_request(0x91, &create);
+    let (status, body) = server.root(&TENANT, &access, &request).await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
-    (dev, access, container, create.target)
+    (dev, access, container, create.target, request)
 }
 
 async fn read_self_grant(
@@ -3123,17 +3131,44 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
         (409, "ROOT_GENERATION_MISMATCH".into())
     );
 
-    // A row that no longer matches its signed container is never served.
+    // A row that no longer matches its signed container is never served, and
+    // the grant is quarantined for good, even once the row is put back.
     server
         .sql(
             "DROP TRIGGER v2_tenant_root_key_grants_record_is_fixed",
             &[],
         )
         .await;
+    let info: Vec<u8> = sqlx::query_scalar("SELECT hpke_info_bytes FROM v2_tenant_root_key_grants")
+        .fetch_one(&db(&server.data).await)
+        .await
+        .unwrap();
     server
         .sql(
             "UPDATE v2_tenant_root_key_grants SET hpke_info_bytes = x'00'",
             &[],
+        )
+        .await;
+    let (status, body) = server
+        .call(&grant_path("0", &SELF_GRANT_REPLAY), &access, None)
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+    assert_eq!(
+        server
+            .count(
+                "SELECT count(*) FROM v2_grant_quarantine
+                  WHERE kind = 'root_grant' AND reason = 'container_mismatch'"
+            )
+            .await,
+        1
+    );
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET hpke_info_bytes = ?",
+            &[&info],
         )
         .await;
     let (status, body) = server
@@ -3278,8 +3313,9 @@ async fn a_row_holding_another_rows_container_is_not_that_grant() {
 
 /// D1, the S6 bootstrap, the ack and the activation: `dev` is the ACTIVE
 /// root custodian.
-async fn custodian(server: &mut Server, seed: u8) -> (Device, String, RootGenerationTarget) {
-    let (dev, access, container, target) = bootstrapped(server, seed).await;
+/// Returns the device, its access token and the exact bootstrap request.
+async fn custodian(server: &mut Server, seed: u8) -> (Device, String, Vec<u8>) {
+    let (dev, access, container, target, request) = bootstrapped_by(server, seed).await;
     let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
     let ack = ack_request(0xb1, grant_ref(&dev, &container));
     assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
@@ -3291,7 +3327,7 @@ async fn custodian(server: &mut Server, seed: u8) -> (Device, String, RootGenera
             .0,
         201
     );
-    (dev, access, target)
+    (dev, access, request)
 }
 
 /// `capability` for `dev` itself, tenant-wide, signed by `signer`.
@@ -3452,24 +3488,41 @@ async fn the_active_custodian_files_capability_grants_once() {
     server
         .sql("DROP TRIGGER v2_capability_grants_record_is_fixed", &[])
         .await;
-    server
-        .sql(
-            "UPDATE v2_capability_grants SET not_after_ms = not_after_ms - 1
-              WHERE replay_id = ?",
-            &[&[0xa1; 16]],
-        )
-        .await;
-    let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+    // The same bytes again find the drift and quarantine the grant for good.
+    for (shift, quarantined) in [("- 1", 1), ("+ 1", 1)] {
+        server
+            .sql(
+                &format!(
+                    "UPDATE v2_capability_grants SET not_after_ms = not_after_ms {shift}
+                      WHERE replay_id = ?"
+                ),
+                &[&[0xa1; 16]],
+            )
+            .await;
+        let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+        assert_eq!(
+            (status, code_of(&body).as_str()),
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+        );
+        assert_eq!(
+            server
+                .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'capability_grant'")
+                .await,
+            quarantined
+        );
+    }
+    // Once quarantined, the replay ID answers nothing else either.
+    let (status, body) = server.call(GRANTS, &access, Some(&other)).await;
     assert_eq!(
         (status, code_of(&body).as_str()),
-        (409, "IDEMPOTENCY_MISMATCH")
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
     );
 }
 
 #[tokio::test]
 async fn only_a_live_custodian_files_an_issuable_grant_for_a_live_subject() {
     let mut server = start("d2-refusals", 38206).await;
-    let (dev, access, _target) = custodian(&mut server, 0x69).await;
+    let (dev, access, _) = custodian(&mut server, 0x69).await;
     let stranger = Ed25519SigningKey::from_bytes(&[0x5e; 32]);
 
     type Edit = fn(&mut TenantCapabilityGrantV2);
@@ -3667,7 +3720,7 @@ async fn only_a_live_custodian_files_an_issuable_grant_for_a_live_subject() {
 #[tokio::test]
 async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
     let mut server = start("d2-revoked", 38207).await;
-    let (dev, access, _target) = custodian(&mut server, 0x6b).await;
+    let (dev, access, _) = custodian(&mut server, 0x6b).await;
     let grant = |replay: u8| capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [replay; 16]);
 
     // An acknowledgement lost behind the trigger's back ends custody, and
@@ -3719,4 +3772,127 @@ async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
         g.capability = Capability::DeviceRevoke;
     });
     assert_eq!(server.call(GRANTS, &access, Some(&other)).await.0, 403);
+}
+
+#[tokio::test]
+async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
+    let mut server = start("quarantine-pass", 38208).await;
+    let (dev, access, bootstrap) = custodian(&mut server, 0x6c).await;
+    // The v1 collection route lists the grant, and the bootstrap replays.
+    server
+        .sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin')
+              WHERE id = ?",
+            &[&OWNER],
+        )
+        .await;
+    let (_, login) = server
+        .post(
+            "/auth/login",
+            None,
+            json!({ "username": "admin", "password": "secret" }),
+        )
+        .await;
+    let v1 = login["token"].as_str().unwrap().to_string();
+    let collect = format!(
+        "/v2/tenants/{}/devices/{}/root-key-grants",
+        hex(&TENANT),
+        hex(&dev.id)
+    );
+    let listed = |body: Vec<u8>| {
+        serde_json::from_slice::<Value>(&body).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let (status, body) = server.call(&collect, &v1, None).await;
+    assert_eq!((status, listed(body)), (200, 1));
+    assert_eq!(server.root(&TENANT, &access, &bootstrap).await.0, 201);
+    let filed = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xf2; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&filed)).await.0, 201);
+    let intact = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xf3; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&intact)).await.0, 201);
+
+    // Both rows drift while the server is down; no request ever sees them.
+    for (trigger, statement) in [
+        (
+            "v2_tenant_root_key_grants_record_is_fixed",
+            "UPDATE v2_tenant_root_key_grants SET hpke_info_bytes = x'00'",
+        ),
+        (
+            "v2_capability_grants_record_is_fixed",
+            "UPDATE v2_capability_grants SET capability = 'device.revoke' WHERE replay_id = x'f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2'",
+        ),
+    ] {
+        server.sql(&format!("DROP TRIGGER {trigger}"), &[]).await;
+        server.sql(statement, &[]).await;
+    }
+    // A row under another replay ID holding the intact grant's exact
+    // container is not that grant.
+    for statement in [
+        "CREATE TABLE borrowed AS SELECT * FROM v2_capability_grants
+          WHERE replay_id = x'f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3'",
+        "UPDATE borrowed SET replay_id = x'f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5'",
+        "INSERT INTO v2_capability_grants SELECT * FROM borrowed",
+    ] {
+        server.sql(statement, &[]).await;
+    }
+    server.restart().await;
+    for (kind, want) in [("root_grant", 1), ("capability_grant", 2)] {
+        assert_eq!(
+            server
+                .count(&format!(
+                    "SELECT count(*) FROM v2_grant_quarantine WHERE kind = '{kind}'"
+                ))
+                .await,
+            want,
+            "{kind}"
+        );
+    }
+    let (status, body) = server
+        .call(&grant_path("0", &SELF_GRANT_REPLAY), &access, None)
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    // The intact grant still answers its retry; the custodian's quarantined
+    // root grant ends its custody.
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&intact)).await,
+        (201, intact.clone())
+    );
+    let (status, body) = server.call(GRANTS, &access, Some(&filed)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let next = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xf4; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&next)).await.0, 422);
+    // Neither is the quarantined self-grant collected, nor does its bootstrap
+    // replay.
+    let (status, body) = server.call(&collect, &v1, None).await;
+    assert_eq!((status, listed(body)), (200, 0));
+    assert_eq!(server.root(&TENANT, &access, &bootstrap).await.0, 422);
+
+    // A second pass finds nothing new, and the record never changes.
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine")
+            .await,
+        3
+    );
+    let pool = db(&server.data).await;
+    for statement in [
+        "DELETE FROM v2_grant_quarantine",
+        "UPDATE v2_grant_quarantine SET reason = 'container_mismatch'",
+        "INSERT OR REPLACE INTO v2_grant_quarantine SELECT * FROM v2_grant_quarantine",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&pool).await.is_err(),
+            "{statement}"
+        );
+    }
+    pool.close().await;
 }

@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 
 use crate::auth;
 use crate::error::AppError;
+use crate::quarantine;
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
@@ -166,7 +167,24 @@ pub fn router(state: AppState) -> Router {
         .route("/proxies", get(proxies::list).post(proxies::create))
         .route("/proxies/:id", delete(proxies::delete))
         .layer(middleware::from_fn_with_state(state.clone(), v2_write_gate))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_quarantine,
+        ))
         .with_state(state)
+}
+
+/// Records the quarantine a refused request found (plan 5.6.4). The request's
+/// transaction rolled back with the refusal, so the mark is written in its
+/// own; a write that fails leaves the grant to the next integrity pass.
+async fn record_quarantine(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    if let Some(mark) = resp.extensions().get::<quarantine::Mark>() {
+        if let Err(e) = quarantine::record(&app.db, mark).await {
+            tracing::error!("could not record a grant quarantine: {e}");
+        }
+    }
+    resp
 }
 
 /// Refuse every state-changing v2 request while the identity authority is

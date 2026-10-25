@@ -35,6 +35,7 @@ use super::v2_root::{
 };
 use crate::error::AppError;
 use crate::identity::Verified;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339};
 
@@ -50,8 +51,6 @@ fn generation_mismatch(msg: &str) -> AppError {
     coded(StatusCode::CONFLICT, "ROOT_GENERATION_MISMATCH", msg)
 }
 
-/// shortcut: a mismatch refuses the request but does not quarantine the
-/// grant (plan 5.6.4); quarantine comes with the PR6 integrity pass.
 fn integrity() -> AppError {
     column_mismatch("the stored root grant does not match its signed container")
 }
@@ -89,7 +88,7 @@ fn replay_id(s: &str) -> Result<[u8; 16], AppError> {
 }
 
 /// A stored grant whose row matched its verified container.
-struct StoredGrant {
+pub(crate) struct StoredGrant {
     record: VerifiedRecord,
     grant: TenantRootKeyGrantV2,
     acked: bool,
@@ -97,8 +96,9 @@ struct StoredGrant {
 }
 
 /// The grant `replay_id` of `generation`, verified against its row; `None`
-/// if there is no such row.
-async fn load_grant(
+/// if there is no such row. A row that disagrees with its container, or was
+/// quarantined before, is refused and quarantined.
+pub(crate) async fn load_grant(
     conn: &mut SqliteConnection,
     v: &Verified,
     tenant: &[u8; 16],
@@ -119,8 +119,18 @@ async fn load_grant(
     else {
         return Ok(None);
     };
+    let mark = Mark {
+        kind: Kind::RootGrant,
+        server_instance_id: v.server_instance_id,
+        tenant_id: *tenant,
+        replay_id: *replay,
+    };
+    let broken = || AppError::Quarantine(Box::new(mark.clone()));
+    if quarantine::holds(conn, &mark).await? {
+        return Err(broken());
+    }
     let exact: Vec<u8> = row.get("exact_signed_container_bytes");
-    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| integrity())?;
+    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
     // The issuer is a device of this tenant, revoked or not: a signature
     // stays the one it was when the grant was filed.
     let issuer: Vec<u8> = sqlx::query_scalar(
@@ -130,17 +140,17 @@ async fn load_grant(
     .bind(parsed.issuer_signing_key_id().as_slice())
     .fetch_optional(&mut *conn)
     .await?
-    .ok_or_else(integrity)?;
-    let issuer: [u8; 32] = issuer.try_into().map_err(|_| integrity())?;
-    let record = parsed.verify_signature(&issuer).map_err(|_| integrity())?;
+    .ok_or_else(broken)?;
+    let issuer: [u8; 32] = issuer.try_into().map_err(|_| broken())?;
+    let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
     let Payload::TenantRootKeyGrant(grant) = record.payload().clone() else {
-        return Err(integrity());
+        return Err(broken());
     };
     let key = (&v.server_instance_id, tenant, replay);
     if grant.root_generation != generation
         || !grant_row_matches(conn, key, &grant, record.record()).await?
     {
-        return Err(integrity());
+        return Err(broken());
     }
     Ok(Some(StoredGrant {
         record,
@@ -661,6 +671,8 @@ pub(super) async fn is_active_custodian(
     .await?;
     for replay in replays {
         let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+        // A broken grant refuses the whole check (422) rather than being
+        // skipped: custody is never decided past a quarantined row.
         let Some(g) = load_grant(conn, v, &s.tenant_id, generation, &replay).await? else {
             continue;
         };
