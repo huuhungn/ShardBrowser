@@ -19,6 +19,7 @@ pub mod fleet_manifest;
 pub mod grants;
 pub mod keys;
 pub mod logins;
+pub mod mutation;
 pub mod oscrypt;
 pub mod passphrase;
 pub mod portable;
