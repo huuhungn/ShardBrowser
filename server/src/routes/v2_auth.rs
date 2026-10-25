@@ -44,6 +44,9 @@ const SETUP_SESSION_MS: i64 = 1_800_000;
 /// Open challenges per ticket. With the ticket's 10-minute life this bounds
 /// the HPKE work one login can cause.
 const MAX_OPEN_CHALLENGES: i64 = 5;
+/// Live tickets per account. Bounds what one account's successful logins can
+/// open: at most this many times `MAX_OPEN_CHALLENGES` challenges.
+const MAX_LIVE_TICKETS: i64 = 10;
 
 const TICKET: &str = "v2t.";
 const ACCESS: &str = "v2a.";
@@ -389,6 +392,17 @@ pub async fn login(
     .fetch_optional(&app.db)
     .await?;
     let Some(row) = row else {
+        // Same work as a wrong password, so timing does not tell which
+        // tenants and usernames exist.
+        static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let dummy = match DUMMY.get() {
+            Some(h) => h.clone(),
+            None => {
+                let h = crate::auth::hash_password(&hex(&random::<16>()?))?;
+                DUMMY.get_or_init(|| h).clone()
+            }
+        };
+        let _ = verify_slot(&app, req.password.clone(), dummy).await?;
         crate::audit::log(
             &app.db,
             None,
@@ -413,15 +427,28 @@ pub async fn login(
     let tenant_id: [u8; 16] = blob(&row, "tenant_id")?;
     let account_id: [u8; 16] = blob(&row, "id")?;
     let token_version: i64 = row.get("token_version");
-    let mut conn = app.db.acquire().await?;
+    let mut conn = app.db.begin_with("BEGIN IMMEDIATE").await?;
     if !account_is_live(&mut conn, &tenant_id, &account_id, token_version).await? {
         return Err(AppError::Unauthorized);
     }
     app.login_throttle.record_success(&ip, &user_key);
 
+    let now = now_ms();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM v2_pre_device_sessions
+          WHERE tenant_id = ? AND account_id = ? AND consumed_at_ms IS NULL
+            AND revoked_at_ms IS NULL AND expires_at_ms > ?",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(account_id.as_slice())
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?;
+    if live >= MAX_LIVE_TICKETS {
+        return Err(AppError::TooManyRequests((TICKET_TTL_MS / 1000) as u64));
+    }
     let (token, hash) = new_token(TICKET)?;
     let id = random::<16>()?;
-    let now = now_ms();
     sqlx::query(
         "INSERT INTO v2_pre_device_sessions
              (id, token_hash, server_instance_id, restore_epoch, tenant_id, account_id,
@@ -439,6 +466,7 @@ pub async fn login(
     .bind(now + TICKET_TTL_MS)
     .execute(&mut *conn)
     .await?;
+    conn.commit().await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -468,8 +496,10 @@ pub async fn create_device_session_challenge(
     let v = verified(&app)?;
     let device_id = unhex::<16>(&req.device_id)
         .ok_or_else(|| AppError::BadRequest("device_id must be 32 hex digits".into()))?;
+    // One write lock from the count to the insert, so concurrent requests
+    // cannot all pass the cap.
+    let mut conn = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
-    let mut conn = app.db.acquire().await?;
     let open: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM v2_device_session_challenges
           WHERE pre_device_session_id = ? AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL
@@ -562,6 +592,7 @@ pub async fn create_device_session_challenge(
     .bind(expires_at_ms)
     .execute(&mut *conn)
     .await?;
+    conn.commit().await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -611,8 +642,8 @@ pub async fn prove_device_session(
     let secret = Zeroizing::new(unhex::<32>(&req.secret).ok_or_else(|| bad("secret"))?);
     let signature = unhex::<64>(&req.signature).ok_or_else(|| bad("signature"))?;
 
-    let now = now_ms();
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
     let ticket = load_ticket(&mut tx, "id", &presented.id, v, now)
         .await?
         .ok_or(AppError::Unauthorized)?;
@@ -667,7 +698,8 @@ pub async fn prove_device_session(
         && f.tenant_id == ticket.tenant_id
         && f.account_id == ticket.account_id
         && f.pre_device_session_id == ticket.id
-        && f.challenge_id == challenge_id;
+        && f.challenge_id == challenge_id
+        && binding.device_id == blob::<16>(&row, "device_id")?;
     if !live_device || !bound {
         revoke_challenge(&mut tx, &challenge_id, now).await?;
         tx.commit().await?;
@@ -767,16 +799,30 @@ pub async fn refresh(
 ) -> Result<Json<Value>, AppError> {
     let v = verified(&app)?;
     let hash = token_hash(&req.refresh_token, REFRESH).ok_or(AppError::Unauthorized)?;
-    let now = now_ms();
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    // Read after the lock: time spent waiting for it must not extend a token.
+    let now = now_ms();
     let row = sqlx::query(&format!(
         "SELECT {SESSION_COLUMNS} FROM v2_sessions
           WHERE refresh_token_hash = ? AND revoked_at_ms IS NULL"
     ))
     .bind(hash.as_slice())
     .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(AppError::Unauthorized)?;
+    .await?;
+    let Some(row) = row else {
+        // A token the last rotation replaced: someone else holds a copy, so
+        // neither holder keeps the session.
+        sqlx::query(
+            "UPDATE v2_sessions SET revoked_at_ms = ?
+              WHERE previous_refresh_token_hash = ? AND revoked_at_ms IS NULL",
+        )
+        .bind(now)
+        .bind(hash.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Err(AppError::Unauthorized);
+    };
     let session = session_from(&row)?;
     let fresh =
         now < row.get::<i64, _>("refresh_expires_at_ms") && now < session.absolute_expires_at_ms;
@@ -795,7 +841,8 @@ pub async fn refresh(
     let access_expires = (now + ACCESS_TTL_MS).min(session.absolute_expires_at_ms);
     let rotated = sqlx::query(
         "UPDATE v2_sessions
-            SET access_token_hash = ?, access_expires_at_ms = ?, refresh_token_hash = ?
+            SET access_token_hash = ?, access_expires_at_ms = ?, refresh_token_hash = ?,
+                previous_refresh_token_hash = refresh_token_hash
           WHERE tenant_id = ? AND id = ? AND refresh_token_hash = ? AND revoked_at_ms IS NULL",
     )
     .bind(access_hash.as_slice())

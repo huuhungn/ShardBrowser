@@ -10,9 +10,10 @@
 -- `v2_sessions` is rebuilt with the binding R2 requires: instance, epoch,
 -- account, device, both key IDs, account token version, class, both token
 -- hashes and the three expiries. No code ever issued a row of the old shape,
--- and 0012 revoked every row a test or dev database might hold, so the
--- rebuild refuses a live row instead of guessing a class for it, and drops
--- revoked ones: they carry no token a client could present.
+-- so the rebuild refuses a live row instead of guessing a class for it, and
+-- drops revoked ones: they carry no token a client could present. A dev or
+-- test database that stops here has rows a test seeded by hand; set their
+-- `revoked_at` (or delete them) and start the server again.
 
 CREATE TEMP TABLE m0013_fk_off (
     ok INTEGER NOT NULL
@@ -33,7 +34,7 @@ SELECT NOT EXISTS (SELECT 1 FROM v2_sessions WHERE revoked_at IS NULL);
 -- Ten minutes, never refreshed. Consumed by the device-session proof that
 -- promotes it, revoked by logout.
 CREATE TABLE v2_pre_device_sessions (
-    id                    BLOB    PRIMARY KEY CHECK (length(id) = 16),
+    id                    BLOB    NOT NULL PRIMARY KEY CHECK (length(id) = 16),
     token_hash            BLOB    NOT NULL UNIQUE CHECK (length(token_hash) = 32),
     server_instance_id    BLOB    NOT NULL CHECK (length(server_instance_id) = 16),
     restore_epoch         INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
@@ -57,7 +58,7 @@ CREATE INDEX v2_pre_device_sessions_by_account
 -- One HPKE proof-of-possession attempt: the exact binding the server issued
 -- and the hash of the secret it sealed. 120 seconds, used at most once.
 CREATE TABLE v2_device_session_challenges (
-    id                    BLOB    PRIMARY KEY CHECK (length(id) = 16),
+    id                    BLOB    NOT NULL PRIMARY KEY CHECK (length(id) = 16),
     pre_device_session_id BLOB    NOT NULL REFERENCES v2_pre_device_sessions(id) ON DELETE CASCADE,
     tenant_id             BLOB    NOT NULL,
     account_id            BLOB    NOT NULL,
@@ -103,6 +104,9 @@ CREATE TABLE v2_sessions (
     access_expires_at_ms        INTEGER NOT NULL
         CHECK (access_expires_at_ms BETWEEN 0 AND 9223372036854775807),
     refresh_token_hash          BLOB    NOT NULL UNIQUE CHECK (length(refresh_token_hash) = 32),
+    -- The token the last rotation replaced: presenting it again means two
+    -- holders, so the session ends.
+    previous_refresh_token_hash BLOB    UNIQUE CHECK (length(previous_refresh_token_hash) = 32),
     refresh_expires_at_ms       INTEGER NOT NULL
         CHECK (refresh_expires_at_ms BETWEEN 0 AND 9223372036854775807),
     absolute_expires_at_ms      INTEGER NOT NULL
@@ -118,6 +122,9 @@ CREATE TABLE v2_sessions (
     CHECK (class <> 'pending_setup' OR absolute_expires_at_ms - pop_at_ms <= 1800000)
 );
 CREATE INDEX v2_sessions_by_device ON v2_sessions (tenant_id, device_id);
+CREATE INDEX v2_sessions_by_account ON v2_sessions (tenant_id, account_id);
+-- A consumed ticket or challenge stays while a session names it.
+CREATE INDEX v2_sessions_by_ticket ON v2_sessions (pre_device_session_id);
 
 -- Neither refresh nor credentials can change what a session is bound to.
 CREATE TRIGGER v2_sessions_binding_is_fixed

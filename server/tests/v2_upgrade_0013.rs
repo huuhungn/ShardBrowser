@@ -159,7 +159,8 @@ async fn settled_rows_and_bindings_never_change() {
             "UPDATE v2_sessions SET absolute_expires_at_ms = 1800003",
             "binding never changes",
         ),
-        // The 30-minute bound on a setup session is a CHECK, not a convention.
+        // No expiry may pass the absolute bound (the 30-minute setup bound
+        // has its own case below).
         (
             "UPDATE v2_sessions SET refresh_expires_at_ms = 1800003",
             "CHECK constraint failed",

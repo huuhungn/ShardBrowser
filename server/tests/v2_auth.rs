@@ -529,20 +529,28 @@ async fn live_state_ends_tickets_and_sessions() {
         .await;
     assert_eq!(server.me(access).await.0, 200);
 
-    // So does a revoked membership, and a device that left pending.
-    server
-        .sql(
+    // So do a disabled account, a suspended tenant and a revoked membership,
+    // for the ticket as for the session; and a device that left pending.
+    for (set, reset) in [
+        (
+            "UPDATE v2_accounts SET status = 'disabled' WHERE id = ?",
+            "UPDATE v2_accounts SET status = 'active' WHERE id = ?",
+        ),
+        (
+            "UPDATE v2_tenants SET status = 'suspended' WHERE id = (SELECT tenant_id FROM v2_accounts WHERE id = ?)",
+            "UPDATE v2_tenants SET status = 'active' WHERE id = (SELECT tenant_id FROM v2_accounts WHERE id = ?)",
+        ),
+        (
             "UPDATE v2_tenant_memberships SET status = 'revoked' WHERE account_id = ?",
-            &[&OWNER],
-        )
-        .await;
-    assert_eq!(server.me(access).await.0, 401);
-    server
-        .sql(
             "UPDATE v2_tenant_memberships SET status = 'active' WHERE account_id = ?",
-            &[&OWNER],
-        )
-        .await;
+        ),
+    ] {
+        server.sql(set, &[&OWNER]).await;
+        assert_eq!(server.me(access).await.0, 401, "{set}");
+        assert_eq!(server.me(t).await.0, 401, "{set}");
+        server.sql(reset, &[&OWNER]).await;
+        assert_eq!(server.me(access).await.0, 200, "{reset}");
+    }
     server
         .sql(
             "UPDATE v2_devices SET status = 'revoked' WHERE id = ?",
@@ -566,28 +574,30 @@ async fn live_state_ends_tickets_and_sessions() {
         "a failed refresh revokes the session"
     );
 
-    // A ticket from another epoch is refused.
-    let (raw, hash) = {
-        let raw = [0x31u8; 32];
-        (raw, shared::canonical::sha256(&raw))
-    };
-    let pool = db(&server.data).await;
-    sqlx::query(
-        "INSERT INTO v2_pre_device_sessions
-             (id, token_hash, server_instance_id, restore_epoch, tenant_id, account_id,
-              account_token_version, created_at_ms, expires_at_ms)
-         VALUES (?, ?, ?, 1, ?, ?, 0, 1, 600000)",
-    )
-    .bind([0x32u8; 16].as_slice())
-    .bind(hash.as_slice())
-    .bind(INSTANCE.as_slice())
-    .bind(TENANT.as_slice())
-    .bind(OWNER.as_slice())
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool.close().await;
-    assert_eq!(server.me(&format!("v2t.{}", hex(&raw))).await.0, 401);
+    // A ticket is pinned to the instance and epoch it was issued under. The
+    // control ticket is the same row under the current pair, so only the pin
+    // differs.
+    assert_eq!(
+        server
+            .me(&forge_ticket(&server, INSTANCE, 0, 0x31).await)
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        server
+            .me(&forge_ticket(&server, INSTANCE, 1, 0x33).await)
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        server
+            .me(&forge_ticket(&server, [8; 16], 0, 0x35).await)
+            .await
+            .0,
+        401
+    );
 }
 
 #[tokio::test]
@@ -607,7 +617,11 @@ async fn refresh_rotates_once_and_respects_expiry() {
     assert_eq!(status, 200, "{r}");
     assert_ne!(r["access_token"], s["access_token"]);
     assert_eq!(r["absolute_expires_at_ms"], s["absolute_expires_at_ms"]);
-    // The old refresh and access tokens are dead; the new access works.
+    // The old access token is dead; the new one works.
+    assert_eq!(server.me(s["access_token"].as_str().unwrap()).await.0, 401);
+    let access = r["access_token"].as_str().unwrap();
+    assert_eq!(server.me(access).await.0, 200);
+    // The replaced refresh token again means two holders: both lose the session.
     let (status, _) = server
         .post(
             "/v2/auth/refresh",
@@ -616,18 +630,7 @@ async fn refresh_rotates_once_and_respects_expiry() {
         )
         .await;
     assert_eq!(status, 401);
-    assert_eq!(server.me(s["access_token"].as_str().unwrap()).await.0, 401);
-    let access = r["access_token"].as_str().unwrap();
-    assert_eq!(server.me(access).await.0, 200);
-
-    // An expired access token is refused; an expired refresh ends the session.
-    server
-        .sql("UPDATE v2_sessions SET access_expires_at_ms = 1", &[])
-        .await;
     assert_eq!(server.me(access).await.0, 401);
-    server
-        .sql("UPDATE v2_sessions SET refresh_expires_at_ms = 1", &[])
-        .await;
     let (status, _) = server
         .post(
             "/v2/auth/refresh",
@@ -636,16 +639,50 @@ async fn refresh_rotates_once_and_respects_expiry() {
         )
         .await;
     assert_eq!(status, 401);
-    // The binding itself cannot be rewritten to stretch a session.
+
+    // On a new session: the binding cannot be rewritten to stretch it, an
+    // expired access token is refused, and an expired refresh ends it.
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
     let pool = db(&server.data).await;
-    let error =
-        sqlx::query("UPDATE v2_sessions SET absolute_expires_at_ms = absolute_expires_at_ms + 1")
-            .execute(&pool)
-            .await
-            .unwrap_err()
-            .to_string();
+    let error = sqlx::query(
+        "UPDATE v2_sessions SET absolute_expires_at_ms = absolute_expires_at_ms + 1
+          WHERE revoked_at_ms IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap_err()
+    .to_string();
     pool.close().await;
-    assert!(error.contains("never changes"), "{error}");
+    assert!(error.contains("binding never changes"), "{error}");
+    server
+        .sql(
+            "UPDATE v2_sessions SET access_expires_at_ms = 1 WHERE revoked_at_ms IS NULL",
+            &[],
+        )
+        .await;
+    assert_eq!(server.me(access).await.0, 401);
+    server
+        .sql(
+            "UPDATE v2_sessions SET refresh_expires_at_ms = 1 WHERE revoked_at_ms IS NULL",
+            &[],
+        )
+        .await;
+    let (status, _) = server
+        .post(
+            "/v2/auth/refresh",
+            None,
+            json!({ "refresh_token": s["refresh_token"] }),
+        )
+        .await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_sessions WHERE revoked_at_ms IS NULL")
+            .await,
+        0,
+        "an expired refresh revokes the session"
+    );
 }
 
 #[tokio::test]
@@ -775,6 +812,35 @@ async fn a_device_that_changed_since_its_challenge_gets_no_session() {
     );
 }
 
+/// A live ticket for the owner under `instance` and `epoch`; returns its token.
+async fn forge_ticket(server: &Server, instance: [u8; 16], epoch: i64, tag: u8) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let raw = [tag; 32];
+    let pool = db(&server.data).await;
+    sqlx::query(
+        "INSERT INTO v2_pre_device_sessions
+             (id, token_hash, server_instance_id, restore_epoch, tenant_id, account_id,
+              account_token_version, created_at_ms, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+    )
+    .bind([tag; 16].as_slice())
+    .bind(shared::canonical::sha256(&raw).as_slice())
+    .bind(instance.as_slice())
+    .bind(epoch)
+    .bind(TENANT.as_slice())
+    .bind(OWNER.as_slice())
+    .bind(now)
+    .bind(now + 600_000)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    format!("v2t.{}", hex(&raw))
+}
+
 /// A session row for `dev`, written as the proof would but under `epoch`;
 /// returns its access token.
 async fn forge_session(
@@ -862,4 +928,64 @@ async fn a_session_from_another_epoch_is_refused() {
     assert_eq!(server.me(&current).await.0, 200);
     let stale = forge_session(&server, &dev, &hpk, 1, 0x70).await;
     assert_eq!(server.me(&stale).await.0, 401);
+}
+
+#[tokio::test]
+async fn an_account_holds_a_bounded_number_of_tickets() {
+    let server = start("tickets", 38183).await;
+    for _ in 0..10 {
+        server.login("owner").await;
+    }
+    let (status, _) = server
+        .post(
+            "/v2/auth/login",
+            None,
+            json!({ "tenant": "acme", "username": "owner", "password": PASSWORD }),
+        )
+        .await;
+    assert_eq!(status, 429);
+    // Another account of the tenant is unaffected.
+    server.login("other").await;
+}
+
+#[tokio::test]
+async fn concurrent_challenges_stop_at_the_cap() {
+    let server = start("race", 38184).await;
+    let dev = device(&server, OWNER, 0x3a, "pending").await;
+    let ticket = server.login("owner").await;
+    let t = ticket["ticket"].as_str().unwrap().to_string();
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let url = format!(
+            "http://127.0.0.1:{}/v2/auth/device-session-challenges",
+            server.port
+        );
+        let (t, body) = (t.clone(), json!({ "device_id": hex(&dev.id) }));
+        tasks.spawn(async move {
+            client()
+                .post(url)
+                .bearer_auth(t)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    let mut created = 0;
+    while let Some(status) = tasks.join_next().await {
+        match status.unwrap() {
+            201 => created += 1,
+            429 => {}
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(created, 5);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_device_session_challenges")
+            .await,
+        5
+    );
 }
