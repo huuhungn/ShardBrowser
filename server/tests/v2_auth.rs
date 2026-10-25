@@ -538,10 +538,9 @@ async fn a_ticket_authorizes_nothing_but_its_own_proofs() {
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
 
-    // Not a v1 token and not a device session.
+    // A ticket is a principal, but a grant and custody need a device session.
     let (status, _) = server.post("/v2/capability-grants", t, json!({})).await;
-    assert_eq!(status, 401);
-    // A ticket is a principal, but custody needs a device session.
+    assert_eq!(status, 403);
     let (status, _) = server
         .post(
             &format!("/v2/tenants/{}/root-key-generations", hex(&TENANT)),
@@ -2541,10 +2540,20 @@ async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_
     let mut server = start("s6-race-keys", 38200).await;
     let (dev, access) = approved(&mut server, 0x67).await;
 
-    // An active `root.custody` capability is root history (rule 1).
+    // An active `root.custody` capability is root history (rule 1). Only a
+    // spike row can hold one: the exact table refuses it, and the spike table
+    // is read-only behind its triggers.
+    for trigger in ["no_insert", "no_update"] {
+        server
+            .sql(
+                &format!("DROP TRIGGER v2_legacy_capability_grants_{trigger}"),
+                &[],
+            )
+            .await;
+    }
     server
         .sql(
-            "INSERT INTO v2_capability_grants VALUES (?, randomblob(16), 'domain', 2, ?, ?, \
+            "INSERT INTO v2_legacy_capability_grants VALUES (?, randomblob(16), 'domain', 2, ?, ?, \
              'root.custody', 'tenant', ?, 1, 1, 2, ?, 0, x'aa', randomblob(32), \
              randomblob(64), randomblob(32), randomblob(32), x'bb', randomblob(32), NULL, 't')",
             &[&TENANT, &OWNER, &dev.id, &TENANT, &INSTANCE],
@@ -2559,7 +2568,10 @@ async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_
         (409, "ROOT_BOOTSTRAP_ALREADY_EXISTS")
     );
     server
-        .sql("UPDATE v2_capability_grants SET revoked_at = 'now'", &[])
+        .sql(
+            "UPDATE v2_legacy_capability_grants SET revoked_at = 'now'",
+            &[],
+        )
         .await;
 
     let (first, second) = (root_request(0xe1, &create), root_request(0xe2, &create));
@@ -3260,4 +3272,451 @@ async fn a_row_holding_another_rows_container_is_not_that_grant() {
         (status, code_of(&body).as_str()),
         (422, "AUTH_CLAIM_COLUMN_MISMATCH")
     );
+}
+
+// --------------------------------------------- D2 capability grant filing ---
+
+/// D1, the S6 bootstrap, the ack and the activation: `dev` is the ACTIVE
+/// root custodian.
+async fn custodian(server: &mut Server, seed: u8) -> (Device, String, RootGenerationTarget) {
+    let (dev, access, container, target) = bootstrapped(server, seed).await;
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let ack = ack_request(0xb1, grant_ref(&dev, &container));
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
+    let activate = activate_request(0xb3, target.clone());
+    assert_eq!(
+        server
+            .call(&activate_path("0"), &access, Some(&activate))
+            .await
+            .0,
+        201
+    );
+    (dev, access, target)
+}
+
+/// `capability` for `dev` itself, tenant-wide, signed by `signer`.
+fn capability_grant(
+    dev: &Device,
+    signer: &Ed25519SigningKey,
+    edit: impl FnOnce(&mut TenantCapabilityGrantV2),
+) -> Vec<u8> {
+    let start = now_ms() - 60_000;
+    let mut g = TenantCapabilityGrantV2 {
+        common: CommonFields {
+            replay_id: [0xa1; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        subject: GrantSubject::Device {
+            account_id: OWNER,
+            device_id: dev.id,
+            signing_key_id: dev.signing_key_id,
+            hpke_key_id: dev.hpke_key_id,
+        },
+        scope_kind: CapabilityScopeKind::Tenant,
+        scope_id: TENANT,
+        capability: Capability::DeviceApprove,
+    };
+    edit(&mut g);
+    build_record(signer, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+}
+
+const GRANTS: &str = "/v2/capability-grants";
+
+#[tokio::test]
+async fn the_active_custodian_files_capability_grants_once() {
+    let mut server = start("d2-file", 38205).await;
+    let (dev, access, container, target) = bootstrapped(&mut server, 0x68).await;
+    let own = capability_grant(&dev, &dev.sk, |_| {});
+
+    // Before activation the device is no custodian (ADR 0001 D2).
+    assert_eq!(server.call(GRANTS, &access, Some(&own)).await.0, 403);
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let ack = ack_request(0xb1, grant_ref(&dev, &container));
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
+    assert_eq!(server.call(GRANTS, &access, Some(&own)).await.0, 403);
+    let activate = activate_request(0xb3, target);
+    assert_eq!(
+        server
+            .call(&activate_path("0"), &access, Some(&activate))
+            .await
+            .0,
+        201
+    );
+
+    // Now it signs its own operating capability, filed whole, once.
+    let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+    assert_eq!(
+        (status, &body),
+        (201, &own),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&own)).await,
+        (201, own.clone())
+    );
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_capability_grants
+              WHERE subject_kind = 'device' AND capability = 'device.approve'
+                AND scope_kind = 'tenant' AND revoked_at IS NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'capability.grant'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+    let exact: i64 = server
+        .count(&format!(
+            "SELECT count(*) FROM v2_capability_grants WHERE exact_signed_container_bytes = x'{}'",
+            hex(&own)
+        ))
+        .await;
+    assert_eq!(exact, 1);
+
+    // Other bytes under the same replay ID are another request.
+    let other = capability_grant(&dev, &dev.sk, |g| g.capability = Capability::DeviceRevoke);
+    let (status, body) = server.call(GRANTS, &access, Some(&other)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+
+    // An account-scoped grant carries no device columns.
+    let account = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa2; 16];
+        g.subject = GrantSubject::Account { account_id: OWNER };
+        g.capability = Capability::TenantManage;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&account)).await.0, 201);
+    assert_eq!(
+        server
+            .count(
+                "SELECT count(*) FROM v2_capability_grants WHERE subject_kind = 'account'
+                   AND subject_device_id IS NULL AND subject_signing_key_id IS NULL
+                   AND subject_hpke_key_id IS NULL"
+            )
+            .await,
+        1
+    );
+
+    // A fleet scope must name a fleet of the tenant.
+    let fleet = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa3; 16];
+        g.scope_kind = CapabilityScopeKind::Fleet;
+        g.scope_id = [0xf1; 16];
+        g.capability = Capability::FleetManage;
+    });
+    let (status, body) = server.call(GRANTS, &access, Some(&fleet)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (404, "RESOURCE_NOT_FOUND")
+    );
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&[0xf1; 16], &TENANT],
+        )
+        .await;
+    assert_eq!(server.call(GRANTS, &access, Some(&fleet)).await.0, 201);
+
+    // D-6: exactly 365 days is the longest life.
+    let longest = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa4; 16];
+        g.common.not_after_ms = g.common.not_before_ms + 365 * DAY_MS;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&longest)).await.0, 201);
+
+    // A filed grant never changes, and a row that drifted from its container
+    // does not answer a retry.
+    let pool = db(&server.data).await;
+    for statement in [
+        "UPDATE v2_capability_grants SET capability = 'device.revoke'",
+        "DELETE FROM v2_capability_grants",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&pool).await.is_err(),
+            "{statement}"
+        );
+    }
+    pool.close().await;
+    server
+        .sql("DROP TRIGGER v2_capability_grants_record_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET not_after_ms = not_after_ms - 1
+              WHERE replay_id = ?",
+            &[&[0xa1; 16]],
+        )
+        .await;
+    let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+}
+
+#[tokio::test]
+async fn only_a_live_custodian_files_an_issuable_grant_for_a_live_subject() {
+    let mut server = start("d2-refusals", 38206).await;
+    let (dev, access, _target) = custodian(&mut server, 0x69).await;
+    let stranger = Ed25519SigningKey::from_bytes(&[0x5e; 32]);
+
+    type Edit = fn(&mut TenantCapabilityGrantV2);
+    let cases: [(&str, Edit, u16, &str); 9] = [
+        (
+            "root.custody",
+            |g| g.capability = Capability::RootCustody,
+            403,
+            "",
+        ),
+        (
+            "not yet valid",
+            |g| {
+                g.common.issued_at_ms = now_ms() + 600_000;
+                g.common.not_before_ms = now_ms() + 600_000;
+                g.common.not_after_ms = now_ms() + DAY_MS;
+            },
+            403,
+            "",
+        ),
+        (
+            "over 365 days",
+            |g| g.common.not_after_ms = g.common.not_before_ms + 366 * DAY_MS,
+            403,
+            "",
+        ),
+        (
+            "another epoch",
+            |g| g.common.restore_epoch = 1,
+            409,
+            "STALE_CONTEXT",
+        ),
+        (
+            "another instance",
+            |g| g.common.server_instance_id = [0x99; 16],
+            403,
+            "",
+        ),
+        (
+            "another tenant",
+            |g| {
+                g.common.tenant_id = [0x42; 16];
+                g.scope_id = [0x42; 16];
+            },
+            403,
+            "",
+        ),
+        (
+            "subject under other keys",
+            |g| {
+                if let GrantSubject::Device { hpke_key_id, .. } = &mut g.subject {
+                    *hpke_key_id = [0x99; 32];
+                }
+            },
+            422,
+            "AUTH_CLAIM_COLUMN_MISMATCH",
+        ),
+        (
+            "unknown subject account",
+            |g| {
+                g.subject = GrantSubject::Account {
+                    account_id: [0x99; 16],
+                }
+            },
+            422,
+            "AUTH_CLAIM_COLUMN_MISMATCH",
+        ),
+        (
+            "unknown profile",
+            |g| {
+                g.scope_kind = CapabilityScopeKind::Profile;
+                g.scope_id = [0x99; 16];
+                g.capability = Capability::ProfileCommit;
+            },
+            404,
+            "RESOURCE_NOT_FOUND",
+        ),
+    ];
+    for (i, (name, edit, status, code)) in cases.into_iter().enumerate() {
+        let rec = capability_grant(&dev, &dev.sk, |g| {
+            g.common.replay_id = [0xc0 + i as u8; 16];
+            edit(g);
+        });
+        let (got, body) = server.call(GRANTS, &access, Some(&rec)).await;
+        assert_eq!(got, status, "{name}: {}", String::from_utf8_lossy(&body));
+        if !code.is_empty() {
+            assert_eq!(code_of(&body), code, "{name}");
+        }
+    }
+
+    // The codec refuses values that never appear in a capability grant.
+    let receive = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xd0; 16];
+        g.capability = Capability::FleetKeyReceive;
+    });
+    let (status, body) = server.call(GRANTS, &access, Some(&receive)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "NON_CANONICAL_RECORD")
+    );
+    // Another record kind is not a capability grant.
+    let approval = approval(&dev, &dev.sk, 0xd1, 0, 30);
+    assert_eq!(server.call(GRANTS, &access, Some(&approval)).await.0, 422);
+    // The issuer is the presenting device and no other key.
+    let foreign = capability_grant(&dev, &stranger, |g| g.common.replay_id = [0xd2; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&foreign)).await.0, 403);
+
+    // An account that is no longer active is no subject.
+    server
+        .sql(
+            "UPDATE v2_accounts SET status = 'disabled' WHERE id = ?",
+            &[&OTHER],
+        )
+        .await;
+    let disabled = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xd7; 16];
+        g.subject = GrantSubject::Account { account_id: OTHER };
+        g.capability = Capability::TenantManage;
+    });
+    let (status, body) = server.call(GRANTS, &access, Some(&disabled)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+
+    // The spike table is read-only, and a replay ID one of its rows holds is
+    // spent.
+    let spike_row = format!(
+        "INSERT INTO v2_legacy_capability_grants VALUES (?, ?, '{DOMAIN_TENANT_CAPABILITY_GRANT}', \
+         2, ?, ?, 'device.approve', 'tenant', ?, 1, 1, 2, ?, 0, x'aa', randomblob(32), \
+         randomblob(64), randomblob(32), randomblob(32), x'bb', randomblob(32), NULL, 't')"
+    );
+    let binds: [&[u8]; 6] = [&TENANT, &[0xd6; 16], &OWNER, &dev.id, &TENANT, &INSTANCE];
+    let pool = db(&server.data).await;
+    let refused = binds
+        .iter()
+        .fold(sqlx::query(&spike_row), |q, b| q.bind(*b))
+        .execute(&pool)
+        .await;
+    assert!(refused.is_err(), "the spike table took a row");
+    pool.close().await;
+    for trigger in ["no_insert", "no_update"] {
+        server
+            .sql(
+                &format!("DROP TRIGGER v2_legacy_capability_grants_{trigger}"),
+                &[],
+            )
+            .await;
+    }
+    server.sql(&spike_row, &binds).await;
+    let spike = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xd6; 16]);
+    let (status, body) = server.call(GRANTS, &access, Some(&spike)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+
+    // A device on a pending session is no custodian, even for itself.
+    let other = device(&server, OWNER, 0x6a, "pending").await;
+    let pending = session(&server, &other).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let self_issued = capability_grant(&other, &other.sk, |g| g.common.replay_id = [0xd3; 16]);
+    assert_eq!(
+        server.call(GRANTS, &pending, Some(&self_issued)).await.0,
+        403
+    );
+
+    // Custody ends with a revoked custody grant or a retired generation.
+    let honest =
+        |replay: u8| capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [replay; 16]);
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&honest(0xd4))).await.0,
+        201
+    );
+    server
+        .sql(
+            "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = 'now'",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&honest(0xd5))).await.0,
+        403
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_capability_grants")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
+    let mut server = start("d2-revoked", 38207).await;
+    let (dev, access, _target) = custodian(&mut server, 0x6b).await;
+    let grant = |replay: u8| capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [replay; 16]);
+
+    // An acknowledgement lost behind the trigger's back ends custody, and
+    // restoring it brings custody back.
+    server
+        .sql(
+            "DROP TRIGGER v2_tenant_root_key_grants_marks_are_final",
+            &[],
+        )
+        .await;
+    let acked: String = sqlx::query_scalar("SELECT acked_at FROM v2_tenant_root_key_grants")
+        .fetch_one(&db(&server.data).await)
+        .await
+        .unwrap();
+    server
+        .sql("UPDATE v2_tenant_root_key_grants SET acked_at = NULL", &[])
+        .await;
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&grant(0xe1))).await.0,
+        403
+    );
+    server
+        .sql(
+            &format!("UPDATE v2_tenant_root_key_grants SET acked_at = '{acked}'"),
+            &[],
+        )
+        .await;
+    let filed = grant(0xe2);
+    assert_eq!(server.call(GRANTS, &access, Some(&filed)).await.0, 201);
+
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET revoked_at = 'now'",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&grant(0xe3))).await.0,
+        403
+    );
+    // A lost response still gets its stored answer, but a device that is no
+    // custodian is not told that a replay ID is spent.
+    assert_eq!(
+        server.call(GRANTS, &access, Some(&filed)).await,
+        (201, filed.clone())
+    );
+    let other = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xe2; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&other)).await.0, 403);
 }

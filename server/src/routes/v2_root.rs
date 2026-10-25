@@ -293,10 +293,10 @@ async fn bootstrap(
             return Err(already_exists());
         }
     }
-    // Nor an active custodian capability. Nothing writes one yet, and D1
-    // refuses a tenant with any; this keeps rule 1 whole once they exist.
+    // Nor an active custodian capability from the spike table; the exact
+    // table refuses `root.custody`, and D1 refuses a tenant with any.
     let custodian: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_capability_grants
+        "SELECT EXISTS (SELECT 1 FROM v2_legacy_capability_grants
                          WHERE tenant_id = ? AND capability = 'root.custody'
                            AND revoked_at IS NULL)",
     )
@@ -462,7 +462,7 @@ async fn bootstrap(
 }
 
 /// The value of one grant column.
-enum Col {
+pub(super) enum Col {
     Blob(Vec<u8>),
     Int(i64),
     Text(&'static str),
@@ -565,6 +565,54 @@ fn grant_columns(
     ])
 }
 
+/// Inserts one row of `table` holding exactly `cols` and `created_at`.
+pub(super) async fn insert_row(
+    conn: &mut SqliteConnection,
+    table: &str,
+    cols: &[(&'static str, Col)],
+    created_at: &str,
+) -> Result<(), AppError> {
+    let names: Vec<&str> = cols.iter().map(|(name, _)| *name).collect();
+    let sql = format!(
+        "INSERT INTO {table} ({}, created_at) VALUES ({}?)",
+        names.join(", "),
+        "?, ".repeat(cols.len())
+    );
+    let mut q = sqlx::query(&sql);
+    for (_, col) in cols {
+        q = bind(q, col);
+    }
+    q.bind(created_at).execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// Whether some row of `table` holds exactly `cols`. A caller that means one
+/// row puts that row's key among `cols`.
+pub(super) async fn row_holds(
+    conn: &mut SqliteConnection,
+    table: &str,
+    cols: &[(&'static str, Col)],
+) -> Result<bool, AppError> {
+    let condition: Vec<String> = cols
+        .iter()
+        .map(|(name, _)| format!("{name} IS ?"))
+        .collect();
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {table} WHERE {})",
+        condition.join(" AND ")
+    );
+    let mut q = sqlx::query_scalar::<_, bool>(&sql);
+    for (_, col) in cols {
+        q = match col {
+            Col::Blob(b) => q.bind(b.as_slice()),
+            Col::Int(n) => q.bind(*n),
+            Col::Text(t) => q.bind(*t),
+            Col::Null => q.bind(Option::<i64>::None),
+        };
+    }
+    Ok(q.fetch_one(&mut *conn).await?)
+}
+
 /// Files the exact grant row: every column from the verified record.
 async fn insert_grant(
     conn: &mut SqliteConnection,
@@ -573,18 +621,7 @@ async fn insert_grant(
     created_at: &str,
 ) -> Result<(), AppError> {
     let cols = grant_columns(g, record)?;
-    let names: Vec<&str> = cols.iter().map(|(name, _)| *name).collect();
-    let sql = format!(
-        "INSERT INTO v2_tenant_root_key_grants ({}, created_at) VALUES ({}?)",
-        names.join(", "),
-        "?, ".repeat(cols.len())
-    );
-    let mut q = sqlx::query(&sql);
-    for (_, col) in &cols {
-        q = bind(q, col);
-    }
-    q.bind(created_at).execute(&mut *conn).await?;
-    Ok(())
+    insert_row(conn, "v2_tenant_root_key_grants", &cols, created_at).await
 }
 
 /// The primary key of a root grant row: instance, tenant, replay ID.
@@ -606,24 +643,7 @@ pub(super) async fn grant_row_matches(
     }
     // The key is among the columns, so the check below is of that one row.
     let cols = grant_columns(g, record)?;
-    let condition: Vec<String> = cols
-        .iter()
-        .map(|(name, _)| format!("{name} IS ?"))
-        .collect();
-    let sql = format!(
-        "SELECT EXISTS (SELECT 1 FROM v2_tenant_root_key_grants WHERE {})",
-        condition.join(" AND ")
-    );
-    let mut q = sqlx::query_scalar::<_, bool>(&sql);
-    for (_, col) in &cols {
-        q = match col {
-            Col::Blob(b) => q.bind(b.as_slice()),
-            Col::Int(n) => q.bind(*n),
-            Col::Text(t) => q.bind(*t),
-            Col::Null => q.bind(Option::<i64>::None),
-        };
-    }
-    Ok(q.fetch_one(&mut *conn).await?)
+    row_holds(conn, "v2_tenant_root_key_grants", &cols).await
 }
 
 // ------------------------------------------------- the idempotency ledger ---

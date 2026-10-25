@@ -19,7 +19,9 @@ use shared::signing::{verify_tbs, SignError};
 /// `shared::authz_record` (ADR 0001 R3).
 #[cfg(test)]
 pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.authorization.device-approval.v2";
-/// Domain separator for capability grants.
+/// A second domain for the generic verifier's tests. Capability grants moved
+/// to `shared::authz_record` (ADR 0002 D-2).
+#[cfg(test)]
 pub const DOMAIN_CAPABILITY_GRANT: &str = "shardx.authorization.capability-grant.v2";
 
 /// Fleet key grant records. Distinct from the root domain so a root grant

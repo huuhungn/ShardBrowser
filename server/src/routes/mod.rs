@@ -7,6 +7,7 @@ pub mod users;
 pub mod v2;
 pub mod v2_approval;
 pub mod v2_auth;
+pub mod v2_capability;
 pub mod v2_root;
 pub mod v2_root_grants;
 
@@ -82,7 +83,12 @@ pub fn router(state: AppState) -> Router {
             post(v2_root_grants::activate_root_generation)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
-        .route("/v2/capability-grants", post(v2::present_capability_grant))
+        .route(
+            "/v2/capability-grants",
+            post(v2_capability::file_capability_grant).layer(DefaultBodyLimit::max(
+                v2_capability::MAX_CAPABILITY_GRANT_BODY,
+            )),
+        )
         .route(
             "/v2/tenants/:tenant_id/root-key-generation",
             get(v2::get_active_root_generation),

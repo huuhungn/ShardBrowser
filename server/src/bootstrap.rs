@@ -110,6 +110,7 @@ async fn candidate(
     for (table, what) in [
         ("v2_device_approvals", "a device approval"),
         ("v2_capability_grants", "a capability grant"),
+        ("v2_legacy_capability_grants", "a spike capability grant"),
         ("v2_root_key_generations", "a root key generation"),
         ("v2_tenant_root_key_grants", "a root key grant"),
         ("v2_legacy_tenant_root_key_grants", "a spike root key grant"),

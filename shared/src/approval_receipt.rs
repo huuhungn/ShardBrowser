@@ -18,6 +18,9 @@ pub const DEVICE_APPROVE_SCOPE: &str = "tenant.device-approve.v2";
 /// ADR 0002 D-6: the longest `not_after_ms - not_before_ms` of a
 /// `DeviceApprovalV2` (730 days).
 pub const MAX_DEVICE_APPROVAL_TTL_MS: u64 = 63_072_000_000;
+/// ADR 0002 D-6: the longest `not_after_ms - not_before_ms` of a
+/// `TenantCapabilityGrantV2` (365 days).
+pub const MAX_CAPABILITY_GRANT_TTL_MS: u64 = 31_536_000_000;
 /// ADR 0002 D-6 `authorization_replay_retention` (90 days): how long past
 /// `not_after_ms` a derived ledger row such as a stored receipt is kept.
 pub const AUTHORIZATION_REPLAY_RETENTION_MS: u64 = 7_776_000_000;
