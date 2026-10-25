@@ -459,7 +459,10 @@ export function AutomationPage() {
       />
       <div className="flex flex-col gap-3.5">
         {editing ? (
-          <Editor project={editing} />
+          <>
+            <h1 className="m-0 text-title-h5 text-text-strong-950">{t("automation.title")}</h1>
+            <Editor project={editing} />
+          </>
         ) : (
           <>
             <div className="flex items-end justify-between gap-4">

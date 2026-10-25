@@ -608,7 +608,7 @@ async function columnLefts(page: Page, grid: string) {
     ), grid);
 }
 
-for (const width of [1720, 1500, 1296, 1024, 900]) {
+for (const width of [2560, 2200, 1720, 1500, 1296, 1024, 900]) {
   test(`table headers stay over their columns at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 860 });
     await gotoMocked(page);
@@ -625,6 +625,19 @@ for (const width of [1720, 1500, 1296, 1024, 900]) {
   });
 }
 
+test("a start in progress keeps the columns aligned on a 2560px screen", async ({ page }) => {
+  // The root font is 16px here, so "Cancel" is the widest label the Start button shows.
+  await page.setViewportSize({ width: 2560, height: 1200 });
+  await gotoMocked(page, "/?e2e=slow-launch");
+  const start = page.getByRole("button", { name: "Start profile VN Automation 001 - No Proxy" });
+  await start.click();
+  await expect(start).toHaveText("Cancel");
+  const [head, ...rows] = await columnLefts(page, ".t-cols");
+  for (const row of rows) expect(row).toEqual(head);
+  await start.click();
+  await expect(start).toHaveText("Start");
+});
+
 test("the page header keeps its place on pages without a search box", async ({ page }) => {
   await gotoMocked(page);
   const heading = page.getByRole("heading", { level: 1 });
@@ -632,8 +645,8 @@ test("the page header keeps its place on pages without a search box", async ({ p
   await expect(page.getByRole("button", { name: "Browsers" })).toHaveAttribute("aria-current", "page");
 
   const tops: number[] = [];
-  // Extensions has a search box; the other three do not.
-  for (const [name, title] of [["Extensions", "Extensions"], ["Trash", "Trash"], ["Fingerprints", "Fingerprint Library"], ["Settings", "Settings"]]) {
+  // Extensions and Automation have a search box; Trash, Fingerprints and Settings do not.
+  for (const [name, title] of [["Extensions", "Extensions"], ["Trash", "Trash"], ["Fingerprints", "Fingerprint Library"], ["Automation", "Automation"], ["Settings", "Settings"]]) {
     await page.getByRole("button", { name, exact: true }).click();
     await expect(heading).toHaveText(title);
     await expect(page.getByRole("button", { name, exact: true })).toHaveAttribute("aria-current", "page");

@@ -29,7 +29,9 @@ export function ProxyRowActions({ proxy }: { proxy: ProxyEntry }) {
             ? setInfoFor(null)
             : setInfoFor({ proxy, anchor: { x: e.clientX, y: e.clientY } })
         }
+        onlyIcon
         title={t("proxy.detailsHistory")}
+        aria-label={t("proxy.detailsHistory")}
         leftIcon={<InfoIcon />}
       >
       </Button>

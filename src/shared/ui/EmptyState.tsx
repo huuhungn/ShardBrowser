@@ -20,7 +20,7 @@ export function EmptyState({ icon, title, body, actions, card = false }: {
       <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
         {icon}
       </div>
-      <h3 className="m-0 text-label-sm text-text-strong-950">{title}</h3>
+      <h2 className="m-0 text-label-sm text-text-strong-950">{title}</h2>
       {body && <p className="m-0 max-w-[460px] text-paragraph-sm text-text-sub-600">{body}</p>}
       {actions && <div className="mt-2 flex gap-2">{actions}</div>}
     </div>
