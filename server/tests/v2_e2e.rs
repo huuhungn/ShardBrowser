@@ -2178,11 +2178,41 @@ async fn only_the_owner_can_begin_or_activate_a_root_generation() {
 
     // The owner passes the role check and reaches the grant check: with no
     // grant on file that is a 409, not a 403.
-    let res = activate(admin).await;
+    let res = activate(admin.clone()).await;
     let status = res.status().as_u16();
     let body = res.text().await.unwrap();
     assert_eq!(status, 409, "the owner must pass authorization: {body}");
     assert!(body.contains("no root key grant on file"), "{body}");
+
+    // A disabled owner account is refused, though its membership still says
+    // owner. Tenant B has no generation yet, so only authorization can refuse.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}",
+            data.join("shardx.db").to_string_lossy().replace('\\', "/")
+        ))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE v2_accounts SET status = 'disabled' WHERE tenant_id = ? AND id = ?")
+        .bind(TENANT_B.as_slice())
+        .bind([1u8; 16].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let res = cl
+        .post(format!("{}/v2/root-key-generations", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "tenant_id": hex(&TENANT_B), "root_key_id": hex(&[0x91u8; 32]) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status().as_u16(),
+        403,
+        "a disabled owner account must not begin a generation"
+    );
 }
 
 /// A grant must wrap the key its generation actually commits to.

@@ -500,8 +500,8 @@ async fn require_tenant_member(
     account_id_for(app, tenant_id, &user.id).await
 }
 
-/// The caller's account in `tenant_id`, if it holds an active owner
-/// membership.
+/// The caller's account in `tenant_id`, if it is an active account holding an
+/// active owner membership.
 ///
 /// Root generation begin and activate decide which key the whole tenant is
 /// sealed under, so membership alone is not enough. ADR 0001 S7 also requires
@@ -514,8 +514,10 @@ async fn require_tenant_owner(
 ) -> Result<[u8; 16], AppError> {
     let account_id = account_id_for(app, tenant_id, &user.id).await?;
     sqlx::query(
-        "SELECT 1 FROM v2_tenant_memberships
-         WHERE tenant_id = ? AND account_id = ? AND role = 'owner' AND status = 'active'",
+        "SELECT 1 FROM v2_tenant_memberships m
+         JOIN v2_accounts a ON a.tenant_id = m.tenant_id AND a.id = m.account_id
+         WHERE m.tenant_id = ? AND m.account_id = ? AND m.role = 'owner'
+           AND m.status = 'active' AND a.status = 'active'",
     )
     .bind(tenant_id.as_slice())
     .bind(account_id.as_slice())
