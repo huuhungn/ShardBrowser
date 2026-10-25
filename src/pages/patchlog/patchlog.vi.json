@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.4.4",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "ui-alignment-and-fingerprint-noise",
+          "title": "Bảng, trang và thư viện vân tay gọn hơn",
+          "lead": "Các cột thẳng hàng trên mọi cỡ màn hình, và thư viện vân tay chỉ cảnh báo lệch GPU một lần thay vì trên từng thẻ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tiêu đề bảng ở trang Trình duyệt và Proxy giờ luôn nằm đúng trên cột ở mọi độ rộng cửa sổ, kể cả màn hình 2K, 4K và khi một hồ sơ đang khởi động. Mọi trang đặt tiêu đề ở cùng một chỗ, và các trang trống dùng chung một bố cục."
+            },
+            {
+              "type": "p",
+              "text": "Thư viện vân tay hiện một dòng cho biết bao nhiêu vân tay khai tính năng GPU mà máy này không có. Mỗi thẻ đó vẫn có một dấu cảnh báo nhỏ, bấm vào để xem giải thích đầy đủ."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.3",
       "date": "2026-10-25",
       "entries": [

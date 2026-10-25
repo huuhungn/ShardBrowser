@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.4",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "ui-alignment-and-fingerprint-noise",
+          "title": "Tidier tables, pages and fingerprint library",
+          "lead": "Columns line up on every screen size, and the fingerprint library warns about a GPU mismatch once instead of on every card.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Table headers on the Browsers and Proxies pages now stay over their columns at every window width, including 2K and 4K screens and while a profile is starting. Every page puts its title in the same place, and empty pages share one layout."
+            },
+            {
+              "type": "p",
+              "text": "The fingerprint library shows one line with how many fingerprints claim GPU features this machine does not have. Each of those cards keeps a small warning mark that opens the full explanation."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.3",
       "date": "2026-10-25",
       "entries": [
