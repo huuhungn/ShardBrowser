@@ -56,11 +56,10 @@ Enrollment (`server/src/enrollment.rs`) registers two keys per device:
 The HPKE key is registered and never used. It exists because the design below
 needs it, and enrollment is the only moment a device can introduce a key.
 
-`team.json` sits beside the profile store in plaintext, protected by filesystem
-permissions alone. For a prototype whose profiles are already on that disk this
-adds no meaningful exposure, but it is not production key storage: an OS
-credential store (DPAPI, Keychain, kernel keyring) is the intended home and is
-not wired up.
+On Windows both seeds are stored DPAPI-protected for the current user
+(`src-tauri/src/dpapi.rs`). Elsewhere `team.json` holds them as plaintext hex,
+protected by filesystem permissions alone; Keychain and kernel keyring are not
+wired up.
 
 ## What the design calls for
 
@@ -201,19 +200,45 @@ distribution mechanism that the frozen design already specifies.
 
 ## Threat model, stated plainly
 
+The team server is trusted for RBAC and coordination (who belongs to a
+tenant, leases, version fencing). It is **not** trusted for key distribution.
+Fleet key grants are not yet signed by an issuer the device can verify, so a
+compromised server could seal a key of its own choosing to a device. Earlier
+versions cached such keys and pushed under them; that let the server read
+every later push and forge snapshots that pull would accept. Until verified
+key distribution ships:
+
+- The Launcher does not accept fleet keys from the server.
+  `team_collect_custody` opens root key grants only; fleet key grants are
+  counted (`fleet_grants_waiting`) and never opened or cached.
+- Push always seals under the shared team passphrase, and refuses an empty
+  one. Pull still tries fleet keys cached by earlier versions, newest first,
+  then the passphrase, so snapshots already pushed under a fleet key restore.
+
 What holds today:
 
-- The server cannot read profile contents. It stores sealed containers only.
+- The server cannot read what a device pushes: push seals under the shared
+  passphrase, which never leaves the devices. The server stores sealed
+  containers only.
 - A stolen container is useless without the passphrase.
 - Tenant boundaries are enforced on every `/v2/` route (`require_tenant_member`).
+  Root key generation begin and activate are restricted to the tenant owner.
 - A stale push is refused: version fencing stops one device silently
   overwriting another.
+- Key material at rest is DPAPI-protected (current Windows user) on Windows:
+  the device signing and HPKE seeds in `team.json` and any cached fleet keys.
+  A plaintext file from an earlier version is rewritten protected the first
+  time it is read. Elsewhere these stay plaintext hex, protected by file
+  permissions alone (`fleet-keys.json` is written 0600 on Unix).
 
 What does not hold:
 
 - Per-device revocation. Everyone shares one passphrase.
 - Forward secrecy across rotations. There are no rotations.
-- Device key confidentiality against local disk access. `team.json` is plaintext.
+- Device key confidentiality against code running as the same Windows user,
+  which can call DPAPI too, or against local disk access on other platforms.
+- Integrity of snapshots pulled under a fleet key cached by an earlier
+  version: if the server chose that key, it can forge a snapshot that opens.
 - Recovery of anything, if the passphrase is lost.
 
 `P-OP` remains blocked, and this is one of the reasons.
