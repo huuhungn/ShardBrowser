@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.4.3",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "team-sync-passphrase-only",
+          "title": "Đồng bộ Team không còn tin khoá từ server",
+          "lead": "Đẩy hồ sơ lên team lại luôn dùng passphrase của team.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trước đây launcher nhận khoá fleet từ team server mà không kiểm ai đã cấp, rồi dùng khoá đó cho mọi lần đẩy. Một server bị chiếm quyền có thể đọc được các hồ sơ đó. Giờ mọi lần đẩy đều dùng passphrase của team. Bản chụp đã đẩy bằng khoá fleet vẫn khôi phục được trên máy đã có khoá."
+            },
+            {
+              "type": "note",
+              "text": "Khoá Team trên máy này giờ được mã hoá theo tài khoản Windows của bạn. Nếu chuyển launcher sang tài khoản hoặc máy khác, hãy ghi danh lại thiết bị."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.2",
       "date": "2026-10-24",
       "entries": [
