@@ -41,6 +41,9 @@ const HPKE_SUITE1_WRAPPED_FKEK_LEN: usize = 48;
 
 const MAX_PAYLOAD_BYTES: usize = 65536;
 const MAX_SIGNATURE_BYTES: usize = 4096;
+/// Both byte fields at their caps plus room for the other nine fields, checked
+/// before decoding so an oversized body is refused without being parsed.
+const MAX_RECORD_BYTES: usize = MAX_PAYLOAD_BYTES + MAX_SIGNATURE_BYTES + 1024;
 
 /// Why a record was refused. [`RecordError::code`] gives the plan's wire code.
 #[derive(Debug, PartialEq, Eq)]
@@ -239,6 +242,8 @@ impl Fields {
 
 /// The payload kinds this build can parse. Any other `payload_domain` is
 /// `SCHEMA_UNSUPPORTED`: the record may be valid, but not for this build.
+/// Root, recovery and rotation grants are not here yet (W3/W4); an endpoint
+/// that accepts them must add their parsers before it calls this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
     DeviceApproval(DeviceApprovalV2),
@@ -336,6 +341,12 @@ impl AuthorizationRecord {
     /// equal the container's, and parses the payload by its closed schema.
     /// A newer container or payload version is `SCHEMA_UNSUPPORTED`.
     pub fn parse(exact: &[u8]) -> Result<Self> {
+        if exact.len() > MAX_RECORD_BYTES {
+            return Err(RecordError::BadField {
+                map: "SignedAuthorizationRecordV2",
+                field: "exact_signed_container_bytes",
+            });
+        }
         let mut f = Fields::decode("SignedAuthorizationRecordV2", exact)?;
         f.exact_text("container_domain", CONTAINER_DOMAIN)?;
         let container_version = f.u16("container_version")?;
@@ -347,33 +358,33 @@ impl AuthorizationRecord {
         }
         let payload_domain = f.text("payload_domain")?;
         let payload_version = f.u16("payload_version")?;
-        let canonical_payload_bytes = f.bytes("canonical_payload_bytes", 1, MAX_PAYLOAD_BYTES)?;
-        let payload_sha256 = f.fixed::<32>("payload_sha256")?;
-        let signature_suite_id = f.u16("signature_suite_id")?;
-        let signature_version = f.u16("signature_version")?;
-        let issuer_signing_key_id = f.fixed::<32>("issuer_signing_key_id")?;
-        let signature_bytes = f.bytes("signature_bytes", 1, MAX_SIGNATURE_BYTES)?;
-        let signed_container_hash = f.fixed::<32>("signed_container_hash")?;
-        f.finish()?;
-
         if payload_version != PAYLOAD_VERSION {
             return Err(RecordError::Unsupported {
                 field: "payload_version",
                 id: payload_version.into(),
             });
         }
+        let canonical_payload_bytes = f.bytes("canonical_payload_bytes", 1, MAX_PAYLOAD_BYTES)?;
+        let payload_sha256 = f.fixed::<32>("payload_sha256")?;
+        let signature_suite_id = f.u16("signature_suite_id")?;
         if signature_suite_id != SIGNATURE_SUITE_ID_ED25519 {
             return Err(RecordError::Unsupported {
                 field: "signature_suite_id",
                 id: signature_suite_id.into(),
             });
         }
+        let signature_version = f.u16("signature_version")?;
         if signature_version != SIGNATURE_VERSION {
             return Err(RecordError::Unsupported {
                 field: "signature_version",
                 id: signature_version.into(),
             });
         }
+        let issuer_signing_key_id = f.fixed::<32>("issuer_signing_key_id")?;
+        let signature_bytes = f.bytes("signature_bytes", 1, MAX_SIGNATURE_BYTES)?;
+        let signed_container_hash = f.fixed::<32>("signed_container_hash")?;
+        f.finish()?;
+
         if signature_bytes.len() != ED25519_SIG_LEN {
             return Err(RecordError::BadField {
                 map: "SignedAuthorizationRecordV2",
@@ -1215,7 +1226,21 @@ mod tests {
                 "{field}"
             );
             assert_eq!(code_of(parse(&with(field, c::u(v)))), "SCHEMA_UNSUPPORTED");
+            // A newer version may add fields; its version decides, not the extra field.
+            let newer = edit_map(&good, |e| {
+                set(e, field, c::u(v));
+                set(e, "added_in_newer_version", c::u(1));
+            });
+            assert_eq!(code_of(parse(&newer)), "SCHEMA_UNSUPPORTED", "{field}");
         }
+        let oversized = with("extra", c::b(&vec![0u8; MAX_RECORD_BYTES]));
+        assert_eq!(
+            parse(&oversized),
+            Err(RecordError::BadField {
+                map: "SignedAuthorizationRecordV2",
+                field: "exact_signed_container_bytes",
+            })
+        );
         assert_eq!(
             code_of(parse(&with("signature_bytes", c::b(&[1u8; 63])))),
             "NON_CANONICAL_RECORD"
