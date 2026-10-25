@@ -243,7 +243,7 @@ async fn stored_response_is_consistent(
         replay_id: identity.replay_id,
     };
     if quarantine::holds(conn, &mark).await? {
-        return Ok(false);
+        return Err(AppError::Quarantine(Box::new(mark)));
     }
     Ok(stored.operation_kind == OperationKind::RootGenerationCreate
         && stored.idempotency_key == req.outer.idempotency_key

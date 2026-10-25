@@ -3873,7 +3873,11 @@ async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
     // replay.
     let (status, body) = server.call(&collect, &v1, None).await;
     assert_eq!((status, listed(body)), (200, 0));
-    assert_eq!(server.root(&TENANT, &access, &bootstrap).await.0, 422);
+    let (status, body) = server.root(&TENANT, &access, &bootstrap).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
 
     // A second pass finds nothing new, and the record never changes.
     server.restart().await;
