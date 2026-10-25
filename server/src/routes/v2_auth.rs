@@ -44,6 +44,10 @@ const SETUP_SESSION_MS: i64 = 1_800_000;
 /// Challenges per ticket, over its whole life: a refused proof does not give
 /// the slot back, so this bounds the HPKE work one login can cause.
 const MAX_CHALLENGES_PER_TICKET: i64 = 5;
+/// Refresh rotations per session. A setup session lives 30 minutes on a
+/// 5-minute access token, so a working client rotates about six times; the
+/// cap bounds the spent-token rows one session can leave behind.
+const MAX_ROTATIONS_PER_SESSION: i64 = 64;
 /// Live tickets per account. Bounds what one account's successful logins can
 /// cause: at most this many times `MAX_CHALLENGES_PER_TICKET` challenges.
 const MAX_LIVE_TICKETS: i64 = 10;
@@ -435,13 +439,14 @@ pub async fn login(
         "SELECT count(*) FROM v2_pre_device_sessions
           WHERE tenant_id = ? AND account_id = ? AND consumed_at_ms IS NULL
             AND revoked_at_ms IS NULL AND expires_at_ms > ?
-            AND server_instance_id = ? AND restore_epoch = ?",
+            AND server_instance_id = ? AND restore_epoch = ? AND account_token_version = ?",
     )
     .bind(tenant_id.as_slice())
     .bind(account_id.as_slice())
     .bind(now)
     .bind(v.server_instance_id.as_slice())
     .bind(epoch(v)?)
+    .bind(token_version)
     .fetch_one(&mut *conn)
     .await?;
     if live >= MAX_LIVE_TICKETS {
@@ -507,7 +512,10 @@ pub async fn create_device_session_challenge(
     .fetch_one(&mut *conn)
     .await?;
     if issued >= MAX_CHALLENGES_PER_TICKET {
-        return Err(AppError::TooManyRequests((CHALLENGE_TTL_MS / 1000) as u64));
+        // Waiting does not help: the budget is the ticket's whole life.
+        return Err(AppError::Conflict(
+            "this ticket has issued all its challenges; log in again".into(),
+        ));
     }
 
     // Another account's or tenant's device is indistinguishable from none.
@@ -788,6 +796,31 @@ pub struct RefreshReq {
     refresh_token: String,
 }
 
+/// Ends a session. Its spent refresh tokens go with it: once it is revoked a
+/// replayed token gets a plain 401, so the rows guard nothing.
+async fn revoke_session(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8],
+    id: &[u8],
+    now: i64,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE v2_sessions SET revoked_at_ms = ?
+          WHERE tenant_id = ? AND id = ? AND revoked_at_ms IS NULL",
+    )
+    .bind(now)
+    .bind(tenant_id)
+    .bind(id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("DELETE FROM v2_spent_refresh_tokens WHERE tenant_id = ? AND session_id = ?")
+        .bind(tenant_id)
+        .bind(id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// `POST /v2/auth/refresh`: single-use rotation that rechecks every live
 /// predicate and never moves past the session's absolute bound.
 pub async fn refresh(
@@ -798,7 +831,7 @@ pub async fn refresh(
     let hash = token_hash(&req.refresh_token, REFRESH).ok_or(AppError::Unauthorized)?;
     // A token the server never issued takes no write lock.
     let known = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM v2_sessions WHERE refresh_token_hash = ?1
+        "SELECT 1 FROM v2_sessions WHERE refresh_token_hash = ?1 AND revoked_at_ms IS NULL
          UNION ALL SELECT 1 FROM v2_spent_refresh_tokens WHERE refresh_token_hash = ?1
          LIMIT 1",
     )
@@ -823,21 +856,20 @@ pub async fn refresh(
         // neither holder keeps the session. A client whose refresh response
         // was lost lands here too, and logs in again.
         let reused = sqlx::query(
-            "UPDATE v2_sessions SET revoked_at_ms = ?
-              WHERE revoked_at_ms IS NULL
-                AND (tenant_id, id) IN (SELECT tenant_id, session_id FROM v2_spent_refresh_tokens
-                                         WHERE refresh_token_hash = ?)
-             RETURNING tenant_id, id, account_id, device_id",
+            "SELECT s.tenant_id, s.id, s.account_id, s.device_id
+               FROM v2_spent_refresh_tokens t
+               JOIN v2_sessions s ON s.tenant_id = t.tenant_id AND s.id = t.session_id
+              WHERE t.refresh_token_hash = ? AND s.revoked_at_ms IS NULL",
         )
-        .bind(now)
         .bind(hash.as_slice())
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(r) = reused {
-            let id: Vec<u8> = r.get("id");
+            let (tenant, id): (Vec<u8>, Vec<u8>) = (r.get("tenant_id"), r.get("id"));
+            revoke_session(&mut tx, &tenant, &id, now).await?;
             audit(
                 &mut tx,
-                &r.get::<Vec<u8>, _>("tenant_id"),
+                &tenant,
                 &r.get::<Vec<u8>, _>("account_id"),
                 &r.get::<Vec<u8>, _>("device_id"),
                 "auth.refresh_reuse",
@@ -852,13 +884,18 @@ pub async fn refresh(
     let session = session_from(&row)?;
     let fresh =
         now < row.get::<i64, _>("refresh_expires_at_ms") && now < session.absolute_expires_at_ms;
-    if !fresh || !session_is_live(&mut tx, &row, &session, v).await? {
-        sqlx::query("UPDATE v2_sessions SET revoked_at_ms = ? WHERE tenant_id = ? AND id = ?")
-            .bind(now)
-            .bind(session.tenant_id.as_slice())
-            .bind(session.id.as_slice())
-            .execute(&mut *tx)
-            .await?;
+    let rotations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM v2_spent_refresh_tokens WHERE tenant_id = ? AND session_id = ?",
+    )
+    .bind(session.tenant_id.as_slice())
+    .bind(session.id.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !fresh
+        || rotations >= MAX_ROTATIONS_PER_SESSION
+        || !session_is_live(&mut tx, &row, &session, v).await?
+    {
+        revoke_session(&mut tx, &session.tenant_id, &session.id, now).await?;
         tx.commit().await?;
         return Err(AppError::Unauthorized);
     }
@@ -928,15 +965,7 @@ pub async fn logout(State(app): State<AppState>, who: Principal) -> Result<Statu
             .await?;
         }
         Principal::Session(s) => {
-            sqlx::query(
-                "UPDATE v2_sessions SET revoked_at_ms = ?
-                  WHERE tenant_id = ? AND id = ? AND revoked_at_ms IS NULL",
-            )
-            .bind(now)
-            .bind(s.tenant_id.as_slice())
-            .bind(s.id.as_slice())
-            .execute(&mut *tx)
-            .await?;
+            revoke_session(&mut tx, &s.tenant_id, &s.id, now).await?;
         }
     }
     tx.commit().await?;

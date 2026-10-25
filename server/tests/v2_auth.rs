@@ -797,14 +797,14 @@ async fn a_device_that_changed_since_its_challenge_gets_no_session() {
     let dev = device(&server, OWNER, 0x3c, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
-    // Five open challenges per ticket; a sixth waits for one to settle.
+    // Five challenges per ticket; a sixth needs a new login.
     let mut open = Vec::new();
     for _ in 0..5 {
         let (status, ch) = challenge(&server, &ticket, &dev).await;
         assert_eq!(status, 201, "{ch}");
         open.push(ch);
     }
-    assert_eq!(challenge(&server, &ticket, &dev).await.0, 429);
+    assert_eq!(challenge(&server, &ticket, &dev).await.0, 409);
 
     // The proof rechecks the device it binds; a revoked one gets nothing.
     server
@@ -954,6 +954,10 @@ async fn a_session_from_another_epoch_is_refused() {
 #[tokio::test]
 async fn an_account_holds_a_bounded_number_of_tickets() {
     let server = start("tickets", 38183).await;
+    // Tickets from another epoch can never be used, so they take no slot.
+    for tag in 0x80..0x8a {
+        forge_ticket(&server, INSTANCE, 1, tag).await;
+    }
     let first = server.login("owner").await;
     for _ in 1..10 {
         server.login("owner").await;
@@ -996,7 +1000,7 @@ async fn a_ticket_issues_five_challenges_in_its_life() {
             .await;
         assert_eq!(status, 401);
     }
-    assert_eq!(challenge(&server, &ticket, &dev).await.0, 429);
+    assert_eq!(challenge(&server, &ticket, &dev).await.0, 409);
     // A new login starts a new budget.
     let fresh = server.login("owner").await;
     assert_eq!(challenge(&server, &fresh, &dev).await.0, 201);
@@ -1031,7 +1035,7 @@ async fn concurrent_challenges_stop_at_the_cap() {
     while let Some(status) = tasks.join_next().await {
         match status.unwrap() {
             201 => created += 1,
-            429 => {}
+            409 => {}
             other => panic!("unexpected status {other}"),
         }
     }
@@ -1041,5 +1045,39 @@ async fn concurrent_challenges_stop_at_the_cap() {
             .count("SELECT count(*) FROM v2_device_session_challenges")
             .await,
         5
+    );
+}
+
+#[tokio::test]
+async fn a_session_rotates_a_bounded_number_of_times() {
+    let server = start("rotations", 38188).await;
+    let dev = device(&server, OWNER, 0x3d, "pending").await;
+    let mut s = session(&server, &dev).await;
+    for _ in 0..64 {
+        let (status, r) = server
+            .post(
+                "/v2/auth/refresh",
+                None,
+                json!({ "refresh_token": s["refresh_token"] }),
+            )
+            .await;
+        assert_eq!(status, 200, "{r}");
+        s = r;
+    }
+    let (status, _) = server
+        .post(
+            "/v2/auth/refresh",
+            None,
+            json!({ "refresh_token": s["refresh_token"] }),
+        )
+        .await;
+    assert_eq!(status, 401);
+    assert_eq!(server.me(s["access_token"].as_str().unwrap()).await.0, 401);
+    // The revoked session takes its spent tokens with it.
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_spent_refresh_tokens")
+            .await,
+        0
     );
 }
