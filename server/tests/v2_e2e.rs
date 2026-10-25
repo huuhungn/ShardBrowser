@@ -1040,7 +1040,8 @@ async fn device_enrollment_requires_proof_of_possession() {
         .await
         .unwrap();
     let stored: (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
-        "SELECT signing_key_id, hpke_key_id, status FROM v2_devices          WHERE tenant_id = ? AND id = ?",
+        "SELECT signing_key_id, hpke_key_id, status FROM v2_devices \
+         WHERE tenant_id = ? AND id = ?",
     )
     .bind(TENANT_A.as_slice())
     .bind(decode_hex_str(&device_id))

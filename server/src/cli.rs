@@ -9,7 +9,7 @@ use anyhow::Context;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
-use crate::{auth, db, identity, util};
+use crate::{audit, auth, bootstrap, db, identity, util};
 
 pub const USAGE: &str = "usage:
   shardx-team-server
@@ -20,7 +20,15 @@ pub const USAGE: &str = "usage:
       verify the identity record against the database mirror
   shardx-team-server tenant create --slug <slug> --owner-username <name> [--password-stdin]
       create a tenant and its owner account; the password is prompted for,
-      or read from stdin with --password-stdin, never taken from argv or env";
+      or read from stdin with --password-stdin, never taken from argv or env
+  shardx-team-server tenant confirm-first-device --tenant <slug> --device <id>
+      show the pending first device's key IDs and record the operator's match
+      (both IDs are read from stdin, as shown on the client)
+  shardx-team-server tenant cancel-first-device --tenant <slug>
+      close a confirmed first device that will not be approved; this tenant
+      cannot bootstrap again
+  shardx-team-server tenant first-device-status --tenant <slug>
+      read the first-device confirmation back without changing anything";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -31,6 +39,16 @@ pub enum Command {
         slug: String,
         owner_username: String,
         password_stdin: bool,
+    },
+    ConfirmFirstDevice {
+        slug: String,
+        device_id: [u8; 16],
+    },
+    CancelFirstDevice {
+        slug: String,
+    },
+    FirstDeviceStatus {
+        slug: String,
     },
 }
 
@@ -43,6 +61,19 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["identity", "init"] => Ok(Command::IdentityInit),
         ["identity", "show"] => Ok(Command::IdentityShow),
         ["tenant", "create", rest @ ..] => parse_tenant_create(rest),
+        ["tenant", "confirm-first-device", "--tenant", slug, "--device", device] => {
+            Ok(Command::ConfirmFirstDevice {
+                slug: slug.to_string(),
+                device_id: bootstrap::parse_device_id(device)
+                    .ok_or("--device must be 32 hex digits")?,
+            })
+        }
+        ["tenant", "cancel-first-device", "--tenant", slug] => Ok(Command::CancelFirstDevice {
+            slug: slug.to_string(),
+        }),
+        ["tenant", "first-device-status", "--tenant", slug] => Ok(Command::FirstDeviceStatus {
+            slug: slug.to_string(),
+        }),
         _ => Err("unrecognized command".into()),
     }
 }
@@ -111,6 +142,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             owner_username,
             password_stdin,
         } => tenant_create(&cfg, &slug, &owner_username, password_stdin).await,
+        Command::ConfirmFirstDevice { slug, device_id } => {
+            bootstrap::confirm(&cfg, &slug, &device_id).await
+        }
+        Command::CancelFirstDevice { slug } => bootstrap::cancel(&cfg, &slug).await,
+        Command::FirstDeviceStatus { slug } => bootstrap::status(&cfg, &slug).await,
     }
 }
 
@@ -215,7 +251,9 @@ async fn tenant_create(
     // ADR 0001 R1: the tenant's one first-device opportunity starts here, and
     // only here; it is never inferred from empty tables later.
     sqlx::query(
-        "INSERT INTO v2_bootstrap_guards          (server_instance_id, tenant_id, state, recovery_reason, updated_at)          VALUES (?, ?, 'unused', NULL, ?)",
+        "INSERT INTO v2_bootstrap_guards \
+         (server_instance_id, tenant_id, state, recovery_reason, updated_at) \
+         VALUES (?, ?, 'unused', NULL, ?)",
     )
     .bind(verified.server_instance_id.as_slice())
     .bind(tenant_id.as_slice())
@@ -223,22 +261,15 @@ async fn tenant_create(
     .execute(&mut *tx)
     .await
     .context("inserting the bootstrap guard")?;
-    // ADR 0001 D3: an offline action has no live account or device.
-    sqlx::query(
-        "INSERT INTO v2_audit_events \
-         (tenant_id, id, actor_account_id, actor_device_id, action, target_type, target_id, \
-          outcome, reason_code, request_id, created_at) \
-         VALUES (?, ?, NULL, NULL, 'tenant.create', 'tenant', ?, 'success', \
-                 'offline_operator_cli', ?, ?)",
+    audit::insert_offline(
+        &mut tx,
+        &tenant_id,
+        "tenant.create",
+        "tenant",
+        &tenant_id,
+        &uuid::Uuid::new_v4().into_bytes(),
     )
-    .bind(tenant_id.as_slice())
-    .bind(uuid::Uuid::new_v4().into_bytes().as_slice())
-    .bind(tenant_id.as_slice())
-    .bind(uuid::Uuid::new_v4().into_bytes().as_slice())
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .context("inserting the audit event")?;
+    .await?;
     tx.commit().await?;
     pool.close().await;
 
@@ -400,7 +431,25 @@ mod tests {
                 password_stdin: true,
             })
         );
+        assert_eq!(
+            parse(&args(
+                "tenant confirm-first-device --tenant acme --device 000102030405060708090a0b0c0d0e0f"
+            )),
+            Ok(Command::ConfirmFirstDevice {
+                slug: "acme".into(),
+                device_id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            })
+        );
+        assert_eq!(
+            parse(&args("tenant first-device-status --tenant acme")),
+            Ok(Command::FirstDeviceStatus {
+                slug: "acme".into()
+            })
+        );
         for bad in [
+            "tenant confirm-first-device --tenant acme",
+            "tenant confirm-first-device --tenant acme --device 0001",
+            "tenant cancel-first-device acme",
             "identity",
             "identity init extra",
             "identity repair",
