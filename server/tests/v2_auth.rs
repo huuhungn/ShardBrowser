@@ -2791,7 +2791,7 @@ async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero(
         server
             .call(&activate_path("0"), &access, Some(&activate))
             .await,
-        (201, stored)
+        (201, stored.clone())
     );
     let (status, body) = server
         .call(
@@ -2843,6 +2843,10 @@ async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero(
             "UPDATE v2_root_key_generations SET activated_at = 'later'".to_string(),
             "only moves forward",
         ),
+        (
+            "UPDATE v2_root_key_generations SET retired_at = 'now'".to_string(),
+            "only moves forward",
+        ),
     ];
     for kind in ["ROOT_GRANT_ACK", "ROOT_GENERATION_ACTIVATE"] {
         statements.push((
@@ -2865,10 +2869,29 @@ async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero(
     }
     pool.close().await;
 
-    // A stored activation whose generation moved on is not replayed.
+    // A stored activation stands after the generation moved on, but not once
+    // its row no longer says it was ever activated.
     server
         .sql(
             "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = 'now'",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server
+            .call(&activate_path("0"), &access, Some(&activate))
+            .await,
+        (201, stored)
+    );
+    server
+        .sql(
+            "DROP TRIGGER v2_root_key_generations_state_moves_forward",
+            &[],
+        )
+        .await;
+    server
+        .sql(
+            "UPDATE v2_root_key_generations SET activated_at = NULL",
             &[],
         )
         .await;
@@ -2914,17 +2937,23 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
         .as_str()
         .unwrap()
         .to_string();
-    for (path, body) in [
-        (grant_path("0", &SELF_GRANT_REPLAY), None),
-        (ack_path.clone(), Some(ack_request(0xbf, honest.clone()))),
+    // To a stranger the grant does not exist; it may not act on it either.
+    for (path, body, want) in [
+        (grant_path("0", &SELF_GRANT_REPLAY), None, 404),
+        (
+            ack_path.clone(),
+            Some(ack_request(0xbf, honest.clone())),
+            403,
+        ),
         (
             activate_path("0"),
             Some(activate_request(0xbe, target.clone())),
+            403,
         ),
     ] {
         assert_eq!(
             server.call(&path, &stranger, body.as_deref()).await.0,
-            403,
+            want,
             "{path}"
         );
     }
@@ -3102,6 +3131,14 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
         refused(status, &body),
         (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
     );
+    // A stranger is not told that the row is broken, or that it exists.
+    assert_eq!(
+        server
+            .call(&grant_path("0", &SELF_GRANT_REPLAY), &stranger, None)
+            .await
+            .0,
+        404
+    );
     let (status, body) = server
         .call(&ack_path, &access, Some(&ack_request(0xc7, honest)))
         .await;
@@ -3109,10 +3146,26 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
         refused(status, &body),
         (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
     );
+
+    // The PREPARING generation carries exactly the times of the states it
+    // reached: none yet, and each state needs its own.
+    let pool = db(&server.data).await;
+    for statement in [
+        "UPDATE v2_root_key_generations SET state = 'ACTIVE'",
+        "UPDATE v2_root_key_generations SET activated_at = 'now'",
+        "UPDATE v2_root_key_generations SET state = 'RETIRED'",
+    ] {
+        let err = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only moves forward"),
+            "{statement}: {err}"
+        );
+    }
+    pool.close().await;
 }
 
 #[tokio::test]
-async fn an_expired_self_grant_is_not_acknowledged() {
+async fn an_expired_self_grant_is_neither_counted_nor_acknowledged() {
     let mut server = start("s6-expired", 38203).await;
     let (dev, access) = approved(&mut server, 0x66).await;
     let until = now_ms() + 5_000;
@@ -3122,8 +3175,89 @@ async fn an_expired_self_grant_is_not_acknowledged() {
         .root(&TENANT, &access, &root_request(0x91, &create))
         .await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
-    tokio::time::sleep(Duration::from_millis(until.saturating_sub(now_ms()) + 200)).await;
     let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
-    let ack = ack_request(0xd0, grant_ref(&dev, &container));
-    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 403);
+    let ack = |key| ack_request(key, grant_ref(&dev, &container));
+    assert_eq!(
+        server.call(&ack_path, &access, Some(&ack(0xd0))).await.0,
+        201
+    );
+    tokio::time::sleep(Duration::from_millis(until.saturating_sub(now_ms()) + 200)).await;
+    // Past its window the acknowledged self-grant holds no custody ...
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xd1, create.target.clone())),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    // ... and, had it not been acknowledged, could not be.
+    server
+        .sql(
+            "DROP TRIGGER v2_tenant_root_key_grants_marks_are_final",
+            &[],
+        )
+        .await;
+    server
+        .sql("UPDATE v2_tenant_root_key_grants SET acked_at = NULL", &[])
+        .await;
+    assert_eq!(
+        server.call(&ack_path, &access, Some(&ack(0xd2))).await.0,
+        403
+    );
+}
+
+#[tokio::test]
+async fn a_row_holding_another_rows_container_is_not_that_grant() {
+    let mut server = start("s6-borrowed", 38204).await;
+    let (_dev, access, _container, target) = bootstrapped(&mut server, 0x67).await;
+    // Behind the triggers' back, a second row under another replay ID that
+    // holds the self-grant's exact container and claims an acknowledgement.
+    let pool = db(&server.data).await;
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('v2_tenant_root_key_grants')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let values: Vec<String> = columns
+        .iter()
+        .map(|c| match c.as_str() {
+            "replay_id" => format!("x'{}'", "99".repeat(16)),
+            "grant_variant" => "'ExistingRootGrant'".into(),
+            "acked_at" => "'now'".into(),
+            _ => c.clone(),
+        })
+        .collect();
+    sqlx::query(&format!(
+        "INSERT INTO v2_tenant_root_key_grants ({}) SELECT {} FROM v2_tenant_root_key_grants",
+        columns.join(", "),
+        values.join(", ")
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // It is not read back as the grant it copied, nor counted for activation.
+    let (status, body) = server
+        .call(&grant_path("0", &[0x99; 16]), &access, None)
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xd3, target)),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
 }

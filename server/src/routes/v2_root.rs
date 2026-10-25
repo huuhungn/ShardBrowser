@@ -132,17 +132,13 @@ pub async fn create_root_generation(
         return Err(AppError::Forbidden);
     }
 
-    let row = sqlx::query(
-        "SELECT * FROM v2_idempotency
-          WHERE server_instance_id = ? AND tenant_id = ? AND actor_device_id = ?
-            AND operation_scope = ? AND idempotency_key = ?",
+    let row = ledger_row(
+        &mut tx,
+        v,
+        &s,
+        OperationKind::RootGenerationCreate,
+        &req.outer.idempotency_key,
     )
-    .bind(v.server_instance_id.as_slice())
-    .bind(s.tenant_id.as_slice())
-    .bind(s.device_id.as_slice())
-    .bind(OperationKind::RootGenerationCreate.scope())
-    .bind(req.outer.idempotency_key.as_slice())
-    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = row {
         return replay(tx, &row, &req, &s, v, &body).await;

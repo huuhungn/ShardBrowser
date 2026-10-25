@@ -50,8 +50,18 @@ fn generation_mismatch(msg: &str) -> AppError {
     coded(StatusCode::CONFLICT, "ROOT_GENERATION_MISMATCH", msg)
 }
 
+/// shortcut: a mismatch refuses the request but does not quarantine the
+/// grant (plan 5.6.4); quarantine comes with the PR6 integrity pass.
 fn integrity() -> AppError {
     column_mismatch("the stored root grant does not match its signed container")
+}
+
+/// The RFC 3339 form of `ms`, so a row's `*_at` and its response's `*_at_ms`
+/// are one instant.
+fn at(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(now_rfc3339)
 }
 
 fn response_mismatch() -> AppError {
@@ -126,6 +136,16 @@ async fn load_grant(
     let Payload::TenantRootKeyGrant(grant) = record.payload().clone() else {
         return Err(integrity());
     };
+    // The container names the row's own key, so the column check below is a
+    // check of this row and not of any row holding the same container.
+    let c = &grant.common;
+    if c.server_instance_id != v.server_instance_id
+        || c.tenant_id != *tenant
+        || c.replay_id != *replay
+        || grant.root_generation != generation
+    {
+        return Err(integrity());
+    }
     if !grant_row_matches(conn, &grant, record.record()).await? {
         return Err(integrity());
     }
@@ -193,14 +213,15 @@ pub async fn read_root_grant(
     let s = reload_session(&mut tx, &presented, v, now_ms())
         .await?
         .ok_or(AppError::Unauthorized)?;
-    // Another tenant's grant does not exist for this session.
-    if s.tenant_id != tenant {
+    // For anyone but the subject the grant does not exist: another tenant's
+    // session, and any session but the setup one, learn nothing from a read.
+    if s.tenant_id != tenant || s.class != "root_setup" {
         return Err(not_found());
     }
     let g = load_grant(&mut tx, v, &tenant, generation, &replay)
         .await?
         .ok_or_else(not_found)?;
-    subject_of(&s, &g.grant)?;
+    subject_of(&s, &g.grant).map_err(|_| not_found())?;
     let generation_state = generation_state(&mut tx, v, &tenant, generation)
         .await?
         .ok_or_else(integrity)?;
@@ -288,16 +309,9 @@ pub async fn ack_root_grant(
         let (payload, response) = stored_payload(&row, &outer, RECORD_TYPE_ROOT_GRANT_ACKED, v)
             .ok_or_else(response_mismatch)?;
         let acked = TenantRootGrantAckedV2::parse(&payload).map_err(|_| response_mismatch())?;
-        let still_acked: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM v2_tenant_root_key_grants
-                             WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?
-                               AND acked_at IS NOT NULL)",
-        )
-        .bind(v.server_instance_id.as_slice())
-        .bind(tenant.as_slice())
-        .bind(replay.as_slice())
-        .fetch_one(&mut *tx)
-        .await?;
+        let still_acked = load_grant(&mut tx, v, &tenant, generation, &replay)
+            .await?
+            .is_some_and(|g| g.acked);
         if acked.grant != ack.grant || !still_acked {
             return Err(response_mismatch());
         }
@@ -310,7 +324,9 @@ pub async fn ack_root_grant(
         .ok_or_else(not_found)?;
     subject_of(&s, &g.grant)?;
     let rec = g.record.record();
+    let c = &g.grant.common;
     if r.root_key_id != g.grant.root_key_id
+        || r.restore_epoch != c.restore_epoch
         || r.signed_container_hash != *rec.signed_container_hash()
         || r.exact_signed_container_bytes_sha256 != *rec.exact_signed_container_bytes_sha256()
     {
@@ -321,8 +337,7 @@ pub async fn ack_root_grant(
             "this grant is revoked or already acknowledged",
         ));
     }
-    let c = &g.grant.common;
-    if now < int(c.not_before_ms)? || now >= int(c.not_after_ms)? {
+    if !inside_window(&g.grant, now)? {
         return Err(AppError::Forbidden);
     }
     match generation_state(&mut tx, v, &tenant, generation).await? {
@@ -330,7 +345,7 @@ pub async fn ack_root_grant(
         _ => return Err(generation_mismatch("the grant's generation is retired")),
     }
 
-    let acked_at = now_rfc3339();
+    let acked_at = at(now);
     sqlx::query(
         "UPDATE v2_tenant_root_key_grants SET acked_at = ?
           WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ? AND acked_at IS NULL",
@@ -385,7 +400,9 @@ pub async fn ack_root_grant(
 
 /// `POST .../root-key-generations/{g}/activate`: generation 0 becomes ACTIVE
 /// once its required grants are all acknowledged and form the set it was
-/// created with.
+/// created with. The restated `recovery_bundle_sha256` is the client's
+/// recovery-bundle readiness acknowledgement (plan 5.6.4 rule 1): it names the
+/// bundle it holds, which must be the one the generation was created with.
 pub async fn activate_root_generation(
     State(app): State<AppState>,
     who: Principal,
@@ -438,10 +455,22 @@ pub async fn activate_root_generation(
                 .ok_or_else(response_mismatch)?;
         let activated =
             TenantRootGenerationActivatedV2::parse(&payload).map_err(|_| response_mismatch())?;
-        let live = generation_state(&mut tx, v, &tenant, generation).await?
-            == Some(RootGenerationState::Active)
-            && active_pointer(&mut tx, &tenant).await? == Some(int(generation)?);
-        if activated.target != *t || activated.previous != activate.previous || !live {
+        let activated_at: Option<String> = sqlx::query_scalar(
+            "SELECT activated_at FROM v2_root_key_generations
+              WHERE server_instance_id = ? AND tenant_id = ? AND generation = ?",
+        )
+        .bind(v.server_instance_id.as_slice())
+        .bind(tenant.as_slice())
+        .bind(int(generation)?)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        // A later rotation retires the generation; the activation still
+        // happened, so its response stands.
+        if activated.target != *t
+            || activated.previous != activate.previous
+            || activated_at.is_none()
+        {
             return Err(response_mismatch());
         }
         tx.commit().await?;
@@ -511,6 +540,9 @@ pub async fn activate_root_generation(
         let g = load_grant(&mut tx, v, &tenant, generation, &replay)
             .await?
             .ok_or_else(integrity)?;
+        if !inside_window(&g.grant, now)? {
+            continue;
+        }
         actor_holds_one |= subject_of(&s, &g.grant).is_ok();
         hashes.push(*g.record.record().signed_container_hash());
     }
@@ -525,7 +557,7 @@ pub async fn activate_root_generation(
         return Err(AppError::Forbidden);
     }
 
-    let activated_at = now_rfc3339();
+    let activated_at = at(now);
     sqlx::query(
         "UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = ?
           WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'PREPARING'",
@@ -596,4 +628,9 @@ async fn active_pointer(
             .fetch_one(&mut *conn)
             .await?,
     )
+}
+
+/// Whether `now` is inside the grant's validity window.
+fn inside_window(g: &TenantRootKeyGrantV2, now: i64) -> Result<bool, AppError> {
+    Ok(int(g.common.not_before_ms)? <= now && now < int(g.common.not_after_ms)?)
 }
