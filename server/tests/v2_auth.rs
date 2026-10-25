@@ -545,6 +545,7 @@ async fn live_state_ends_tickets_and_sessions() {
             "UPDATE v2_tenant_memberships SET status = 'active' WHERE account_id = ?",
         ),
     ] {
+        assert_eq!(server.me(t).await.0, 200, "control before {set}");
         server.sql(set, &[&OWNER]).await;
         assert_eq!(server.me(access).await.0, 401, "{set}");
         assert_eq!(server.me(t).await.0, 401, "{set}");
@@ -619,9 +620,19 @@ async fn refresh_rotates_once_and_respects_expiry() {
     assert_eq!(r["absolute_expires_at_ms"], s["absolute_expires_at_ms"]);
     // The old access token is dead; the new one works.
     assert_eq!(server.me(s["access_token"].as_str().unwrap()).await.0, 401);
+    assert_eq!(server.me(r["access_token"].as_str().unwrap()).await.0, 200);
+    // A second rotation, then the first token again: any replaced token means
+    // two holders, however many rotations ago, and both lose the session.
+    let (status, r) = server
+        .post(
+            "/v2/auth/refresh",
+            None,
+            json!({ "refresh_token": r["refresh_token"] }),
+        )
+        .await;
+    assert_eq!(status, 200, "{r}");
     let access = r["access_token"].as_str().unwrap();
     assert_eq!(server.me(access).await.0, 200);
-    // The replaced refresh token again means two holders: both lose the session.
     let (status, _) = server
         .post(
             "/v2/auth/refresh",
@@ -639,6 +650,16 @@ async fn refresh_rotates_once_and_respects_expiry() {
         )
         .await;
     assert_eq!(status, 401);
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_audit_events WHERE action = 'auth.refresh_reuse' \
+                 AND actor_device_id = x'{}'",
+                hex(&dev.id)
+            ))
+            .await,
+        1
+    );
 
     // On a new session: the binding cannot be rewritten to stretch it, an
     // expired access token is refused, and an expired refresh ends it.
@@ -933,7 +954,8 @@ async fn a_session_from_another_epoch_is_refused() {
 #[tokio::test]
 async fn an_account_holds_a_bounded_number_of_tickets() {
     let server = start("tickets", 38183).await;
-    for _ in 0..10 {
+    let first = server.login("owner").await;
+    for _ in 1..10 {
         server.login("owner").await;
     }
     let (status, _) = server
@@ -944,8 +966,40 @@ async fn an_account_holds_a_bounded_number_of_tickets() {
         )
         .await;
     assert_eq!(status, 429);
-    // Another account of the tenant is unaffected.
+    // Another account of the tenant is unaffected, and a ticket given back
+    // frees its slot.
     server.login("other").await;
+    let (status, _) = server
+        .post("/v2/auth/logout", first["ticket"].as_str(), json!({}))
+        .await;
+    assert_eq!(status, 204);
+    server.login("owner").await;
+}
+
+#[tokio::test]
+async fn a_ticket_issues_five_challenges_in_its_life() {
+    let server = start("burn", 38187).await;
+    let dev = device(&server, OWNER, 0x3b, "pending").await;
+    let ticket = server.login("owner").await;
+    // Burning a challenge with a wrong answer does not give its slot back.
+    for _ in 0..5 {
+        let (status, ch) = challenge(&server, &ticket, &dev).await;
+        assert_eq!(status, 201, "{ch}");
+        let mut wrong = answer(&ticket, &ch, &dev);
+        wrong["secret"] = json!(hex(&[0u8; 32]));
+        let (status, _) = server
+            .post(
+                "/v2/auth/device-session-proofs",
+                ticket["ticket"].as_str(),
+                wrong,
+            )
+            .await;
+        assert_eq!(status, 401);
+    }
+    assert_eq!(challenge(&server, &ticket, &dev).await.0, 429);
+    // A new login starts a new budget.
+    let fresh = server.login("owner").await;
+    assert_eq!(challenge(&server, &fresh, &dev).await.0, 201);
 }
 
 #[tokio::test]

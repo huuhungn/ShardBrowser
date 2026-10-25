@@ -104,9 +104,6 @@ CREATE TABLE v2_sessions (
     access_expires_at_ms        INTEGER NOT NULL
         CHECK (access_expires_at_ms BETWEEN 0 AND 9223372036854775807),
     refresh_token_hash          BLOB    NOT NULL UNIQUE CHECK (length(refresh_token_hash) = 32),
-    -- The token the last rotation replaced: presenting it again means two
-    -- holders, so the session ends.
-    previous_refresh_token_hash BLOB    UNIQUE CHECK (length(previous_refresh_token_hash) = 32),
     refresh_expires_at_ms       INTEGER NOT NULL
         CHECK (refresh_expires_at_ms BETWEEN 0 AND 9223372036854775807),
     absolute_expires_at_ms      INTEGER NOT NULL
@@ -125,6 +122,18 @@ CREATE INDEX v2_sessions_by_device ON v2_sessions (tenant_id, device_id);
 CREATE INDEX v2_sessions_by_account ON v2_sessions (tenant_id, account_id);
 -- A consumed ticket or challenge stays while a session names it.
 CREATE INDEX v2_sessions_by_ticket ON v2_sessions (pre_device_session_id);
+
+-- Every refresh token a rotation replaced. Presenting one again means two
+-- holders, so the session ends; keeping all of them, not only the last, stops
+-- a thief from rotating twice to slip past the check.
+CREATE TABLE v2_spent_refresh_tokens (
+    refresh_token_hash BLOB NOT NULL PRIMARY KEY CHECK (length(refresh_token_hash) = 32),
+    tenant_id          BLOB NOT NULL,
+    session_id         BLOB NOT NULL,
+    FOREIGN KEY (tenant_id, session_id) REFERENCES v2_sessions(tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX v2_spent_refresh_tokens_by_session
+    ON v2_spent_refresh_tokens (tenant_id, session_id);
 
 -- Neither refresh nor credentials can change what a session is bound to.
 CREATE TRIGGER v2_sessions_binding_is_fixed

@@ -41,11 +41,11 @@ const CHALLENGE_TTL_MS: i64 = 120_000;
 const ACCESS_TTL_MS: i64 = 300_000;
 /// Pending-setup sessions end 30 minutes after the proof, refresh or not.
 const SETUP_SESSION_MS: i64 = 1_800_000;
-/// Open challenges per ticket. With the ticket's 10-minute life this bounds
-/// the HPKE work one login can cause.
-const MAX_OPEN_CHALLENGES: i64 = 5;
+/// Challenges per ticket, over its whole life: a refused proof does not give
+/// the slot back, so this bounds the HPKE work one login can cause.
+const MAX_CHALLENGES_PER_TICKET: i64 = 5;
 /// Live tickets per account. Bounds what one account's successful logins can
-/// open: at most this many times `MAX_OPEN_CHALLENGES` challenges.
+/// cause: at most this many times `MAX_CHALLENGES_PER_TICKET` challenges.
 const MAX_LIVE_TICKETS: i64 = 10;
 
 const TICKET: &str = "v2t.";
@@ -394,14 +394,11 @@ pub async fn login(
     let Some(row) = row else {
         // Same work as a wrong password, so timing does not tell which
         // tenants and usernames exist.
-        static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let dummy = match DUMMY.get() {
-            Some(h) => h.clone(),
-            None => {
-                let h = crate::auth::hash_password(&hex(&random::<16>()?))?;
-                DUMMY.get_or_init(|| h).clone()
-            }
-        };
+        static DUMMY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+        let dummy = DUMMY
+            .get_or_try_init(|| async { crate::auth::hash_slot(&app, hex(&random::<16>()?)).await })
+            .await?
+            .clone();
         let _ = verify_slot(&app, req.password.clone(), dummy).await?;
         crate::audit::log(
             &app.db,
@@ -437,11 +434,14 @@ pub async fn login(
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM v2_pre_device_sessions
           WHERE tenant_id = ? AND account_id = ? AND consumed_at_ms IS NULL
-            AND revoked_at_ms IS NULL AND expires_at_ms > ?",
+            AND revoked_at_ms IS NULL AND expires_at_ms > ?
+            AND server_instance_id = ? AND restore_epoch = ?",
     )
     .bind(tenant_id.as_slice())
     .bind(account_id.as_slice())
     .bind(now)
+    .bind(v.server_instance_id.as_slice())
+    .bind(epoch(v)?)
     .fetch_one(&mut *conn)
     .await?;
     if live >= MAX_LIVE_TICKETS {
@@ -500,16 +500,13 @@ pub async fn create_device_session_challenge(
     // cannot all pass the cap.
     let mut conn = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
-    let open: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM v2_device_session_challenges
-          WHERE pre_device_session_id = ? AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL
-            AND expires_at_ms > ?",
+    let issued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM v2_device_session_challenges WHERE pre_device_session_id = ?",
     )
     .bind(ticket.id.as_slice())
-    .bind(now)
     .fetch_one(&mut *conn)
     .await?;
-    if open >= MAX_OPEN_CHALLENGES {
+    if issued >= MAX_CHALLENGES_PER_TICKET {
         return Err(AppError::TooManyRequests((CHALLENGE_TTL_MS / 1000) as u64));
     }
 
@@ -799,6 +796,18 @@ pub async fn refresh(
 ) -> Result<Json<Value>, AppError> {
     let v = verified(&app)?;
     let hash = token_hash(&req.refresh_token, REFRESH).ok_or(AppError::Unauthorized)?;
+    // A token the server never issued takes no write lock.
+    let known = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM v2_sessions WHERE refresh_token_hash = ?1
+         UNION ALL SELECT 1 FROM v2_spent_refresh_tokens WHERE refresh_token_hash = ?1
+         LIMIT 1",
+    )
+    .bind(hash.as_slice())
+    .fetch_optional(&app.db)
+    .await?;
+    if known.is_none() {
+        return Err(AppError::Unauthorized);
+    }
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     // Read after the lock: time spent waiting for it must not extend a token.
     let now = now_ms();
@@ -810,16 +819,33 @@ pub async fn refresh(
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
-        // A token the last rotation replaced: someone else holds a copy, so
-        // neither holder keeps the session.
-        sqlx::query(
+        // A token a rotation already replaced: someone else holds a copy, so
+        // neither holder keeps the session. A client whose refresh response
+        // was lost lands here too, and logs in again.
+        let reused = sqlx::query(
             "UPDATE v2_sessions SET revoked_at_ms = ?
-              WHERE previous_refresh_token_hash = ? AND revoked_at_ms IS NULL",
+              WHERE revoked_at_ms IS NULL
+                AND (tenant_id, id) IN (SELECT tenant_id, session_id FROM v2_spent_refresh_tokens
+                                         WHERE refresh_token_hash = ?)
+             RETURNING tenant_id, id, account_id, device_id",
         )
         .bind(now)
         .bind(hash.as_slice())
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
+        if let Some(r) = reused {
+            let id: Vec<u8> = r.get("id");
+            audit(
+                &mut tx,
+                &r.get::<Vec<u8>, _>("tenant_id"),
+                &r.get::<Vec<u8>, _>("account_id"),
+                &r.get::<Vec<u8>, _>("device_id"),
+                "auth.refresh_reuse",
+                "session",
+                &id,
+            )
+            .await?;
+        }
         tx.commit().await?;
         return Err(AppError::Unauthorized);
     };
@@ -841,8 +867,7 @@ pub async fn refresh(
     let access_expires = (now + ACCESS_TTL_MS).min(session.absolute_expires_at_ms);
     let rotated = sqlx::query(
         "UPDATE v2_sessions
-            SET access_token_hash = ?, access_expires_at_ms = ?, refresh_token_hash = ?,
-                previous_refresh_token_hash = refresh_token_hash
+            SET access_token_hash = ?, access_expires_at_ms = ?, refresh_token_hash = ?
           WHERE tenant_id = ? AND id = ? AND refresh_token_hash = ? AND revoked_at_ms IS NULL",
     )
     .bind(access_hash.as_slice())
@@ -856,6 +881,15 @@ pub async fn refresh(
     if rotated.rows_affected() != 1 {
         return Err(AppError::Unauthorized);
     }
+    sqlx::query(
+        "INSERT INTO v2_spent_refresh_tokens (refresh_token_hash, tenant_id, session_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(hash.as_slice())
+    .bind(session.tenant_id.as_slice())
+    .bind(session.id.as_slice())
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Json(json!({
         "session_id": hex(&session.id),
@@ -871,8 +905,8 @@ pub async fn refresh(
 /// `POST /v2/auth/logout`: ends the ticket (and its open challenges) or the
 /// session the bearer token names.
 pub async fn logout(State(app): State<AppState>, who: Principal) -> Result<StatusCode, AppError> {
-    let now = now_ms();
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
     match who {
         Principal::Ticket(t) => {
             sqlx::query(
