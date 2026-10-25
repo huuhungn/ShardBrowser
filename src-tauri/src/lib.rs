@@ -2000,8 +2000,16 @@ async fn team_test_connection() -> Result<String, String> {
 /// The key is generated locally and only its public half is sent. Enrolling
 /// again replaces the previous identity, so the command refuses when this
 /// device is already enrolled rather than silently orphaning the old one.
+///
+/// `username` and `password` are the operator's v2 account in the tenant: the
+/// server enrolls a device only under that account's pre-device ticket. The
+/// password is used for that one login and never stored.
 #[tauri::command]
-async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, String> {
+async fn team_enroll_device(
+    label: String,
+    username: String,
+    password: String,
+) -> Result<team_config::TeamStatus, String> {
     let mut c = team_config::load().map_err(|e| e.to_string())?;
     if c.server_url.is_empty() || c.token.is_empty() {
         return Err(crate::errcode::code("fleet.setServerAndTokenFirst"));
@@ -2011,6 +2019,9 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     }
     if c.is_enrolled() {
         return Err(crate::errcode::code("fleet.deviceAlreadyEnrolled"));
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
 
     // Fresh signing key for this device. `getrandom` is a Windows-only
@@ -2034,7 +2045,16 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
     let enrolled = client
-        .enroll_device(&c.tenant_id, &signer, &hpke_public, label.trim().as_bytes())
+        .enroll_device(
+            &fleet_client::AccountLogin {
+                tenant_id: &c.tenant_id,
+                username: username.trim(),
+                password: &password,
+            },
+            &signer,
+            &hpke_public,
+            label.trim().as_bytes(),
+        )
         .await
         .map_err(|e| e.to_string())?;
 

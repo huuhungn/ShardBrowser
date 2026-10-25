@@ -16,9 +16,12 @@ export const teamSetConnection = (
 /** Ask the server who it is; returns its identity. */
 export const teamTestConnection = () => invoke<string>("team_test_connection");
 
-/** Enrol this device, keeping its signing and HPKE keys locally. */
-export const teamEnrollDevice = (label: string) =>
-  invoke<TeamStatus>("team_enroll_device", { label });
+/**
+ * Enrol this device as the given v2 account, keeping its signing and HPKE keys
+ * locally. The password is used for one login and never stored.
+ */
+export const teamEnrollDevice = (label: string, username: string, password: string) =>
+  invoke<TeamStatus>("team_enroll_device", { label, username, password });
 
 /**
  * Collect the root key grants issued to this device. Reports whether custody

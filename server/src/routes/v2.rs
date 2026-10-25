@@ -6,7 +6,6 @@
 //! session and the record are checked independently — neither substitutes
 //! for the other.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -15,7 +14,6 @@ use sqlx::Row;
 
 use crate::auth::AuthUser;
 use crate::authz::{self, VerificationContext};
-use crate::enrollment::{HPKE_SUITE_X25519_HKDF_SHA256, SIGNING_SUITE_ED25519};
 use crate::error::AppError;
 use crate::fleet;
 use crate::idempotency::{self, OperationClaim, ReplayClaim, ReplayTable};
@@ -38,7 +36,7 @@ fn parse_id32(hex: &str, field: &'static str) -> Result<[u8; 32], AppError> {
         .map_err(|_| AppError::BadRequest(format!("{field}: expected 32 bytes")))
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -511,167 +509,6 @@ async fn require_tenant_member(
     user: &AuthUser,
 ) -> Result<[u8; 16], AppError> {
     account_id_for(app, tenant_id, &user.id).await
-}
-
-// ---------------------------------------------------------------------------
-// Device enrollment
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct ChallengeReq {
-    /// Tenant the device will belong to, hex-encoded.
-    pub tenant_id: String,
-    /// Hex-encoded 32-byte Ed25519 public key the device will sign with.
-    pub signing_public_key: String,
-    /// Hex-encoded 32-byte HPKE recipient public key.
-    pub hpke_public_key: String,
-}
-
-/// Issue an enrollment challenge for the calling account.
-///
-/// The account is taken from the session, never from the body: a caller may
-/// only enroll devices for itself.
-pub async fn create_enrollment_challenge(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ChallengeReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let account_id = require_tenant_member(&app, tenant_id, &user).await?;
-
-    let signing_public_key: [u8; 32] = decode_hex(&req.signing_public_key)
-        .ok_or_else(|| AppError::BadRequest("signing_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("signing_public_key: must be 32 bytes".into()))?;
-    let hpke_public_key: [u8; 32] = decode_hex(&req.hpke_public_key)
-        .ok_or_else(|| AppError::BadRequest("hpke_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("hpke_public_key: must be 32 bytes".into()))?;
-
-    let now = chrono::Utc::now();
-    let ctx = verification_context(&app, tenant_id, now.timestamp_millis().max(0) as u64).await?;
-
-    let commitment = crate::enrollment::key_commitment(&signing_public_key, &hpke_public_key);
-    let challenge = crate::enrollment::issue_challenge(
-        &app.db,
-        &tenant_id,
-        &commitment,
-        &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
-        now,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "challenge_id": hex(&challenge.id),
-            "nonce": hex(&challenge.nonce),
-            "account_id": hex(&account_id),
-            "server_instance_id": hex(&ctx.server_instance_id),
-            "restore_epoch": ctx.restore_epoch,
-            "expires_at": challenge.expires_at,
-        })),
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct EnrollReq {
-    pub tenant_id: String,
-    pub challenge_id: String,
-    /// Hex-encoded 32-byte nonce from the challenge response.
-    pub nonce: String,
-    /// Hex-encoded 32-byte Ed25519 public key the device will sign with.
-    pub signing_public_key: String,
-    /// Hex-encoded 32-byte HPKE recipient public key.
-    pub hpke_public_key: String,
-    /// Hex-encoded 64-byte signature over the canonical proof bytes.
-    pub proof_signature: String,
-    /// Opaque, client-encrypted device label. The server stores it without
-    /// reading it, so a device list cannot leak machine names.
-    pub label_ciphertext: String,
-}
-
-/// Complete enrollment by proving possession of the signing key.
-pub async fn enroll_device(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<EnrollReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let account_id = require_tenant_member(&app, tenant_id, &user).await?;
-    let challenge_id = parse_id16(&req.challenge_id, "challenge_id")?;
-    let nonce: [u8; 32] = decode_hex(&req.nonce)
-        .ok_or_else(|| AppError::BadRequest("nonce: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("nonce: must be 32 bytes".into()))?;
-
-    let signing_public_key: [u8; 32] = decode_hex(&req.signing_public_key)
-        .ok_or_else(|| AppError::BadRequest("signing_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("signing_public_key: must be 32 bytes".into()))?;
-    let hpke_public_key: [u8; 32] = decode_hex(&req.hpke_public_key)
-        .ok_or_else(|| AppError::BadRequest("hpke_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("hpke_public_key: must be 32 bytes".into()))?;
-    let proof_signature = decode_hex(&req.proof_signature)
-        .ok_or_else(|| AppError::BadRequest("proof_signature: not hex".into()))?;
-    let label_ciphertext = decode_hex(&req.label_ciphertext)
-        .ok_or_else(|| AppError::BadRequest("label_ciphertext: not hex".into()))?;
-
-    let now = chrono::Utc::now();
-    let ctx = verification_context(&app, tenant_id, now.timestamp_millis().max(0) as u64).await?;
-
-    // The device id is minted server-side. Letting the client choose it would
-    // let one account claim an id another tenant's device already uses, and
-    // nothing in the proof binds it.
-    let mut device_id = [0u8; 16];
-    OsRng.fill_bytes(&mut device_id);
-
-    crate::enrollment::enroll_device(
-        &app.db,
-        crate::enrollment::EnrollRequest {
-            tenant_id: &tenant_id,
-            account_id: &account_id,
-            challenge_id: &challenge_id,
-            nonce: &nonce,
-            device_id: &device_id,
-            label_ciphertext: &label_ciphertext,
-            signing_public_key: &signing_public_key,
-            signing_suite: SIGNING_SUITE_ED25519,
-            hpke_public_key: &hpke_public_key,
-            hpke_suite: HPKE_SUITE_X25519_HKDF_SHA256,
-            signature: &proof_signature,
-        },
-        &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
-        &now.to_rfc3339(),
-    )
-    .await
-    .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    let signing_key_id = shared::keys::signing_key_id(&signing_public_key);
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.device.enrolled",
-        None,
-        &hex(&device_id),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "device_id": hex(&device_id),
-            "signing_key_id": hex(&signing_key_id),
-            // Fleet routes are scoped by account. The client cannot infer this
-            // and must not invent it, so return the one we authenticated.
-            "account_id": hex(&account_id),
-        })),
-    ))
 }
 
 /// Map a v1 session user to a v2 account within a tenant.

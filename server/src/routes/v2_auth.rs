@@ -2,8 +2,10 @@
 //! (ADR 0001 R2).
 //!
 //! `POST /v2/auth/login` checks a v2 account's password and returns an
-//! account-only ticket. The ticket opens a device-session challenge for one of
-//! the account's own pending devices; the device answers with the secret the
+//! account-only ticket. The ticket enrolls a device (`/v2/devices/enrollment-*`:
+//! the candidate signs the server's `EnrollmentBindingV2`, which proves only the
+//! signing key) and opens a device-session challenge for one of the account's
+//! own pending devices; the device answers with the secret the
 //! server sealed to its HPKE key and an Ed25519 signature over the binding and
 //! that secret. Only then does a `v2_sessions` row exist, bound to that device
 //! and both its keys. A ticket grants nothing else: no approval, no root
@@ -364,7 +366,11 @@ async fn audit(
 
 #[derive(Deserialize)]
 pub struct LoginReq {
-    tenant: String,
+    /// The tenant slug, or `tenant_id` (32 hex digits); exactly one.
+    #[serde(default)]
+    tenant: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
     username: String,
     password: String,
 }
@@ -378,8 +384,32 @@ pub async fn login(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let v = verified(&app)?;
     let ip = client_ip(&app, &headers, peer);
+    // Both ways of naming a tenant resolve to its ID first, so the throttle
+    // counts one key per account whichever form the client sends.
+    let tenant_id: Option<Vec<u8>> = match (&req.tenant, &req.tenant_id) {
+        (Some(slug), None) => {
+            sqlx::query_scalar("SELECT id FROM v2_tenants WHERE slug = ?")
+                .bind(slug.as_str())
+                .fetch_optional(&app.db)
+                .await?
+        }
+        (None, Some(id)) => Some(
+            unhex::<16>(id)
+                .ok_or_else(|| AppError::BadRequest("tenant_id must be 32 hex digits".into()))?
+                .to_vec(),
+        ),
+        _ => {
+            return Err(AppError::BadRequest(
+                "name the tenant by exactly one of tenant or tenant_id".into(),
+            ))
+        }
+    };
+    let named = match &tenant_id {
+        Some(id) => hex(id),
+        None => format!("slug:{}", req.tenant.as_deref().unwrap_or_default()),
+    };
     // Its own key space: a v2 account is named by tenant and username.
-    let user_key = format!("v2:{}/{}", req.tenant, req.username);
+    let user_key = format!("v2:{named}/{}", req.username);
     if let Some(retry) = app.login_throttle.locked_for(&ip, &user_key) {
         return Err(AppError::TooManyRequests(retry));
     }
@@ -391,9 +421,9 @@ pub async fn login(
     let row = sqlx::query(
         "SELECT a.tenant_id, a.id, a.pw_hash, a.token_version
            FROM v2_accounts a JOIN v2_tenants t ON t.id = a.tenant_id
-          WHERE t.slug = ? AND a.username = ?",
+          WHERE t.id = ? AND a.username = ?",
     )
-    .bind(&req.tenant)
+    .bind(tenant_id.unwrap_or_default())
     .bind(&req.username)
     .fetch_optional(&app.db)
     .await?;
@@ -488,6 +518,275 @@ pub async fn login(
     ))
 }
 
+/// Refuses a challenge beyond the ticket's lifetime budget in `table`.
+async fn limit_challenges(
+    conn: &mut SqliteConnection,
+    table: &str,
+    ticket: &Ticket,
+) -> Result<(), AppError> {
+    let issued: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE pre_device_session_id = ?"
+    ))
+    .bind(ticket.id.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    if issued >= MAX_CHALLENGES_PER_TICKET {
+        // Waiting does not help: the budget is the ticket's whole life.
+        return Err(AppError::Conflict(
+            "this ticket has issued all its challenges; log in again".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Keys already enrolled in the tenant. The HPKE public key is compared too:
+/// earlier releases stored its ID under the signing domain, so the ID index
+/// alone cannot see that historical key.
+async fn keys_taken(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8; 16],
+    signing_key_id: &[u8; 32],
+    hpke_key_id: &[u8; 32],
+    hpke_public_key: &[u8; 32],
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM v2_devices
+          WHERE tenant_id = ? AND (signing_key_id = ? OR hpke_key_id = ? OR hpke_public_key = ?)",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(signing_key_id.as_slice())
+    .bind(hpke_key_id.as_slice())
+    .bind(hpke_public_key.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some())
+}
+
+#[derive(Deserialize)]
+pub struct EnrollmentChallengeReq {
+    signing_public_key: String,
+    hpke_public_key: String,
+}
+
+/// `POST /v2/devices/enrollment-challenges`: the `EnrollmentBindingV2` a
+/// candidate signs to enroll its keys under the ticket's account. The server
+/// owns every field; the client only names its two public keys.
+pub async fn create_enrollment_challenge(
+    State(app): State<AppState>,
+    TicketAuth(ticket): TicketAuth,
+    AppJson(req): AppJson<EnrollmentChallengeReq>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let v = verified(&app)?;
+    let bad = |what: &str| AppError::BadRequest(format!("{what} must be 64 hex digits"));
+    let spk = unhex::<32>(&req.signing_public_key).ok_or_else(|| bad("signing_public_key"))?;
+    let hpk = unhex::<32>(&req.hpke_public_key).ok_or_else(|| bad("hpke_public_key"))?;
+    let unusable = || AppError::BadRequest("the device keys are not usable".into());
+    let (signing_key_id, hpke_key_id) =
+        derive_device_key_ids(1, &spk, 1, &hpk).map_err(|_| unusable())?;
+
+    // One write lock from the count to the insert, as for device sessions.
+    let mut conn = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    limit_challenges(&mut conn, ENROLLMENT_CHALLENGES, &ticket).await?;
+    if keys_taken(
+        &mut conn,
+        &ticket.tenant_id,
+        &signing_key_id,
+        &hpke_key_id,
+        &hpk,
+    )
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "these keys are already enrolled in this tenant".into(),
+        ));
+    }
+
+    let challenge_id = random::<16>()?;
+    let expires_at_ms = now + CHALLENGE_TTL_MS;
+    let binding = sb::EnrollmentBindingV2 {
+        fields: BindingFields {
+            server_instance_id: v.server_instance_id,
+            restore_epoch: v.restore_epoch,
+            tenant_id: ticket.tenant_id,
+            account_id: ticket.account_id,
+            pre_device_session_id: ticket.id,
+            challenge_id,
+            nonce: random::<16>()?,
+            signing_suite: 1,
+            signing_public_key: spk,
+            signing_key_id,
+            hpke_suite: 1,
+            hpke_public_key: hpk,
+            hpke_key_id,
+            expires_at_ms: expires_at_ms as u64,
+        },
+    }
+    .encode()
+    .map_err(|_| unusable())?;
+    sqlx::query(
+        "INSERT INTO v2_enrollment_challenges
+             (id, pre_device_session_id, tenant_id, account_id, binding_bytes, created_at_ms,
+              expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(challenge_id.as_slice())
+    .bind(ticket.id.as_slice())
+    .bind(ticket.tenant_id.as_slice())
+    .bind(ticket.account_id.as_slice())
+    .bind(&binding)
+    .bind(now)
+    .bind(expires_at_ms)
+    .execute(&mut *conn)
+    .await?;
+    conn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "challenge_id": hex(&challenge_id),
+            "binding": hex(&binding),
+            "expires_at_ms": expires_at_ms,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct EnrollmentProofReq {
+    challenge_id: String,
+    signature: String,
+    /// Opaque, client-encrypted device label; stored without being read.
+    label_ciphertext: String,
+}
+
+/// `POST /v2/devices/enrollment-proofs`: the candidate's signature over the
+/// stored binding. One `BEGIN IMMEDIATE` consumes the challenge, mints the
+/// device ID, inserts the pending device and writes the audit row. The ticket
+/// stays usable: the device still has to prove its HPKE key for a session.
+pub async fn enroll_device(
+    State(app): State<AppState>,
+    TicketAuth(presented): TicketAuth,
+    AppJson(req): AppJson<EnrollmentProofReq>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let v = verified(&app)?;
+    let bad =
+        |what: &str| AppError::BadRequest(format!("{what} has the wrong length or is not hex"));
+    let challenge_id = unhex::<16>(&req.challenge_id).ok_or_else(|| bad("challenge_id"))?;
+    let signature = unhex::<64>(&req.signature).ok_or_else(|| bad("signature"))?;
+    let label =
+        super::v2::decode_hex(&req.label_ciphertext).ok_or_else(|| bad("label_ciphertext"))?;
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let ticket = load_ticket(&mut tx, "id", &presented.id, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let row = sqlx::query(
+        "SELECT binding_bytes, expires_at_ms, consumed_at_ms, revoked_at_ms
+           FROM v2_enrollment_challenges WHERE id = ? AND pre_device_session_id = ?",
+    )
+    .bind(challenge_id.as_slice())
+    .bind(ticket.id.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    if row.get::<Option<i64>, _>("consumed_at_ms").is_some()
+        || row.get::<Option<i64>, _>("revoked_at_ms").is_some()
+        || row.get::<i64, _>("expires_at_ms") <= now
+    {
+        return Err(AppError::Unauthorized);
+    }
+    let binding_bytes: Vec<u8> = row.get("binding_bytes");
+    let binding = sb::EnrollmentBindingV2::parse(&binding_bytes)
+        .map_err(|_| AppError::Internal("a stored binding does not parse".into()))?;
+    let f = &binding.fields;
+    if sb::verify_enrollment(&f.signing_public_key, &binding_bytes, &signature).is_err() {
+        // One attempt per challenge: a wrong signature burns it.
+        revoke_challenge(&mut tx, ENROLLMENT_CHALLENGES, &challenge_id, now).await?;
+        tx.commit().await?;
+        return Err(AppError::Unauthorized);
+    }
+    let bound = f.server_instance_id == v.server_instance_id
+        && f.restore_epoch == v.restore_epoch
+        && f.tenant_id == ticket.tenant_id
+        && f.account_id == ticket.account_id
+        && f.pre_device_session_id == ticket.id
+        && f.challenge_id == challenge_id;
+    let taken = keys_taken(
+        &mut tx,
+        &f.tenant_id,
+        &f.signing_key_id,
+        &f.hpke_key_id,
+        &f.hpke_public_key,
+    )
+    .await?;
+    if !bound || taken {
+        revoke_challenge(&mut tx, ENROLLMENT_CHALLENGES, &challenge_id, now).await?;
+        tx.commit().await?;
+        return Err(AppError::Conflict(if taken {
+            "these keys are already enrolled in this tenant".into()
+        } else {
+            "this challenge no longer matches the ticket or the server; ask for a new one".into()
+        }));
+    }
+
+    let used = sqlx::query(
+        "UPDATE v2_enrollment_challenges SET consumed_at_ms = ?
+          WHERE id = ? AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL",
+    )
+    .bind(now)
+    .bind(challenge_id.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    if used.rows_affected() != 1 {
+        return Err(AppError::Unauthorized);
+    }
+    // Minted here: nothing in the proof binds a client-chosen ID, and a
+    // collision fails the insert rather than overwriting a device.
+    let device_id = random::<16>()?;
+    sqlx::query(
+        "INSERT INTO v2_devices
+             (id, tenant_id, account_id, label_ciphertext, signing_key_id, signing_public_key,
+              signing_suite, hpke_key_id, hpke_public_key, hpke_suite, status, last_seen_at,
+              created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)",
+    )
+    .bind(device_id.as_slice())
+    .bind(ticket.tenant_id.as_slice())
+    .bind(ticket.account_id.as_slice())
+    .bind(&label)
+    .bind(f.signing_key_id.as_slice())
+    .bind(f.signing_public_key.as_slice())
+    .bind(i64::from(f.signing_suite))
+    .bind(f.hpke_key_id.as_slice())
+    .bind(f.hpke_public_key.as_slice())
+    .bind(i64::from(f.hpke_suite))
+    .bind(crate::util::now_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        &ticket.tenant_id,
+        &ticket.account_id,
+        &device_id,
+        "auth.device_enrolled",
+        "device",
+        &device_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "device_id": hex(&device_id),
+            "tenant_id": hex(&ticket.tenant_id),
+            "account_id": hex(&ticket.account_id),
+            "signing_key_id": hex(&f.signing_key_id),
+            "hpke_key_id": hex(&f.hpke_key_id),
+            "status": "pending",
+        })),
+    ))
+}
+
 #[derive(Deserialize)]
 pub struct ChallengeReq {
     device_id: String,
@@ -507,18 +806,7 @@ pub async fn create_device_session_challenge(
     // cannot all pass the cap.
     let mut conn = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
-    let issued: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM v2_device_session_challenges WHERE pre_device_session_id = ?",
-    )
-    .bind(ticket.id.as_slice())
-    .fetch_one(&mut *conn)
-    .await?;
-    if issued >= MAX_CHALLENGES_PER_TICKET {
-        // Waiting does not help: the budget is the ticket's whole life.
-        return Err(AppError::Conflict(
-            "this ticket has issued all its challenges; log in again".into(),
-        ));
-    }
+    limit_challenges(&mut conn, DEVICE_SESSION_CHALLENGES, &ticket).await?;
 
     // Another account's or tenant's device is indistinguishable from none.
     let row = sqlx::query(
@@ -619,15 +907,19 @@ pub struct ProofReq {
     signature: String,
 }
 
+const DEVICE_SESSION_CHALLENGES: &str = "v2_device_session_challenges";
+const ENROLLMENT_CHALLENGES: &str = "v2_enrollment_challenges";
+
 async fn revoke_challenge(
     conn: &mut SqliteConnection,
+    table: &str,
     id: &[u8; 16],
     now: i64,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        "UPDATE v2_device_session_challenges SET revoked_at_ms = ?
-          WHERE id = ? AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL",
-    )
+    sqlx::query(&format!(
+        "UPDATE {table} SET revoked_at_ms = ?
+          WHERE id = ? AND consumed_at_ms IS NULL AND revoked_at_ms IS NULL"
+    ))
     .bind(now)
     .bind(id.as_slice())
     .execute(&mut *conn)
@@ -678,7 +970,7 @@ pub async fn prove_device_session(
         && sb::verify_pop(&f.signing_public_key, &binding_bytes, &secret, &signature).is_ok();
     if !proven {
         // One attempt per challenge: a wrong answer burns it.
-        revoke_challenge(&mut tx, &challenge_id, now).await?;
+        revoke_challenge(&mut tx, DEVICE_SESSION_CHALLENGES, &challenge_id, now).await?;
         tx.commit().await?;
         return Err(AppError::Unauthorized);
     }
@@ -708,7 +1000,7 @@ pub async fn prove_device_session(
         && f.challenge_id == challenge_id
         && binding.device_id == blob::<16>(&row, "device_id")?;
     if !live_device || !bound {
-        revoke_challenge(&mut tx, &challenge_id, now).await?;
+        revoke_challenge(&mut tx, DEVICE_SESSION_CHALLENGES, &challenge_id, now).await?;
         tx.commit().await?;
         return Err(AppError::Conflict(
             "the device changed since the challenge".into(),
@@ -958,15 +1250,17 @@ pub async fn logout(State(app): State<AppState>, who: Principal) -> Result<Statu
             .bind(t.id.as_slice())
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "UPDATE v2_device_session_challenges SET revoked_at_ms = ?
-                  WHERE pre_device_session_id = ? AND consumed_at_ms IS NULL
-                    AND revoked_at_ms IS NULL",
-            )
-            .bind(now)
-            .bind(t.id.as_slice())
-            .execute(&mut *tx)
-            .await?;
+            for table in [DEVICE_SESSION_CHALLENGES, ENROLLMENT_CHALLENGES] {
+                sqlx::query(&format!(
+                    "UPDATE {table} SET revoked_at_ms = ?
+                      WHERE pre_device_session_id = ? AND consumed_at_ms IS NULL
+                        AND revoked_at_ms IS NULL"
+                ))
+                .bind(now)
+                .bind(t.id.as_slice())
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         Principal::Session(s) => {
             revoke_session(&mut tx, &s.tenant_id, &s.id, now).await?;

@@ -10,6 +10,7 @@
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::Executor;
@@ -169,14 +170,30 @@ async fn seed(
         .await
         .unwrap();
 
+        // The same password as the v1 admin: enrollment logs in as this v2
+        // account, while the fleet routes still map the v1 user through
+        // `legacy_user_id`.
+        let pw_hash = argon2::Argon2::default()
+            .hash_password(b"secret", &SaltString::generate(&mut OsRng))
+            .unwrap()
+            .to_string();
         sqlx::query(
             "INSERT INTO v2_accounts
                  (id, tenant_id, username, pw_hash, legacy_user_id, status, created_at)
-             VALUES (?, ?, 'admin', 'x', ?, 'active', '2026-01-01T00:00:00Z')",
+             VALUES (?, ?, 'admin', ?, ?, 'active', '2026-01-01T00:00:00Z')",
         )
         .bind([1u8; 16].as_slice())
         .bind(tid.as_slice())
+        .bind(&pw_hash)
         .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO v2_tenant_memberships VALUES (?, ?, 'owner', 'active', '2026-01-01T00:00:00Z')",
+        )
+        .bind(tid.as_slice())
+        .bind([1u8; 16].as_slice())
         .execute(&pool)
         .await
         .unwrap();
@@ -922,7 +939,7 @@ async fn a_member_outside_the_tenant_cannot_lease_its_profiles() {
 }
 
 /// Enrollment registers a device key only when the caller proves it holds the
-/// matching private key.
+/// matching private key, and only under a v2 account's pre-device ticket.
 ///
 /// A registration endpoint that skipped the proof would let anyone bind a
 /// public key they do not control, and every later manifest signed by the
@@ -941,89 +958,43 @@ async fn device_enrollment_requires_proof_of_possession() {
     let sk_b = Ed25519SigningKey::from_bytes(&[22u8; 32]);
     seed(&data, &user_id, &sk_a, &sk_b).await;
 
-    let tenant_hex = hex(&TENANT_A);
-
-    // The device key pair being enrolled. The challenge commits to it, so the
-    // keys are named before the nonce is issued.
+    // The device key pair being enrolled. The binding names both keys, so
+    // they are fixed before the server issues it.
     let device_sk = Ed25519SigningKey::from_bytes(&[0x44u8; 32]);
     let device_vk = device_sk.verifying_key().to_bytes();
-    let hpke_pk = [0x55u8; 32];
+    let (_, hpke_pk) = shared::grants::derive_keypair(&[0x55u8; 32]);
+    let hpke_pk: [u8; 32] = hpke_pk.try_into().unwrap();
 
-    // Round trip one: ask for a challenge.
-    let ch: Value = cl
-        .post(format!("{}/v2/devices/enrollment-challenges", base(port)))
-        .bearer_auth(&admin)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(&hpke_pk),
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // A v1 session token is not a ticket.
+    let (status, _) = enrollment_challenge(&cl, port, &admin, &device_vk, &hpke_pk).await;
+    assert_eq!(status, 401, "enrollment needs a pre-device ticket");
 
-    let challenge_id = ch["challenge_id"].as_str().unwrap().to_string();
-    let nonce = decode_hex_str(ch["nonce"].as_str().unwrap());
-    let account_id = decode_hex_str(ch["account_id"].as_str().unwrap());
+    let t = ticket(&cl, port, &TENANT_A).await;
+    let (status, ch) = enrollment_challenge(&cl, port, &t, &device_vk, &hpke_pk).await;
+    assert_eq!(status, 201, "{ch}");
+    let binding = decode_hex_str(ch["binding"].as_str().unwrap());
+    let parsed = shared::session_binding::EnrollmentBindingV2::parse(&binding).unwrap();
+    assert_eq!(parsed.fields.tenant_id, TENANT_A);
+    assert_eq!(parsed.fields.signing_public_key, device_vk);
+    assert_eq!(parsed.fields.hpke_public_key, hpke_pk);
 
-    let proof_bytes = enrollment_proof_bytes(
-        &decode_hex_str(&challenge_id),
-        &nonce,
-        &TENANT_A,
-        &account_id,
-        &device_vk,
-        &hpke_pk,
-    );
-
-    // A signature from the wrong key must not enroll the device.
-    let wrong = shared::signing::sign_tbs(&sk_b, &proof_bytes);
-    let refused = cl
-        .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
-        .bearer_auth(&admin)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "challenge_id": challenge_id,
-            "nonce": hex(&nonce),
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(&hpke_pk),
-            "proof_signature": hex(&wrong),
-            "label_ciphertext": hex(b"opaque"),
-        }))
-        .send()
-        .await
-        .unwrap();
+    // A signature from the wrong key must not enroll the device, and it
+    // spends the challenge.
+    let (status, _) = prove_enrollment(&cl, port, &t, &ch, &sk_b).await;
     assert_eq!(
-        refused.status().as_u16(),
-        400,
+        status, 401,
         "a proof signed by another key must not enroll the device"
     );
+    let (status, _) = prove_enrollment(&cl, port, &t, &ch, &device_sk).await;
+    assert_eq!(status, 401, "a refused proof burns its challenge");
 
-    // The real holder succeeds.
-    let sig = shared::signing::sign_tbs(&device_sk, &proof_bytes);
-    let ok = cl
-        .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
-        .bearer_auth(&admin)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "challenge_id": challenge_id,
-            "nonce": hex(&nonce),
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(&hpke_pk),
-            "proof_signature": hex(&sig),
-            "label_ciphertext": hex(b"opaque"),
-        }))
-        .send()
-        .await
-        .unwrap();
-    let ok_status = ok.status().as_u16();
-    let ok_body = ok.text().await.unwrap();
-    assert_eq!(ok_status, 201, "valid proof should enroll, got: {ok_body}");
-    let enrolled: Value = serde_json::from_str(&ok_body).unwrap();
+    // The real holder succeeds with a fresh challenge.
+    let (_, ch) = enrollment_challenge(&cl, port, &t, &device_vk, &hpke_pk).await;
+    let (status, enrolled) = prove_enrollment(&cl, port, &t, &ch, &device_sk).await;
+    assert_eq!(status, 201, "valid proof should enroll, got: {enrolled}");
     let device_id = enrolled["device_id"].as_str().unwrap().to_string();
     assert_eq!(device_id.len(), 32, "device id should be a 16-byte hex id");
+    assert_eq!(enrolled["account_id"], hex(&[1u8; 16]));
 
     // Enrollment must use the same domain-separated ids as the grant codecs.
     // Successful enrollment alone did not catch HPKE keys being assigned a
@@ -1031,6 +1002,7 @@ async fn device_enrollment_requires_proof_of_possession() {
     let expected_signing_id = shared::keys::signing_key_id(&device_vk);
     let expected_hpke_id = shared::keys::hpke_key_id(&hpke_pk);
     assert_eq!(enrolled["signing_key_id"], hex(&expected_signing_id));
+    assert_eq!(enrolled["hpke_key_id"], hex(&expected_hpke_id));
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&format!(
@@ -1052,30 +1024,52 @@ async fn device_enrollment_requires_proof_of_possession() {
     assert_eq!(stored.1, expected_hpke_id);
     // Plan L369: proof of possession alone leaves the device pending.
     assert_eq!(stored.2, "pending");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM v2_audit_events WHERE action = 'auth.device_enrolled' \
+         AND tenant_id = ? AND actor_device_id = ?",
+    )
+    .bind(TENANT_A.as_slice())
+    .bind(decode_hex_str(&device_id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audited, 1,
+        "enrollment writes its audit row with the device"
+    );
     pool.close().await;
 
     // The challenge is single-use: replaying the same valid proof must fail,
     // or an intercepted proof could enroll a second device.
-    let replay = cl
-        .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
-        .bearer_auth(&admin)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "challenge_id": challenge_id,
-            "nonce": hex(&nonce),
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(&hpke_pk),
-            "proof_signature": hex(&sig),
-            "label_ciphertext": hex(b"opaque"),
-        }))
-        .send()
-        .await
-        .unwrap();
+    let (status, _) = prove_enrollment(&cl, port, &t, &ch, &device_sk).await;
     assert_eq!(
-        replay.status().as_u16(),
-        400,
+        status, 401,
         "a consumed challenge must not enroll a second device"
     );
+    // A ticket of the other tenant cannot redeem this tenant's challenge.
+    let other = ticket(&cl, port, &TENANT_B).await;
+    let (_, ch) = enrollment_challenge(
+        &cl,
+        port,
+        &t,
+        &Ed25519SigningKey::from_bytes(&[0x47u8; 32])
+            .verifying_key()
+            .to_bytes(),
+        &shared::grants::derive_keypair(&[0x57u8; 32])
+            .1
+            .try_into()
+            .unwrap(),
+    )
+    .await;
+    let (status, _) = prove_enrollment(
+        &cl,
+        port,
+        &other,
+        &ch,
+        &Ed25519SigningKey::from_bytes(&[0x47u8; 32]),
+    )
+    .await;
+    assert_eq!(status, 404, "a challenge belongs to its own ticket");
 }
 
 fn decode_hex_str(s: &str) -> Vec<u8> {
@@ -1085,30 +1079,63 @@ fn decode_hex_str(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Mirror of the server's canonical proof bytes. Written independently here on
-/// purpose: if the server changes its preimage, this test fails rather than
-/// following it silently.
-fn enrollment_proof_bytes(
-    challenge_id: &[u8],
-    nonce: &[u8],
-    tenant_id: &[u8; 16],
-    account_id: &[u8],
+/// A pre-device ticket for the seeded `admin` account of `tenant`, named by
+/// ID the way the Launcher names it.
+async fn ticket(cl: &reqwest::Client, port: u16, tenant: &[u8; 16]) -> String {
+    let res = cl
+        .post(format!("{}/v2/auth/login", base(port)))
+        .json(&json!({ "tenant_id": hex(tenant), "username": "admin", "password": "secret" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 201);
+    let body: Value = res.json().await.unwrap();
+    body["ticket"].as_str().unwrap().to_string()
+}
+
+async fn enrollment_challenge(
+    cl: &reqwest::Client,
+    port: u16,
+    bearer: &str,
     signing_public_key: &[u8; 32],
     hpke_public_key: &[u8; 32],
-) -> Vec<u8> {
-    c::encode(&c::Value::Map(vec![
-        (
-            "container_domain".into(),
-            c::t("shardx.authorization.device-enrollment-proof.v2"),
-        ),
-        ("container_version".into(), c::u(1)),
-        ("challenge_id".into(), c::b(challenge_id)),
-        ("nonce".into(), c::b(nonce)),
-        ("tenant_id".into(), c::b(tenant_id)),
-        ("account_id".into(), c::b(account_id)),
-        ("signing_public_key".into(), c::b(signing_public_key)),
-        ("hpke_public_key".into(), c::b(hpke_public_key)),
-    ]))
+) -> (u16, Value) {
+    let res = cl
+        .post(format!("{}/v2/devices/enrollment-challenges", base(port)))
+        .bearer_auth(bearer)
+        .json(&json!({
+            "signing_public_key": hex(signing_public_key),
+            "hpke_public_key": hex(hpke_public_key),
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
+}
+
+/// Sign the challenge's binding with `signer` and submit it.
+async fn prove_enrollment(
+    cl: &reqwest::Client,
+    port: u16,
+    ticket: &str,
+    challenge: &Value,
+    signer: &Ed25519SigningKey,
+) -> (u16, Value) {
+    let binding = decode_hex_str(challenge["binding"].as_str().unwrap());
+    let res = cl
+        .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
+        .bearer_auth(ticket)
+        .json(&json!({
+            "challenge_id": challenge["challenge_id"],
+            "signature": hex(&shared::session_binding::sign_enrollment(signer, &binding)),
+            "label_ciphertext": hex(b"opaque"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
 }
 
 #[tokio::test]
@@ -1127,8 +1154,20 @@ async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
     let original_signer = Ed25519SigningKey::from_bytes(&[0x45u8; 32]);
     let (_, hpke_pk) = shared::grants::derive_keypair(&[0x56u8; 32]);
     let hpke_pk: [u8; 32] = hpke_pk.try_into().unwrap();
-    let (original_device, _) =
-        enroll(&cl, port, &admin, &TENANT_A, &original_signer, &hpke_pk).await;
+    // A second challenge for the same HPKE key, issued before the first
+    // enrollment lands: only the proof's own check can refuse it.
+    let t = ticket(&cl, port, &TENANT_A).await;
+    let racing_signer = Ed25519SigningKey::from_bytes(&[0x48u8; 32]);
+    let (status, racing) = enrollment_challenge(
+        &cl,
+        port,
+        &t,
+        &racing_signer.verifying_key().to_bytes(),
+        &hpke_pk,
+    )
+    .await;
+    assert_eq!(status, 201, "{racing}");
+    let (original_device, _) = enroll(&cl, port, &TENANT_A, &original_signer, &hpke_pk).await;
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&format!(
@@ -1137,6 +1176,17 @@ async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
         ))
         .await
         .unwrap();
+    let (status, body) = prove_enrollment(&cl, port, &t, &racing, &racing_signer).await;
+    assert_eq!(status, 409, "{body}");
+    let racing_id = decode_hex_str(racing["challenge_id"].as_str().unwrap());
+    let revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at_ms FROM v2_enrollment_challenges WHERE id = ?")
+            .bind(&racing_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(revoked.is_some(), "a refused proof ends its challenge");
+
     let replacement_signer = Ed25519SigningKey::from_bytes(&[0x46u8; 32]);
     let replacement_vk = replacement_signer.verifying_key().to_bytes();
 
@@ -1155,49 +1205,12 @@ async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
             .execute(&pool)
             .await
             .unwrap();
-        let ch_res = cl
-            .post(format!("{}/v2/devices/enrollment-challenges", base(port)))
-            .bearer_auth(&admin)
-            .json(&json!({
-                "tenant_id": hex(&TENANT_A),
-                "signing_public_key": hex(&replacement_vk),
-                "hpke_public_key": hex(&hpke_pk),
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert!(ch_res.status().is_success());
-        let ch: Value = ch_res.json().await.unwrap();
-        let challenge_id = decode_hex_str(ch["challenge_id"].as_str().unwrap());
-        let nonce = decode_hex_str(ch["nonce"].as_str().unwrap());
-        let account_id = decode_hex_str(ch["account_id"].as_str().unwrap());
-        let tbs = enrollment_proof_bytes(
-            &challenge_id,
-            &nonce,
-            &TENANT_A,
-            &account_id,
-            &replacement_vk,
-            &hpke_pk,
+        let (status, body) = enrollment_challenge(&cl, port, &t, &replacement_vk, &hpke_pk).await;
+        assert_eq!(status, 409, "duplicate HPKE key accepted (legacy={legacy})");
+        assert_eq!(
+            body["error"],
+            "these keys are already enrolled in this tenant"
         );
-        let res = cl
-            .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
-            .bearer_auth(&admin)
-            .json(&json!({
-                "tenant_id": hex(&TENANT_A),
-                "challenge_id": hex(&challenge_id),
-                "nonce": hex(&nonce),
-                "signing_public_key": hex(&replacement_vk),
-                "hpke_public_key": hex(&hpke_pk),
-                "proof_signature": hex(&shared::signing::sign_tbs(&replacement_signer, &tbs)),
-                "label_ciphertext": hex(b"duplicate-key-upgrade-fixture"),
-            }))
-            .send()
-            .await
-            .unwrap();
-        let status = res.status().as_u16();
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(status, 400, "duplicate HPKE key accepted (legacy={legacy})");
-        assert_eq!(body["error"], "device is already enrolled in this tenant");
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM v2_devices WHERE tenant_id = ?")
             .bind(TENANT_A.as_slice())
             .fetch_one(&pool)
@@ -1212,18 +1225,6 @@ async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
                 .await
                 .unwrap();
         assert_eq!(after, stored_id, "refusal must not rewrite historical ids");
-        let consumed: Option<String> = sqlx::query_scalar(
-            "SELECT consumed_at FROM v2_enrollment_challenges WHERE tenant_id = ? AND id = ?",
-        )
-        .bind(TENANT_A.as_slice())
-        .bind(&challenge_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            consumed.is_none(),
-            "refused duplicate must roll back the challenge claim"
-        );
     }
     pool.close().await;
 }
@@ -1345,65 +1346,18 @@ fn grant_record(
 async fn enroll(
     cl: &reqwest::Client,
     port: u16,
-    tok: &str,
     tenant: &[u8; 16],
     device_sk: &Ed25519SigningKey,
     hpke_pk: &[u8; 32],
 ) -> (Vec<u8>, Vec<u8>) {
-    let tenant_hex = hex(tenant);
-    let tenant_hex = tenant_hex.as_str();
+    let t = ticket(cl, port, tenant).await;
     let device_vk = device_sk.verifying_key().to_bytes();
-
-    let ch: Value = cl
-        .post(format!("{}/v2/devices/enrollment-challenges", base(port)))
-        .bearer_auth(tok)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(hpke_pk),
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let challenge_id = ch["challenge_id"].as_str().unwrap().to_string();
-    let nonce = decode_hex_str(ch["nonce"].as_str().unwrap());
-    let account_id = decode_hex_str(ch["account_id"].as_str().unwrap());
-
-    let proof_bytes = enrollment_proof_bytes(
-        &decode_hex_str(&challenge_id),
-        &nonce,
-        tenant,
-        &account_id,
-        &device_vk,
-        hpke_pk,
-    );
-    let sig = shared::signing::sign_tbs(device_sk, &proof_bytes);
-
-    let body = cl
-        .post(format!("{}/v2/devices/enrollment-proofs", base(port)))
-        .bearer_auth(tok)
-        .json(&json!({
-            "tenant_id": tenant_hex,
-            "challenge_id": challenge_id,
-            "nonce": hex(&nonce),
-            "signing_public_key": hex(&device_vk),
-            "hpke_public_key": hex(hpke_pk),
-            "proof_signature": hex(&sig),
-            "label_ciphertext": hex(b"opaque"),
-        }))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-
-    let enrolled: Value = serde_json::from_str(&body).unwrap();
+    let (status, ch) = enrollment_challenge(cl, port, &t, &device_vk, hpke_pk).await;
+    assert_eq!(status, 201, "{ch}");
+    let (status, enrolled) = prove_enrollment(cl, port, &t, &ch, device_sk).await;
+    assert_eq!(status, 201, "{enrolled}");
     let device_id = decode_hex_str(enrolled["device_id"].as_str().expect("device_id"));
+    let account_id = decode_hex_str(enrolled["account_id"].as_str().expect("account_id"));
     (device_id, account_id)
 }
 
@@ -1434,8 +1388,7 @@ async fn a_filed_root_key_grant_comes_back_sealed_to_its_device() {
     let (device_hpke_sk, device_hpke_pk) = shared::grants::derive_keypair(&[0x66u8; 32]);
     let device_sk = Ed25519SigningKey::from_bytes(&[0x44u8; 32]);
     let device_hpke_pk: [u8; 32] = device_hpke_pk.as_slice().try_into().expect("hpke pk");
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &device_hpke_pk).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &device_hpke_pk).await;
 
     // The tenant root key that custody is actually about. It never leaves this
     // test in plaintext, and the server never sees it.
@@ -1593,8 +1546,7 @@ async fn a_root_key_grant_replay_id_is_claimed_exactly_once() {
     let (_sk, device_hpke_pk) = shared::grants::derive_keypair(&[0x77u8; 32]);
     let device_hpke_pk: [u8; 32] = device_hpke_pk.as_slice().try_into().expect("hpke pk");
     let device_sk = Ed25519SigningKey::from_bytes(&[0x45u8; 32]);
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &device_hpke_pk).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &device_hpke_pk).await;
 
     let trk: [u8; 32] = [0x5Cu8; 32];
 
@@ -1753,8 +1705,7 @@ async fn an_unknown_grant_variant_is_refused_before_it_reaches_the_database() {
     let (_device_hpke_sk, device_hpke_pk) = shared::grants::derive_keypair(&ikm);
     let hpke_pk32: [u8; 32] = device_hpke_pk.as_slice().try_into().unwrap();
 
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &hpke_pk32).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &hpke_pk32).await;
 
     let trk: [u8; 32] = [0x79u8; 32];
     let scope = shared::grants::GrantScope {
@@ -1830,8 +1781,7 @@ async fn a_grant_for_an_unknown_generation_is_refused() {
     let ikm: [u8; 32] = [0x82u8; 32];
     let (_hpke_sk, device_hpke_pk) = shared::grants::derive_keypair(&ikm);
     let hpke_pk32: [u8; 32] = device_hpke_pk.as_slice().try_into().unwrap();
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &hpke_pk32).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &hpke_pk32).await;
 
     let trk: [u8; 32] = [0x83u8; 32];
 
@@ -1901,8 +1851,7 @@ async fn a_second_first_root_self_grant_is_refused() {
     let ikm: [u8; 32] = [0x87u8; 32];
     let (_hpke_sk, device_hpke_pk) = shared::grants::derive_keypair(&ikm);
     let hpke_pk32: [u8; 32] = device_hpke_pk.as_slice().try_into().unwrap();
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &hpke_pk32).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &hpke_pk32).await;
 
     let trk: [u8; 32] = [0x88u8; 32];
     let generation = begin_generation(
@@ -2099,8 +2048,7 @@ async fn a_grant_wrapping_a_different_key_than_its_generation_is_refused() {
     let ikm: [u8; 32] = [0x91u8; 32];
     let (_hpke_sk, device_hpke_pk) = shared::grants::derive_keypair(&ikm);
     let hpke_pk32: [u8; 32] = device_hpke_pk.as_slice().try_into().unwrap();
-    let (device_id, account_id) =
-        enroll(&cl, port, &admin, &TENANT_A, &device_sk, &hpke_pk32).await;
+    let (device_id, account_id) = enroll(&cl, port, &TENANT_A, &device_sk, &hpke_pk32).await;
 
     // The generation commits to this key.
     let committed_trk: [u8; 32] = [0x92u8; 32];
@@ -2317,7 +2265,7 @@ async fn fleet_fixture(
     let (hpke_sk, hpke_pk) = shared::grants::derive_keypair(&[hpke_seed; 32]);
     let hpke_pk: [u8; 32] = hpke_pk.as_slice().try_into().expect("hpke pk");
     let device_sk = Ed25519SigningKey::from_bytes(&[0x44u8; 32]);
-    let (device_id, account_id) = enroll(cl, port, &admin, &TENANT_A, &device_sk, &hpke_pk).await;
+    let (device_id, account_id) = enroll(cl, port, &TENANT_A, &device_sk, &hpke_pk).await;
 
     // A fleet key anchors to an active root generation, so bootstrap one the
     // way a real tenant would: begin, file the first self grant, activate.
