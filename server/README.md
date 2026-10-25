@@ -52,8 +52,11 @@ Avoid `tmpfs`: the record is lost on reboot and v2 then stays disabled.
 All commands run with the **server stopped**. The server and every command
 take an exclusive lock on `<SHARDX_DATA_DIR>/shardx.lock` and refuse while
 another holder runs. That lock only orders processes that see the same
-filesystem through the same kernel. Across a Docker Desktop bind mount it may
-not exclude the server, so stop the server container before running a command.
+filesystem through the same kernel. Measured on Docker Desktop for Windows
+(9p bind mount): a one-off container is refused while the server container
+holds the lock, but a command run on the Windows host against the same
+bind-mounted directory is not. Stop the server container before running a
+command, and never run a host-side command on a directory a container uses.
 
 ```bash
 # one-off container, server container stopped
