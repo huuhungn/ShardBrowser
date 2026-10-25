@@ -4,7 +4,10 @@ export type TeamStatus = {
   tenant_id: string;
   device_id: string;
   has_token: boolean;
+  /** False when the stored keys cannot be opened, so enrollment is offered. */
   is_enrolled: boolean;
+  /** The stored keys were protected by another Windows account or machine. */
+  keys_unreadable: boolean;
   /**
    * Whether profile sync can run. False for a device enrolled before sync
    * existed, which needs re-enrolling to learn its account id.

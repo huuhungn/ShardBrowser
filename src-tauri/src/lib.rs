@@ -2010,7 +2010,9 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     if c.tenant_id.is_empty() {
         return Err(crate::errcode::code("fleet.setTenantFirst"));
     }
-    if c.is_enrolled() {
+    // A device whose stored keys this Windows account cannot open may enroll
+    // again: there is no working identity left to orphan.
+    if c.blocks_enrollment() {
         return Err(crate::errcode::code("fleet.deviceAlreadyEnrolled"));
     }
 

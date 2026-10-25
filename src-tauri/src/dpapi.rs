@@ -10,8 +10,14 @@
 
 use anyhow::Result;
 
-#[cfg(windows)]
 const PREFIX: &str = "dpapi:";
+
+/// Whether a value `reveal` returned is still a protected blob: one this
+/// Windows account cannot open (another account's, another machine's, or a
+/// file copied here from Windows).
+pub fn unreadable(revealed: &str) -> bool {
+    revealed.starts_with(PREFIX)
+}
 
 /// Encode `plain` for storage. Empty stays empty, and a value that is already
 /// protected passes through, so one that failed to unprotect is written back
@@ -23,10 +29,11 @@ pub fn conceal(plain: &str) -> Result<String> {
         return Ok(plain.to_string());
     }
     let failed = || anyhow::anyhow!(crate::errcode::code("keyStore.protectFailed"));
-    let blob = protect(plain.as_bytes()).ok_or_else(failed)?;
+    // SAFETY: `call` only reads its input and frees what Windows allocated.
+    let blob = unsafe { call(plain.as_bytes(), true, KEY_FLAGS) }.ok_or_else(failed)?;
     // Never write a value this account cannot read back: a key lost here is
     // lost for good.
-    if unprotect(&blob).as_deref() != Some(plain.as_bytes()) {
+    if unsafe { call(&blob, false, KEY_FLAGS) }.as_deref() != Some(plain.as_bytes()) {
         return Err(failed());
     }
     Ok(format!("{PREFIX}{}", STANDARD.encode(blob)))
@@ -41,7 +48,8 @@ pub fn reveal(stored: &str) -> String {
     stored
         .strip_prefix(PREFIX)
         .and_then(|b64| STANDARD.decode(b64).ok())
-        .and_then(|blob| unprotect(&blob))
+        // SAFETY: `call` only reads the blob and frees what Windows allocated.
+        .and_then(|blob| unsafe { call(&blob, false, KEY_FLAGS) })
         .and_then(|plain| String::from_utf8(plain).ok())
         .unwrap_or_else(|| stored.to_string())
 }
@@ -67,22 +75,28 @@ pub fn needs_protection(_stored: &str) -> bool {
     false
 }
 
+/// Flags for the key seeds and fleet keys: never show a prompt, since these
+/// are read from background commands with no window to show it in.
+#[cfg(windows)]
+const KEY_FLAGS: u32 = windows_sys::Win32::Security::Cryptography::CRYPTPROTECT_UI_FORBIDDEN;
+
 /// Encrypt `input` for the current Windows user. `None` when Windows refuses.
+/// The cookie path's flags: Chrome reads what this writes, so they stay 0.
 #[cfg(windows)]
 pub fn protect(input: &[u8]) -> Option<Vec<u8>> {
     // SAFETY: `call` only reads `input` and frees the blob Windows allocated.
-    unsafe { call(input, true) }
+    unsafe { call(input, true, 0) }
 }
 
 /// Decrypt a blob `protect` produced for this Windows user.
 #[cfg(windows)]
 pub fn unprotect(input: &[u8]) -> Option<Vec<u8>> {
     // SAFETY: as for `protect`.
-    unsafe { call(input, false) }
+    unsafe { call(input, false, 0) }
 }
 
 #[cfg(windows)]
-unsafe fn call(input: &[u8], protect: bool) -> Option<Vec<u8>> {
+unsafe fn call(input: &[u8], protect: bool, flags: u32) -> Option<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
@@ -102,7 +116,7 @@ unsafe fn call(input: &[u8], protect: bool) -> Option<Vec<u8>> {
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
-            0,
+            flags,
             &mut out_blob,
         )
     } else {
@@ -112,15 +126,23 @@ unsafe fn call(input: &[u8], protect: bool) -> Option<Vec<u8>> {
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
-            0,
+            flags,
             &mut out_blob,
         )
     };
     if ok == 0 {
         return None;
     }
-    let out = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
-    LocalFree(out_blob.pbData as _);
+    // An empty result may come back with a null pointer, which
+    // `from_raw_parts` must never see.
+    let out = if out_blob.cbData == 0 || out_blob.pbData.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
+    };
+    if !out_blob.pbData.is_null() {
+        LocalFree(out_blob.pbData as _);
+    }
     Some(out)
 }
 
@@ -149,9 +171,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_secret_round_trips_through_dpapi() {
+        let blob = protect(b"").expect("protect an empty input");
+        assert_eq!(unprotect(&blob), Some(Vec::new()));
+    }
+
+    #[test]
     fn an_unreadable_blob_is_kept_rather_than_dropped() {
         let junk = format!("{PREFIX}AAAA");
         assert_eq!(reveal(&junk), junk);
+        assert!(unreadable(&reveal(&junk)));
+        assert!(!unreadable(&reveal(&conceal("00ff").unwrap())));
         assert_eq!(
             conceal(&junk).unwrap(),
             junk,

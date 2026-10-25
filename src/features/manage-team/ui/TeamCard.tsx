@@ -173,6 +173,11 @@ export function TeamCard() {
         <div className="mt-1 flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
           {!st.is_enrolled ? (
             <>
+              {st.keys_unreadable && (
+                <p className="m-0 text-paragraph-xs text-state-error-base">
+                  {t("keyStore.otherWindowsAccount")}
+                </p>
+              )}
               <Input
                 label={t("team.deviceLabel")}
                 inputSize="small"

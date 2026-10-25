@@ -24,8 +24,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::sync::Mutex;
 
 use crate::{dpapi, store};
+
+/// Serialises writes. Two pulls can load at once, and both would migrate
+/// through the same temp file: one could truncate it under the other's rename.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One fleet's collected keys, by generation.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -125,27 +131,48 @@ pub fn load() -> Result<FleetKeyStore> {
     if !path.exists() {
         return Ok(FleetKeyStore::default());
     }
-    let body = fs::read_to_string(&path)?;
-    let stored: FleetKeyStore = serde_json::from_str(&body).unwrap_or_default();
-    let plain = stored.map_keys(|v| Ok(dpapi::reveal(v)))?;
+    let mut stored = read(&path)?;
     if stored.has_plaintext_keys() {
-        // Written before keys were protected; nothing else writes this file
-        // any more, so rewrite it now. Best effort: on failure the file keeps
-        // the keys exactly as before.
-        let _ = save(&plain);
+        // Written before keys were protected; rewrite it now. Re-read under
+        // the lock: another load may have migrated it already. Best effort: on
+        // failure the file keeps the keys exactly as before.
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        stored = read(&path)?;
+        if stored.has_plaintext_keys() {
+            let _ = write(&path, &stored);
+        }
     }
-    Ok(plain)
+    stored.map_keys(|v| Ok(dpapi::reveal(v)))
 }
 
+/// Test-only: production writes this file only to migrate it in `load`.
+#[cfg(test)]
 pub fn save(s: &FleetKeyStore) -> Result<()> {
     let path = store::fleet_keys_path()?;
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    write(&path, s)
+}
+
+/// The file as stored: keys still in their on-disk form.
+fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
+    let body = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&body).unwrap_or_default())
+}
+
+/// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
+fn write(path: &std::path::Path, s: &FleetKeyStore) -> Result<()> {
     let on_disk = s.map_keys(dpapi::conceal)?;
-    // Write-then-rename, as with team.json: a crash mid-write must not leave a
-    // file that reads back as "no keys" and silently strands the snapshots.
+    // Write-then-rename, flushed before the rename: a crash must not leave a
+    // file that reads back as "no keys" and strands the snapshots. std cannot
+    // flush the parent directory on Windows, so the rename itself is not
+    // fsynced there.
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(&on_disk)?)?;
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(serde_json::to_string_pretty(&on_disk)?.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     restrict(&tmp);
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -205,6 +232,52 @@ mod tests {
             "Debug leaked a key: {shown}"
         );
         assert!(shown.contains("ab"), "the fleet id is not secret");
+    }
+
+    /// Concurrent loads and saves (two pulls at once) must all succeed, each
+    /// see the key, and leave a file that still holds it.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_migrations_never_lose_the_key() {
+        let _lock = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let path = store::fleet_keys_path().unwrap();
+        let mut s = FleetKeyStore::default();
+        s.insert("ab", 1, &[0x5Au8; 32]);
+        let plaintext = serde_json::to_string(&s).unwrap();
+
+        let mut lost = 0;
+        for _ in 0..40 {
+            fs::write(&path, &plaintext).unwrap();
+            let threads: Vec<_> = (0..8)
+                .map(|i| {
+                    // Half the threads also save: saves share the temp file.
+                    let s = s.clone();
+                    std::thread::spawn(move || {
+                        (0..4).all(|_| {
+                            let saved = i % 2 == 1 || save(&s).is_ok();
+                            saved && load().is_ok_and(|s| !s.keys_newest_first("ab").is_empty())
+                        })
+                    })
+                })
+                .collect();
+            for t in threads {
+                if !t.join().unwrap() {
+                    lost += 1;
+                }
+            }
+            if load().unwrap().keys_newest_first("ab").is_empty() {
+                lost += 1;
+            }
+        }
+        store::set_config_root(None);
+        assert_eq!(
+            lost, 0,
+            "a concurrent migration lost the key {lost} time(s)"
+        );
     }
 
     #[cfg(windows)]

@@ -4,7 +4,6 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { toast } from "../../../shared/lib/toast";
 import { confirmModal } from "../../../shared/lib/confirm";
 import { passphraseModal } from "../../../shared/model/passphrase";
-import { useTeam } from "../../team";
 import { clip } from "../../../shared/lib/clipboard";
 import { readTextFile, fmtBytes, safeUiError } from "../../../shared/lib/utils";
 import { storeBus } from "../../../shared/lib/storeBus";
@@ -556,13 +555,14 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           { label: t("profile.pullAndReplace"), value: true, danger: true },
         ],
       }))) return;
-      let passphrase: string | null = "";
-      if (!useTeam.getState().status?.has_fleet_key) {
-        passphrase = await passphraseModal({
-          title: t("profile.passphraseForThisProfile"),
-          message: t("profile.thePassphraseUsedWhenThisProfileWas"),
-        });
-      }
+      // Always ask. Fleet keys an earlier version cached are still tried
+      // first, so an older snapshot may open without the passphrase.
+      const passphrase = await passphraseModal({
+        title: t("profile.passphraseForThisProfile"),
+        message:
+          t("profile.thePassphraseUsedWhenThisProfileWas") + " " +
+          t("profile.olderSnapshotsMayOpenWithThisDevicesKey"),
+      });
       if (passphrase === null) return;
       const bytes = await profileSyncPull(p.id, passphrase);
       toast.ok(t("profile.pulledVersion", { v: remote.version, size: fmtBytes(bytes) }));
