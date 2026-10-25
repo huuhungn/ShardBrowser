@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.4.3
+
+A security fix release for Team sync. The browser engine is unchanged
+(Chromium 156.0.8078.48, engine build 1).
+
+### Security
+
+- Team sync no longer accepts fleet keys from the team server. 2.4.2 opened
+  every fleet key grant the server listed, without verifying who issued it,
+  and used that key for every later push, so a malicious or compromised team
+  server could read profiles pushed after it planted a key. Push now always
+  seals under the team passphrase; pull still tries fleet keys already on the
+  device, so snapshots pushed under a fleet key keep restoring. Passphrase-free
+  sync returns once key grants are verified against a trust chain (v0.2.x).
+- Device keys are protected at rest on Windows. The device signing and HPKE
+  seeds in `team.json` and cached fleet keys are DPAPI-protected for the
+  current Windows user, migrated in place on first start, and no longer appear
+  in debug output.
+- Team server: only an active tenant owner can begin or activate a root key
+  generation. Any member could before.
+
+### Known issues
+
+- A protected `team.json` or fleet key cache opens only under the same Windows
+  account. After an administrator password reset, a reinstall that copies
+  `%APPDATA%` back, or a move to another account or machine, enroll the device
+  again; the launcher keeps a copy of the old `team.json` first. Re-push
+  profiles that were pushed under a fleet key so they are sealed under the
+  passphrase.
+- Downgrading to 2.4.2 after 2.4.3 has started breaks Team on that device,
+  because 2.4.2 cannot read the protected seeds. Enroll it again.
+- A fleet key a hostile server planted before this release stays usable for
+  pulls until the cached key is removed.
+
 ## v2.4.2
 
 A fix release for the launcher and the team server. The browser engine is

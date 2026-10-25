@@ -1,6 +1,6 @@
 {
   "name": "shardx-mcp",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "description": "MCP server for the ShardX Launcher — drives the local automation API and a profile's browser over CDP.",
   "type": "module",
   "bin": {

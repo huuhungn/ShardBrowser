@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.3",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "team-sync-passphrase-only",
+          "title": "Team sync no longer trusts keys from the server",
+          "lead": "Pushing a profile to your team always uses the team passphrase again.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The launcher used to accept a fleet key from the team server without checking who issued it, and then used that key for every push. A compromised server could have read those profiles. Pushes now always use the team passphrase. Snapshots pushed under a fleet key still restore on devices that already hold the key."
+            },
+            {
+              "type": "note",
+              "text": "Team keys on this computer are now encrypted for your Windows account. If you move the launcher to another account or machine, enroll the device again."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.2",
       "date": "2026-10-24",
       "entries": [
