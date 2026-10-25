@@ -65,10 +65,12 @@ pub enum RecordError {
     BadValue(&'static str),
     PayloadHashMismatch,
     ContainerHashMismatch,
-    UnsupportedSuite {
+    /// A suite or version this build does not support.
+    Unsupported {
         field: &'static str,
         id: u64,
     },
+    UnknownPayloadDomain(String),
     /// The public key the caller looked up does not hash to `issuer_signing_key_id`.
     IssuerKeyMismatch,
     Signature,
@@ -78,7 +80,10 @@ impl RecordError {
     /// Wire code from the plan's error table (L1233, L1237, L1240).
     pub fn code(&self) -> &'static str {
         match self {
-            Self::Cbor(CborError::IntegerOutOfSqliteDomain(_)) => "WIRE_INTEGER_OUT_OF_RANGE",
+            // Plan L1237: negative values are out of range too, not malformed.
+            Self::Cbor(
+                CborError::IntegerOutOfSqliteDomain(_) | CborError::UnsupportedMajorType(1),
+            ) => "WIRE_INTEGER_OUT_OF_RANGE",
             Self::Cbor(_)
             | Self::NotAMap(_)
             | Self::UnknownField { .. }
@@ -87,7 +92,7 @@ impl RecordError {
             | Self::BadValue(_) => "NON_CANONICAL_RECORD",
             Self::PayloadHashMismatch => "SIGNED_BYTES_MISMATCH",
             Self::ContainerHashMismatch => "SIGNED_CONTAINER_HASH_MISMATCH",
-            Self::UnsupportedSuite { .. } => "SCHEMA_UNSUPPORTED",
+            Self::Unsupported { .. } | Self::UnknownPayloadDomain(_) => "SCHEMA_UNSUPPORTED",
             Self::IssuerKeyMismatch => "KEY_SUBSTITUTION_DETECTED",
             Self::Signature => "SIGNATURE_INVALID",
         }
@@ -111,7 +116,8 @@ impl std::fmt::Display for RecordError {
             Self::ContainerHashMismatch => {
                 write!(f, "signed_container_hash does not match the container core")
             }
-            Self::UnsupportedSuite { field, id } => write!(f, "unsupported {field} {id}"),
+            Self::Unsupported { field, id } => write!(f, "unsupported {field} {id}"),
+            Self::UnknownPayloadDomain(d) => write!(f, "unsupported payload_domain {d}"),
             Self::IssuerKeyMismatch => write!(f, "issuer key does not match issuer_signing_key_id"),
             Self::Signature => write!(f, "signature verification failed"),
         }
@@ -231,23 +237,62 @@ impl Fields {
 
 // -------------------------------------------------------------- container ---
 
-/// A `SignedAuthorizationRecordV2` whose bytes, hashes and suite were checked.
-/// The signature is checked separately by [`AuthorizationRecord::verify_signature`],
-/// because the caller first has to look up the issuer key.
+/// The payload kinds this build can parse. Any other `payload_domain` is
+/// `SCHEMA_UNSUPPORTED`: the record may be valid, but not for this build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payload {
+    DeviceApproval(DeviceApprovalV2),
+    TenantCapabilityGrant(TenantCapabilityGrantV2),
+    DeviceHpkeGrant(DeviceHpkeGrantV2),
+}
+
+impl Payload {
+    fn parse(domain: &str, bytes: &[u8]) -> Result<Self> {
+        match domain {
+            DOMAIN_DEVICE_APPROVAL => DeviceApprovalV2::parse(bytes).map(Self::DeviceApproval),
+            DOMAIN_TENANT_CAPABILITY_GRANT => {
+                TenantCapabilityGrantV2::parse(bytes).map(Self::TenantCapabilityGrant)
+            }
+            DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE => {
+                DeviceHpkeGrantV2::parse(bytes).map(Self::DeviceHpkeGrant)
+            }
+            other => Err(RecordError::UnknownPayloadDomain(other.to_string())),
+        }
+    }
+}
+
+/// A `SignedAuthorizationRecordV2` whose bytes, hashes, suite and payload were
+/// checked. Fields are read-only, and the payload is reachable only through
+/// [`AuthorizationRecord::verify_signature`], so nothing can act on a payload
+/// whose signature was never checked, or on bytes changed after parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationRecord {
-    pub payload_domain: String,
-    pub payload_version: u16,
-    pub canonical_payload_bytes: Vec<u8>,
-    pub payload_sha256: [u8; 32],
-    pub signature_suite_id: u16,
-    pub signature_version: u16,
-    pub issuer_signing_key_id: [u8; 32],
-    pub signature_bytes: Vec<u8>,
-    pub signed_container_hash: [u8; 32],
-    pub exact_signed_container_bytes: Vec<u8>,
-    pub exact_signed_container_bytes_sha256: [u8; 32],
+    payload_domain: String,
+    canonical_payload_bytes: Vec<u8>,
+    payload_sha256: [u8; 32],
+    issuer_signing_key_id: [u8; 32],
+    signature_bytes: Vec<u8>,
+    signed_container_hash: [u8; 32],
+    exact_signed_container_bytes: Vec<u8>,
+    exact_signed_container_bytes_sha256: [u8; 32],
     tbs_bytes: Vec<u8>,
+    payload: Payload,
+}
+
+/// A record whose signature verified under the issuer key the caller supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedRecord {
+    record: AuthorizationRecord,
+}
+
+impl VerifiedRecord {
+    pub fn record(&self) -> &AuthorizationRecord {
+        &self.record
+    }
+
+    pub fn payload(&self) -> &Payload {
+        &self.record.payload
+    }
 }
 
 /// The nine TBS fields, from `container_domain` to `issuer_signing_key_id`.
@@ -287,13 +332,18 @@ pub fn build_record(sk: &SigningKey, payload_domain: &str, payload_bytes: &[u8])
 
 impl AuthorizationRecord {
     /// Parses exact container bytes. Accepts only suite 1 version 1 (Ed25519,
-    /// ADR 0002 D-8) and checks that the payload's own `domain` and `version`
-    /// equal the container's.
+    /// ADR 0002 D-8), checks that the payload's own `domain` and `version`
+    /// equal the container's, and parses the payload by its closed schema.
+    /// A newer container or payload version is `SCHEMA_UNSUPPORTED`.
     pub fn parse(exact: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("SignedAuthorizationRecordV2", exact)?;
         f.exact_text("container_domain", CONTAINER_DOMAIN)?;
-        if f.u16("container_version")? != CONTAINER_VERSION {
-            return Err(RecordError::BadValue("container_version"));
+        let container_version = f.u16("container_version")?;
+        if container_version != CONTAINER_VERSION {
+            return Err(RecordError::Unsupported {
+                field: "container_version",
+                id: container_version.into(),
+            });
         }
         let payload_domain = f.text("payload_domain")?;
         let payload_version = f.u16("payload_version")?;
@@ -307,16 +357,19 @@ impl AuthorizationRecord {
         f.finish()?;
 
         if payload_version != PAYLOAD_VERSION {
-            return Err(RecordError::BadValue("payload_version"));
+            return Err(RecordError::Unsupported {
+                field: "payload_version",
+                id: payload_version.into(),
+            });
         }
         if signature_suite_id != SIGNATURE_SUITE_ID_ED25519 {
-            return Err(RecordError::UnsupportedSuite {
+            return Err(RecordError::Unsupported {
                 field: "signature_suite_id",
                 id: signature_suite_id.into(),
             });
         }
         if signature_version != SIGNATURE_VERSION {
-            return Err(RecordError::UnsupportedSuite {
+            return Err(RecordError::Unsupported {
                 field: "signature_version",
                 id: signature_version.into(),
             });
@@ -352,32 +405,73 @@ impl AuthorizationRecord {
         if p.u16("version")? != payload_version {
             return Err(RecordError::BadValue("payload_version"));
         }
+        let payload = Payload::parse(&payload_domain, &canonical_payload_bytes)?;
 
         Ok(Self {
             payload_domain,
-            payload_version,
             canonical_payload_bytes,
             payload_sha256,
-            signature_suite_id,
-            signature_version,
             issuer_signing_key_id,
             signature_bytes,
             signed_container_hash,
             exact_signed_container_bytes: exact.to_vec(),
             exact_signed_container_bytes_sha256: c::sha256(exact),
             tbs_bytes,
+            payload,
         })
     }
 
-    /// Checks the signature under the issuer key the caller looked up by
-    /// `issuer_signing_key_id`. A key with a different ID is refused before any
-    /// curve arithmetic, so a lookup bug cannot verify under the wrong key.
-    pub fn verify_signature(&self, issuer_public_key: &[u8; 32]) -> Result<()> {
+    /// Checks the signature under the issuer key the caller looked up.
+    ///
+    /// The caller owns the lookup: the key must be found by tenant, server
+    /// instance, epoch and `issuer_signing_key_id`, and its holder must satisfy
+    /// the ADR 0002 D-2 issuer rule for this payload. This function only refuses
+    /// a key whose ID differs from `issuer_signing_key_id`, before any curve
+    /// arithmetic, and then verifies under `verify_strict`.
+    pub fn verify_signature(self, issuer_public_key: &[u8; 32]) -> Result<VerifiedRecord> {
         if signing_key_id(issuer_public_key) != self.issuer_signing_key_id {
             return Err(RecordError::IssuerKeyMismatch);
         }
         signing::verify_tbs(issuer_public_key, &self.tbs_bytes, &self.signature_bytes)
-            .map_err(|_| RecordError::Signature)
+            .map_err(|_| RecordError::Signature)?;
+        Ok(VerifiedRecord { record: self })
+    }
+
+    pub fn payload_domain(&self) -> &str {
+        &self.payload_domain
+    }
+
+    pub fn canonical_payload_bytes(&self) -> &[u8] {
+        &self.canonical_payload_bytes
+    }
+
+    pub fn payload_sha256(&self) -> &[u8; 32] {
+        &self.payload_sha256
+    }
+
+    /// Always suite 1 version 1; a record with any other value does not parse.
+    pub fn signature_suite(&self) -> (u16, u16) {
+        (SIGNATURE_SUITE_ID_ED25519, SIGNATURE_VERSION)
+    }
+
+    pub fn issuer_signing_key_id(&self) -> &[u8; 32] {
+        &self.issuer_signing_key_id
+    }
+
+    pub fn signature_bytes(&self) -> &[u8] {
+        &self.signature_bytes
+    }
+
+    pub fn signed_container_hash(&self) -> &[u8; 32] {
+        &self.signed_container_hash
+    }
+
+    pub fn exact_signed_container_bytes(&self) -> &[u8] {
+        &self.exact_signed_container_bytes
+    }
+
+    pub fn exact_signed_container_bytes_sha256(&self) -> &[u8; 32] {
+        &self.exact_signed_container_bytes_sha256
     }
 
     /// The exact bytes the signature covers.
@@ -473,7 +567,7 @@ pub struct DeviceApprovalV2 {
 const APPROVED_USE_TEAM_DEVICE: &str = "team.device";
 
 impl DeviceApprovalV2 {
-    pub fn parse(payload: &[u8]) -> Result<Self> {
+    fn parse(payload: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("DeviceApprovalV2", payload)?;
         let common = CommonFields::take(&mut f, DOMAIN_DEVICE_APPROVAL)?;
         let subject_account_id = f.fixed("subject_account_id")?;
@@ -652,10 +746,10 @@ pub struct TenantCapabilityGrantV2 {
 }
 
 impl TenantCapabilityGrantV2 {
-    /// Parses the L484 shape. `root.custody` parses when device-scoped, as Q-2
-    /// keeps that shape, but [`Self::is_issuable`] refuses it: custody comes only
-    /// from root grants.
-    pub fn parse(payload: &[u8]) -> Result<Self> {
+    /// Parses the L484 shape. `root.custody` parses when device-scoped and
+    /// tenant-scoped, as Q-2 keeps that shape, but [`Self::is_issuable`] refuses
+    /// it: custody comes only from root grants.
+    fn parse(payload: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("TenantCapabilityGrantV2", payload)?;
         let common = CommonFields::take(&mut f, DOMAIN_TENANT_CAPABILITY_GRANT)?;
         let subject_kind = f.text("subject_kind")?;
@@ -698,6 +792,11 @@ impl TenantCapabilityGrantV2 {
         match capability {
             Capability::RootCustody if !matches!(subject, GrantSubject::Device { .. }) => {
                 return Err(RecordError::BadValue("capability"));
+            }
+            // Custody is tenant-wide: the root key covers every fleet, so only a
+            // tenant scope describes it (this ADR's reading of L484 and Q-2).
+            Capability::RootCustody if scope_kind != CapabilityScopeKind::Tenant => {
+                return Err(RecordError::BadValue("scope_kind"));
             }
             Capability::RootCustody => {}
             Capability::FleetKeyReceive | Capability::FleetKeyRecover => {
@@ -776,8 +875,10 @@ const GRANT_VARIANT_DEVICE_HPKE: &str = "DeviceHpkeGrant";
 
 impl DeviceHpkeGrantV2 {
     /// The closed HPKE `info` map (D-8). The grant carries these exact bytes,
-    /// and [`Self::parse`] refuses a grant whose bytes differ, so the info a
-    /// recipient opens with is always the one bound to the signed fields.
+    /// and parsing refuses a grant whose bytes differ, so the info a recipient
+    /// opens with is always the one bound to the signed fields. That refusal is
+    /// `NON_CANONICAL_RECORD`: the payload contradicts itself. A difference from
+    /// a stored column is the caller's `AUTH_CLAIM_COLUMN_MISMATCH` (plan 7.2).
     pub fn hpke_info_bytes(&self) -> Vec<u8> {
         let k = &self.common;
         c::encode(&c::m(vec![
@@ -805,7 +906,7 @@ impl DeviceHpkeGrantV2 {
         ]))
     }
 
-    pub fn parse(payload: &[u8]) -> Result<Self> {
+    fn parse(payload: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("DeviceHpkeGrant", payload)?;
         let common = CommonFields::take(&mut f, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE)?;
         f.exact_text("grant_variant", GRANT_VARIANT_DEVICE_HPKE)?;
@@ -824,7 +925,7 @@ impl DeviceHpkeGrantV2 {
         f.finish()?;
 
         if hpke_suite_id != HPKE_SUITE_ID_X25519_CHACHA {
-            return Err(RecordError::UnsupportedSuite {
+            return Err(RecordError::Unsupported {
                 field: "hpke_suite_id",
                 id: hpke_suite_id.into(),
             });
@@ -986,7 +1087,7 @@ mod tests {
         }
     }
 
-    /// Re-encodes `payload` with `edit` applied to its field list.
+    /// Re-encodes canonical map bytes with `edit` applied to the field list.
     fn edit_map(bytes: &[u8], edit: impl FnOnce(&mut Vec<(String, Value)>)) -> Vec<u8> {
         let Value::Map(mut entries) = c::decode(bytes).unwrap() else {
             panic!("not a map")
@@ -1004,6 +1105,13 @@ mod tests {
         r.expect_err("expected a rejection").code()
     }
 
+    /// Signs `payload` under `domain`, then parses and verifies the record.
+    fn sign_and_verify(domain: &str, payload: &[u8]) -> Result<VerifiedRecord> {
+        let sk = issuer();
+        AuthorizationRecord::parse(&build_record(&sk, domain, payload))?
+            .verify_signature(sk.verifying_key().as_bytes())
+    }
+
     // ---------------------------------------------------------- container ---
 
     #[test]
@@ -1012,123 +1120,136 @@ mod tests {
         let payload = approval().encode();
         let exact = build_record(&sk, DOMAIN_DEVICE_APPROVAL, &payload);
         let rec = AuthorizationRecord::parse(&exact).unwrap();
-        assert_eq!(rec.payload_domain, DOMAIN_DEVICE_APPROVAL);
-        assert_eq!(rec.canonical_payload_bytes, payload);
-        assert_eq!(rec.exact_signed_container_bytes, exact);
-        assert_eq!(rec.verify_signature(sk.verifying_key().as_bytes()), Ok(()));
+        assert_eq!(rec.payload_domain(), DOMAIN_DEVICE_APPROVAL);
+        assert_eq!(rec.canonical_payload_bytes(), payload);
+        assert_eq!(rec.exact_signed_container_bytes(), exact);
         assert_eq!(
-            DeviceApprovalV2::parse(&rec.canonical_payload_bytes).unwrap(),
-            approval()
+            rec.issuer_signing_key_id(),
+            &signing_key_id(sk.verifying_key().as_bytes())
         );
+        let verified = rec.verify_signature(sk.verifying_key().as_bytes()).unwrap();
+        assert_eq!(verified.payload(), &Payload::DeviceApproval(approval()));
+        assert_eq!(verified.record().exact_signed_container_bytes(), exact);
     }
 
-    /// Regression vector pinned at this commit, so any change to the field set,
-    /// the payload encoding or the container assembly shows up as a diff.
+    /// Regression vectors pinned at this commit, so any change to a field set,
+    /// a payload encoding or the container assembly shows up as a diff.
     #[test]
-    fn device_approval_golden_vector() {
-        let payload = approval().encode();
-        let exact = build_record(&issuer(), DOMAIN_DEVICE_APPROVAL, &payload);
-        let rec = AuthorizationRecord::parse(&exact).unwrap();
+    fn golden_vectors() {
+        let cases = [
+            (
+                DOMAIN_DEVICE_APPROVAL,
+                approval().encode(),
+                "06985017828088ac0bce13425bf0e439af3937643091931a5e7648b913b60189",
+                "a8d4bc42778377524176aa3f806306b133f94d26df10c3f07406856ee66987da",
+            ),
+            (
+                DOMAIN_TENANT_CAPABILITY_GRANT,
+                device_grant(Capability::DeviceApprove, CapabilityScopeKind::Fleet).encode(),
+                "db116833af5bdf359b78f153c8f1bf1ecbee00993584effd8d782b1f75e938d8",
+                "d039b6d784b7316f6feca96987c957760c05621905c11b458353576f9f8f4882",
+            ),
+            (
+                DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+                hpke_grant().encode(),
+                "f816e7b501732ffa3ce94236395d0497e7b30ba4537b04fbcaccf8415eed558f",
+                "4a9150a067d5951fbaf6bb672d38c0b0271b5005daa87593cb4b34d5135fbc42",
+            ),
+        ];
+        for (domain, payload, container_hash, exact_sha) in cases {
+            let rec =
+                AuthorizationRecord::parse(&build_record(&issuer(), domain, &payload)).unwrap();
+            assert_eq!(hex(rec.signed_container_hash()), container_hash, "{domain}");
+            assert_eq!(
+                hex(rec.exact_signed_container_bytes_sha256()),
+                exact_sha,
+                "{domain}"
+            );
+        }
         assert_eq!(
-            hex(&rec.payload_sha256),
+            hex(&c::sha256(&approval().encode())),
             "89e4d4c23e4a1aa0d085b812bedb12cf68c52433b4e2f50c4f972733e6031048"
         );
+        // D-8 asks for golden info bytes; pinned by length and SHA-256.
+        let info = hpke_grant().hpke_info_bytes();
+        assert_eq!(info.len(), 492);
         assert_eq!(
-            hex(&rec.signed_container_hash),
-            "06985017828088ac0bce13425bf0e439af3937643091931a5e7648b913b60189"
-        );
-        assert_eq!(
-            hex(&rec.exact_signed_container_bytes_sha256),
-            "a8d4bc42778377524176aa3f806306b133f94d26df10c3f07406856ee66987da"
+            hex(&c::sha256(&info)),
+            "2a4877e5df7b46a2c00c6809e334f58cdffdeefe063b36d78c7611c593f8e518"
         );
     }
 
     #[test]
     fn container_rejects_every_field_level_defect() {
-        let sk = issuer();
-        let payload = approval().encode();
-        let good = build_record(&sk, DOMAIN_DEVICE_APPROVAL, &payload);
-
+        let good = build_record(&issuer(), DOMAIN_DEVICE_APPROVAL, &approval().encode());
         let with = |key: &str, v: Value| edit_map(&good, |e| set(e, key, v));
         let without = |key: &str| edit_map(&good, |e| e.retain(|(k, _)| k != key));
+        let parse = |b: &[u8]| AuthorizationRecord::parse(b);
 
         // Closed map.
-        assert_eq!(
-            code_of(AuthorizationRecord::parse(&with("extra", c::u(1)))),
-            "NON_CANONICAL_RECORD"
-        );
         assert!(matches!(
-            AuthorizationRecord::parse(&without("payload_sha256")),
+            parse(&with("extra", c::u(1))),
+            Err(RecordError::UnknownField { .. })
+        ));
+        assert!(matches!(
+            parse(&without("payload_sha256")),
             Err(RecordError::MissingField {
                 field: "payload_sha256",
                 ..
             })
         ));
-        // Exact values.
+        // Exact values, and newer versions or suites this build cannot read.
         assert_eq!(
-            AuthorizationRecord::parse(&with("container_domain", c::t("shardx.other"))),
+            parse(&with("container_domain", c::t("shardx.other"))),
             Err(RecordError::BadValue("container_domain"))
         );
+        for (field, v) in [
+            ("container_version", 3),
+            ("payload_version", 3),
+            ("signature_suite_id", 2),
+            ("signature_version", 2),
+        ] {
+            assert_eq!(
+                parse(&with(field, c::u(v))),
+                Err(RecordError::Unsupported { field, id: v }),
+                "{field}"
+            );
+            assert_eq!(code_of(parse(&with(field, c::u(v)))), "SCHEMA_UNSUPPORTED");
+        }
         assert_eq!(
-            AuthorizationRecord::parse(&with("container_version", c::u(1))),
-            Err(RecordError::BadValue("container_version"))
-        );
-        assert_eq!(
-            code_of(AuthorizationRecord::parse(&with(
-                "signature_suite_id",
-                c::u(2)
-            ))),
-            "SCHEMA_UNSUPPORTED"
-        );
-        assert_eq!(
-            code_of(AuthorizationRecord::parse(&with(
-                "signature_bytes",
-                c::b(&[1u8; 63])
-            ))),
+            code_of(parse(&with("signature_bytes", c::b(&[1u8; 63])))),
             "NON_CANONICAL_RECORD"
         );
         // Hashes are recomputed, never trusted.
         assert_eq!(
-            code_of(AuthorizationRecord::parse(&with(
-                "payload_sha256",
-                c::b(&[0u8; 32])
-            ))),
+            code_of(parse(&with("payload_sha256", c::b(&[0u8; 32])))),
             "SIGNED_BYTES_MISMATCH"
         );
         assert_eq!(
-            code_of(AuthorizationRecord::parse(&with(
-                "signed_container_hash",
-                c::b(&[0u8; 32])
-            ))),
+            code_of(parse(&with("signed_container_hash", c::b(&[0u8; 32])))),
             "SIGNED_CONTAINER_HASH_MISMATCH"
         );
         // Trailing byte and a non-shortest integer are not canonical.
         let mut trailing = good.clone();
         trailing.push(0);
-        assert_eq!(
-            code_of(AuthorizationRecord::parse(&trailing)),
-            "NON_CANONICAL_RECORD"
-        );
-        assert_eq!(
-            code_of(AuthorizationRecord::parse(&[0x18, 0x01])),
-            "NON_CANONICAL_RECORD"
-        );
+        assert_eq!(code_of(parse(&trailing)), "NON_CANONICAL_RECORD");
+        assert_eq!(code_of(parse(&[0x18, 0x01])), "NON_CANONICAL_RECORD");
     }
 
     #[test]
     fn signature_binds_issuer_and_bytes() {
         let sk = issuer();
         let exact = build_record(&sk, DOMAIN_DEVICE_APPROVAL, &approval().encode());
-        let rec = AuthorizationRecord::parse(&exact).unwrap();
+        let parsed = || AuthorizationRecord::parse(&exact).unwrap();
 
         let other = SigningKey::from_bytes(&fx::<32>("someone-else"));
         assert_eq!(
-            rec.verify_signature(other.verifying_key().as_bytes()),
+            parsed().verify_signature(other.verifying_key().as_bytes()),
             Err(RecordError::IssuerKeyMismatch)
         );
 
-        // A signature flipped in place keeps a valid container hash only if the
-        // hash is recomputed too, which is what a forger would do.
+        // A flipped signature with a recomputed container hash, which is what a
+        // forger would send.
         let forged = edit_map(&exact, |e| {
             let Some((_, Value::Bytes(sig))) = e.iter_mut().find(|(k, _)| k == "signature_bytes")
             else {
@@ -1151,32 +1272,79 @@ mod tests {
     }
 
     #[test]
-    fn payload_domain_and_version_must_match_the_container() {
-        let sk = issuer();
+    fn small_order_issuer_key_never_verifies() {
+        // Issuer key = the identity point, R = identity, S = 0. Plain `verify`
+        // accepts this signature for every message; `verify_strict` must not.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&identity);
         let payload = approval().encode();
-        let as_grant = build_record(&sk, DOMAIN_TENANT_CAPABILITY_GRANT, &payload);
+        let mut core = tbs_fields(
+            DOMAIN_DEVICE_APPROVAL,
+            &payload,
+            &c::sha256(&payload),
+            &signing_key_id(&identity),
+        );
+        core.push(("signature_bytes", c::b(&sig)));
+        let hash = c::domain_hash(c::L_SIGNED_CONTAINER, &c::encode(&c::m(core.clone())));
+        core.push(("signed_container_hash", c::b(&hash)));
+        let exact = c::encode(&c::m(core));
+
+        let rec = AuthorizationRecord::parse(&exact).unwrap();
         assert_eq!(
-            AuthorizationRecord::parse(&as_grant),
-            Err(RecordError::BadValue("payload_domain"))
+            rec.verify_signature(&identity).err(),
+            Some(RecordError::Signature)
         );
     }
 
     #[test]
-    fn integer_above_the_sqlite_domain_is_its_own_code() {
-        // restore_epoch = 2^63 encoded by hand: major 0, 8-byte argument.
+    fn payload_must_match_the_container_and_a_known_schema() {
+        let payload = approval().encode();
+        // Signed under another known domain.
+        assert_eq!(
+            sign_and_verify(DOMAIN_TENANT_CAPABILITY_GRANT, &payload),
+            Err(RecordError::BadValue("payload_domain"))
+        );
+        // A payload that says version 3 inside a container that says 2.
+        let v3 = edit_map(&payload, |e| set(e, "version", c::u(3)));
+        assert_eq!(
+            sign_and_verify(DOMAIN_DEVICE_APPROVAL, &v3),
+            Err(RecordError::BadValue("payload_version"))
+        );
+        // A domain this build does not know, named the same in both places.
+        let unknown = edit_map(&payload, |e| set(e, "domain", c::t("shardx.auth.other.v2")));
+        assert_eq!(
+            sign_and_verify("shardx.auth.other.v2", &unknown),
+            Err(RecordError::UnknownPayloadDomain(
+                "shardx.auth.other.v2".into()
+            ))
+        );
+        assert_eq!(
+            code_of(sign_and_verify("shardx.auth.other.v2", &unknown)),
+            "SCHEMA_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn integers_outside_the_sqlite_domain_have_their_own_code() {
         let payload = edit_map(&approval().encode(), |e| set(e, "restore_epoch", c::u(1)));
         let at = payload
             .windows(14)
             .position(|w| w == b"\x6drestore_epoch")
             .unwrap()
             + 14;
-        let mut raw = payload[..at].to_vec();
-        raw.extend_from_slice(&[0x1b, 0x80, 0, 0, 0, 0, 0, 0, 0]);
-        raw.extend_from_slice(&payload[at + 1..]);
-        assert_eq!(
-            code_of(DeviceApprovalV2::parse(&raw)),
-            "WIRE_INTEGER_OUT_OF_RANGE"
-        );
+        // 2^63 (major 0, 8-byte argument) and -1 (major 1).
+        for value in [&[0x1b, 0x80, 0, 0, 0, 0, 0, 0, 0][..], &[0x20]] {
+            let mut raw = payload[..at].to_vec();
+            raw.extend_from_slice(value);
+            raw.extend_from_slice(&payload[at + 1..]);
+            assert_eq!(
+                code_of(DeviceApprovalV2::parse(&raw)),
+                "WIRE_INTEGER_OUT_OF_RANGE",
+                "{value:02x?}"
+            );
+        }
     }
 
     // --------------------------------------------------------- approvals ---
@@ -1240,33 +1408,53 @@ mod tests {
 
     // ------------------------------------------------------- capabilities ---
 
+    /// ADR 0002 D-2, written out by hand: each value and the scope kinds a
+    /// capability grant may carry it with. `root.custody` keeps its L484 shape
+    /// at tenant scope but is never issuable; the last two never appear here.
+    const D2_TABLE: [(&str, &[&str]); 14] = [
+        ("tenant.manage", &["tenant"]),
+        ("membership.manage", &["tenant"]),
+        ("fleet.manage", &["tenant", "fleet"]),
+        ("device.approve", &["tenant", "fleet"]),
+        ("device.revoke", &["tenant", "fleet"]),
+        ("key.rotate", &["tenant", "fleet"]),
+        ("recovery.manage", &["tenant"]),
+        ("lease.force_expire", &["tenant", "fleet", "profile"]),
+        ("profile.publish", &["tenant", "fleet"]),
+        ("profile.checkout", &["tenant", "fleet", "profile"]),
+        ("profile.commit", &["tenant", "fleet", "profile"]),
+        ("root.custody", &["tenant"]),
+        ("fleet.key.receive", &[]),
+        ("fleet.key.recover", &[]),
+    ];
+
     #[test]
-    fn every_grantable_value_parses_in_its_scopes_and_only_there() {
+    fn capability_grants_follow_the_d2_table() {
         use CapabilityScopeKind::{Fleet, Profile, Tenant};
-        let mut grantable = 0;
-        for cap in Capability::ALL {
+        assert_eq!(Capability::ALL.len(), D2_TABLE.len());
+        for (name, scopes) in D2_TABLE {
+            let cap = Capability::parse(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(cap.as_str(), name);
             for scope in [Tenant, Fleet, Profile] {
                 let parsed = TenantCapabilityGrantV2::parse(&device_grant(cap, scope).encode());
-                let allowed = cap.grant_scopes().contains(&scope) || cap == Capability::RootCustody;
                 assert_eq!(
                     parsed.is_ok(),
-                    allowed,
-                    "{} at {scope:?}: {parsed:?}",
-                    cap.as_str()
+                    scopes.contains(&scope.as_str()),
+                    "{name} at {scope:?}: {parsed:?}"
                 );
                 if let Ok(g) = parsed {
-                    assert_eq!(g.is_issuable(), cap != Capability::RootCustody);
-                    grantable += usize::from(g.is_issuable());
+                    assert_eq!(g.is_issuable(), name != "root.custody", "{name}");
                 }
             }
         }
-        // D-2: 11 grantable values over their scope lists.
-        assert_eq!(grantable, 3 + 5 * 2 + 3 * 3);
     }
 
     #[test]
     fn capability_strings_outside_the_closed_set_reject() {
         let raw = device_grant(Capability::DeviceApprove, CapabilityScopeKind::Tenant).encode();
+        let edited = |field: &str, v: &str| {
+            TenantCapabilityGrantV2::parse(&edit_map(&raw, |e| set(e, field, c::t(v))))
+        };
         for s in [
             "root-custody",
             "Device.approve",
@@ -1275,20 +1463,20 @@ mod tests {
             "device",
             "",
         ] {
-            let edited = edit_map(&raw, |e| set(e, "capability", c::t(s)));
             assert_eq!(
-                TenantCapabilityGrantV2::parse(&edited),
+                edited("capability", s),
                 Err(RecordError::BadValue("capability")),
                 "{s:?}"
             );
         }
-        for cap in [Capability::FleetKeyReceive, Capability::FleetKeyRecover] {
-            let g = device_grant(cap, CapabilityScopeKind::Fleet).encode();
-            assert_eq!(
-                TenantCapabilityGrantV2::parse(&g),
-                Err(RecordError::BadValue("capability"))
-            );
-        }
+        assert_eq!(
+            edited("subject_kind", "service"),
+            Err(RecordError::BadValue("subject_kind"))
+        );
+        assert_eq!(
+            edited("scope_kind", "account"),
+            Err(RecordError::BadValue("scope_kind"))
+        );
     }
 
     #[test]
@@ -1305,8 +1493,7 @@ mod tests {
             account
         );
 
-        let raw = account.encode();
-        let with_device = edit_map(&raw, |e| {
+        let with_device = edit_map(&account.encode(), |e| {
             set(e, "subject_device_id", c::b(&fx::<16>("device-a")))
         });
         assert_eq!(
@@ -1314,16 +1501,32 @@ mod tests {
             Err(RecordError::BadValue("subject_kind"))
         );
 
-        let raw = device.encode();
-        let no_hpke = edit_map(&raw, |e| e.retain(|(k, _)| k != "subject_hpke_key_id"));
+        let no_hpke = edit_map(&device.encode(), |e| {
+            e.retain(|(k, _)| k != "subject_hpke_key_id")
+        });
         assert_eq!(
             TenantCapabilityGrantV2::parse(&no_hpke),
             Err(RecordError::BadValue("subject_kind"))
         );
 
+        // The device's signing and HPKE keys must differ.
+        let same_keys = edit_map(&device.encode(), |e| {
+            set(
+                e,
+                "subject_hpke_key_id",
+                c::b(&fx::<32>("device-a-signing")),
+            )
+        });
+        assert_eq!(
+            TenantCapabilityGrantV2::parse(&same_keys),
+            Err(RecordError::BadValue("subject_hpke_key_id"))
+        );
+
         // root.custody is device-only (L484).
         let root_account = TenantCapabilityGrantV2 {
             capability: Capability::RootCustody,
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: fx("tenant-a"),
             ..account
         };
         assert_eq!(
@@ -1345,16 +1548,14 @@ mod tests {
     // -------------------------------------------------- device HPKE grants ---
 
     #[test]
-    fn hpke_grant_roundtrips_inside_a_record() {
-        let sk = issuer();
+    fn grants_roundtrip_inside_a_record() {
         let g = hpke_grant();
-        let exact = build_record(&sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode());
-        let rec = AuthorizationRecord::parse(&exact).unwrap();
-        rec.verify_signature(sk.verifying_key().as_bytes()).unwrap();
-        assert_eq!(
-            DeviceHpkeGrantV2::parse(&rec.canonical_payload_bytes).unwrap(),
-            g
-        );
+        let verified = sign_and_verify(DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode()).unwrap();
+        assert_eq!(verified.payload(), &Payload::DeviceHpkeGrant(g));
+
+        let g = device_grant(Capability::KeyRotate, CapabilityScopeKind::Fleet);
+        let verified = sign_and_verify(DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode()).unwrap();
+        assert_eq!(verified.payload(), &Payload::TenantCapabilityGrant(g));
     }
 
     #[test]
@@ -1393,6 +1594,18 @@ mod tests {
             edited("grant_variant", c::t("FirstFleetSelfGrant")),
             Err(RecordError::BadValue("grant_variant"))
         );
+        assert!(matches!(
+            edited("extra", c::u(1)),
+            Err(RecordError::UnknownField { .. })
+        ));
+        let missing = edit_map(&raw, |e| e.retain(|(k, _)| k != "fleet_id"));
+        assert!(matches!(
+            DeviceHpkeGrantV2::parse(&missing),
+            Err(RecordError::MissingField {
+                field: "fleet_id",
+                ..
+            })
+        ));
 
         let same_keys = DeviceHpkeGrantV2 {
             recipient_hpke_key_id: fx("device-a-signing"),
