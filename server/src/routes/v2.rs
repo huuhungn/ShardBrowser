@@ -500,6 +500,33 @@ async fn require_tenant_member(
     account_id_for(app, tenant_id, &user.id).await
 }
 
+/// The caller's account in `tenant_id`, if it is an active account holding an
+/// active owner membership.
+///
+/// Root generation begin and activate decide which key the whole tenant is
+/// sealed under, so membership alone is not enough. ADR 0001 S7 also requires
+/// the `root.custody` capability, which `owner` does not imply; the server
+/// does not model capabilities yet, so this is the narrower interim rule.
+async fn require_tenant_owner(
+    app: &AppState,
+    tenant_id: [u8; 16],
+    user: &AuthUser,
+) -> Result<[u8; 16], AppError> {
+    let account_id = account_id_for(app, tenant_id, &user.id).await?;
+    sqlx::query(
+        "SELECT 1 FROM v2_tenant_memberships m
+         JOIN v2_accounts a ON a.tenant_id = m.tenant_id AND a.id = m.account_id
+         WHERE m.tenant_id = ? AND m.account_id = ? AND m.role = 'owner'
+           AND m.status = 'active' AND a.status = 'active'",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(account_id.as_slice())
+    .fetch_optional(&app.db)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    Ok(account_id)
+}
+
 // ---------------------------------------------------------------------------
 // Device enrollment
 // ---------------------------------------------------------------------------
@@ -1079,7 +1106,7 @@ pub async fn begin_root_generation(
     axum::Json(req): axum::Json<BeginRootGenerationReq>,
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
+    require_tenant_owner(&app, tenant_id, &user).await?;
 
     let root_key_id = parse_id32(&req.root_key_id, "root_key_id")?;
 
@@ -1109,7 +1136,7 @@ pub async fn activate_root_generation(
     axum::Json(req): axum::Json<ActivateRootGenerationReq>,
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
+    require_tenant_owner(&app, tenant_id, &user).await?;
 
     crate::generations::activate_generation(
         &app.db,

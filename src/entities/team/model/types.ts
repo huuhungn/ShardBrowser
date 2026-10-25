@@ -4,7 +4,10 @@ export type TeamStatus = {
   tenant_id: string;
   device_id: string;
   has_token: boolean;
+  /** False when the stored keys cannot be opened, so enrollment is offered. */
   is_enrolled: boolean;
+  /** The stored keys were protected by another Windows account or machine. */
+  keys_unreadable: boolean;
   /**
    * Whether profile sync can run. False for a device enrolled before sync
    * existed, which needs re-enrolling to learn its account id.
@@ -17,7 +20,10 @@ export type TeamStatus = {
    * opened. Such a device must re-enroll.
    */
   can_receive_custody: boolean;
-  /** True when this device holds a fleet key, so sync needs no passphrase. */
+  /**
+   * Always false: push seals under the team passphrase, never a fleet key
+   * cached from the server, until verified key distribution ships.
+   */
   has_fleet_key: boolean;
 };
 
@@ -31,12 +37,17 @@ export type CustodyResult = {
   failed: number;
   /** Highest root generation among the opened grants, if any. */
   newest_generation: number | null;
-  /** Fleet key grants opened. These hold the key sync actually uses. */
+  /** Always 0: fleet key grants from the server are counted, not opened. */
   fleet_opened: number;
-  /** Fleet grants that failed to open. */
+  /** Always 0, for the same reason. */
   fleet_failed: number;
-  /** Highest fleet generation among the opened fleet grants, if any. */
+  /** Always null, for the same reason. */
   newest_fleet_generation: number | null;
-  /** True once this device holds a fleet key, so sync needs no passphrase. */
+  /**
+   * Fleet key grants the server holds for this device. They are not accepted
+   * until verified key distribution ships; sync uses the team passphrase.
+   */
+  fleet_grants_waiting: number;
+  /** Always false, for the same reason. */
   can_sync_without_passphrase: boolean;
 };

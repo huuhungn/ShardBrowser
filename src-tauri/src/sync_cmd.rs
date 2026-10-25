@@ -108,33 +108,15 @@ pub async fn profile_sync_push(
         return Err(crate::errcode::code("sync.noDataToPush"));
     }
 
-    // Prefer the fleet key this device collected from its grant: it is the
-    // key the fleet actually shares, so no passphrase has to be agreed out of
-    // band. The passphrase path stays for devices that have not collected a
-    // grant yet, and is refused outright if neither is available.
-    let fleet_key = fleet_keys::load()
-        .ok()
-        .and_then(|s| s.active_key(&c.fleet_id));
-    if fleet_key.is_none() && passphrase.is_empty() {
-        return Err(
-            "this device has no fleet key yet — collect key custody in Team settings, \
-             or supply a passphrase"
-                .into(),
-        );
-    }
-
     // Argon2id is deliberately slow and packing is IO-bound: not on the UI
     // thread.
     let seal_profile_id = profile_id.clone();
-    let sealed = tokio::task::spawn_blocking(move || match fleet_key {
-        Some((fkek, _generation)) => {
-            shardx_core::backup_file::seal_profile_with_fkek(&seal_profile_id, &udd, &fkek)
-        }
-        None => shardx_core::backup_file::seal_profile(&seal_profile_id, &udd, &passphrase),
-    })
-    .await
-    .map_err(|e| crate::errcode::code_with("sync.sealTaskFailed", &[("error", &e.to_string())]))?
-    .map_err(|e| format!("{e:#}"))?;
+    let sealed =
+        tokio::task::spawn_blocking(move || seal_for_push(&seal_profile_id, &udd, &passphrase))
+            .await
+            .map_err(|e| {
+                crate::errcode::code_with("sync.sealTaskFailed", &[("error", &e.to_string())])
+            })??;
 
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let client =
@@ -174,6 +156,42 @@ pub async fn profile_sync_push(
     })
 }
 
+/// Seal a profile for push: always under the passphrase, never a cached fleet
+/// key. Those came from the team server, which cannot yet prove who issued
+/// them, and sealing under a key the server chose would let it read every push
+/// from here on.
+fn seal_for_push(
+    profile_id: &str,
+    udd: &std::path::Path,
+    passphrase: &str,
+) -> Result<shardx_core::backup_file::SealedProfile, String> {
+    if passphrase.is_empty() {
+        return Err(crate::errcode::code("sync.passphraseRequired"));
+    }
+    shardx_core::backup_file::seal_profile(profile_id, udd, passphrase)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Open a pulled container: every cached fleet key first, newest first (a
+/// snapshot an earlier version pushed under one must still restore), then the
+/// passphrase.
+fn open_pulled(
+    container: &[u8],
+    udd: &std::path::Path,
+    candidates: &[([u8; 32], u64)],
+    passphrase: &str,
+) -> Result<u64, String> {
+    for (fkek, _generation) in candidates {
+        if let Ok(bytes) = shardx_core::backup_file::open_profile_with_fkek(container, udd, fkek) {
+            return Ok(bytes);
+        }
+    }
+    if passphrase.is_empty() {
+        return Err(crate::errcode::code("sync.pullPassphraseRequired"));
+    }
+    shardx_core::backup_file::open_profile(container, udd, passphrase).map_err(|e| format!("{e:#}"))
+}
+
 /// Pull the current snapshot of `profile_id` and restore it over the local
 /// profile.
 ///
@@ -211,34 +229,15 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    // Try every fleet key this device holds, newest first: a snapshot pushed
-    // before a rotation is sealed under an older generation and must still
-    // restore. Falls back to the passphrase for pre-custody snapshots.
     let candidates = fleet_keys::load()
         .map(|s| s.keys_newest_first(&c.fleet_id))
         .unwrap_or_default();
 
-    tokio::task::spawn_blocking(move || {
-        let mut last_err = None;
-        for (fkek, _generation) in &candidates {
-            match shardx_core::backup_file::open_profile_with_fkek(&container, &udd, fkek) {
-                Ok(bytes) => return Ok(bytes),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        if !passphrase.is_empty() {
-            return shardx_core::backup_file::open_profile(&container, &udd, &passphrase);
-        }
-        Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "this device has no fleet key for this snapshot — collect key custody in \
-                 Team settings, or supply the passphrase it was pushed with"
-            )
-        }))
-    })
-    .await
-    .map_err(|e| crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())]))?
-    .map_err(|e| format!("{e:#}"))
+    tokio::task::spawn_blocking(move || open_pulled(&container, &udd, &candidates, &passphrase))
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
+        })?
 }
 
 /// What the server currently holds for `profile_id`, or `None` if nothing.
@@ -298,5 +297,117 @@ mod tests {
     fn profile_ref_is_stable_and_distinct() {
         assert_eq!(profile_ref("a"), profile_ref("a"));
         assert_ne!(profile_ref("a"), profile_ref("b"));
+    }
+
+    /// With a fleet key cached and a passphrase given, push still seals a
+    /// passphrase container: it opens with the passphrase and not the key.
+    #[test]
+    fn push_seals_under_the_passphrase_even_with_a_cached_fleet_key() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let fkek = [0x5Cu8; 32];
+        let fleet = "dd".repeat(16);
+        team_config::save(&team_config::TeamConfig {
+            fleet_id: fleet.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut keys = fleet_keys::FleetKeyStore::default();
+        keys.insert(&fleet, 1, &fkek);
+        fleet_keys::save(&keys).unwrap();
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+
+        let sealed = seal_for_push("p", &udd, "team-passphrase");
+        crate::store::set_config_root(None);
+        let bytes = sealed.expect("seal").bytes;
+
+        assert_eq!(
+            &bytes[..8],
+            b"SHXBAK01",
+            "a passphrase container, not SHXFLT01"
+        );
+        let out = dir.path().join("out");
+        assert!(
+            shardx_core::backup_file::open_profile_with_fkek(&bytes, &out, &fkek).is_err(),
+            "the cached fleet key must not open it"
+        );
+        shardx_core::backup_file::open_profile(&bytes, &out, "team-passphrase")
+            .expect("opens with the passphrase");
+    }
+
+    /// Pull with no key that opens the snapshot and no passphrase asks for the
+    /// passphrase in the operator's language.
+    #[test]
+    fn pull_without_a_working_key_or_passphrase_asks_for_the_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let bytes = shardx_core::backup_file::seal_profile("p", &udd, "team-passphrase")
+            .unwrap()
+            .bytes;
+        let out = dir.path().join("out");
+
+        for candidates in [vec![], vec![([0x11u8; 32], 1)]] {
+            let err = open_pulled(&bytes, &out, &candidates, "").unwrap_err();
+            assert!(
+                crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+                "{err}"
+            );
+        }
+        assert!(open_pulled(&bytes, &out, &[([0x11u8; 32], 1)], "team-passphrase").is_ok());
+    }
+
+    /// A fleet key cached from the team server must not stand in for the
+    /// passphrase: the server may have chosen that key.
+    #[test]
+    fn push_refuses_an_empty_passphrase_even_with_a_cached_fleet_key() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _lifecycle = profile::lifecycle_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+
+        let mut stored = profile::StoredProfile::default();
+        profile::save_raw(&mut stored).unwrap();
+        let id = stored.meta.id.clone();
+        let udd = profile::user_data_dir(&id).unwrap();
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+
+        let seed = "11".repeat(32);
+        team_config::save(&team_config::TeamConfig {
+            // Nothing listens here, so a push that got past the key check
+            // fails on the network instead of with the refusal.
+            server_url: "http://127.0.0.1:9".into(),
+            token: "t".into(),
+            tenant_id: "aa".repeat(16),
+            device_id: "bb".repeat(16),
+            account_id: "cc".repeat(16),
+            fleet_id: "dd".repeat(16),
+            signing_key_seed: seed.clone(),
+            hpke_key_seed: seed,
+        })
+        .unwrap();
+        let mut keys = fleet_keys::FleetKeyStore::default();
+        keys.insert(&"dd".repeat(16), 1, &[0x5Cu8; 32]);
+        fleet_keys::save(&keys).unwrap();
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(profile_sync_push(id, String::new(), 0));
+        crate::store::set_config_root(None);
+
+        let err = result.expect_err("push must refuse without a passphrase");
+        assert!(
+            crate::errcode::has_code(&err, "sync.passphraseRequired"),
+            "expected the passphrase refusal, got: {err}"
+        );
     }
 }

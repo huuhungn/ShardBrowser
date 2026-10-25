@@ -543,6 +543,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         device_id: "",
         has_token: false,
         is_enrolled: false,
+        keys_unreadable: false,
         can_sync: false,
         can_receive_custody: false,
         has_fleet_key: false,
