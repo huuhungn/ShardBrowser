@@ -107,7 +107,6 @@ pub enum ReplayTable {
     /// the tests keep it as a sample table.
     #[cfg(test)]
     DeviceApprovals,
-    CapabilityGrants,
     FleetKeyGrants,
 }
 
@@ -116,7 +115,6 @@ impl ReplayTable {
         match self {
             #[cfg(test)]
             Self::DeviceApprovals => "v2_device_approvals",
-            Self::CapabilityGrants => "v2_capability_grants",
             Self::FleetKeyGrants => "v2_fleet_key_grants",
         }
     }

@@ -460,6 +460,7 @@ async fn first_approval(
     for table in [
         "v2_device_approvals",
         "v2_capability_grants",
+        "v2_legacy_capability_grants",
         "v2_root_key_generations",
         "v2_tenant_root_key_grants",
         "v2_legacy_tenant_root_key_grants",

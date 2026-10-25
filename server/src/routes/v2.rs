@@ -203,61 +203,6 @@ pub async fn complete_idempotent_operation(
     ))
 }
 
-/// Present a signed capability grant.
-///
-/// Verify, then consume, under its own domain, so a grant and another record
-/// kind can never be substituted for one another even if they share a replay
-/// id.
-pub async fn present_capability_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_CAPABILITY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::CapabilityGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.capability_grant.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
-    ))
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

@@ -627,3 +627,54 @@ async fn active_pointer(
 fn inside_window(g: &TenantRootKeyGrantV2, now: i64) -> Result<bool, AppError> {
     Ok(int(g.common.not_before_ms)? <= now && now < int(g.common.not_after_ms)?)
 }
+
+/// ADR 0001 D2, ADR 0002 D-2: the session's device is a root custodian. It
+/// holds an acknowledged, unrevoked root grant of the tenant's ACTIVE
+/// generation, inside its window and issued to its exact keys, read back like
+/// every other grant. Any variant counts: the self-grant, a grant from another
+/// custodian, or the rotation grant that became this generation's.
+pub(super) async fn is_active_custodian(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(pointer) = active_pointer(conn, &s.tenant_id).await? else {
+        return Ok(false);
+    };
+    let generation = u64::try_from(pointer).map_err(|_| integrity())?;
+    if generation_state(conn, v, &s.tenant_id, generation).await?
+        != Some(RootGenerationState::Active)
+    {
+        return Ok(false);
+    }
+    let replays: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_tenant_root_key_grants
+          WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
+            AND subject_device_id = ? AND acked_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(pointer)
+    .bind(s.device_id.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    for replay in replays {
+        let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+        let Some(g) = load_grant(conn, v, &s.tenant_id, generation, &replay).await? else {
+            continue;
+        };
+        let k = &g.grant;
+        if g.acked
+            && !g.revoked
+            && inside_window(k, now)?
+            && k.subject_account_id == s.account_id
+            && k.subject_device_id == s.device_id
+            && k.subject_signing_key_id == s.signing_key_id
+            && k.recipient_hpke_key_id == s.hpke_key_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

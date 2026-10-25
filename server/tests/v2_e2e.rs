@@ -202,36 +202,6 @@ async fn seed(
     pool.close().await;
 }
 
-/// Build a signed device-approval record for a tenant.
-fn approval_record(
-    sk: &Ed25519SigningKey,
-    tenant: [u8; 16],
-    replay_id: [u8; 16],
-    domain: &str,
-) -> Vec<u8> {
-    let fields = vec![
-        ("container_domain", c::Value::Text(domain.to_string())),
-        ("container_version", c::Value::Uint(1)),
-        ("tenant_id", c::Value::Bytes(tenant.to_vec())),
-        ("replay_id", c::Value::Bytes(replay_id.to_vec())),
-        ("subject_account_id", c::Value::Bytes(vec![3u8; 16])),
-        ("subject_device_id", c::Value::Bytes(vec![4u8; 16])),
-        ("approved_use", c::Value::Text("profile.sync".to_string())),
-        ("issued_at_ms", c::Value::Uint(0)),
-        ("not_before_ms", c::Value::Uint(0)),
-        // Far enough out that wall-clock time in CI cannot expire it, but
-        // still a real bounded window rather than "never expires".
-        ("not_after_ms", c::Value::Uint(4_102_444_800_000)),
-        ("server_instance_id", c::Value::Bytes(INSTANCE.to_vec())),
-        ("restore_epoch", c::Value::Uint(0)),
-        (
-            "issuer_signing_key_id",
-            c::Value::Bytes(identity_key_id(&sk.verifying_key()).to_vec()),
-        ),
-    ];
-    build_signed_container(sk, fields).exact_bytes
-}
-
 async fn admin_user_id(c: &reqwest::Client, port: u16, tok: &str) -> String {
     let v: Value = c
         .get(format!("{}/users", base(port)))
@@ -253,148 +223,26 @@ async fn admin_user_id(c: &reqwest::Client, port: u16, tok: &str) -> String {
 }
 
 #[tokio::test]
-async fn v2_authorization_holds_over_http() {
+async fn a_v1_token_cannot_file_a_capability_grant() {
     let port = 38111u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
     wait_health(&cl, port).await;
-
     let admin = token(&cl, port, "admin", "secret").await;
-    let user_id = admin_user_id(&cl, port, &admin).await;
 
-    let sk_a = Ed25519SigningKey::from_bytes(&[11u8; 32]);
-    let sk_b = Ed25519SigningKey::from_bytes(&[22u8; 32]);
-    seed(&data, &user_id, &sk_a, &sk_b).await;
-
-    let present = |body: Value| {
-        let cl = cl.clone();
-        let admin = admin.clone();
-        async move {
-            cl.post(format!("{}/v2/capability-grants", base(port)))
-                .bearer_auth(&admin)
-                .json(&body)
-                .send()
-                .await
-                .unwrap()
+    // Filing needs the issuer's v2 device session; the custody rules
+    // themselves are covered in v2_auth.rs.
+    for bearer in [Some(admin.as_str()), None] {
+        let mut r = cl
+            .post(format!("{}/v2/capability-grants", base(port)))
+            .header("content-type", "application/cbor")
+            .body(vec![0xa0]);
+        if let Some(b) = bearer {
+            r = r.bearer_auth(b);
         }
-    };
-
-    // A well-formed record for tenant A is accepted.
-    let rec = approval_record(
-        &sk_a,
-        TENANT_A,
-        [1u8; 16],
-        "shardx.authorization.capability-grant.v2",
-    );
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_A),
-        "record_hex": hex(&rec),
-    }))
-    .await;
-    let status = r.status();
-    let body = r.text().await.unwrap_or_default();
-    assert_eq!(status, 201, "valid record should be accepted: {body}");
-
-    // The same record a second time is a replay: refused, not silently re-run.
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_A),
-        "record_hex": hex(&rec),
-    }))
-    .await;
-    assert_eq!(r.status(), 409, "replayed record must be refused");
-
-    // Tenant isolation over HTTP: a record signed by tenant A's issuer,
-    // presented against tenant B, must fail. B does not trust that key.
-    let cross = approval_record(
-        &sk_a,
-        TENANT_B,
-        [2u8; 16],
-        "shardx.authorization.capability-grant.v2",
-    );
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_B),
-        "record_hex": hex(&cross),
-    }))
-    .await;
-    assert!(
-        !r.status().is_success(),
-        "a record signed by another tenant's issuer must not verify, got {}",
-        r.status()
-    );
-
-    // Tenant confusion, the case a trusted-issuer check alone cannot catch:
-    // a record that binds tenant A, presented as tenant B, signed by B's own
-    // issuer. The issuer IS trusted for B, the signature IS valid, and the
-    // domain IS right — only the tenant binding separates the two. Without
-    // it, B could replay A's authorizations under its own key.
-    let confused = approval_record(
-        &sk_b,
-        TENANT_A,
-        [7u8; 16],
-        "shardx.authorization.capability-grant.v2",
-    );
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_B),
-        "record_hex": hex(&confused),
-    }))
-    .await;
-    assert!(
-        !r.status().is_success(),
-        "a record bound to another tenant must not verify even when signed by \
-         a trusted issuer of the presenting tenant, got {}",
-        r.status()
-    );
-
-    // Domain confusion: a device approval presented to the capability-grant
-    // endpoint must be refused even though it is correctly signed.
-    let wrong_domain = approval_record(
-        &sk_a,
-        TENANT_A,
-        [3u8; 16],
-        "shardx.authorization.device-approval.v2",
-    );
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_A),
-        "record_hex": hex(&wrong_domain),
-    }))
-    .await;
-    assert!(
-        !r.status().is_success(),
-        "a record from another domain must not be accepted, got {}",
-        r.status()
-    );
-
-    // A single flipped byte in the signed container must not verify.
-    let mut tampered = approval_record(
-        &sk_a,
-        TENANT_A,
-        [4u8; 16],
-        "shardx.authorization.capability-grant.v2",
-    );
-    let last = tampered.len() - 1;
-    tampered[last] ^= 0x01;
-    let r = present(json!({
-        "tenant_id": hex(&TENANT_A),
-        "record_hex": hex(&tampered),
-    }))
-    .await;
-    assert!(
-        !r.status().is_success(),
-        "a tampered record must not verify, got {}",
-        r.status()
-    );
-
-    // Unauthenticated requests never reach the verifier.
-    let r = cl
-        .post(format!("{}/v2/capability-grants", base(port)))
-        .json(&json!({ "tenant_id": hex(&TENANT_A), "record_hex": hex(&rec) }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "v2 endpoints require a session");
-
-    let _ = sk_b;
+        assert_eq!(r.send().await.unwrap().status(), 401, "{bearer:?}");
+    }
 }
 
 #[tokio::test]
