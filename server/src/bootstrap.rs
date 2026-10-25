@@ -88,6 +88,14 @@ async fn candidate(
     device_id: &[u8; 16],
 ) -> Result<Candidate> {
     let tenant_id = tenant_id(conn, slug).await?;
+    let tenant_status: String = sqlx::query_scalar("SELECT status FROM v2_tenants WHERE id = ?")
+        .bind(&tenant_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    ensure!(
+        tenant_status == "active",
+        "refusing: the tenant is {tenant_status}"
+    );
     match guard_state(conn, instance, &tenant_id).await? {
         Some((state, _)) if state == "unused" => {}
         Some((state, reason)) => bail!(
@@ -287,16 +295,26 @@ pub async fn cancel(cfg: &Config, slug: &str) -> Result<()> {
         }
         None => bail!("refusing: this tenant has no bootstrap guard for this server instance"),
     }
-    let device_id: Vec<u8> = sqlx::query_scalar(
-        "SELECT device_id FROM v2_first_device_confirmations
-          WHERE server_instance_id = ? AND tenant_id = ? AND state = 'pending'",
+    let (device_id, epoch, device_status): (Vec<u8>, i64, Option<String>) = sqlx::query_as(
+        "SELECT c.device_id, c.restore_epoch, d.status
+           FROM v2_first_device_confirmations c
+           LEFT JOIN v2_devices d ON d.tenant_id = c.tenant_id AND d.id = c.device_id
+          WHERE c.server_instance_id = ? AND c.tenant_id = ? AND c.state = 'pending'",
     )
     .bind(instance.as_slice())
     .bind(&tenant_id)
     .fetch_optional(&mut *tx)
     .await?
     .context("refusing: the guard is reserved but no pending confirmation exists")?;
-    sqlx::query(
+    // A cancel records an operator decision. A confirmation that is already
+    // inconsistent belongs to the startup integrity pass (R1), not to a cancel.
+    ensure!(
+        device_status.as_deref() == Some("pending")
+            && u64::try_from(epoch).ok() == Some(verified.restore_epoch),
+        "refusing: the confirmation no longer matches its device or this restore epoch; \
+         restart the server so the integrity pass moves it to recovery"
+    );
+    let cancelled = sqlx::query(
         "UPDATE v2_first_device_confirmations
             SET state = 'cancelled', terminal_at_ms = ?, terminal_reason = 'operator_cancelled'
           WHERE server_instance_id = ? AND tenant_id = ? AND state = 'pending'",
@@ -306,7 +324,8 @@ pub async fn cancel(cfg: &Config, slug: &str) -> Result<()> {
     .bind(&tenant_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
+    ensure!(cancelled.rows_affected() == 1, "the confirmation moved");
+    let closed = sqlx::query(
         "UPDATE v2_bootstrap_guards SET state = 'closed', updated_at = ?
           WHERE server_instance_id = ? AND tenant_id = ? AND state = 'reserved'",
     )
@@ -315,6 +334,7 @@ pub async fn cancel(cfg: &Config, slug: &str) -> Result<()> {
     .bind(&tenant_id)
     .execute(&mut *tx)
     .await?;
+    ensure!(closed.rows_affected() == 1, "the bootstrap guard moved");
     let request_id = uuid::Uuid::new_v4().into_bytes();
     audit::insert_offline(
         &mut tx,
@@ -379,6 +399,17 @@ pub async fn status(cfg: &Config, slug: &str) -> Result<()> {
     }
     println!("state={}", row.get::<String, _>("state"));
     println!("restore_epoch={}", row.get::<i64, _>("restore_epoch"));
+    println!("restore_epoch_current={}", verified.restore_epoch);
+    let device_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM v2_devices WHERE tenant_id = ? AND id = ?")
+            .bind(&tenant_id)
+            .bind(row.get::<Vec<u8>, _>("device_id"))
+            .fetch_optional(&mut *conn)
+            .await?;
+    println!(
+        "device_status={}",
+        device_status.as_deref().unwrap_or("missing")
+    );
     if let Some(reason) = row.get::<Option<String>, _>("terminal_reason") {
         println!("terminal_reason={reason}");
     }
@@ -397,6 +428,10 @@ pub async fn status(cfg: &Config, slug: &str) -> Result<()> {
     println!("key_ids_verified={verified_keys}");
     drop(conn);
     pool.close().await;
+    ensure!(
+        verified_keys,
+        "the stored key IDs are not the derivation of the stored keys"
+    );
     Ok(())
 }
 

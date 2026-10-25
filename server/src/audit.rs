@@ -44,7 +44,10 @@ pub async fn insert_offline(
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     sqlx::query(
-        "INSERT INTO v2_audit_events          (tenant_id, id, actor_account_id, actor_device_id, action, target_type, target_id,           outcome, reason_code, request_id, created_at)          VALUES (?, ?, NULL, NULL, ?, ?, ?, 'success', 'offline_operator_cli', ?, ?)",
+        "INSERT INTO v2_audit_events \
+         (tenant_id, id, actor_account_id, actor_device_id, action, target_type, target_id, \
+          outcome, reason_code, request_id, created_at) \
+         VALUES (?, ?, NULL, NULL, ?, ?, ?, 'success', 'offline_operator_cli', ?, ?)",
     )
     .bind(tenant_id)
     .bind(uuid::Uuid::new_v4().into_bytes().as_slice())

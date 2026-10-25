@@ -251,7 +251,9 @@ async fn tenant_create(
     // ADR 0001 R1: the tenant's one first-device opportunity starts here, and
     // only here; it is never inferred from empty tables later.
     sqlx::query(
-        "INSERT INTO v2_bootstrap_guards          (server_instance_id, tenant_id, state, recovery_reason, updated_at)          VALUES (?, ?, 'unused', NULL, ?)",
+        "INSERT INTO v2_bootstrap_guards \
+         (server_instance_id, tenant_id, state, recovery_reason, updated_at) \
+         VALUES (?, ?, 'unused', NULL, ?)",
     )
     .bind(verified.server_instance_id.as_slice())
     .bind(tenant_id.as_slice())

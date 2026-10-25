@@ -713,7 +713,8 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
 
     // The tenant's one first-device opportunity, bound to this instance (R1).
     let guard: (String, Option<String>, bool) = sqlx::query_as(
-        "SELECT g.state, g.recovery_reason, g.server_instance_id = s.server_instance_id          FROM v2_bootstrap_guards g, v2_server_state s WHERE hex(g.tenant_id) = upper(?)",
+        "SELECT g.state, g.recovery_reason, g.server_instance_id = s.server_instance_id \
+         FROM v2_bootstrap_guards g, v2_server_state s WHERE hex(g.tenant_id) = upper(?)",
     )
     .bind(&tenant_id)
     .fetch_one(&pool)
@@ -1056,13 +1057,65 @@ async fn cancel_closes_the_attempt_for_good() {
 }
 
 #[tokio::test]
+async fn cancel_refuses_what_is_not_an_open_reservation() {
+    let cancel = |d: &Dirs| tenant_cmd(d, &["cancel-first-device", "--tenant", "acme"], "");
+
+    // Nothing reserved yet: the guard stays unused.
+    let d = initialised("cancel-unused");
+    first_device_candidate(&d, "pending", true).await;
+    let before = first_device_rows(&d).await;
+    let out = cancel(&d);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("(unused)"), "{}", stderr(&out));
+    assert_eq!(first_device_rows(&d).await, before);
+
+    // The device left pending after the confirmation: an inconsistent state
+    // is the integrity pass's to move to recovery, not an operator cancel.
+    let d = initialised("cancel-revoked");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+    assert!(confirm(&d, &device, &format!("{sid}\n{hid}\n"))
+        .status
+        .success());
+    let pool = db(&d).await;
+    sqlx::query("UPDATE v2_devices SET status = 'revoked'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let before = first_device_rows(&d).await;
+    let out = cancel(&d);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("integrity pass"), "{}", stderr(&out));
+    assert_eq!(first_device_rows(&d).await, before);
+    let status = tenant_cmd(&d, &["first-device-status", "--tenant", "acme"], "");
+    assert_eq!(field(&status, "device_status"), "revoked");
+    assert_eq!(field(&status, "restore_epoch_current"), "0");
+}
+
+#[tokio::test]
 async fn confirm_refuses_a_device_that_is_not_a_clean_pending_first_device() {
     // Not pending.
     let d = initialised("first-active");
     let (device, sid, hid) = first_device_candidate(&d, "active", true).await;
     let before = first_device_rows(&d).await;
     let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(!out.status.success());
     assert!(stderr(&out).contains("not pending"), "{}", stderr(&out));
+    assert_eq!(first_device_rows(&d).await, before);
+
+    // A suspended tenant gets no first device.
+    let d = initialised("first-suspended");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+    let pool = db(&d).await;
+    sqlx::query("UPDATE v2_tenants SET status = 'suspended'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let before = first_device_rows(&d).await;
+    let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("suspended"), "{}", stderr(&out));
     assert_eq!(first_device_rows(&d).await, before);
 
     // A wrong-domain HPKE ID is never shown for blessing (R4).
