@@ -200,46 +200,52 @@ export function SettingsPage() {
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
           {t("settings.language.help")}
         </p>
-        <Select
-          label={t("settings.language.label")}
-          size="small"
-          value={lang}
-          onChange={(v) => setLang(v as (typeof LANG_OPTIONS)[number]["value"])}
-          options={LANG_OPTIONS}
-        />
+        <div className="max-w-[420px]">
+          <Select
+            label={t("settings.language.label")}
+            size="small"
+            value={lang}
+            onChange={(v) => setLang(v as (typeof LANG_OPTIONS)[number]["value"])}
+            options={LANG_OPTIONS}
+          />
+        </div>
       </SettingsCard>
 
       <SettingsCard title={t("settings.geo.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
           <Rich text={t("settings.geo.help")} />
         </p>
-        <Select
-          label={t("settings.geo.label")}
-          size="small"
-          value={s.geo_checker ?? "ip-api.com"}
-          onChange={(v) => setS({ ...s, geo_checker: v })}
-          options={[
-            { value: "ip-api.com", label: "ip-api.com (45 req/min, HTTP)" },
-            { value: "ipapi.co", label: "ipapi.co (1k/day, HTTPS)" },
-            { value: "ipwho.is", label: "ipwho.is (10k/month, HTTPS)" },
-          ]}
-        />
+        <div className="max-w-[420px]">
+          <Select
+            label={t("settings.geo.label")}
+            size="small"
+            value={s.geo_checker ?? "ip-api.com"}
+            onChange={(v) => setS({ ...s, geo_checker: v })}
+            options={[
+              { value: "ip-api.com", label: "ip-api.com (45 req/min, HTTP)" },
+              { value: "ipapi.co", label: "ipapi.co (1k/day, HTTPS)" },
+              { value: "ipwho.is", label: "ipwho.is (10k/month, HTTPS)" },
+            ]}
+          />
+        </div>
       </SettingsCard>
 
       <SettingsCard title={t("settings.screen.title")}>
         <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
           <Rich text={t("settings.screen.help")} />
         </p>
-        <Select
-          label={t("settings.screen.label")}
-          size="small"
-          value={s.screen_resolution_mode ?? "fingerprint"}
-          onChange={(v) => setS({ ...s, screen_resolution_mode: v })}
-          options={[
-            { value: "fingerprint", label: t("settings.screen.fingerprint") },
-            { value: "real", label: t("settings.screen.real") },
-          ]}
-        />
+        <div className="max-w-[420px]">
+          <Select
+            label={t("settings.screen.label")}
+            size="small"
+            value={s.screen_resolution_mode ?? "fingerprint"}
+            onChange={(v) => setS({ ...s, screen_resolution_mode: v })}
+            options={[
+              { value: "fingerprint", label: t("settings.screen.fingerprint") },
+              { value: "real", label: t("settings.screen.real") },
+            ]}
+          />
+        </div>
       </SettingsCard>
 
       <SettingsCard title={t("settings.helper.title")}>
