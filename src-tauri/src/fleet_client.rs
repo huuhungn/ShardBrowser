@@ -130,6 +130,9 @@ impl FleetClient {
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
+            // A redirect would resend the body, and a login body holds the
+            // account password. The API never redirects.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context(crate::errcode::code("fleet.netClientFailed"))?;
         Ok(Self {
@@ -142,7 +145,23 @@ impl FleetClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+}
 
+/// True for `https://`, or `http://` to this machine.
+fn sends_secrets_safely(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Domain(d))) => d.eq_ignore_ascii_case("localhost"),
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+impl FleetClient {
     /// Turn a non-2xx response into an error that keeps the server reason.
     /// The body carries refusal text (version conflicts, expired leases), no
     /// key material.
@@ -183,6 +202,11 @@ impl FleetClient {
         label_ciphertext: &[u8],
     ) -> Result<EnrolledDevice> {
         let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+        // The password is a long-lived account secret, unlike the token, so
+        // it never crosses a network in clear.
+        if !sends_secrets_safely(&self.base_url) {
+            bail!(crate::errcode::code("fleet.insecureLogin"));
+        }
 
         let res = self
             .http
@@ -746,7 +770,29 @@ pub fn random_id_hex() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex16, random_id_hex, FleetClient};
+    use super::{decode_hex16, random_id_hex, sends_secrets_safely, FleetClient};
+
+    #[test]
+    fn a_password_goes_only_over_https_or_to_this_machine() {
+        for ok in [
+            "https://team.example",
+            "https://10.0.0.5:8443",
+            "http://127.0.0.1:38200",
+            "http://localhost:8080",
+            "http://[::1]:9000",
+        ] {
+            assert!(sends_secrets_safely(ok), "{ok}");
+        }
+        for bad in [
+            "http://team.lan",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1.example",
+            "ftp://127.0.0.1",
+            "not a url",
+        ] {
+            assert!(!sends_secrets_safely(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn a_base_url_must_carry_a_scheme() {

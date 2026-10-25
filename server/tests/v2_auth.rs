@@ -79,6 +79,9 @@ fn launch(data: &Path, port: u16) -> Child {
         .env("SHARDX_TOKEN_SECRET", "v2-auth-secret")
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "secret")
+        // Lets a test spread requests over source addresses; without the
+        // header the peer address is used, as before.
+        .env("SHARDX_TRUST_PROXY", "1")
         .spawn()
         .expect("spawn server binary")
 }
@@ -169,6 +172,18 @@ impl Server {
             req = req.bearer_auth(t);
         }
         let r = req.send().await.unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(Value::Null))
+    }
+
+    async fn post_from(&self, ip: &str, path: &str, body: Value) -> (u16, Value) {
+        let r = client()
+            .post(format!("http://127.0.0.1:{}{path}", self.port))
+            .header("x-forwarded-for", ip)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
         let status = r.status().as_u16();
         (status, r.json().await.unwrap_or(Value::Null))
     }
@@ -782,6 +797,46 @@ async fn login_failures_are_throttled_and_say_nothing() {
             .await,
         0
     );
+}
+
+#[tokio::test]
+async fn every_way_of_naming_the_tenant_shares_one_account_throttle() {
+    let server = start("throttle-forms", 38189).await;
+    let lower = hex(&TENANT);
+    let upper = lower.to_ascii_uppercase();
+    let forms = [
+        json!({ "tenant": "acme" }),
+        json!({ "tenant_id": lower }),
+        json!({ "tenant_id": upper }),
+    ];
+    let with = |form: &Value, password: &str| {
+        let mut body = form.clone();
+        body["username"] = json!("owner");
+        body["password"] = json!(password);
+        body
+    };
+    // Fifteen failures, a fresh source address each, so only the account key
+    // counts them; split over three spellings, no single one reaches the limit.
+    for i in 0..15 {
+        let (status, _) = server
+            .post_from(
+                &format!("10.0.0.{i}"),
+                "/v2/auth/login",
+                with(&forms[i % 3], "nope"),
+            )
+            .await;
+        assert_eq!(status, 401);
+    }
+    for (i, form) in forms.iter().enumerate() {
+        let (status, _) = server
+            .post_from(
+                &format!("10.0.1.{i}"),
+                "/v2/auth/login",
+                with(form, PASSWORD),
+            )
+            .await;
+        assert_eq!(status, 429, "form {i} must share the account's lockout");
+    }
 }
 
 #[tokio::test]

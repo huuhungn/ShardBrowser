@@ -274,6 +274,7 @@
   "fleet.downloadIncomplete": "The download from the team server is incomplete: got {got} bytes, expected {total}.",
   "fleet.downloadStalled": "The server stopped sending data at byte {offset} of {total}.",
   "fleet.hpkeKeyLength": "The HPKE public key must be 32 bytes.",
+  "fleet.insecureLogin": "The account password is sent only over https://, or to this computer. Change the server address to https://.",
   "fleet.malformedHex32": "The team server sent a malformed {field}: expected 32 hex characters.",
   "fleet.malformedHex64": "The team server sent a malformed {field}: expected 64 hex characters.",
   "fleet.malformedHexDigits": "The team server sent a malformed {field}: not hexadecimal.",

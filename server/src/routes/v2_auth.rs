@@ -400,7 +400,7 @@ pub async fn login(
         ),
         _ => {
             return Err(AppError::BadRequest(
-                "name the tenant by tenant or tenant_id, not both".into(),
+                "name the tenant by exactly one of tenant or tenant_id".into(),
             ))
         }
     };
@@ -722,9 +722,11 @@ pub async fn enroll_device(
     if !bound || taken {
         revoke_challenge(&mut tx, ENROLLMENT_CHALLENGES, &challenge_id, now).await?;
         tx.commit().await?;
-        return Err(AppError::Conflict(
-            "these keys are already enrolled in this tenant".into(),
-        ));
+        return Err(AppError::Conflict(if taken {
+            "these keys are already enrolled in this tenant".into()
+        } else {
+            "this challenge no longer matches the ticket or the server; ask for a new one".into()
+        }));
     }
 
     let used = sqlx::query(

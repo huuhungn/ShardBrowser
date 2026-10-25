@@ -10,7 +10,7 @@
 DROP TABLE v2_enrollment_challenges;
 
 CREATE TABLE v2_enrollment_challenges (
-    id                    BLOB    PRIMARY KEY CHECK (length(id) = 16),
+    id                    BLOB    NOT NULL PRIMARY KEY CHECK (length(id) = 16),
     pre_device_session_id BLOB    NOT NULL REFERENCES v2_pre_device_sessions(id) ON DELETE CASCADE,
     tenant_id             BLOB    NOT NULL,
     account_id            BLOB    NOT NULL,

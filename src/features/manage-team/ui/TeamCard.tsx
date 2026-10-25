@@ -84,8 +84,10 @@ export function TeamCard() {
   });
 
   const enroll = () => run("enroll", async () => {
-    const next = await teamEnrollDevice(label.trim() || suggestLabel(), username, password);
+    // Cleared before the call, so a failed attempt does not keep it either.
+    const typed = password;
     setPassword("");
+    const next = await teamEnrollDevice(label.trim() || suggestLabel(), username, typed);
     setSt(next);
     void shareStatus();
     toast.ok(t("team.deviceEnrolled"));
