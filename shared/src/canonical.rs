@@ -36,7 +36,11 @@ pub enum Value {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CborError {
+    /// A length or count not in its shortest form.
     NonCanonicalIntegerForm,
+    /// An integer (major type 0 or 1) not in its shortest form. Kept apart from
+    /// lengths because plan L1236 gives integers `WIRE_INTEGER_OUT_OF_RANGE`.
+    OverlongInteger,
     IndefiniteLength,
     UnsupportedMajorType(u8),
     FloatOrSimpleValue,
@@ -60,6 +64,7 @@ impl std::fmt::Display for CborError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NonCanonicalIntegerForm => write!(f, "non-canonical integer/length form"),
+            Self::OverlongInteger => write!(f, "integer not in its shortest form"),
             Self::IndefiniteLength => write!(f, "indefinite-length item"),
             Self::UnsupportedMajorType(m) => write!(f, "unsupported CBOR major type {m}"),
             Self::FloatOrSimpleValue => write!(f, "float or disallowed simple value"),
@@ -199,12 +204,17 @@ impl<'a> Decoder<'a> {
         let ib = self.byte()?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
+        let overlong = if major <= 1 {
+            CborError::OverlongInteger
+        } else {
+            CborError::NonCanonicalIntegerForm
+        };
         let arg = match ai {
             0..=23 => ai as u64,
             24 => {
                 let v = self.byte()? as u64;
                 if v < 24 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -212,7 +222,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(2)?;
                 let v = u16::from_be_bytes([b[0], b[1]]) as u64;
                 if v <= u8::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -220,7 +230,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(4)?;
                 let v = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
                 if v <= u16::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -228,7 +238,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(8)?;
                 let v = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
                 if v <= u32::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -488,8 +498,20 @@ mod tests {
     fn shortest_form_is_required_on_decode() {
         // 24 encoded in two bytes (0x18 0x18) is canonical; 0x18 0x17 is not.
         assert_eq!(decode(&[0x18, 0x18]), Ok(Value::Uint(24)));
+        assert_eq!(decode(&[0x18, 0x17]), Err(CborError::OverlongInteger));
+        // -1 as 0x38 0x00, and 1 at every wider width.
+        for overlong in [
+            &[0x38, 0x00][..],
+            &[0x19, 0x00, 0x01],
+            &[0x1a, 0, 0, 0, 1],
+            &[0x1b, 0, 0, 0, 0, 0, 0, 0, 1],
+        ] {
+            assert_eq!(decode(overlong), Err(CborError::OverlongInteger));
+        }
+        // A length keeps the generic code: a one-byte text string with a
+        // two-byte length head.
         assert_eq!(
-            decode(&[0x18, 0x17]),
+            decode(&[0x78, 0x01, b'a']),
             Err(CborError::NonCanonicalIntegerForm)
         );
     }
