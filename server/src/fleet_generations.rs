@@ -370,7 +370,7 @@ mod tests {
 
         // A non-NULL pointer naming a PREPARING row is not an active root.
         assert!(matches!(begin(INSTANCE).await, Err(AppError::Conflict(_))));
-        sqlx::query("UPDATE v2_root_key_generations SET state = 'ACTIVE'")
+        sqlx::query("UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = 'now'")
             .execute(&pool)
             .await
             .unwrap();

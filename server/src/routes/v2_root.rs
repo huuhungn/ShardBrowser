@@ -45,11 +45,11 @@ pub const MAX_ROOT_REQUEST_BODY: usize = 262_144;
 /// ADR 0002 D-6: every root grant variant has the device approval's 730 days.
 const MAX_ROOT_GRANT_TTL_MS: u64 = MAX_DEVICE_APPROVAL_TTL_MS;
 
-fn record_error(e: RecordError) -> AppError {
+pub(super) fn record_error(e: RecordError) -> AppError {
     coded(StatusCode::UNPROCESSABLE_ENTITY, e.code(), &e.to_string())
 }
 
-fn mismatch() -> AppError {
+pub(super) fn mismatch() -> AppError {
     coded(
         StatusCode::CONFLICT,
         "IDEMPOTENCY_MISMATCH",
@@ -57,7 +57,7 @@ fn mismatch() -> AppError {
     )
 }
 
-fn stale() -> AppError {
+pub(super) fn stale() -> AppError {
     coded(
         StatusCode::CONFLICT,
         "STALE_CONTEXT",
@@ -78,7 +78,6 @@ struct Request {
     outer: IdempotentMutationRequestV2,
     create: TenantRootGenerationCreateV2,
     request_hash: [u8; 32],
-    exact_sha: [u8; 32],
 }
 
 pub async fn create_root_generation(
@@ -120,7 +119,6 @@ pub async fn create_root_generation(
     }
     let req = Request {
         request_hash: outer.canonical_request_hash(),
-        exact_sha: sha256(&body),
         outer,
         create,
     };
@@ -134,17 +132,13 @@ pub async fn create_root_generation(
         return Err(AppError::Forbidden);
     }
 
-    let row = sqlx::query(
-        "SELECT * FROM v2_idempotency
-          WHERE server_instance_id = ? AND tenant_id = ? AND actor_device_id = ?
-            AND operation_scope = ? AND idempotency_key = ?",
+    let row = ledger_row(
+        &mut tx,
+        v,
+        &s,
+        OperationKind::RootGenerationCreate,
+        &req.outer.idempotency_key,
     )
-    .bind(v.server_instance_id.as_slice())
-    .bind(s.tenant_id.as_slice())
-    .bind(s.device_id.as_slice())
-    .bind(OperationKind::RootGenerationCreate.scope())
-    .bind(req.outer.idempotency_key.as_slice())
-    .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = row {
         return replay(tx, &row, &req, &s, v, &body).await;
@@ -169,13 +163,12 @@ async fn replay(
     v: &Verified,
     exact_request: &[u8],
 ) -> Result<Response, AppError> {
-    let same = row.get::<String, _>("operation_kind")
-        == OperationKind::RootGenerationCreate.as_str()
-        && row.get::<String, _>("status") == "succeeded"
-        && blob::<32>(row, "canonical_request_hash")? == req.request_hash
-        && blob::<32>(row, "exact_request_bytes_sha256")? == req.exact_sha
-        && row.get::<Vec<u8>, _>("exact_request_bytes") == exact_request;
-    if !same {
+    if !same_request(
+        row,
+        OperationKind::RootGenerationCreate,
+        &req.request_hash,
+        exact_request,
+    )? {
         return Err(mismatch());
     }
     let response: Vec<u8> = row
@@ -432,44 +425,27 @@ async fn bootstrap(
         }),
         created_at_ms: committed_at_ms,
     };
-    let response = IdempotentStoredResponseV2 {
-        operation_kind: OperationKind::RootGenerationCreate,
-        idempotency_key: req.outer.idempotency_key,
-        exact_request_hash: req.request_hash,
-        response_record_type: RECORD_TYPE_ROOT_GENERATION_CREATED.into(),
-        canonical_response_payload_bytes: created.encode(),
-        server_instance_id: v.server_instance_id,
-        restore_epoch: v.restore_epoch,
+    let response = stored_response(
+        &req.outer,
+        RECORD_TYPE_ROOT_GENERATION_CREATED,
+        created.encode(),
+        v,
         committed_at_ms,
-        receipt_id: random::<16>()?,
-    }
-    .encode();
+    )?;
     let retained_until = c
         .not_after_ms
         .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
         .ok_or(AppError::Forbidden)?;
-    sqlx::query(
-        "INSERT INTO v2_idempotency
-             (server_instance_id, tenant_id, actor_device_id, operation_scope, idempotency_key,
-              operation_kind, canonical_request_hash, exact_request_bytes,
-              exact_request_bytes_sha256, status, response_record_type, exact_response_bytes,
-              exact_response_bytes_sha256, retained_until)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)",
+    store_response(
+        &mut tx,
+        v,
+        s,
+        &req.outer,
+        exact_request,
+        RECORD_TYPE_ROOT_GENERATION_CREATED,
+        &response,
+        retained_until,
     )
-    .bind(v.server_instance_id.as_slice())
-    .bind(s.tenant_id.as_slice())
-    .bind(s.device_id.as_slice())
-    .bind(OperationKind::RootGenerationCreate.scope())
-    .bind(req.outer.idempotency_key.as_slice())
-    .bind(OperationKind::RootGenerationCreate.as_str())
-    .bind(req.request_hash.as_slice())
-    .bind(exact_request)
-    .bind(req.exact_sha.as_slice())
-    .bind(RECORD_TYPE_ROOT_GENERATION_CREATED)
-    .bind(&response)
-    .bind(sha256(&response).as_slice())
-    .bind(int(retained_until)?)
-    .execute(&mut *tx)
     .await?;
     audit(
         &mut tx,
@@ -485,6 +461,110 @@ async fn bootstrap(
     Ok(cbor(StatusCode::CREATED, response))
 }
 
+/// The value of one grant column.
+enum Col {
+    Blob(Vec<u8>),
+    Int(i64),
+    Text(&'static str),
+    Null,
+}
+
+type Query<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+
+fn bind<'q>(q: Query<'q>, col: &'q Col) -> Query<'q> {
+    match col {
+        Col::Blob(b) => q.bind(b.as_slice()),
+        Col::Int(n) => q.bind(*n),
+        Col::Text(t) => q.bind(*t),
+        Col::Null => q.bind(Option::<i64>::None),
+    }
+}
+
+/// Every plan 7.2 column of a grant row except `created_at` and the two
+/// marks, each derived from the verified record. Filing and readback both use
+/// this list, so a column cannot be written one way and checked another.
+fn grant_columns(
+    g: &TenantRootKeyGrantV2,
+    record: &AuthorizationRecord,
+) -> Result<Vec<(&'static str, Col)>, AppError> {
+    let c = &g.common;
+    let b = |bytes: &[u8]| Col::Blob(bytes.to_vec());
+    let (previous_key, previous_generation) = match g.variant {
+        RootGrantVariant::RotationGrant {
+            previous_root_key_id,
+            previous_root_generation,
+        } => (
+            b(&previous_root_key_id),
+            Col::Int(int(previous_root_generation)?),
+        ),
+        _ => (Col::Null, Col::Null),
+    };
+    let (suite, version) = record.signature_suite();
+    Ok(vec![
+        ("server_instance_id", b(&c.server_instance_id)),
+        ("tenant_id", b(&c.tenant_id)),
+        ("replay_id", b(&c.replay_id)),
+        (
+            "container_domain",
+            Col::Text(shared::authz_record::CONTAINER_DOMAIN),
+        ),
+        (
+            "container_version",
+            Col::Int(i64::from(shared::authz_record::CONTAINER_VERSION)),
+        ),
+        ("payload_domain", Col::Text(DOMAIN_TENANT_ROOT_KEY_GRANT)),
+        ("payload_version", Col::Int(2)),
+        ("grant_variant", Col::Text(g.variant.as_str())),
+        ("root_key_id", b(&g.root_key_id)),
+        ("root_generation", Col::Int(int(g.root_generation)?)),
+        ("grant_capability", Col::Text("root.custody")),
+        ("subject_account_id", b(&g.subject_account_id)),
+        ("subject_device_id", b(&g.subject_device_id)),
+        ("subject_signing_key_id", b(&g.subject_signing_key_id)),
+        (
+            "subject_device_approval_payload_domain",
+            Col::Text(DOMAIN_DEVICE_APPROVAL),
+        ),
+        (
+            "subject_device_approval_replay_id",
+            b(&g.subject_device_approval_replay_id),
+        ),
+        ("recipient_hpke_key_id", b(&g.recipient_hpke_key_id)),
+        ("hpke_suite_id", Col::Int(1)),
+        ("hpke_mode_id", Col::Int(0)),
+        ("hpke_kem_id", Col::Int(32)),
+        ("hpke_kdf_id", Col::Int(1)),
+        ("hpke_aead_id", Col::Int(3)),
+        ("hpke_info_bytes", Col::Blob(g.hpke_info_bytes())),
+        ("hpke_encapped_key_bytes", b(&g.hpke_encapped_key_bytes)),
+        ("hpke_wrapped_trk_bytes", b(&g.hpke_wrapped_trk_bytes)),
+        ("previous_root_key_id", previous_key),
+        ("previous_root_generation", previous_generation),
+        ("issued_at_ms", Col::Int(int(c.issued_at_ms)?)),
+        ("not_before_ms", Col::Int(int(c.not_before_ms)?)),
+        ("not_after_ms", Col::Int(int(c.not_after_ms)?)),
+        ("restore_epoch", Col::Int(int(c.restore_epoch)?)),
+        (
+            "canonical_payload_bytes",
+            b(record.canonical_payload_bytes()),
+        ),
+        ("payload_sha256", b(record.payload_sha256())),
+        ("signature_suite_id", Col::Int(i64::from(suite))),
+        ("signature_version", Col::Int(i64::from(version))),
+        ("issuer_signing_key_id", b(record.issuer_signing_key_id())),
+        ("signature_bytes", b(record.signature_bytes())),
+        ("signed_container_hash", b(record.signed_container_hash())),
+        (
+            "exact_signed_container_bytes",
+            b(record.exact_signed_container_bytes()),
+        ),
+        (
+            "exact_signed_container_bytes_sha256",
+            b(record.exact_signed_container_bytes_sha256()),
+        ),
+    ])
+}
+
 /// Files the exact grant row: every column from the verified record.
 async fn insert_grant(
     conn: &mut SqliteConnection,
@@ -492,67 +572,182 @@ async fn insert_grant(
     record: &AuthorizationRecord,
     created_at: &str,
 ) -> Result<(), AppError> {
+    let cols = grant_columns(g, record)?;
+    let names: Vec<&str> = cols.iter().map(|(name, _)| *name).collect();
+    let sql = format!(
+        "INSERT INTO v2_tenant_root_key_grants ({}, created_at) VALUES ({}?)",
+        names.join(", "),
+        "?, ".repeat(cols.len())
+    );
+    let mut q = sqlx::query(&sql);
+    for (_, col) in &cols {
+        q = bind(q, col);
+    }
+    q.bind(created_at).execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// The primary key of a root grant row: instance, tenant, replay ID.
+pub(super) type GrantKey<'a> = (&'a [u8; 16], &'a [u8; 16], &'a [u8; 16]);
+
+/// Whether the row stored under `key` holds exactly the columns the verified
+/// record determines (plan 5.6.4: every read reparses and compares one for
+/// one). A record naming another key is never this row's, even if some other
+/// row holds it.
+pub(super) async fn grant_row_matches(
+    conn: &mut SqliteConnection,
+    key: GrantKey<'_>,
+    g: &TenantRootKeyGrantV2,
+    record: &AuthorizationRecord,
+) -> Result<bool, AppError> {
     let c = &g.common;
-    let (previous_key, previous_generation) = match g.variant {
-        RootGrantVariant::RotationGrant {
-            previous_root_key_id,
-            previous_root_generation,
-        } => (
-            Some(previous_root_key_id.to_vec()),
-            Some(int(previous_root_generation)?),
-        ),
-        _ => (None, None),
-    };
-    sqlx::query(
-        "INSERT INTO v2_tenant_root_key_grants
-             (server_instance_id, tenant_id, replay_id, container_domain, container_version,
-              payload_domain, payload_version, grant_variant, root_key_id, root_generation,
-              grant_capability, subject_account_id, subject_device_id, subject_signing_key_id,
-              subject_device_approval_payload_domain, subject_device_approval_replay_id,
-              recipient_hpke_key_id, hpke_suite_id, hpke_mode_id, hpke_kem_id, hpke_kdf_id,
-              hpke_aead_id, hpke_info_bytes, hpke_encapped_key_bytes, hpke_wrapped_trk_bytes,
-              previous_root_key_id, previous_root_generation, issued_at_ms, not_before_ms,
-              not_after_ms, restore_epoch, canonical_payload_bytes, payload_sha256,
-              signature_suite_id, signature_version, issuer_signing_key_id, signature_bytes,
-              signed_container_hash, exact_signed_container_bytes,
-              exact_signed_container_bytes_sha256, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 2, ?, ?, ?, 'root.custody', ?, ?, ?, ?, ?, ?, 1, 0, 32, 1, 3,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id) != key {
+        return Ok(false);
+    }
+    // The key is among the columns, so the check below is of that one row.
+    let cols = grant_columns(g, record)?;
+    let condition: Vec<String> = cols
+        .iter()
+        .map(|(name, _)| format!("{name} IS ?"))
+        .collect();
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM v2_tenant_root_key_grants WHERE {})",
+        condition.join(" AND ")
+    );
+    let mut q = sqlx::query_scalar::<_, bool>(&sql);
+    for (_, col) in &cols {
+        q = match col {
+            Col::Blob(b) => q.bind(b.as_slice()),
+            Col::Int(n) => q.bind(*n),
+            Col::Text(t) => q.bind(*t),
+            Col::Null => q.bind(Option::<i64>::None),
+        };
+    }
+    Ok(q.fetch_one(&mut *conn).await?)
+}
+
+// ------------------------------------------------- the idempotency ledger ---
+
+/// The ledger row of `kind` under the actor's key, if any.
+pub(super) async fn ledger_row(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    kind: OperationKind,
+    key: &[u8; 16],
+) -> Result<Option<sqlx::sqlite::SqliteRow>, AppError> {
+    Ok(sqlx::query(
+        "SELECT * FROM v2_idempotency
+          WHERE server_instance_id = ? AND tenant_id = ? AND actor_device_id = ?
+            AND operation_scope = ? AND idempotency_key = ?",
     )
-    .bind(c.server_instance_id.as_slice())
-    .bind(c.tenant_id.as_slice())
-    .bind(c.replay_id.as_slice())
-    .bind(shared::authz_record::CONTAINER_DOMAIN)
-    .bind(i64::from(shared::authz_record::CONTAINER_VERSION))
-    .bind(DOMAIN_TENANT_ROOT_KEY_GRANT)
-    .bind(g.variant.as_str())
-    .bind(g.root_key_id.as_slice())
-    .bind(int(g.root_generation)?)
-    .bind(g.subject_account_id.as_slice())
-    .bind(g.subject_device_id.as_slice())
-    .bind(g.subject_signing_key_id.as_slice())
-    .bind(DOMAIN_DEVICE_APPROVAL)
-    .bind(g.subject_device_approval_replay_id.as_slice())
-    .bind(g.recipient_hpke_key_id.as_slice())
-    .bind(g.hpke_info_bytes())
-    .bind(g.hpke_encapped_key_bytes.as_slice())
-    .bind(g.hpke_wrapped_trk_bytes.as_slice())
-    .bind(previous_key)
-    .bind(previous_generation)
-    .bind(int(c.issued_at_ms)?)
-    .bind(int(c.not_before_ms)?)
-    .bind(int(c.not_after_ms)?)
-    .bind(int(c.restore_epoch)?)
-    .bind(record.canonical_payload_bytes())
-    .bind(record.payload_sha256().as_slice())
-    .bind(i64::from(record.signature_suite().0))
-    .bind(i64::from(record.signature_suite().1))
-    .bind(record.issuer_signing_key_id().as_slice())
-    .bind(record.signature_bytes())
-    .bind(record.signed_container_hash().as_slice())
-    .bind(record.exact_signed_container_bytes())
-    .bind(record.exact_signed_container_bytes_sha256().as_slice())
-    .bind(created_at)
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(s.device_id.as_slice())
+    .bind(kind.scope())
+    .bind(key.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// A ledger row answers this request only if it is the same committed
+/// request, byte for byte.
+pub(super) fn same_request(
+    row: &sqlx::sqlite::SqliteRow,
+    kind: OperationKind,
+    request_hash: &[u8; 32],
+    exact_request: &[u8],
+) -> Result<bool, AppError> {
+    Ok(row.get::<String, _>("operation_kind") == kind.as_str()
+        && row.get::<String, _>("status") == "succeeded"
+        && blob::<32>(row, "canonical_request_hash")? == *request_hash
+        && blob::<32>(row, "exact_request_bytes_sha256")? == sha256(exact_request)
+        && row.get::<Vec<u8>, _>("exact_request_bytes") == exact_request)
+}
+
+/// The stored response a ledger row holds, if it is the exact map of `kind`
+/// for this request on this instance and epoch, with its record type and
+/// hash; `None` for anything else.
+pub(super) fn stored_payload(
+    row: &sqlx::sqlite::SqliteRow,
+    outer: &IdempotentMutationRequestV2,
+    record_type: &str,
+    v: &Verified,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let response: Vec<u8> = row.get::<Option<Vec<u8>>, _>("exact_response_bytes")?;
+    let stored = IdempotentStoredResponseV2::parse(&response).ok()?;
+    let ok = stored.operation_kind == outer.operation_kind
+        && stored.idempotency_key == outer.idempotency_key
+        && stored.exact_request_hash == outer.canonical_request_hash()
+        && stored.response_record_type == record_type
+        && stored.server_instance_id == v.server_instance_id
+        && stored.restore_epoch == v.restore_epoch
+        && row
+            .get::<Option<String>, _>("response_record_type")
+            .as_deref()
+            == Some(record_type)
+        && row
+            .get::<Option<Vec<u8>>, _>("exact_response_bytes_sha256")
+            .as_deref()
+            == Some(&sha256(&response)[..]);
+    ok.then_some((stored.canonical_response_payload_bytes, response))
+}
+
+/// The exact stored response map for `outer`.
+pub(super) fn stored_response(
+    outer: &IdempotentMutationRequestV2,
+    record_type: &str,
+    payload: Vec<u8>,
+    v: &Verified,
+    committed_at_ms: u64,
+) -> Result<Vec<u8>, AppError> {
+    Ok(IdempotentStoredResponseV2 {
+        operation_kind: outer.operation_kind,
+        idempotency_key: outer.idempotency_key,
+        exact_request_hash: outer.canonical_request_hash(),
+        response_record_type: record_type.into(),
+        canonical_response_payload_bytes: payload,
+        server_instance_id: v.server_instance_id,
+        restore_epoch: v.restore_epoch,
+        committed_at_ms,
+        receipt_id: random::<16>()?,
+    }
+    .encode())
+}
+
+/// Writes the committed ledger row, in the caller's transaction.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn store_response(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    outer: &IdempotentMutationRequestV2,
+    exact_request: &[u8],
+    record_type: &str,
+    response: &[u8],
+    retained_until: u64,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO v2_idempotency
+             (server_instance_id, tenant_id, actor_device_id, operation_scope, idempotency_key,
+              operation_kind, canonical_request_hash, exact_request_bytes,
+              exact_request_bytes_sha256, status, response_record_type, exact_response_bytes,
+              exact_response_bytes_sha256, retained_until)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(s.device_id.as_slice())
+    .bind(outer.operation_kind.scope())
+    .bind(outer.idempotency_key.as_slice())
+    .bind(outer.operation_kind.as_str())
+    .bind(outer.canonical_request_hash().as_slice())
+    .bind(exact_request)
+    .bind(sha256(exact_request).as_slice())
+    .bind(record_type)
+    .bind(response)
+    .bind(sha256(response).as_slice())
+    .bind(int(retained_until)?)
     .execute(&mut *conn)
     .await?;
     Ok(())

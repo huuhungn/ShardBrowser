@@ -8,6 +8,7 @@ pub mod v2;
 pub mod v2_approval;
 pub mod v2_auth;
 pub mod v2_root;
+pub mod v2_root_grants;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::Method;
@@ -65,6 +66,20 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v2/tenants/:tenant_id/root-key-generations",
             post(v2_root::create_root_generation)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/tenants/:tenant_id/root-key-generations/:generation/grants/:replay_id",
+            get(v2_root_grants::read_root_grant),
+        )
+        .route(
+            "/v2/tenants/:tenant_id/root-key-generations/:generation/grants/:replay_id/ack",
+            post(v2_root_grants::ack_root_grant)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/tenants/:tenant_id/root-key-generations/:generation/activate",
+            post(v2_root_grants::activate_root_generation)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
         .route("/v2/capability-grants", post(v2::present_capability_grant))
