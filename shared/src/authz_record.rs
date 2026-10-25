@@ -13,8 +13,11 @@
 
 use ed25519_dalek::SigningKey;
 
+use zeroize::Zeroizing;
+
 use crate::canonical::{self as c, CborError, Value};
-use crate::keys::signing_key_id;
+use crate::grants::{self, GrantError, GrantScope, TRK_LEN};
+use crate::keys::{root_key_id, signing_key_id};
 use crate::signing::{self, ED25519_SIG_LEN, SIGNATURE_SUITE_ID_ED25519, SIGNATURE_VERSION};
 
 pub const CONTAINER_DOMAIN: &str = "shardx.authorization.signed-container.v2";
@@ -24,6 +27,7 @@ pub const PAYLOAD_VERSION: u16 = 2;
 pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.auth.device-approval.v2";
 pub const DOMAIN_TENANT_CAPABILITY_GRANT: &str = "shardx.auth.tenant-capability-grant.v2";
 pub const DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE: &str = "shardx.keys.fleet-key-grant.device-hpke.v2";
+pub const DOMAIN_TENANT_ROOT_KEY_GRANT: &str = "shardx.keys.tenant-root-key-grant.v2";
 /// Domain of the closed HPKE `info` map of a `DeviceHpkeGrant` (ADR 0002 D-8).
 pub const DOMAIN_FLEET_KEY_GRANT_HPKE_INFO: &str =
     "shardx.keys.fleet-key-grant.device-hpke.hpke-info.v2";
@@ -202,6 +206,14 @@ impl Fields {
         }
     }
 
+    pub(crate) fn opt_uint(&mut self, field: &'static str) -> Result<Option<u64>> {
+        match self.take(field) {
+            None => Ok(None),
+            Some(Value::Uint(n)) => Ok(Some(n)),
+            Some(_) => Err(self.bad(field)),
+        }
+    }
+
     pub(crate) fn u16(&mut self, field: &'static str) -> Result<u16> {
         let n = self.uint(field)?;
         u16::try_from(n).map_err(|_| self.bad(field))
@@ -247,13 +259,14 @@ impl Fields {
 
 /// The payload kinds this build can parse. Any other `payload_domain` is
 /// `SCHEMA_UNSUPPORTED`: the record may be valid, but not for this build.
-/// Root, recovery and rotation grants are not here yet (W3/W4); an endpoint
-/// that accepts them must add their parsers before it calls this.
+/// Fleet recovery and rotation grants are not here yet (W4); an endpoint that
+/// accepts them must add their parsers before it calls this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
     DeviceApproval(DeviceApprovalV2),
     TenantCapabilityGrant(TenantCapabilityGrantV2),
     DeviceHpkeGrant(DeviceHpkeGrantV2),
+    TenantRootKeyGrant(TenantRootKeyGrantV2),
 }
 
 impl Payload {
@@ -265,6 +278,9 @@ impl Payload {
             }
             DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE => {
                 DeviceHpkeGrantV2::parse(bytes).map(Self::DeviceHpkeGrant)
+            }
+            DOMAIN_TENANT_ROOT_KEY_GRANT => {
+                TenantRootKeyGrantV2::parse(bytes).map(Self::TenantRootKeyGrant)
             }
             other => Err(RecordError::UnknownPayloadDomain(other.to_string())),
         }
@@ -1011,6 +1027,248 @@ impl DeviceHpkeGrantV2 {
     }
 }
 
+// ------------------------------------------------- TenantRootKeyGrantV2 ---
+
+/// Which root grant this is (plan 5.6.4). The previous-root pair exists only on
+/// a rotation, so the enum carries it there and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootGrantVariant {
+    /// Generation 0, signed by its own subject in the one-time bootstrap.
+    FirstRootSelfGrant,
+    /// Another custodian of the ACTIVE generation.
+    ExistingRootGrant,
+    /// A custodian of PREPARING generation N+1, issued under ACTIVE N.
+    RotationGrant {
+        previous_root_key_id: [u8; 32],
+        previous_root_generation: u64,
+    },
+}
+
+impl RootGrantVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstRootSelfGrant => "FirstRootSelfGrant",
+            Self::ExistingRootGrant => "ExistingRootGrant",
+            Self::RotationGrant { .. } => "RotationGrant",
+        }
+    }
+}
+
+/// Plan 5.6.4 `TenantRootKeyGrantV2`, suite 1 only. Parsing checks what the
+/// payload alone decides: the exact HPKE tuple and lengths, the info bytes,
+/// distinct subject keys and the generation rules of each variant. Whether
+/// the issuer, approval link and generation match live state is the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRootKeyGrantV2 {
+    pub common: CommonFields,
+    pub variant: RootGrantVariant,
+    pub root_key_id: [u8; 32],
+    pub root_generation: u64,
+    pub subject_account_id: [u8; 16],
+    pub subject_device_id: [u8; 16],
+    pub subject_signing_key_id: [u8; 32],
+    pub recipient_hpke_key_id: [u8; 32],
+    pub subject_device_approval_replay_id: [u8; 16],
+    pub hpke_encapped_key_bytes: [u8; 32],
+    pub hpke_wrapped_trk_bytes: [u8; 48],
+}
+
+impl TenantRootKeyGrantV2 {
+    /// The fields the HPKE `info` binds.
+    pub fn scope(&self) -> GrantScope {
+        let k = &self.common;
+        GrantScope {
+            replay_id: k.replay_id,
+            tenant_id: k.tenant_id,
+            server_instance_id: k.server_instance_id,
+            restore_epoch: k.restore_epoch,
+            root_key_id: self.root_key_id,
+            root_generation: self.root_generation,
+            subject_account_id: self.subject_account_id,
+            subject_device_id: self.subject_device_id,
+            recipient_hpke_key_id: self.recipient_hpke_key_id,
+        }
+    }
+
+    /// Exact `TenantRootKeyGrantHpkeInfoV2` bytes. As with the device grant,
+    /// parsing refuses a payload whose stored bytes differ.
+    pub fn hpke_info_bytes(&self) -> Vec<u8> {
+        grants::root_grant_info(&self.scope())
+    }
+
+    /// Opens the wrapped TRK and checks it hashes to `root_key_id`. On any
+    /// failure the plaintext buffer is dropped, which zeroizes it.
+    pub fn open_trk(
+        &self,
+        recipient_sk_bytes: &[u8],
+    ) -> std::result::Result<Zeroizing<[u8; TRK_LEN]>, GrantError> {
+        let trk = grants::open_trk(
+            recipient_sk_bytes,
+            &self.scope(),
+            &self.hpke_encapped_key_bytes,
+            &self.hpke_wrapped_trk_bytes,
+        )?;
+        if root_key_id(&trk) != self.root_key_id {
+            return Err(GrantError::FieldMismatch("root_key_id"));
+        }
+        Ok(trk)
+    }
+
+    fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("TenantRootKeyGrantV2", payload)?;
+        let common = CommonFields::take(&mut f, DOMAIN_TENANT_ROOT_KEY_GRANT)?;
+        let variant = f.text("grant_variant")?;
+        let root_key_id = f.fixed("root_key_id")?;
+        let root_generation = f.uint("root_generation")?;
+        f.exact_text("grant_capability", Capability::RootCustody.as_str())?;
+        let subject_account_id = f.fixed("subject_account_id")?;
+        let subject_device_id = f.fixed("subject_device_id")?;
+        let subject_signing_key_id = f.fixed("subject_signing_key_id")?;
+        let recipient_hpke_key_id = f.fixed("recipient_hpke_key_id")?;
+        let subject_device_approval_replay_id = f.fixed("subject_device_approval_replay_id")?;
+        let suite = [
+            (
+                "hpke_suite_id",
+                u64::from(f.u16("hpke_suite_id")?),
+                u64::from(HPKE_SUITE_ID_X25519_CHACHA),
+            ),
+            ("hpke_mode_id", f.uint("hpke_mode_id")?, HPKE_MODE_BASE),
+            (
+                "hpke_kem_id",
+                u64::from(f.u16("hpke_kem_id")?),
+                HPKE_KEM_X25519_HKDF_SHA256,
+            ),
+            (
+                "hpke_kdf_id",
+                u64::from(f.u16("hpke_kdf_id")?),
+                HPKE_KDF_HKDF_SHA256,
+            ),
+            (
+                "hpke_aead_id",
+                u64::from(f.u16("hpke_aead_id")?),
+                HPKE_AEAD_CHACHA20POLY1305,
+            ),
+        ];
+        let hpke_info_bytes = f.bytes("hpke_info_bytes", 1, 1024)?;
+        let hpke_encapped_key_bytes = f.fixed("hpke_encapped_key_bytes")?;
+        let hpke_wrapped_trk_bytes = f.fixed("hpke_wrapped_trk_bytes")?;
+        let previous_root_key_id = f.opt_fixed::<32>("previous_root_key_id")?;
+        let previous_root_generation = f.opt_uint("previous_root_generation")?;
+        f.finish()?;
+
+        // hpke_mode_id is a U8; a larger value is out of type, not a suite.
+        if suite[1].1 > u64::from(u8::MAX) {
+            return Err(RecordError::BadField {
+                map: "TenantRootKeyGrantV2",
+                field: "hpke_mode_id",
+            });
+        }
+        for (field, id, exact) in suite {
+            if id != exact {
+                return Err(RecordError::Unsupported { field, id });
+            }
+        }
+        let variant = match (
+            variant.as_str(),
+            previous_root_key_id,
+            previous_root_generation,
+        ) {
+            ("FirstRootSelfGrant", None, None) => RootGrantVariant::FirstRootSelfGrant,
+            ("ExistingRootGrant", None, None) => RootGrantVariant::ExistingRootGrant,
+            ("RotationGrant", Some(previous_root_key_id), Some(previous_root_generation)) => {
+                RootGrantVariant::RotationGrant {
+                    previous_root_key_id,
+                    previous_root_generation,
+                }
+            }
+            // The previous-root pair is present iff the variant is a rotation.
+            ("FirstRootSelfGrant" | "ExistingRootGrant" | "RotationGrant", _, _) => {
+                return Err(RecordError::BadValue("previous_root_key_id"));
+            }
+            _ => return Err(RecordError::BadValue("grant_variant")),
+        };
+        match variant {
+            // Bootstrap creates generation 0 and nothing else.
+            RootGrantVariant::FirstRootSelfGrant if root_generation != 0 => {
+                return Err(RecordError::BadValue("root_generation"));
+            }
+            RootGrantVariant::RotationGrant {
+                previous_root_key_id,
+                previous_root_generation,
+            } => {
+                if previous_root_generation.checked_add(1) != Some(root_generation) {
+                    return Err(RecordError::BadValue("root_generation"));
+                }
+                if previous_root_key_id == root_key_id {
+                    return Err(RecordError::BadValue("previous_root_key_id"));
+                }
+            }
+            _ => {}
+        }
+        if subject_signing_key_id == recipient_hpke_key_id {
+            return Err(RecordError::BadValue("recipient_hpke_key_id"));
+        }
+        let grant = Self {
+            common,
+            variant,
+            root_key_id,
+            root_generation,
+            subject_account_id,
+            subject_device_id,
+            subject_signing_key_id,
+            recipient_hpke_key_id,
+            subject_device_approval_replay_id,
+            hpke_encapped_key_bytes,
+            hpke_wrapped_trk_bytes,
+        };
+        if hpke_info_bytes != grant.hpke_info_bytes() {
+            return Err(RecordError::BadValue("hpke_info_bytes"));
+        }
+        Ok(grant)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.common.put(DOMAIN_TENANT_ROOT_KEY_GRANT, &mut out);
+        out.extend([
+            ("grant_variant", c::t(self.variant.as_str())),
+            ("root_key_id", c::b(&self.root_key_id)),
+            ("root_generation", c::u(self.root_generation)),
+            ("grant_capability", c::t(Capability::RootCustody.as_str())),
+            ("subject_account_id", c::b(&self.subject_account_id)),
+            ("subject_device_id", c::b(&self.subject_device_id)),
+            ("subject_signing_key_id", c::b(&self.subject_signing_key_id)),
+            ("recipient_hpke_key_id", c::b(&self.recipient_hpke_key_id)),
+            (
+                "subject_device_approval_replay_id",
+                c::b(&self.subject_device_approval_replay_id),
+            ),
+            ("hpke_suite_id", c::u(HPKE_SUITE_ID_X25519_CHACHA.into())),
+            ("hpke_mode_id", c::u(HPKE_MODE_BASE)),
+            ("hpke_kem_id", c::u(HPKE_KEM_X25519_HKDF_SHA256)),
+            ("hpke_kdf_id", c::u(HPKE_KDF_HKDF_SHA256)),
+            ("hpke_aead_id", c::u(HPKE_AEAD_CHACHA20POLY1305)),
+            ("hpke_info_bytes", c::b(&self.hpke_info_bytes())),
+            (
+                "hpke_encapped_key_bytes",
+                c::b(&self.hpke_encapped_key_bytes),
+            ),
+            ("hpke_wrapped_trk_bytes", c::b(&self.hpke_wrapped_trk_bytes)),
+        ]);
+        if let RootGrantVariant::RotationGrant {
+            previous_root_key_id,
+            previous_root_generation,
+        } = self.variant
+        {
+            out.extend([
+                ("previous_root_key_id", c::b(&previous_root_key_id)),
+                ("previous_root_generation", c::u(previous_root_generation)),
+            ]);
+        }
+        c::encode(&c::m(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,6 +1361,29 @@ mod tests {
         }
     }
 
+    fn root_grant(variant: RootGrantVariant, root_generation: u64) -> TenantRootKeyGrantV2 {
+        TenantRootKeyGrantV2 {
+            common: common(),
+            variant,
+            root_key_id: fx("root-key-1"),
+            root_generation,
+            subject_account_id: fx("account-a"),
+            subject_device_id: fx("device-a"),
+            subject_signing_key_id: fx("device-a-signing"),
+            recipient_hpke_key_id: fx("device-a-hpke"),
+            subject_device_approval_replay_id: fx("approval-replay"),
+            hpke_encapped_key_bytes: fx("root-encapped"),
+            hpke_wrapped_trk_bytes: fx("root-wrapped"),
+        }
+    }
+
+    fn rotation(previous_root_generation: u64) -> RootGrantVariant {
+        RootGrantVariant::RotationGrant {
+            previous_root_key_id: fx("root-key-0"),
+            previous_root_generation,
+        }
+    }
+
     /// Re-encodes canonical map bytes with `edit` applied to the field list.
     fn edit_map(bytes: &[u8], edit: impl FnOnce(&mut Vec<(String, Value)>)) -> Vec<u8> {
         let Value::Map(mut entries) = c::decode(bytes).unwrap() else {
@@ -1171,6 +1452,18 @@ mod tests {
                 "f816e7b501732ffa3ce94236395d0497e7b30ba4537b04fbcaccf8415eed558f",
                 "4a9150a067d5951fbaf6bb672d38c0b0271b5005daa87593cb4b34d5135fbc42",
             ),
+            (
+                DOMAIN_TENANT_ROOT_KEY_GRANT,
+                root_grant(RootGrantVariant::FirstRootSelfGrant, 0).encode(),
+                "65170bee6254fc404bac04b3e9589416c29ae4a640035d7eb263db1207347eef",
+                "a8b93397f2addd39543bccaaca42426019db5ab2834e4560b37b3f9aaabe34f5",
+            ),
+            (
+                DOMAIN_TENANT_ROOT_KEY_GRANT,
+                root_grant(rotation(4), 5).encode(),
+                "7c7f9fd7996ec70ff35d60d72540f85228a2f1278e08f721996fddc9c5b4ab36",
+                "9d3a50858dcec59b85bdeb20dc0e84434d2ff7fecd5e7fc19010c667f044b7db",
+            ),
         ];
         for (domain, payload, container_hash, exact_sha) in cases {
             let rec =
@@ -1192,6 +1485,12 @@ mod tests {
         assert_eq!(
             hex(&c::sha256(&info)),
             "2a4877e5df7b46a2c00c6809e334f58cdffdeefe063b36d78c7611c593f8e518"
+        );
+        let info = root_grant(RootGrantVariant::FirstRootSelfGrant, 0).hpke_info_bytes();
+        assert_eq!(info.len(), 460);
+        assert_eq!(
+            hex(&c::sha256(&info)),
+            "83cf05a9e2a487fa64210dfa9fdc2486e9e84615f1a4842d920c8190a42f1493"
         );
     }
 
@@ -1651,5 +1950,205 @@ mod tests {
             DeviceHpkeGrantV2::parse(&same_keys.encode()),
             Err(RecordError::BadValue("recipient_hpke_key_id"))
         );
+    }
+
+    // ------------------------------------------------- tenant root grants ---
+
+    #[test]
+    fn root_grants_roundtrip_inside_a_record() {
+        for g in [
+            root_grant(RootGrantVariant::FirstRootSelfGrant, 0),
+            root_grant(RootGrantVariant::ExistingRootGrant, 0),
+            root_grant(RootGrantVariant::ExistingRootGrant, 3),
+            root_grant(rotation(0), 1),
+        ] {
+            let raw = g.encode();
+            assert_eq!(TenantRootKeyGrantV2::parse(&raw).unwrap().encode(), raw);
+            let verified = sign_and_verify(DOMAIN_TENANT_ROOT_KEY_GRANT, &raw).unwrap();
+            assert_eq!(verified.payload(), &Payload::TenantRootKeyGrant(g));
+        }
+        // The plan's info map is what the payload binds, byte for byte.
+        let g = root_grant(RootGrantVariant::ExistingRootGrant, 3);
+        assert_eq!(g.hpke_info_bytes(), grants::root_grant_info(&g.scope()));
+    }
+
+    #[test]
+    fn root_grant_pins_the_hpke_tuple_info_and_lengths() {
+        let raw = root_grant(RootGrantVariant::ExistingRootGrant, 3).encode();
+        let edited =
+            |key: &str, v: Value| TenantRootKeyGrantV2::parse(&edit_map(&raw, |e| set(e, key, v)));
+
+        for (field, wrong) in [
+            ("hpke_suite_id", 2),
+            ("hpke_mode_id", 1),
+            ("hpke_kem_id", 0x0021),
+            ("hpke_kdf_id", 0x0002),
+            ("hpke_aead_id", 0x0001),
+        ] {
+            assert_eq!(
+                edited(field, c::u(wrong)),
+                Err(RecordError::Unsupported { field, id: wrong }),
+                "{field}"
+            );
+        }
+        // Out of type is malformed, not a suite this build lacks.
+        assert!(matches!(
+            edited("hpke_mode_id", c::u(256)),
+            Err(RecordError::BadField {
+                field: "hpke_mode_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            edited("hpke_kem_id", c::u(0x1_0000)),
+            Err(RecordError::BadField {
+                field: "hpke_kem_id",
+                ..
+            })
+        ));
+        let other_info = root_grant(RootGrantVariant::ExistingRootGrant, 4).hpke_info_bytes();
+        assert_eq!(
+            edited("hpke_info_bytes", c::b(&other_info)),
+            Err(RecordError::BadValue("hpke_info_bytes"))
+        );
+        for (field, len) in [
+            ("hpke_encapped_key_bytes", 31),
+            ("hpke_encapped_key_bytes", 33),
+            ("hpke_wrapped_trk_bytes", 47),
+            ("hpke_wrapped_trk_bytes", 49),
+        ] {
+            assert_eq!(
+                code_of(edited(field, c::b(&vec![1u8; len]))),
+                "NON_CANONICAL_RECORD",
+                "{field} {len}"
+            );
+        }
+        assert_eq!(
+            edited("grant_capability", c::t("fleet.key.receive")),
+            Err(RecordError::BadValue("grant_capability"))
+        );
+        assert_eq!(
+            edited("grant_variant", c::t("DeviceHpkeGrant")),
+            Err(RecordError::BadValue("grant_variant"))
+        );
+        assert!(matches!(
+            edited("extra", c::u(1)),
+            Err(RecordError::UnknownField { .. })
+        ));
+        let missing = edit_map(&raw, |e| {
+            e.retain(|(k, _)| k != "subject_device_approval_replay_id")
+        });
+        assert!(matches!(
+            TenantRootKeyGrantV2::parse(&missing),
+            Err(RecordError::MissingField {
+                field: "subject_device_approval_replay_id",
+                ..
+            })
+        ));
+        let same_keys = TenantRootKeyGrantV2 {
+            recipient_hpke_key_id: fx("device-a-signing"),
+            ..root_grant(RootGrantVariant::ExistingRootGrant, 3)
+        };
+        assert_eq!(
+            TenantRootKeyGrantV2::parse(&same_keys.encode()),
+            Err(RecordError::BadValue("recipient_hpke_key_id"))
+        );
+    }
+
+    #[test]
+    fn root_grant_variants_follow_their_generation_rules() {
+        let parse = |g: TenantRootKeyGrantV2| TenantRootKeyGrantV2::parse(&g.encode());
+        // Bootstrap is generation 0 only.
+        assert_eq!(
+            parse(root_grant(RootGrantVariant::FirstRootSelfGrant, 1)),
+            Err(RecordError::BadValue("root_generation"))
+        );
+        // A rotation targets exactly previous + 1, under another key.
+        for target in [4, 6, 0] {
+            assert_eq!(
+                parse(root_grant(rotation(4), target)),
+                Err(RecordError::BadValue("root_generation")),
+                "{target}"
+            );
+        }
+        let same_key = TenantRootKeyGrantV2 {
+            variant: RootGrantVariant::RotationGrant {
+                previous_root_key_id: fx("root-key-1"),
+                previous_root_generation: 4,
+            },
+            ..root_grant(rotation(4), 5)
+        };
+        assert_eq!(
+            parse(same_key),
+            Err(RecordError::BadValue("previous_root_key_id"))
+        );
+
+        // The previous-root pair is present iff the variant is a rotation.
+        let rot = root_grant(rotation(4), 5).encode();
+        let plain = root_grant(RootGrantVariant::ExistingRootGrant, 5).encode();
+        for (raw, edit) in [
+            (&rot, ("drop", "previous_root_key_id")),
+            (&rot, ("drop", "previous_root_generation")),
+            (&rot, ("variant", "ExistingRootGrant")),
+            (&plain, ("add", "previous_root_key_id")),
+            (&plain, ("add", "previous_root_generation")),
+        ] {
+            let bytes = edit_map(raw, |e| match edit {
+                ("drop", key) => e.retain(|(k, _)| k != key),
+                ("variant", v) => set(e, "grant_variant", c::t(v)),
+                (_, "previous_root_key_id") => set(e, "previous_root_key_id", c::b(&[9u8; 32])),
+                (_, key) => set(e, key, c::u(4)),
+            });
+            assert_eq!(
+                TenantRootKeyGrantV2::parse(&bytes),
+                Err(RecordError::BadValue("previous_root_key_id")),
+                "{edit:?}"
+            );
+        }
+        let rot_bad_type = edit_map(&rot, |e| set(e, "previous_root_generation", c::t("4")));
+        assert!(matches!(
+            TenantRootKeyGrantV2::parse(&rot_bad_type),
+            Err(RecordError::BadField {
+                field: "previous_root_generation",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn root_grant_opens_only_to_the_trk_its_key_id_names() {
+        let (sk, pk) = grants::generate_keypair();
+        let trk = fx::<32>("tenant-root-key");
+        let sealed = |root_key_id: [u8; 32]| {
+            let mut g = TenantRootKeyGrantV2 {
+                root_key_id,
+                recipient_hpke_key_id: crate::keys::hpke_key_id(&pk),
+                ..root_grant(RootGrantVariant::FirstRootSelfGrant, 0)
+            };
+            let s = grants::seal_trk(&pk, &g.scope(), &trk).unwrap();
+            assert_eq!(s.hpke_info_bytes, g.hpke_info_bytes());
+            g.hpke_encapped_key_bytes = s.encapped_key_bytes.try_into().unwrap();
+            g.hpke_wrapped_trk_bytes = s.ciphertext_bytes.try_into().unwrap();
+            TenantRootKeyGrantV2::parse(&g.encode()).unwrap()
+        };
+
+        let good = sealed(root_key_id(&trk));
+        assert_eq!(*good.open_trk(&sk).unwrap(), trk);
+
+        // Sealed honestly, but naming another key ID: refused after opening.
+        let lying = sealed(fx("root-key-1"));
+        assert_eq!(
+            lying.open_trk(&sk),
+            Err(GrantError::FieldMismatch("root_key_id"))
+        );
+        // A grant whose signed fields moved no longer opens at all.
+        let moved = TenantRootKeyGrantV2 {
+            root_generation: 1,
+            variant: RootGrantVariant::ExistingRootGrant,
+            ..good.clone()
+        };
+        assert_eq!(moved.open_trk(&sk), Err(GrantError::HpkeFailure));
+        let (other_sk, _) = grants::generate_keypair();
+        assert_eq!(good.open_trk(&other_sk), Err(GrantError::HpkeFailure));
     }
 }
