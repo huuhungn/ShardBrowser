@@ -660,6 +660,13 @@ async fn refresh_rotates_once_and_respects_expiry() {
             .await,
         1
     );
+    // The revoked session's spent tokens went with it.
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_spent_refresh_tokens")
+            .await,
+        0
+    );
 
     // On a new session: the binding cannot be rewritten to stretch it, an
     // expired access token is refused, and an expired refresh ends it.
@@ -977,6 +984,26 @@ async fn an_account_holds_a_bounded_number_of_tickets() {
         .post("/v2/auth/logout", first["ticket"].as_str(), json!({}))
         .await;
     assert_eq!(status, 204);
+    server.login("owner").await;
+    assert_eq!(
+        server
+            .post(
+                "/v2/auth/login",
+                None,
+                json!({ "tenant": "acme", "username": "owner", "password": PASSWORD }),
+            )
+            .await
+            .0,
+        429
+    );
+    // A password change (token version) kills the old tickets, so they free
+    // their slots.
+    server
+        .sql(
+            "UPDATE v2_accounts SET token_version = 1 WHERE id = ?",
+            &[&OWNER],
+        )
+        .await;
     server.login("owner").await;
 }
 

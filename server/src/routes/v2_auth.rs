@@ -47,6 +47,8 @@ const MAX_CHALLENGES_PER_TICKET: i64 = 5;
 /// Refresh rotations per session. A setup session lives 30 minutes on a
 /// 5-minute access token, so a working client rotates about six times; the
 /// cap bounds the spent-token rows one session can leave behind.
+// shortcut: one cap for every class, sized for `pending_setup`; revisit when
+// W2 PR5 issues longer-lived `ordinary` sessions.
 const MAX_ROTATIONS_PER_SESSION: i64 = 64;
 /// Live tickets per account. Bounds what one account's successful logins can
 /// cause: at most this many times `MAX_CHALLENGES_PER_TICKET` challenges.
@@ -832,7 +834,9 @@ pub async fn refresh(
     // A token the server never issued takes no write lock.
     let known = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM v2_sessions WHERE refresh_token_hash = ?1 AND revoked_at_ms IS NULL
-         UNION ALL SELECT 1 FROM v2_spent_refresh_tokens WHERE refresh_token_hash = ?1
+         UNION ALL SELECT 1 FROM v2_spent_refresh_tokens t
+                     JOIN v2_sessions s ON s.tenant_id = t.tenant_id AND s.id = t.session_id
+                    WHERE t.refresh_token_hash = ?1 AND s.revoked_at_ms IS NULL
          LIMIT 1",
     )
     .bind(hash.as_slice())
