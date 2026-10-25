@@ -50,11 +50,12 @@ Enrollment (`server/src/enrollment.rs`) registers two keys per device:
 
 | Key | Purpose | Stored |
 | --- | --- | --- |
-| Ed25519 signing | Proof of possession; signs snapshot manifests | `team.json`, hex seed |
-| X25519 HPKE recipient | Receives wrapped keys — **unused today** | `team.json`, hex seed |
+| Ed25519 signing | Proof of possession; signs snapshot manifests | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
+| X25519 HPKE recipient | Opens root key grants sealed to this device | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
 
-The HPKE key is registered and never used. It exists because the design below
-needs it, and enrollment is the only moment a device can introduce a key.
+`team_collect_custody` uses the HPKE key to open root key grants. Fleet key
+grants are sealed to it too, but are not opened until verified key
+distribution ships (see the threat model below).
 
 On Windows both seeds are stored DPAPI-protected for the current user
 (`src-tauri/src/dpapi.rs`). Elsewhere `team.json` holds them as plaintext hex,
@@ -193,7 +194,9 @@ Roughly the sequence the constraints force:
    and should stay openable on a machine that has never enrolled.
 5. **Recovery bundle plus readback**, before any of this is called
    production-ready.
-6. **Move device keys into the OS credential store.**
+6. **Move device keys into the OS credential store.** Partly done: on
+   Windows the seeds and cached fleet keys are DPAPI-protected for the current
+   user. Keychain and kernel keyring are not wired up.
 
 Steps 1–3 are prerequisites for 4; shipping 4 first would mean inventing a
 distribution mechanism that the frozen design already specifies.
@@ -230,6 +233,17 @@ What holds today:
   A plaintext file from an earlier version is rewritten protected the first
   time it is read. Elsewhere these stay plaintext hex, protected by file
   permissions alone (`fleet-keys.json` is written 0600 on Unix).
+
+DPAPI recovery caveat. A protected `team.json` or `fleet-keys.json` opens only
+under the same Windows account with the same DPAPI master key. An
+administrator resetting the account password, reinstalling Windows and copying
+`%APPDATA%` back, or moving the files to another account or machine leaves
+them unreadable. A backup of these files therefore no longer carries a device
+identity across machines: the device must enroll again, and the Launcher says
+so (`keyStore.otherWindowsAccount`) instead of reporting a corrupt key. Fleet
+keys cached by an earlier version are lost the same way, so profiles pushed
+under a fleet key should be pushed again now: the new push is sealed under the
+passphrase and no longer depends on that cached key.
 
 What does not hold:
 
