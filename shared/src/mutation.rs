@@ -241,6 +241,8 @@ impl IdempotentMutationRequestV2 {
 pub struct IdempotentStoredResponseV2 {
     pub operation_kind: OperationKind,
     pub idempotency_key: [u8; 16],
+    /// The request's `canonical_request_hash`, as in the commit receipt (plan
+    /// L572), not the SHA-256 of its exact bytes.
     pub exact_request_hash: [u8; 32],
     pub response_record_type: String,
     pub canonical_response_payload_bytes: Vec<u8>,
@@ -304,6 +306,9 @@ impl IdempotentStoredResponseV2 {
         let stored_response_hash: [u8; 32] = f.fixed("stored_response_hash")?;
         f.finish()?;
 
+        // shortcut: plan L927 leaves the type unbounded and does not tie it to
+        // the kind; 128 bytes holds every 5.6.4 record name. Bind it to the
+        // kind when a second kind has a codec.
         if !(1..=128).contains(&response_record_type.len()) {
             return Err(RecordError::BadField {
                 map: "IdempotentStoredResponseV2",
@@ -452,6 +457,20 @@ fn take_mode(f: &mut Fields, target: &RootGenerationTarget) -> Result<RootGenera
     }
 }
 
+/// ADR 0002 D-4: the custodian set of a bootstrap is its self-grant alone,
+/// and both are named in the same map.
+fn bootstrap_set_is_self_grant(target: &RootGenerationTarget, self_grant: &[u8; 32]) -> Result<()> {
+    if target.required_custodian_grant_count != 1 {
+        return Err(RecordError::BadValue("required_custodian_grant_count"));
+    }
+    if root_custodian_grant_set_hash(&[*self_grant])
+        != Some(target.required_custodian_grant_set_hash)
+    {
+        return Err(RecordError::BadValue("required_custodian_grant_set_hash"));
+    }
+    Ok(())
+}
+
 fn put_mode<B>(mode: &RootGenerationMode<B>, out: &mut Vec<(&'static str, Value)>) {
     match mode {
         RootGenerationMode::Bootstrap(_) => out.push(("mode", c::t("bootstrap"))),
@@ -497,6 +516,7 @@ impl TenantRootGenerationCreateV2 {
                         "first_self_grant_container_bytes_sha256",
                     ));
                 }
+                bootstrap_set_is_self_grant(&target, &hash)?;
                 RootGenerationMode::Bootstrap(EmbeddedSelfGrant {
                     container_bytes,
                     signed_container_hash: hash,
@@ -567,6 +587,7 @@ impl TenantRootGenerationCreatedV2 {
 
         let mode = match (mode, replay_id, hash, bytes_sha) {
             (RootGenerationMode::Bootstrap(()), Some(replay_id), Some(hash), Some(sha)) => {
+                bootstrap_set_is_self_grant(&target, &hash)?;
                 RootGenerationMode::Bootstrap(SelfGrantIdentity {
                     replay_id,
                     signed_container_hash: hash,
@@ -669,9 +690,20 @@ mod tests {
         }
     }
 
+    /// Generation 0, whose custodian set is the fixture self-grant (D-4).
+    fn boot_target() -> RootGenerationTarget {
+        RootGenerationTarget {
+            required_custodian_grant_set_hash: root_custodian_grant_set_hash(&[fx(
+                "container-hash",
+            )])
+            .unwrap(),
+            ..target(0)
+        }
+    }
+
     fn bootstrap() -> TenantRootGenerationCreateV2 {
         TenantRootGenerationCreateV2 {
-            target: target(0),
+            target: boot_target(),
             mode: RootGenerationMode::Bootstrap(EmbeddedSelfGrant {
                 container_bytes: b"signed self-grant container".to_vec(),
                 signed_container_hash: fx("container-hash"),
@@ -691,7 +723,7 @@ mod tests {
 
     fn created() -> TenantRootGenerationCreatedV2 {
         TenantRootGenerationCreatedV2 {
-            target: target(0),
+            target: boot_target(),
             mode: RootGenerationMode::Bootstrap(SelfGrantIdentity {
                 replay_id: fx("self-grant-replay"),
                 signed_container_hash: fx("container-hash"),
@@ -710,6 +742,43 @@ mod tests {
             server_instance_id: fx("instance"),
             restore_epoch: 3,
         }
+    }
+
+    fn rotated() -> TenantRootGenerationCreatedV2 {
+        TenantRootGenerationCreatedV2 {
+            target: target(5),
+            mode: RootGenerationMode::Rotation {
+                previous_root_key_id: fx("root-key-0"),
+                previous_root_generation: 4,
+            },
+            created_at_ms: 9,
+        }
+    }
+
+    /// Each map's exact bytes and a parse that drops the value.
+    type Reencode = fn(&[u8]) -> Result<Vec<u8>>;
+
+    fn maps() -> Vec<(&'static str, Vec<u8>, Reencode)> {
+        vec![
+            ("request", request().encode(), |b| {
+                IdempotentMutationRequestV2::parse(b).map(|m| m.encode())
+            }),
+            ("response", response().encode(), |b| {
+                IdempotentStoredResponseV2::parse(b).map(|m| m.encode())
+            }),
+            ("bootstrap", bootstrap().encode(), |b| {
+                TenantRootGenerationCreateV2::parse(b).map(|m| m.encode())
+            }),
+            ("rotation", rotation().encode(), |b| {
+                TenantRootGenerationCreateV2::parse(b).map(|m| m.encode())
+            }),
+            ("created", created().encode(), |b| {
+                TenantRootGenerationCreatedV2::parse(b).map(|m| m.encode())
+            }),
+            ("rotated", rotated().encode(), |b| {
+                TenantRootGenerationCreatedV2::parse(b).map(|m| m.encode())
+            }),
+        ]
     }
 
     fn response() -> IdempotentStoredResponseV2 {
@@ -739,20 +808,107 @@ mod tests {
         for g in [bootstrap(), rotation()] {
             assert_eq!(TenantRootGenerationCreateV2::parse(&g.encode()).unwrap(), g);
         }
-        let rotated = TenantRootGenerationCreatedV2 {
-            target: target(5),
-            mode: RootGenerationMode::Rotation {
-                previous_root_key_id: fx("root-key-0"),
-                previous_root_generation: 4,
-            },
-            created_at_ms: 9,
-        };
-        for g in [created(), rotated] {
+        for g in [created(), rotated()] {
             assert_eq!(
                 TenantRootGenerationCreatedV2::parse(&g.encode()).unwrap(),
                 g
             );
         }
+        for (name, raw, reencode) in maps() {
+            assert_eq!(reencode(&raw).unwrap(), raw, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_map_refuses_another_domain_or_version() {
+        for (name, raw, reencode) in maps() {
+            for domain in ["shardx.sync.other.v2", "shardx.auth.device-approval.v2"] {
+                assert_eq!(
+                    reencode(&edit(&raw, |e| set(e, "domain", c::t(domain)))),
+                    Err(RecordError::BadValue("domain")),
+                    "{name} {domain}"
+                );
+            }
+            for version in [1, 3] {
+                assert_eq!(
+                    reencode(&edit(&raw, |e| set(e, "version", c::u(version)))),
+                    Err(RecordError::BadValue("version")),
+                    "{name} {version}"
+                );
+            }
+        }
+        // One map's bytes never parse as another's.
+        assert!(TenantRootGenerationCreatedV2::parse(&bootstrap().encode()).is_err());
+        assert!(TenantRootGenerationCreateV2::parse(&created().encode()).is_err());
+    }
+
+    /// Plan L913 and 5.6.4 name the root kinds and scopes, ADR 0002 D-9 the
+    /// fleet and device ones. The plan names no scope for the six profile
+    /// kinds; these are the names this module files them under.
+    #[test]
+    fn the_kind_and_scope_table_is_exact() {
+        let table = [
+            ("PROFILE_PUBLISH_CREATE", "profile.publish-create.v2"),
+            ("PROFILE_CHECKOUT", "profile.checkout.v2"),
+            ("CREATE_UPLOAD", "profile.create-upload.v2"),
+            ("FINALIZE_UPLOAD", "profile.finalize-upload.v2"),
+            ("RELEASE_LEASE", "profile.release-lease.v2"),
+            ("LOCAL_UNBIND", "local.profile.unbind.v2"),
+            ("ROOT_GENERATION_CREATE", "tenant.root-generation-create.v2"),
+            ("ROOT_GRANT_CREATE", "tenant.root-grant-create.v2"),
+            ("ROOT_GRANT_ACK", "tenant.root-grant-ack.v2"),
+            (
+                "ROOT_GENERATION_ACTIVATE",
+                "tenant.root-generation-activate.v2",
+            ),
+            ("ROOT_GRANT_REVOKE", "tenant.root-grant-revoke.v2"),
+            ("FLEET_GENERATION_CREATE", "fleet.key-generation-create.v2"),
+            ("FLEET_GRANT_CREATE", "fleet.key-grant-create.v2"),
+            ("FLEET_GRANT_ACK", "fleet.key-grant-ack.v2"),
+            (
+                "FLEET_GENERATION_ACTIVATE",
+                "fleet.key-generation-activate.v2",
+            ),
+            ("FLEET_GRANT_REVOKE", "fleet.key-grant-revoke.v2"),
+            ("DEVICE_REVOKE", "device.revoke.v2"),
+        ];
+        let actual: Vec<_> = OperationKind::ALL
+            .iter()
+            .map(|k| (k.as_str(), k.scope()))
+            .collect();
+        assert_eq!(actual, table);
+    }
+
+    #[test]
+    fn a_bootstrap_custodian_set_is_its_self_grant_alone() {
+        let mut g = bootstrap();
+        g.target.required_custodian_grant_count = 2;
+        assert_eq!(
+            TenantRootGenerationCreateV2::parse(&g.encode()),
+            Err(RecordError::BadValue("required_custodian_grant_count"))
+        );
+        let mut g = bootstrap();
+        g.target.required_custodian_grant_set_hash = fx("grant-set");
+        assert_eq!(
+            TenantRootGenerationCreateV2::parse(&g.encode()),
+            Err(RecordError::BadValue("required_custodian_grant_set_hash"))
+        );
+        let mut g = created();
+        g.target.required_custodian_grant_count = 2;
+        assert_eq!(
+            TenantRootGenerationCreatedV2::parse(&g.encode()),
+            Err(RecordError::BadValue("required_custodian_grant_count"))
+        );
+        let mut g = created();
+        g.target.required_custodian_grant_set_hash = fx("grant-set");
+        assert_eq!(
+            TenantRootGenerationCreatedV2::parse(&g.encode()),
+            Err(RecordError::BadValue("required_custodian_grant_set_hash"))
+        );
+        // A rotation names its custodians elsewhere; any set parses here.
+        let mut g = rotation();
+        g.target.required_custodian_grant_count = 3;
+        assert!(TenantRootGenerationCreateV2::parse(&g.encode()).is_ok());
     }
 
     /// Pins the hash constructions and the field sets.
@@ -760,11 +916,11 @@ mod tests {
     fn golden_vectors() {
         assert_eq!(
             hex(&request().canonical_request_hash()),
-            "2d557baf1e87b529fc479e01a54d1719d43cef9a1755ab4eb5204505ff6cce90"
+            "0e1a42ce3b2eae6840e90894e351e9da5608d23da626174261de2c259ed270a6"
         );
         assert_eq!(
             hex(&response().stored_response_hash()),
-            "60d137064996eef08748611a262838a65076646048d404a693e6020b243a6224"
+            "decc4d687516199a5b88213a10c197e4ba744b485307b24ebf29cf9276b78a49"
         );
         assert_eq!(
             hex(&c::sha256(&rotation().encode())),
@@ -850,13 +1006,15 @@ mod tests {
             req(&|e| set(e, "extra", c::u(1))),
             Err(RecordError::UnknownField { .. })
         ));
-        assert!(matches!(
-            req(&|e| set(e, "canonical_payload_bytes", c::b(&vec![1; 262145]))),
-            Err(RecordError::BadField {
-                field: "canonical_payload_bytes",
-                ..
-            })
-        ));
+        for len in [0, 262145] {
+            assert!(matches!(
+                req(&|e| set(e, "canonical_payload_bytes", c::b(&vec![1; len]))),
+                Err(RecordError::BadField {
+                    field: "canonical_payload_bytes",
+                    ..
+                })
+            ));
+        }
 
         let raw = response().encode();
         let resp = |f: Editor| IdempotentStoredResponseV2::parse(&edit(&raw, |e| f(e)));
@@ -872,13 +1030,24 @@ mod tests {
             resp(&|e| set(e, "outcome", c::t("failed"))),
             Err(RecordError::BadValue("outcome"))
         );
-        assert!(matches!(
-            resp(&|e| set(e, "response_record_type", c::t(""))),
-            Err(RecordError::BadField {
-                field: "response_record_type",
-                ..
-            })
-        ));
+        for len in [0, 129] {
+            assert!(matches!(
+                resp(&|e| set(e, "response_record_type", c::t(&"T".repeat(len)))),
+                Err(RecordError::BadField {
+                    field: "response_record_type",
+                    ..
+                }),
+            ));
+        }
+        for len in [0, 262145] {
+            assert!(matches!(
+                resp(&|e| set(e, "canonical_response_payload_bytes", c::b(&vec![1; len]))),
+                Err(RecordError::BadField {
+                    field: "canonical_response_payload_bytes",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -966,14 +1135,19 @@ mod tests {
             p(&edit(&boot, |e| set(e, "mode", c::t("restore")))),
             Err(RecordError::BadValue("mode"))
         );
-        assert!(matches!(
-            p(&edit(&boot, |e| set(
-                e,
-                "first_self_grant_container_bytes",
-                c::b(&vec![1; 131073])
-            ))),
-            Err(RecordError::BadField { .. })
-        ));
+        for len in [0, 131073] {
+            assert!(matches!(
+                p(&edit(&boot, |e| set(
+                    e,
+                    "first_self_grant_container_bytes",
+                    c::b(&vec![1; len])
+                ))),
+                Err(RecordError::BadField {
+                    field: "first_self_grant_container_bytes",
+                    ..
+                })
+            ));
+        }
 
         let made = created().encode();
         let q = TenantRootGenerationCreatedV2::parse;
@@ -981,9 +1155,28 @@ mod tests {
             q(&edit(&made, |e| set(e, "generation_state", c::t("ACTIVE")))),
             Err(RecordError::BadValue("generation_state"))
         );
-        assert_eq!(
-            q(&edit(&made, |e| drop_key(e, "first_self_grant_replay_id"))),
-            Err(RecordError::BadValue("first_self_grant_replay_id"))
-        );
+        // The self-grant identity is present iff bootstrap, every field.
+        let rot = rotated().encode();
+        for key in [
+            "first_self_grant_replay_id",
+            "first_self_grant_signed_container_hash",
+            "first_self_grant_container_bytes_sha256",
+        ] {
+            assert_eq!(
+                q(&edit(&made, |e| drop_key(e, key))),
+                Err(RecordError::BadValue("first_self_grant_replay_id")),
+                "{key}"
+            );
+            let len = if key == "first_self_grant_replay_id" {
+                16
+            } else {
+                32
+            };
+            assert_eq!(
+                q(&edit(&rot, |e| set(e, key, c::b(&vec![1; len])))),
+                Err(RecordError::BadValue("first_self_grant_replay_id")),
+                "{key}"
+            );
+        }
     }
 }
