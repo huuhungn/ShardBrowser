@@ -844,3 +844,254 @@ async fn tenant_create_rolls_back_everything_when_the_audit_insert_fails() {
     assert!(stderr(&out).contains("audit"), "{}", stderr(&out));
     assert_eq!(tenant_rows(&d).await, [0; 5]);
 }
+
+// ------------------------------------------------- first-device confirmation ---
+
+/// A tenant from `tenant create` with a device of its owner, seeded the way
+/// enrollment stores it. Returns the device ID and both key IDs as hex.
+async fn first_device_candidate(
+    d: &Dirs,
+    status: &str,
+    hpke_domain_ok: bool,
+) -> (String, String, String) {
+    let out = tenant_create(d, "acme", &["--password-stdin"], &stdin_password());
+    assert!(out.status.success(), "{}", stderr(&out));
+    let pool = db(d).await;
+    let (tenant_id, account_id): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT tenant_id, id FROM v2_accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let spk = shared::signing::Ed25519SigningKey::from_bytes(&[3; 32])
+        .verifying_key()
+        .to_bytes();
+    let hpk = [9u8; 32];
+    let sid = shared::keys::signing_key_id(&spk);
+    // The historical bug stored the HPKE ID under the signing domain.
+    let hid = if hpke_domain_ok {
+        shared::keys::hpke_key_id(&hpk)
+    } else {
+        shared::keys::signing_key_id(&hpk)
+    };
+    let device_id = [0x5au8; 16];
+    sqlx::query("INSERT INTO v2_devices VALUES (?, ?, ?, x'aa', ?, ?, 1, ?, ?, 1, ?, NULL, 't')")
+        .bind(device_id.as_slice())
+        .bind(&tenant_id)
+        .bind(&account_id)
+        .bind(sid.as_slice())
+        .bind(spk.as_slice())
+        .bind(hid.as_slice())
+        .bind(hpk.as_slice())
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    (hex(&device_id), hex(&sid), hex(&hid))
+}
+
+fn tenant_cmd(d: &Dirs, args: &[&str], input: &str) -> Output {
+    let mut child = bin()
+        .arg("tenant")
+        .args(args)
+        .env("SHARDX_DATA_DIR", &d.data)
+        .env("SHARDX_IDENTITY_DIR", &d.identity)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+fn confirm(d: &Dirs, device: &str, input: &str) -> Output {
+    tenant_cmd(
+        d,
+        &[
+            "confirm-first-device",
+            "--tenant",
+            "acme",
+            "--device",
+            device,
+        ],
+        input,
+    )
+}
+
+type FirstDeviceRows = (String, Vec<(String, String)>, Vec<String>);
+
+/// The guard state, every confirmation and every audit action.
+async fn first_device_rows(d: &Dirs) -> FirstDeviceRows {
+    let pool = db(d).await;
+    let guard: String = sqlx::query_scalar("SELECT state FROM v2_bootstrap_guards")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let confirmations: Vec<(String, String)> =
+        sqlx::query_as("SELECT hex(confirmation_id), state FROM v2_first_device_confirmations")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let audit: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM v2_audit_events ORDER BY action")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    (guard, confirmations, audit)
+}
+
+#[tokio::test]
+async fn confirm_first_device_records_the_operator_match_once() {
+    let d = initialised("first-confirm");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+
+    // The operator copies the IDs from the client screen, in either case.
+    let out = confirm(&d, &device, &format!("{}\n{hid}\n", sid.to_uppercase()));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(field(&out, "signing_key_id"), sid);
+    assert_eq!(field(&out, "hpke_key_id"), hid);
+    let confirmation_id = field(&out, "confirmation_id");
+
+    let (guard, confirmations, audit) = first_device_rows(&d).await;
+    assert_eq!(guard, "reserved");
+    assert_eq!(
+        confirmations,
+        vec![(confirmation_id.to_uppercase(), "pending".to_string())]
+    );
+    assert_eq!(audit, vec!["tenant.create", "tenant.first_device_confirm"]);
+    let pool = db(&d).await;
+    type Tuple = (String, String, String, Option<Vec<u8>>, Option<Vec<u8>>);
+    let tuple: Tuple = sqlx::query_as(
+        "SELECT hex(c.device_id), hex(c.signing_key_id), hex(c.hpke_key_id), \
+                a.actor_account_id, a.actor_device_id \
+         FROM v2_first_device_confirmations c JOIN v2_audit_events a \
+           ON a.tenant_id = c.tenant_id AND a.action = 'tenant.first_device_confirm' \
+          AND a.target_id = c.device_id AND a.request_id = c.request_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(
+        tuple,
+        (
+            device.to_uppercase(),
+            sid.to_uppercase(),
+            hid.to_uppercase(),
+            None,
+            None
+        )
+    );
+
+    // A second confirmation is refused and writes nothing.
+    let before = first_device_rows(&d).await;
+    let again = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(!again.status.success());
+    assert!(stderr(&again).contains("reserved"), "{}", stderr(&again));
+    assert_eq!(first_device_rows(&d).await, before);
+
+    // After a lost response the status command reads it back, read-only.
+    let status = tenant_cmd(&d, &["first-device-status", "--tenant", "acme"], "");
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(field(&status, "guard"), "reserved");
+    assert_eq!(field(&status, "confirmation_id"), confirmation_id);
+    assert_eq!(field(&status, "state"), "pending");
+    assert_eq!(field(&status, "key_ids_verified"), "true");
+    assert_eq!(first_device_rows(&d).await, before);
+}
+
+#[tokio::test]
+async fn a_fingerprint_typo_writes_nothing_and_can_be_retried() {
+    let d = initialised("first-typo");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+    let before = first_device_rows(&d).await;
+    let mut typo = hid.clone().into_bytes();
+    typo[63] = if typo[63] == b'0' { b'1' } else { b'0' };
+    for input in [
+        format!("{sid}\n{}\n", String::from_utf8(typo).unwrap()),
+        format!("{hid}\n{sid}\n"),
+        format!("{sid}\n"),
+        String::new(),
+    ] {
+        let out = confirm(&d, &device, &input);
+        assert!(!out.status.success(), "{input:?}");
+        assert!(
+            stderr(&out).contains("nothing was written"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(first_device_rows(&d).await, before, "{input:?}");
+    }
+    let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn cancel_closes_the_attempt_for_good() {
+    let d = initialised("first-cancel");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+    let ids = format!("{sid}\n{hid}\n");
+    assert!(confirm(&d, &device, &ids).status.success());
+
+    let out = tenant_cmd(&d, &["cancel-first-device", "--tenant", "acme"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (guard, confirmations, audit) = first_device_rows(&d).await;
+    assert_eq!(guard, "closed");
+    assert_eq!(confirmations[0].1, "cancelled");
+    assert!(audit.contains(&"tenant.first_device_cancel".to_string()));
+
+    // No replacement, not even for the same fingerprints, and no second cancel.
+    let before = first_device_rows(&d).await;
+    let again = confirm(&d, &device, &ids);
+    assert!(!again.status.success());
+    assert!(stderr(&again).contains("closed"), "{}", stderr(&again));
+    let cancel_again = tenant_cmd(&d, &["cancel-first-device", "--tenant", "acme"], "");
+    assert!(!cancel_again.status.success());
+    assert_eq!(first_device_rows(&d).await, before);
+    let status = tenant_cmd(&d, &["first-device-status", "--tenant", "acme"], "");
+    assert_eq!(field(&status, "state"), "cancelled");
+    assert_eq!(field(&status, "terminal_reason"), "operator_cancelled");
+}
+
+#[tokio::test]
+async fn confirm_refuses_a_device_that_is_not_a_clean_pending_first_device() {
+    // Not pending.
+    let d = initialised("first-active");
+    let (device, sid, hid) = first_device_candidate(&d, "active", true).await;
+    let before = first_device_rows(&d).await;
+    let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(stderr(&out).contains("not pending"), "{}", stderr(&out));
+    assert_eq!(first_device_rows(&d).await, before);
+
+    // A wrong-domain HPKE ID is never shown for blessing (R4).
+    let d = initialised("first-r4");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", false).await;
+    let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(stderr(&out).contains("reconciliation"), "{}", stderr(&out));
+    assert!(!stdout(&out).contains(&hid), "the wrong ID was displayed");
+    assert_eq!(first_device_rows(&d).await.1, vec![]);
+
+    // Any history in the tenant, even a retired one, closes the path.
+    let d = initialised("first-history");
+    let (device, sid, hid) = first_device_candidate(&d, "pending", true).await;
+    let pool = db(&d).await;
+    sqlx::query(
+        "INSERT INTO v2_root_key_generations \
+         (server_instance_id, tenant_id, generation, root_key_id, state, created_at) \
+         SELECT s.server_instance_id, t.id, 0, zeroblob(32), 'RETIRED', 't' \
+         FROM v2_server_state s, v2_tenants t",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let out = confirm(&d, &device, &format!("{sid}\n{hid}\n"));
+    assert!(
+        stderr(&out).contains("root key generation"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(first_device_rows(&d).await.1, vec![]);
+}

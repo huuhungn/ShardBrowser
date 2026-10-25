@@ -2,6 +2,7 @@ mod audit;
 mod auth;
 mod authz;
 mod blob;
+mod bootstrap;
 mod cli;
 mod config;
 mod db;

@@ -491,7 +491,7 @@ pub async fn init(cfg: &Config) -> anyhow::Result<()> {
 }
 
 /// Open the existing database read-only, or None if there is none yet.
-async fn open_read_only(cfg: &Config) -> anyhow::Result<Option<SqlitePool>> {
+pub(crate) async fn open_read_only(cfg: &Config) -> anyhow::Result<Option<SqlitePool>> {
     if !Path::new(&cfg.db_path).exists() {
         return Ok(None);
     }
