@@ -19,6 +19,9 @@ pub enum AppError {
     /// The identity authority did not verify at startup, so v2 writes are
     /// off (plan L1238: HTTP 423 with the reason code).
     EpochAuthority(ReasonCode),
+    /// A refusal with a plan 8.2 wire code (ADR 0001 R3), for clients that
+    /// fail closed on a code they do not know.
+    Coded(StatusCode, &'static str, String),
 }
 
 impl AppError {
@@ -41,6 +44,7 @@ impl AppError {
                     code.as_str()
                 ),
             ),
+            AppError::Coded(status, _, m) => (*status, m.clone()),
         }
     }
 }
@@ -61,6 +65,7 @@ impl IntoResponse for AppError {
             AppError::EpochAuthority(reason) => {
                 json!({ "error": client_msg, "code": reason.as_str() })
             }
+            AppError::Coded(_, code, _) => json!({ "error": client_msg, "code": code }),
             _ => json!({ "error": client_msg }),
         };
         let mut resp = (code, Json(body)).into_response();

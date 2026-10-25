@@ -71,6 +71,14 @@ async fn migrated() -> SqlitePool {
     pool
 }
 
+/// Through 0014: 0015 adds approval triggers that refuse these writes first,
+/// which would hide whether 0012's own constraints hold.
+async fn before_0015() -> SqlitePool {
+    let pool = memory().await;
+    migrate_through(&pool, 14).await;
+    pool
+}
+
 async fn exec(pool: &SqlitePool, sql: &str, args: &[A]) -> Result<(), String> {
     let mut q = sqlx::query(sql);
     for a in args {
@@ -438,7 +446,7 @@ async fn approval(pool: &SqlitePool, tenant: u8, device: u8, replay: u8) {
 
 #[tokio::test]
 async fn a_confirmation_is_consumed_once_with_its_full_link() {
-    let pool = migrated().await;
+    let pool = before_0015().await;
     tenant(&pool, 1, false).await;
     device(&pool, 1, 0x20, "pending").await;
     confirmation(&pool, 1, 0x20).await;
@@ -583,7 +591,7 @@ async fn a_quarantined_device_can_only_be_revoked() {
 
 #[tokio::test]
 async fn approval_rows_carry_the_contract_values() {
-    let pool = migrated().await;
+    let pool = before_0015().await;
     tenant(&pool, 1, false).await;
     device(&pool, 1, 0x20, "pending").await;
     approval(&pool, 1, 0x20, 0x50).await;
