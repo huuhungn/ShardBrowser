@@ -12,7 +12,6 @@ pub mod backup;
 pub mod backup_file;
 pub mod canonical;
 pub mod cookies;
-pub mod enrollment_proof;
 pub mod envelope;
 pub mod fleet_grants;
 pub mod fleet_manifest;

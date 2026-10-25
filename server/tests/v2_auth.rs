@@ -1108,3 +1108,187 @@ async fn a_session_rotates_a_bounded_number_of_times() {
         0
     );
 }
+
+#[tokio::test]
+async fn a_ticket_enrolls_a_device_and_then_proves_it_into_a_session() {
+    let server = start("enroll", 38185).await;
+    // The Launcher names the tenant by ID; naming it twice is refused.
+    let (status, _) = server
+        .post(
+            "/v2/auth/login",
+            None,
+            json!({ "tenant": "acme", "tenant_id": hex(&TENANT), "username": "owner", "password": PASSWORD }),
+        )
+        .await;
+    assert_eq!(status, 400);
+    let (status, ticket) = server
+        .post(
+            "/v2/auth/login",
+            None,
+            json!({ "tenant_id": hex(&TENANT), "username": "owner", "password": PASSWORD }),
+        )
+        .await;
+    assert_eq!(status, 201, "{ticket}");
+    let t = ticket["ticket"].as_str();
+
+    let sk = Ed25519SigningKey::from_bytes(&[0x4b; 32]);
+    let spk = sk.verifying_key().to_bytes();
+    let (hpke_sk, hpk) = derive_keypair(&[0x4c; 32]);
+    let keys = json!({ "signing_public_key": hex(&spk), "hpke_public_key": hex(&hpk) });
+    let (status, ch) = server
+        .post("/v2/devices/enrollment-challenges", t, keys.clone())
+        .await;
+    assert_eq!(status, 201, "{ch}");
+    let binding = unhex(ch["binding"].as_str().unwrap());
+    let parsed = sb::EnrollmentBindingV2::parse(&binding).unwrap();
+    assert_eq!(parsed.fields.account_id, OWNER);
+    assert_eq!(
+        hex(&parsed.fields.pre_device_session_id),
+        ticket["ticket_id"].as_str().unwrap()
+    );
+    let (status, enrolled) = server
+        .post(
+            "/v2/devices/enrollment-proofs",
+            t,
+            json!({
+                "challenge_id": ch["challenge_id"],
+                "signature": hex(&sb::sign_enrollment(&sk, &binding)),
+                "label_ciphertext": hex(b"label"),
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{enrolled}");
+    assert_eq!(enrolled["status"], "pending");
+    // The same keys cannot be enrolled twice.
+    let (status, _) = server
+        .post("/v2/devices/enrollment-challenges", t, keys)
+        .await;
+    assert_eq!(status, 409);
+
+    // Enrollment left the ticket usable: it lists the device and proves it.
+    let (_, me) = server.me(t.unwrap()).await;
+    assert_eq!(me["devices"][0]["device_id"], enrolled["device_id"]);
+    let dev = Device {
+        id: unhex(enrolled["device_id"].as_str().unwrap())
+            .try_into()
+            .unwrap(),
+        sk,
+        hpke_sk,
+    };
+    let (status, ch) = challenge(&server, &ticket, &dev).await;
+    assert_eq!(status, 201, "{ch}");
+    let (status, s) = server
+        .post(
+            "/v2/auth/device-session-proofs",
+            t,
+            answer(&ticket, &ch, &dev),
+        )
+        .await;
+    assert_eq!(status, 201, "{s}");
+    assert_eq!(s["device_id"], enrolled["device_id"]);
+
+    // A session is not a ticket: it cannot enroll another device.
+    let (status, _) = server
+        .post(
+            "/v2/devices/enrollment-challenges",
+            s["access_token"].as_str(),
+            json!({ "signing_public_key": hex(&[0x11; 32]), "hpke_public_key": hex(&[0x12; 32]) }),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    // Logout ends a ticket's open enrollment challenges too.
+    let other = server.login("owner").await;
+    let sk2 = Ed25519SigningKey::from_bytes(&[0x4d; 32]);
+    let (_, hpk2) = derive_keypair(&[0x4e; 32]);
+    let (status, _) = server
+        .post(
+            "/v2/devices/enrollment-challenges",
+            other["ticket"].as_str(),
+            json!({ "signing_public_key": hex(&sk2.verifying_key().to_bytes()), "hpke_public_key": hex(&hpk2) }),
+        )
+        .await;
+    assert_eq!(status, 201);
+    assert_eq!(
+        server
+            .post("/v2/auth/logout", other["ticket"].as_str(), json!({}))
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        server
+            .count(
+                "SELECT count(*) FROM v2_enrollment_challenges \
+                 WHERE consumed_at_ms IS NULL AND revoked_at_ms IS NULL"
+            )
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_enrollment_signature_burns_the_challenge() {
+    let server = start("enroll-wrong", 38186).await;
+    let ticket = server.login("owner").await;
+    let t = ticket["ticket"].as_str();
+    let sk = Ed25519SigningKey::from_bytes(&[0x4f; 32]);
+    let (_, hpk) = derive_keypair(&[0x50; 32]);
+    let (_, ch) = server
+        .post(
+            "/v2/devices/enrollment-challenges",
+            t,
+            json!({ "signing_public_key": hex(&sk.verifying_key().to_bytes()), "hpke_public_key": hex(&hpk) }),
+        )
+        .await;
+    let binding = unhex(ch["binding"].as_str().unwrap());
+    let prove = |signer: &Ed25519SigningKey| {
+        json!({
+            "challenge_id": ch["challenge_id"],
+            "signature": hex(&sb::sign_enrollment(signer, &binding)),
+            "label_ciphertext": "",
+        })
+    };
+    let impostor = Ed25519SigningKey::from_bytes(&[0x51; 32]);
+    let (status, _) = server
+        .post("/v2/devices/enrollment-proofs", t, prove(&impostor))
+        .await;
+    assert_eq!(status, 401);
+    let (status, _) = server
+        .post("/v2/devices/enrollment-proofs", t, prove(&sk))
+        .await;
+    assert_eq!(status, 401, "the challenge is spent");
+    assert_eq!(server.count("SELECT count(*) FROM v2_devices").await, 0);
+    // Another ticket of the same account cannot redeem it either.
+    let second = server.login("owner").await;
+    let (status, _) = server
+        .post(
+            "/v2/devices/enrollment-proofs",
+            second["ticket"].as_str(),
+            prove(&sk),
+        )
+        .await;
+    assert_eq!(status, 404);
+
+    // Enrollment challenges spend the ticket's lifetime budget too.
+    for seed in 0x52..0x56u8 {
+        let (_, hpk) = derive_keypair(&[seed; 32]);
+        let (status, _) = server
+            .post(
+                "/v2/devices/enrollment-challenges",
+                t,
+                json!({ "signing_public_key": hex(&Ed25519SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()), "hpke_public_key": hex(&hpk) }),
+            )
+            .await;
+        assert_eq!(status, 201);
+    }
+    let (_, hpk) = derive_keypair(&[0x56; 32]);
+    let (status, _) = server
+        .post(
+            "/v2/devices/enrollment-challenges",
+            t,
+            json!({ "signing_public_key": hex(&Ed25519SigningKey::from_bytes(&[0x56; 32]).verifying_key().to_bytes()), "hpke_public_key": hex(&hpk) }),
+        )
+        .await;
+    assert_eq!(status, 409);
+}

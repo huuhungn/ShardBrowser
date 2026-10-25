@@ -48,6 +48,8 @@ export function TeamCard() {
   const [token, setToken] = useState("");
   const [tenant, setTenant] = useState("");
   const [label, setLabel] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
 
   const shareStatus = useTeam((s) => s.refresh);
@@ -82,7 +84,8 @@ export function TeamCard() {
   });
 
   const enroll = () => run("enroll", async () => {
-    const next = await teamEnrollDevice(label.trim() || suggestLabel());
+    const next = await teamEnrollDevice(label.trim() || suggestLabel(), username, password);
+    setPassword("");
     setSt(next);
     void shareStatus();
     toast.ok(t("team.deviceEnrolled"));
@@ -184,8 +187,27 @@ export function TeamCard() {
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
               />
+              <Input
+                label={t("team.accountUsername")}
+                inputSize="small"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+              <Input
+                label={t("team.accountPassword")}
+                inputSize="small"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
               <div>
-                <Button size="small" disabled={!!busy || !connected} onClick={enroll}>
+                <Button
+                  size="small"
+                  disabled={!!busy || !connected || !username.trim() || !password}
+                  onClick={enroll}
+                >
                   {busy === "enroll" ? t("busy.enrolling") : t("team.enrolThisDevice")}
                 </Button>
               </div>

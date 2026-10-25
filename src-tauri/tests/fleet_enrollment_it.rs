@@ -1,6 +1,7 @@
 //! The Launcher's fleet client against a real team server process.
 //!
-//! The client signs an enrollment proof and the server verifies it. Only a
+//! The client logs in as a v2 account, checks and signs the server's
+//! enrollment binding, and the server verifies it. Only a
 //! real round trip proves the two agree about the wire format, the route
 //! paths and the hex encoding — a unit test that reused one side's encoder
 //! would pass even if the protocol were wrong.
@@ -8,7 +9,18 @@
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use shardx_launcher_lib::fleet_client::FleetClient;
+use shardx_launcher_lib::fleet_client::{AccountLogin, FleetClient};
+
+const PASSWORD: &str = "enrollment-integration-pass";
+
+/// The seeded v2 account, which enrollment logs in as.
+fn account(tenant_hex: &str) -> AccountLogin<'_> {
+    AccountLogin {
+        tenant_id: tenant_hex,
+        username: "it-admin",
+        password: PASSWORD,
+    }
+}
 
 /// Disposable server process with its own data dir, killed on drop.
 struct TestServer {
@@ -113,7 +125,7 @@ async fn login(port: u16) -> Option<String> {
         .post(format!("http://127.0.0.1:{port}/auth/login"))
         .json(&serde_json::json!({
             "username": "admin",
-            "password": "enrollment-integration-pass"
+            "password": PASSWORD
         }))
         .send()
         .await
@@ -126,7 +138,9 @@ async fn login(port: u16) -> Option<String> {
 
 /// Seed a tenant and map the admin user into it, the way the server's own
 /// end-to-end tests do. Without this the enrollment would fail for lack of an
-/// account and the test would prove nothing about the proof format.
+/// account and the test would prove nothing about the proof format. The v2
+/// account reuses the v1 admin's password hash, so it logs in with the same
+/// password.
 async fn seed_tenant(data_dir: &std::path::Path, tenant: &[u8; 16], user_id: &str) -> bool {
     use sqlx::Executor;
     let db = data_dir.join("shardx.db");
@@ -158,7 +172,8 @@ async fn seed_tenant(data_dir: &std::path::Path, tenant: &[u8; 16], user_id: &st
         "INSERT OR IGNORE INTO v2_accounts
              (id, tenant_id, username, pw_hash, legacy_user_id, token_version,
               status, created_at)
-         VALUES (?, ?, 'it-admin', 'x', ?, 0, 'active', '2026-01-01T00:00:00Z')",
+         VALUES (?, ?, 'it-admin', (SELECT pw_hash FROM users WHERE id = ?3), ?3, 0, 'active',
+                 '2026-01-01T00:00:00Z')",
     )
     .bind([0xAAu8; 16].as_slice())
     .bind(tenant.as_slice())
@@ -166,8 +181,16 @@ async fn seed_tenant(data_dir: &std::path::Path, tenant: &[u8; 16], user_id: &st
     .execute(&pool)
     .await
     .is_ok();
+    let ok_membership = sqlx::query(
+        "INSERT OR IGNORE INTO v2_tenant_memberships VALUES (?, ?, 'owner', 'active', 't')",
+    )
+    .bind(tenant.as_slice())
+    .bind([0xAAu8; 16].as_slice())
+    .execute(&pool)
+    .await
+    .is_ok();
 
-    ok_tenant && ok_account
+    ok_tenant && ok_account && ok_membership
 }
 
 async fn admin_user_id(port: u16, token: &str) -> Option<String> {
@@ -223,7 +246,12 @@ async fn launcher_enrolls_a_device_against_a_real_server() {
     let hpke_pk: [u8; 32] = hpke_pk.as_slice().try_into().expect("32-byte hpke key");
 
     let device = client
-        .enroll_device(&tenant_hex, &signer, &hpke_pk, b"integration-test-device")
+        .enroll_device(
+            &account(&tenant_hex),
+            &signer,
+            &hpke_pk,
+            b"integration-test-device",
+        )
         .await
         .expect("enrollment must succeed against a real server");
 
@@ -237,7 +265,12 @@ async fn launcher_enrolls_a_device_against_a_real_server() {
     // this device, and silently re-registering it would let a stale client
     // overwrite the record the fleet trusts.
     let err = client
-        .enroll_device(&tenant_hex, &signer, &hpke_pk, b"integration-test-device")
+        .enroll_device(
+            &account(&tenant_hex),
+            &signer,
+            &hpke_pk,
+            b"integration-test-device",
+        )
         .await
         .expect_err("re-enrolling an existing device key must be refused");
     let msg = err.to_string().to_lowercase();
@@ -285,7 +318,12 @@ async fn an_enrolled_device_collects_and_opens_its_root_key_grant() {
     let hpke_pk_arr: [u8; 32] = hpke_pk.as_slice().try_into().expect("32-byte hpke key");
 
     let device = client
-        .enroll_device(&tenant_hex, &signer, &hpke_pk_arr, b"custody-device")
+        .enroll_device(
+            &account(&tenant_hex),
+            &signer,
+            &hpke_pk_arr,
+            b"custody-device",
+        )
         .await
         .expect("enrollment must succeed");
 

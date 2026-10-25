@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use shardx_core::canonical as c;
 use shardx_core::fleet_manifest::{build_snapshot_manifest, ManifestFields};
+use shardx_core::session_binding::{sign_enrollment, EnrollmentBindingV2};
 use shardx_core::signing::Ed25519SigningKey;
 
 /// Upload chunk size. The server caps a ranged read at 8 MiB; staying below it
@@ -78,12 +79,30 @@ pub struct UploadRequest<'a> {
     pub container: &'a [u8],
 }
 
+/// The v2 account that enrolls this device. The password serves one login
+/// and is never stored.
+pub struct AccountLogin<'a> {
+    pub tenant_id: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+/// An account-only pre-device ticket and the server facts it was issued under.
+#[derive(Deserialize)]
+struct Ticket {
+    ticket: String,
+    ticket_id: String,
+    account_id: String,
+    server_instance_id: String,
+    restore_epoch: u64,
+}
+
 /// Server response to an enrollment challenge request.
 #[derive(Deserialize)]
 struct EnrollmentChallenge {
     challenge_id: String,
-    nonce: String,
-    account_id: String,
+    /// Hex of the exact `EnrollmentBindingV2` bytes to sign.
+    binding: String,
 }
 
 /// Ids the server assigned to a freshly enrolled device.
@@ -146,29 +165,70 @@ impl FleetClient {
         )))
     }
 
-    /// Register this device's signing key with the server.
+    /// Register this device's keys with the server, as `login`'s account.
     ///
-    /// Two round trips: the server issues a nonce committed to the key pair,
-    /// and the device signs it. The private key never leaves this process —
-    /// what proves possession is the signature, not the key.
+    /// The account logs in for a pre-device ticket, the server issues an
+    /// `EnrollmentBindingV2` naming both keys, and the device signs it. The
+    /// binding is checked against the keys, tenant, account and ticket before
+    /// signing, so a server cannot get a signature over anything else. The
+    /// private key never leaves this process; the signature proves possession.
     ///
     /// Returns the ids the server assigned. The caller stores them; a device
     /// enrolls once per server.
     pub async fn enroll_device(
         &self,
-        tenant_id: &str,
+        login: &AccountLogin<'_>,
+        signer: &Ed25519SigningKey,
+        hpke_public_key: &[u8; 32],
+        label_ciphertext: &[u8],
+    ) -> Result<EnrolledDevice> {
+        let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+
+        let res = self
+            .http
+            .post(self.url("/v2/auth/login"))
+            .json(&serde_json::json!({
+                "tenant_id": login.tenant_id,
+                "username": login.username,
+                "password": login.password,
+            }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableLogin"))?;
+        let ticket: Ticket = Self::ok_or_err(res, "fleet.refusedLogin")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyLogin"))?;
+
+        let enrolled = self
+            .enroll_with_ticket(&ticket, &tenant, signer, hpke_public_key, label_ciphertext)
+            .await;
+        // The ticket is only for this enrollment here; end it either way.
+        // Best effort: it expires in ten minutes regardless.
+        let _ = self
+            .http
+            .post(self.url("/v2/auth/logout"))
+            .bearer_auth(&ticket.ticket)
+            .send()
+            .await;
+        enrolled
+    }
+
+    async fn enroll_with_ticket(
+        &self,
+        ticket: &Ticket,
+        tenant: &[u8; 16],
         signer: &Ed25519SigningKey,
         hpke_public_key: &[u8; 32],
         label_ciphertext: &[u8],
     ) -> Result<EnrolledDevice> {
         let signing_public_key = signer.verifying_key().to_bytes();
-
         let res = self
             .http
             .post(self.url("/v2/devices/enrollment-challenges"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&ticket.ticket)
             .json(&serde_json::json!({
-                "tenant_id": tenant_id,
                 "signing_public_key": hex(&signing_public_key),
                 "hpke_public_key": hex(hpke_public_key),
             }))
@@ -181,35 +241,31 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
-        let nonce = decode_hex32(
-            &challenge.nonce,
-            &crate::errcode::code("fleet.fieldChallengeNonce"),
-        )?;
-        let challenge_id = decode_hex16(&challenge.challenge_id, "challenge_id")?;
-        let account_id = decode_hex16(&challenge.account_id, "account_id")?;
-        let tenant_bytes = decode_hex16(tenant_id, "tenant_id")?;
-
-        let tbs = enrollment_proof_bytes(
-            &challenge_id,
-            &nonce,
-            &tenant_bytes,
-            &account_id,
-            &signing_public_key,
-            hpke_public_key,
-        );
-        let signature = shardx_core::signing::sign_tbs(signer, &tbs);
+        let mismatch = || anyhow!(crate::errcode::code("fleet.bindingMismatch"));
+        let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
+        let parsed = EnrollmentBindingV2::parse(&binding).map_err(|_| mismatch())?;
+        let f = &parsed.fields;
+        let expected = f.signing_public_key == signing_public_key
+            && f.hpke_public_key == *hpke_public_key
+            && f.tenant_id == *tenant
+            && f.account_id == decode_hex16(&ticket.account_id, "account_id")?
+            && f.pre_device_session_id == decode_hex16(&ticket.ticket_id, "ticket_id")?
+            && f.challenge_id == decode_hex16(&challenge.challenge_id, "challenge_id")?
+            && f.server_instance_id
+                == decode_hex16(&ticket.server_instance_id, "server_instance_id")?
+            && f.restore_epoch == ticket.restore_epoch;
+        if !expected {
+            return Err(mismatch());
+        }
+        let signature = sign_enrollment(signer, &binding);
 
         let res = self
             .http
             .post(self.url("/v2/devices/enrollment-proofs"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&ticket.ticket)
             .json(&serde_json::json!({
-                "tenant_id": tenant_id,
                 "challenge_id": challenge.challenge_id,
-                "nonce": challenge.nonce,
-                "signing_public_key": hex(&signing_public_key),
-                "hpke_public_key": hex(hpke_public_key),
-                "proof_signature": hex(&signature),
+                "signature": hex(&signature),
                 "label_ciphertext": hex(label_ciphertext),
             }))
             .send()
@@ -612,30 +668,14 @@ fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Canonical bytes a device signs to prove it holds its signing key.
-///
-/// Must match the server's `enrollment::proof_tbs_bytes` exactly; the domain
-/// label keeps this signature from being valid as any other record.
-fn enrollment_proof_bytes(
-    challenge_id: &[u8; 16],
-    nonce: &[u8; 32],
-    tenant_id: &[u8; 16],
-    account_id: &[u8; 16],
-    signing_public_key: &[u8; 32],
-    hpke_public_key: &[u8; 32],
-) -> Vec<u8> {
-    // Shared with the server: one definition, so a mismatch is impossible
-    // rather than merely unlikely.
-    shardx_core::enrollment_proof::enrollment_proof_tbs(
-        &shardx_core::enrollment_proof::EnrollmentProofFields {
-            challenge_id,
-            nonce,
-            tenant_id,
-            account_id,
-            signing_public_key,
-            hpke_public_key,
-        },
-    )
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
