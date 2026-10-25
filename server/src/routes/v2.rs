@@ -139,14 +139,6 @@ pub async fn server_identity(
 }
 
 #[derive(Deserialize)]
-pub struct BeginRootGenerationReq {
-    pub tenant_id: String,
-    /// Identifier of a root key generated on the caller's device. The key
-    /// itself is never sent.
-    pub root_key_id: String,
-}
-
-#[derive(Deserialize)]
 pub struct BeginFleetGenerationReq {
     pub tenant_id: String,
     pub fleet_id: String,
@@ -162,11 +154,6 @@ pub struct ActivateFleetGenerationReq {
     pub generation: u64,
 }
 
-#[derive(Deserialize)]
-pub struct ActivateRootGenerationReq {
-    pub tenant_id: String,
-    pub generation: u64,
-}
 #[derive(Deserialize)]
 pub struct PresentRecordReq {
     /// Tenant this operation targets, hex-encoded.
@@ -257,98 +244,6 @@ pub async fn present_capability_grant(
         &app.db,
         Some(&user.id),
         "v2.capability_grant.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
-    ))
-}
-
-/// Present a signed tenant root key grant.
-///
-/// The server verifies and files the grant but cannot read it: the payload is
-/// HPKE-sealed to the recipient device's public key, so only that device can
-/// recover the tenant root key. Storing it here is a delivery mechanism, not
-/// an escrow.
-pub async fn present_tenant_root_key_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_TENANT_ROOT_KEY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Only a member may deposit a grant for this tenant. The record's signature
-    // proves an issuer wrote it, not that the caller is entitled to file it.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    // Read the grant out of the signed fields before claiming the replay id, so
-    // a malformed record does not burn one.
-    let row = crate::grants::grant_row_from_record(&verified)?;
-
-    // A grant names a generation and a root key. Both must match a generation
-    // this tenant actually has, and a first self-grant is only accepted while
-    // that generation is still preparing and unclaimed. Checked before the
-    // replay id is claimed so a rejected grant does not burn one.
-    crate::generations::check_grant_against_generation(
-        &app.db,
-        &ctx.server_instance_id,
-        &tenant_id,
-        &row.grant_variant,
-        row.root_generation,
-        &row.root_key_id,
-    )
-    .await?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::TenantRootKeyGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    // The grant is stored only after the replay id is claimed, so a retry of an
-    // already-filed record cannot write a second copy.
-    crate::grants::insert_grant(
-        &app.db,
-        &tenant_id,
-        &ctx.server_instance_id,
-        ctx.restore_epoch,
-        &verified,
-        &record_bytes,
-        &row,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.tenant_root_key_grant.accepted",
         None,
         &hex(&verified.signed_container_hash),
     )
@@ -855,65 +750,6 @@ pub async fn head_snapshot(
         "container_size": target.container_size,
         "container_sha256": hex(&target.container_sha256),
         "manifest_hex": hex(&target.exact_signed_container_bytes),
-    })))
-}
-
-/// Begin the tenant's first root key generation.
-///
-/// The caller generates the root key locally and sends only its identifier;
-/// the key itself never leaves the device, which is why the server can hold
-/// this record without being able to read anything sealed under it.
-pub async fn begin_root_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<BeginRootGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let root_key_id = parse_id32(&req.root_key_id, "root_key_id")?;
-
-    let generation = crate::generations::begin_first_generation(
-        &app.db,
-        &verified_instance(&app)?,
-        &tenant_id,
-        &root_key_id,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": generation,
-        "state": crate::generations::STATE_PREPARING,
-    })))
-}
-
-/// Activate a prepared generation once its holder has proven it can unwrap.
-///
-/// Activation is a separate call because filing a grant only proves it was
-/// written, not that anyone can open it. The caller unwraps its own grant
-/// first; activating before that could leave a tenant sealed under a key that
-/// no device can recover.
-pub async fn activate_root_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ActivateRootGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    crate::generations::activate_generation(
-        &app.db,
-        &verified_instance(&app)?,
-        &tenant_id,
-        req.generation,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": req.generation,
-        "state": crate::generations::STATE_ACTIVE,
     })))
 }
 

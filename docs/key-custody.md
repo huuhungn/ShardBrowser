@@ -95,10 +95,10 @@ the right model to keep.
 | Piece | State |
 | --- | --- |
 | `seal_trk` / `open_trk` | Implemented in `shared`; exercised end to end by the grant tests |
-| `v2_tenant_root_key_grants` table | Stores filed grants |
-| `POST /v2/tenant-root-key-grants` | Verifies, claims the replay id, and **stores** the sealed grant |
-| `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants |
-| Root generation lifecycle | `v2_root_key_generations` plus begin/activate/read endpoints (bootstrap only; no rotation) |
+| `v2_tenant_root_key_grants` table | The exact plan 7.2 shape since migration 0016; spike rows stay read-only in `v2_legacy_tenant_root_key_grants` |
+| `POST /v2/tenants/:tenant/root-key-generations` | S6 bootstrap: the D1 device's setup session files its signed `FirstRootSelfGrant` and generation 0 in `PREPARING`, as one exact idempotent mutation |
+| `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants of an `ACTIVE` generation only |
+| Root generation lifecycle | Bootstrap create only. Readback, acknowledgement, activation and rotation are not implemented; the spike `POST /v2/tenant-root-key-grants` and begin/activate routes were removed |
 | Grant issuance at enrollment | Not implemented — grants must be filed by an external custodian |
 | Recovery bundle | Not implemented |
 
@@ -112,13 +112,13 @@ generation committed to. Before this, the generation number in a grant was
 decoration: a grant could name any number and seal any key, and the mismatch
 would only surface later as a backup nobody could open.
 
-The bootstrap is three steps. A tenant begins a generation in `PREPARING`,
-sending only the root key's identifier — the key itself is generated on the
-device and never transmitted, which is what keeps the server unable to read
-anything sealed under it. The first device files a `FirstRootSelfGrant`, which
-is accepted only while the generation is preparing and only once per tenant.
-The generation becomes `ACTIVE` only after the holder confirms it can unwrap
-what it filed.
+The bootstrap creates generation 0 in `PREPARING` together with the first
+device's `FirstRootSelfGrant`, in one request that names only the root key's
+identifier — the key itself is generated on the device and never transmitted,
+which is what keeps the server unable to read anything sealed under it. It is
+accepted once per tenant, only on the setup session that D1 approved. The
+generation is to become `ACTIVE` only after the holder acknowledges that it can
+unwrap what it filed; that step is not built yet.
 
 Activation is deliberately separate from filing. Filing proves a grant was
 written; it does not prove anyone can open it. A tenant that activated on filing

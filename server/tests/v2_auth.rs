@@ -20,13 +20,19 @@ use zeroize::Zeroizing;
 use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
 use shared::approval_receipt::DeviceApprovalReceiptV2;
 use shared::authz_record::{
-    build_record, ApprovalScopeKind, Capability, CapabilityScopeKind, CommonFields,
-    DeviceApprovalV2, GrantSubject, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
-    DOMAIN_TENANT_CAPABILITY_GRANT,
+    build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
+    CommonFields, DeviceApprovalV2, GrantSubject, Payload, RootGrantVariant,
+    TenantCapabilityGrantV2, TenantRootKeyGrantV2, DOMAIN_DEVICE_APPROVAL,
+    DOMAIN_TENANT_CAPABILITY_GRANT, DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shared::canonical::sha256;
 use shared::grants::derive_keypair;
 use shared::keys::{hpke_key_id, signing_key_id};
+use shared::mutation::{
+    root_custodian_grant_set_hash, EmbeddedSelfGrant, IdempotentMutationRequestV2,
+    IdempotentStoredResponseV2, OperationKind, RootGenerationMode, RootGenerationTarget,
+    TenantRootGenerationCreateV2, TenantRootGenerationCreatedV2,
+};
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
 use shared::signing::Ed25519SigningKey;
 
@@ -287,6 +293,24 @@ impl Server {
         (status, ct, r.bytes().await.unwrap().to_vec())
     }
 
+    /// Posts an exact root generation create to `tenant`'s path.
+    async fn root(&self, tenant: &[u8; 16], bearer: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let r = client()
+            .post(format!(
+                "http://127.0.0.1:{}/v2/tenants/{}/root-key-generations",
+                self.port,
+                hex(tenant)
+            ))
+            .bearer_auth(bearer)
+            .header("content-type", "application/cbor")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.bytes().await.unwrap().to_vec())
+    }
+
     async fn me(&self, bearer: &str) -> (u16, Value) {
         let r = client()
             .get(format!("http://127.0.0.1:{}/v2/me", self.port))
@@ -332,6 +356,7 @@ struct Device {
     id: [u8; 16],
     sk: Ed25519SigningKey,
     hpke_sk: Zeroizing<Vec<u8>>,
+    hpke_pk: Vec<u8>,
     signing_key_id: [u8; 32],
     hpke_key_id: [u8; 32],
 }
@@ -362,6 +387,7 @@ async fn device(server: &Server, account: [u8; 16], seed: u8, status: &str) -> D
         hpke_sk,
         signing_key_id: signing_key_id(&spk),
         hpke_key_id: hpke_key_id(&hpk),
+        hpke_pk: hpk,
     }
 }
 
@@ -492,10 +518,17 @@ async fn a_ticket_authorizes_nothing_but_its_own_proofs() {
     let t = ticket["ticket"].as_str();
 
     // Not a v1 token and not a device session.
-    for path in ["/v2/capability-grants", "/v2/root-key-generations"] {
-        let (status, _) = server.post(path, t, json!({})).await;
-        assert_eq!(status, 401, "{path}");
-    }
+    let (status, _) = server.post("/v2/capability-grants", t, json!({})).await;
+    assert_eq!(status, 401);
+    // A ticket is a principal, but custody needs a device session.
+    let (status, _) = server
+        .post(
+            &format!("/v2/tenants/{}/root-key-generations", hex(&TENANT)),
+            t,
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 403);
     let (status, _) = server
         .post("/v2/auth/refresh", None, json!({ "refresh_token": t }))
         .await;
@@ -1334,6 +1367,7 @@ async fn a_ticket_enrolls_a_device_and_then_proves_it_into_a_session() {
         hpke_sk,
         signing_key_id: signing_key_id(&spk),
         hpke_key_id: hpke_key_id(&hpk),
+        hpke_pk: hpk,
     };
     let (status, ch) = challenge(&server, &ticket, &dev).await;
     assert_eq!(status, 201, "{ch}");
@@ -1896,9 +1930,12 @@ async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
     let mut forged = DeviceApprovalReceiptV2::parse(&stored).unwrap();
     forged.request_hash[0] ^= 1;
     let forged = forged.encode();
-    server
-        .sql("DROP TRIGGER v2_idempotency_device_approve_is_fixed", &[])
-        .await;
+    for trigger in [
+        "v2_idempotency_device_approve_is_fixed",
+        "v2_idempotency_succeeded_is_fixed",
+    ] {
+        server.sql(&format!("DROP TRIGGER {trigger}"), &[]).await;
+    }
     server
         .sql(
             "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?",
@@ -1918,4 +1955,640 @@ async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
     );
     // root_setup needs a consumed guard, so the session ends with it.
     assert_eq!(server.me(access).await.0, 401);
+}
+
+// ------------------------------------------------------ S6 root bootstrap ---
+
+const TRK: [u8; 32] = [0x7c; 32];
+const APPROVAL_REPLAY: u8 = 0x71;
+
+/// D1 for a fresh pending device of the owner; returns it and its
+/// `root_setup` access token.
+async fn approved(server: &mut Server, seed: u8) -> (Device, String) {
+    let dev = device(server, OWNER, seed, "pending").await;
+    server.confirm(&dev).await;
+    let s = session(server, &dev).await;
+    let access = s["access_token"].as_str().unwrap().to_string();
+    let rec = approval(&dev, &dev.sk, APPROVAL_REPLAY, 0, 30);
+    assert_eq!(server.approve(&dev.id, &access, &rec).await.0, 201);
+    (dev, access)
+}
+
+/// An honest first self-grant of `trk` to `dev`, sealed to its HPKE key.
+fn self_grant(
+    dev: &Device,
+    trk: &[u8; 32],
+    edit: impl FnOnce(&mut TenantRootKeyGrantV2),
+) -> Vec<u8> {
+    let start = now_ms() - 60_000;
+    let mut g = TenantRootKeyGrantV2 {
+        common: CommonFields {
+            replay_id: [0x81; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        variant: RootGrantVariant::FirstRootSelfGrant,
+        root_key_id: shared::keys::root_key_id(trk),
+        root_generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        recipient_hpke_key_id: dev.hpke_key_id,
+        subject_device_approval_replay_id: [APPROVAL_REPLAY; 16],
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let sealed = shared::grants::seal_trk(&dev.hpke_pk, &g.scope(), trk).unwrap();
+    g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+    g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+    edit(&mut g);
+    build_record(&dev.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+}
+
+/// The bootstrap create naming `container`, with `edit` applied.
+fn bootstrap_create(
+    trk: &[u8; 32],
+    container: Vec<u8>,
+    edit: impl FnOnce(&mut TenantRootGenerationCreateV2),
+) -> TenantRootGenerationCreateV2 {
+    let hash = *AuthorizationRecord::parse(&container)
+        .unwrap()
+        .signed_container_hash();
+    let mut create = TenantRootGenerationCreateV2 {
+        target: RootGenerationTarget {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            root_key_id: shared::keys::root_key_id(trk),
+            root_generation: 0,
+            required_custodian_grant_count: 1,
+            required_custodian_grant_set_hash: root_custodian_grant_set_hash(&[hash]).unwrap(),
+            recovery_bundle_sha256: [0x5a; 32],
+        },
+        mode: RootGenerationMode::Bootstrap(EmbeddedSelfGrant {
+            container_bytes: container,
+            signed_container_hash: hash,
+        }),
+    };
+    edit(&mut create);
+    create
+}
+
+/// The exact outer request under idempotency key `key`.
+fn root_request(key: u8, create: &TenantRootGenerationCreateV2) -> Vec<u8> {
+    IdempotentMutationRequestV2 {
+        operation_kind: OperationKind::RootGenerationCreate,
+        idempotency_key: [key; 16],
+        canonical_payload_bytes: create.encode(),
+        client_request_nonce: [0x92; 16],
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+    }
+    .encode()
+}
+
+fn code_of(body: &[u8]) -> String {
+    code(body)
+}
+
+#[tokio::test]
+async fn the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response() {
+    let mut server = start("s6", 38196).await;
+    let (dev, access) = approved(&mut server, 0x61).await;
+    let create = bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |_| {});
+    let req = root_request(0x91, &create);
+
+    let (status, stored) = server.root(&TENANT, &access, &req).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&stored));
+    let response = IdempotentStoredResponseV2::parse(&stored).unwrap();
+    assert_eq!(response.operation_kind, OperationKind::RootGenerationCreate);
+    assert_eq!(
+        response.exact_request_hash,
+        IdempotentMutationRequestV2::parse(&req)
+            .unwrap()
+            .canonical_request_hash()
+    );
+    let created =
+        TenantRootGenerationCreatedV2::parse(&response.canonical_response_payload_bytes).unwrap();
+    assert_eq!(created.target, create.target);
+    let RootGenerationMode::Bootstrap(identity) = &created.mode else {
+        panic!("a bootstrap response names its self-grant")
+    };
+    assert_eq!(identity.replay_id, [0x81; 16]);
+
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 0 AND state = 'PREPARING' AND required_custodian_grant_count = 1",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_tenant_root_key_grants
+              WHERE grant_variant = 'FirstRootSelfGrant' AND acked_at IS NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'ROOT_GENERATION_CREATE'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.bootstrap'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+
+    // The filed grant is the exact signed container, and it opens on the
+    // device to the TRK its key ID names.
+    let pool = db(&server.data).await;
+    let exact: Vec<u8> =
+        sqlx::query_scalar("SELECT exact_signed_container_bytes FROM v2_tenant_root_key_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    let EmbeddedSelfGrant {
+        container_bytes, ..
+    } = match &create.mode {
+        RootGenerationMode::Bootstrap(g) => g.clone(),
+        RootGenerationMode::Rotation { .. } => unreachable!(),
+    };
+    assert_eq!(exact, container_bytes);
+    let verified = AuthorizationRecord::parse(&exact)
+        .unwrap()
+        .verify_signature(dev.sk.verifying_key().as_bytes())
+        .unwrap();
+    let Payload::TenantRootKeyGrant(g) = verified.payload() else {
+        panic!("a root grant")
+    };
+    assert_eq!(*g.open_trk(&dev.hpke_sk).unwrap(), TRK);
+
+    // A lost response: the same bytes get the same response, and nothing more.
+    let (status, again) = server.root(&TENANT, &access, &req).await;
+    assert_eq!((status, &again), (201, &stored));
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'root.bootstrap'")
+            .await,
+        1
+    );
+    // Other bytes under the key are a mismatch; a new bootstrap is refused.
+    let other_nonce = IdempotentMutationRequestV2 {
+        client_request_nonce: [0x93; 16],
+        ..IdempotentMutationRequestV2::parse(&req).unwrap()
+    }
+    .encode();
+    let (status, body) = server.root(&TENANT, &access, &other_nonce).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+    let trk2 = [0x7d; 32];
+    let second = bootstrap_create(
+        &trk2,
+        self_grant(&dev, &trk2, |g| g.common.replay_id = [0x82; 16]),
+        |_| {},
+    );
+    let (status, body) = server
+        .root(&TENANT, &access, &root_request(0x94, &second))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_BOOTSTRAP_ALREADY_EXISTS")
+    );
+    // The stored response cannot be rewritten in place.
+    let pool = db(&server.data).await;
+    let rewrite = sqlx::query("UPDATE v2_idempotency SET retained_until = 0")
+        .execute(&pool)
+        .await;
+    pool.close().await;
+    assert!(rewrite.is_err());
+}
+
+#[tokio::test]
+async fn a_bootstrap_needs_d1_the_setup_session_and_an_exact_self_grant() {
+    let mut server = start("s6-refusals", 38197).await;
+    // Before D1 the device's session is pending_setup.
+    let early = device(&server, OWNER, 0x62, "pending").await;
+    let s = session(&server, &early).await;
+    let pending = s["access_token"].as_str().unwrap().to_string();
+    let honest = |dev: &Device| bootstrap_create(&TRK, self_grant(dev, &TRK, |_| {}), |_| {});
+    assert_eq!(
+        server
+            .root(&TENANT, &pending, &root_request(0xa0, &honest(&early)))
+            .await
+            .0,
+        403
+    );
+
+    server
+        .sql("DELETE FROM v2_devices WHERE id = ?", &[&early.id])
+        .await;
+    let (dev, access) = approved(&mut server, 0x63).await;
+    let other = device(&server, OWNER, 0x64, "pending").await;
+    let refused = |status: u16, code: &'static str| (status, code.to_string());
+    let cases: Vec<((u16, String), TenantRootGenerationCreateV2)> = vec![
+        // The self-grant names another approval, recipient or key.
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| {
+                    g.subject_device_approval_replay_id = [0x77; 16]
+                }),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.recipient_hpke_key_id = other.hpke_key_id),
+                |_| {},
+            ),
+        ),
+        // Signed by this device, but naming another subject or context.
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.subject_device_id = other.id),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.subject_account_id = OTHER),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.common.tenant_id = [0x42; 16]),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.common.server_instance_id = [0x43; 16]),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| g.common.restore_epoch = 1),
+                |_| {},
+            ),
+        ),
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+                c.target.root_key_id = [0x33; 32]
+            }),
+        ),
+        // The custodian set is the self-grant alone; the codec refuses it.
+        (
+            refused(422, "NON_CANONICAL_RECORD"),
+            bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+                c.target.required_custodian_grant_count = 2
+            }),
+        ),
+        (
+            refused(422, "NON_CANONICAL_RECORD"),
+            bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+                c.target.required_custodian_grant_set_hash = [0x34; 32]
+            }),
+        ),
+        // The request names another container hash than the bytes have, with
+        // a custodian set consistent with that claim.
+        (
+            refused(422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+                if let RootGenerationMode::Bootstrap(g) = &mut c.mode {
+                    g.signed_container_hash = [0x35; 32];
+                }
+                c.target.required_custodian_grant_set_hash =
+                    root_custodian_grant_set_hash(&[[0x35; 32]]).unwrap();
+            }),
+        ),
+        // Another device's honest self-grant is not this session's.
+        (
+            refused(422, "KEY_SUBSTITUTION_DETECTED"),
+            bootstrap_create(&TRK, self_grant(&other, &TRK, |_| {}), |_| {}),
+        ),
+        // A grant that is not yet valid, or valid for more than 730 days.
+        (
+            refused(403, ""),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| {
+                    g.common.issued_at_ms = now_ms() + 3_600_000;
+                    g.common.not_before_ms = now_ms() + 3_600_000;
+                }),
+                |_| {},
+            ),
+        ),
+        (
+            refused(403, ""),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| {
+                    g.common.not_after_ms = g.common.not_before_ms + 731 * DAY_MS;
+                }),
+                |_| {},
+            ),
+        ),
+        // A grant whose window has closed.
+        (
+            refused(403, ""),
+            bootstrap_create(
+                &TRK,
+                self_grant(&dev, &TRK, |g| {
+                    g.common.issued_at_ms = 1;
+                    g.common.not_before_ms = 1;
+                    g.common.not_after_ms = 2;
+                }),
+                |_| {},
+            ),
+        ),
+        // Rotation needs an ACTIVE root.
+        (
+            refused(403, ""),
+            bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+                c.target.root_generation = 1;
+                c.mode = RootGenerationMode::Rotation {
+                    previous_root_key_id: [0x36; 32],
+                    previous_root_generation: 0,
+                };
+            }),
+        ),
+    ];
+    for (i, (want, create)) in cases.into_iter().enumerate() {
+        let (status, body) = server
+            .root(&TENANT, &access, &root_request(0xb0 + i as u8, &create))
+            .await;
+        assert_eq!((status, code_of(&body)), want, "case {i}");
+    }
+
+    // Another tenant named by both the path and the target is still not the
+    // session's tenant.
+    let elsewhere = bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |c| {
+        c.target.tenant_id = [0x42; 16]
+    });
+    assert_eq!(
+        server
+            .root(&[0x42; 16], &access, &root_request(0xbf, &elsewhere))
+            .await
+            .0,
+        403
+    );
+
+    // Context: another epoch, another tenant's path, another operation.
+    let good = honest(&dev);
+    let stale = IdempotentMutationRequestV2 {
+        restore_epoch: 1,
+        ..IdempotentMutationRequestV2::parse(&root_request(0xc0, &good)).unwrap()
+    }
+    .encode();
+    let (status, body) = server.root(&TENANT, &access, &stale).await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "STALE_CONTEXT"));
+    let (status, body) = server
+        .root(&[0x42; 16], &access, &root_request(0xc1, &good))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let grant_kind = IdempotentMutationRequestV2 {
+        operation_kind: OperationKind::RootGrantCreate,
+        ..IdempotentMutationRequestV2::parse(&root_request(0xc2, &good)).unwrap()
+    }
+    .encode();
+    let (status, body) = server.root(&TENANT, &access, &grant_kind).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    // Only the tenant's sole owner bootstraps.
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'owner' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
+    assert_eq!(
+        server
+            .root(&TENANT, &access, &root_request(0xc3, &good))
+            .await
+            .0,
+        403
+    );
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'member' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
+
+    // Nothing was written by any refusal, and the honest request still works.
+    for table in [
+        "v2_root_key_generations",
+        "v2_tenant_root_key_grants",
+        "v2_audit_events WHERE action = 'root.bootstrap'",
+    ] {
+        assert_eq!(
+            server.count(&format!("SELECT count(*) FROM {table}")).await,
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        server
+            .root(&TENANT, &access, &root_request(0xc4, &good))
+            .await
+            .0,
+        201
+    );
+}
+
+#[tokio::test]
+async fn concurrent_identical_bootstraps_commit_once_and_a_bad_ledger_is_refused() {
+    let mut server = start("s6-race", 38198).await;
+    let (dev, access) = approved(&mut server, 0x65).await;
+    let req = root_request(
+        0x95,
+        &bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |_| {}),
+    );
+    let (a, b) = tokio::join!(
+        server.root(&TENANT, &access, &req),
+        server.root(&TENANT, &access, &req)
+    );
+    assert_eq!((a.0, b.0), (201, 201));
+    assert_eq!(a.1, b.1, "one commit, one response");
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_root_key_generations")
+            .await,
+        1
+    );
+
+    // Behind the trigger's back, store a response that parses and hashes
+    // consistently but names another request.
+    let mut forged = IdempotentStoredResponseV2::parse(&a.1).unwrap();
+    forged.exact_request_hash[0] ^= 1;
+    let forged = forged.encode();
+    server
+        .sql("DROP TRIGGER v2_idempotency_succeeded_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?
+              WHERE operation_kind = 'ROOT_GENERATION_CREATE'",
+            &[&forged, &sha256(&forged)],
+        )
+        .await;
+    let (status, body) = server.root(&TENANT, &access, &req).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+}
+
+#[tokio::test]
+async fn a_bootstrap_needs_a_first_self_grant_and_a_consumed_guard() {
+    let mut server = start("s6-state", 38199).await;
+    let (dev, access) = approved(&mut server, 0x66).await;
+    let request = |key: u8, edit: fn(&mut TenantRootKeyGrantV2)| {
+        root_request(
+            key,
+            &bootstrap_create(&TRK, self_grant(&dev, &TRK, edit), |_| {}),
+        )
+    };
+
+    // A grant of an existing root, signed by the subject, at generation 0.
+    let (status, body) = server
+        .root(
+            &TENANT,
+            &access,
+            &request(0xd0, |g| g.variant = RootGrantVariant::ExistingRootGrant),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+
+    // A guard that moved to recovery after D1 ends the setup session.
+    server
+        .sql(
+            "UPDATE v2_bootstrap_guards
+                SET state = 'recovery_required', recovery_reason = 'integrity_failure'",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server
+            .root(&TENANT, &access, &request(0xd2, |_| {}))
+            .await
+            .0,
+        401
+    );
+    for table in ["v2_root_key_generations", "v2_tenant_root_key_grants"] {
+        assert_eq!(
+            server.count(&format!("SELECT count(*) FROM {table}")).await,
+            0,
+            "{table}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_it() {
+    let mut server = start("s6-race-keys", 38200).await;
+    let (dev, access) = approved(&mut server, 0x67).await;
+
+    // An active `root.custody` capability is root history (rule 1).
+    server
+        .sql(
+            "INSERT INTO v2_capability_grants VALUES (?, randomblob(16), 'domain', 2, ?, ?, \
+             'root.custody', 'tenant', ?, 1, 1, 2, ?, 0, x'aa', randomblob(32), \
+             randomblob(64), randomblob(32), randomblob(32), x'bb', randomblob(32), NULL, 't')",
+            &[&TENANT, &OWNER, &dev.id, &TENANT, &INSTANCE],
+        )
+        .await;
+    let create = bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |_| {});
+    let (status, body) = server
+        .root(&TENANT, &access, &root_request(0xe0, &create))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_BOOTSTRAP_ALREADY_EXISTS")
+    );
+    server
+        .sql("UPDATE v2_capability_grants SET revoked_at = 'now'", &[])
+        .await;
+
+    let (first, second) = (root_request(0xe1, &create), root_request(0xe2, &create));
+    let (a, b) = tokio::join!(
+        server.root(&TENANT, &access, &first),
+        server.root(&TENANT, &access, &second)
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409]);
+    let refused = if a.0 == 409 { &a.1 } else { &b.1 };
+    assert_eq!(code_of(refused), "ROOT_BOOTSTRAP_ALREADY_EXISTS");
+    for table in [
+        "v2_root_key_generations",
+        "v2_tenant_root_key_grants",
+        "v2_idempotency WHERE operation_kind = 'ROOT_GENERATION_CREATE'",
+    ] {
+        assert_eq!(
+            server.count(&format!("SELECT count(*) FROM {table}")).await,
+            1,
+            "{table}"
+        );
+    }
+
+    // Behind the trigger's back, an unfinished row under a third key that
+    // holds these exact request bytes: only a succeeded row replays.
+    let third = root_request(0xe3, &create);
+    let hash = IdempotentMutationRequestV2::parse(&third)
+        .unwrap()
+        .canonical_request_hash();
+    server
+        .sql(
+            "DROP TRIGGER v2_idempotency_root_generation_create_is_complete",
+            &[],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_idempotency
+             SELECT server_instance_id, tenant_id, actor_device_id, operation_scope, ?,
+                    operation_kind, ?, ?, ?, 'in_flight', response_record_type,
+                    exact_response_bytes, exact_response_bytes_sha256, retained_until,
+                    approval_payload_domain, restore_epoch, actor_account_id, subject_device_id
+               FROM v2_idempotency WHERE operation_kind = 'ROOT_GENERATION_CREATE'",
+            &[&[0xe3; 16], &hash, &third, &sha256(&third)],
+        )
+        .await;
+    let (status, body) = server.root(&TENANT, &access, &third).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
 }

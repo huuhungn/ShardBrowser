@@ -43,7 +43,7 @@ pub const MAX_APPROVAL_BODY: usize = 262_144;
 const RECEIPT_TYPE: &str = "DeviceApprovalReceiptV2";
 const CBOR: &str = "application/cbor";
 
-fn coded(status: StatusCode, code: &'static str, msg: &str) -> AppError {
+pub(super) fn coded(status: StatusCode, code: &'static str, msg: &str) -> AppError {
     AppError::Coded(status, code, msg.into())
 }
 
@@ -71,7 +71,7 @@ fn closed() -> AppError {
     )
 }
 
-fn column_mismatch(msg: &str) -> AppError {
+pub(super) fn column_mismatch(msg: &str) -> AppError {
     coded(
         StatusCode::UNPROCESSABLE_ENTITY,
         "AUTH_CLAIM_COLUMN_MISMATCH",
@@ -79,7 +79,7 @@ fn column_mismatch(msg: &str) -> AppError {
     )
 }
 
-fn int(n: u64) -> Result<i64, AppError> {
+pub(super) fn int(n: u64) -> Result<i64, AppError> {
     i64::try_from(n).map_err(|_| {
         coded(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -89,8 +89,31 @@ fn int(n: u64) -> Result<i64, AppError> {
     })
 }
 
-fn cbor(status: StatusCode, bytes: Vec<u8>) -> Response {
+pub(super) fn cbor(status: StatusCode, bytes: Vec<u8>) -> Response {
     (status, [(header::CONTENT_TYPE, CBOR)], bytes).into_response()
+}
+
+/// The body is exact CBOR bytes: no other media type, no content encoding,
+/// and within `max`.
+pub(super) fn exact_cbor_body(
+    headers: &HeaderMap,
+    body: &[u8],
+    max: usize,
+) -> Result<(), AppError> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok());
+    if content_type != Some(CBOR) || headers.contains_key(header::CONTENT_ENCODING) {
+        return Err(AppError::BadRequest(
+            "send the exact bytes as application/cbor, unencoded".into(),
+        ));
+    }
+    if body.is_empty() || body.len() > max {
+        return Err(AppError::BadRequest(
+            "the body is empty or too large".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The verified approval and the facts every later step compares with.
@@ -114,19 +137,7 @@ pub async fn approve_device(
     };
     let path_device = unhex::<16>(&device)
         .ok_or_else(|| AppError::BadRequest("device id must be 32 hex digits".into()))?;
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok());
-    if content_type != Some(CBOR) || headers.contains_key(header::CONTENT_ENCODING) {
-        return Err(AppError::BadRequest(
-            "send the exact signed record as application/cbor, unencoded".into(),
-        ));
-    }
-    if body.is_empty() || body.len() > MAX_APPROVAL_BODY {
-        return Err(AppError::BadRequest(
-            "the body is empty or too large".into(),
-        ));
-    }
+    exact_cbor_body(&headers, &body, MAX_APPROVAL_BODY)?;
     let parsed = AuthorizationRecord::parse(&body)
         .map_err(|e| coded(StatusCode::UNPROCESSABLE_ENTITY, e.code(), &e.to_string()))?;
     if parsed.payload_domain() != DOMAIN_DEVICE_APPROVAL {
@@ -406,7 +417,7 @@ async fn device_is(
 }
 
 /// The session's account is the tenant's one active owner.
-async fn sole_owner(conn: &mut SqliteConnection, s: &Session) -> Result<bool, AppError> {
+pub(super) async fn sole_owner(conn: &mut SqliteConnection, s: &Session) -> Result<bool, AppError> {
     let owners: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT m.account_id FROM v2_tenant_memberships m
            JOIN v2_accounts a ON a.tenant_id = m.tenant_id AND a.id = m.account_id
@@ -451,6 +462,7 @@ async fn first_approval(
         "v2_capability_grants",
         "v2_root_key_generations",
         "v2_tenant_root_key_grants",
+        "v2_legacy_tenant_root_key_grants",
     ] {
         let any: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM {table} WHERE tenant_id = ?)"
