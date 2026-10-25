@@ -83,7 +83,9 @@ pub fn verify_tbs(vk_bytes: &[u8], tbs_bytes: &[u8], sig_bytes: &[u8]) -> Result
 
 /// Ed25519 (RFC 8032, pure) under `verify_strict`, the suite-1 rule (ADR 0002
 /// D-8): small-order public keys and `R`, non-canonical encodings and `S >= L`
-/// are rejected, so one signature has one valid reading on every verifier.
+/// are rejected. Every ShardX verifier uses this one rule, so a signature
+/// accepted on one device is accepted on all; other Ed25519 verifiers (cofactored,
+/// ZIP-215) may disagree on edge cases such as speccheck case 4.
 fn verify_message_strict(vk_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<(), SignError> {
     let vk_arr: [u8; 32] = vk_bytes.try_into().map_err(|_| SignError::BadLength {
         field: "verifying_key",
@@ -235,7 +237,8 @@ mod tests {
     }
 
     /// The 12 edge cases of "Taming the many EdDSAs" (novifinancial/ed25519-speccheck
-    /// `cases.json`, SHA-256 08e47a36…0450): (message, public key, signature).
+    /// `cases.json`, SHA-256
+    /// 08e47a36d9aead288664930505584f353fff113ab854f2800db1e4f5b3540450): (message, public key, signature).
     /// Under `verify_strict` only case 3 verifies; the others cover small-order
     /// `A` and `R`, `S >= L`, and non-canonical `R` and `A`.
     const SPECCHECK_CASES: [(&str, &str, &str); 12] = [
