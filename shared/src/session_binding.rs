@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use crate::authz_record::{Fields, RecordError};
 use crate::canonical::{self as c, Value};
 use crate::grants::{Aead, Kdf, Kem, OsRng, HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305};
-use crate::keys::{hpke_key_id, signing_key_id};
+use crate::keys::{fill_random, hpke_key_id, signing_key_id};
 use crate::signing::{
     verify_message_strict, Ed25519VerifyingKey, SignError, ED25519_SIG_LEN,
     SIGNATURE_SUITE_ID_ED25519,
@@ -115,9 +115,20 @@ impl BindingFields {
                 id: self.hpke_suite.into(),
             });
         }
+        for (field, n) in [
+            ("restore_epoch", self.restore_epoch),
+            ("expires_at_ms", self.expires_at_ms),
+        ] {
+            if n > c::MAX_SQLITE_WIRE_UINT {
+                return Err(RecordError::BadValue(field));
+            }
+        }
         match Ed25519VerifyingKey::from_bytes(&self.signing_public_key) {
             Ok(vk) if !vk.is_weak() => {}
             _ => return Err(RecordError::BadValue("signing_public_key")),
+        }
+        if !hpke_key_usable(&self.hpke_public_key) {
+            return Err(RecordError::BadValue("hpke_public_key"));
         }
         if self.signing_key_id != signing_key_id(&self.signing_public_key) {
             return Err(RecordError::BadValue("signing_key_id"));
@@ -165,10 +176,13 @@ pub struct EnrollmentBindingV2 {
 }
 
 impl EnrollmentBindingV2 {
-    pub fn encode(&self) -> Vec<u8> {
+    /// Refuses fields that [`Self::parse`] would refuse, so the server never
+    /// issues a binding its clients reject.
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        self.fields.check()?;
         let mut out = header(DOMAIN_ENROLLMENT_BINDING);
         self.fields.put(&mut out);
-        encode(out)
+        Ok(encode(out))
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -187,11 +201,13 @@ pub struct DeviceSessionBindingV2 {
 }
 
 impl DeviceSessionBindingV2 {
-    pub fn encode(&self) -> Vec<u8> {
+    /// Refuses fields that [`Self::parse`] would refuse.
+    pub fn encode(&self) -> Result<Vec<u8>, RecordError> {
+        self.fields.check()?;
         let mut out = header(DOMAIN_DEVICE_SESSION_BINDING);
         out.push(("device_id", c::b(&self.device_id)));
         self.fields.put(&mut out);
-        encode(out)
+        Ok(encode(out))
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, RecordError> {
@@ -207,19 +223,69 @@ impl DeviceSessionBindingV2 {
     }
 }
 
-fn labelled(label: &str, binding: &[u8], tail: &[u8]) -> Vec<u8> {
+/// Callers bound `binding` by [`MAX_BINDING_BYTES`], so the length fits a u32.
+fn labelled(label: &str, binding: &[u8], tail: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut out = Vec::with_capacity(label.len() + 4 + binding.len() + tail.len());
     out.extend_from_slice(label.as_bytes());
     out.extend_from_slice(&(binding.len() as u32).to_be_bytes());
     out.extend_from_slice(binding);
     out.extend_from_slice(tail);
-    out
+    Zeroizing::new(out)
 }
+
+fn bounded(binding: &[u8]) -> Result<(), SignError> {
+    if binding.len() > MAX_BINDING_BYTES {
+        return Err(SignError::BadLength {
+            field: "binding",
+            got: binding.len(),
+        });
+    }
+    Ok(())
+}
+
+/// A canonical X25519 encoding (top bit clear, u below 2^255 - 19) that is not
+/// low order, so one key has exactly one encoding and one ID, and sealing to
+/// it cannot fail later. A trial encapsulation catches the low-order points.
+fn hpke_key_usable(pk: &[u8; 32]) -> bool {
+    let at_least_p = pk[31] == 0x7f && pk[1..31].iter().all(|&b| b == 0xff) && pk[0] >= 0xed;
+    pk[31] & 0x80 == 0
+        && !at_least_p
+        && seal_with(pk, &[], &[0; POP_SECRET_LEN], &mut FixedRng([1; 32])).is_ok()
+}
+
+/// Repeats its seed: for the trial above and for test vectors, never for a
+/// real seal.
+struct FixedRng([u8; 32]);
+
+impl hpke::rand_core::TryRng for FixedRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        for (d, s) in dst.iter_mut().zip(self.0.iter().cycle()) {
+            *d = *s;
+        }
+        Ok(())
+    }
+}
+
+impl hpke::rand_core::TryCryptoRng for FixedRng {}
 
 // --------------------------------------------------------- enrollment proof ---
 
 /// `SHARDX-ENROLLMENT-BINDING-V2\0 || u32be(len) || binding`.
-pub fn enrollment_signing_input(binding: &[u8]) -> Vec<u8> {
+pub fn enrollment_signing_input(binding: &[u8]) -> Zeroizing<Vec<u8>> {
     labelled(L_ENROLLMENT_BINDING, binding, &[])
 }
 
@@ -233,6 +299,7 @@ pub fn verify_enrollment(
     binding: &[u8],
     signature: &[u8],
 ) -> Result<(), SignError> {
+    bounded(binding)?;
     verify_message_strict(
         signing_public_key,
         &enrollment_signing_input(binding),
@@ -265,10 +332,10 @@ impl std::fmt::Display for PopError {
 impl std::error::Error for PopError {}
 
 /// A fresh 32-byte PoP secret from the OS CSPRNG.
-pub fn fresh_pop_secret() -> Zeroizing<[u8; POP_SECRET_LEN]> {
+pub fn fresh_pop_secret() -> Result<Zeroizing<[u8; POP_SECRET_LEN]>, getrandom04::Error> {
     let mut s = Zeroizing::new([0u8; POP_SECRET_LEN]);
-    getrandom04::fill(s.as_mut_slice()).expect("OS entropy source unavailable");
-    s
+    fill_random(s.as_mut_slice())?;
+    Ok(s)
 }
 
 /// What the server stores instead of the secret.
@@ -293,6 +360,18 @@ pub fn seal_pop_secret(
     binding: &[u8],
     secret: &[u8; POP_SECRET_LEN],
 ) -> Result<([u8; POP_ENCAPPED_LEN], [u8; POP_CIPHERTEXT_LEN]), PopError> {
+    if binding.len() > MAX_BINDING_BYTES {
+        return Err(PopError::BadLength);
+    }
+    seal_with(hpke_public_key, binding, secret, &mut OsRng)
+}
+
+fn seal_with(
+    hpke_public_key: &[u8; 32],
+    binding: &[u8],
+    secret: &[u8; POP_SECRET_LEN],
+    rng: &mut impl hpke::rand_core::CryptoRng,
+) -> Result<([u8; POP_ENCAPPED_LEN], [u8; POP_CIPHERTEXT_LEN]), PopError> {
     let pk =
         <Kem as KemTrait>::PublicKey::from_bytes(hpke_public_key).map_err(|_| PopError::BadKey)?;
     let (encapped, ciphertext) = hpke::single_shot_seal_with_rng::<Aead, Kdf, Kem>(
@@ -301,7 +380,7 @@ pub fn seal_pop_secret(
         HPKE_POP_INFO,
         secret,
         binding,
-        &mut OsRng,
+        rng,
     )
     .map_err(|_| PopError::Hpke)?;
     let encapped: [u8; POP_ENCAPPED_LEN] = encapped
@@ -348,7 +427,7 @@ pub fn open_pop_secret(
 }
 
 /// `SHARDX-DEVICE-SESSION-POP-V2\0 || u32be(len(binding)) || binding || s`.
-pub fn pop_signing_input(binding: &[u8], secret: &[u8; POP_SECRET_LEN]) -> Vec<u8> {
+pub fn pop_signing_input(binding: &[u8], secret: &[u8; POP_SECRET_LEN]) -> Zeroizing<Vec<u8>> {
     labelled(L_DEVICE_SESSION_POP, binding, secret)
 }
 
@@ -367,6 +446,7 @@ pub fn verify_pop(
     secret: &[u8; POP_SECRET_LEN],
     signature: &[u8],
 ) -> Result<(), SignError> {
+    bounded(binding)?;
     verify_message_strict(
         signing_public_key,
         &pop_signing_input(binding, secret),
@@ -432,12 +512,18 @@ mod tests {
     #[test]
     fn both_bindings_round_trip_and_stay_apart() {
         let e = EnrollmentBindingV2 { fields: fields() };
-        assert_eq!(EnrollmentBindingV2::parse(&e.encode()), Ok(e.clone()));
+        assert_eq!(
+            EnrollmentBindingV2::parse(&e.encode().unwrap()),
+            Ok(e.clone())
+        );
         let s = session();
-        assert_eq!(DeviceSessionBindingV2::parse(&s.encode()), Ok(s.clone()));
+        assert_eq!(
+            DeviceSessionBindingV2::parse(&s.encode().unwrap()),
+            Ok(s.clone())
+        );
         // Neither parses as the other.
-        assert!(DeviceSessionBindingV2::parse(&e.encode()).is_err());
-        assert!(EnrollmentBindingV2::parse(&s.encode()).is_err());
+        assert!(DeviceSessionBindingV2::parse(&e.encode().unwrap()).is_err());
+        assert!(EnrollmentBindingV2::parse(&s.encode().unwrap()).is_err());
     }
 
     /// Pinned so a change to field names, order or types shows up as a diff.
@@ -445,8 +531,8 @@ mod tests {
     /// Python `cryptography` Ed25519 signer.
     #[test]
     fn golden_vectors() {
-        let e = EnrollmentBindingV2 { fields: fields() }.encode();
-        let s = session().encode();
+        let e = EnrollmentBindingV2 { fields: fields() }.encode().unwrap();
+        let s = session().encode().unwrap();
         let sk = device().0;
         assert_eq!(hex(&c::sha256(&e)), GOLDEN_ENROLLMENT_SHA256);
         assert_eq!(hex(&c::sha256(&s)), GOLDEN_SESSION_SHA256);
@@ -465,7 +551,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_every_contract_violation() {
-        let good = session().encode();
+        let good = session().encode().unwrap();
         let other_key = SigningKey::from_bytes(&[0x44; 32])
             .verifying_key()
             .to_bytes();
@@ -525,7 +611,7 @@ mod tests {
     fn enrollment_signature_binds_key_and_bytes() {
         let (sk, _, _) = device();
         let spk = sk.verifying_key().to_bytes();
-        let binding = EnrollmentBindingV2 { fields: fields() }.encode();
+        let binding = EnrollmentBindingV2 { fields: fields() }.encode().unwrap();
         let sig = sign_enrollment(&sk, &binding);
         assert_eq!(verify_enrollment(&spk, &binding, &sig), Ok(()));
         let other = edit(&binding, "nonce", Some(c::b(&[9; 16])));
@@ -544,8 +630,8 @@ mod tests {
     fn hpke_pop_round_trip_binds_binding_key_and_secret() {
         let (sk, hsk, hpk) = device();
         let spk = sk.verifying_key().to_bytes();
-        let binding = session().encode();
-        let secret = fresh_pop_secret();
+        let binding = session().encode().unwrap();
+        let secret = fresh_pop_secret().unwrap();
         let hash = pop_secret_hash(&secret);
         let (enc, ct) = seal_pop_secret(&hpk, &binding, &secret).unwrap();
 
@@ -587,9 +673,65 @@ mod tests {
         assert_ne!(enc, enc2);
     }
 
+    /// A fixed ephemeral key makes the seal reproducible. Cross-checked
+    /// against an independent RFC 9180 implementation in Python.
+    #[test]
+    fn hpke_golden_vector() {
+        let (_, hsk, hpk) = device();
+        let binding = session().encode().unwrap();
+        let (enc, ct) = seal_with(&hpk, &binding, &[0x33; 32], &mut FixedRng([0xab; 32])).unwrap();
+        assert_eq!(hex(&enc), GOLDEN_POP_ENC);
+        assert_eq!(hex(&ct), GOLDEN_POP_CT);
+        assert_eq!(
+            *open_pop_secret(&hsk, &binding, &enc, &ct).unwrap(),
+            [0x33; 32]
+        );
+    }
+
+    const GOLDEN_POP_ENC: &str = "3b9eaeab62292c4205e5118a1be6ffbad4a57e2fcfb27d0e93d190ab8ae90463";
+    const GOLDEN_POP_CT: &str = "7632e882657572a2813d1c3938c651a1e9b83ff7dcfe22baf1eeae15373ad59f\
+                                 547cb526a1f68a7c36716b0f67f0d6c6";
+
+    #[test]
+    fn parse_and_encode_refuse_unusable_hpke_keys() {
+        let good = session().encode().unwrap();
+        let mut p = [0xffu8; 32];
+        // p + 9: the base point written non-canonically, otherwise usable.
+        p[0] = 0xf6;
+        p[31] = 0x7f;
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        let mut high_bit = fields().hpke_public_key;
+        high_bit[31] |= 0x80;
+        for pk in [[0u8; 32], one, p, high_bit] {
+            // The ID matches the key, so only the key check can stop it.
+            let bytes = edit(
+                &edit(&good, "hpke_public_key", Some(c::b(&pk))),
+                "hpke_key_id",
+                Some(c::b(&hpke_key_id(&pk))),
+            );
+            assert_eq!(
+                DeviceSessionBindingV2::parse(&bytes),
+                Err(RecordError::BadValue("hpke_public_key")),
+                "{}",
+                hex(&pk)
+            );
+            let mut f = fields();
+            f.hpke_public_key = pk;
+            f.hpke_key_id = hpke_key_id(&pk);
+            assert!(EnrollmentBindingV2 { fields: f }.encode().is_err());
+        }
+        let mut f = fields();
+        f.restore_epoch = u64::MAX;
+        assert_eq!(
+            EnrollmentBindingV2 { fields: f }.encode(),
+            Err(RecordError::BadValue("restore_epoch"))
+        );
+    }
+
     #[test]
     fn a_low_order_hpke_key_never_gets_a_secret() {
-        let binding = session().encode();
+        let binding = session().encode().unwrap();
         let mut one = [0u8; 32];
         one[0] = 1;
         for pk in [[0u8; 32], one] {
