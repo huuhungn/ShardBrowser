@@ -143,43 +143,43 @@ type Result<T> = std::result::Result<T, RecordError>;
 
 /// A decoded map whose fields are taken one by one; [`Fields::finish`] rejects
 /// whatever is left, which is what makes every record a closed map.
-struct Fields {
+pub(crate) struct Fields {
     map: &'static str,
     entries: Vec<(String, Value)>,
 }
 
 impl Fields {
-    fn open(map: &'static str, v: Value) -> Result<Self> {
+    pub(crate) fn open(map: &'static str, v: Value) -> Result<Self> {
         match v {
             Value::Map(entries) => Ok(Self { map, entries }),
             _ => Err(RecordError::NotAMap(map)),
         }
     }
 
-    fn decode(map: &'static str, bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(map: &'static str, bytes: &[u8]) -> Result<Self> {
         Self::open(map, c::assert_canonical_roundtrip(bytes)?)
     }
 
-    fn take(&mut self, field: &str) -> Option<Value> {
+    pub(crate) fn take(&mut self, field: &str) -> Option<Value> {
         let i = self.entries.iter().position(|(k, _)| k == field)?;
         Some(self.entries.remove(i).1)
     }
 
-    fn req(&mut self, field: &'static str) -> Result<Value> {
+    pub(crate) fn req(&mut self, field: &'static str) -> Result<Value> {
         self.take(field).ok_or(RecordError::MissingField {
             map: self.map,
             field,
         })
     }
 
-    fn bad(&self, field: &'static str) -> RecordError {
+    pub(crate) fn bad(&self, field: &'static str) -> RecordError {
         RecordError::BadField {
             map: self.map,
             field,
         }
     }
 
-    fn text(&mut self, field: &'static str) -> Result<String> {
+    pub(crate) fn text(&mut self, field: &'static str) -> Result<String> {
         match self.req(field)? {
             Value::Text(s) => Ok(s),
             _ => Err(self.bad(field)),
@@ -187,7 +187,7 @@ impl Fields {
     }
 
     /// A text field that must hold exactly `expected`.
-    fn exact_text(&mut self, field: &'static str, expected: &str) -> Result<()> {
+    pub(crate) fn exact_text(&mut self, field: &'static str, expected: &str) -> Result<()> {
         if self.text(field)? == expected {
             Ok(())
         } else {
@@ -195,31 +195,34 @@ impl Fields {
         }
     }
 
-    fn uint(&mut self, field: &'static str) -> Result<u64> {
+    pub(crate) fn uint(&mut self, field: &'static str) -> Result<u64> {
         match self.req(field)? {
             Value::Uint(n) => Ok(n),
             _ => Err(self.bad(field)),
         }
     }
 
-    fn u16(&mut self, field: &'static str) -> Result<u16> {
+    pub(crate) fn u16(&mut self, field: &'static str) -> Result<u16> {
         let n = self.uint(field)?;
         u16::try_from(n).map_err(|_| self.bad(field))
     }
 
-    fn bytes(&mut self, field: &'static str, min: usize, max: usize) -> Result<Vec<u8>> {
+    pub(crate) fn bytes(&mut self, field: &'static str, min: usize, max: usize) -> Result<Vec<u8>> {
         match self.req(field)? {
             Value::Bytes(b) if (min..=max).contains(&b.len()) => Ok(b),
             _ => Err(self.bad(field)),
         }
     }
 
-    fn fixed<const N: usize>(&mut self, field: &'static str) -> Result<[u8; N]> {
+    pub(crate) fn fixed<const N: usize>(&mut self, field: &'static str) -> Result<[u8; N]> {
         let b = self.bytes(field, N, N)?;
         Ok(b.try_into().expect("length checked"))
     }
 
-    fn opt_fixed<const N: usize>(&mut self, field: &'static str) -> Result<Option<[u8; N]>> {
+    pub(crate) fn opt_fixed<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<[u8; N]>> {
         match self.take(field) {
             None => Ok(None),
             Some(Value::Bytes(b)) if b.len() == N => {
@@ -229,7 +232,7 @@ impl Fields {
         }
     }
 
-    fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> Result<()> {
         match self.entries.into_iter().next() {
             None => Ok(()),
             Some((field, _)) => Err(RecordError::UnknownField {
