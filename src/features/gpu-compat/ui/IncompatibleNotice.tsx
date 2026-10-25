@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Modal, Button } from "@proxyshard/shardx-ui-kit";
-import Badge from "../../../shared/ui/Badge";
+import { WarningIcon } from "../../../shared/icons";
 import { useGpuCompat } from "../../../shared/model/gpuCompat";
 import { useT } from "../../../shared/i18n";
 import type { GpuCompat } from "../../../entities/fingerprint/model/types";
@@ -91,28 +91,20 @@ export function IncompatibleBadge({ compat }: { compat: GpuCompat }) {
   if (compat.compatible) return null;
   return (
     <>
-      <Badge
-        color="warning"
-        variant="lighter"
-        size="small"
-        role="button"
-        tabIndex={0}
-        className="flex-none cursor-pointer select-none"
+      {/* An icon, not a worded badge: on a library where most cards mismatch, the word on every
+          card is noise. The library states the count once above the cards. */}
+      <button
+        type="button"
+        className="grid size-5 flex-none cursor-pointer place-items-center rounded-md text-warning-base transition-colors hover:bg-warning-alpha-16"
         title={t("incompatibleNotice.badgeTitle")}
+        aria-label={t("incompatibleNotice.badgeLabel")}
         onClick={(e) => {
           e.stopPropagation();
           setOpen(true);
         }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.stopPropagation();
-            e.preventDefault();
-            setOpen(true);
-          }
-        }}
       >
-        {t("incompatibleNotice.badgeLabel")}
-      </Badge>
+        <WarningIcon className="size-3.5" />
+      </button>
       {open && (
         <Modal
           open
