@@ -1,5 +1,6 @@
 import Badge from "../../shared/ui/Badge";
-import { AppleOsIcon, WindowsOsIcon, LinuxOsIcon } from "../../shared/icons";
+import { AppleOsIcon, WindowsOsIcon, LinuxOsIcon, NavFingerprintsIcon } from "../../shared/icons";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useFingerprint, useFingerprintGroups, FingerprintCard } from "../../entities/fingerprint";
 import { FingerprintCardActions } from "../../features/manage-fingerprints";
 import { useT } from "../../shared/i18n";
@@ -24,9 +25,7 @@ export function FingerprintLibrary() {
 
   if (isEmpty) {
     return (
-      <div className="rounded-12 bg-bg-white-0 px-6 py-14 text-center text-paragraph-sm text-text-sub-600 ring-1 ring-inset ring-stroke-soft-200">
-        {t("fp.libraryIsEmpty")}
-      </div>
+      <EmptyState card icon={<NavFingerprintsIcon className="size-6" />} title={t("fp.none.title")} body={t("fp.libraryIsEmpty")} />
     );
   }
 

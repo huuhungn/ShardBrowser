@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, DialogModal } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useStoreChanged } from "../../shared/hooks/useStoreChanged";
 import { AddIcon, DeleteIcon, FolderIcon, GlobeIcon, NavExtensionsIcon } from "../../shared/icons";
 import { Field } from "../../shared/ui/Field";
@@ -144,17 +145,12 @@ export function ExtensionsPage() {
       </div>
 
       {shown.length === 0 ? (
-        <div className="flex flex-col items-center gap-2.5 rounded-lg bg-bg-white-0 px-6 py-14 text-center ring-1 ring-inset ring-stroke-soft-200">
-          <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-            <NavExtensionsIcon className="size-6" />
-          </div>
-          <h3 className="m-0 text-label-sm text-text-strong-950">
-            {items.length === 0 ? t("extensions.none.title") : t("extensions.none.noMatch")}
-          </h3>
-          <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-            {t("extensions.none.body")}
-          </p>
-        </div>
+        <EmptyState
+          card
+          icon={<NavExtensionsIcon className="size-6" />}
+          title={items.length === 0 ? t("extensions.none.title") : t("extensions.none.noMatch")}
+          body={t("extensions.none.body")}
+        />
       ) : (
         <div className="grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-2.5 pb-6">
           {shown.map((e) => <Card key={e.id} e={e} />)}

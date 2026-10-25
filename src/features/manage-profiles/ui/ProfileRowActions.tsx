@@ -3,6 +3,7 @@ import {
   PinIconApp,
   EditIcon,
   CopyIcon,
+  LinkIcon,
   DeleteIcon,
   MoreIcon,
   PlayIcon,
@@ -69,7 +70,7 @@ export function ProfileRowActions({ profile, onMore }: {
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
-      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
+      {wide && <Button variant="error" mode="stroke" size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
         leftIcon={<DeleteIcon className="size-4" />}
       >
       </Button>}
@@ -81,7 +82,7 @@ export function ProfileRowActions({ profile, onMore }: {
         onClick={() => { void copyCdp(p.id); }}
         aria-label={t("profile.copyCdpFor", { name: p.name })}
         title={t("profile.copyCdpHttpUrl")}
-        leftIcon={<CopyIcon className="size-4" />}
+        leftIcon={<LinkIcon className="size-4" />}
       >
       </Button>}
       <Button

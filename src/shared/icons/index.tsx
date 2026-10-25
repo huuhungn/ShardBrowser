@@ -39,6 +39,7 @@ import {
   StopIcon as HugeStopIcon,
   MoreVerticalIcon,
   Link04Icon,
+  Link01Icon,
   PauseIcon as HugePauseIcon,
   SparklesIcon,
   StarIcon,
@@ -83,6 +84,7 @@ export const LinuxOsIcon = make(TerminalIcon);
 export const RouteIcon = make(Route01Icon);
 export const SearchIcon = make(Search01Icon);
 export const CopyIcon = make(Copy01Icon);
+export const LinkIcon = make(Link01Icon);
 export const DownloadIcon = make(Download04Icon);
 export const UploadIcon = make(Upload04Icon);
 export const SunIcon = make(Sun01Icon);

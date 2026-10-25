@@ -41,7 +41,7 @@ export function ProxyRowActions({ proxy }: { proxy: ProxyEntry }) {
         leftIcon={<EditIcon />}
       >
       </Button>
-      <Button variant="error" mode='filled' size="xsmall"  onlyIcon onClick={() => removeProxy(proxy.id)} title={t("common.delete")}
+      <Button variant="error" mode="stroke" size="xsmall" onlyIcon onClick={() => removeProxy(proxy.id)} title={t("common.delete")}
         leftIcon={<DeleteIcon />}
       >
       </Button>

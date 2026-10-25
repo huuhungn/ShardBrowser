@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { Button, cn } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useStoreChanged } from "../../shared/hooks/useStoreChanged";
 import { Field } from "../../shared/ui/Field";
 import { CSSelect } from "../../shared/ui/CSSelect";
@@ -452,19 +453,22 @@ export function AutomationPage() {
   return (
     <>
       <Topbar
-        crumbs={[t("automation.title")]}
+        crumbs={[t("nav.workspace"), t("automation.title")]}
         search={editing ? undefined : search}
         onSearch={editing ? undefined : setSearch}
       />
-      <div className="flex flex-col gap-4 px-6 py-5">
+      <div className="flex flex-col gap-3.5">
         {editing ? (
           <Editor project={editing} />
         ) : (
           <>
-            <div className="flex items-center justify-between">
-              <p className="m-0 text-paragraph-sm text-text-sub-600">
-                {t("automation.intro")}
-              </p>
+            <div className="flex items-end justify-between gap-4">
+              <div>
+                <h1 className="m-0 text-title-h5 text-text-strong-950">{t("automation.title")}</h1>
+                <p className="m-0 mt-1 max-w-[70ch] text-paragraph-xs text-text-soft-400">
+                  {t("automation.intro")}
+                </p>
+              </div>
               <Button
                 variant="primary" mode="filled" size="small"
                 leftIcon={<AddIcon className="size-4" />}
@@ -503,17 +507,11 @@ export function AutomationPage() {
                 </div>
               ))}
               {shown.length === 0 && (
-                <div className="flex flex-col items-center gap-2.5 px-6 py-14 text-center">
-                  <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-                    <NavAutomationIcon className="size-6" />
-                  </div>
-                  <h3 className="m-0 text-label-sm text-text-strong-950">
-                    {items.length === 0 ? t("automation.none.title") : t("automation.none.noMatch")}
-                  </h3>
-                  <p className="m-0 max-w-[460px] text-paragraph-sm text-text-sub-600">
-                    {t("automation.none.body")}
-                  </p>
-                </div>
+                <EmptyState
+                  icon={<NavAutomationIcon className="size-6" />}
+                  title={items.length === 0 ? t("automation.none.title") : t("automation.none.noMatch")}
+                  body={t("automation.none.body")}
+                />
               )}
             </div>
           </>
