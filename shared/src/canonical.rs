@@ -42,13 +42,18 @@ pub enum CborError {
     FloatOrSimpleValue,
     Tag,
     DuplicateKey(String),
-    UnsortedKey { previous: String, current: String },
+    UnsortedKey {
+        previous: String,
+        current: String,
+    },
     NonTextKey,
     TrailingBytes(usize),
     UnexpectedEof,
     InvalidUtf8,
     NulInText,
     IntegerOutOfSqliteDomain(u64),
+    /// Arrays and maps nested deeper than [`MAX_NESTING`].
+    NestingTooDeep,
 }
 
 impl std::fmt::Display for CborError {
@@ -71,6 +76,7 @@ impl std::fmt::Display for CborError {
             Self::IntegerOutOfSqliteDomain(v) => {
                 write!(f, "integer {v} outside 0..=i64::MAX SQLite domain")
             }
+            Self::NestingTooDeep => write!(f, "arrays or maps nested deeper than {MAX_NESTING}"),
         }
     }
 }
@@ -81,6 +87,11 @@ impl std::error::Error for CborError {}
 /// accepted domain of `0..=i64::MAX`. This is enforced at codec level so no
 /// value can reach a cast or SQL bind out of range.
 pub const MAX_SQLITE_WIRE_UINT: u64 = i64::MAX as u64;
+
+/// Deepest array/map nesting a decoder accepts. Every v2 record is far
+/// shallower; the bound stops a few kilobytes of nested arrays from
+/// overflowing the stack of whoever parses untrusted bytes.
+pub const MAX_NESTING: usize = 16;
 
 // ---------------------------------------------------------------- encoding --
 
@@ -155,9 +166,18 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
+    fn enter(&mut self) -> Result<(), CborError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(CborError::NestingTooDeep);
+        }
+        Ok(())
+    }
+
     fn byte(&mut self) -> Result<u8, CborError> {
         let b = *self.buf.get(self.pos).ok_or(CborError::UnexpectedEof)?;
         self.pos += 1;
@@ -256,12 +276,15 @@ impl<'a> Decoder<'a> {
             }
             4 => {
                 let mut items = Vec::with_capacity(arg.min(1024) as usize);
+                self.enter()?;
                 for _ in 0..arg {
                     items.push(self.value()?);
                 }
+                self.depth -= 1;
                 Ok(Value::Array(items))
             }
             5 => {
+                self.enter()?;
                 let mut entries: Vec<(String, Value)> = Vec::with_capacity(arg.min(1024) as usize);
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..arg {
@@ -298,6 +321,7 @@ impl<'a> Decoder<'a> {
                     let v = self.value()?;
                     entries.push((key, v));
                 }
+                self.depth -= 1;
                 Ok(Value::Map(entries))
             }
             other => Err(CborError::UnsupportedMajorType(other)),
@@ -307,7 +331,11 @@ impl<'a> Decoder<'a> {
 
 /// Strict decode: canonical form, no trailing bytes.
 pub fn decode(buf: &[u8]) -> Result<Value, CborError> {
-    let mut d = Decoder { buf, pos: 0 };
+    let mut d = Decoder {
+        buf,
+        pos: 0,
+        depth: 0,
+    };
     let v = d.value()?;
     if d.pos != buf.len() {
         return Err(CborError::TrailingBytes(buf.len() - d.pos));
@@ -391,6 +419,34 @@ pub fn u(n: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_is_bounded_before_the_stack_is() {
+        // [[...[0]...]] with `n` arrays.
+        let nested = |n: usize| {
+            let mut v = vec![0x81u8; n];
+            v.push(0x00);
+            v
+        };
+        assert!(decode(&nested(MAX_NESTING)).is_ok());
+        assert_eq!(
+            decode(&nested(MAX_NESTING + 1)),
+            Err(CborError::NestingTooDeep)
+        );
+        // A few kilobytes that used to overflow the stack now fail cleanly.
+        assert_eq!(decode(&nested(5_000)), Err(CborError::NestingTooDeep));
+        // Maps count too: {"a": {"a": ... 0}}.
+        let mut deep_map = Vec::new();
+        for _ in 0..=MAX_NESTING {
+            deep_map.extend_from_slice(&[0xa1, 0x61, b'a']);
+        }
+        deep_map.push(0x00);
+        assert_eq!(decode(&deep_map), Err(CborError::NestingTooDeep));
+        // Siblings do not add depth.
+        let mut wide = vec![0x98, 100];
+        wide.extend(std::iter::repeat_n([0x81u8, 0x00], 100).flatten());
+        assert!(decode(&wide).is_ok());
+    }
 
     fn hex32(h: &[u8; 32]) -> String {
         h.iter().map(|b| format!("{b:02x}")).collect()
