@@ -38,6 +38,7 @@ use shared::mutation::{
 };
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
 use shared::signing::Ed25519SigningKey;
+use shared::trust_evidence::TenantTrustEvidencePageV2;
 
 const INSTANCE: [u8; 16] = [7; 16];
 const TENANT: [u8; 16] = [0x41; 16];
@@ -3899,4 +3900,279 @@ async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
         );
     }
     pool.close().await;
+}
+
+// ------------------------------------------------------- W3 trust evidence ---
+
+/// Every page of the tenant's trust evidence, following the cursors.
+async fn evidence(
+    server: &Server,
+    bearer: &str,
+    signers: &[[u8; 32]],
+) -> Vec<TenantTrustEvidencePageV2> {
+    let mut pages = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let mut query: Vec<String> = signers
+            .iter()
+            .map(|s| format!("signer={}", hex(s)))
+            .collect();
+        if !cursor.is_empty() {
+            query.push(format!("cursor={cursor}"));
+        }
+        let path = format!(
+            "/v2/tenants/{}/trust-evidence?{}",
+            hex(&TENANT),
+            query.join("&")
+        );
+        let (status, body) = server.call(&path, bearer, None).await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let page = TenantTrustEvidencePageV2::parse(&body).unwrap();
+        assert_eq!(page.page_index as usize, pages.len());
+        assert_eq!(
+            (page.server_instance_id, page.tenant_id),
+            (INSTANCE, TENANT)
+        );
+        cursor = hex(&page.next_cursor);
+        pages.push(page);
+        if cursor.is_empty() {
+            return pages;
+        }
+    }
+}
+
+fn containers(pages: &[TenantTrustEvidencePageV2]) -> Vec<Vec<u8>> {
+    pages.iter().flat_map(|p| p.containers.clone()).collect()
+}
+
+#[tokio::test]
+async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
+    let mut server = start("trust-evidence", 38209).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    let own = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xa5; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&own)).await.0, 201);
+    // A grant for another device is evidence only when its key is asked about.
+    let other = device(&server, OWNER, 0x6e, "active").await;
+    let theirs = capability_grant(&other, &dev.sk, |g| g.common.replay_id = [0xa6; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&theirs)).await.0, 201);
+
+    let pages = evidence(&server, &access, &[]).await;
+    assert_eq!(pages.len(), 1);
+    let all = containers(&pages);
+    let stored = |table: &str| format!("SELECT exact_signed_container_bytes FROM {table}");
+    let pool = db(&server.data).await;
+    let mut want: Vec<Vec<u8>> = Vec::new();
+    for table in ["v2_tenant_root_key_grants", "v2_device_approvals"] {
+        want.extend(
+            sqlx::query_scalar::<_, Vec<u8>>(&stored(table))
+                .fetch_all(&pool)
+                .await
+                .unwrap(),
+        );
+    }
+    want.push(own.clone());
+    assert_eq!(
+        all, want,
+        "root grants, then approvals, then capability grants"
+    );
+    assert!(!all.contains(&theirs));
+    assert_eq!(
+        pages[0].signing_public_keys,
+        vec![dev.sk.verifying_key().to_bytes()]
+    );
+    assert!(pages[0].revocations.is_empty());
+
+    // Naming the other device's key adds its grant.
+    let named = containers(&evidence(&server, &access, &[other.signing_key_id]).await);
+    assert_eq!(named.len(), all.len() + 1);
+    assert_eq!(named.last(), Some(&theirs));
+
+    // A revoked record is still evidence, and is reported revoked.
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET revoked_at = '2026-01-01T00:00:00+00:00'
+              WHERE replay_id = ?",
+            &[&[0xa5; 16]],
+        )
+        .await;
+    let pages = evidence(&server, &access, &[]).await;
+    assert_eq!(containers(&pages), all);
+    assert_eq!(pages[0].revocations.len(), 1);
+    assert_eq!(
+        (
+            pages[0].revocations[0].replay_id,
+            pages[0].revocations[0].revoked_at_ms
+        ),
+        ([0xa5; 16], 1_767_225_600_000)
+    );
+
+    // A quarantined grant is not served, and two rows holding one container
+    // serve it once.
+    server
+        .sql(
+            "INSERT INTO v2_grant_quarantine
+                 SELECT 'capability_grant', server_instance_id, tenant_id, replay_id,
+                        'container_mismatch', 't'
+                   FROM v2_capability_grants WHERE replay_id = ?",
+            &[&[0xa5; 16]],
+        )
+        .await;
+    for statement in [
+        "CREATE TABLE twin AS SELECT * FROM v2_device_approvals LIMIT 1",
+        "UPDATE twin SET replay_id = x'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'",
+        "INSERT INTO v2_device_approvals SELECT * FROM twin",
+    ] {
+        server.sql(statement, &[]).await;
+    }
+    let served = containers(&evidence(&server, &access, &[]).await);
+    let without: Vec<Vec<u8>> = all.iter().filter(|c| **c != own).cloned().collect();
+    assert_eq!(served, without);
+
+    // A joining device reads it too; another tenant's path and a ticket do
+    // not.
+    let joiner = device(&server, OWNER, 0x6f, "pending").await;
+    let pending = session(&server, &joiner).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(containers(&evidence(&server, &pending, &[]).await), without);
+    let elsewhere = format!("/v2/tenants/{}/trust-evidence", hex(&[0x42; 16]));
+    assert_eq!(server.call(&elsewhere, &access, None).await.0, 404);
+    let ticket = server.login("owner").await["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    assert_eq!(server.call(&path, &ticket, None).await.0, 403);
+    for bad in ["cursor=00", "signer=00", "other=1"] {
+        assert_eq!(
+            server.call(&format!("{path}?{bad}"), &access, None).await.0,
+            400,
+            "{bad}"
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn the_trust_evidence_pages_past_a_thousand_containers_and_leaves_nothing_out() {
+    let mut server = start("trust-pages", 38210).await;
+    let (_dev, access, _) = custodian(&mut server, 0x70).await;
+    // 1100 more approvals of the root subject, each its own container.
+    let pool = db(&server.data).await;
+    let cols: String = sqlx::query_scalar(
+        "SELECT group_concat(name, ', ') FROM pragma_table_info('v2_device_approvals')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let picked = cols
+        .split(", ")
+        .map(|c| match c {
+            "replay_id" => "randomblob(16)",
+            "exact_signed_container_bytes" => "randomblob(200)",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1100)
+         INSERT INTO v2_device_approvals ({cols})
+         SELECT {picked} FROM n, (SELECT * FROM v2_device_approvals LIMIT 1)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A row of another server instance is not this tenant's evidence.
+    let foreign = cols
+        .split(", ")
+        .map(|c| match c {
+            "server_instance_id" => "randomblob(16)",
+            "replay_id" => "randomblob(16)",
+            "exact_signed_container_bytes" => "randomblob(200)",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "INSERT INTO v2_device_approvals ({cols})
+         SELECT {foreign} FROM (SELECT * FROM v2_device_approvals LIMIT 1)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let total: i64 = server
+        .count(&format!(
+            "SELECT (SELECT count(*) FROM v2_tenant_root_key_grants)
+                  + (SELECT count(*) FROM v2_device_approvals WHERE server_instance_id = x'{}')",
+            hex(&INSTANCE)
+        ))
+        .await;
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_device_approvals WHERE server_instance_id <> x'{}'",
+                hex(&INSTANCE)
+            ))
+            .await,
+        1
+    );
+    pool.close().await;
+
+    let pages = evidence(&server, &access, &[]).await;
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].containers.len(), 1024);
+    let all = containers(&pages);
+    assert_eq!(all.len() as i64, total);
+    let unique: std::collections::BTreeSet<_> = all.iter().collect();
+    assert_eq!(unique.len(), all.len(), "no container twice");
+
+    // A cursor cannot name a page past the last index.
+    let forged = format!(
+        "/v2/tenants/{}/trust-evidence?cursor=ffffffff000000000000000000",
+        hex(&TENANT)
+    );
+    assert_eq!(server.call(&forged, &access, None).await.0, 400);
+}
+
+#[tokio::test]
+async fn a_trust_evidence_page_stays_within_four_mebibytes() {
+    let mut server = start("trust-bytes", 38211).await;
+    let (_dev, access, _) = custodian(&mut server, 0x71).await;
+    // 40 revoked approvals of 128 KiB each: more than one page can carry.
+    let pool = db(&server.data).await;
+    let cols: String = sqlx::query_scalar(
+        "SELECT group_concat(name, ', ') FROM pragma_table_info('v2_device_approvals')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let picked = cols
+        .split(", ")
+        .map(|c| match c {
+            "replay_id" => "randomblob(16)",
+            "exact_signed_container_bytes" => "randomblob(131072)",
+            "revoked_at" => "'2026-01-01T00:00:00+00:00'",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+         INSERT INTO v2_device_approvals ({cols})
+         SELECT {picked} FROM n, (SELECT * FROM v2_device_approvals LIMIT 1)"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let pages = evidence(&server, &access, &[]).await;
+    assert!(pages.len() >= 2, "{} pages", pages.len());
+    for page in &pages {
+        assert!(page.encode().len() <= shared::trust_evidence::MAX_PAGE_BYTES);
+    }
+    assert_eq!(containers(&pages).len(), 1 + 41);
+    let reported: usize = pages.iter().map(|p| p.revocations.len()).sum();
+    assert_eq!(reported, 40);
 }
