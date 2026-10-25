@@ -15,6 +15,7 @@ mod generations;
 mod grants;
 mod idempotency;
 mod identity;
+mod integrity;
 mod models;
 mod ratelimit;
 mod routes;
@@ -72,7 +73,15 @@ async fn main() -> anyhow::Result<()> {
 
     // The server only reads the record; it never creates or repairs it.
     let mirror = identity::read_mirror(&pool).await?;
-    let authority = identity::authority(&cfg, mirror.as_ref());
+    let mut authority = identity::authority(&cfg, mirror.as_ref());
+    // ADR 0001 R1/R4: reconcile the control plane before any request runs.
+    if let Ok(verified) = &authority {
+        let report = integrity::run(&pool, verified).await?;
+        tracing::info!(?report, "v2 integrity pass");
+        if let Some(refusal) = report.refusal() {
+            authority = Err(refusal);
+        }
+    }
     match &authority {
         Ok(v) => tracing::info!(
             "server identity verified: instance {} epoch {}",

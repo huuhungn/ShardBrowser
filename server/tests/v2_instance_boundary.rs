@@ -296,7 +296,17 @@ async fn upgrade_binds_generations_to_the_mirror_instance_and_preserves_every_ro
     let cols = columns(&pool).await;
     let before = snapshot(&pool, Some(&cols)).await;
 
-    run_migrations(&pool).await.unwrap();
+    // Through 0011 only: 0012 adds tables and quarantines legacy devices,
+    // which v2_upgrade_0012 covers.
+    let mut through_0011 = sqlx::migrate!("./migrations");
+    through_0011.migrations = Cow::Owned(
+        through_0011
+            .iter()
+            .filter(|m| m.version <= 11)
+            .cloned()
+            .collect(),
+    );
+    run_migrations_with(&pool, &through_0011).await.unwrap();
 
     assert_eq!(snapshot(&pool, Some(&cols)).await, before);
     for table in ["v2_root_key_generations", "v2_fleet_key_generations"] {

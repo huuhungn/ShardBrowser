@@ -1039,8 +1039,8 @@ async fn device_enrollment_requires_proof_of_possession() {
         ))
         .await
         .unwrap();
-    let stored: (Vec<u8>, Vec<u8>) = sqlx::query_as(
-        "SELECT signing_key_id, hpke_key_id FROM v2_devices WHERE tenant_id = ? AND id = ?",
+    let stored: (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
+        "SELECT signing_key_id, hpke_key_id, status FROM v2_devices          WHERE tenant_id = ? AND id = ?",
     )
     .bind(TENANT_A.as_slice())
     .bind(decode_hex_str(&device_id))
@@ -1049,6 +1049,8 @@ async fn device_enrollment_requires_proof_of_possession() {
     .unwrap();
     assert_eq!(stored.0, expected_signing_id);
     assert_eq!(stored.1, expected_hpke_id);
+    // Plan L369: proof of possession alone leaves the device pending.
+    assert_eq!(stored.2, "pending");
     pool.close().await;
 
     // The challenge is single-use: replaying the same valid proof must fail,

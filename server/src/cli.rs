@@ -155,7 +155,7 @@ async fn tenant_create(
     // Verify through a read-only open first, so a refusal creates nothing:
     // no database file, no blob directory, no migration.
     let mirror = identity::read_mirror_read_only(cfg).await?;
-    identity::authority(cfg, mirror.as_ref()).map_err(|r| {
+    let verified = identity::authority(cfg, mirror.as_ref()).map_err(|r| {
         anyhow::anyhow!(
             "refusing: the server identity does not verify ({}: {}); run `identity show`",
             r.code.as_str(),
@@ -212,6 +212,17 @@ async fn tenant_create(
     .execute(&mut *tx)
     .await
     .context("inserting the owner membership")?;
+    // ADR 0001 R1: the tenant's one first-device opportunity starts here, and
+    // only here; it is never inferred from empty tables later.
+    sqlx::query(
+        "INSERT INTO v2_bootstrap_guards          (server_instance_id, tenant_id, state, recovery_reason, updated_at)          VALUES (?, ?, 'unused', NULL, ?)",
+    )
+    .bind(verified.server_instance_id.as_slice())
+    .bind(tenant_id.as_slice())
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting the bootstrap guard")?;
     // ADR 0001 D3: an offline action has no live account or device.
     sqlx::query(
         "INSERT INTO v2_audit_events \
