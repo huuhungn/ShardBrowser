@@ -30,8 +30,11 @@ use shared::grants::derive_keypair;
 use shared::keys::{hpke_key_id, signing_key_id};
 use shared::mutation::{
     root_custodian_grant_set_hash, EmbeddedSelfGrant, IdempotentMutationRequestV2,
-    IdempotentStoredResponseV2, OperationKind, RootGenerationMode, RootGenerationTarget,
-    TenantRootGenerationCreateV2, TenantRootGenerationCreatedV2,
+    IdempotentStoredResponseV2, OperationKind, PreviousRoot, RootGenerationMode,
+    RootGenerationState, RootGenerationTarget, RootGrantRef, RootGrantState,
+    TenantRootGenerationActivateV2, TenantRootGenerationActivatedV2, TenantRootGenerationCreateV2,
+    TenantRootGenerationCreatedV2, TenantRootGrantAckV2, TenantRootGrantAckedV2,
+    TenantRootGrantDescriptorV2,
 };
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
 use shared::signing::Ed25519SigningKey;
@@ -307,6 +310,24 @@ impl Server {
             .send()
             .await
             .unwrap();
+        let status = r.status().as_u16();
+        (status, r.bytes().await.unwrap().to_vec())
+    }
+
+    /// A GET, or a CBOR POST of `body`, to `path`.
+    async fn call(&self, path: &str, bearer: &str, body: Option<&[u8]>) -> (u16, Vec<u8>) {
+        let url = format!("http://127.0.0.1:{}{path}", self.port);
+        let r = match body {
+            None => client().get(url),
+            Some(b) => client()
+                .post(url)
+                .header("content-type", "application/cbor")
+                .body(b.to_vec()),
+        }
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .unwrap();
         let status = r.status().as_u16();
         (status, r.bytes().await.unwrap().to_vec())
     }
@@ -2591,4 +2612,518 @@ async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_
         (status, code_of(&body).as_str()),
         (409, "IDEMPOTENCY_MISMATCH")
     );
+}
+
+// --------------------------------------------- S6 readback, ack, activate ---
+
+const SELF_GRANT_REPLAY: [u8; 16] = [0x81; 16];
+
+/// The exact ref naming `container`, a grant `dev` signed.
+fn grant_ref(dev: &Device, container: &[u8]) -> RootGrantRef {
+    let v = AuthorizationRecord::parse(container)
+        .unwrap()
+        .verify_signature(dev.sk.verifying_key().as_bytes())
+        .unwrap();
+    let Payload::TenantRootKeyGrant(g) = v.payload() else {
+        panic!("a root grant")
+    };
+    RootGrantRef {
+        tenant_id: g.common.tenant_id,
+        server_instance_id: g.common.server_instance_id,
+        restore_epoch: g.common.restore_epoch,
+        root_generation: g.root_generation,
+        root_key_id: g.root_key_id,
+        replay_id: g.common.replay_id,
+        signed_container_hash: *v.record().signed_container_hash(),
+        exact_signed_container_bytes_sha256: *v.record().exact_signed_container_bytes_sha256(),
+    }
+}
+
+/// The exact outer request of `kind` under idempotency key `key`.
+fn lifecycle_request(kind: OperationKind, key: u8, payload: Vec<u8>) -> Vec<u8> {
+    IdempotentMutationRequestV2 {
+        operation_kind: kind,
+        idempotency_key: [key; 16],
+        canonical_payload_bytes: payload,
+        client_request_nonce: [0x92; 16],
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+    }
+    .encode()
+}
+
+fn grant_path(generation: &str, replay: &[u8; 16]) -> String {
+    format!(
+        "/v2/tenants/{}/root-key-generations/{generation}/grants/{}",
+        hex(&TENANT),
+        hex(replay)
+    )
+}
+
+fn activate_path(generation: &str) -> String {
+    format!(
+        "/v2/tenants/{}/root-key-generations/{generation}/activate",
+        hex(&TENANT)
+    )
+}
+
+fn ack_request(key: u8, grant: RootGrantRef) -> Vec<u8> {
+    lifecycle_request(
+        OperationKind::RootGrantAck,
+        key,
+        TenantRootGrantAckV2 { grant }.encode(),
+    )
+}
+
+fn activate_request(key: u8, target: RootGenerationTarget) -> Vec<u8> {
+    lifecycle_request(
+        OperationKind::RootGenerationActivate,
+        key,
+        TenantRootGenerationActivateV2 {
+            target,
+            previous: None,
+        }
+        .encode(),
+    )
+}
+
+/// D1 and the S6 bootstrap; returns the device, its access token, the filed
+/// self-grant and the create request's terms.
+async fn bootstrapped(
+    server: &mut Server,
+    seed: u8,
+) -> (Device, String, Vec<u8>, RootGenerationTarget) {
+    let (dev, access) = approved(server, seed).await;
+    let container = self_grant(&dev, &TRK, |_| {});
+    let create = bootstrap_create(&TRK, container.clone(), |_| {});
+    let (status, body) = server
+        .root(&TENANT, &access, &root_request(0x91, &create))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    (dev, access, container, create.target)
+}
+
+async fn read_self_grant(
+    server: &Server,
+    dev: &Device,
+    access: &str,
+) -> TenantRootGrantDescriptorV2 {
+    let (status, body) = server
+        .call(&grant_path("0", &SELF_GRANT_REPLAY), access, None)
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    TenantRootGrantDescriptorV2::parse(&body, dev.sk.verifying_key().as_bytes()).unwrap()
+}
+
+#[tokio::test]
+async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero() {
+    let mut server = start("s6-activate", 38201).await;
+    let (dev, access, container, target) = bootstrapped(&mut server, 0x63).await;
+    let read = || read_self_grant(&server, &dev, &access);
+
+    // The readback is the exact container, and it opens to the TRK.
+    let d = read().await;
+    assert_eq!(
+        (d.grant_state(), d.generation_state()),
+        (RootGrantState::PendingAck, RootGenerationState::Preparing)
+    );
+    assert_eq!(
+        d.record().record().exact_signed_container_bytes(),
+        container
+    );
+    let Payload::TenantRootKeyGrant(g) = d.record().payload() else {
+        panic!("a root grant")
+    };
+    assert_eq!(*g.open_trk(&dev.hpke_sk).unwrap(), TRK);
+
+    // Nothing activates before the self-grant is acknowledged.
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xb0, target.clone())),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    // The acknowledgement, once; a lost response gets the same bytes back.
+    let ack = ack_request(0xb1, grant_ref(&dev, &container));
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let (status, stored) = server.call(&ack_path, &access, Some(&ack)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&stored));
+    let response = IdempotentStoredResponseV2::parse(&stored).unwrap();
+    let acked = TenantRootGrantAckedV2::parse(&response.canonical_response_payload_bytes).unwrap();
+    assert_eq!(acked.grant, grant_ref(&dev, &container));
+    assert_eq!(
+        server.call(&ack_path, &access, Some(&ack)).await,
+        (201, stored)
+    );
+    let (status, body) = server
+        .call(
+            &ack_path,
+            &access,
+            Some(&ack_request(0xb2, grant_ref(&dev, &container))),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    assert_eq!(read().await.grant_state(), RootGrantState::Acknowledged);
+
+    // Activation flips the generation and the tenant's pointer, once.
+    let activate = activate_request(0xb3, target.clone());
+    let (status, stored) = server
+        .call(&activate_path("0"), &access, Some(&activate))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&stored));
+    let response = IdempotentStoredResponseV2::parse(&stored).unwrap();
+    let activated =
+        TenantRootGenerationActivatedV2::parse(&response.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (activated.target, activated.previous),
+        (target.clone(), None)
+    );
+    assert_eq!(
+        server
+            .call(&activate_path("0"), &access, Some(&activate))
+            .await,
+        (201, stored)
+    );
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xb4, target)),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    assert_eq!(read().await.generation_state(), RootGenerationState::Active);
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 0 AND state = 'ACTIVE' AND activated_at IS NOT NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_tenants WHERE active_root_generation = 0",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_tenant_root_key_grants WHERE acked_at IS NOT NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.grant_ack'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.activate'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+
+    // An ACTIVE generation never goes back, nor rewrites when it became so,
+    // and each mutation commits with its response.
+    let pool = db(&server.data).await;
+    let mut statements = vec![
+        (
+            "UPDATE v2_root_key_generations SET state = 'PREPARING'".to_string(),
+            "only moves forward",
+        ),
+        (
+            "UPDATE v2_root_key_generations SET activated_at = 'later'".to_string(),
+            "only moves forward",
+        ),
+    ];
+    for kind in ["ROOT_GRANT_ACK", "ROOT_GENERATION_ACTIVATE"] {
+        statements.push((
+            format!(
+                "INSERT INTO v2_idempotency
+                 SELECT server_instance_id, tenant_id, actor_device_id, operation_scope,
+                        x'{}', operation_kind, canonical_request_hash, exact_request_bytes,
+                        exact_request_bytes_sha256, 'in_flight', NULL, NULL, NULL,
+                        retained_until, approval_payload_domain, restore_epoch,
+                        actor_account_id, subject_device_id
+                   FROM v2_idempotency WHERE operation_kind = '{kind}'",
+                "ee".repeat(16)
+            ),
+            "stored with its response",
+        ));
+    }
+    for (statement, why) in statements {
+        let err = sqlx::query(&statement).execute(&pool).await.unwrap_err();
+        assert!(err.to_string().contains(why), "{statement}: {err}");
+    }
+    pool.close().await;
+
+    // A stored activation whose generation moved on is not replayed.
+    server
+        .sql(
+            "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = 'now'",
+            &[],
+        )
+        .await;
+    let (status, body) = server
+        .call(&activate_path("0"), &access, Some(&activate))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+}
+
+#[tokio::test]
+async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() {
+    let mut server = start("s6-lifecycle-refusals", 38202).await;
+    let (dev, access, container, target) = bootstrapped(&mut server, 0x64).await;
+    let honest = grant_ref(&dev, &container);
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let refused = |status: u16, body: &[u8]| (status, code_of(body));
+
+    // One spelling per path; no such grant; another tenant's path.
+    for path in [
+        grant_path("00", &SELF_GRANT_REPLAY),
+        grant_path("+0", &SELF_GRANT_REPLAY),
+    ] {
+        assert_eq!(server.call(&path, &access, None).await.0, 400, "{path}");
+    }
+    let (status, body) = server
+        .call(&grant_path("0", &[0x99; 16]), &access, None)
+        .await;
+    assert_eq!(refused(status, &body), (404, "RESOURCE_NOT_FOUND".into()));
+    let elsewhere = format!(
+        "/v2/tenants/{}/root-key-generations/0/grants/{}",
+        hex(&[0x42; 16]),
+        hex(&SELF_GRANT_REPLAY)
+    );
+    let (status, body) = server.call(&elsewhere, &access, None).await;
+    assert_eq!(refused(status, &body), (404, "RESOURCE_NOT_FOUND".into()));
+
+    // Only the self-grant's subject, on its setup session, reads or acts on it.
+    let other = device(&server, OWNER, 0x65, "pending").await;
+    let stranger = session(&server, &other).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (path, body) in [
+        (grant_path("0", &SELF_GRANT_REPLAY), None),
+        (ack_path.clone(), Some(ack_request(0xbf, honest.clone()))),
+        (
+            activate_path("0"),
+            Some(activate_request(0xbe, target.clone())),
+        ),
+    ] {
+        assert_eq!(
+            server.call(&path, &stranger, body.as_deref()).await.0,
+            403,
+            "{path}"
+        );
+    }
+
+    // An acknowledgement names exactly the grant on its path.
+    for (name, edit, want) in [
+        (
+            "another replay",
+            (|r: &mut RootGrantRef| r.replay_id = [0x99; 16]) as fn(&mut RootGrantRef),
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+        ),
+        (
+            "another container",
+            |r: &mut RootGrantRef| r.signed_container_hash = [0x99; 32],
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+        ),
+        (
+            "another root key",
+            |r: &mut RootGrantRef| r.root_key_id = [0x99; 32],
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+        ),
+        (
+            "another epoch",
+            |r: &mut RootGrantRef| r.restore_epoch = 1,
+            (409, "STALE_CONTEXT"),
+        ),
+    ] {
+        let mut r = honest.clone();
+        edit(&mut r);
+        let (status, body) = server
+            .call(&ack_path, &access, Some(&ack_request(0xc0, r)))
+            .await;
+        assert_eq!(
+            (status, code_of(&body).as_str()),
+            want,
+            "{name} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let mut r = honest.clone();
+    r.server_instance_id = [0x99; 16];
+    assert_eq!(
+        server
+            .call(&ack_path, &access, Some(&ack_request(0xc1, r)))
+            .await
+            .0,
+        403
+    );
+    // The body must be the operation its path names.
+    let (status, body) = server
+        .call(
+            &ack_path,
+            &access,
+            Some(&activate_request(0xc2, target.clone())),
+        )
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+
+    // An activation restates the generation's terms, and only generation 0
+    // activates for now.
+    let mut other = target.clone();
+    other.recovery_bundle_sha256 = [0x99; 32];
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xc3, other)),
+        )
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+    let mut later = target.clone();
+    later.root_generation = 1;
+    later.root_key_id = [0x98; 32];
+    let rotation = lifecycle_request(
+        OperationKind::RootGenerationActivate,
+        0xc4,
+        TenantRootGenerationActivateV2 {
+            target: later,
+            previous: Some(PreviousRoot {
+                root_key_id: target.root_key_id,
+                root_generation: 0,
+            }),
+        }
+        .encode(),
+    );
+    assert_eq!(
+        server
+            .call(&activate_path("1"), &access, Some(&rotation))
+            .await
+            .0,
+        403
+    );
+
+    // A revoked grant is neither acknowledged nor counted.
+    let (status, _) = server
+        .call(&ack_path, &access, Some(&ack_request(0xc5, honest.clone())))
+        .await;
+    assert_eq!(status, 201);
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET revoked_at = 'now'",
+            &[],
+        )
+        .await;
+    let (status, body) = server
+        .call(
+            &activate_path("0"),
+            &access,
+            Some(&activate_request(0xc6, target.clone())),
+        )
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (409, "ROOT_GENERATION_MISMATCH".into())
+    );
+    assert_eq!(
+        TenantRootGrantDescriptorV2::parse(
+            &server
+                .call(&grant_path("0", &SELF_GRANT_REPLAY), &access, None)
+                .await
+                .1,
+            dev.sk.verifying_key().as_bytes()
+        )
+        .unwrap()
+        .grant_state(),
+        RootGrantState::Revoked
+    );
+    server
+        .sql(
+            "DROP TRIGGER v2_tenant_root_key_grants_marks_are_final",
+            &[],
+        )
+        .await;
+    server
+        .sql("UPDATE v2_tenant_root_key_grants SET acked_at = NULL", &[])
+        .await;
+    let (status, body) = server
+        .call(&ack_path, &access, Some(&ack_request(0xc5, honest.clone())))
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "MUTATION_RESPONSE_MISMATCH".into())
+    );
+    let (status, body) = server
+        .call(&ack_path, &access, Some(&ack_request(0xc8, honest.clone())))
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (409, "ROOT_GENERATION_MISMATCH".into())
+    );
+
+    // A row that no longer matches its signed container is never served.
+    server
+        .sql(
+            "DROP TRIGGER v2_tenant_root_key_grants_record_is_fixed",
+            &[],
+        )
+        .await;
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET hpke_info_bytes = x'00'",
+            &[],
+        )
+        .await;
+    let (status, body) = server
+        .call(&grant_path("0", &SELF_GRANT_REPLAY), &access, None)
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+    let (status, body) = server
+        .call(&ack_path, &access, Some(&ack_request(0xc7, honest)))
+        .await;
+    assert_eq!(
+        refused(status, &body),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+}
+
+#[tokio::test]
+async fn an_expired_self_grant_is_not_acknowledged() {
+    let mut server = start("s6-expired", 38203).await;
+    let (dev, access) = approved(&mut server, 0x66).await;
+    let until = now_ms() + 5_000;
+    let container = self_grant(&dev, &TRK, |g| g.common.not_after_ms = until);
+    let create = bootstrap_create(&TRK, container.clone(), |_| {});
+    let (status, body) = server
+        .root(&TENANT, &access, &root_request(0x91, &create))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    tokio::time::sleep(Duration::from_millis(until.saturating_sub(now_ms()) + 200)).await;
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let ack = ack_request(0xd0, grant_ref(&dev, &container));
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 403);
 }
