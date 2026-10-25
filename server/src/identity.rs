@@ -27,6 +27,8 @@ pub enum ReasonCode {
     Corrupt,
     BehindDb,
     ReconciliationRequired,
+    /// The startup integrity pass found a broken control-plane reference.
+    ControlPlaneIntegrityUntrusted,
 }
 
 impl ReasonCode {
@@ -36,6 +38,7 @@ impl ReasonCode {
             Self::Corrupt => "EPOCH_AUTHORITY_CORRUPT",
             Self::BehindDb => "EPOCH_AUTHORITY_BEHIND_DB",
             Self::ReconciliationRequired => "EPOCH_RECONCILIATION_REQUIRED",
+            Self::ControlPlaneIntegrityUntrusted => "CONTROL_PLANE_INTEGRITY_UNTRUSTED",
         }
     }
 }

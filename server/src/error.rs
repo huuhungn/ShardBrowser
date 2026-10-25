@@ -37,7 +37,7 @@ impl AppError {
             AppError::EpochAuthority(code) => (
                 StatusCode::LOCKED,
                 format!(
-                    "v2 is unavailable until the server identity verifies: {}",
+                    "v2 is unavailable until the server's control plane verifies: {}",
                     code.as_str()
                 ),
             ),

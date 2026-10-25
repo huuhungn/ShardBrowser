@@ -604,14 +604,15 @@ fn tenant_create(d: &Dirs, slug: &str, extra: &[&str], input: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
-async fn tenant_rows(d: &Dirs) -> [i64; 4] {
+async fn tenant_rows(d: &Dirs) -> [i64; 5] {
     let pool = db(d).await;
-    let mut out = [0; 4];
+    let mut out = [0; 5];
     for (i, t) in [
         "v2_tenants",
         "v2_accounts",
         "v2_tenant_memberships",
         "v2_audit_events",
+        "v2_bootstrap_guards",
     ]
     .iter()
     .enumerate()
@@ -710,6 +711,16 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
         )
     );
 
+    // The tenant's one first-device opportunity, bound to this instance (R1).
+    let guard: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT g.state, g.recovery_reason, g.server_instance_id = s.server_instance_id          FROM v2_bootstrap_guards g, v2_server_state s WHERE hex(g.tenant_id) = upper(?)",
+    )
+    .bind(&tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(guard, ("unused".to_string(), None, true));
+
     // No root key, grant, capability or device comes with the tenant (ADR Q3).
     for table in [
         "v2_root_key_generations",
@@ -723,7 +734,7 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
 
     let again = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!again.status.success());
-    assert_eq!(tenant_rows(&d).await, [1, 1, 1, 1]);
+    assert_eq!(tenant_rows(&d).await, [1, 1, 1, 1, 1]);
 }
 
 #[tokio::test]
@@ -748,7 +759,7 @@ async fn tenant_create_refuses_before_identity_init() {
     migrated(&d).await.close().await;
     let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!out.status.success());
-    assert_eq!(tenant_rows(&d).await, [0; 4]);
+    assert_eq!(tenant_rows(&d).await, [0; 5]);
 }
 
 #[tokio::test]
@@ -763,7 +774,7 @@ async fn tenant_create_refuses_a_weak_password() {
             stderr(&out)
         );
     }
-    assert_eq!(tenant_rows(&d).await, [0; 4]);
+    assert_eq!(tenant_rows(&d).await, [0; 5]);
 }
 
 /// The password never comes from argv or the environment, and without a
@@ -810,7 +821,7 @@ async fn tenant_create_takes_no_password_from_argv_or_env_and_never_blocks() {
     let mut err = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
     assert!(err.contains("--password-stdin"), "{err}");
-    assert_eq!(tenant_rows(&d).await, [0; 4]);
+    assert_eq!(tenant_rows(&d).await, [0; 5]);
 }
 
 /// The audit row is part of the transaction: if it cannot be written, the
@@ -831,5 +842,5 @@ async fn tenant_create_rolls_back_everything_when_the_audit_insert_fails() {
     let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!out.status.success());
     assert!(stderr(&out).contains("audit"), "{}", stderr(&out));
-    assert_eq!(tenant_rows(&d).await, [0; 4]);
+    assert_eq!(tenant_rows(&d).await, [0; 5]);
 }

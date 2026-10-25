@@ -26,7 +26,6 @@ use argon2::password_hash::rand_core::{OsRng, RngCore};
 use sqlx::{Row, SqlitePool};
 
 use shared::canonical as c;
-use shared::keys::{hpke_key_id, signing_key_id};
 use shared::signing::verify_tbs;
 
 /// Suite identifiers recorded alongside an enrolled key.
@@ -237,8 +236,14 @@ pub async fn enroll_device(
         bail!("enrollment challenge already used");
     }
 
-    let signing_kid = signing_key_id(req.signing_public_key);
-    let hpke_kid = hpke_key_id(req.hpke_public_key);
+    // R4: pinned suites and a usable signing point, then both role-separated IDs.
+    let (signing_kid, hpke_kid) = crate::integrity::derive_device_key_ids(
+        req.signing_suite,
+        req.signing_public_key,
+        req.hpke_suite,
+        req.hpke_public_key,
+    )
+    .map_err(|_| anyhow::anyhow!("unsupported device key suite or unusable signing key"))?;
 
     // Refuse duplicates without disclosing database internals. Compare the
     // HPKE public key too: earlier releases stored its id using the signing
@@ -263,7 +268,7 @@ pub async fn enroll_device(
              (id, tenant_id, account_id, label_ciphertext, signing_key_id, signing_public_key,
               signing_suite, hpke_key_id, hpke_public_key, hpke_suite, status, last_seen_at,
               created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?)",
     )
     .bind(req.device_id.as_slice())
     .bind(req.tenant_id.as_slice())
