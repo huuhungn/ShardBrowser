@@ -28,12 +28,13 @@ use super::v2_auth::{audit, reload_session, verified, Principal};
 use super::v2_root::{insert_row, mismatch, record_error, row_holds, stale, Col};
 use super::v2_root_grants::is_active_custodian;
 use crate::error::AppError;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339};
 
 /// The exact container is stored whole, within the table's bound.
 pub const MAX_CAPABILITY_GRANT_BODY: usize = 131_072;
-const TABLE: &str = "v2_capability_grants";
+pub(crate) const TABLE: &str = "v2_capability_grants";
 
 /// Every plan 7.2 column of a capability grant row except `created_at` and
 /// `revoked_at`, each derived from the verified record. Filing and the retry
@@ -186,6 +187,63 @@ async fn replay_spent(
     Ok(false)
 }
 
+/// The exact container a row of this table holds under `replay`.
+async fn stored_bytes(
+    conn: &mut SqliteConnection,
+    tenant: &[u8; 16],
+    replay: &[u8; 16],
+) -> Result<Option<Vec<u8>>, AppError> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT exact_signed_container_bytes FROM {TABLE}
+          WHERE tenant_id = ? AND payload_domain = ? AND replay_id = ?"
+    ))
+    .bind(tenant.as_slice())
+    .bind(DOMAIN_TENANT_CAPABILITY_GRANT)
+    .bind(replay.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?)
+}
+
+/// Whether the row `(tenant, replay)` holds exactly what its own container
+/// says: the container parses, verifies under its issuer device's key, names
+/// this row's key, and every column equals the record's. The startup
+/// integrity pass quarantines a row for which this is false.
+pub(crate) async fn stored_row_matches(
+    conn: &mut SqliteConnection,
+    instance: &[u8; 16],
+    tenant: &[u8; 16],
+    replay: &[u8; 16],
+) -> Result<bool, AppError> {
+    let Some(exact) = stored_bytes(conn, tenant, replay).await? else {
+        return Ok(false);
+    };
+    let Ok(parsed) = AuthorizationRecord::parse(&exact) else {
+        return Ok(false);
+    };
+    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
+    )
+    .bind(tenant.as_slice())
+    .bind(parsed.issuer_signing_key_id().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(issuer) = issuer.and_then(|k| <[u8; 32]>::try_from(k).ok()) else {
+        return Ok(false);
+    };
+    let Ok(record) = parsed.verify_signature(&issuer) else {
+        return Ok(false);
+    };
+    let Payload::TenantCapabilityGrant(g) = record.payload() else {
+        return Ok(false);
+    };
+    let c = &g.common;
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id) != (instance, tenant, replay) {
+        return Ok(false);
+    }
+    let cols = grant_columns(g, record.record())?;
+    row_holds(conn, TABLE, &cols).await
+}
+
 pub async fn file_capability_grant(
     State(app): State<AppState>,
     who: Principal,
@@ -242,7 +300,25 @@ pub async fn file_capability_grant(
     // as every stored response does. Anything else under the replay ID is
     // another request; only a custodian learns that the ID is spent.
     if replay_spent(&mut tx, &g).await? {
+        let mark = Mark {
+            kind: Kind::CapabilityGrant,
+            server_instance_id: c.server_instance_id,
+            tenant_id: c.tenant_id,
+            replay_id: c.replay_id,
+        };
+        if quarantine::holds(&mut tx, &mark).await? {
+            return Err(AppError::Quarantine(Box::new(mark)));
+        }
         if !row_holds(&mut tx, TABLE, &cols).await? {
+            // The same bytes filed as other columns: the row drifted from its
+            // container (plan 5.6.1).
+            if stored_bytes(&mut tx, &c.tenant_id, &c.replay_id)
+                .await?
+                .as_deref()
+                == Some(&body[..])
+            {
+                return Err(AppError::Quarantine(Box::new(mark)));
+            }
             if !is_active_custodian(&mut tx, v, &s, now).await? {
                 return Err(AppError::Forbidden);
             }

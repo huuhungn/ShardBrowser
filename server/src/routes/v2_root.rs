@@ -36,6 +36,7 @@ use super::v2_auth::{
 };
 use crate::error::AppError;
 use crate::identity::Verified;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339};
 
@@ -234,6 +235,16 @@ async fn stored_response_is_consistent(
     let (Some(generation), Some(grant)) = (generation, grant) else {
         return Ok(false);
     };
+    // A quarantined self-grant answers nothing, not even a lost response.
+    let mark = Mark {
+        kind: Kind::RootGrant,
+        server_instance_id: v.server_instance_id,
+        tenant_id: s.tenant_id,
+        replay_id: identity.replay_id,
+    };
+    if quarantine::holds(conn, &mark).await? {
+        return Err(AppError::Quarantine(Box::new(mark)));
+    }
     Ok(stored.operation_kind == OperationKind::RootGenerationCreate
         && stored.idempotency_key == req.outer.idempotency_key
         && stored.exact_request_hash == req.request_hash
