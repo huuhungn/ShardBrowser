@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.4.4
+
+A user interface release. Team sync and the browser engine are unchanged
+(Chromium 156.0.8078.48, engine build 1).
+
+### Changed
+
+- Table headers on the Browsers and Proxies pages line up with their columns at
+  every window width, including 2K and 4K screens and while a profile is
+  starting.
+- Every page puts its title in the same place, and empty pages (Trash,
+  Extensions, Bookmarks, Automation, Fingerprints, an empty folder, an empty
+  proxy list) share one empty-state layout. In Vietnamese, the "All" folder tab
+  and the patch log are translated.
+- The fingerprint library states a GPU mismatch once, above the cards, with a
+  count. Each mismatched card keeps a small warning mark that opens the same
+  explanation, and the remove button is a quiet icon instead of a red one.
+- Row buttons on the Browsers and Proxies pages have names that screen readers
+  read with the profile or proxy name, and the current page is marked in the
+  sidebar.
+
 ## v2.4.3
 
 A security fix release for Team sync. The browser engine is unchanged
