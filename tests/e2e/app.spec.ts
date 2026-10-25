@@ -666,3 +666,20 @@ test("empty states read in the chosen language", async ({ page }) => {
   await page.getByRole("button", { name: "Vân tay" }).click();
   await expect(page.getByRole("heading", { name: "Chưa có vân tay nào" })).toBeVisible();
 });
+
+test("the fingerprint library states a GPU mismatch once and keeps the cards quiet", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=fingerprints");
+  await page.getByRole("button", { name: "Fingerprints", exact: true }).click();
+  await expect(page.getByRole("status").filter({ hasText: "2 of 3 fingerprints claim GPU features" })).toBeVisible();
+  // One icon per mismatched card, named for screen readers, with no word repeated on every card.
+  await expect(page.getByRole("button", { name: "GPU mismatch" })).toHaveCount(2);
+  await expect(page.getByText("GPU mismatch", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "GPU mismatch" }).first().click();
+  await expect(page.getByRole("dialog")).toContainText("This fingerprint does not fit this machine");
+  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).last().click();
+  // Remove is a named icon on user cards only, and is not drawn as a red error button.
+  const remove = page.getByRole("button", { name: "Remove Win RTX 3060" });
+  await expect(remove).toBeVisible();
+  await expect(remove).not.toHaveText("✕");
+  await expect(page.getByRole("button", { name: /^Remove / })).toHaveCount(2);
+});

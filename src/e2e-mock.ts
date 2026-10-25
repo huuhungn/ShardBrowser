@@ -134,6 +134,15 @@ const settings = {
   mcp_path: "C:\\Users\\Example\\ShardX-MCP",
 };
 
+// "fingerprints": a library where two of three cards claim a GPU this machine lacks.
+const fingerprints = scenario === "fingerprints" ? [
+  { id: "fp-mac", label: "Mac M2 Air", platform: "macOS", chrome: "131", gpu: "Apple M2", tag_color: "", builtin: false, payload: {} },
+  { id: "fp-win", label: "Win RTX 3060", platform: "Windows", chrome: "131", gpu: "NVIDIA GeForce RTX 3060", tag_color: "", builtin: false, payload: {} },
+  { id: "fp-ref", label: "Windows reference", platform: "Windows", chrome: "130", gpu: "Intel UHD 620", tag_color: "", builtin: true, payload: {} },
+] : [];
+const mismatch = (profile_renderer: string) =>
+  ({ compatible: false, missing_webgl1: ["WEBGL_compressed_texture_astc"], missing_webgl2: [], missing_webgpu: [], profile_renderer });
+
 // The E2E suite runs the production build, so each one-shot fixture fails once.
 let runtimeFailures = scenario === "runtime-error-once" ? 1 : 0;
 let runtimeInstallFailures = scenario === "runtime-install-error-once" ? 1 : 0;
@@ -261,7 +270,17 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
           }]
         : [];
     case "fingerprint_list":
-      return [];
+      return fingerprints;
+    case "gpu_caps":
+      if (scenario !== "fingerprints") throw new Error(`Unhandled E2E command: ${cmd}`);
+      return { renderer: "Fixture GPU", vendor: "Fixture", webgl1: [], webgl2: [], webgpu: null, engine_version: "fixture" };
+    case "gpu_caps_compat":
+      if (scenario !== "fingerprints") throw new Error(`Unhandled E2E command: ${cmd}`);
+      return {
+        "fp-mac": mismatch("Apple M2"),
+        "fp-win": mismatch("NVIDIA GeForce RTX 3060"),
+        "fp-ref": { compatible: true, missing_webgl1: [], missing_webgl2: [], missing_webgpu: [], profile_renderer: "Intel UHD 620" },
+      };
     case "profile_get": {
       const id = (payload as { id?: string } | undefined)?.id;
       const profile = profiles.find((entry) => entry.id === id) ?? fixtureProfiles[0];
