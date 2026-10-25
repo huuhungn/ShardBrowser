@@ -8,6 +8,7 @@ pub mod cdp;
 mod codex_mcp;
 mod cookies;
 pub mod db;
+mod dpapi;
 pub mod errcode;
 mod extensions;
 pub mod files;
@@ -2324,14 +2325,40 @@ async fn team_collect_custody() -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| e.to_string())?;
 
+    // Fleet grants are only counted, never opened: see `custody_report`.
+    let fleet_grants = if c.fleet_id.is_empty() {
+        Vec::new()
+    } else {
+        client
+            .fleet_key_grants(&c.tenant_id, &c.device_id)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    custody_report(&device_sk, &grants, &fleet_grants)
+}
+
+/// Open the root key grants and report counts.
+///
+/// Fleet key grants are counted but not opened, and nothing is written to the
+/// fleet key store. The team server delivers them, and nothing yet proves who
+/// issued one: a hostile server could seal a key of its own choosing to this
+/// device, and a device that synced under it would hand the server every
+/// profile. Until verified key distribution ships, sync uses the team
+/// passphrase, and the interface uses `fleet_grants_waiting` to say why.
+fn custody_report(
+    device_sk: &[u8],
+    grants: &[fleet_client::RootKeyGrant],
+    fleet_grants: &[fleet_client::FleetKeyGrant],
+) -> Result<serde_json::Value, String> {
     let mut opened = 0usize;
     let mut failed = 0usize;
     let mut newest_generation: Option<i64> = None;
-    for g in &grants {
+    for g in grants {
         let info = hex_bytes(&g.hpke_info_hex)?;
         let encapped = hex_bytes(&g.hpke_encapped_key_hex)?;
         let wrapped = hex_bytes(&g.hpke_wrapped_trk_hex)?;
-        match shardx_core::grants::open_trk_with_info(&device_sk, &info, &encapped, &wrapped) {
+        match shardx_core::grants::open_trk_with_info(device_sk, &info, &encapped, &wrapped) {
             Ok(_trk) => {
                 // The key is dropped here: it is zeroized on drop, and holding
                 // it would mean deciding where to store it, which is the
@@ -2346,55 +2373,16 @@ async fn team_collect_custody() -> Result<serde_json::Value, String> {
         }
     }
 
-    // Fleet keys. These are the ones sync actually needs: the root key
-    // authorises custody, the fleet key opens snapshots. Collected keys are
-    // cached so a push or pull no longer needs a passphrase.
-    let mut fleet_opened = 0usize;
-    let mut fleet_failed = 0usize;
-    let mut newest_fleet_generation: Option<i64> = None;
-    if !c.fleet_id.is_empty() {
-        let fleet_grants = client
-            .fleet_key_grants(&c.tenant_id, &c.device_id)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut store = fleet_keys::load().map_err(|e| e.to_string())?;
-        for g in &fleet_grants {
-            let info = hex_bytes(&g.hpke_info_hex)?;
-            let encapped = hex_bytes(&g.hpke_encapped_key_hex)?;
-            let wrapped = hex_bytes(&g.hpke_wrapped_fkek_hex)?;
-            let sealed = shardx_core::grants::SealedGrant {
-                hpke_info_bytes: info,
-                encapped_key_bytes: encapped,
-                ciphertext_bytes: wrapped,
-            };
-            match shardx_core::fleet_grants::open_fkek_with_info(&device_sk, &sealed) {
-                Ok(fkek) => {
-                    let generation = u64::try_from(g.fleet_generation).unwrap_or(0);
-                    store.insert(&g.fleet_id, generation, &fkek);
-                    fleet_opened += 1;
-                    newest_fleet_generation = Some(match newest_fleet_generation {
-                        Some(n) if n >= g.fleet_generation => n,
-                        _ => g.fleet_generation,
-                    });
-                }
-                Err(_) => fleet_failed += 1,
-            }
-        }
-        if fleet_opened > 0 {
-            fleet_keys::save(&store).map_err(|e| e.to_string())?;
-        }
-    }
-
     Ok(serde_json::json!({
         "grants": grants.len(),
         "opened": opened,
         "failed": failed,
         "newest_generation": newest_generation,
-        "fleet_opened": fleet_opened,
-        "fleet_failed": fleet_failed,
-        "newest_fleet_generation": newest_fleet_generation,
-        "can_sync_without_passphrase": fleet_opened > 0,
+        "fleet_opened": 0,
+        "fleet_failed": 0,
+        "newest_fleet_generation": null,
+        "fleet_grants_waiting": fleet_grants.len(),
+        "can_sync_without_passphrase": false,
     }))
 }
 
@@ -2434,6 +2422,65 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Even a fleet grant this device can open is only counted: the server
+    /// delivered it, and nothing yet proves who issued it.
+    #[test]
+    fn a_server_delivered_fleet_key_is_counted_but_never_cached() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+
+        let (device_sk, device_pk) = shardx_core::grants::derive_keypair(&[7u8; 32]);
+        let fkek = [0x5Cu8; 32];
+        let scope = shardx_core::fleet_grants::FleetGrantScope {
+            replay_id: [1; 16],
+            tenant_id: [2; 16],
+            server_instance_id: [3; 16],
+            restore_epoch: 0,
+            fleet_id: [4; 16],
+            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&fkek),
+            generation: 1,
+            subject_account_id: [5; 16],
+            subject_device_id: [6; 16],
+            recipient_hpke_key_id: shardx_core::keys::hpke_key_id(&device_pk),
+        };
+        let sealed = shardx_core::fleet_grants::seal_fkek(&device_pk, &scope, &fkek).unwrap();
+        assert!(
+            shardx_core::fleet_grants::open_fkek_with_info(&device_sk, &sealed).is_ok(),
+            "the grant must be one this device could open"
+        );
+        let grant = fleet_client::FleetKeyGrant {
+            grant_variant: "DeviceHpkeGrant".into(),
+            fleet_id: hex(&scope.fleet_id),
+            fkek_key_id: hex(&scope.fkek_key_id),
+            fleet_generation: 1,
+            recipient_hpke_key_id: hex(&scope.recipient_hpke_key_id),
+            hpke_info_hex: hex(&sealed.hpke_info_bytes),
+            hpke_encapped_key_hex: hex(&sealed.encapped_key_bytes),
+            hpke_wrapped_fkek_hex: hex(&sealed.ciphertext_bytes),
+        };
+
+        let report = custody_report(&device_sk, &[], &[grant]).unwrap();
+        let cached = store::fleet_keys_path().unwrap().exists();
+        store::set_config_root(None);
+
+        assert!(!cached, "the fleet key store must not be written");
+        assert_eq!(report["fleet_opened"], 0);
+        assert_eq!(report["fleet_grants_waiting"], 1);
+        assert_eq!(report["can_sync_without_passphrase"], false);
     }
 }
 

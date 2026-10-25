@@ -525,20 +525,16 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       // another device published in the meantime.
       const remote = await profileSyncStatus(p.id);
       const base = remote?.version ?? 0;
-      // A device holding a fleet key needs no passphrase: the fleet shares the
-      // key through grants, so asking for one would be theatre.
-      let passphrase = "";
-      if (!useTeam.getState().status?.has_fleet_key) {
-        const typed = await passphraseModal({
-          title: base === 0 ? t("profile.encryptProfileForTheTeam") : t("profile.pushOverVersion", { v: base }),
-          message:
-            t("profile.passphraseShared") +
-            t("profile.itIsNotStoredAnywhereAndCannotBeRecove"),
-          confirm: base === 0,
-        });
-        if (typed === null) return;
-        passphrase = typed;
-      }
+      // Always ask: push never seals under a fleet key cached from the team
+      // server, which cannot yet prove who issued it.
+      const passphrase = await passphraseModal({
+        title: base === 0 ? t("profile.encryptProfileForTheTeam") : t("profile.pushOverVersion", { v: base }),
+        message:
+          t("profile.passphraseShared") +
+          t("profile.itIsNotStoredAnywhereAndCannotBeRecove"),
+        confirm: base === 0,
+      });
+      if (passphrase === null) return;
       const res = await profileSyncPush(p.id, passphrase, base);
       toast.ok(t("profile.pushedVersion", { v: res.version, size: fmtBytes(res.container_bytes) }));
     } catch (e) { toast.err(safeUiError(e)); }
