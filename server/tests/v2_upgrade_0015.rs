@@ -91,6 +91,13 @@ async fn a_device_approve_row_carries_its_four_columns_and_never_changes() {
             &format!("'shardx.auth.device-approval.v2', 0, {A}, NULL"),
         ),
         approve_row("COMMIT", "tenant.device-approve.v2", &r3),
+        // NULL slips through a plain comparison; the CHECK names it.
+        approve_row("DEVICE_APPROVE", "tenant.device-approve.v2", &r3).replace(
+            "'DeviceApprovalReceiptV2', x'cc'",
+            "'DeviceApprovalReceiptV2', NULL",
+        ),
+        approve_row("DEVICE_APPROVE", "tenant.device-approve.v2", &r3)
+            .replace("'DeviceApprovalReceiptV2', x'cc'", "NULL, x'cc'"),
     ] {
         let e = exec(&pool, &sql).await.unwrap_err();
         assert!(e.contains("CHECK constraint failed"), "{e}");

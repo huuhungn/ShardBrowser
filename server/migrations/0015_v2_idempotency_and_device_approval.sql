@@ -39,10 +39,14 @@ CREATE TABLE v2_idempotency (
     CHECK ((operation_kind = 'DEVICE_APPROVE') = (actor_account_id IS NOT NULL)),
     CHECK ((operation_kind = 'DEVICE_APPROVE') = (subject_device_id IS NOT NULL)),
     -- Only the committing transaction writes an approval row, with its receipt.
+    -- A comparison with NULL is NULL, which a CHECK lets through, so every
+    -- required column is also named IS NOT NULL.
     CHECK (operation_kind <> 'DEVICE_APPROVE' OR (
         operation_scope = 'tenant.device-approve.v2'
         AND status = 'succeeded'
+        AND response_record_type IS NOT NULL
         AND response_record_type = 'DeviceApprovalReceiptV2'
+        AND exact_response_bytes IS NOT NULL
         AND length(exact_response_bytes) BETWEEN 1 AND 4096
         AND exact_response_bytes_sha256 IS NOT NULL))
 );

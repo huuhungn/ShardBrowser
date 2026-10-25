@@ -1471,13 +1471,25 @@ fn approval(
     days: u64,
 ) -> Vec<u8> {
     let start = now_ms() - 60_000;
+    approval_window(dev, signer, replay, epoch, start, start + days * DAY_MS)
+}
+
+/// The same approval with an explicit validity window.
+fn approval_window(
+    dev: &Device,
+    signer: &Ed25519SigningKey,
+    replay: u8,
+    epoch: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+) -> Vec<u8> {
     let payload = DeviceApprovalV2 {
         common: CommonFields {
             replay_id: [replay; 16],
             tenant_id: TENANT,
-            issued_at_ms: start,
-            not_before_ms: start,
-            not_after_ms: start + days * DAY_MS,
+            issued_at_ms: not_before_ms,
+            not_before_ms,
+            not_after_ms,
             server_instance_id: INSTANCE,
             restore_epoch: epoch,
         },
@@ -1576,6 +1588,11 @@ async fn the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt
             &rec,
         )
         .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+    let (status, _, body) = server.approve(&bystander.id, access, &rec).await;
     assert_eq!(
         (status, code(&body).as_str()),
         (409, "IDEMPOTENCY_MISMATCH")
@@ -1751,14 +1768,29 @@ async fn an_approval_needs_the_confirmation_the_session_and_the_exact_subject() 
             .0,
         403
     );
-    // A window longer than the 730-day policy.
-    assert_eq!(
-        server
-            .approve(&dev.id, access, &approval(&dev, &dev.sk, 0x77, 0, 731))
-            .await
-            .0,
-        403
-    );
+    // A window longer than the 730-day policy, one not yet open, one over.
+    let now = now_ms();
+    for rec in [
+        approval(&dev, &dev.sk, 0x77, 0, 731),
+        approval_window(&dev, &dev.sk, 0x7d, 0, now + 600_000, now + 30 * DAY_MS),
+        approval_window(&dev, &dev.sk, 0x7e, 0, now - 2 * DAY_MS, now - DAY_MS),
+    ] {
+        assert_eq!(server.approve(&dev.id, access, &rec).await.0, 403);
+    }
+    // A second owner, added after the confirmation, ends the sole-owner case.
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'owner' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
+    assert_eq!(server.approve(&dev.id, access, &good).await.0, 403);
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'member' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
 
     // The confirmation names `dev`; another pending device of the owner cannot
     // use it, even approving itself on its own session.
@@ -1821,14 +1853,19 @@ async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
     let rec = approval(&dev, &dev.sk, 0x79, 0, 30);
     assert_eq!(server.approve(&dev.id, access, &rec).await.0, 201);
 
-    // Damage the stored receipt behind the trigger's back.
+    let (_, _, stored) = server.approve(&dev.id, access, &rec).await;
+    // Behind the trigger's back, store a receipt that parses, whose hash
+    // matches, and that names another request.
+    let mut forged = DeviceApprovalReceiptV2::parse(&stored).unwrap();
+    forged.request_hash[0] ^= 1;
+    let forged = forged.encode();
     server
         .sql("DROP TRIGGER v2_idempotency_device_approve_is_fixed", &[])
         .await;
     server
         .sql(
-            "UPDATE v2_idempotency SET exact_response_bytes = x'a0'",
-            &[],
+            "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?",
+            &[&forged, &sha256(&forged)],
         )
         .await;
     let (status, _, body) = server.approve(&dev.id, access, &rec).await;
@@ -1842,4 +1879,6 @@ async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
             .await,
         1
     );
+    // root_setup needs a consumed guard, so the session ends with it.
+    assert_eq!(server.me(access).await.0, 401);
 }

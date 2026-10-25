@@ -207,9 +207,11 @@ pub struct Session {
     pub hpke_key_id: [u8; 32],
     pub access_expires_at_ms: i64,
     pub absolute_expires_at_ms: i64,
+    access_token_hash: [u8; 32],
 }
 
 const SESSION_COLUMNS: &str = "id, tenant_id, account_id, device_id, class, signing_key_id, \
+     access_token_hash, \
      hpke_key_id, account_token_version, access_expires_at_ms, refresh_expires_at_ms, \
      absolute_expires_at_ms, server_instance_id, restore_epoch";
 
@@ -224,11 +226,13 @@ fn session_from(row: &sqlx::sqlite::SqliteRow) -> Result<Session, AppError> {
         hpke_key_id: blob(row, "hpke_key_id")?,
         access_expires_at_ms: row.get("access_expires_at_ms"),
         absolute_expires_at_ms: row.get("absolute_expires_at_ms"),
+        access_token_hash: blob(row, "access_token_hash")?,
     })
 }
 
 /// The device's D1 approval is live: unrevoked, inside its window, for these
-/// keys on this instance and epoch, and the one the first-device confirmation consumed.
+/// keys on this instance and epoch, the one the first-device confirmation
+/// consumed, and the tenant's guard still `consumed` (not `recovery_required`).
 /// It is the only approval that grants `root_setup` (ADR 0001 R2).
 pub(super) async fn d1_approval_is_live(
     conn: &mut SqliteConnection,
@@ -244,6 +248,9 @@ pub(super) async fn d1_approval_is_live(
            JOIN v2_first_device_confirmations c
              ON c.server_instance_id = a.server_instance_id AND c.tenant_id = a.tenant_id
             AND c.approval_payload_domain = a.payload_domain AND c.approval_replay_id = a.replay_id
+           JOIN v2_bootstrap_guards g
+             ON g.server_instance_id = a.server_instance_id AND g.tenant_id = a.tenant_id
+            AND g.state = 'consumed'
           WHERE a.tenant_id = ? AND a.subject_device_id = ? AND a.subject_signing_key_id = ?
             AND a.subject_hpke_key_id = ? AND a.server_instance_id = ? AND a.restore_epoch = ?
             AND a.revoked_at IS NULL
@@ -328,17 +335,18 @@ async fn session_is_live(
 /// must recheck it under its own write lock.
 pub(super) async fn reload_session(
     conn: &mut SqliteConnection,
-    tenant_id: &[u8; 16],
-    id: &[u8; 16],
+    presented: &Session,
     v: &Verified,
     now: i64,
 ) -> Result<Option<Session>, AppError> {
     let Some(row) = sqlx::query(&format!(
         "SELECT {SESSION_COLUMNS} FROM v2_sessions
-          WHERE tenant_id = ? AND id = ? AND revoked_at_ms IS NULL AND access_expires_at_ms > ?"
+          WHERE tenant_id = ? AND id = ? AND access_token_hash = ? AND revoked_at_ms IS NULL
+            AND access_expires_at_ms > ?"
     ))
-    .bind(tenant_id.as_slice())
-    .bind(id.as_slice())
+    .bind(presented.tenant_id.as_slice())
+    .bind(presented.id.as_slice())
+    .bind(presented.access_token_hash.as_slice())
     .bind(now)
     .fetch_optional(&mut *conn)
     .await?

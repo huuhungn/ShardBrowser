@@ -130,14 +130,12 @@ pub async fn approve_device(
     let parsed = AuthorizationRecord::parse(&body)
         .map_err(|e| coded(StatusCode::UNPROCESSABLE_ENTITY, e.code(), &e.to_string()))?;
     if parsed.payload_domain() != DOMAIN_DEVICE_APPROVAL {
-        return Err(AppError::BadRequest(
-            "the record is not a device approval".into(),
-        ));
+        return Err(column_mismatch("the record is not a device approval"));
     }
 
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
-    let s = reload_session(&mut tx, &presented.tenant_id, &presented.id, v, now)
+    let s = reload_session(&mut tx, &presented, v, now)
         .await?
         .ok_or(AppError::Unauthorized)?;
     let req = verify(&mut tx, parsed, &s, v, &path_device, &body).await?;
@@ -172,10 +170,17 @@ pub async fn approve_device(
     if reserved {
         return Err(mismatch());
     }
+    if req.approval.subject_device_id != path_device {
+        return Err(AppError::BadRequest(
+            "the path names another device than the approval".into(),
+        ));
+    }
     first_approval(tx, &req, &s, v, &path_device, now).await
 }
 
-/// Step 1: signature, context and path, before any lookup.
+/// Step 1: signature and context, before any lookup. The signature is checked
+/// first, so changed bytes under a known replay ID that also fail to verify
+/// get a 422 rather than a 409: stricter than R3's order, never weaker.
 async fn verify(
     conn: &mut SqliteConnection,
     parsed: AuthorizationRecord,
@@ -204,9 +209,7 @@ async fn verify(
         .verify_signature(&issuer)
         .map_err(|e| coded(StatusCode::UNPROCESSABLE_ENTITY, e.code(), &e.to_string()))?;
     let Payload::DeviceApproval(approval) = record.payload().clone() else {
-        return Err(AppError::BadRequest(
-            "the record is not a device approval".into(),
-        ));
+        return Err(column_mismatch("the record is not a device approval"));
     };
     let c = &approval.common;
     if c.server_instance_id != v.server_instance_id || c.tenant_id != s.tenant_id {
@@ -214,11 +217,6 @@ async fn verify(
     }
     if c.restore_epoch != v.restore_epoch {
         return Err(stale());
-    }
-    if approval.subject_device_id != *path_device {
-        return Err(AppError::BadRequest(
-            "the path names another device than the approval".into(),
-        ));
     }
     let request_hash = device_approve_request_hash(
         &v.server_instance_id,
@@ -261,7 +259,9 @@ async fn replay(
         return Err(mismatch());
     }
 
-    let response: Vec<u8> = row.get("exact_response_bytes");
+    let response: Vec<u8> = row
+        .get::<Option<Vec<u8>>, _>("exact_response_bytes")
+        .unwrap_or_default();
     if !stored_row_is_consistent(&mut tx, row, req, s, v, &response).await? {
         // The ledger disagrees with itself: close the approval path rather
         // than answer from it (R3 step 2).
