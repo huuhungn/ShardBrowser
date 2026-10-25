@@ -83,9 +83,11 @@ impl RecordError {
     /// Wire code from the plan's error table (L1233, L1237, L1240).
     pub fn code(&self) -> &'static str {
         match self {
-            // Plan L1237: negative values are out of range too, not malformed.
+            // Plan L1236: negative, overlong and too-large integers alike.
             Self::Cbor(
-                CborError::IntegerOutOfSqliteDomain(_) | CborError::UnsupportedMajorType(1),
+                CborError::IntegerOutOfSqliteDomain(_)
+                | CborError::UnsupportedMajorType(1)
+                | CborError::OverlongInteger,
             ) => "WIRE_INTEGER_OUT_OF_RANGE",
             Self::Cbor(_)
             | Self::NotAMap(_)
@@ -1254,11 +1256,11 @@ mod tests {
             code_of(parse(&with("signed_container_hash", c::b(&[0u8; 32])))),
             "SIGNED_CONTAINER_HASH_MISMATCH"
         );
-        // Trailing byte and a non-shortest integer are not canonical.
+        // A trailing byte and a non-shortest length are not canonical.
         let mut trailing = good.clone();
         trailing.push(0);
         assert_eq!(code_of(parse(&trailing)), "NON_CANONICAL_RECORD");
-        assert_eq!(code_of(parse(&[0x18, 0x01])), "NON_CANONICAL_RECORD");
+        assert_eq!(code_of(parse(&[0x78, 0x01, b'a'])), "NON_CANONICAL_RECORD");
     }
 
     #[test]
@@ -1359,8 +1361,14 @@ mod tests {
             .position(|w| w == b"\x6drestore_epoch")
             .unwrap()
             + 14;
-        // 2^63 (major 0, 8-byte argument) and -1 (major 1).
-        for value in [&[0x1b, 0x80, 0, 0, 0, 0, 0, 0, 0][..], &[0x20]] {
+        // 2^63 (major 0, 8-byte argument), -1 (major 1), and 7 and -1 in
+        // overlong forms.
+        for value in [
+            &[0x1b, 0x80, 0, 0, 0, 0, 0, 0, 0][..],
+            &[0x20],
+            &[0x18, 0x07],
+            &[0x38, 0x00],
+        ] {
             let mut raw = payload[..at].to_vec();
             raw.extend_from_slice(value);
             raw.extend_from_slice(&payload[at + 1..]);
