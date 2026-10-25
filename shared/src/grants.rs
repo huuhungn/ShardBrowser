@@ -282,7 +282,9 @@ pub fn open_trk_with_info(
         ciphertext,
         &aad,
     )
-    .map_err(|_| GrantError::HpkeFailure)?;
+    .map_err(|_| GrantError::HpkeFailure)
+    // The plaintext is key material: wipe this buffer too, not only the copy.
+    .map(Zeroizing::new)?;
 
     if pt.len() != TRK_LEN {
         return Err(GrantError::BadTrkLength);
@@ -320,7 +322,9 @@ pub fn open_trk(
         ciphertext,
         &aad,
     )
-    .map_err(|_| GrantError::HpkeFailure)?;
+    .map_err(|_| GrantError::HpkeFailure)
+    // The plaintext is key material: wipe this buffer too, not only the copy.
+    .map(Zeroizing::new)?;
 
     if pt.len() != TRK_LEN {
         return Err(GrantError::BadTrkLength);
