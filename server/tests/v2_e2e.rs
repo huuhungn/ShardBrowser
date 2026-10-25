@@ -157,6 +157,17 @@ async fn seed(
         .execute(&pool)
         .await
         .unwrap();
+
+        // Root generation begin/activate are owner-only.
+        sqlx::query(
+            "INSERT INTO v2_tenant_memberships (tenant_id, account_id, role, status, created_at)
+             VALUES (?, ?, 'owner', 'active', '2026-01-01T00:00:00Z')",
+        )
+        .bind(tid.as_slice())
+        .bind([1u8; 16].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
     }
 
     pool.close().await;
@@ -2046,6 +2057,132 @@ async fn an_outsider_cannot_begin_a_generation() {
         "an outsider must not begin a generation, got {}",
         res.status()
     );
+}
+
+/// Only the tenant owner may begin or activate a root generation: an ordinary
+/// member choosing the tenant's root key would decide what every device seals
+/// under.
+#[tokio::test]
+async fn only_the_owner_can_begin_or_activate_a_root_generation() {
+    let port = 38139u16;
+    let data = std::env::temp_dir().join(format!("shardx-e2e-genowner-{}", std::process::id()));
+    let _guard = spawn_server(&data, port);
+    let cl = client();
+    wait_health(&cl, port).await;
+
+    let admin = token(&cl, port, "admin", "secret").await;
+    let user_id = admin_user_id(&cl, port, &admin).await;
+    let sk_a = Ed25519SigningKey::from_bytes(&[11u8; 32]);
+    let sk_b = Ed25519SigningKey::from_bytes(&[22u8; 32]);
+    seed(&data, &user_id, &sk_a, &sk_b).await;
+
+    let created = cl
+        .post(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({ "username": "member", "password": "member-pass", "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        created.status().is_success(),
+        "create member: {}",
+        created.status()
+    );
+    let users: Value = cl
+        .get(format!("{}/users", base(port)))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let member_user_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == "member")
+        .expect("member user")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A real member of tenant A, with the 'member' role.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}",
+            data.join("shardx.db").to_string_lossy().replace('\\', "/")
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO v2_accounts
+             (id, tenant_id, username, pw_hash, legacy_user_id, status, created_at)
+         VALUES (?, ?, 'member', 'x', ?, 'active', '2026-01-01T00:00:00Z')",
+    )
+    .bind([9u8; 16].as_slice())
+    .bind(TENANT_A.as_slice())
+    .bind(&member_user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO v2_tenant_memberships (tenant_id, account_id, role, status, created_at)
+         VALUES (?, ?, 'member', 'active', '2026-01-01T00:00:00Z')",
+    )
+    .bind(TENANT_A.as_slice())
+    .bind([9u8; 16].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let member = token(&cl, port, "member", "member-pass").await;
+    let tenant_hex = hex(&TENANT_A);
+    let root_key_id = hex(&[0x90u8; 32]);
+
+    let res = cl
+        .post(format!("{}/v2/root-key-generations", base(port)))
+        .bearer_auth(&member)
+        .json(&json!({ "tenant_id": tenant_hex, "root_key_id": root_key_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status().as_u16(),
+        403,
+        "a member must not begin a generation"
+    );
+
+    let generation = begin_generation(&cl, port, &admin, &tenant_hex, &[0x90u8; 32]).await;
+
+    let activate = |tok: String| {
+        let cl = cl.clone();
+        let tenant_hex = tenant_hex.clone();
+        async move {
+            cl.post(format!("{}/v2/root-key-generations/activate", base(port)))
+                .bearer_auth(&tok)
+                .json(&json!({ "tenant_id": tenant_hex, "generation": generation }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let res = activate(member).await;
+    assert_eq!(
+        res.status().as_u16(),
+        403,
+        "a member must not activate a generation"
+    );
+
+    // The owner passes the role check and reaches the grant check: with no
+    // grant on file that is a 409, not a 403.
+    let res = activate(admin).await;
+    let status = res.status().as_u16();
+    let body = res.text().await.unwrap();
+    assert_eq!(status, 409, "the owner must pass authorization: {body}");
+    assert!(body.contains("no root key grant on file"), "{body}");
 }
 
 /// A grant must wrap the key its generation actually commits to.
