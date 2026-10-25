@@ -136,17 +136,10 @@ async fn load_grant(
     let Payload::TenantRootKeyGrant(grant) = record.payload().clone() else {
         return Err(integrity());
     };
-    // The container names the row's own key, so the column check below is a
-    // check of this row and not of any row holding the same container.
-    let c = &grant.common;
-    if c.server_instance_id != v.server_instance_id
-        || c.tenant_id != *tenant
-        || c.replay_id != *replay
-        || grant.root_generation != generation
+    let key = (&v.server_instance_id, tenant, replay);
+    if grant.root_generation != generation
+        || !grant_row_matches(conn, key, &grant, record.record()).await?
     {
-        return Err(integrity());
-    }
-    if !grant_row_matches(conn, &grant, record.record()).await? {
         return Err(integrity());
     }
     Ok(Some(StoredGrant {

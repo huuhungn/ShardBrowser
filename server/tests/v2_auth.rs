@@ -3168,7 +3168,7 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
 async fn an_expired_self_grant_is_neither_counted_nor_acknowledged() {
     let mut server = start("s6-expired", 38203).await;
     let (dev, access) = approved(&mut server, 0x66).await;
-    let until = now_ms() + 5_000;
+    let until = now_ms() + 15_000;
     let container = self_grant(&dev, &TRK, |g| g.common.not_after_ms = until);
     let create = bootstrap_create(&TRK, container.clone(), |_| {});
     let (status, body) = server

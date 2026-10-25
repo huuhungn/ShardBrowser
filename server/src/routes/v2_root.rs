@@ -587,13 +587,24 @@ async fn insert_grant(
     Ok(())
 }
 
-/// Whether a stored row holds exactly the columns the verified record
-/// determines (plan 5.6.4: every read reparses and compares one for one).
+/// The primary key of a root grant row: instance, tenant, replay ID.
+pub(super) type GrantKey<'a> = (&'a [u8; 16], &'a [u8; 16], &'a [u8; 16]);
+
+/// Whether the row stored under `key` holds exactly the columns the verified
+/// record determines (plan 5.6.4: every read reparses and compares one for
+/// one). A record naming another key is never this row's, even if some other
+/// row holds it.
 pub(super) async fn grant_row_matches(
     conn: &mut SqliteConnection,
+    key: GrantKey<'_>,
     g: &TenantRootKeyGrantV2,
     record: &AuthorizationRecord,
 ) -> Result<bool, AppError> {
+    let c = &g.common;
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id) != key {
+        return Ok(false);
+    }
+    // The key is among the columns, so the check below is of that one row.
     let cols = grant_columns(g, record)?;
     let condition: Vec<String> = cols
         .iter()
