@@ -9,7 +9,7 @@
 
 use crate::authz_record::{
     AuthorizationRecord, Fields, Payload, RecordError, VerifiedRecord, CONTAINER_DOMAIN,
-    CONTAINER_VERSION,
+    CONTAINER_VERSION, MAX_RECORD_BYTES,
 };
 use crate::canonical::{self as c, Value};
 
@@ -666,7 +666,7 @@ pub struct RootGrantRef {
     pub restore_epoch: u64,
     pub root_generation: u64,
     pub root_key_id: [u8; 32],
-    pub grant_replay_id: [u8; 16],
+    pub replay_id: [u8; 16],
     pub signed_container_hash: [u8; 32],
     pub exact_signed_container_bytes_sha256: [u8; 32],
 }
@@ -679,7 +679,7 @@ impl RootGrantRef {
             restore_epoch: f.uint("restore_epoch")?,
             root_generation: f.uint("root_generation")?,
             root_key_id: f.fixed("root_key_id")?,
-            grant_replay_id: f.fixed("grant_replay_id")?,
+            replay_id: f.fixed("replay_id")?,
             signed_container_hash: f.fixed("signed_container_hash")?,
             exact_signed_container_bytes_sha256: f.fixed("exact_signed_container_bytes_sha256")?,
         })
@@ -692,7 +692,7 @@ impl RootGrantRef {
             ("restore_epoch", c::u(self.restore_epoch)),
             ("root_generation", c::u(self.root_generation)),
             ("root_key_id", c::b(&self.root_key_id)),
-            ("grant_replay_id", c::b(&self.grant_replay_id)),
+            ("replay_id", c::b(&self.replay_id)),
             ("signed_container_hash", c::b(&self.signed_container_hash)),
             (
                 "exact_signed_container_bytes_sha256",
@@ -788,7 +788,9 @@ fn take_previous(f: &mut Fields, target: &RootGenerationTarget) -> Result<Option
     let key = f.opt_fixed::<32>("previous_root_key_id")?;
     let generation = f.opt_uint("previous_root_generation")?;
     let previous = match (target.root_generation, key, generation) {
-        (0, None, None) => None,
+        // ADR 0002 D-4: generation 0 is held by its one self-grant.
+        (0, None, None) if target.required_custodian_grant_count == 1 => None,
+        (0, None, None) => return Err(RecordError::BadValue("required_custodian_grant_count")),
         (n, Some(root_key_id), Some(root_generation)) if n > 0 => Some(PreviousRoot {
             root_key_id,
             root_generation,
@@ -954,10 +956,14 @@ impl RootGenerationState {
 /// with its container, or that adds or drops a column, does not parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantRootGrantDescriptorV2 {
-    pub record: VerifiedRecord,
-    pub grant_state: RootGrantState,
-    pub generation_state: RootGenerationState,
+    record: VerifiedRecord,
+    grant_state: RootGrantState,
+    generation_state: RootGenerationState,
 }
+
+/// The container, the payload twice (as columns and as bytes) and a few
+/// fixed-size columns.
+const MAX_DESCRIPTOR_BYTES: usize = 3 * MAX_RECORD_BYTES + 4096;
 
 impl TenantRootGrantDescriptorV2 {
     /// `None` unless `record` holds a root key grant.
@@ -971,6 +977,18 @@ impl TenantRootGrantDescriptorV2 {
             grant_state,
             generation_state,
         })
+    }
+
+    pub fn record(&self) -> &VerifiedRecord {
+        &self.record
+    }
+
+    pub fn grant_state(&self) -> RootGrantState {
+        self.grant_state
+    }
+
+    pub fn generation_state(&self) -> RootGenerationState {
+        self.generation_state
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -994,6 +1012,7 @@ impl TenantRootGrantDescriptorV2 {
             ("version", c::u(VERSION)),
             ("container_domain", c::t(CONTAINER_DOMAIN)),
             ("container_version", c::u(CONTAINER_VERSION.into())),
+            ("canonical_payload_bytes", c::b(r.canonical_payload_bytes())),
             ("payload_sha256", c::b(r.payload_sha256())),
             ("signature_suite_id", c::u(suite.into())),
             ("signature_version", c::u(version.into())),
@@ -1018,9 +1037,12 @@ impl TenantRootGrantDescriptorV2 {
 
     /// Verifies the embedded container under `issuer_public_key`.
     pub fn parse(exact: &[u8], issuer_public_key: &[u8; 32]) -> Result<Self> {
+        if exact.len() > MAX_DESCRIPTOR_BYTES {
+            return Err(RecordError::BadValue("descriptor"));
+        }
         let mut f = Fields::decode("TenantRootGrantDescriptorV2", exact)?;
         exact_version(&mut f, DOMAIN_ROOT_GRANT_DESCRIPTOR)?;
-        let container = f.bytes("exact_signed_container_bytes", 1, MAX_EMBEDDED_GRANT_BYTES)?;
+        let container = f.bytes("exact_signed_container_bytes", 1, MAX_RECORD_BYTES)?;
         let grant_state = f.text("grant_state")?;
         let grant_state = RootGrantState::ALL
             .into_iter()
@@ -1597,7 +1619,7 @@ mod tests {
             restore_epoch: 3,
             root_generation: 0,
             root_key_id: fx("root-key-1"),
-            grant_replay_id: fx("self-grant-replay"),
+            replay_id: fx("self-grant-replay"),
             signed_container_hash: fx("container-hash"),
             exact_signed_container_bytes_sha256: fx("container-sha"),
         }
@@ -1733,14 +1755,67 @@ mod tests {
             TenantRootGenerationActivatedV2::parse(&activated(5).encode()),
             Ok(activated(5))
         );
+        let pinned: Vec<(&str, String)> = maps
+            .iter()
+            .map(|(name, raw, _)| (*name, hex(&c::sha256(raw))))
+            .collect();
+        assert_eq!(pinned, GOLDEN_LIFECYCLE.map(|(n, h)| (n, h.to_string())));
+    }
+
+    const GOLDEN_LIFECYCLE: [(&str, &str); 6] = [
+        (
+            "ack",
+            "148a758a45a53e4f3abfac172ade4d2b3327596ec3b090c50bd7a9b38a018e2a",
+        ),
+        (
+            "acked",
+            "d53eed89d922de2f3135f250b40c274efbf0f1214ccc0d0865ad286eaaa58e80",
+        ),
+        (
+            "activate 0",
+            "426ad32a4c79fc8175e1b03601504383c5700b9e2be839bbf1c68cd82f7390e7",
+        ),
+        (
+            "activate 5",
+            "f294bc81d4d0e3513d1d44096eacb9f69e037e1d6b61adfb4cbec1a98951e5a8",
+        ),
+        (
+            "activated 0",
+            "c2182c07a36a7ee98adc7f6ed7103ef68e181bf1264164475992fd300e5347da",
+        ),
+        (
+            "activated 5",
+            "6adc9ba8a9030fd6a6bd92e9b8723e8f60bf3021edf5fcc0fa1db2acd7354b17",
+        ),
+    ];
+
+    #[test]
+    fn lifecycle_names_are_the_plan_strings() {
         assert_eq!(
-            hex(&c::sha256(&ack().encode())),
-            "e67d7a87038dc5672557c2624f0a5bf0464c3a2696460220aa00ce8c46940ede"
+            RootGrantState::ALL.map(RootGrantState::as_str),
+            ["PENDING_ACK", "ACKNOWLEDGED", "REVOKED"]
         );
         assert_eq!(
-            hex(&c::sha256(&activated(5).encode())),
-            "6adc9ba8a9030fd6a6bd92e9b8723e8f60bf3021edf5fcc0fa1db2acd7354b17"
+            RootGenerationState::ALL.map(RootGenerationState::as_str),
+            ["PREPARING", "ACTIVE", "RETIRED"]
         );
+        assert_eq!(
+            [
+                DOMAIN_ROOT_GRANT_ACK,
+                DOMAIN_ROOT_GRANT_ACKED,
+                DOMAIN_ROOT_GENERATION_ACTIVATE,
+                DOMAIN_ROOT_GENERATION_ACTIVATED,
+                DOMAIN_ROOT_GRANT_DESCRIPTOR,
+            ],
+            [
+                "shardx.keys.tenant-root-grant-ack.v2",
+                "shardx.keys.tenant-root-grant-acked.v2",
+                "shardx.keys.tenant-root-generation-activate.v2",
+                "shardx.keys.tenant-root-generation-activated.v2",
+                "shardx.keys.tenant-root-grant-descriptor.v2",
+            ]
+        );
+        assert_eq!(ACK_OUTCOME_ACKNOWLEDGED, "acknowledged");
     }
 
     #[test]
@@ -1781,6 +1856,21 @@ mod tests {
             assert_eq!(
                 p(&edited),
                 Err(RecordError::BadValue("previous_root_key_id"))
+            );
+        }
+        // Generation 0 is held by its one self-grant (D-4).
+        for count in [2, 7] {
+            let mut a = activate(0);
+            a.target.required_custodian_grant_count = count;
+            assert_eq!(
+                p(&a.encode()),
+                Err(RecordError::BadValue("required_custodian_grant_count"))
+            );
+            let mut d = activated(0);
+            d.target.required_custodian_grant_count = count;
+            assert_eq!(
+                TenantRootGenerationActivatedV2::parse(&d.encode()),
+                Err(RecordError::BadValue("required_custodian_grant_count"))
             );
         }
         for previous in [3, 5] {
@@ -1838,6 +1928,12 @@ mod tests {
         }
     }
 
+    const GOLDEN_DESCRIPTORS: [&str; 3] = [
+        "d5f863d23d0f931e5a416bfc917161a770e2c69a647fb920b68e12470dcd9004",
+        "a6cb85d129e68fe2fed8b9b358bffd718c4da07405b810e3f45ccbe0dbb286da",
+        "1eeede1fada9e91cd6a668bc2efd5060f96afcb2c1e5740dd8aa33553d0470f2",
+    ];
+
     #[test]
     fn a_descriptor_is_exactly_its_verified_container() {
         let issuer = *custodian().verifying_key().as_bytes();
@@ -1846,10 +1942,33 @@ mod tests {
         let raw = d.encode();
         let parse = |b: &[u8]| TenantRootGrantDescriptorV2::parse(b, &issuer);
         assert_eq!(parse(&raw), Ok(d.clone()));
-        assert_eq!(
-            hex(&c::sha256(&raw)),
-            "e89391841184fde192f59c7d532941e33907221c7ac84a58fb28ebbdc13cc7d9"
-        );
+        // One golden per grant state; Preparing and Active pin the generation
+        // states.
+        let pinned: Vec<String> = [
+            (RootGrantState::PendingAck, RootGenerationState::Preparing),
+            (RootGrantState::Acknowledged, RootGenerationState::Active),
+            (RootGrantState::Revoked, RootGenerationState::Retired),
+        ]
+        .into_iter()
+        .map(|(g, s)| {
+            let mut other = d.clone();
+            other.grant_state = g;
+            other.generation_state = s;
+            hex(&c::sha256(&other.encode()))
+        })
+        .collect();
+        assert_eq!(pinned, GOLDEN_DESCRIPTORS);
+
+        // Each payload field is one column and no descriptor column shadows
+        // one: the map holds them all plus its own 15.
+        let Value::Map(payload) = c::decode(d.record().record().canonical_payload_bytes()).unwrap()
+        else {
+            panic!("not a map")
+        };
+        let Value::Map(columns) = c::decode(&raw).unwrap() else {
+            panic!("not a map")
+        };
+        assert_eq!(columns.len(), payload.len() + 15);
 
         // A rotation carries its previous pair as columns too.
         let rotation = root_record(
@@ -1885,7 +2004,12 @@ mod tests {
                 "{column}"
             );
         }
-        for column in ["subject_account_id", "payload_sha256", "hpke_info_bytes"] {
+        for column in [
+            "subject_account_id",
+            "payload_sha256",
+            "hpke_info_bytes",
+            "canonical_payload_bytes",
+        ] {
             assert_eq!(
                 parse(&edit(&raw, |e| drop_key(e, column))),
                 Err(RecordError::BadValue("descriptor")),
@@ -1905,6 +2029,12 @@ mod tests {
         assert_eq!(
             parse(&edit(&raw, |e| set(e, "generation_state", c::t("GONE")))),
             Err(RecordError::BadValue("generation_state"))
+        );
+
+        // Larger than any descriptor of a valid container.
+        assert_eq!(
+            parse(&vec![0; MAX_DESCRIPTOR_BYTES + 1]),
+            Err(RecordError::BadValue("descriptor"))
         );
 
         // Another issuer, a tampered container, another record domain.

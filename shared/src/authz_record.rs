@@ -47,7 +47,7 @@ const MAX_PAYLOAD_BYTES: usize = 65536;
 const MAX_SIGNATURE_BYTES: usize = 4096;
 /// Both byte fields at their caps plus room for the other nine fields, checked
 /// before decoding so an oversized body is refused without being parsed.
-const MAX_RECORD_BYTES: usize = MAX_PAYLOAD_BYTES + MAX_SIGNATURE_BYTES + 1024;
+pub const MAX_RECORD_BYTES: usize = MAX_PAYLOAD_BYTES + MAX_SIGNATURE_BYTES + 1024;
 
 /// Why a record was refused. [`RecordError::code`] gives the plan's wire code.
 #[derive(Debug, PartialEq, Eq)]
