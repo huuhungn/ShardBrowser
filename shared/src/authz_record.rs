@@ -438,6 +438,15 @@ impl AuthorizationRecord {
             return Err(RecordError::BadValue("payload_version"));
         }
         let payload = Payload::parse(&payload_domain, &canonical_payload_bytes)?;
+        // Plan 5.6.4 rule 1: a first self-grant is signed by its own subject.
+        // The record alone decides that, so the parser checks it.
+        if let Payload::TenantRootKeyGrant(g) = &payload {
+            if g.variant == RootGrantVariant::FirstRootSelfGrant
+                && g.subject_signing_key_id != issuer_signing_key_id
+            {
+                return Err(RecordError::BadValue("issuer_signing_key_id"));
+            }
+        }
 
         Ok(Self {
             payload_domain,
@@ -1096,8 +1105,8 @@ impl TenantRootKeyGrantV2 {
         grants::root_grant_info(&self.scope())
     }
 
-    /// Opens the wrapped TRK and checks it hashes to `root_key_id`. On any
-    /// failure the plaintext buffer is dropped, which zeroizes it.
+    /// Opens the wrapped TRK and checks it hashes to `root_key_id`. Every
+    /// plaintext buffer is `Zeroizing`, so a refused TRK is wiped on drop.
     pub fn open_trk(
         &self,
         recipient_sk_bytes: &[u8],
@@ -1150,6 +1159,9 @@ impl TenantRootKeyGrantV2 {
             ),
         ];
         let hpke_info_bytes = f.bytes("hpke_info_bytes", 1, 1024)?;
+        // Bytes32 and Bytes48 are the plan's field types, so a wrong length is
+        // malformed before the suite is looked at (unlike the device grant,
+        // whose lengths depend on its suite).
         let hpke_encapped_key_bytes = f.fixed("hpke_encapped_key_bytes")?;
         let hpke_wrapped_trk_bytes = f.fixed("hpke_wrapped_trk_bytes")?;
         let previous_root_key_id = f.opt_fixed::<32>("previous_root_key_id")?;
@@ -1361,6 +1373,7 @@ mod tests {
         }
     }
 
+    /// The subject signs its own grant, which a first self-grant requires.
     fn root_grant(variant: RootGrantVariant, root_generation: u64) -> TenantRootKeyGrantV2 {
         TenantRootKeyGrantV2 {
             common: common(),
@@ -1369,7 +1382,7 @@ mod tests {
             root_generation,
             subject_account_id: fx("account-a"),
             subject_device_id: fx("device-a"),
-            subject_signing_key_id: fx("device-a-signing"),
+            subject_signing_key_id: signing_key_id(issuer().verifying_key().as_bytes()),
             recipient_hpke_key_id: fx("device-a-hpke"),
             subject_device_approval_replay_id: fx("approval-replay"),
             hpke_encapped_key_bytes: fx("root-encapped"),
@@ -1455,14 +1468,14 @@ mod tests {
             (
                 DOMAIN_TENANT_ROOT_KEY_GRANT,
                 root_grant(RootGrantVariant::FirstRootSelfGrant, 0).encode(),
-                "65170bee6254fc404bac04b3e9589416c29ae4a640035d7eb263db1207347eef",
-                "a8b93397f2addd39543bccaaca42426019db5ab2834e4560b37b3f9aaabe34f5",
+                "bf221871b815b09dc45a849639431b139009a3dddf1a2ba9c8e4242b5ee42627",
+                "06525a353d6cf1e6164e9b5fa19a74070ece459aa2e84473482264399a80403f",
             ),
             (
                 DOMAIN_TENANT_ROOT_KEY_GRANT,
                 root_grant(rotation(4), 5).encode(),
-                "7c7f9fd7996ec70ff35d60d72540f85228a2f1278e08f721996fddc9c5b4ab36",
-                "9d3a50858dcec59b85bdeb20dc0e84434d2ff7fecd5e7fc19010c667f044b7db",
+                "80ecf31281d0a761e65920d5f149169ff9e53ac246f28903648d30dc88629525",
+                "2ebf1f30cad074f2b343e4f3cd2850434a26f8d7a73b9ca442658c0d42a3768d",
             ),
         ];
         for (domain, payload, container_hash, exact_sha) in cases {
@@ -1967,9 +1980,52 @@ mod tests {
             let verified = sign_and_verify(DOMAIN_TENANT_ROOT_KEY_GRANT, &raw).unwrap();
             assert_eq!(verified.payload(), &Payload::TenantRootKeyGrant(g));
         }
-        // The plan's info map is what the payload binds, byte for byte.
+        // The info map of plan 5.6.4, written out here rather than taken from
+        // the helper the codec uses, so a wrong helper cannot pin itself.
         let g = root_grant(RootGrantVariant::ExistingRootGrant, 3);
-        assert_eq!(g.hpke_info_bytes(), grants::root_grant_info(&g.scope()));
+        let k = &g.common;
+        let plan_info = c::encode(&c::m(vec![
+            (
+                "domain",
+                c::t("shardx.keys.tenant-root-key-grant.hpke-info.v2"),
+            ),
+            ("version", c::u(2)),
+            ("replay_id", c::b(&k.replay_id)),
+            ("tenant_id", c::b(&k.tenant_id)),
+            ("server_instance_id", c::b(&k.server_instance_id)),
+            ("restore_epoch", c::u(k.restore_epoch)),
+            ("root_key_id", c::b(&g.root_key_id)),
+            ("root_generation", c::u(3)),
+            ("subject_account_id", c::b(&g.subject_account_id)),
+            ("subject_device_id", c::b(&g.subject_device_id)),
+            ("recipient_hpke_key_id", c::b(&g.recipient_hpke_key_id)),
+            ("hpke_suite_id", c::u(1)),
+            ("hpke_mode_id", c::u(0)),
+            ("hpke_kem_id", c::u(0x0020)),
+            ("hpke_kdf_id", c::u(0x0001)),
+            ("hpke_aead_id", c::u(0x0003)),
+            ("grant_capability", c::t("root.custody")),
+        ]));
+        assert_eq!(g.hpke_info_bytes(), plan_info);
+    }
+
+    #[test]
+    fn a_first_self_grant_is_signed_by_its_subject() {
+        let other = SigningKey::from_bytes(&fx::<32>("another-custodian"));
+        let signed_by_other = |g: TenantRootKeyGrantV2| {
+            AuthorizationRecord::parse(&build_record(
+                &other,
+                DOMAIN_TENANT_ROOT_KEY_GRANT,
+                &g.encode(),
+            ))
+        };
+        assert_eq!(
+            signed_by_other(root_grant(RootGrantVariant::FirstRootSelfGrant, 0)),
+            Err(RecordError::BadValue("issuer_signing_key_id"))
+        );
+        // Any custodian may issue the other variants; the caller checks which.
+        assert!(signed_by_other(root_grant(RootGrantVariant::ExistingRootGrant, 0)).is_ok());
+        assert!(signed_by_other(root_grant(rotation(0), 1)).is_ok());
     }
 
     #[test]
@@ -2045,9 +2101,10 @@ mod tests {
                 ..
             })
         ));
+        let g = root_grant(RootGrantVariant::ExistingRootGrant, 3);
         let same_keys = TenantRootKeyGrantV2 {
-            recipient_hpke_key_id: fx("device-a-signing"),
-            ..root_grant(RootGrantVariant::ExistingRootGrant, 3)
+            recipient_hpke_key_id: g.subject_signing_key_id,
+            ..g
         };
         assert_eq!(
             TenantRootKeyGrantV2::parse(&same_keys.encode()),
@@ -2086,12 +2143,16 @@ mod tests {
         // The previous-root pair is present iff the variant is a rotation.
         let rot = root_grant(rotation(4), 5).encode();
         let plain = root_grant(RootGrantVariant::ExistingRootGrant, 5).encode();
+        let first = root_grant(RootGrantVariant::FirstRootSelfGrant, 0).encode();
         for (raw, edit) in [
             (&rot, ("drop", "previous_root_key_id")),
             (&rot, ("drop", "previous_root_generation")),
             (&rot, ("variant", "ExistingRootGrant")),
+            (&rot, ("variant", "FirstRootSelfGrant")),
             (&plain, ("add", "previous_root_key_id")),
             (&plain, ("add", "previous_root_generation")),
+            (&first, ("add", "previous_root_key_id")),
+            (&first, ("add", "previous_root_generation")),
         ] {
             let bytes = edit_map(raw, |e| match edit {
                 ("drop", key) => e.retain(|(k, _)| k != key),
