@@ -20,7 +20,9 @@ use zeroize::Zeroizing;
 use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
 use shared::approval_receipt::DeviceApprovalReceiptV2;
 use shared::authz_record::{
-    build_record, ApprovalScopeKind, CommonFields, DeviceApprovalV2, DOMAIN_DEVICE_APPROVAL,
+    build_record, ApprovalScopeKind, Capability, CapabilityScopeKind, CommonFields,
+    DeviceApprovalV2, GrantSubject, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
+    DOMAIN_TENANT_CAPABILITY_GRANT,
 };
 use shared::canonical::sha256;
 use shared::grants::derive_keypair;
@@ -1806,6 +1808,41 @@ async fn an_approval_needs_the_confirmation_the_session_and_the_exact_subject() 
             .await
             .0,
         403
+    );
+
+    // A well-formed, correctly signed record of another kind is not an approval.
+    let start = now_ms() - 60_000;
+    let grant = TenantCapabilityGrantV2 {
+        common: CommonFields {
+            replay_id: [0x7f; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        subject: GrantSubject::Device {
+            account_id: OWNER,
+            device_id: dev.id,
+            signing_key_id: dev.signing_key_id,
+            hpke_key_id: dev.hpke_key_id,
+        },
+        scope_kind: CapabilityScopeKind::Tenant,
+        scope_id: TENANT,
+        capability: Capability::DeviceApprove,
+    }
+    .encode();
+    let (status, _, body) = server
+        .approve(
+            &dev.id,
+            access,
+            &build_record(&dev.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &grant),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
     );
 
     // None of that wrote anything; the real approval still goes through.
