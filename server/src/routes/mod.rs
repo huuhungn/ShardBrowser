@@ -5,6 +5,7 @@ pub mod locks;
 pub mod proxies;
 pub mod users;
 pub mod v2;
+pub mod v2_approval;
 pub mod v2_auth;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -55,7 +56,11 @@ pub fn router(state: AppState) -> Router {
             "/v2/devices/enrollment-proofs",
             post(v2_auth::enroll_device),
         )
-        .route("/v2/device-approvals", post(v2::present_device_approval))
+        .route(
+            "/v2/devices/:device_id/approve",
+            post(v2_approval::approve_device)
+                .layer(DefaultBodyLimit::max(v2_approval::MAX_APPROVAL_BODY)),
+        )
         .route("/v2/capability-grants", post(v2::present_capability_grant))
         .route(
             "/v2/tenant-root-key-grants",

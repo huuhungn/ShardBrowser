@@ -7,6 +7,7 @@
 //!   cache and normalizing the (machine-bound) cookie encryption so a snapshot
 //!   taken on one machine restores correctly on another (incl. Mac↔Windows).
 
+pub mod approval_receipt;
 pub mod authz_record;
 pub mod backup;
 pub mod backup_file;

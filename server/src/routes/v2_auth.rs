@@ -41,8 +41,8 @@ use crate::util::now_ms;
 const TICKET_TTL_MS: i64 = 600_000;
 const CHALLENGE_TTL_MS: i64 = 120_000;
 const ACCESS_TTL_MS: i64 = 300_000;
-/// Pending-setup sessions end 30 minutes after the proof, refresh or not.
-const SETUP_SESSION_MS: i64 = 1_800_000;
+/// Setup sessions end 30 minutes after the proof, refresh or not.
+pub(super) const SETUP_SESSION_MS: i64 = 1_800_000;
 /// Challenges per ticket, over its whole life: a refused proof does not give
 /// the slot back, so this bounds the HPKE work one login can cause.
 const MAX_CHALLENGES_PER_TICKET: i64 = 5;
@@ -60,25 +60,25 @@ const TICKET: &str = "v2t.";
 const ACCESS: &str = "v2a.";
 const REFRESH: &str = "v2r.";
 
-fn verified(app: &AppState) -> Result<&Verified, AppError> {
+pub(super) fn verified(app: &AppState) -> Result<&Verified, AppError> {
     app.authority
         .as_ref()
         .as_ref()
         .map_err(|r| AppError::EpochAuthority(r.code))
 }
 
-fn epoch(v: &Verified) -> Result<i64, AppError> {
+pub(super) fn epoch(v: &Verified) -> Result<i64, AppError> {
     i64::try_from(v.restore_epoch)
         .map_err(|_| AppError::Internal("restore epoch out of range".into()))
 }
 
-fn random<const N: usize>() -> Result<[u8; N], AppError> {
+pub(super) fn random<const N: usize>() -> Result<[u8; N], AppError> {
     let mut out = [0u8; N];
     fill_random(&mut out).map_err(|e| AppError::Internal(format!("entropy: {e}")))?;
     Ok(out)
 }
 
-fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+pub(super) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     if s.len() != 2 * N || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -89,7 +89,10 @@ fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-fn blob<const N: usize>(row: &sqlx::sqlite::SqliteRow, col: &str) -> Result<[u8; N], AppError> {
+pub(super) fn blob<const N: usize>(
+    row: &sqlx::sqlite::SqliteRow,
+    col: &str,
+) -> Result<[u8; N], AppError> {
     row.get::<Vec<u8>, _>(col)
         .try_into()
         .map_err(|_| AppError::Internal(format!("{col} has the wrong length")))
@@ -121,7 +124,7 @@ fn bearer(parts: &Parts) -> Option<&str> {
 
 /// The account may act now: active, same token version, active membership,
 /// active tenant.
-async fn account_is_live(
+pub(super) async fn account_is_live(
     conn: &mut SqliteConnection,
     tenant_id: &[u8; 16],
     account_id: &[u8; 16],
@@ -204,9 +207,11 @@ pub struct Session {
     pub hpke_key_id: [u8; 32],
     pub access_expires_at_ms: i64,
     pub absolute_expires_at_ms: i64,
+    access_token_hash: [u8; 32],
 }
 
 const SESSION_COLUMNS: &str = "id, tenant_id, account_id, device_id, class, signing_key_id, \
+     access_token_hash, \
      hpke_key_id, account_token_version, access_expires_at_ms, refresh_expires_at_ms, \
      absolute_expires_at_ms, server_instance_id, restore_epoch";
 
@@ -221,17 +226,59 @@ fn session_from(row: &sqlx::sqlite::SqliteRow) -> Result<Session, AppError> {
         hpke_key_id: blob(row, "hpke_key_id")?,
         access_expires_at_ms: row.get("access_expires_at_ms"),
         absolute_expires_at_ms: row.get("absolute_expires_at_ms"),
+        access_token_hash: blob(row, "access_token_hash")?,
     })
 }
 
+/// The device's D1 approval is live: unrevoked, inside its window, for these
+/// keys on this instance and epoch, the one the first-device confirmation
+/// consumed, and the tenant's guard still `consumed` (not `recovery_required`).
+/// It is the only approval that grants `root_setup` (ADR 0001 R2).
+pub(super) async fn d1_approval_is_live(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8; 16],
+    device_id: &[u8; 16],
+    signing_key_id: &[u8; 32],
+    hpke_key_id: &[u8; 32],
+    v: &Verified,
+    now: i64,
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM v2_device_approvals a
+           JOIN v2_first_device_confirmations c
+             ON c.server_instance_id = a.server_instance_id AND c.tenant_id = a.tenant_id
+            AND c.approval_payload_domain = a.payload_domain AND c.approval_replay_id = a.replay_id
+           JOIN v2_bootstrap_guards g
+             ON g.server_instance_id = a.server_instance_id AND g.tenant_id = a.tenant_id
+            AND g.state = 'consumed'
+          WHERE a.tenant_id = ? AND a.subject_device_id = ? AND a.subject_signing_key_id = ?
+            AND a.subject_hpke_key_id = ? AND a.server_instance_id = ? AND a.restore_epoch = ?
+            AND a.revoked_at IS NULL
+            AND a.not_before_ms <= ? AND a.not_after_ms > ?
+            AND c.state = 'consumed' AND c.device_id = a.subject_device_id",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(device_id.as_slice())
+    .bind(signing_key_id.as_slice())
+    .bind(hpke_key_id.as_slice())
+    .bind(v.server_instance_id.as_slice())
+    .bind(epoch(v)?)
+    .bind(now)
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?
+    .is_some())
+}
+
 /// The predicates R2 rechecks on every use and refresh: this instance and
-/// epoch, the account, and a device still in the state the class needs with
-/// the same two keys.
+/// epoch, the account, a device still in the state the class needs with the
+/// same two keys, and for `root_setup` the live D1 approval.
 async fn session_is_live(
     conn: &mut SqliteConnection,
     row: &sqlx::sqlite::SqliteRow,
     s: &Session,
     v: &Verified,
+    now: i64,
 ) -> Result<bool, AppError> {
     let instance: Vec<u8> = row.get("server_instance_id");
     if instance != v.server_instance_id || row.get::<i64, _>("restore_epoch") != epoch(v)? {
@@ -252,7 +299,7 @@ async fn session_is_live(
     } else {
         "active"
     };
-    Ok(sqlx::query_scalar::<_, i64>(
+    let device_ok = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM v2_devices
           WHERE tenant_id = ? AND id = ? AND account_id = ? AND status = ?
             AND signing_key_id = ? AND hpke_key_id = ?",
@@ -265,7 +312,51 @@ async fn session_is_live(
     .bind(s.hpke_key_id.as_slice())
     .fetch_optional(&mut *conn)
     .await?
-    .is_some())
+    .is_some();
+    if !device_ok || s.class == "pending_setup" {
+        return Ok(device_ok);
+    }
+    // `ordinary` sessions need ordinary approvals and capabilities, which do
+    // not exist yet, so none is live.
+    Ok(s.class == "root_setup"
+        && d1_approval_is_live(
+            conn,
+            &s.tenant_id,
+            &s.device_id,
+            &s.signing_key_id,
+            &s.hpke_key_id,
+            v,
+            now,
+        )
+        .await?)
+}
+
+/// Reloads a session by ID with every live predicate, for a handler that
+/// must recheck it under its own write lock.
+pub(super) async fn reload_session(
+    conn: &mut SqliteConnection,
+    presented: &Session,
+    v: &Verified,
+    now: i64,
+) -> Result<Option<Session>, AppError> {
+    let Some(row) = sqlx::query(&format!(
+        "SELECT {SESSION_COLUMNS} FROM v2_sessions
+          WHERE tenant_id = ? AND id = ? AND access_token_hash = ? AND revoked_at_ms IS NULL
+            AND access_expires_at_ms > ?"
+    ))
+    .bind(presented.tenant_id.as_slice())
+    .bind(presented.id.as_slice())
+    .bind(presented.access_token_hash.as_slice())
+    .bind(now)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let session = session_from(&row)?;
+    Ok(session_is_live(conn, &row, &session, v, now)
+        .await?
+        .then_some(session))
 }
 
 /// Whoever a v2 bearer token names: a ticket or a device session.
@@ -305,7 +396,7 @@ where
         .await?
         .ok_or(AppError::Unauthorized)?;
         let session = session_from(&row)?;
-        if !session_is_live(&mut conn, &row, &session, v).await? {
+        if !session_is_live(&mut conn, &row, &session, v, now).await? {
             return Err(AppError::Unauthorized);
         }
         Ok(Principal::Session(session))
@@ -333,7 +424,7 @@ where
 
 /// A structured audit row for an online v2 action by a device.
 #[allow(clippy::too_many_arguments)]
-async fn audit(
+pub(super) async fn audit(
     conn: &mut SqliteConnection,
     tenant_id: &[u8],
     account_id: &[u8],
@@ -821,11 +912,27 @@ pub async fn create_device_session_challenge(
     .await?
     .ok_or(AppError::NotFound)?;
     let status: String = row.get("status");
-    if status != "pending" {
-        // An active device needs its live approval to start a session; that
-        // path arrives with approvals (W2 PR4).
+    let usable = match status.as_str() {
+        "pending" => true,
+        // An active device starts a session only on its live D1 approval;
+        // ordinary approvals arrive with capability grants (W2 PR5).
+        "active" => {
+            d1_approval_is_live(
+                &mut conn,
+                &ticket.tenant_id,
+                &device_id,
+                &blob(&row, "signing_key_id")?,
+                &blob(&row, "hpke_key_id")?,
+                v,
+                now,
+            )
+            .await?
+        }
+        _ => false,
+    };
+    if !usable {
         return Err(AppError::Conflict(format!(
-            "the device is {status}, not pending"
+            "the device is {status} and holds no live approval"
         )));
     }
     let spk: [u8; 32] = blob(&row, "signing_public_key")?;
@@ -907,10 +1014,10 @@ pub struct ProofReq {
     signature: String,
 }
 
-const DEVICE_SESSION_CHALLENGES: &str = "v2_device_session_challenges";
+pub(super) const DEVICE_SESSION_CHALLENGES: &str = "v2_device_session_challenges";
 const ENROLLMENT_CHALLENGES: &str = "v2_enrollment_challenges";
 
-async fn revoke_challenge(
+pub(super) async fn revoke_challenge(
     conn: &mut SqliteConnection,
     table: &str,
     id: &[u8; 16],
@@ -975,10 +1082,12 @@ pub async fn prove_device_session(
         return Err(AppError::Unauthorized);
     }
 
-    // The device must still be what the binding named.
-    let live_device = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM v2_devices
-          WHERE tenant_id = ? AND id = ? AND account_id = ? AND status = 'pending'
+    // The device must still be what the binding named, and its state now
+    // decides the class: a pending device gets `pending_setup`, an active one
+    // `root_setup`, and only on its live D1 approval.
+    let device_status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM v2_devices
+          WHERE tenant_id = ? AND id = ? AND account_id = ? AND status IN ('pending', 'active')
             AND signing_public_key = ? AND signing_key_id = ?
             AND hpke_public_key = ? AND hpke_key_id = ?",
     )
@@ -990,8 +1099,25 @@ pub async fn prove_device_session(
     .bind(f.hpke_public_key.as_slice())
     .bind(f.hpke_key_id.as_slice())
     .fetch_optional(&mut *tx)
-    .await?
-    .is_some();
+    .await?;
+    let class = match device_status.as_deref() {
+        Some("pending") => Some("pending_setup"),
+        Some(_)
+            if d1_approval_is_live(
+                &mut tx,
+                &ticket.tenant_id,
+                &binding.device_id,
+                &f.signing_key_id,
+                &f.hpke_key_id,
+                v,
+                now,
+            )
+            .await? =>
+        {
+            Some("root_setup")
+        }
+        _ => None,
+    };
     let bound = f.server_instance_id == v.server_instance_id
         && f.restore_epoch == v.restore_epoch
         && f.tenant_id == ticket.tenant_id
@@ -999,13 +1125,13 @@ pub async fn prove_device_session(
         && f.pre_device_session_id == ticket.id
         && f.challenge_id == challenge_id
         && binding.device_id == blob::<16>(&row, "device_id")?;
-    if !live_device || !bound {
+    let (Some(class), true) = (class, bound) else {
         revoke_challenge(&mut tx, DEVICE_SESSION_CHALLENGES, &challenge_id, now).await?;
         tx.commit().await?;
         return Err(AppError::Conflict(
             "the device changed since the challenge".into(),
         ));
-    }
+    };
 
     let used = sqlx::query(
         "UPDATE v2_device_session_challenges SET consumed_at_ms = ?
@@ -1038,7 +1164,7 @@ pub async fn prove_device_session(
               signing_key_id, hpke_key_id, account_token_version, class, pre_device_session_id,
               device_session_challenge_id, pop_at_ms, access_token_hash, access_expires_at_ms,
               refresh_token_hash, refresh_expires_at_ms, absolute_expires_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_setup', ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(session_id.as_slice())
     .bind(ticket.tenant_id.as_slice())
@@ -1049,6 +1175,7 @@ pub async fn prove_device_session(
     .bind(f.signing_key_id.as_slice())
     .bind(f.hpke_key_id.as_slice())
     .bind(ticket.token_version)
+    .bind(class)
     .bind(ticket.id.as_slice())
     .bind(challenge_id.as_slice())
     .bind(now)
@@ -1074,7 +1201,7 @@ pub async fn prove_device_session(
         StatusCode::CREATED,
         Json(json!({
             "session_id": hex(&session_id),
-            "class": "pending_setup",
+            "class": class,
             "device_id": hex(&binding.device_id),
             "access_token": access.as_str(),
             "access_expires_at_ms": access_expires,
@@ -1189,7 +1316,7 @@ pub async fn refresh(
     .await?;
     if !fresh
         || rotations >= MAX_ROTATIONS_PER_SESSION
-        || !session_is_live(&mut tx, &row, &session, v).await?
+        || !session_is_live(&mut tx, &row, &session, v, now).await?
     {
         revoke_session(&mut tx, &session.tenant_id, &session.id, now).await?;
         tx.commit().await?;

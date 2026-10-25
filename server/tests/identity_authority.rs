@@ -508,7 +508,7 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
     for path in [
         "/v2/devices/enrollment-challenges",
         "/v2/devices/enrollment-proofs",
-        "/v2/device-approvals",
+        "/v2/devices/00000000000000000000000000000000/approve",
         "/v2/capability-grants",
         "/v2/tenant-root-key-grants",
         "/v2/root-key-generations/activate",

@@ -271,7 +271,7 @@ async fn v2_authorization_holds_over_http() {
         let cl = cl.clone();
         let admin = admin.clone();
         async move {
-            cl.post(format!("{}/v2/device-approvals", base(port)))
+            cl.post(format!("{}/v2/capability-grants", base(port)))
                 .bearer_auth(&admin)
                 .json(&body)
                 .send()
@@ -285,7 +285,7 @@ async fn v2_authorization_holds_over_http() {
         &sk_a,
         TENANT_A,
         [1u8; 16],
-        "shardx.authorization.device-approval.v2",
+        "shardx.authorization.capability-grant.v2",
     );
     let r = present(json!({
         "tenant_id": hex(&TENANT_A),
@@ -310,7 +310,7 @@ async fn v2_authorization_holds_over_http() {
         &sk_a,
         TENANT_B,
         [2u8; 16],
-        "shardx.authorization.device-approval.v2",
+        "shardx.authorization.capability-grant.v2",
     );
     let r = present(json!({
         "tenant_id": hex(&TENANT_B),
@@ -332,7 +332,7 @@ async fn v2_authorization_holds_over_http() {
         &sk_b,
         TENANT_A,
         [7u8; 16],
-        "shardx.authorization.device-approval.v2",
+        "shardx.authorization.capability-grant.v2",
     );
     let r = present(json!({
         "tenant_id": hex(&TENANT_B),
@@ -346,13 +346,13 @@ async fn v2_authorization_holds_over_http() {
         r.status()
     );
 
-    // Domain confusion: a capability grant presented to the device-approval
+    // Domain confusion: a device approval presented to the capability-grant
     // endpoint must be refused even though it is correctly signed.
     let wrong_domain = approval_record(
         &sk_a,
         TENANT_A,
         [3u8; 16],
-        "shardx.authorization.capability-grant.v2",
+        "shardx.authorization.device-approval.v2",
     );
     let r = present(json!({
         "tenant_id": hex(&TENANT_A),
@@ -370,7 +370,7 @@ async fn v2_authorization_holds_over_http() {
         &sk_a,
         TENANT_A,
         [4u8; 16],
-        "shardx.authorization.device-approval.v2",
+        "shardx.authorization.capability-grant.v2",
     );
     let last = tampered.len() - 1;
     tampered[last] ^= 0x01;
@@ -387,7 +387,7 @@ async fn v2_authorization_holds_over_http() {
 
     // Unauthenticated requests never reach the verifier.
     let r = cl
-        .post(format!("{}/v2/device-approvals", base(port)))
+        .post(format!("{}/v2/capability-grants", base(port)))
         .json(&json!({ "tenant_id": hex(&TENANT_A), "record_hex": hex(&rec) }))
         .send()
         .await

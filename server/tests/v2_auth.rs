@@ -6,8 +6,9 @@
 //! non-2xx response, and that the rows behind a session say what the
 //! response says.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
@@ -17,6 +18,13 @@ use sqlx::SqlitePool;
 use zeroize::Zeroizing;
 
 use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
+use shared::approval_receipt::DeviceApprovalReceiptV2;
+use shared::authz_record::{
+    build_record, ApprovalScopeKind, Capability, CapabilityScopeKind, CommonFields,
+    DeviceApprovalV2, GrantSubject, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
+    DOMAIN_TENANT_CAPABILITY_GRANT,
+};
+use shared::canonical::sha256;
 use shared::grants::derive_keypair;
 use shared::keys::{hpke_key_id, signing_key_id};
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
@@ -128,6 +136,12 @@ async fn start(tag: &str, port: u16) -> Server {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO v2_bootstrap_guards VALUES (?, ?, 'unused', NULL, 't')")
+        .bind(INSTANCE.as_slice())
+        .bind(TENANT.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
     let hash = argon2::Argon2::default()
         .hash_password(PASSWORD.as_bytes(), &SaltString::generate(&mut OsRng))
         .unwrap()
@@ -188,6 +202,91 @@ impl Server {
         (status, r.json().await.unwrap_or(Value::Null))
     }
 
+    /// Stops the server, runs one offline operator command with `stdin`, and
+    /// starts the server again.
+    async fn offline(&mut self, args: &[&str], stdin: &str) -> std::process::Output {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_shardx-team-server"))
+            .args(args)
+            .env("SHARDX_DATA_DIR", &self.data)
+            .env("SHARDX_IDENTITY_DIR", self.data.with_extension("identity"))
+            .env("SHARDX_TOKEN_SECRET", "v2-auth-secret")
+            .env("SHARDX_ADMIN_USER", "admin")
+            .env("SHARDX_ADMIN_PASS", "secret")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the operator command");
+        cli.stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = cli.wait_with_output().unwrap();
+        self.child = launch(&self.data, self.port);
+        wait_health(self.port).await;
+        out
+    }
+
+    /// The offline D1 confirmation, typed the way the operator types it.
+    async fn confirm(&mut self, dev: &Device) -> [u8; 16] {
+        let out = self
+            .offline(
+                &[
+                    "tenant",
+                    "confirm-first-device",
+                    "--tenant",
+                    "acme",
+                    "--device",
+                    &hex(&dev.id),
+                ],
+                &format!("{}\n{}\n", hex(&dev.signing_key_id), hex(&dev.hpke_key_id)),
+            )
+            .await;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout} {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let id = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("confirmation_id="))
+            .expect("the CLI prints the confirmation ID");
+        unhex(id).try_into().unwrap()
+    }
+
+    /// Posts exact CBOR; returns the status, content type and body bytes.
+    async fn approve(
+        &self,
+        device: &[u8; 16],
+        bearer: &str,
+        body: &[u8],
+    ) -> (u16, String, Vec<u8>) {
+        let r = client()
+            .post(format!(
+                "http://127.0.0.1:{}/v2/devices/{}/approve",
+                self.port,
+                hex(device)
+            ))
+            .bearer_auth(bearer)
+            .header("content-type", "application/cbor")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let ct = r
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (status, ct, r.bytes().await.unwrap().to_vec())
+    }
+
     async fn me(&self, bearer: &str) -> (u16, Value) {
         let r = client()
             .get(format!("http://127.0.0.1:{}/v2/me", self.port))
@@ -233,6 +332,8 @@ struct Device {
     id: [u8; 16],
     sk: Ed25519SigningKey,
     hpke_sk: Zeroizing<Vec<u8>>,
+    signing_key_id: [u8; 32],
+    hpke_key_id: [u8; 32],
 }
 
 /// A device enrolled for `account`, stored the way enrollment stores it.
@@ -255,7 +356,13 @@ async fn device(server: &Server, account: [u8; 16], seed: u8, status: &str) -> D
         .await
         .unwrap();
     pool.close().await;
-    Device { id, sk, hpke_sk }
+    Device {
+        id,
+        sk,
+        hpke_sk,
+        signing_key_id: signing_key_id(&spk),
+        hpke_key_id: hpke_key_id(&hpk),
+    }
 }
 
 /// The client half of a challenge: check the binding, open the secret, sign.
@@ -385,11 +492,7 @@ async fn a_ticket_authorizes_nothing_but_its_own_proofs() {
     let t = ticket["ticket"].as_str();
 
     // Not a v1 token and not a device session.
-    for path in [
-        "/v2/device-approvals",
-        "/v2/capability-grants",
-        "/v2/root-key-generations",
-    ] {
+    for path in ["/v2/capability-grants", "/v2/root-key-generations"] {
         let (status, _) = server.post(path, t, json!({})).await;
         assert_eq!(status, 401, "{path}");
     }
@@ -1229,6 +1332,8 @@ async fn a_ticket_enrolls_a_device_and_then_proves_it_into_a_session() {
             .unwrap(),
         sk,
         hpke_sk,
+        signing_key_id: signing_key_id(&spk),
+        hpke_key_id: hpke_key_id(&hpk),
     };
     let (status, ch) = challenge(&server, &ticket, &dev).await;
     assert_eq!(status, 201, "{ch}");
@@ -1346,4 +1451,471 @@ async fn a_wrong_enrollment_signature_burns_the_challenge() {
         )
         .await;
     assert_eq!(status, 409);
+}
+
+// ------------------------------------------------------------ D1 approval ---
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+const DAY_MS: u64 = 86_400_000;
+
+/// A D1 self-approval of `dev`, signed by `signer`.
+fn approval(
+    dev: &Device,
+    signer: &Ed25519SigningKey,
+    replay: u8,
+    epoch: u64,
+    days: u64,
+) -> Vec<u8> {
+    let start = now_ms() - 60_000;
+    approval_window(dev, signer, replay, epoch, start, start + days * DAY_MS)
+}
+
+/// The same approval with an explicit validity window.
+fn approval_window(
+    dev: &Device,
+    signer: &Ed25519SigningKey,
+    replay: u8,
+    epoch: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+) -> Vec<u8> {
+    let payload = DeviceApprovalV2 {
+        common: CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: not_before_ms,
+            not_before_ms,
+            not_after_ms,
+            server_instance_id: INSTANCE,
+            restore_epoch: epoch,
+        },
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        subject_hpke_key_id: dev.hpke_key_id,
+        approval_scope_kind: ApprovalScopeKind::Tenant,
+        approval_scope_id: TENANT,
+    }
+    .encode();
+    build_record(signer, DOMAIN_DEVICE_APPROVAL, &payload)
+}
+
+fn code(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body).unwrap_or(Value::Null)["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt() {
+    let mut server = start("d1", 38190).await;
+    let dev = device(&server, OWNER, 0x61, "pending").await;
+    let confirmation_id = server.confirm(&dev).await;
+    // A second pending device of the same owner, with a live setup session.
+    let bystander = device(&server, OWNER, 0x68, "pending").await;
+    let bystander_session = session(&server, &bystander).await;
+    let other_session = session(&server, &dev).await;
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
+
+    let rec = approval(&dev, &dev.sk, 0x71, 0, 30);
+    let (status, ct, receipt) = server.approve(&dev.id, access, &rec).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt));
+    assert_eq!(ct, "application/cbor");
+    let r = DeviceApprovalReceiptV2::parse(&receipt).unwrap();
+    assert_eq!(
+        (r.server_instance_id, r.restore_epoch, r.tenant_id),
+        (INSTANCE, 0, TENANT)
+    );
+    assert_eq!((r.actor_account_id, r.actor_device_id), (OWNER, dev.id));
+    assert_eq!(
+        (r.subject_device_id, r.approval_replay_id),
+        (dev.id, [0x71; 16])
+    );
+    assert_eq!(r.approval_outer_sha256, sha256(&rec));
+    assert_eq!(r.confirmation_id, Some(confirmation_id));
+
+    // Every transition happened, once.
+    for (query, want) in [
+        ("SELECT count(*) FROM v2_devices WHERE status = 'active'", 1),
+        ("SELECT count(*) FROM v2_device_approvals", 1),
+        ("SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'DEVICE_APPROVE'", 1),
+        ("SELECT count(*) FROM v2_bootstrap_guards WHERE state = 'consumed'", 1),
+        (
+            "SELECT count(*) FROM v2_first_device_confirmations \
+              WHERE state = 'consumed' AND approval_replay_id = x'71717171717171717171717171717171'",
+            1,
+        ),
+        ("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'", 1),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+    let (status, me) = server.me(access).await;
+    assert_eq!((status, me["class"].as_str()), (200, Some("root_setup")));
+    // The device's other setup session is not promoted; it simply ends.
+    let (status, _) = server
+        .me(other_session["access_token"].as_str().unwrap())
+        .await;
+    assert_eq!(status, 401);
+
+    // A lost response: the same bytes get the same receipt, and nothing more.
+    let (status, _, again) = server.approve(&dev.id, access, &rec).await;
+    assert_eq!((status, &again), (201, &receipt));
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'")
+            .await,
+        1
+    );
+    // Other bytes under that replay ID, and any new D1 approval, are refused.
+    let changed = approval(&dev, &dev.sk, 0x71, 0, 31);
+    let (status, _, body) = server.approve(&dev.id, access, &changed).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+    // The replay ID is reserved for its first actor: another device gets a
+    // conflict, not the receipt.
+    let (status, _, body) = server
+        .approve(
+            &dev.id,
+            bystander_session["access_token"].as_str().unwrap(),
+            &rec,
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+    let (status, _, body) = server.approve(&bystander.id, access, &rec).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH")
+    );
+    let second = approval(&dev, &dev.sk, 0x72, 0, 30);
+    let (status, _, body) = server.approve(&dev.id, access, &second).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "FIRST_DEVICE_ALREADY_CLOSED")
+    );
+
+    // After a restart the device proves itself again into root_setup, and the
+    // new session, same actor and keys, still gets the stored receipt.
+    server.restart().await;
+    let s2 = session(&server, &dev).await;
+    assert_eq!(s2["class"], "root_setup");
+    assert_ne!(s2["session_id"], s["session_id"]);
+    let access2 = s2["access_token"].as_str().unwrap();
+    let (status, _, again) = server.approve(&dev.id, access2, &rec).await;
+    assert_eq!((status, &again), (201, &receipt));
+    // The receipt goes only to the tenant's sole owner, checked at each retry.
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'member' WHERE account_id = ?",
+            &[&OWNER],
+        )
+        .await;
+    assert_eq!(server.approve(&dev.id, access2, &rec).await.0, 403);
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'owner' WHERE account_id = ?",
+            &[&OWNER],
+        )
+        .await;
+
+    // Revoking the approval ends root_setup at once, and no new session
+    // starts on it: not from a fresh challenge, and not from one opened
+    // while the approval was still live.
+    let early = server.login("owner").await;
+    let (status, open) = challenge(&server, &early, &dev).await;
+    assert_eq!(status, 201, "{open}");
+    server
+        .sql("UPDATE v2_device_approvals SET revoked_at = 't'", &[])
+        .await;
+    assert_eq!(server.me(access2).await.0, 401);
+    let (status, _) = server
+        .post(
+            "/v2/auth/device-session-proofs",
+            early["ticket"].as_str(),
+            answer(&early, &open, &dev),
+        )
+        .await;
+    assert_eq!(status, 409);
+    let ticket = server.login("owner").await;
+    assert_eq!(challenge(&server, &ticket, &dev).await.0, 409);
+}
+
+#[tokio::test]
+async fn a_closed_or_recovering_guard_never_approves() {
+    // An inconsistency found while the confirmation is still pending.
+    let mut server = start("d1-recovery", 38194).await;
+    let dev = device(&server, OWNER, 0x6a, "pending").await;
+    server.confirm(&dev).await;
+    server
+        .sql(
+            "UPDATE v2_bootstrap_guards SET state = 'recovery_required', \
+             recovery_reason = 'integrity_failure'",
+            &[],
+        )
+        .await;
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
+    let rec = approval(&dev, &dev.sk, 0x7b, 0, 30);
+    assert_eq!(server.approve(&dev.id, access, &rec).await.0, 403);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_device_approvals")
+            .await,
+        0
+    );
+    drop(server);
+
+    // The operator cancelled the attempt: closed for good, not just refused.
+    let mut server = start("d1-cancelled", 38195).await;
+    let dev = device(&server, OWNER, 0x6b, "pending").await;
+    server.confirm(&dev).await;
+    let out = server
+        .offline(&["tenant", "cancel-first-device", "--tenant", "acme"], "")
+        .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let s = session(&server, &dev).await;
+    let (status, _, body) = server
+        .approve(
+            &dev.id,
+            s["access_token"].as_str().unwrap(),
+            &approval(&dev, &dev.sk, 0x7c, 0, 30),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (409, "FIRST_DEVICE_ALREADY_CLOSED")
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_device_approvals")
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_approval_needs_the_confirmation_the_session_and_the_exact_subject() {
+    let mut server = start("d1-refusals", 38191).await;
+    let dev = device(&server, OWNER, 0x63, "pending").await;
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
+    let good = approval(&dev, &dev.sk, 0x73, 0, 30);
+
+    // No offline confirmation yet.
+    assert_eq!(server.approve(&dev.id, access, &good).await.0, 403);
+    // A ticket proves only the password.
+    let ticket = server.login("owner").await;
+    assert_eq!(
+        server
+            .approve(&dev.id, ticket["ticket"].as_str().unwrap(), &good)
+            .await
+            .0,
+        403
+    );
+
+    server.confirm(&dev).await;
+    // JSON is not the exact signed record.
+    let (status, _) = server
+        .post(
+            &format!("/v2/devices/{}/approve", hex(&dev.id)),
+            Some(access),
+            json!({ "record_hex": hex(&good) }),
+        )
+        .await;
+    assert_eq!(status, 400);
+    // The path must name the approval's subject.
+    assert_eq!(server.approve(&[0x99; 16], access, &good).await.0, 400);
+    // Another epoch is stale, not a new approval.
+    let (status, _, body) = server
+        .approve(&dev.id, access, &approval(&dev, &dev.sk, 0x74, 1, 30))
+        .await;
+    assert_eq!((status, code(&body).as_str()), (409, "STALE_CONTEXT"));
+    // One flipped byte breaks the container.
+    let mut tampered = good.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    let (status, _, body) = server.approve(&dev.id, access, &tampered).await;
+    assert_eq!(status, 422);
+    assert!(!code(&body).is_empty());
+    // A key that is not a device here, and a device that is not the subject.
+    let stranger = Ed25519SigningKey::from_bytes(&[0x64; 32]);
+    let (status, _, body) = server
+        .approve(&dev.id, access, &approval(&dev, &stranger, 0x75, 0, 30))
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (422, "KEY_SUBSTITUTION_DETECTED")
+    );
+    let other = device(&server, OTHER, 0x65, "pending").await;
+    assert_eq!(
+        server
+            .approve(&dev.id, access, &approval(&dev, &other.sk, 0x76, 0, 30))
+            .await
+            .0,
+        403
+    );
+    // A window longer than the 730-day policy, one not yet open, one over.
+    let now = now_ms();
+    for rec in [
+        approval(&dev, &dev.sk, 0x77, 0, 731),
+        approval_window(&dev, &dev.sk, 0x7d, 0, now + 600_000, now + 30 * DAY_MS),
+        approval_window(&dev, &dev.sk, 0x7e, 0, now - 2 * DAY_MS, now - DAY_MS),
+    ] {
+        assert_eq!(server.approve(&dev.id, access, &rec).await.0, 403);
+    }
+    // A second owner, added after the confirmation, ends the sole-owner case.
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'owner' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
+    assert_eq!(server.approve(&dev.id, access, &good).await.0, 403);
+    server
+        .sql(
+            "UPDATE v2_tenant_memberships SET role = 'member' WHERE account_id = ?",
+            &[&OTHER],
+        )
+        .await;
+
+    // The confirmation names `dev`; another pending device of the owner cannot
+    // use it, even approving itself on its own session.
+    let dev2 = device(&server, OWNER, 0x69, "pending").await;
+    let s2 = session(&server, &dev2).await;
+    assert_eq!(
+        server
+            .approve(
+                &dev2.id,
+                s2["access_token"].as_str().unwrap(),
+                &approval(&dev2, &dev2.sk, 0x7a, 0, 30),
+            )
+            .await
+            .0,
+        403
+    );
+
+    // A well-formed, correctly signed record of another kind is not an approval.
+    let start = now_ms() - 60_000;
+    let grant = TenantCapabilityGrantV2 {
+        common: CommonFields {
+            replay_id: [0x7f; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        subject: GrantSubject::Device {
+            account_id: OWNER,
+            device_id: dev.id,
+            signing_key_id: dev.signing_key_id,
+            hpke_key_id: dev.hpke_key_id,
+        },
+        scope_kind: CapabilityScopeKind::Tenant,
+        scope_id: TENANT,
+        capability: Capability::DeviceApprove,
+    }
+    .encode();
+    let (status, _, body) = server
+        .approve(
+            &dev.id,
+            access,
+            &build_record(&dev.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &grant),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+
+    // None of that wrote anything; the real approval still goes through.
+    for query in [
+        "SELECT count(*) FROM v2_device_approvals",
+        "SELECT count(*) FROM v2_idempotency",
+        "SELECT count(*) FROM v2_devices WHERE status = 'active'",
+        "SELECT count(*) FROM v2_bootstrap_guards WHERE state <> 'reserved'",
+    ] {
+        assert_eq!(server.count(query).await, 0, "{query}");
+    }
+    assert_eq!(server.approve(&dev.id, access, &good).await.0, 201);
+}
+
+#[tokio::test]
+async fn concurrent_identical_approvals_commit_once() {
+    let mut server = start("d1-race", 38192).await;
+    let dev = device(&server, OWNER, 0x66, "pending").await;
+    server.confirm(&dev).await;
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
+    let rec = approval(&dev, &dev.sk, 0x78, 0, 30);
+    let (a, b) = tokio::join!(
+        server.approve(&dev.id, access, &rec),
+        server.approve(&dev.id, access, &rec)
+    );
+    assert_eq!((a.0, b.0), (201, 201));
+    assert_eq!(a.2, b.2, "one commit, one receipt");
+    assert_eq!(server.count("SELECT count(*) FROM v2_idempotency").await, 1);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
+    let mut server = start("d1-integrity", 38193).await;
+    let dev = device(&server, OWNER, 0x67, "pending").await;
+    server.confirm(&dev).await;
+    let s = session(&server, &dev).await;
+    let access = s["access_token"].as_str().unwrap();
+    let rec = approval(&dev, &dev.sk, 0x79, 0, 30);
+    assert_eq!(server.approve(&dev.id, access, &rec).await.0, 201);
+
+    let (_, _, stored) = server.approve(&dev.id, access, &rec).await;
+    // Behind the trigger's back, store a receipt that parses, whose hash
+    // matches, and that names another request.
+    let mut forged = DeviceApprovalReceiptV2::parse(&stored).unwrap();
+    forged.request_hash[0] ^= 1;
+    let forged = forged.encode();
+    server
+        .sql("DROP TRIGGER v2_idempotency_device_approve_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?",
+            &[&forged, &sha256(&forged)],
+        )
+        .await;
+    let (status, _, body) = server.approve(&dev.id, access, &rec).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_bootstrap_guards WHERE state = 'recovery_required'")
+            .await,
+        1
+    );
+    // root_setup needs a consumed guard, so the session ends with it.
+    assert_eq!(server.me(access).await.0, 401);
 }

@@ -15,7 +15,9 @@
 use shared::canonical as c;
 use shared::signing::{verify_tbs, SignError};
 
-/// Domain separator for device approvals.
+/// Domain the generic verifier's tests sign under. Device approvals moved to
+/// `shared::authz_record` (ADR 0001 R3).
+#[cfg(test)]
 pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.authorization.device-approval.v2";
 /// Domain separator for capability grants.
 pub const DOMAIN_CAPABILITY_GRANT: &str = "shardx.authorization.capability-grant.v2";

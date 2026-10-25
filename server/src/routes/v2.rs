@@ -175,66 +175,6 @@ pub struct PresentRecordReq {
     pub record_hex: String,
 }
 
-/// Present a signed device approval.
-///
-/// Verification and consumption are separate steps on purpose: verification
-/// is a pure function of bytes and context, while consumption mutates state
-/// and can lose a race. Both must succeed.
-pub async fn present_device_approval(
-    State(app): State<AppState>,
-    user: AuthUser,
-    headers: HeaderMap,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_DEVICE_APPROVAL, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Consume after verification: an invalid record must not burn a replay id,
-    // or an attacker could disable a legitimate record by submitting a
-    // corrupted copy of it first.
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::DeviceApprovals,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.device_approval.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    let _ = headers;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
-    ))
-}
-
 #[derive(Deserialize)]
 pub struct CompleteOpReq {
     pub tenant_id: String,
@@ -278,9 +218,9 @@ pub async fn complete_idempotent_operation(
 
 /// Present a signed capability grant.
 ///
-/// Same two-step shape as a device approval — verify, then consume — but
-/// under its own domain, so a grant and an approval can never be substituted
-/// for one another even if they share a replay id.
+/// Verify, then consume, under its own domain, so a grant and another record
+/// kind can never be substituted for one another even if they share a replay
+/// id.
 pub async fn present_capability_grant(
     State(app): State<AppState>,
     user: AuthUser,

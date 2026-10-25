@@ -99,8 +99,13 @@ pub async fn consume_replay_id(
 ///
 /// An enum rather than a caller-supplied string: the table name is
 /// interpolated into SQL, so it must not be attacker-influenced.
+// Outside tests every variant is a grant table.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayTable {
+    /// Device approvals are their own replay authority now (ADR 0001 R3);
+    /// the tests keep it as a sample table.
+    #[cfg(test)]
     DeviceApprovals,
     CapabilityGrants,
     TenantRootKeyGrants,
@@ -110,6 +115,7 @@ pub enum ReplayTable {
 impl ReplayTable {
     fn as_table_name(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::DeviceApprovals => "v2_device_approvals",
             Self::CapabilityGrants => "v2_capability_grants",
             Self::TenantRootKeyGrants => "v2_tenant_root_key_grants",
