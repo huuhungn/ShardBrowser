@@ -120,6 +120,16 @@ BEGIN
     SELECT RAISE(ABORT, 'a quarantined device can only be revoked');
 END;
 
+-- REPLACE on the device would otherwise write a fresh row past the trigger above.
+CREATE TRIGGER v2_devices_quarantine_no_reinsert
+BEFORE INSERT ON v2_devices
+WHEN NEW.status IN ('pending', 'active')
+ AND EXISTS (SELECT 1 FROM v2_device_quarantine q
+              WHERE q.tenant_id = NEW.tenant_id AND q.device_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a quarantined device can only be revoked');
+END;
+
 -- REPLACE would delete the old row without firing the delete trigger.
 CREATE TRIGGER v2_device_quarantine_no_replace
 BEFORE INSERT ON v2_device_quarantine

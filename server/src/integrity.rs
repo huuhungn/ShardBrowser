@@ -234,12 +234,12 @@ async fn reconcile_guards(pool: &SqlitePool) -> Result<usize> {
                      WHERE c.server_instance_id = v2_bootstrap_guards.server_instance_id
                        AND c.tenant_id = v2_bootstrap_guards.tenant_id
                        AND c.state = 'consumed')
-                -- Closed: cancelled, invalidated, or closed before any confirmation.
-                WHEN 'closed' THEN NOT EXISTS (
+                -- Closed: only from a reservation, so its confirmation ended.
+                WHEN 'closed' THEN EXISTS (
                     SELECT 1 FROM v2_first_device_confirmations c
                      WHERE c.server_instance_id = v2_bootstrap_guards.server_instance_id
                        AND c.tenant_id = v2_bootstrap_guards.tenant_id
-                       AND c.state IN ('pending', 'consumed'))
+                       AND c.state IN ('cancelled', 'invalidated'))
                 END",
     )
     .bind(util::now_rfc3339())
@@ -495,9 +495,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reserved_guard_without_its_confirmation_goes_to_recovery() {
+    async fn a_guard_without_its_confirmation_goes_to_recovery() {
         let pool = pool().await;
-        for (tenant, slug, state) in [(1u8, None, "reserved"), (9, Some("other"), "unused")] {
+        for (tenant, slug, states) in [
+            (1u8, None, &["reserved"][..]),
+            (9, Some("other"), &[][..]),
+            (10, Some("closed"), &["reserved", "closed"][..]),
+        ] {
             if let Some(slug) = slug {
                 sqlx::query("INSERT INTO v2_tenants VALUES (?, ?, 'active', NULL, 't')")
                     .bind([tenant; 16].as_slice())
@@ -507,12 +511,12 @@ mod tests {
                     .unwrap();
             }
             insert_guard(&pool, tenant).await;
-            if state != "unused" {
+            for state in states {
                 set_guard(&pool, tenant, state).await;
             }
         }
         let report = run(&pool, &identity()).await.unwrap();
-        assert_eq!(report.guards_to_recovery, 1);
+        assert_eq!(report.guards_to_recovery, 2);
         let states: Vec<(Vec<u8>, String)> =
             sqlx::query_as("SELECT tenant_id, state FROM v2_bootstrap_guards ORDER BY tenant_id")
                 .fetch_all(&pool)
@@ -522,7 +526,8 @@ mod tests {
             states,
             vec![
                 ([1u8; 16].to_vec(), "recovery_required".into()),
-                ([9u8; 16].to_vec(), "unused".into())
+                ([9u8; 16].to_vec(), "unused".into()),
+                ([10u8; 16].to_vec(), "recovery_required".into())
             ]
         );
     }

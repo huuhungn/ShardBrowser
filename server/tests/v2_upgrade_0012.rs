@@ -562,6 +562,14 @@ async fn a_quarantined_device_can_only_be_revoked() {
     for status in ["active", "pending"] {
         refused(&pool, back, &[A::T(status)], "can only be revoked").await;
     }
+    // Nor is writing the row afresh.
+    refused(
+        &pool,
+        "INSERT OR REPLACE INTO v2_devices          SELECT id, tenant_id, account_id, label_ciphertext, signing_key_id, signing_public_key,                 signing_suite, hpke_key_id, hpke_public_key, hpke_suite, 'active', last_seen_at,                 created_at FROM v2_devices",
+        &[],
+        "can only be revoked",
+    )
+    .await;
 }
 
 #[tokio::test]
