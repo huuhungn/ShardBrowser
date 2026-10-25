@@ -78,7 +78,10 @@ impl TeamConfig {
     /// enrolled before `account_id` was persisted is enrolled but cannot sync,
     /// and must re-enroll rather than guess.
     pub fn can_sync(&self) -> bool {
-        self.is_enrolled() && !self.account_id.is_empty() && !self.tenant_id.is_empty()
+        self.is_enrolled()
+            && !self.keys_unreadable()
+            && !self.account_id.is_empty()
+            && !self.tenant_id.is_empty()
     }
 
     /// Whether a stored key seed is a DPAPI blob this Windows account cannot
@@ -115,8 +118,25 @@ impl TeamConfig {
 
     /// Whether this device can open grants sealed to it.
     pub fn can_receive_custody(&self) -> bool {
-        self.is_enrolled() && !self.hpke_key_seed.is_empty()
+        self.is_enrolled() && !self.keys_unreadable() && !self.hpke_key_seed.is_empty()
     }
+}
+
+/// Copy `team.json` aside before a re-enrolment replaces seeds this account
+/// cannot open. "Cannot open" may be temporary (a domain master key not yet
+/// fetched while offline), so the old identity is kept, not overwritten.
+/// Returns the copy's path.
+pub fn preserve_unreadable() -> Result<std::path::PathBuf> {
+    let path = store::team_config_path()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let copy = path.with_extension(format!("json.unreadable-{stamp}"));
+    fs::copy(&path, &copy)?;
+    // Flushing needs a writable handle on Windows.
+    fs::OpenOptions::new().write(true).open(&copy)?.sync_all()?;
+    Ok(copy)
 }
 
 /// Name the real cause of an unopenable seed instead of calling it corrupt.
@@ -285,8 +305,16 @@ mod tests {
         let loaded = load().unwrap();
         let body = fs::read_to_string(store::team_config_path().unwrap()).unwrap();
         let st = status().unwrap();
+        let copy = preserve_unreadable().unwrap();
+        let copied = fs::read_to_string(&copy).unwrap();
         store::set_config_root(None);
         drop(lock);
+
+        assert_eq!(
+            copied, body,
+            "re-enrolment keeps the old file byte for byte"
+        );
+        assert!(!st.can_sync && !st.can_receive_custody, "{st:?}");
 
         let signing = loaded.signing_key().err().map(|e| format!("{e:#}"));
         let hpke = loaded.hpke_seed().err().map(|e| format!("{e:#}"));

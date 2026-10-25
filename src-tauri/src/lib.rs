@@ -2015,6 +2015,11 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     if c.blocks_enrollment() {
         return Err(crate::errcode::code("fleet.deviceAlreadyEnrolled"));
     }
+    // Before anything is registered server-side: if the copy fails, nothing
+    // has changed anywhere.
+    if c.keys_unreadable() {
+        team_config::preserve_unreadable().map_err(|e| e.to_string())?;
+    }
 
     // Fresh signing key for this device. `getrandom` is a Windows-only
     // dependency in this crate, so go through shared, which has it on every
@@ -2050,7 +2055,6 @@ async fn team_enroll_device(label: String) -> Result<team_config::TeamStatus, St
     // to it: the public half is registered with the server, but the private
     // half only exists here. Discarding it would make enrollment permanently
     // unable to receive custody.
-    c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
     c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
     team_config::save(&c).map_err(|e| e.to_string())?;
 
