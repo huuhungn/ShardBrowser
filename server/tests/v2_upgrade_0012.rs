@@ -176,6 +176,13 @@ async fn upgrade_quarantines_legacy_active_devices_and_seeds_guards() {
     device(&pool, 2, 0x20, "active").await;
     device(&pool, 2, 0x30, "revoked").await;
     tenant(&pool, 3, false).await; // no provenance
+                                   // A child row of the legacy device: kept, but its session is revoked (R4).
+    ok(
+        &pool,
+        "INSERT INTO v2_sessions VALUES (?, ?, ?, ?, ?, '2099', NULL)",
+        &[ab(0x21), ab(2), ab(0x82), ab(0x20), ak(0x23)],
+    )
+    .await;
     let carried = "SELECT quote(id) || quote(tenant_id) || quote(account_id) || \
                    quote(label_ciphertext) || quote(signing_key_id) || quote(signing_public_key) || \
                    quote(signing_suite) || quote(hpke_key_id) || quote(hpke_public_key) || \
@@ -215,6 +222,20 @@ async fn upgrade_quarantines_legacy_active_devices_and_seeds_guards() {
             k(0x22)
         )]
     );
+    let session: (Vec<u8>, bool) =
+        sqlx::query_as("SELECT device_id, revoked_at IS NOT NULL FROM v2_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(session, (b(0x20), true));
+    let index: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master \
+         WHERE type = 'index' AND name = 'v2_devices_by_account'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index, 1, "the rebuild keeps the 0004 index");
 
     let legacy = |t| {
         (
@@ -298,6 +319,16 @@ async fn a_guard_only_moves_forward_and_is_never_deleted() {
         &[ab(INSTANCE), ab(1)],
     )
     .await;
+    // Closing needs a reservation first (R1 table).
+    refused(&pool, set, &[A::T("closed"), ab(1)], not_allowed).await;
+    // REPLACE would skip the delete and transition triggers.
+    refused(
+        &pool,
+        "INSERT OR REPLACE INTO v2_bootstrap_guards VALUES (?, ?, 'unused', NULL, 't')",
+        &[ab(INSTANCE), ab(1)],
+        "inserted once",
+    )
+    .await;
     ok(&pool, set, &[A::T("reserved"), ab(1)]).await;
     for back in ["unused", "reserved"] {
         refused(&pool, set, &[A::T(back), ab(1)], not_allowed).await;
@@ -317,6 +348,28 @@ async fn a_guard_only_moves_forward_and_is_never_deleted() {
         "DELETE FROM v2_bootstrap_guards",
         &[],
         "a bootstrap guard is never deleted",
+    )
+    .await;
+    // A guard is born unused or in recovery, and recovery is kept as found.
+    tenant(&pool, 2, false).await;
+    refused(
+        &pool,
+        "INSERT INTO v2_bootstrap_guards VALUES (?, ?, 'consumed', NULL, 't')",
+        &[ab(INSTANCE), ab(2)],
+        "inserted once",
+    )
+    .await;
+    ok(
+        &pool,
+        "INSERT INTO v2_bootstrap_guards VALUES (?, ?, 'recovery_required', 'legacy_tenant', 't')",
+        &[ab(INSTANCE), ab(2)],
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE v2_bootstrap_guards SET recovery_reason = 'missing_guard' WHERE tenant_id = ?",
+        &[ab(2)],
+        "kept as found",
     )
     .await;
     refused(
@@ -393,6 +446,15 @@ async fn a_confirmation_is_consumed_once_with_its_full_link() {
         )
     };
 
+    // Born pending, and never replaced.
+    refused(
+        &pool,
+        "INSERT OR REPLACE INTO v2_first_device_confirmations \
+         SELECT * FROM v2_first_device_confirmations",
+        &[],
+        "inserted once",
+    )
+    .await;
     // The subject never changes, even while pending.
     refused(
         &pool,
@@ -477,16 +539,29 @@ async fn a_quarantined_device_can_only_be_revoked() {
     let pool = migrated().await;
     tenant(&pool, 1, false).await;
     device(&pool, 1, 0x20, "quarantined").await;
+    ok(
+        &pool,
+        "INSERT INTO v2_device_quarantine VALUES (?, ?, 'key_id_mismatch', 'pending', ?, ?, 't')",
+        &[ab(1), ab(0x20), ak(0x20), ak(0x22)],
+    )
+    .await;
+    refused(
+        &pool,
+        "INSERT OR REPLACE INTO v2_device_quarantine \
+         VALUES (?, ?, 'invalid_key_encoding', 'pending', ?, ?, 't')",
+        &[ab(1), ab(0x20), ak(0x20), ak(0x22)],
+        "permanent",
+    )
+    .await;
+    let back = "UPDATE v2_devices SET status = ?";
     for status in ["active", "pending"] {
-        refused(
-            &pool,
-            "UPDATE v2_devices SET status = ?",
-            &[A::T(status)],
-            "can only be revoked",
-        )
-        .await;
+        refused(&pool, back, &[A::T(status)], "can only be revoked").await;
     }
+    // The record, not the status, holds it: revoking first is no way back.
     ok(&pool, "UPDATE v2_devices SET status = 'revoked'", &[]).await;
+    for status in ["active", "pending"] {
+        refused(&pool, back, &[A::T(status)], "can only be revoked").await;
+    }
 }
 
 #[tokio::test]

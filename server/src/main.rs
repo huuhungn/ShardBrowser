@@ -76,10 +76,20 @@ async fn main() -> anyhow::Result<()> {
     let mut authority = identity::authority(&cfg, mirror.as_ref());
     // ADR 0001 R1/R4: reconcile the control plane before any request runs.
     if let Ok(verified) = &authority {
-        let report = integrity::run(&pool, verified).await?;
-        tracing::info!(?report, "v2 integrity pass");
-        if let Some(refusal) = report.refusal() {
-            authority = Err(refusal);
+        // A failed pass turns v2 writes off; it never stops v1.
+        match integrity::run(&pool, verified).await {
+            Ok(report) => {
+                tracing::info!(?report, "v2 integrity pass");
+                if let Some(refusal) = report.refusal() {
+                    authority = Err(refusal);
+                }
+            }
+            Err(e) => {
+                authority = Err(identity::Refusal {
+                    code: identity::ReasonCode::ControlPlaneIntegrityUntrusted,
+                    detail: format!("the integrity pass failed: {e:#}"),
+                })
+            }
         }
     }
     match &authority {

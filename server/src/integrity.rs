@@ -100,7 +100,10 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
     let rows = sqlx::query(
         "SELECT tenant_id, id, status, signing_suite, signing_public_key, signing_key_id,
                 hpke_suite, hpke_public_key, hpke_key_id
-           FROM v2_devices WHERE status <> 'quarantined'",
+           FROM v2_devices d
+          WHERE status <> 'quarantined'
+            AND NOT EXISTS (SELECT 1 FROM v2_device_quarantine q
+                             WHERE q.tenant_id = d.tenant_id AND q.device_id = d.id)",
     )
     .fetch_all(pool)
     .await?;
@@ -141,11 +144,26 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
         .bind(&device_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE v2_devices SET status = 'quarantined' WHERE tenant_id = ? AND id = ?")
-            .bind(&tenant_id)
-            .bind(&device_id)
-            .execute(&mut *tx)
-            .await?;
+        // A revoked device stays revoked; the record above still says why.
+        sqlx::query(
+            "UPDATE v2_devices SET status = 'quarantined'
+              WHERE tenant_id = ? AND id = ? AND status <> 'revoked'",
+        )
+        .bind(&tenant_id)
+        .bind(&device_id)
+        .execute(&mut *tx)
+        .await?;
+        // R4: a tenant whose device keys fail is in recovery, not bootstrap.
+        sqlx::query(
+            "UPDATE v2_bootstrap_guards
+                SET state = 'recovery_required', recovery_reason = 'integrity_failure',
+                    updated_at = ?
+              WHERE tenant_id = ? AND state IN ('unused', 'reserved')",
+        )
+        .bind(&now)
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE v2_sessions SET revoked_at = ?
               WHERE tenant_id = ? AND device_id = ? AND revoked_at IS NULL",
@@ -204,11 +222,13 @@ async fn reconcile_guards(pool: &SqlitePool) -> Result<usize> {
                     SELECT 1 FROM v2_first_device_confirmations c
                      WHERE c.server_instance_id = v2_bootstrap_guards.server_instance_id
                        AND c.tenant_id = v2_bootstrap_guards.tenant_id)
+                -- Reserved: its pending confirmation names a still-pending device.
                 WHEN 'reserved' THEN EXISTS (
                     SELECT 1 FROM v2_first_device_confirmations c
+                      JOIN v2_devices d ON d.tenant_id = c.tenant_id AND d.id = c.device_id
                      WHERE c.server_instance_id = v2_bootstrap_guards.server_instance_id
                        AND c.tenant_id = v2_bootstrap_guards.tenant_id
-                       AND c.state = 'pending')
+                       AND c.state = 'pending' AND d.status = 'pending')
                 WHEN 'consumed' THEN EXISTS (
                     SELECT 1 FROM v2_first_device_confirmations c
                      WHERE c.server_instance_id = v2_bootstrap_guards.server_instance_id
@@ -309,6 +329,31 @@ mod tests {
         .unwrap()
     }
 
+    async fn insert_guard(pool: &SqlitePool, tenant: u8) {
+        sqlx::query("INSERT INTO v2_bootstrap_guards VALUES (?, ?, 'unused', NULL, 't')")
+            .bind(INSTANCE.as_slice())
+            .bind([tenant; 16].as_slice())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn set_guard(pool: &SqlitePool, tenant: u8, state: &str) {
+        sqlx::query("UPDATE v2_bootstrap_guards SET state = ? WHERE tenant_id = ?")
+            .bind(state)
+            .bind([tenant; 16].as_slice())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn guard(pool: &SqlitePool) -> (String, Option<String>) {
+        sqlx::query_as("SELECT state, recovery_reason FROM v2_bootstrap_guards")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn key_checks_follow_r4() {
         let (spk, hpk) = keys(3);
@@ -357,6 +402,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quarantine_ends_bootstrap_and_survives_a_later_revocation() {
+        let pool = pool().await;
+        insert_guard(&pool, 1).await;
+        let (_, hpk) = keys(5);
+        insert_device(&pool, 5, 5, "pending", signing_key_id(&hpk)).await;
+        assert_eq!(
+            run(&pool, &identity()).await.unwrap().quarantined_devices,
+            1
+        );
+        assert_eq!(
+            guard(&pool).await,
+            ("recovery_required".into(), Some("integrity_failure".into()))
+        );
+
+        // Revoked later, the device is not quarantined again: that second
+        // record would collide and stop the server at startup.
+        sqlx::query("UPDATE v2_devices SET status = 'revoked'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run(&pool, &identity()).await.unwrap().quarantined_devices,
+            0
+        );
+        assert_eq!(
+            status(&pool, 5).await,
+            ("revoked".into(), Some("key_id_mismatch".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_guard_whose_device_left_pending_goes_to_recovery() {
+        let pool = pool().await;
+        let (spk, hpk) = keys(4);
+        insert_device(&pool, 4, 4, "pending", hpke_key_id(&hpk)).await;
+        insert_guard(&pool, 1).await;
+        sqlx::query(
+            "INSERT INTO v2_first_device_confirmations
+                 (server_instance_id, tenant_id, confirmation_id, account_id, device_id,
+                  request_id, restore_epoch, confirmed_at_ms, signing_key_id, hpke_key_id,
+                  signing_public_key, hpke_public_key, signing_suite, hpke_suite, state)
+             VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, 1, 1, 'pending')",
+        )
+        .bind(INSTANCE.as_slice())
+        .bind([1u8; 16].as_slice())
+        .bind([3u8; 16].as_slice())
+        .bind([2u8; 16].as_slice())
+        .bind([4u8; 16].as_slice())
+        .bind([6u8; 16].as_slice())
+        .bind(signing_key_id(&spk).as_slice())
+        .bind(hpke_key_id(&hpk).as_slice())
+        .bind(spk.as_slice())
+        .bind(hpk.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        set_guard(&pool, 1, "reserved").await;
+        assert_eq!(run(&pool, &identity()).await.unwrap().guards_to_recovery, 0);
+
+        sqlx::query("UPDATE v2_devices SET status = 'revoked'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(run(&pool, &identity()).await.unwrap().guards_to_recovery, 1);
+        assert_eq!(
+            guard(&pool).await,
+            (
+                "recovery_required".into(),
+                Some("inconsistent_confirmation".into())
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn a_tenant_without_a_guard_is_never_unused() {
         let pool = pool().await;
         let report = run(&pool, &identity()).await.unwrap();
@@ -387,13 +506,10 @@ mod tests {
                     .await
                     .unwrap();
             }
-            sqlx::query("INSERT INTO v2_bootstrap_guards VALUES (?, ?, ?, NULL, 't')")
-                .bind(INSTANCE.as_slice())
-                .bind([tenant; 16].as_slice())
-                .bind(state)
-                .execute(&pool)
-                .await
-                .unwrap();
+            insert_guard(&pool, tenant).await;
+            if state != "unused" {
+                set_guard(&pool, tenant, state).await;
+            }
         }
         let report = run(&pool, &identity()).await.unwrap();
         assert_eq!(report.guards_to_recovery, 1);

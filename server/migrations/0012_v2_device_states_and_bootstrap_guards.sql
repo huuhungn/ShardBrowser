@@ -85,12 +85,21 @@ CREATE TABLE v2_device_quarantine (
 );
 INSERT INTO v2_device_quarantine
 SELECT tenant_id, id, 'legacy_unproven_active', 'active', signing_key_id, hpke_key_id,
-       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
   FROM v2_devices
  WHERE status = 'active';
 
 DROP TABLE v2_devices;
 ALTER TABLE v2_devices_new RENAME TO v2_devices;
+-- Dropping the old table dropped its index (0004).
+CREATE INDEX v2_devices_by_account ON v2_devices (tenant_id, account_id);
+
+-- R4: quarantining a device revokes its sessions in the same step.
+UPDATE v2_sessions SET revoked_at = strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+ WHERE revoked_at IS NULL
+   AND EXISTS (SELECT 1 FROM v2_device_quarantine q
+                WHERE q.tenant_id = v2_sessions.tenant_id
+                  AND q.device_id = v2_sessions.device_id);
 
 CREATE TRIGGER v2_device_quarantine_no_delete
 BEFORE DELETE ON v2_device_quarantine
@@ -99,12 +108,25 @@ BEGIN
 END;
 
 -- A quarantined device leaves quarantine only through a reviewed path that
--- does not exist yet, so for now it can only be revoked.
+-- does not exist yet, so for now it can only be revoked. Keyed on the
+-- quarantine record, not the old status, so revoking first is no way out.
 CREATE TRIGGER v2_devices_quarantine_is_final
 BEFORE UPDATE OF status ON v2_devices
-WHEN OLD.status = 'quarantined' AND NEW.status NOT IN ('quarantined', 'revoked')
+WHEN NEW.status IN ('pending', 'active')
+ AND (OLD.status = 'quarantined'
+      OR EXISTS (SELECT 1 FROM v2_device_quarantine q
+                  WHERE q.tenant_id = OLD.tenant_id AND q.device_id = OLD.id))
 BEGIN
     SELECT RAISE(ABORT, 'a quarantined device can only be revoked');
+END;
+
+-- REPLACE would delete the old row without firing the delete trigger.
+CREATE TRIGGER v2_device_quarantine_no_replace
+BEFORE INSERT ON v2_device_quarantine
+WHEN EXISTS (SELECT 1 FROM v2_device_quarantine q
+              WHERE q.tenant_id = NEW.tenant_id AND q.device_id = NEW.device_id)
+BEGIN
+    SELECT RAISE(ABORT, 'v2_device_quarantine rows are permanent');
 END;
 
 -- -------------------------------------------------------------- approvals ---
@@ -177,12 +199,31 @@ END;
 CREATE TRIGGER v2_bootstrap_guards_forward_only
 BEFORE UPDATE OF state ON v2_bootstrap_guards
 WHEN NOT (
-       (OLD.state = 'unused'   AND NEW.state IN ('reserved', 'closed', 'recovery_required'))
+       (OLD.state = 'unused'   AND NEW.state IN ('reserved', 'recovery_required'))
     OR (OLD.state = 'reserved' AND NEW.state IN ('consumed', 'closed', 'recovery_required'))
     OR (OLD.state IN ('consumed', 'closed') AND NEW.state = 'recovery_required')
 )
 BEGIN
     SELECT RAISE(ABORT, 'bootstrap guard transition not allowed');
+END;
+
+CREATE TRIGGER v2_bootstrap_guards_recovery_is_frozen
+BEFORE UPDATE ON v2_bootstrap_guards
+WHEN OLD.state = 'recovery_required'
+BEGIN
+    SELECT RAISE(ABORT, 'a guard in recovery_required is kept as found');
+END;
+
+-- A guard is born `unused` (tenant create) or `recovery_required`, and never
+-- replaces another: REPLACE would skip the delete and transition triggers.
+CREATE TRIGGER v2_bootstrap_guards_insert
+BEFORE INSERT ON v2_bootstrap_guards
+WHEN NEW.state NOT IN ('unused', 'recovery_required')
+  OR EXISTS (SELECT 1 FROM v2_bootstrap_guards g
+              WHERE g.server_instance_id = NEW.server_instance_id
+                AND g.tenant_id = NEW.tenant_id)
+BEGIN
+    SELECT RAISE(ABORT, 'a bootstrap guard is inserted once, unused or recovery_required');
 END;
 
 CREATE TRIGGER v2_bootstrap_guards_identity_is_fixed
@@ -213,7 +254,7 @@ SELECT s.server_instance_id, t.id,
              AND NOT EXISTS (SELECT 1 FROM v2_root_key_generations r WHERE r.tenant_id = t.id)
              AND NOT EXISTS (SELECT 1 FROM v2_tenant_root_key_grants r WHERE r.tenant_id = t.id)
             THEN NULL ELSE 'legacy_tenant' END,
-       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+       strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
   FROM v2_tenants t, v2_server_state s;
 
 -- ------------------------------------------------ first-device confirmation ---
@@ -283,6 +324,18 @@ BEFORE UPDATE OF server_instance_id, tenant_id, confirmation_id, account_id, dev
 ON v2_first_device_confirmations
 BEGIN
     SELECT RAISE(ABORT, 'a first-device confirmation subject never changes');
+END;
+
+-- A confirmation is born pending and never replaces another.
+CREATE TRIGGER v2_first_device_confirmations_insert
+BEFORE INSERT ON v2_first_device_confirmations
+WHEN NEW.state <> 'pending'
+  OR EXISTS (SELECT 1 FROM v2_first_device_confirmations c
+              WHERE (c.server_instance_id = NEW.server_instance_id AND c.tenant_id = NEW.tenant_id)
+                 OR (c.server_instance_id = NEW.server_instance_id
+                     AND c.confirmation_id = NEW.confirmation_id))
+BEGIN
+    SELECT RAISE(ABORT, 'a first-device confirmation is inserted once, pending');
 END;
 
 -- Only a pending row moves, once; a settled row (and its link) never changes.
