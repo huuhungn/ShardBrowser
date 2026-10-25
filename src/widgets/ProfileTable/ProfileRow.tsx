@@ -203,7 +203,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
             </div>
           )}
           <div className="mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap">
-            <span className="mono shrink-0 text-[10.5px] text-text-disabled-300">{p.id.slice(0, 8)}</span>
+            <span className="mono shrink-0 text-[11px] text-text-soft-400">{p.id.slice(0, 8)}</span>
             {p.tags.length > 0 && (
               <span
                 className="row-tags flex min-w-0 items-center gap-1 overflow-hidden"
@@ -246,7 +246,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
                     <span className="inline-block rounded-4 bg-bg-weak-50 px-1.5 py-0.5 text-[10.5px] font-bold tracking-[0.5px] text-text-sub-600">{proxy.country}</span>
                   </>
                 )}
-                <span className="mono small text-text-sub-600">{proxy.host}:{proxy.port}</span>
+                <span className="mono small min-w-0 truncate text-text-sub-600" title={`${proxy.host}:${proxy.port}`}>{proxy.host}:{proxy.port}</span>
               </span>
             </div>
           ) : <span className="text-paragraph-xs text-text-soft-400">{t("profileTable.direct")}</span>}
@@ -267,7 +267,7 @@ export function ProfileRow({ profile, proxy, onMenu }: {
             })()}
           </span>
         </div>
-        <div className="cell-lastrun"><span className="text-paragraph-xs text-text-soft-400">{p.last_launched_at ? fmtTs(p.last_launched_at) : "never"}</span></div>
+        <div className="cell-lastrun"><span className="text-paragraph-xs text-text-soft-400">{p.last_launched_at ? fmtTs(p.last_launched_at) : t("profileTable.never")}</span></div>
         <ProfileRowActions
           profile={p}
           onMore={(e) => { e.stopPropagation(); onMenu(e, menu()); }}

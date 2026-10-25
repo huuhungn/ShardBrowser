@@ -523,6 +523,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return "";
 
     // v2 list endpoints: empty is a valid, uninteresting fixture state.
+    case "automation_list":
     case "bookmark_list":
     case "extension_list":
     case "trash_list":

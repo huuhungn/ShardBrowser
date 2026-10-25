@@ -596,3 +596,73 @@ test("selecting profiles does not move the table at 1280px", async ({ page }) =>
   await expect(page.getByRole("button", { name: /Launch synced/ })).toBeVisible();
   expect(await top()).toBe(before);
 });
+
+// Every row is its own CSS grid, so an `auto` actions track sized by its own
+// buttons lets the header (whose actions cell is empty) lay out differently.
+async function columnLefts(page: Page, grid: string) {
+  return page.evaluate((selector) =>
+    [...document.querySelectorAll(selector)].map((row) =>
+      [...row.children]
+        .filter((cell) => getComputedStyle(cell).display !== "none")
+        .map((cell) => Math.round(cell.getBoundingClientRect().left)),
+    ), grid);
+}
+
+for (const width of [2560, 2200, 1720, 1500, 1296, 1024, 900]) {
+  test(`table headers stay over their columns at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 860 });
+    await gotoMocked(page);
+    await expect(page.getByText("Beta Research")).toBeVisible();
+    const [head, ...rows] = await columnLefts(page, ".t-cols");
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row).toEqual(head);
+
+    await page.getByRole("button", { name: "Proxies" }).click();
+    await expect(page.getByText("US Sanitize 1")).toBeVisible();
+    const [proxyHead, ...proxyRows] = await columnLefts(page, ".p-cols");
+    expect(proxyRows.length).toBeGreaterThan(0);
+    for (const row of proxyRows) expect(row).toEqual(proxyHead);
+  });
+}
+
+test("a start in progress keeps the columns aligned on a 2560px screen", async ({ page }) => {
+  // The root font is 16px here, so "Cancel" is the widest label the Start button shows.
+  await page.setViewportSize({ width: 2560, height: 1200 });
+  await gotoMocked(page, "/?e2e=slow-launch");
+  const start = page.getByRole("button", { name: "Start profile VN Automation 001 - No Proxy" });
+  await start.click();
+  await expect(start).toHaveText("Cancel");
+  const [head, ...rows] = await columnLefts(page, ".t-cols");
+  for (const row of rows) expect(row).toEqual(head);
+  await start.click();
+  await expect(start).toHaveText("Start");
+});
+
+test("the page header keeps its place on pages without a search box", async ({ page }) => {
+  await gotoMocked(page);
+  const heading = page.getByRole("heading", { level: 1 });
+  await expect(heading).toHaveText("Browsers");
+  await expect(page.getByRole("button", { name: "Browsers" })).toHaveAttribute("aria-current", "page");
+
+  const tops: number[] = [];
+  // Extensions and Automation have a search box; Trash, Fingerprints and Settings do not.
+  for (const [name, title] of [["Extensions", "Extensions"], ["Trash", "Trash"], ["Fingerprints", "Fingerprint Library"], ["Automation", "Automation"], ["Settings", "Settings"]]) {
+    await page.getByRole("button", { name, exact: true }).click();
+    await expect(heading).toHaveText(title);
+    await expect(page.getByRole("button", { name, exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(page.getByRole("button", { name: "Browsers" })).not.toHaveAttribute("aria-current", "page");
+    tops.push(Math.round((await heading.boundingBox())!.y));
+  }
+  expect(new Set(tops).size).toBe(1);
+});
+
+test("empty states read in the chosen language", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("shardx.lang", "vi"));
+  await gotoMocked(page, "/?e2e=proxies-empty");
+  // The folder tab that lists every profile used to say "All" in every language.
+  await expect(page.getByRole("button", { name: /^Tất cả/ })).toBeVisible();
+  await page.getByRole("button", { name: "Proxy", exact: true }).click();
+  await expect(page.getByText("Thêm một máy chủ SOCKS5/HTTP(S) để hồ sơ đi qua nó.")).toBeVisible();
+  await page.getByRole("button", { name: "Vân tay" }).click();
+  await expect(page.getByRole("heading", { name: "Chưa có vân tay nào" })).toBeVisible();
+});

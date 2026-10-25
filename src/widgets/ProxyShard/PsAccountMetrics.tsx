@@ -9,7 +9,7 @@ export function PsAccountMetrics() {
   const connected = usePsConnected();
 
   return (
-    <div className="mb-4 grid grid-cols-2 gap-[10px] [@media(min-width:1100px)]:grid-cols-4">
+    <div className="mb-4 grid grid-cols-3 gap-[10px]">
       <Metric label={t("ps.account")} value={connected ? t("ps.connected") : "—"} accent={connected} pulse={connected} />
       <Metric label={t("ps.balance")} value={me ? fmtCents(me.wallet_balance) : "—"} />
       <Metric label={t("ps.activeOrders")} value={me ? String(me.active_orders) : "—"} />

@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Button } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useStoreChanged } from "../../shared/hooks/useStoreChanged";
 import Badge from "../../shared/ui/Badge";
 import { DeleteIcon, NavTrashIcon, RestoreIcon } from "../../shared/icons";
@@ -63,7 +64,7 @@ export function TrashPage() {
             >
               <div className="min-w-0">
                 <div className="truncate text-label-xs text-text-strong-950">{e.name}</div>
-                <div className="mono truncate text-[10.5px] text-text-disabled-300">{e.id.slice(0, 8)}</div>
+                <div className="mono truncate text-[11px] text-text-soft-400">{e.id.slice(0, 8)}</div>
               </div>
               <div className="truncate text-paragraph-xs text-text-sub-600">
                 {e.folder || <span className="text-text-soft-400">—</span>}
@@ -96,15 +97,7 @@ export function TrashPage() {
           );
         })}
         {items.length === 0 && (
-          <div className="flex flex-col items-center gap-2.5 px-6 py-14 text-center">
-            <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-              <NavTrashIcon className="size-6" />
-            </div>
-            <h3 className="m-0 text-label-sm text-text-strong-950">{t("trash.none.title")}</h3>
-            <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-              {t("trash.none.body")}
-            </p>
-          </div>
+          <EmptyState icon={<NavTrashIcon className="size-6" />} title={t("trash.none.title")} body={t("trash.none.body")} />
         )}
       </div>
     </section>

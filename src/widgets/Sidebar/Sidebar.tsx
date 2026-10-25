@@ -88,6 +88,7 @@ export function Sidebar() {
                     ? "bg-primary-alpha-10 text-primary-base"
                     : "bg-transparent text-text-sub-600 hover:bg-bg-weak-50 hover:text-text-strong-950",
                 )}
+                aria-current={section === it.id ? "page" : undefined}
                 onClick={() => setSection(it.id)}
               >
                 <span

@@ -36,7 +36,7 @@ export function Topbar({ crumbs, search = "", onSearch }: {
   }, [searchable]);
 
   return (
-    <div className="mb-4 flex items-center justify-between gap-4">
+    <div className="mb-4 flex min-h-[32px] items-center justify-between gap-4">
       <Breadcrumb items={crumbs.map((c) => ({ label: c }))} />
       {searchable && (
       <div className="w-[320px]">

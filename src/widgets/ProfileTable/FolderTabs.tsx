@@ -79,7 +79,7 @@ export function FolderTabs() {
           if (id) setProfileFolder(id, ""); // "" = unassign folder
         }}
       >
-        All<span className={badge(folder === "all")}>{profiles.length}</span>
+        {t("profile.all")}<span className={badge(folder === "all")}>{profiles.length}</span>
       </button>
       {folders.map((f) => (
         <button
