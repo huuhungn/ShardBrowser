@@ -3,6 +3,11 @@ pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Unix time in milliseconds, the unit of every v2 `*_ms` column.
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
 /// Fresh UUID v4 string — used for every primary key.
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()

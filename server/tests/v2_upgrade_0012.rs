@@ -45,18 +45,23 @@ async fn memory() -> SqlitePool {
         .unwrap()
 }
 
-/// A database migrated through 0011, the schema 0012 upgrades.
-async fn before_0012() -> SqlitePool {
-    let pool = memory().await;
+/// Applies the migrations up to `version`.
+async fn migrate_through(pool: &SqlitePool, version: i64) {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.migrations = Cow::Owned(
         migrator
             .iter()
-            .filter(|m| m.version <= 11)
+            .filter(|m| m.version <= version)
             .cloned()
             .collect(),
     );
-    run_migrations_with(&pool, &migrator).await.unwrap();
+    run_migrations_with(pool, &migrator).await.unwrap();
+}
+
+/// A database migrated through 0011, the schema 0012 upgrades.
+async fn before_0012() -> SqlitePool {
+    let pool = memory().await;
+    migrate_through(&pool, 11).await;
     pool
 }
 
@@ -190,7 +195,8 @@ async fn upgrade_quarantines_legacy_active_devices_and_seeds_guards() {
                    FROM v2_devices ORDER BY id";
     let before: Vec<String> = sqlx::query_scalar(carried).fetch_all(&pool).await.unwrap();
 
-    run_migrations(&pool).await.unwrap();
+    // Through 0012 only: 0013 rebuilds v2_sessions, whose 0012 effect is checked here.
+    migrate_through(&pool, 12).await;
 
     // Every column but status is carried over unchanged.
     let after: Vec<String> = sqlx::query_scalar(carried).fetch_all(&pool).await.unwrap();
