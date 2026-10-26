@@ -2723,6 +2723,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "libappindicator"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4567,6 +4576,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "jsonwebtoken",
+ "keyring-core",
  "libc",
  "minisign-verify",
  "pbkdf2",
@@ -4598,7 +4608,9 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
+ "windows-native-keyring-store",
  "windows-sys 0.59.0",
+ "zeroize",
  "zip 9.0.5",
 ]
 
@@ -6553,6 +6565,19 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-native-keyring-store"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
+dependencies = [
+ "byteorder",
+ "keyring-core",
+ "regex",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
 
 [[package]]
 name = "windows-numerics"
