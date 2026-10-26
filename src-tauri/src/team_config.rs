@@ -69,8 +69,11 @@ impl TeamConfig {
 
     /// The device signing key, if enrolled.
     pub fn signing_key(&self) -> Result<Ed25519SigningKey> {
-        let seed = seed(&self.signing_key_seed, &self.signing_credential_ref)
-            .context(crate::errcode::code("teamConfig.signingKeyCorrupt"))?;
+        let seed = seed(
+            &self.signing_key_seed,
+            &self.signing_credential_ref,
+            "teamConfig.signingKeyCorrupt",
+        )?;
         Ok(Ed25519SigningKey::from_bytes(&seed))
     }
 
@@ -79,9 +82,12 @@ impl TeamConfig {
     /// half registered server-side but no private half here, so they cannot
     /// open grants and must re-enroll.
     pub fn hpke_seed(&self) -> Result<[u8; 32]> {
-        seed(&self.hpke_key_seed, &self.hpke_credential_ref)
-            .map(|s| *s)
-            .context(crate::errcode::code("teamConfig.hpkeKeyUnusable"))
+        seed(
+            &self.hpke_key_seed,
+            &self.hpke_credential_ref,
+            "teamConfig.hpkeKeyUnusable",
+        )
+        .map(|s| *s)
     }
 
     /// Whether this device can open grants sealed to it.
@@ -93,11 +99,15 @@ impl TeamConfig {
 
 /// A seed from the file while it is still there, else from the credential
 /// store. The file copy is the newer one: a seed leaves it only once stored.
-fn seed(plaintext: &str, credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
+/// A store error is reported as it is (a locked key file is not a corrupt
+/// key); only an unreadable file copy is `corrupt`.
+fn seed(plaintext: &str, credential_ref: &str, corrupt: &str) -> Result<Zeroizing<[u8; 32]>> {
     if plaintext.is_empty() && !credential_ref.is_empty() {
         crate::credential::load(credential_ref)
     } else {
-        decode_hex32(plaintext).map(Zeroizing::new)
+        decode_hex32(plaintext)
+            .map(Zeroizing::new)
+            .context(crate::errcode::code(corrupt))
     }
 }
 
@@ -169,6 +179,11 @@ pub struct TeamStatus {
     /// False while a seed or fleet key is still in plaintext on disk because
     /// no store was usable (ADR 0004, unavailable store).
     pub keys_protected: bool,
+    /// Whether this device has a passphrase-protected key file.
+    pub has_key_file: bool,
+    /// Whether that file exists but was not opened in this run, so keys kept
+    /// in it cannot be used until the passphrase is entered.
+    pub keys_locked: bool,
 }
 
 pub fn load() -> Result<TeamConfig> {
@@ -209,6 +224,8 @@ pub fn status() -> Result<TeamStatus> {
             && c.hpke_key_seed.is_empty()
             && crate::fleet_keys::load()
                 .is_ok_and(|s| s.fleets.values().all(|f| f.keys.is_empty())),
+        has_key_file: crate::key_file::exists(),
+        keys_locked: crate::key_file::exists() && !crate::key_file::is_open(),
     })
 }
 

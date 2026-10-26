@@ -324,7 +324,7 @@ fn stored_payload(
 
 /// Writes `bytes` over `path` so a crash leaves the old file or the new one:
 /// a synced sibling `<path>.tmp`, owner-only on Unix, renamed into place.
-fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");

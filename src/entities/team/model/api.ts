@@ -30,6 +30,17 @@ export const teamEnrollDevice = (label: string, username: string, password: stri
 export const teamCollectCustody = () =>
   invoke<CustodyResult>("team_collect_custody");
 
+/**
+ * Create the passphrase-protected key file for a device whose OS credential
+ * store cannot hold its keys, and move the keys into it.
+ */
+export const teamKeysCreateFile = (passphrase: string) =>
+  invoke<TeamStatus>("team_keys_create_file", { passphrase });
+
+/** Open the key file for this run, so the keys in it can be used. */
+export const teamKeysUnlock = (passphrase: string) =>
+  invoke<TeamStatus>("team_keys_unlock", { passphrase });
+
 /** How far this device's first-device custody setup got. */
 export const teamCustodyBootstrapStatus = () =>
   invoke<CustodyBootstrapStatus>("team_custody_bootstrap_status");

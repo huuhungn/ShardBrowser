@@ -253,6 +253,43 @@ test("an interrupted custody setup resumes at its saved bundle without asking fo
   await expect(page.locator("html")).not.toHaveAttribute("data-e2e-save-dialogs", /.+/);
 });
 
+test("keys the credential store refused move into a key file once both passphrases agree", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-first-device-resume");
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  const card = page.getByTestId("keys-unprotected");
+  await card.getByLabel("Key file passphrase", { exact: true }).fill("correct horse");
+  await card.getByLabel("Key file passphrase again").fill("correct horsf");
+  await card.getByRole("button", { name: "Protect with a passphrase" }).click();
+  await expect(page.getByText("The two passphrases differ")).toBeVisible();
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-key-files", /.+/);
+
+  await card.getByLabel("Key file passphrase again").fill("correct horse");
+  await card.getByRole("button", { name: "Protect with a passphrase" }).click();
+  await expect(page.getByText("The keys are now in the encrypted key file.")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-key-files", "1");
+  await expect(page.getByTestId("keys-unprotected")).toHaveCount(0);
+});
+
+test("locked keys open with the key file passphrase and stay locked with a wrong one", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-keys-locked");
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  const card = page.getByTestId("keys-locked");
+  await expect(card).toContainText("locked in its key file");
+  await card.getByLabel("Key file passphrase").fill("wrong horse");
+  await card.getByRole("button", { name: "Unlock keys" }).click();
+  await expect(page.getByText("That is not the key file passphrase.")).toBeVisible();
+  await expect(page.getByTestId("keys-locked")).toBeVisible();
+  await expect(card.getByLabel("Key file passphrase")).toHaveValue("");
+
+  await card.getByLabel("Key file passphrase").fill("correct horse");
+  await card.getByRole("button", { name: "Unlock keys" }).click();
+  await expect(page.getByText("Keys unlocked for this session.")).toBeVisible();
+  await expect(page.getByTestId("keys-locked")).toHaveCount(0);
+  await expect(page.getByTestId("keys-unprotected")).toHaveCount(0);
+});
+
 test("choosing a language translates what has been moved into locales", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Settings" }).click();
