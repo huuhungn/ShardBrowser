@@ -60,8 +60,9 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
     if !bin.exists() {
         return None;
     }
-    // Distinct from the enrollment test's range so the two can run together.
-    let port = 41900 + (std::process::id() % 300) as u16 + slot * 400;
+    // Distinct from the enrollment test's range so the two can run together,
+    // and below the Linux ephemeral range (32768+) so no client socket holds it.
+    let port = 24900 + (std::process::id() % 300) as u16 + slot * 400;
     let data_dir = std::env::temp_dir().join(format!("shardx-sync-it-{port}"));
     let identity_dir = std::env::temp_dir().join(format!("shardx-sync-it-{port}-identity"));
     let _ = std::fs::remove_dir_all(&data_dir);

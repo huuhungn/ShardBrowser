@@ -19,6 +19,8 @@ use shardx_team_server::identity_record::{external_record_sha256, IdentityRecord
 use shared::canonical as c;
 use shared::signing::{build_signed_container, identity_key_id, Ed25519SigningKey};
 
+// Test ports are fixed at 28xxx: below the Linux ephemeral range (32768+),
+// where a parallel test's client socket could already hold them.
 fn base(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -224,7 +226,7 @@ async fn admin_user_id(c: &reqwest::Client, port: u16, tok: &str) -> String {
 
 #[tokio::test]
 async fn a_v1_token_cannot_file_a_capability_grant() {
-    let port = 38111u16;
+    let port = 28111u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -247,7 +249,7 @@ async fn a_v1_token_cannot_file_a_capability_grant() {
 
 #[tokio::test]
 async fn v2_operations_replay_the_stored_response() {
-    let port = 38112u16;
+    let port = 28112u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2op-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -332,7 +334,7 @@ async fn v2_operations_replay_the_stored_response() {
 /// verifier reads — and must not hand them to an unauthenticated caller.
 #[tokio::test]
 async fn server_identity_reports_the_values_records_bind_to() {
-    let port = 38113u16;
+    let port = 28113u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-v2id-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -379,7 +381,7 @@ async fn server_identity_reports_the_values_records_bind_to() {
 /// builder through the real HTTP commit path to prove the two agree.
 #[tokio::test]
 async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
-    let port = 38114u16;
+    let port = 28114u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-manifest-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -582,7 +584,7 @@ async fn seed_profile(data: &std::path::Path, fleet: &[u8; 16], profile: &[u8; 1
 /// exact attack: same signed manifest, mismatched body.
 #[tokio::test]
 async fn a_body_that_contradicts_the_signed_manifest_is_refused() {
-    let port = 38115u16;
+    let port = 28115u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-mismatch-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -730,7 +732,7 @@ async fn a_body_that_contradicts_the_signed_manifest_is_refused() {
 /// signature, so the tenant boundary has to be enforced by the handler.
 #[tokio::test]
 async fn a_member_outside_the_tenant_cannot_lease_its_profiles() {
-    let port = 38117u16;
+    let port = 28117u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-crosstenant-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -794,7 +796,7 @@ async fn a_member_outside_the_tenant_cannot_lease_its_profiles() {
 /// real holder would be attributed to whoever registered it first.
 #[tokio::test]
 async fn device_enrollment_requires_proof_of_possession() {
-    let port = 38118u16;
+    let port = 28118u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-enroll-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -988,7 +990,7 @@ async fn prove_enrollment(
 
 #[tokio::test]
 async fn duplicate_hpke_keys_are_rejected_across_enrollment_versions() {
-    let port = 38138u16;
+    let port = 28138u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-hpke-upgrade-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -1319,7 +1321,7 @@ async fn fleet_fixture(
 /// receiving device cannot reconstruct byte for byte is silent data loss.
 #[tokio::test]
 async fn a_fleet_key_grant_round_trips_to_its_device() {
-    let port = 38131u16;
+    let port = 28131u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-rt-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -1415,7 +1417,7 @@ async fn a_fleet_key_grant_round_trips_to_its_device() {
 /// be unwrapped. Activating early advertises a key nothing can open.
 #[tokio::test]
 async fn a_fleet_generation_cannot_activate_without_a_self_grant() {
-    let port = 38132u16;
+    let port = 28132u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-act-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -1473,7 +1475,7 @@ async fn a_fleet_generation_cannot_activate_without_a_self_grant() {
 /// refused, or a device could be handed a key that decrypts nothing.
 #[tokio::test]
 async fn a_fleet_grant_wrapping_a_different_key_is_refused() {
-    let port = 38133u16;
+    let port = 28133u16;
     let data =
         std::env::temp_dir().join(format!("shardx-e2e-fleet-mismatch-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
@@ -1533,7 +1535,7 @@ async fn a_fleet_grant_wrapping_a_different_key_is_refused() {
 /// then may the generation activate.
 #[tokio::test]
 async fn the_first_fleet_grant_must_be_a_unique_self_grant() {
-    let port = 38134u16;
+    let port = 28134u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-first-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
@@ -1662,7 +1664,7 @@ async fn the_first_fleet_grant_must_be_a_unique_self_grant() {
 /// grant for an unrelated purpose could collect the key that opens snapshots.
 #[tokio::test]
 async fn a_fleet_grant_claiming_another_capability_is_refused() {
-    let port = 38137u16;
+    let port = 28137u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fleet-cap-{}", std::process::id()));
     let _guard = spawn_server(&data, port).await;
     let cl = client();
