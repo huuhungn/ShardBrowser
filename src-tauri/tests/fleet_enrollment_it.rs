@@ -702,6 +702,10 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         "the bundle's path is kept"
     );
     assert_eq!(done.create_request, resumed.create_request);
+    assert_eq!(
+        done.anchor, signing_key_id,
+        "the trust evidence verified to this device as the anchor"
+    );
 
     let active: serde_json::Value = reqwest::Client::new()
         .get(format!(

@@ -231,6 +231,8 @@ test("the first device sets up root custody once its passphrases agree", async (
   await expect(page.getByText("Root custody is set up")).toBeVisible();
   await expect(page.locator("html")).toHaveAttribute("data-e2e-custody-path", "C:\\Users\\Example\\shardx-recovery.shxrecovery");
   await expect(page.getByTestId("custody-bootstrap")).toHaveCount(0);
+  await expect(page.getByText("Bootstrap anchor")).toBeVisible();
+  await expect(page.locator(`input[value="${"a0".repeat(32)}"]`)).toBeVisible();
 });
 
 test("an interrupted custody setup resumes at its saved bundle without asking for a path", async ({ page }) => {

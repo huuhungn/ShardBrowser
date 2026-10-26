@@ -28,6 +28,8 @@ export type CustodyBootstrapStatus = {
   activated: boolean;
   /** Where the recovery bundle was written; empty until it was. */
   recovery_path: string;
+  /** The bootstrap anchor the trust evidence verified to; empty until then. */
+  anchor: string;
 };
 
 /** What `team_collect_custody` found waiting on the server. */

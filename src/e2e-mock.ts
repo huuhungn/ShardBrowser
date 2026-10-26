@@ -200,8 +200,8 @@ if (scenario === "folder-empty") {
 // setup. The bootstrap itself is the backend's; the card only drives it.
 const firstDevice = scenario === "team-first-device" || scenario === "team-first-device-resume";
 let custodyBootstrap = scenario === "team-first-device-resume"
-  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery" }
-  : { started: false, activated: false, recovery_path: "" };
+  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
+  : { started: false, activated: false, recovery_path: "", anchor: "" };
 
 mockIPC(async (cmd: string, payload?: InvokeArgs) => {
   if (
@@ -581,6 +581,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         started: true,
         activated: true,
         recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
+        anchor: "a0".repeat(32),
       };
       return custodyBootstrap;
     }
