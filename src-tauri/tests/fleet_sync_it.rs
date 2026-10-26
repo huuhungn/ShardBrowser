@@ -28,7 +28,12 @@ impl Drop for TestServer {
     }
 }
 
+/// The server built by `cargo build --manifest-path ../server/Cargo.toml`, or
+/// the one `SHARDX_TEAM_SERVER_BIN` names when it was built elsewhere.
 fn server_binary() -> std::path::PathBuf {
+    if let Some(bin) = std::env::var_os("SHARDX_TEAM_SERVER_BIN") {
+        return bin.into();
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")

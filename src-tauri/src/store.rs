@@ -151,6 +151,13 @@ pub fn fleet_keys_path() -> Result<PathBuf> {
     Ok(config_root()?.join("fleet-keys.json"))
 }
 
+/// Where the first-device custody bootstrap keeps its exact requests and the
+/// tenant root key between attempts. Separate from `team.json` for the same
+/// reason as the fleet keys.
+pub fn custody_bootstrap_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("custody-bootstrap.json"))
+}
+
 pub fn psapi_path() -> Result<PathBuf> {
     Ok(config_root()?.join("psapi.json"))
 }

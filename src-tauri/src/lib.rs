@@ -19,6 +19,7 @@ mod hermes_mcp;
 pub mod http_session;
 mod launch;
 mod profile_icon;
+pub mod root_bootstrap;
 pub mod runner;
 pub mod traffic;
 

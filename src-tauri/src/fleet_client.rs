@@ -303,6 +303,16 @@ impl FleetClient {
             .context(crate::errcode::code("fleet.badReplyLogin"))
     }
 
+    /// Ends a device session. Best effort: it expires on its own.
+    pub async fn end_session(&self, access_token: &str) {
+        let _ = self
+            .http
+            .post(self.url("/v2/auth/logout"))
+            .bearer_auth(access_token)
+            .send()
+            .await;
+    }
+
     /// Ends a ticket that served one step. Best effort: it expires in ten
     /// minutes regardless.
     async fn end_ticket(&self, ticket: &Ticket) {
@@ -408,6 +418,117 @@ impl FleetClient {
             .json()
             .await
             .context(crate::errcode::code("fleet.badReplySession"))
+    }
+
+    /// POSTs exact CBOR bytes under a device session and returns the exact
+    /// response bytes. Custody routes take and answer canonical CBOR.
+    async fn post_cbor(&self, path: &str, access_token: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let res = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(access_token)
+            .header("content-type", "application/cbor")
+            .body(body.to_vec())
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableCustody"))?;
+        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyCustody"))?;
+        Ok(body.to_vec())
+    }
+
+    /// D1: files this device's approval of itself (ADR 0001 D1). Returns the
+    /// exact `DeviceApprovalReceiptV2` bytes.
+    pub async fn approve_device(
+        &self,
+        access_token: &str,
+        device_id: &str,
+        approval_container: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/devices/{device_id}/approve"),
+            access_token,
+            approval_container,
+        )
+        .await
+    }
+
+    /// Creates a root key generation. Returns the exact stored response.
+    pub async fn create_root_generation(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/tenants/{tenant_id}/root-key-generations"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Reads one root grant back as its exact `TenantRootGrantDescriptorV2`.
+    pub async fn read_root_grant(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        replay_id: &str,
+    ) -> Result<Vec<u8>> {
+        let res = self
+            .http
+            .get(self.url(&format!(
+                "/v2/tenants/{tenant_id}/root-key-generations/{generation}/grants/{replay_id}"
+            )))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableCustody"))?;
+        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyCustody"))?;
+        Ok(body.to_vec())
+    }
+
+    /// Acknowledges one root grant. Returns the exact stored response.
+    pub async fn ack_root_grant(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        replay_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!(
+                "/v2/tenants/{tenant_id}/root-key-generations/{generation}/grants/{replay_id}/ack"
+            ),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Activates a root key generation. Returns the exact stored response.
+    pub async fn activate_root_generation(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/tenants/{tenant_id}/root-key-generations/{generation}/activate"),
+            access_token,
+            request,
+        )
+        .await
     }
 
     /// Rotates a device session's tokens. The old refresh token is spent:
@@ -883,7 +1004,7 @@ fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -893,11 +1014,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
+pub(crate) fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
         bail!(crate::errcode::code_with(
             "fleet.malformedHex32",

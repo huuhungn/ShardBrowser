@@ -124,13 +124,13 @@ pub fn save(s: &FleetKeyStore) -> Result<()> {
 /// bits. A best-effort call: failure to tighten permissions must not lose the
 /// key that was just collected.
 #[cfg(unix)]
-fn restrict(path: &std::path::Path) {
+pub(crate) fn restrict(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &std::path::Path) {}
+pub(crate) fn restrict(_path: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
