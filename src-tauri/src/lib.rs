@@ -2322,6 +2322,60 @@ async fn ps_set_tag(id: i64, tag: String) -> Result<Value, String> {
     .map_err(|e| e.to_string())
 }
 
+/// How far this device's first-device custody bootstrap got.
+#[tauri::command]
+fn team_custody_bootstrap_status() -> Result<root_bootstrap::BootstrapStatus, String> {
+    root_bootstrap::status().map_err(|e| e.to_string())
+}
+
+/// Bootstrap root custody as the tenant's first device, or resume it.
+///
+/// The operator confirms this device first (`tenant confirm-first-device`).
+/// The recovery bundle goes to `recovery_path`, sealed under `passphrase`;
+/// a resumed run keeps the path of the bundle it already wrote and needs the
+/// same passphrase. The password is used for one login and never stored.
+#[tauri::command]
+async fn team_bootstrap_custody(
+    username: String,
+    password: String,
+    recovery_path: String,
+    passphrase: String,
+) -> Result<root_bootstrap::BootstrapStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if !c.can_receive_custody() {
+        return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let hpke_seed = c.hpke_seed().map_err(|e| e.to_string())?;
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let device = root_bootstrap::BootstrapDevice {
+        login: fleet_client::AccountLogin {
+            tenant_id: &c.tenant_id,
+            username: username.trim(),
+            password: &password,
+        },
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &hpke_seed,
+    };
+    root_bootstrap::run(
+        &client,
+        &device,
+        std::path::Path::new(&recovery_path),
+        &passphrase,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Collect the root key grants issued to this device and report what opened.
 ///
 /// The tenant root key itself is never returned to the caller: this reports
@@ -2582,6 +2636,8 @@ pub fn run() {
             profile_delete,
             team_status,
             team_collect_custody,
+            team_custody_bootstrap_status,
+            team_bootstrap_custody,
             team_set_connection,
             team_test_connection,
             team_enroll_device,

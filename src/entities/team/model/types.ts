@@ -21,6 +21,15 @@ export type TeamStatus = {
   has_fleet_key: boolean;
 };
 
+/** How far `team_bootstrap_custody` got; none of its secrets. */
+export type CustodyBootstrapStatus = {
+  /** Some step ran, so the next attempt resumes rather than starts over. */
+  started: boolean;
+  activated: boolean;
+  /** Where the recovery bundle was written; empty until it was. */
+  recovery_path: string;
+};
+
 /** What `team_collect_custody` found waiting on the server. */
 export type CustodyResult = {
   /** Grants the server holds for this device. */
