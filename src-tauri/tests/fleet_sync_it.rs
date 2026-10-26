@@ -492,7 +492,7 @@ async fn two_devices_share_a_profile_through_the_fleet_key_without_a_passphrase(
         "the server must return the exact sealed bytes"
     );
 
-    shardx_core::backup_file::open_profile_with_fkek(&pulled, &dir_b, &fkek)
+    shardx_core::backup_file::open_profile_with_fkek(&pulled, &dir_b, &fkek, "shared")
         .expect("device B opens the snapshot with the fleet key, with no passphrase");
 
     let restored = std::fs::read(dir_b.join("Default").join("Preferences")).expect("restored file");
@@ -505,8 +505,13 @@ async fn two_devices_share_a_profile_through_the_fleet_key_without_a_passphrase(
     let outsider = std::env::temp_dir().join(format!("shardx-outsider-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&outsider);
     assert!(
-        shardx_core::backup_file::open_profile_with_fkek(&pulled, &outsider, &[0x5Du8; 32])
-            .is_err(),
+        shardx_core::backup_file::open_profile_with_fkek(
+            &pulled,
+            &outsider,
+            &[0x5Du8; 32],
+            "shared"
+        )
+        .is_err(),
         "a device without this fleet's key must not be able to open the snapshot"
     );
 

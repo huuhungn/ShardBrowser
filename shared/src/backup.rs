@@ -189,6 +189,9 @@ pub struct OpenOutcome {
     pub signed_head_hash: [u8; 32],
     pub frame_count: u32,
     pub plaintext_len: u64,
+    /// The intent's `profile_id`, so a caller can refuse a container sealed
+    /// for another profile.
+    pub profile_id: [u8; 16],
 }
 
 // -------------------------------------------------------------------- seal ----
@@ -637,12 +640,18 @@ pub fn open(
         return Err(BackupError::MalformedContainer("prologue intent mismatch"));
     }
 
+    // Authenticated: the signed head commits to these exact intent bytes.
+    let profile_id: [u8; 16] = field_bytes(&intent_v, "profile_id")
+        .and_then(|b| b.as_slice().try_into().ok())
+        .ok_or(BackupError::MalformedContainer("intent profile_id"))?;
+
     out.flush()?;
     Ok(OpenOutcome {
         intent_hash,
         signed_head_hash,
         frame_count,
         plaintext_len,
+        profile_id,
     })
 }
 
