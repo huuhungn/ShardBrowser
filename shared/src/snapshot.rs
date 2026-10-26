@@ -403,8 +403,19 @@ fn build_staging(bytes: &[u8], udd: &Path, staging: &Path) -> Result<PortableSta
             continue;
         }
         let out = safe_join(staging, &rel)?;
+        // A second entry for a path already unpacked, in any spelling this
+        // filesystem treats as the same name (case on Windows and macOS), or a
+        // file where a directory is, would silently replace or merge what came
+        // first (G2-51). Only a directory may repeat, and only as a directory.
+        if let Ok(meta) = std::fs::symlink_metadata(&out) {
+            if !(meta.is_dir() && et.is_dir()) {
+                bail!("snapshot has two entries for one path — refusing: {rel}");
+            }
+        }
         if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("snapshot puts an entry under a file — refusing: {rel}")
+            })?;
         }
         e.unpack(&out)?;
     }
@@ -1094,6 +1105,85 @@ mod tests {
             !dst.join("Default/evil").symlink_metadata().is_ok(),
             "symlink must be rejected"
         );
+    }
+
+    /// A gzipped tar with the portable state first, then `entries` as
+    /// `(path, is_dir)`; files hold one byte.
+    fn crafted(entries: &[(&str, bool)]) -> Vec<u8> {
+        let state = br#"{"cookies":[],"logins":[]}"#;
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(state.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, PORTABLE_FILE, &state[..]).unwrap();
+        for (path, is_dir) in entries {
+            let mut h = tar::Header::new_gnu();
+            if *is_dir {
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(0o755);
+                h.set_cksum();
+                tar.append_data(&mut h, path, std::io::empty()).unwrap();
+            } else {
+                h.set_size(1);
+                h.set_mode(0o644);
+                h.set_cksum();
+                tar.append_data(&mut h, path, &b"x"[..]).unwrap();
+            }
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn unpack_fresh(name: &str, bytes: &[u8]) -> Result<PortableState> {
+        let base = std::env::temp_dir().join(format!("shardx-snap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let result = unpack(bytes, &base.join("dst"));
+        let _ = std::fs::remove_dir_all(&base);
+        result
+    }
+
+    #[test]
+    fn unpack_rejects_two_entries_for_one_path() {
+        let refused = [
+            ("dup-file", vec![("Default/a", false), ("Default/a", false)]),
+            (
+                "file-then-dir",
+                vec![("Default/a", false), ("Default/a/", true)],
+            ),
+            (
+                "dir-then-file",
+                vec![("Default/a/", true), ("Default/a", false)],
+            ),
+            (
+                "file-then-child",
+                vec![("Default/a", false), ("Default/a/b", false)],
+            ),
+            (
+                "normalized-dup",
+                vec![("Default/a", false), ("./Default//a", false)],
+            ),
+        ];
+        for (name, entries) in refused {
+            let err = unpack_fresh(name, &crafted(&entries)).unwrap_err();
+            assert!(format!("{err:#}").contains("refusing"), "{name}: {err:#}");
+        }
+        // A directory may repeat, as a directory, with files under it.
+        unpack_fresh(
+            "dir-twice",
+            &crafted(&[("Default/", true), ("Default/", true), ("Default/a", false)]),
+        )
+        .unwrap();
+    }
+
+    /// Names that differ only in case are one file on Windows and macOS.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn unpack_rejects_a_case_variant_of_an_unpacked_path() {
+        let entries = [("Default/Cookies-x", false), ("default/COOKIES-X", false)];
+        let err = unpack_fresh("case", &crafted(&entries)).unwrap_err();
+        assert!(format!("{err:#}").contains("two entries"), "{err:#}");
     }
 
     #[test]
