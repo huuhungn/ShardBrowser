@@ -174,22 +174,25 @@ fn seal_for_push(
 
 /// Open a pulled container: every cached fleet key first, newest first (a
 /// snapshot an earlier version pushed under one must still restore), then the
-/// passphrase.
+/// passphrase. The server picks the bytes, so a container sealed for any
+/// profile other than `profile_id` is refused before the profile is touched.
 fn open_pulled(
     container: &[u8],
     udd: &std::path::Path,
+    profile_id: &str,
     candidates: &[([u8; 32], u64)],
     passphrase: &str,
 ) -> Result<u64, String> {
+    use shardx_core::backup_file::{open_profile_for, open_profile_with_fkek};
     for (fkek, _generation) in candidates {
-        if let Ok(bytes) = shardx_core::backup_file::open_profile_with_fkek(container, udd, fkek) {
+        if let Ok(bytes) = open_profile_with_fkek(container, udd, fkek, profile_id) {
             return Ok(bytes);
         }
     }
     if passphrase.is_empty() {
         return Err(crate::errcode::code("sync.pullPassphraseRequired"));
     }
-    shardx_core::backup_file::open_profile(container, udd, passphrase).map_err(|e| format!("{e:#}"))
+    open_profile_for(container, udd, passphrase, profile_id).map_err(|e| format!("{e:#}"))
 }
 
 /// Pull the current snapshot of `profile_id` and restore it over the local
@@ -233,11 +236,13 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .map(|s| s.keys_newest_first(&c.fleet_id))
         .unwrap_or_default();
 
-    tokio::task::spawn_blocking(move || open_pulled(&container, &udd, &candidates, &passphrase))
-        .await
-        .map_err(|e| {
-            crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
-        })?
+    tokio::task::spawn_blocking(move || {
+        open_pulled(&container, &udd, &profile_id, &candidates, &passphrase)
+    })
+    .await
+    .map_err(|e| {
+        crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
+    })?
 }
 
 /// What the server currently holds for `profile_id`, or `None` if nothing.
@@ -333,7 +338,7 @@ mod tests {
         );
         let out = dir.path().join("out");
         assert!(
-            shardx_core::backup_file::open_profile_with_fkek(&bytes, &out, &fkek).is_err(),
+            shardx_core::backup_file::open_profile_with_fkek(&bytes, &out, &fkek, "p").is_err(),
             "the cached fleet key must not open it"
         );
         shardx_core::backup_file::open_profile(&bytes, &out, "team-passphrase")
@@ -354,13 +359,44 @@ mod tests {
         let out = dir.path().join("out");
 
         for candidates in [vec![], vec![([0x11u8; 32], 1)]] {
-            let err = open_pulled(&bytes, &out, &candidates, "").unwrap_err();
+            let err = open_pulled(&bytes, &out, "p", &candidates, "").unwrap_err();
             assert!(
                 crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
                 "{err}"
             );
         }
-        assert!(open_pulled(&bytes, &out, &[([0x11u8; 32], 1)], "team-passphrase").is_ok());
+        assert!(open_pulled(&bytes, &out, "p", &[([0x11u8; 32], 1)], "team-passphrase").is_ok());
+    }
+
+    /// A server that answers a pull for one profile with another profile's
+    /// genuine snapshot is refused, under a cached fleet key or the passphrase.
+    #[test]
+    fn pull_refuses_another_profiles_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let fkek = [0x5Cu8; 32];
+        let by_key = shardx_core::backup_file::seal_profile_with_fkek("other", &udd, &fkek)
+            .unwrap()
+            .bytes;
+        let by_passphrase =
+            shardx_core::backup_file::seal_profile("other", &udd, "team-passphrase")
+                .unwrap()
+                .bytes;
+        let out = dir.path().join("out");
+
+        let err = open_pulled(&by_key, &out, "p", &[(fkek, 1)], "").unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+            "{err}"
+        );
+        let err = open_pulled(&by_passphrase, &out, "p", &[], "team-passphrase").unwrap_err();
+        assert!(err.contains("another profile"), "{err}");
+        assert!(
+            !out.exists(),
+            "nothing restored from another profile's snapshot"
+        );
     }
 
     /// A fleet key cached from the team server must not stand in for the
