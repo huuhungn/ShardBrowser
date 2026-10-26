@@ -16,6 +16,13 @@ pub async fn init_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
 
 /// Open (creating if needed) the SQLite DB without migrating it, so
 /// `identity init` can refuse on existing rows before writing anything.
+/// How long a statement waits for the write lock before failing. Every write
+/// serializes on it, and on a loaded host (CI ran 20 concurrent challenge
+/// requests while other servers shared its disk) five seconds ran out and the
+/// waiters failed with 500. Clients wait two minutes for a reply, so waiting
+/// longer here only turns those failures into slower successes.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
     tokio::fs::create_dir_all(&cfg.data_dir).await?;
     tokio::fs::create_dir_all(&cfg.blob_dir).await?;
@@ -23,9 +30,9 @@ pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", cfg.db_path))?
         .create_if_missing(true)
         .foreign_keys(true)
-        // Writers queue instead of failing fast when a checkin transaction
-        // briefly holds the write lock.
-        .busy_timeout(std::time::Duration::from_secs(5));
+        // Writers queue instead of failing fast while another transaction
+        // holds the write lock.
+        .busy_timeout(BUSY_TIMEOUT);
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
         .connect_with(opts)
@@ -216,6 +223,33 @@ mod tests {
         assert!(bootstrap_admin(&pool, &cfg("0.0.0.0:8080")).await.is_err());
         // Same DB on a loopback bind is tolerated (local-only exposure).
         assert!(bootstrap_admin(&pool, &cfg("127.0.0.1:8080")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_pooled_connection_waits_long_for_the_write_lock() {
+        let dir = std::env::temp_dir().join(format!("shardx-busy-{}", std::process::id()));
+        let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
+        let cfg = Config {
+            data_dir: path(""),
+            db_path: path("server.db"),
+            blob_dir: path("blobs"),
+            ..cfg("127.0.0.1:8080")
+        };
+        let pool = open_pool(&cfg).await.unwrap();
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            conns.push(pool.acquire().await.unwrap());
+        }
+        for conn in &mut conns {
+            let ms: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            assert!(ms >= 30_000, "busy_timeout is {ms} ms");
+        }
+        drop(conns);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
