@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, Checkbox, Pagination } from "@proxyshard/shardx-ui-kit";
 import { ShardLogo } from "../../shared/icons";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useContextMenu } from "../../shared/hooks/useContextMenu";
 import {
   useProfile,
@@ -67,7 +68,7 @@ export function ProfileTable() {
   return (
     <>
       <div className="overflow-x-auto overflow-y-hidden rounded-lg bg-bg-white-0 shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
-        <div className="t-cols border-b border-stroke-soft-200 bg-bg-weak-50 text-subheading-2xs text-text-soft-400">
+        <div className="t-cols whitespace-nowrap border-b border-stroke-soft-200 bg-bg-weak-50 text-subheading-2xs text-text-soft-400">
           <div></div>
           <div>
             <Checkbox
@@ -101,46 +102,27 @@ export function ProfileTable() {
           />
         ))}
         {visible.length === 0 && !expanded && (
-          <div className="flex flex-col items-center gap-2.5 px-6 py-14 text-center">
-            <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-              <ShardLogo />
-            </div>
-            {search ? (
-              <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noMatchingProfiles")}</h3>
-                <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-                  Nothing matches “{search}”.
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <Button variant="neutral" mode="stroke" size="xsmall" onClick={() => setSearch("")}>
-                    {t("profileTable.clearSearch")}
-                  </Button>
-                </div>
-              </>
-            ) : folder && folder !== "all" ? (
-              <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.folderIsEmpty")}</h3>
-                <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-                  “{folder}” has no profiles. Move one in, or create one here.
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <FromTemplateButton />
-                  <NewProfileButton />
-                </div>
-              </>
-            ) : (
-              <>
-                <h3 className="m-0 text-label-sm text-text-strong-950">{t("profileTable.noProfilesYet")}</h3>
-                <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-                  {t("profileTable.pickAFingerprintTemplateToStartFromA")}
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <FromTemplateButton />
-                  <NewProfileButton />
-                </div>
-              </>
-            )}
-          </div>
+          search ? (
+            <EmptyState
+              icon={<ShardLogo />}
+              title={t("profileTable.noMatchingProfiles")}
+              body={t("ui.nothingMatchesQuery", { query: search })}
+              actions={
+                <Button variant="neutral" mode="stroke" size="xsmall" onClick={() => setSearch("")}>
+                  {t("profileTable.clearSearch")}
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyState
+              icon={<ShardLogo />}
+              title={folder && folder !== "all" ? t("profileTable.folderIsEmpty") : t("profileTable.noProfilesYet")}
+              body={folder && folder !== "all"
+                ? t("profileTable.folderHasNoProfiles", { folder })
+                : t("profileTable.pickAFingerprintTemplateToStartFromA")}
+              actions={<><FromTemplateButton /><NewProfileButton /></>}
+            />
+          )
         )}
       </div>
       {pageCount > 1 && (

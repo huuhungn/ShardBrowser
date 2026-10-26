@@ -17,16 +17,25 @@
 //! anything else happens, and then moved into the OS credential store (ADR
 //! 0004): the file keeps only its reference once the key read back. While no
 //! store is usable the key stays here, and the file is as sensitive as the
-//! profiles it opens: 0600 on Unix, the user profile directory's ACL on
-//! Windows.
+//! profiles it opens: 0600 on Unix, and DPAPI-protected on Windows (see
+//! `dpapi`).
+//!
+//! Since 2.4.3 nothing new is collected: fleet keys the team server delivers
+//! are counted, never cached, because nothing yet proves who issued them
+//! (`custody_report`). Keys cached by 2.4.2 still open old snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::Mutex;
 
-use crate::store;
+use crate::{dpapi, store};
 use zeroize::Zeroizing;
+
+/// Serialises writes, so a migration rewrite cannot land on top of a newer
+/// save with the content it read before that save.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One fleet's collected keys, by generation.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -52,11 +61,12 @@ pub struct FleetKeyStore {
 }
 
 impl FleetKeyStore {
-    /// The key to seal new snapshots under, if this device has one.
+    /// The active generation's key. Sync no longer seals under it (push uses
+    /// the passphrase), so only the tests still ask.
+    #[cfg(test)]
     pub fn active_key(&self, fleet_id: &str) -> Option<([u8; 32], u64)> {
         let f = self.fleets.get(fleet_id)?;
-        f.key(f.active_generation)
-            .map(|k| (*k, f.active_generation))
+        f.key(f.active_generation).map(|k| (*k, f.active_generation))
     }
 
     /// Every key this device holds for a fleet, newest generation first.
@@ -82,12 +92,30 @@ impl FleetKeyStore {
     }
 
     /// Record a collected key.
+    #[cfg(test)]
     pub fn insert(&mut self, fleet_id: &str, generation: u64, key: &[u8; 32]) {
         let f = self.fleets.entry(fleet_id.to_string()).or_default();
         f.keys.insert(generation, to_hex(key));
         if generation >= f.active_generation {
             f.active_generation = generation;
         }
+    }
+
+    fn map_keys(&self, f: impl Fn(&str) -> Result<String>) -> Result<Self> {
+        let mut out = self.clone();
+        for keys in out.fleets.values_mut() {
+            for value in keys.keys.values_mut() {
+                *value = f(value)?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn has_plaintext_keys(&self) -> bool {
+        self.fleets
+            .values()
+            .flat_map(|f| f.keys.values())
+            .any(|v| dpapi::needs_protection(v))
     }
 }
 
@@ -119,6 +147,7 @@ impl FleetKeys {
 }
 
 /// Hex-encode a key for storage.
+#[cfg(test)]
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -144,14 +173,35 @@ pub fn load() -> Result<FleetKeyStore> {
     if !path.exists() {
         return Ok(FleetKeyStore::default());
     }
-    let body = fs::read_to_string(&path)?;
+    let mut stored = read(&path)?;
+    if stored.has_plaintext_keys() {
+        // Written before keys were protected: rewrite it now. Re-read under
+        // the lock, since a save may have landed; best effort, so a failure
+        // leaves the file as it was.
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        stored = read(&path)?;
+        if stored.has_plaintext_keys() {
+            let _ = write(&stored);
+        }
+    }
+    stored.map_keys(|v| Ok(dpapi::reveal(v)))
+}
+
+/// The file as stored: keys still in their on-disk form.
+fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
+    let body = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&body).unwrap_or_default())
 }
 
 /// Writes `s`, then moves its plaintext keys into the credential store. The
-/// keys are durable once written, so the move is best effort.
+/// keys are durable once written, so the move is best effort. Nothing is
+/// collected any more (see the module note), so only the tests save.
+#[cfg(test)]
 pub fn save(s: &FleetKeyStore) -> Result<()> {
-    write(s)?;
+    {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        write(s)?;
+    }
     if let Err(error) = protect() {
         eprintln!("[fleet] fleet keys stay in fleet_keys.json: {error}");
     }
@@ -164,7 +214,12 @@ pub fn save(s: &FleetKeyStore) -> Result<()> {
 // shortcut: with no usable store the keys stay in plaintext `fleet_keys.json`
 // until the fallback key file (ADR 0002, G2-48) lands.
 pub fn protect() -> Result<bool> {
-    let mut s = load()?;
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = store::fleet_keys_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
     let mut moved = false;
     for (fleet_id, f) in &mut s.fleets {
         for (generation, hex) in std::mem::take(&mut f.keys) {
@@ -186,11 +241,13 @@ pub fn protect() -> Result<bool> {
     Ok(moved)
 }
 
+/// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
 fn write(s: &FleetKeyStore) -> Result<()> {
     let path = store::fleet_keys_path()?;
+    let on_disk = s.map_keys(dpapi::conceal)?;
     // As with team.json: a crash mid-write must not leave a file that reads
     // back as "no keys" and silently strands the snapshots.
-    crate::durable::write_private(&path, serde_json::to_string_pretty(s)?.as_bytes())?;
+    crate::durable::write_private(&path, serde_json::to_string_pretty(&on_disk)?.as_bytes())?;
     Ok(())
 }
 
@@ -284,5 +341,35 @@ mod tests {
         let s = FleetKeyStore::default();
         assert!(s.active_key("nope").is_none());
         assert!(s.keys_newest_first("nope").is_empty());
+    }
+
+    /// A key the store refused stays in the file DPAPI-protected, still opens,
+    /// and moves out on a later pass.
+    #[cfg(windows)]
+    #[test]
+    fn a_key_left_in_the_file_is_dpapi_protected_and_moves_later() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "ef".repeat(16);
+        let mut s = FleetKeyStore::default();
+        s.insert(&fleet, 1, &[0x5A; 32]);
+        crate::credential::fail_next_call(&format!("fleet-key.{fleet}.1"));
+        save(&s).unwrap();
+        let path = store::fleet_keys_path().unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        let held = load().unwrap().keys_newest_first(&fleet);
+        let moved = protect().unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+        let after = load().unwrap().keys_newest_first(&fleet);
+        store::set_config_root(None);
+
+        assert!(first.contains("dpapi:") && !first.contains(&"5a".repeat(32)), "{first}");
+        assert_eq!(held, vec![([0x5A; 32], 1)]);
+        assert!(moved);
+        assert!(!second.contains("dpapi:"), "{second}");
+        assert_eq!(after, vec![([0x5A; 32], 1)]);
     }
 }

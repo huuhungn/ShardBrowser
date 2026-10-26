@@ -1,6 +1,75 @@
 {
   "releases": [
     {
+      "version": "2.4.4",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "ui-alignment-and-fingerprint-noise",
+          "title": "Bảng, trang và thư viện vân tay gọn hơn",
+          "lead": "Các cột thẳng hàng trên mọi cỡ màn hình, và thư viện vân tay chỉ cảnh báo lệch GPU một lần thay vì trên từng thẻ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tiêu đề bảng ở trang Trình duyệt và Proxy giờ luôn nằm đúng trên cột ở mọi độ rộng cửa sổ, kể cả màn hình 2K, 4K và khi một hồ sơ đang khởi động. Mọi trang đặt tiêu đề ở cùng một chỗ, và các trang trống dùng chung một bố cục."
+            },
+            {
+              "type": "p",
+              "text": "Thư viện vân tay hiện một dòng cho biết bao nhiêu vân tay khai tính năng GPU mà máy này không có. Mỗi thẻ đó vẫn có một dấu cảnh báo nhỏ, bấm vào để xem giải thích đầy đủ."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.3",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "team-sync-passphrase-only",
+          "title": "Đồng bộ Team không còn tin khoá từ server",
+          "lead": "Đẩy hồ sơ lên team lại luôn dùng passphrase của team.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trước đây launcher nhận khoá fleet từ team server mà không kiểm ai đã cấp, rồi dùng khoá đó cho mọi lần đẩy. Một server bị chiếm quyền có thể đọc được các hồ sơ đó. Giờ mọi lần đẩy đều dùng passphrase của team. Bản chụp đã đẩy bằng khoá fleet vẫn khôi phục được trên máy đã có khoá."
+            },
+            {
+              "type": "note",
+              "text": "Khoá Team trên máy này giờ được mã hoá theo tài khoản Windows của bạn. Nếu chuyển launcher sang tài khoản hoặc máy khác, hãy ghi danh lại thiết bị."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.2",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "selection-keeps-table-in-place",
+          "title": "Chọn hồ sơ không làm bảng nhảy",
+          "lead": "Các hàng không còn bị đẩy xuống khi bạn tick một hồ sơ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trước đây, tick hồ sơ đầu tiên rồi hồ sơ thứ hai đều đẩy bảng xuống, nên cú bấm thứ hai nếu nhanh có thể rơi vào hàng khác. Giờ thanh chọn nằm cạnh tiêu đề trang và bảng đứng yên. Số hồ sơ đã chọn cũng hiện bằng tiếng Việt."
+            },
+            {
+              "type": "note",
+              "text": "Bản này còn sửa máy chủ nhóm: mở được cơ sở dữ liệu do bản build cho hệ điều hành khác tạo ra, và ghi đúng khoá của thiết bị khi đăng ký. Engine trình duyệt không đổi."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.1",
       "date": "2026-10-24",
       "entries": [

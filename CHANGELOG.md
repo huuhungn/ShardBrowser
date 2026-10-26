@@ -1,5 +1,95 @@
 # Changelog
 
+## v2.4.4
+
+A user interface release. Team sync and the browser engine are unchanged
+(Chromium 156.0.8078.48, engine build 1).
+
+### Changed
+
+- Table headers on the Browsers and Proxies pages line up with their columns at
+  every window width, including 2K and 4K screens and while a profile is
+  starting.
+- Every page puts its title in the same place, and empty pages (Trash,
+  Extensions, Bookmarks, Automation, Fingerprints, an empty folder, an empty
+  proxy list) share one empty-state layout. In Vietnamese, the "All" folder tab
+  and the patch log are translated.
+- The fingerprint library states a GPU mismatch once, above the cards, with a
+  count. Each mismatched card keeps a small warning mark that opens the same
+  explanation, and the remove button is a quiet icon instead of a red one.
+- Row buttons on the Browsers and Proxies pages have names that screen readers
+  read with the profile or proxy name, and the current page is marked in the
+  sidebar.
+
+## v2.4.3
+
+A security fix release for Team sync. The browser engine is unchanged
+(Chromium 156.0.8078.48, engine build 1).
+
+### Security
+
+- Team sync no longer accepts fleet keys from the team server. 2.4.2 opened
+  every fleet key grant the server listed, without verifying who issued it,
+  and used that key for every later push, so a malicious or compromised team
+  server could read profiles pushed after it planted a key. Push now always
+  seals under the team passphrase; pull still tries fleet keys already on the
+  device, so snapshots pushed under a fleet key keep restoring. Passphrase-free
+  sync returns once key grants are verified against a trust chain (v0.2.x).
+- Device keys are protected at rest on Windows. The device signing and HPKE
+  seeds in `team.json` and cached fleet keys are DPAPI-protected for the
+  current Windows user, migrated in place on first start, and no longer appear
+  in debug output.
+- Team server: only an active tenant owner can begin or activate a root key
+  generation. Any member could before.
+
+### Known issues
+
+- A protected `team.json` or fleet key cache opens only under the same Windows
+  account. After an administrator password reset, a reinstall that copies
+  `%APPDATA%` back, or a move to another account or machine, enroll the device
+  again; the launcher keeps a copy of the old `team.json` first. Re-push
+  profiles that were pushed under a fleet key so they are sealed under the
+  passphrase.
+- Downgrading to 2.4.2 after 2.4.3 has started breaks Team on that device,
+  because 2.4.2 cannot read the protected seeds. Enroll it again.
+- A fleet key a hostile server planted before this release stays usable for
+  pulls until the cached key is removed.
+
+## v2.4.2
+
+A fix release for the launcher and the team server. The browser engine is
+unchanged (Chromium 156.0.8078.48, engine build 1).
+
+### Fixed
+
+- Selecting profiles no longer moves the profile table. The selection bar now
+  sits in the title row, so a quick second click lands on the row that was
+  under the cursor. The selection count on the Browsers and Proxies pages is
+  translated.
+- Team server: a database created by the Windows build was refused by the
+  Linux and macOS builds, and the other way round, because the migration files
+  were embedded with different line endings and SQLx checksums them. Every
+  build now accepts either and never rewrites the stored checksums, so the
+  previous version can still open the database.
+- Team server: device enrollment derived the stored HPKE key id in the signing
+  domain. New enrollments use the HPKE domain. Existing devices keep their id,
+  and the same HPKE key can no longer be enrolled a second time.
+
+### Internal
+
+- ADR 0001 (draft) on server identity and first-tenant bootstrap is in
+  `docs/adr/`, with its architect reviews.
+
+### Known issues
+
+The two engine build 1 issues listed under v2.3.1 (audio noise on a filled
+`AudioBuffer`, upstream #120; the `window.chrome` keys, upstream #118) still
+apply; they need a new engine build.
+
+A team server database created by 2.4.2 does not open in the 2.4.1 Windows
+team server, which accepts only the line endings it was built with. A database
+the 2.4.1 Windows server created still opens in it after 2.4.2 has run on it.
+
 ## v2.4.1
 
 A fix and security release. The browser engine is unchanged

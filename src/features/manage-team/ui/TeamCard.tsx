@@ -171,20 +171,11 @@ export function TeamCard() {
   const collect = () => run("collect", async () => {
     const r = await teamCollectCustody();
     if (r.grants === 0) {
-      toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
+      if (r.fleet_grants_waiting === 0) toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
       toast.err(t("team.grantsOpened", { opened: r.opened, grants: r.grants, failed: r.failed }));
     } else {
-      // The fleet key is the one sync needs, so lead with that.
-      if (r.can_sync_without_passphrase) {
-        const gen =
-          r.newest_fleet_generation == null
-            ? ""
-            : t("team.generationSuffix", { n: r.newest_fleet_generation });
-        toast.ok(
-          t("team.fleetKeyCollected", { gen }),
-        );
-      } else if (r.opened > 0) {
+      if (r.opened > 0) {
         const gen =
           r.newest_generation == null
             ? ""
@@ -193,6 +184,11 @@ export function TeamCard() {
       } else {
         toast.err(t("team.noGrantsAreWaitingForThisDeviceYet"));
       }
+    }
+    // Fleet keys from the server are not accepted yet: say so, rather than
+    // leave the user expecting sync without a passphrase.
+    if (r.fleet_grants_waiting > 0) {
+      toast.info(t("team.fleetKeysNotAccepted", { n: r.fleet_grants_waiting }));
     }
   });
 
@@ -257,6 +253,11 @@ export function TeamCard() {
         <div className="mt-1 flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
           {!st.is_enrolled ? (
             <>
+              {st.keys_unreadable && (
+                <p className="m-0 text-paragraph-xs text-state-error-base">
+                  {t("keyStore.otherWindowsAccount")}
+                </p>
+              )}
               <Input
                 label={t("team.deviceLabel")}
                 inputSize="small"
@@ -427,6 +428,10 @@ export function TeamCard() {
                   {t("team.thisDeviceWasEnrolledBeforeItsKeyMat")}
                 </p>
               )}
+
+              <p className="m-0 text-paragraph-xs text-text-soft-400">
+                {t("team.syncUsesPassphrase")}
+              </p>
 
               {!st.can_sync && (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
