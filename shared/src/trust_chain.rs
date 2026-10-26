@@ -32,6 +32,9 @@ use crate::trust_evidence::{TenantTrustEvidencePageV2, MAX_EVIDENCE_CONTAINERS};
 pub const MAX_CUSTODIAN_KEY_AGE_MS: u64 = 1095 * 86_400_000;
 /// The local clock's tolerance for "now".
 pub const CLOCK_TOLERANCE_MS: u64 = 300_000;
+/// A client stops at this many pages: enough for the container cap at the
+/// smallest pages the byte limit forces, and a bound on empty pages.
+pub const MAX_EVIDENCE_PAGES: usize = 4096;
 
 type KeyId = [u8; 32];
 
@@ -108,6 +111,9 @@ impl Evidence {
         binding: &Binding,
         pages: &[TenantTrustEvidencePageV2],
     ) -> Result<Self, TrustError> {
+        if pages.len() > MAX_EVIDENCE_PAGES {
+            return Err(TrustError::TooMuchEvidence);
+        }
         let Some(last) = pages.last() else {
             return Err(TrustError::BadPages("no page"));
         };
@@ -216,12 +222,29 @@ fn holds(window: (u64, u64), t: u64) -> bool {
     window.0 <= t && t < window.1
 }
 
+/// Positions in `items` by the key `key_of` names, so a question about one
+/// key reads only that key's records.
+fn index<T>(items: &[T], key_of: impl Fn(&T) -> Option<KeyId>) -> BTreeMap<KeyId, Vec<usize>> {
+    let mut by_key: BTreeMap<KeyId, Vec<usize>> = BTreeMap::new();
+    for (i, item) in items.iter().enumerate() {
+        if let Some(key) = key_of(item) {
+            by_key.entry(key).or_default().push(i);
+        }
+    }
+    by_key
+}
+
 /// The result of evaluating one evidence set.
 #[derive(Debug, Clone)]
 pub struct TrustChain {
     anchor: KeyId,
-    /// `Cust(K)`, already clipped.
+    /// `Cust(K)`: clipped, non-empty windows.
     custodians: BTreeMap<KeyId, Vec<(u64, u64)>>,
+    /// D-6 (c): the first `not_before_ms` of any usable root grant naming a
+    /// key, over every usable root grant so the clip is fixed up front.
+    first_not_before: BTreeMap<KeyId, u64>,
+    approvals_by_subject: BTreeMap<KeyId, Vec<usize>>,
+    grants_by_subject: BTreeMap<KeyId, Vec<usize>>,
     evidence: Evidence,
     /// The replay ID of the D1 approval `g0` links.
     anchor_approval: [u8; 16],
@@ -230,65 +253,71 @@ pub struct TrustChain {
 impl TrustChain {
     /// Rules 1-4 over `evidence`. With `pinned`, the anchor must be it.
     pub fn evaluate(evidence: Evidence, pinned: Option<&KeyId>) -> Result<Self, TrustError> {
-        let mut anchors = evidence.roots.iter().filter(|r| {
+        let mut anchors = evidence.roots.iter().enumerate().filter(|(_, r)| {
             r.payload.variant == RootGrantVariant::FirstRootSelfGrant
                 && r.issuer == r.payload.subject_signing_key_id
                 && r.payload.root_generation == 0
         });
-        let g0 = anchors.next().ok_or(TrustError::NoAnchor)?.clone();
+        let (g0, first) = anchors.next().ok_or(TrustError::NoAnchor)?;
         if anchors.next().is_some() {
             return Err(TrustError::ConflictingAnchors);
         }
-        let anchor = g0.issuer;
+        let anchor = first.issuer;
         if pinned.is_some_and(|p| *p != anchor) {
             return Err(TrustError::AnchorMismatch);
+        }
+        let mut first_not_before: BTreeMap<KeyId, u64> = BTreeMap::new();
+        for r in &evidence.roots {
+            let at = first_not_before
+                .entry(r.payload.subject_signing_key_id)
+                .or_insert(u64::MAX);
+            *at = (*at).min(r.payload.common.not_before_ms);
         }
         let mut chain = TrustChain {
             anchor,
             custodians: BTreeMap::new(),
-            anchor_approval: g0.payload.subject_device_approval_replay_id,
+            first_not_before,
+            approvals_by_subject: index(&evidence.approvals, |a| {
+                Some(a.payload.subject_signing_key_id)
+            }),
+            grants_by_subject: index(&evidence.grants, |g| match &g.payload.subject {
+                GrantSubject::Device { signing_key_id, .. } => Some(*signing_key_id),
+                GrantSubject::Account { .. } => None,
+            }),
+            anchor_approval: first.payload.subject_device_approval_replay_id,
             evidence,
         };
         // Base: g0 counts only with its D1 approval, A0's own, valid when g0
         // was issued.
-        if !chain.approval_holds(
-            &anchor,
-            Some(&chain.anchor_approval),
-            g0.payload.common.issued_at_ms,
-        ) {
+        let base = chain.evidence.roots[g0].payload.clone();
+        if !chain.linked_approval_holds(&base) {
             return Err(TrustError::NoAnchor);
         }
-        let mut counted = BTreeSet::new();
-        chain.add_window(&g0);
-        counted.insert(g0.payload.common.replay_id);
+        chain.add_window(g0);
 
         // Step, to the least fixpoint: every pass either counts a new grant or
         // ends, and nothing counted is ever taken back.
+        let mut pending: Vec<usize> = (0..chain.evidence.roots.len())
+            .filter(|&i| i != g0)
+            .filter(|&i| {
+                chain.evidence.roots[i].payload.variant != RootGrantVariant::FirstRootSelfGrant
+            })
+            .collect();
         loop {
-            let next: Vec<_> = chain
-                .evidence
-                .roots
-                .iter()
-                .filter(|r| !counted.contains(&r.payload.common.replay_id))
-                .filter(|r| r.payload.variant != RootGrantVariant::FirstRootSelfGrant)
-                .filter(|r| {
-                    let t = r.payload.common.issued_at_ms;
-                    chain.custodian_at(&r.issuer, t)
-                        && chain.approval_holds(
-                            &r.payload.subject_signing_key_id,
-                            Some(&r.payload.subject_device_approval_replay_id),
-                            t,
-                        )
-                })
-                .cloned()
-                .collect();
-            if next.is_empty() {
+            let (ready, rest): (Vec<usize>, Vec<usize>) = pending.into_iter().partition(|&i| {
+                let r = &chain.evidence.roots[i];
+                // The cheap test first: most junk names an issuer with no window.
+                chain.custodians.contains_key(&r.issuer)
+                    && chain.custodian_at(&r.issuer, r.payload.common.issued_at_ms)
+                    && chain.linked_approval_holds(&r.payload)
+            });
+            if ready.is_empty() {
                 break;
             }
-            for r in &next {
-                counted.insert(r.payload.common.replay_id);
-                chain.add_window(r);
+            for i in ready {
+                chain.add_window(i);
             }
+            pending = rest;
         }
         Ok(chain)
     }
@@ -298,47 +327,36 @@ impl TrustChain {
         &self.anchor
     }
 
-    fn add_window(&mut self, r: &Usable<TenantRootKeyGrantV2>) {
+    fn add_window(&mut self, i: usize) {
+        let r = &self.evidence.roots[i];
         let g = &r.payload;
         let device_revoked = self
             .evidence
             .revoked_devices
             .get(&g.subject_device_id)
             .copied();
-        let window = (
+        let cap = self.first_not_before[&g.subject_signing_key_id]
+            .saturating_add(MAX_CUSTODIAN_KEY_AGE_MS);
+        let (nb, na) = (
             g.common.not_before_ms,
-            end_of(&g.common, r.revoked_at_ms, device_revoked),
+            end_of(&g.common, r.revoked_at_ms, device_revoked).min(cap),
         );
-        let windows = self.custodians.entry(g.subject_signing_key_id).or_default();
-        windows.push(window);
+        // A window the clip or a revocation emptied holds nothing.
+        if nb < na {
+            self.custodians
+                .entry(g.subject_signing_key_id)
+                .or_default()
+                .push((nb, na));
+        }
     }
 
-    /// D-6 (c): the first `not_before_ms` of any usable root grant naming `key`.
-    fn first_not_before(&self, key: &KeyId) -> Option<u64> {
-        self.evidence
-            .roots
-            .iter()
-            .filter(|r| r.payload.subject_signing_key_id == *key)
-            .map(|r| r.payload.common.not_before_ms)
-            .min()
-    }
-
-    fn windows(&self, key: &KeyId) -> Vec<(u64, u64)> {
-        let Some(first) = self.first_not_before(key) else {
-            return Vec::new();
-        };
-        let cap = first.saturating_add(MAX_CUSTODIAN_KEY_AGE_MS);
-        self.custodians
-            .get(key)
-            .into_iter()
-            .flatten()
-            .map(|&(nb, na)| (nb, na.min(cap)))
-            .collect()
+    fn windows(&self, key: &KeyId) -> &[(u64, u64)] {
+        self.custodians.get(key).map_or(&[], Vec::as_slice)
     }
 
     /// Rule 1: `key` holds a custodian window containing `t`.
     pub fn custodian_at(&self, key: &KeyId, t: u64) -> bool {
-        self.windows(key).into_iter().any(|w| holds(w, t))
+        self.windows(key).iter().any(|&w| holds(w, t))
     }
 
     /// Rule 2: `key` is a custodian now, within the clock tolerance.
@@ -348,31 +366,50 @@ impl TrustChain {
             now.saturating_add(CLOCK_TOLERANCE_MS),
         );
         self.windows(key)
-            .into_iter()
-            .any(|(nb, na)| nb <= hi && lo < na)
+            .iter()
+            .any(|&(nb, na)| nb <= hi && lo < na)
     }
 
-    /// Rule 3: a usable approval of `key` valid at `t`, optionally the one
-    /// with replay ID `linked`.
-    fn approval_holds(&self, key: &KeyId, linked: Option<&[u8; 16]>, t: u64) -> bool {
-        self.evidence.approvals.iter().any(|a| {
-            let p = &a.payload;
-            let device_revoked = self
-                .evidence
-                .revoked_devices
-                .get(&p.subject_device_id)
-                .copied();
-            p.subject_signing_key_id == *key
-                && linked.is_none_or(|id| p.common.replay_id == *id)
-                && holds(
+    /// Rule 1's link: `g`'s own approval, the one it names by replay ID for
+    /// exactly its subject device, account and HPKE key, valid when `g` was
+    /// issued.
+    fn linked_approval_holds(&self, g: &TenantRootKeyGrantV2) -> bool {
+        self.approvals_of(&g.subject_signing_key_id, g.common.issued_at_ms)
+            .any(|a| {
+                let p = &a.payload;
+                p.common.replay_id == g.subject_device_approval_replay_id
+                    && p.subject_device_id == g.subject_device_id
+                    && p.subject_account_id == g.subject_account_id
+                    && p.subject_hpke_key_id == g.recipient_hpke_key_id
+            })
+    }
+
+    /// Rule 3: the usable approvals of `key` valid at `t`, whatever their scope.
+    fn approvals_of(
+        &self,
+        key: &KeyId,
+        t: u64,
+    ) -> impl Iterator<Item = &Usable<DeviceApprovalV2>> + '_ {
+        self.approvals_by_subject
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.evidence.approvals[i])
+            .filter(move |a| {
+                let p = &a.payload;
+                let device_revoked = self
+                    .evidence
+                    .revoked_devices
+                    .get(&p.subject_device_id)
+                    .copied();
+                holds(
                     (
                         p.common.not_before_ms,
                         end_of(&p.common, a.revoked_at_ms, device_revoked),
                     ),
                     t,
-                )
-                && self.approval_issuer_ok(a)
-        })
+                ) && self.approval_issuer_ok(a)
+            })
     }
 
     fn approval_issuer_ok(&self, a: &Usable<DeviceApprovalV2>) -> bool {
@@ -384,46 +421,58 @@ impl TrustChain {
         {
             return true;
         }
-        let scope = match p.approval_scope_kind {
-            ApprovalScopeKind::Tenant => Scope::Tenant,
-            ApprovalScopeKind::Fleet => Scope::Fleet(p.approval_scope_id),
-        };
         let t = p.common.issued_at_ms;
         self.custodian_at(&a.issuer, t)
-            && self.capability_at(&a.issuer, Capability::DeviceApprove, scope, t)
+            && self.capability_at(&a.issuer, Capability::DeviceApprove, approval_scope(p), t)
     }
 
-    /// Rule 3, public: `key` holds an approval valid at `t`.
-    pub fn approval_valid_at(&self, key: &KeyId, t: u64) -> bool {
-        self.approval_holds(key, None, t)
+    /// Rule 3, public: `key` holds an approval valid at `t` that covers `scope`.
+    pub fn approval_valid_at(&self, key: &KeyId, scope: Scope, t: u64) -> bool {
+        self.approvals_of(key, t)
+            .any(|a| match (approval_scope(&a.payload), scope) {
+                (Scope::Tenant, _) => true,
+                (Scope::Fleet(f), Scope::Fleet(g)) => f == g,
+                _ => false,
+            })
     }
 
     /// Rule 4: `key` holds `capability` over `scope` at `t`, through a usable
     /// device-scoped grant whose issuer was a custodian when it was issued.
+    /// Custody itself is never a capability grant: only root grants carry it
+    /// (D-2), so `root.custody` is never held this way.
     pub fn capability_at(&self, key: &KeyId, capability: Capability, scope: Scope, t: u64) -> bool {
-        self.evidence.grants.iter().any(|g| {
-            let p = &g.payload;
-            let GrantSubject::Device {
-                signing_key_id,
-                device_id,
-                ..
-            } = &p.subject
-            else {
-                return false;
-            };
-            let device_revoked = self.evidence.revoked_devices.get(device_id).copied();
-            *signing_key_id == *key
-                && p.capability == capability
-                && covers(p.scope_kind, &p.scope_id, scope)
-                && holds(
-                    (
-                        p.common.not_before_ms,
-                        end_of(&p.common, g.revoked_at_ms, device_revoked),
-                    ),
-                    t,
-                )
-                && self.custodian_at(&g.issuer, p.common.issued_at_ms)
-        })
+        if capability == Capability::RootCustody {
+            return false;
+        }
+        self.grants_by_subject
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.evidence.grants[i])
+            .any(|g| {
+                let p = &g.payload;
+                let GrantSubject::Device { device_id, .. } = &p.subject else {
+                    return false;
+                };
+                let device_revoked = self.evidence.revoked_devices.get(device_id).copied();
+                p.capability == capability
+                    && covers(p.scope_kind, &p.scope_id, scope)
+                    && holds(
+                        (
+                            p.common.not_before_ms,
+                            end_of(&p.common, g.revoked_at_ms, device_revoked),
+                        ),
+                        t,
+                    )
+                    && self.custodian_at(&g.issuer, p.common.issued_at_ms)
+            })
+    }
+}
+
+fn approval_scope(a: &DeviceApprovalV2) -> Scope {
+    match a.approval_scope_kind {
+        ApprovalScopeKind::Tenant => Scope::Tenant,
+        ApprovalScopeKind::Fleet => Scope::Fleet(a.approval_scope_id),
     }
 }
 
@@ -617,7 +666,7 @@ mod tests {
             "windows are half-open"
         );
         assert!(!c.custodian_at(&b.key(), T0 + DAY), "not before its grant");
-        assert!(c.approval_valid_at(&b.key(), T0 + 3 * DAY));
+        assert!(c.approval_valid_at(&b.key(), Scope::Fleet([5; 16]), T0 + 3 * DAY));
         assert!(c.capability_at(
             &a0.key(),
             Capability::DeviceApprove,
@@ -694,7 +743,7 @@ mod tests {
             T0 + 365 * DAY,
         ));
         let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
-        assert!(c.approval_valid_at(&d.key(), T0 + 3 * DAY));
+        assert!(c.approval_valid_at(&d.key(), Scope::Tenant, T0 + 3 * DAY));
         assert!(!c.custodian_at(&d.key(), T0 + 3 * DAY));
         assert!(!c.capability_at(
             &b.key(),
@@ -702,6 +751,254 @@ mod tests {
             Scope::Tenant,
             T0 + 3 * DAY
         ));
+    }
+
+    /// B's ExistingRootGrant from A0, with `edit` applied before signing.
+    fn appointment(
+        a0: &Device,
+        b: &Device,
+        edit: impl FnOnce(&mut TenantRootKeyGrantV2),
+    ) -> Vec<u8> {
+        let mut g = TenantRootKeyGrantV2 {
+            common: common(21, T0 + 2 * DAY, T0 + 100 * DAY),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [7; 32],
+            root_generation: 0,
+            subject_account_id: [9; 16],
+            subject_device_id: b.id,
+            subject_signing_key_id: b.key(),
+            recipient_hpke_key_id: [b.id[0]; 32],
+            subject_device_approval_replay_id: [20; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        edit(&mut g);
+        build_record(&a0.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+    }
+
+    #[test]
+    fn a_root_grant_counts_only_with_its_exact_approval() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let custodian = |root: Vec<u8>| {
+            let mut evidence = tenant(&a0, &b);
+            evidence[4] = root;
+            chain(page(&[&a0, &b], evidence))
+                .unwrap()
+                .custodian_at(&b.key(), T0 + 50 * DAY)
+        };
+        assert!(custodian(appointment(&a0, &b, |_| {})));
+        type Edit = fn(&mut TenantRootKeyGrantV2);
+        let edits: [Edit; 4] = [
+            |g| g.subject_device_id = [6; 16],
+            |g| g.subject_account_id = [6; 16],
+            |g| g.recipient_hpke_key_id = [6; 32],
+            |g| g.subject_device_approval_replay_id = [6; 16],
+        ];
+        for (n, edit) in edits.into_iter().enumerate() {
+            assert!(!custodian(appointment(&a0, &b, edit)), "edit {n}");
+        }
+    }
+
+    #[test]
+    fn a_fleet_approval_covers_only_its_fleet() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let mut evidence = tenant(&a0, &b);
+        let a = DeviceApprovalV2 {
+            common: common(70, T0 + DAY, T0 + 365 * DAY),
+            subject_account_id: [9; 16],
+            subject_device_id: d.id,
+            subject_signing_key_id: d.key(),
+            subject_hpke_key_id: [4; 32],
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: [5; 16],
+        };
+        evidence.push(build_record(&a0.sk, DOMAIN_DEVICE_APPROVAL, &a.encode()));
+        let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
+        let t = T0 + 2 * DAY;
+        assert!(c.approval_valid_at(&d.key(), Scope::Fleet([5; 16]), t));
+        assert!(!c.approval_valid_at(&d.key(), Scope::Fleet([6; 16]), t));
+        assert!(!c.approval_valid_at(&d.key(), Scope::Tenant, t));
+    }
+
+    #[test]
+    fn a_grant_sharing_a_counted_grants_replay_id_still_counts() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let mut evidence = tenant(&a0, &b);
+        // B's appointment reuses g0's replay ID.
+        evidence[4] = root(
+            &a0,
+            &b,
+            RootGrantVariant::ExistingRootGrant,
+            11,
+            20,
+            T0 + 2 * DAY,
+            T0 + 100 * DAY,
+        );
+        let c = chain(page(&[&a0, &b], evidence)).unwrap();
+        assert!(c.custodian_at(&b.key(), T0 + 50 * DAY));
+    }
+
+    #[test]
+    fn a_window_the_clip_empties_holds_nothing_even_now() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let cap = T0 + MAX_CUSTODIAN_KEY_AGE_MS;
+        let mut evidence = tenant(&a0, &b);
+        // A0 (custodian until T0 + 2000 days) renews itself starting just
+        // past its key age.
+        evidence[0] = approval(&a0, &a0, 10, T0, T0 + 2000 * DAY);
+        evidence[1] = root(
+            &a0,
+            &a0,
+            RootGrantVariant::FirstRootSelfGrant,
+            11,
+            10,
+            T0,
+            T0 + 10 * DAY,
+        );
+        evidence[3] = grant(&a0, &a0, Capability::DeviceApprove, 12, T0, T0 + 2000 * DAY);
+        evidence.push(root(
+            &a0,
+            &a0,
+            RootGrantVariant::ExistingRootGrant,
+            80,
+            10,
+            T0 + 5 * DAY,
+            cap - 1000,
+        ));
+        evidence.push(root(
+            &a0,
+            &a0,
+            RootGrantVariant::ExistingRootGrant,
+            81,
+            10,
+            cap - 2000,
+            cap + 50 * DAY,
+        ));
+        let c = chain(page(&[&a0, &b], evidence)).unwrap();
+        assert!(c.custodian_now(&a0.key(), cap - 1500));
+        let mut evidence = tenant(&a0, &b);
+        evidence[0] = approval(&a0, &a0, 10, T0, T0 + 2000 * DAY);
+        evidence[1] = root(
+            &a0,
+            &a0,
+            RootGrantVariant::FirstRootSelfGrant,
+            11,
+            10,
+            T0,
+            T0 + 10 * DAY,
+        );
+        evidence.push(root(
+            &a0,
+            &a0,
+            RootGrantVariant::ExistingRootGrant,
+            80,
+            10,
+            T0 + 5 * DAY,
+            T0 + 10 * DAY,
+        ));
+        // Issued while A0 holds a window, starting past the clip.
+        let late = TenantRootKeyGrantV2 {
+            common: CommonFields {
+                issued_at_ms: T0 + 6 * DAY,
+                ..common(82, cap + 100_000, cap + 50 * DAY)
+            },
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [7; 32],
+            root_generation: 0,
+            subject_account_id: [9; 16],
+            subject_device_id: a0.id,
+            subject_signing_key_id: a0.key(),
+            recipient_hpke_key_id: [a0.id[0]; 32],
+            subject_device_approval_replay_id: [10; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        evidence.push(build_record(
+            &a0.sk,
+            DOMAIN_TENANT_ROOT_KEY_GRANT,
+            &late.encode(),
+        ));
+        let c = chain(page(&[&a0, &b], evidence)).unwrap();
+        for now in [cap - 100_000, cap, cap + 250_000] {
+            assert!(!c.custodian_now(&a0.key(), now), "{now}");
+        }
+    }
+
+    #[test]
+    fn root_custody_is_never_a_capability() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let mut evidence = tenant(&a0, &b);
+        evidence.push(grant(
+            &a0,
+            &b,
+            Capability::RootCustody,
+            90,
+            T0,
+            T0 + 365 * DAY,
+        ));
+        let c = chain(page(&[&a0, &b], evidence)).unwrap();
+        assert!(!c.capability_at(&b.key(), Capability::RootCustody, Scope::Tenant, T0 + DAY));
+    }
+
+    #[test]
+    fn junk_from_a_key_with_no_window_costs_one_pass() {
+        let (a0, b, m) = (Device::new(1), Device::new(2), Device::new(3));
+        let mut evidence = tenant(&a0, &b);
+        // A chain ten custodians deep, listed last-first.
+        let deep: Vec<Device> = (10..20).map(Device::new).collect();
+        let mut prev = &b;
+        for (n, d) in deep.iter().enumerate() {
+            let at = T0 + (3 + n as u64) * DAY;
+            evidence.push(approval(&a0, d, 100 + n as u8, at, T0 + 365 * DAY));
+            evidence.push(root(
+                prev,
+                d,
+                RootGrantVariant::ExistingRootGrant,
+                150 + n as u8,
+                100 + n as u8,
+                at,
+                T0 + 300 * DAY,
+            ));
+            prev = d;
+        }
+        evidence.reverse();
+        let mut keys: Vec<&Device> = vec![&a0, &b];
+        keys.extend(deep.iter());
+        let mut ev = Evidence::collect(&BINDING, &[page(&keys, evidence)]).unwrap();
+        // And the cap's worth of root grants a non-custodian signed: built as
+        // already-usable entries, since signing 60000 records costs more
+        // than the evaluation under test.
+        let junk = TenantRootKeyGrantV2 {
+            common: common(0, T0, T0 + DAY),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [7; 32],
+            root_generation: 0,
+            subject_account_id: [9; 16],
+            subject_device_id: m.id,
+            subject_signing_key_id: m.key(),
+            recipient_hpke_key_id: [3; 32],
+            subject_device_approval_replay_id: [0; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        for n in 0..60_000u32 {
+            let mut g = junk.clone();
+            g.common.replay_id[..4].copy_from_slice(&n.to_be_bytes());
+            ev.roots.push(Usable {
+                issuer: m.key(),
+                payload: g,
+                revoked_at_ms: None,
+            });
+        }
+        let started = std::time::Instant::now();
+        let c = TrustChain::evaluate(ev, None).unwrap();
+        assert!(c.custodian_at(&deep[9].key(), T0 + 20 * DAY));
+        assert!(!c.custodian_at(&m.key(), T0 + 1000));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -857,6 +1154,17 @@ mod tests {
         foreign.tenant_id = [8; 16];
         assert!(Evidence::collect(&BINDING, &[first.clone(), foreign]).is_err());
         assert!(Evidence::collect(&BINDING, &[]).is_err());
+        let endless: Vec<_> = (0..=MAX_EVIDENCE_PAGES as u32)
+            .map(|i| TenantTrustEvidencePageV2 {
+                page_index: i,
+                next_cursor: vec![1],
+                ..second.clone()
+            })
+            .collect();
+        assert_eq!(
+            Evidence::collect(&BINDING, &endless).unwrap_err(),
+            TrustError::TooMuchEvidence
+        );
         let mut twice = first.clone();
         twice.page_index = 0;
         let mut last = second.clone();

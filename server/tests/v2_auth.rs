@@ -38,7 +38,7 @@ use shared::mutation::{
 };
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
 use shared::signing::Ed25519SigningKey;
-use shared::trust_chain::{Binding, Evidence, TrustChain};
+use shared::trust_chain::{Binding, Evidence, Scope, TrustChain};
 use shared::trust_evidence::TenantTrustEvidencePageV2;
 
 const INSTANCE: [u8; 16] = [7; 16];
@@ -3993,6 +3993,13 @@ async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
     assert_eq!(chain.anchor(), &dev.signing_key_id);
     assert!(chain.custodian_now(&dev.signing_key_id, now_ms()));
     assert!(!chain.custodian_now(&other.signing_key_id, now_ms()));
+    // The grant it filed for itself is held under its own custody.
+    assert!(chain.capability_at(
+        &dev.signing_key_id,
+        Capability::DeviceApprove,
+        Scope::Fleet([0x33; 16]),
+        now_ms()
+    ));
 
     // Naming the other device's key adds its grant.
     let named = containers(&evidence(&server, &access, &[other.signing_key_id]).await);
