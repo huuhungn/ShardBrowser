@@ -26,6 +26,7 @@ pub mod portable;
 pub mod session_binding;
 pub mod signing;
 pub mod snapshot;
+pub mod trust_evidence;
 pub mod webdata;
 
 pub use oscrypt::LocalCrypt;
