@@ -23,7 +23,7 @@ hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "x2
 getrandom04 = { package = "getrandom", version = "=0.4.3" }
 # Argon2id for passphrase-derived local backup keys. Pinned: the cost
 # parameters and algorithm version are part of the on-disk backup format.
-argon2 = { version = "=0.5.3", features = ["std"] }
+argon2 = { version = "=0.5.3", features = ["std", "zeroize"] }
 
 # POSIX os_crypt: AES-128-CBC with a fixed IV.
 [target.'cfg(not(windows))'.dependencies]
