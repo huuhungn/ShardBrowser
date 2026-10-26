@@ -28,7 +28,8 @@ use chacha20poly1305::ChaCha20Poly1305;
 
 use crate::canonical::{self as c, Value};
 use crate::keys::{
-    wrap_dek, KeyError, DEK_LEN, ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
+    wrap_dek, KeyError, ARCHIVE_FORMAT_ID_TAR, ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT,
+    COMPRESSION_ID_GZIP, DEK_LEN, ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
     STREAM_NONCE_PREFIX_LEN, WRAP_NONCE_LEN, WRAP_SUITE_ID_CHACHA20POLY1305,
 };
 
@@ -214,9 +215,12 @@ pub fn build_envelope_intent(
             c::u(ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM as u64),
         ),
         ("wrap_suite_id", c::u(WRAP_SUITE_ID_CHACHA20POLY1305 as u64)),
-        ("archive_format_id", c::u(1)),
-        ("archive_policy_id", c::u(1)),
-        ("compression_id", c::u(1)),
+        ("archive_format_id", c::u(ARCHIVE_FORMAT_ID_TAR as u64)),
+        (
+            "archive_policy_id",
+            c::u(ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT as u64),
+        ),
+        ("compression_id", c::u(COMPRESSION_ID_GZIP as u64)),
         (
             "frame_plaintext_size",
             c::u(nums.frame_plaintext_size as u64),
