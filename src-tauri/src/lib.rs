@@ -18,6 +18,7 @@ mod fleet_keys;
 pub mod gpu_caps;
 mod hermes_mcp;
 pub mod http_session;
+mod key_file;
 mod launch;
 mod profile_icon;
 pub mod root_bootstrap;
@@ -1952,6 +1953,44 @@ fn team_status() -> Result<team_config::TeamStatus, String> {
     team_config::status().map_err(|e| e.to_string())
 }
 
+/// Moves every key still in plaintext into whatever now takes it: run after
+/// the key file opens, so keys the OS store refused land there.
+fn protect_all_keys() {
+    if let Ok(mut team) = team_config::load() {
+        if let Err(error) = team_config::protect_keys(&mut team) {
+            eprintln!("[team] device keys stay in team.json: {error}");
+        }
+    }
+    if let Err(error) = fleet_keys::protect() {
+        eprintln!("[team] fleet keys stay in fleet_keys.json: {error}");
+    }
+}
+
+/// Creates the passphrase-protected key file for a device whose OS
+/// credential store cannot hold its keys, and moves them into it.
+#[tauri::command]
+async fn team_keys_create_file(passphrase: String) -> Result<team_config::TeamStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        key_file::create(&passphrase).map_err(|e| e.to_string())?;
+        protect_all_keys();
+        team_config::status().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Opens the key file for this run.
+#[tauri::command]
+async fn team_keys_unlock(passphrase: String) -> Result<team_config::TeamStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        key_file::unlock(&passphrase).map_err(|e| e.to_string())?;
+        protect_all_keys();
+        team_config::status().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Save the server URL, token and tenant.
 ///
 /// Changing the server clears the enrollment: a device id and signing key are
@@ -2659,6 +2698,8 @@ pub fn run() {
             profile_save,
             profile_delete,
             team_status,
+            team_keys_create_file,
+            team_keys_unlock,
             team_collect_custody,
             team_custody_bootstrap_status,
             team_bootstrap_custody,
@@ -2778,14 +2819,7 @@ pub fn run() {
             // Devices enrolled before ADR 0004 still hold their seeds in
             // team.json and their fleet keys in fleet_keys.json; move both
             // into the OS credential store.
-            if let Ok(mut team) = team_config::load() {
-                if let Err(error) = team_config::protect_keys(&mut team) {
-                    eprintln!("[launcher] device keys stay in team.json: {error}");
-                }
-            }
-            if let Err(error) = fleet_keys::protect() {
-                eprintln!("[launcher] fleet keys stay in fleet_keys.json: {error}");
-            }
+            protect_all_keys();
 
             // The window is created hidden to avoid a login-time flash. Normal
             // launches show it immediately; a configured startup launch keeps

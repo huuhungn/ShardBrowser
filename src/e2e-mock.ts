@@ -198,7 +198,40 @@ if (scenario === "folder-empty") {
 
 // A device enrolled as a tenant's first, before or part-way through custody
 // setup. The bootstrap itself is the backend's; the card only drives it.
-const firstDevice = scenario === "team-first-device" || scenario === "team-first-device-resume";
+const firstDevice = scenario === "team-first-device" || scenario === "team-first-device-resume"
+  || scenario === "team-keys-locked";
+// The resumed setup also stands for a host whose credential store refused the
+// keys; `team-keys-locked` for one whose keys sit in a key file not yet opened.
+let keyState = scenario === "team-first-device-resume"
+  ? { keys_protected: false, has_key_file: false, keys_locked: false }
+  : scenario === "team-keys-locked"
+    ? { keys_protected: true, has_key_file: true, keys_locked: true }
+    : { keys_protected: true, has_key_file: false, keys_locked: false };
+const teamStatusFixture = () => (firstDevice
+  ? {
+    server_url: "https://team.example.com",
+    tenant_id: "11111111-1111-4111-8111-111111111111",
+    device_id: "0123456789abcdef0123456789abcdef",
+    has_token: true,
+    is_enrolled: true,
+    can_sync: true,
+    can_receive_custody: true,
+    has_fleet_key: false,
+    ...keyState,
+  }
+  : {
+    server_url: "",
+    tenant_id: "",
+    device_id: "",
+    has_token: false,
+    is_enrolled: false,
+    can_sync: false,
+    can_receive_custody: false,
+    has_fleet_key: false,
+    keys_protected: true,
+    has_key_file: false,
+    keys_locked: false,
+  });
 let custodyBootstrap = scenario === "team-first-device-resume"
   ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
   : { started: false, activated: false, recovery_path: "", anchor: "" };
@@ -547,31 +580,17 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     case "profile_sync_status":
       return null;
     case "team_status":
-      return firstDevice
-        ? {
-          server_url: "https://team.example.com",
-          tenant_id: "11111111-1111-4111-8111-111111111111",
-          device_id: "0123456789abcdef0123456789abcdef",
-          has_token: true,
-          is_enrolled: true,
-          can_sync: true,
-          can_receive_custody: true,
-          has_fleet_key: false,
-          // The resumed setup also stands for a host whose credential store
-          // refused the keys.
-          keys_protected: scenario !== "team-first-device-resume",
-        }
-        : {
-          server_url: "",
-          tenant_id: "",
-          device_id: "",
-          has_token: false,
-          is_enrolled: false,
-          can_sync: false,
-          can_receive_custody: false,
-          has_fleet_key: false,
-          keys_protected: true,
-        };
+      return teamStatusFixture();
+    case "team_keys_create_file":
+      count("KeyFiles");
+      keyState = { keys_protected: true, has_key_file: true, keys_locked: false };
+      return teamStatusFixture();
+    case "team_keys_unlock":
+      if ((payload as { passphrase?: string } | undefined)?.passphrase !== "correct horse") {
+        throw new Error("That is not the key file passphrase.");
+      }
+      keyState = { ...keyState, keys_locked: false };
+      return teamStatusFixture();
     case "team_custody_bootstrap_status":
       return custodyBootstrap;
     case "plugin:dialog|save":

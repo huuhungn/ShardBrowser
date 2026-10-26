@@ -24,6 +24,13 @@ export type TeamStatus = {
    * while a key is still in plaintext on disk because no store was usable.
    */
   keys_protected: boolean;
+  /** Whether this device has a passphrase-protected key file. */
+  has_key_file: boolean;
+  /**
+   * Whether that file was not opened in this run yet: keys kept in it cannot
+   * be used until the passphrase is entered.
+   */
+  keys_locked: boolean;
 };
 
 /** How far `team_bootstrap_custody` got; none of its secrets. */

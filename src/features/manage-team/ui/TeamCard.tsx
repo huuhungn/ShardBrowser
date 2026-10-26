@@ -6,6 +6,7 @@ import {
   teamStatus, teamSetConnection, teamTestConnection,
   teamEnrollDevice, teamCollectCustody, useTeam,
   teamCustodyBootstrapStatus, teamBootstrapCustody,
+  teamKeysCreateFile, teamKeysUnlock,
   type TeamStatus, type CustodyBootstrapStatus,
 } from "../../../entities/team";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -59,6 +60,8 @@ export function TeamCard() {
   const [boot, setBoot] = useState<CustodyBootstrapStatus | null>(null);
   const [passphrase, setPassphrase] = useState("");
   const [passphrase2, setPassphrase2] = useState("");
+  const [keyPass, setKeyPass] = useState("");
+  const [keyPass2, setKeyPass2] = useState("");
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -102,6 +105,32 @@ export function TeamCard() {
     setSt(next);
     void shareStatus();
     toast.ok(t("team.deviceEnrolled"));
+  });
+
+  const createKeyFile = () => run("keyFile", async () => {
+    if (keyPass.length < MIN_RECOVERY_PASSPHRASE) {
+      toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
+      return;
+    }
+    if (keyPass !== keyPass2) {
+      toast.err(t("team.recoveryPassphrasesDiffer"));
+      return;
+    }
+    const next = await teamKeysCreateFile(keyPass);
+    setKeyPass("");
+    setKeyPass2("");
+    setSt(next);
+    void shareStatus();
+    toast.ok(t("team.keyFileCreated"));
+  });
+
+  const unlockKeys = () => run("unlock", async () => {
+    const typed = keyPass;
+    setKeyPass("");
+    const next = await teamKeysUnlock(typed);
+    setSt(next);
+    void shareStatus();
+    toast.ok(t("team.keysUnlocked"));
   });
 
   const bootstrap = () => run("bootstrap", async () => {
@@ -272,10 +301,53 @@ export function TeamCard() {
                 <CopyField value={st.device_id} />
               </div>
 
-              {!st.keys_protected && (
-                <p className="m-0 text-paragraph-xs text-state-error-base" data-testid="keys-unprotected">
-                  {t("team.keysNotProtected")}
-                </p>
+              {st.keys_locked ? (
+                <div className="flex flex-col gap-2" data-testid="keys-locked">
+                  <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.keysLocked")}</p>
+                  <Input
+                    label={t("team.keyFilePassphrase")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="current-password"
+                    value={keyPass}
+                    onChange={(e) => setKeyPass(e.target.value)}
+                  />
+                  <div>
+                    <Button size="small" disabled={!!busy || !keyPass} onClick={unlockKeys}>
+                      {busy === "unlock" ? t("busy.unlocking") : t("team.unlockKeys")}
+                    </Button>
+                  </div>
+                </div>
+              ) : !st.keys_protected && (
+                <div className="flex flex-col gap-2" data-testid="keys-unprotected">
+                  <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.keysNotProtected")}</p>
+                  {!st.has_key_file && (
+                    <>
+                      <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.keyFileHint")}</p>
+                      <Input
+                        label={t("team.keyFilePassphrase")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={keyPass}
+                        onChange={(e) => setKeyPass(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.keyFilePassphraseAgain")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={keyPass2}
+                        onChange={(e) => setKeyPass2(e.target.value)}
+                      />
+                      <div>
+                        <Button size="small" disabled={!!busy || !keyPass || !keyPass2} onClick={createKeyFile}>
+                          {busy === "keyFile" ? t("busy.protectingKeys") : t("team.protectWithPassphrase")}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
               )}
 
               {boot?.activated && boot.anchor && (

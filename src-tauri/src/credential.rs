@@ -6,8 +6,11 @@
 //! `Enterprise`, roams with the profile and would put one device identity on
 //! two machines. A key counts as stored only once it reads back unchanged.
 //!
-//! On platforms without a backend, every call fails with
-//! `credential.unavailable` and callers keep the key where it was.
+//! Where the OS store cannot take a key (no backend on this platform, or a
+//! platform error), the key goes to the passphrase-protected key file instead
+//! once the user opened it this run ([`crate::key_file`]). With neither, every
+//! call fails with `credential.unavailable` and callers keep the key where it
+//! was.
 
 use anyhow::{anyhow, Result};
 use zeroize::Zeroizing;
@@ -42,11 +45,21 @@ fn ensure_store() -> Result<()> {
     Err(unavailable())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes this test thread's OS store unavailable, as on a platform
+    /// without a backend.
+    pub(crate) static OS_STORE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Tests run against the in-memory mock store, on every platform.
 #[cfg(test)]
 fn ensure_store() -> Result<()> {
     static STORE: std::sync::Once = std::sync::Once::new();
     STORE.call_once(|| keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap()));
+    if OS_STORE_DOWN.with(|d| d.get()) {
+        return Err(unavailable());
+    }
     Ok(())
 }
 
@@ -64,9 +77,17 @@ fn entry(credential_ref: &str) -> Result<keyring_core::Entry> {
     entry.map_err(|_| unavailable())
 }
 
-/// Stores `key` under `credential_ref` and reads it back. Only an exact
-/// read-back counts: on any failure the caller keeps its own copy.
+/// Stores `key` under `credential_ref` and reads it back, in the OS store or
+/// else the open key file. Only an exact read-back counts: on any failure the
+/// caller keeps its own copy.
 pub fn store(credential_ref: &str, key: &[u8; 32]) -> Result<()> {
+    match os_store(credential_ref, key) {
+        Err(_) if crate::key_file::is_open() => crate::key_file::store(credential_ref, key),
+        result => result,
+    }
+}
+
+fn os_store(credential_ref: &str, key: &[u8; 32]) -> Result<()> {
     let entry = entry(credential_ref)?;
     entry.set_secret(key).map_err(|_| unavailable())?;
     let back = Zeroizing::new(entry.get_secret().map_err(|_| unavailable())?);
@@ -76,9 +97,18 @@ pub fn store(credential_ref: &str, key: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-/// The key under `credential_ref`. A missing credential is an error: a
-/// reference is only ever kept for a key that was stored.
+/// The key under `credential_ref`, from the OS store or else the key file. A
+/// missing credential is an error: a reference is only ever kept for a key
+/// that was stored. A key file not yet opened this run is
+/// `credential.locked`.
 pub fn load(credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
+    match os_load(credential_ref) {
+        Err(_) if crate::key_file::exists() => crate::key_file::load(credential_ref),
+        result => result,
+    }
+}
+
+fn os_load(credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
     let secret = Zeroizing::new(match entry(credential_ref)?.get_secret() {
         Ok(secret) => secret,
         Err(keyring_core::Error::NoEntry) => {
@@ -94,13 +124,15 @@ pub fn load(credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-/// Deletes the credential under `credential_ref`; one that is already gone
-/// counts as deleted.
+/// Deletes the credential under `credential_ref` from the OS store and the
+/// open key file; one that is already gone counts as deleted.
 pub fn forget(credential_ref: &str) -> Result<()> {
-    match entry(credential_ref)?.delete_credential() {
+    // With no OS store, the key file was the only place it could be.
+    let os = entry(credential_ref).map_or(Ok(()), |entry| match entry.delete_credential() {
         Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(_) => Err(unavailable()),
-    }
+    });
+    os.and(crate::key_file::forget(credential_ref))
 }
 
 /// Makes the next store call on `credential_ref` fail, as a locked or
