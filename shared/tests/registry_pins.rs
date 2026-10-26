@@ -8,7 +8,7 @@
 //! The reviewed values are recorded in docs/security-review-g2.md.
 
 use shardx_core::{
-    approval_receipt as ar, authz_record as az, canonical as c, envelope as ev,
+    approval_receipt as ar, authz_record as az, canonical as c, envelope as ev, envelope_v2 as e2,
     fallback_key_file as fk, fleet_manifest as fm, grants as gr, keys as k, mutation as mu,
     recovery_bundle as rb, session_binding as sb, signing as sg, trust_evidence as te,
 };
@@ -50,6 +50,7 @@ const LABELS: &[&str] = &[
     c::L_RESTORE_EPOCH_NODE1,
     c::L_RESTORE_EPOCH_PROOF,
     ev::L_ENVELOPE_FRAME,
+    e2::L_ENVELOPE_PREAMBLE,
     k::L_SIGNING_KEY_ID,
     k::L_HPKE_KEY_ID,
     k::L_TENANT_ROOT_KEY_ID,
@@ -141,6 +142,20 @@ fn the_numeric_registry_holds_the_reviewed_values() {
         (32, 12, 12, 16)
     );
     assert_eq!(k::STREAM_NONCE_PREFIX_LEN, 7);
+    // Envelope v2 (ADR 0003): suite 2 is XChaCha20-Poly1305 under STREAM LE31,
+    // whose 24-byte nonce leaves 20 bytes of prefix before the u32 counter word.
+    assert_eq!(k::ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31, 2);
+    assert_eq!(
+        (
+            e2::ENVELOPE_VERSION,
+            e2::PREAMBLE_LEN,
+            e2::STREAM_NONCE_PREFIX_LEN,
+            e2::KIND_DATA,
+            e2::KIND_FINAL
+        ),
+        (2, 64, 20, 0, 1)
+    );
+    assert_eq!(&e2::MAGIC, b"SHARDXBK");
     assert_eq!(sg::ED25519_SIG_LEN, 64);
     // Recovery bundle KDF defaults (ADR 0002 D-5); p=4 is pinned inside the
     // module by its own KAT.
