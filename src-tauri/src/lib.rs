@@ -2776,11 +2776,15 @@ pub fn run() {
             let _ = APP_HANDLE.set(app.handle().clone());
 
             // Devices enrolled before ADR 0004 still hold their seeds in
-            // team.json; move them into the OS credential store.
+            // team.json and their fleet keys in fleet_keys.json; move both
+            // into the OS credential store.
             if let Ok(mut team) = team_config::load() {
                 if let Err(error) = team_config::protect_keys(&mut team) {
                     eprintln!("[launcher] device keys stay in team.json: {error}");
                 }
+            }
+            if let Err(error) = fleet_keys::protect() {
+                eprintln!("[launcher] fleet keys stay in fleet_keys.json: {error}");
             }
 
             // The window is created hidden to avoid a login-time flash. Normal
