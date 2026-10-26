@@ -102,14 +102,14 @@ pub fn preflight(identity_dir: &str, data_dir: &str) -> Result<PathBuf, String> 
 }
 
 #[cfg(windows)]
-fn is_network_path(path: &Path) -> bool {
+pub(crate) fn is_network_path(path: &Path) -> bool {
     // `canonicalize` resolves both UNC paths and mapped network drives to this
     // form.
     path.as_os_str().to_string_lossy().starts_with(r"\\?\UNC\")
 }
 
 #[cfg(target_os = "linux")]
-fn is_network_path(path: &Path) -> bool {
+pub(crate) fn is_network_path(path: &Path) -> bool {
     // Unreadable mounts mean unknown, and unknown is treated as remote.
     std::fs::read_to_string("/proc/self/mounts").map_or(true, |m| !on_local_fs(&m, path))
 }
@@ -171,7 +171,7 @@ fn unescape_mount(field: &str) -> String {
 // shortcut: no network-filesystem probe outside Windows and Linux, the only
 // platforms the server ships for; add one before supporting another.
 #[cfg(not(any(windows, target_os = "linux")))]
-fn is_network_path(_path: &Path) -> bool {
+pub(crate) fn is_network_path(_path: &Path) -> bool {
     false
 }
 
