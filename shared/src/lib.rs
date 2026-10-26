@@ -14,6 +14,7 @@ pub mod backup_file;
 pub mod canonical;
 pub mod cookies;
 pub mod envelope;
+pub mod fallback_key_file;
 pub mod fleet_grants;
 pub mod fleet_manifest;
 pub mod grants;

@@ -32,17 +32,17 @@ const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-RECOVERY-BUNDLE-KDF-V2\0";
 const L_RECOVERY_BUNDLE: &str = "SHARDX-RECOVERY-BUNDLE-V2\0";
 
 /// Argon2id, version 0x13.
-const KDF_ARGON2ID: u64 = 1;
-const AEAD_CHACHA20_POLY1305: u64 = 1;
+pub(crate) const KDF_ARGON2ID: u64 = 1;
+pub(crate) const AEAD_CHACHA20_POLY1305: u64 = 1;
 pub const KDF_MEMORY_KIB: RangeInclusive<u32> = 65_536..=1_048_576;
 pub const KDF_ITERATIONS: RangeInclusive<u32> = 3..=64;
-const KDF_PARALLELISM: u32 = 4;
+pub(crate) const KDF_PARALLELISM: u32 = 4;
 /// What a new bundle costs. A later build may only raise these (L1375).
 pub const DEFAULT_KDF_MEMORY_KIB: u32 = 65_536;
 pub const DEFAULT_KDF_ITERATIONS: u32 = 3;
-const CIPHERTEXT_BYTES: RangeInclusive<usize> = 48..=16_777_216;
+pub(crate) const CIPHERTEXT_BYTES: RangeInclusive<usize> = 48..=16_777_216;
 /// Fits the ciphertext bound with room for the header.
-const MAX_FILE_BYTES: usize = 16_777_216 + 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 16_777_216 + 1024;
 pub const MAX_RETAINED_FKEKS: usize = 65_535;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -197,7 +197,11 @@ impl RecoveryBundleHeaderV2 {
     }
 }
 
-fn supported(f: &mut Fields, field: &'static str, id: u64) -> std::result::Result<(), RecordError> {
+pub(crate) fn supported(
+    f: &mut Fields,
+    field: &'static str,
+    id: u64,
+) -> std::result::Result<(), RecordError> {
     if f.uint(field)? == id {
         Ok(())
     } else {
@@ -205,7 +209,7 @@ fn supported(f: &mut Fields, field: &'static str, id: u64) -> std::result::Resul
     }
 }
 
-fn u32_of(f: &mut Fields, field: &'static str) -> std::result::Result<u32, RecordError> {
+pub(crate) fn u32_of(f: &mut Fields, field: &'static str) -> std::result::Result<u32, RecordError> {
     let n = f.uint(field)?;
     u32::try_from(n).map_err(|_| f.bad(field))
 }
@@ -321,7 +325,7 @@ impl RecoveryBundlePlaintextV2 {
     }
 }
 
-fn strictly_increasing<T: Ord>(items: impl IntoIterator<Item = T>) -> bool {
+pub(crate) fn strictly_increasing<T: Ord>(items: impl IntoIterator<Item = T>) -> bool {
     let mut last = None;
     items.into_iter().all(|item| {
         let ok = last.as_ref().is_none_or(|prev| *prev < item);
@@ -333,29 +337,45 @@ fn strictly_increasing<T: Ord>(items: impl IntoIterator<Item = T>) -> bool {
 /// The passphrase length is checked only when sealing, so a later build that
 /// raises the minimum still opens every older bundle.
 fn kek(passphrase: &str, header: &RecoveryBundleHeaderV2) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(
+    argon2id_kek(
+        passphrase,
+        KDF_SALT_CONTEXT,
         header.kdf_memory_kib,
         header.kdf_iterations,
-        KDF_PARALLELISM,
-        Some(32),
+        &header.kdf_salt,
     )
-    .map_err(|_| RecoveryBundleError::Kdf)?;
-    let mut salt = Vec::with_capacity(KDF_SALT_CONTEXT.len() + header.kdf_salt.len());
-    salt.extend_from_slice(KDF_SALT_CONTEXT);
-    salt.extend_from_slice(&header.kdf_salt);
+    .ok_or(RecoveryBundleError::Kdf)
+}
+
+/// Argon2id v0x13 at `p = 4`, salt = `context || salt`, out 32: the KDF of
+/// every passphrase-protected file (D-5). `None` when it cannot run.
+pub(crate) fn argon2id_kek(
+    passphrase: &str,
+    context: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    salt: &[u8; 16],
+) -> Option<Zeroizing<[u8; 32]>> {
+    let params = Params::new(memory_kib, iterations, KDF_PARALLELISM, Some(32)).ok()?;
+    let mut full_salt = Vec::with_capacity(context.len() + salt.len());
+    full_salt.extend_from_slice(context);
+    full_salt.extend_from_slice(salt);
     // A hostile file may ask for up to 1 GiB: allocate it fallibly, so a
     // machine short of memory gets an error instead of an abort.
     let mut blocks = Vec::new();
-    blocks
-        .try_reserve_exact(params.block_count())
-        .map_err(|_| RecoveryBundleError::Kdf)?;
+    blocks.try_reserve_exact(params.block_count()).ok()?;
     blocks.resize(params.block_count(), Block::default());
     let mut out = Zeroizing::new([0u8; 32]);
     let derived = Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into_with_memory(passphrase.as_bytes(), &salt, out.as_mut(), &mut blocks);
+        .hash_password_into_with_memory(
+            passphrase.as_bytes(),
+            &full_salt,
+            out.as_mut(),
+            &mut blocks,
+        );
     blocks.iter_mut().for_each(Zeroize::zeroize);
-    derived.map_err(|_| RecoveryBundleError::Kdf)?;
-    Ok(out)
+    derived.ok()?;
+    Some(out)
 }
 
 fn seal_exact(
