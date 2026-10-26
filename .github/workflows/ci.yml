@@ -45,6 +45,18 @@ jobs:
           cargo +stable install cargo-audit --locked --version 0.22.2
           cargo +stable audit --file sdks/rust/Cargo.lock
 
+      # Each ignore is a reviewed disposition in docs/dependency-review.md; a
+      # new advisory, or one of these reaching a new path, fails the build.
+      - name: Launcher, server and shared RustSec audit
+        run: |
+          cargo +stable audit --deny unsound --deny yanked --file shared/Cargo.lock
+          cargo +stable audit --deny unsound --deny yanked --file server/Cargo.lock \
+            --ignore RUSTSEC-2023-0071
+          cargo +stable audit --deny unsound --deny yanked --file src-tauri/Cargo.lock \
+            --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 \
+            --ignore RUSTSEC-2024-0429
+
       - name: Rust SDK MSRV checks
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
