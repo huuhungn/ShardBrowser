@@ -244,7 +244,9 @@ pub struct TrustChain {
     /// key, over every usable root grant so the clip is fixed up front.
     first_not_before: BTreeMap<KeyId, u64>,
     approvals_by_subject: BTreeMap<KeyId, Vec<usize>>,
-    grants_by_subject: BTreeMap<KeyId, Vec<usize>>,
+    /// Capability grants by subject, then issuer: a question reads only the
+    /// grants that custodians issued, however many others name the subject.
+    grants_by_subject: BTreeMap<KeyId, BTreeMap<KeyId, Vec<usize>>>,
     evidence: Evidence,
     /// The replay ID of the D1 approval `g0` links.
     anchor_approval: [u8; 16],
@@ -280,10 +282,19 @@ impl TrustChain {
             approvals_by_subject: index(&evidence.approvals, |a| {
                 Some(a.payload.subject_signing_key_id)
             }),
-            grants_by_subject: index(&evidence.grants, |g| match &g.payload.subject {
-                GrantSubject::Device { signing_key_id, .. } => Some(*signing_key_id),
-                GrantSubject::Account { .. } => None,
-            }),
+            grants_by_subject: {
+                let mut by: BTreeMap<KeyId, BTreeMap<KeyId, Vec<usize>>> = BTreeMap::new();
+                for (i, g) in evidence.grants.iter().enumerate() {
+                    if let GrantSubject::Device { signing_key_id, .. } = &g.payload.subject {
+                        by.entry(*signing_key_id)
+                            .or_default()
+                            .entry(g.issuer)
+                            .or_default()
+                            .push(i);
+                    }
+                }
+                by
+            },
             anchor_approval: first.payload.subject_device_approval_replay_id,
             evidence,
         };
@@ -374,14 +385,38 @@ impl TrustChain {
     /// exactly its subject device, account and HPKE key, valid when `g` was
     /// issued.
     fn linked_approval_holds(&self, g: &TenantRootKeyGrantV2) -> bool {
-        self.approvals_of(&g.subject_signing_key_id, g.common.issued_at_ms)
-            .any(|a| {
+        // The link fields first: they are cheap, and pick out at most a few
+        // of the approvals the server lists for this key.
+        self.approvals_by_subject
+            .get(&g.subject_signing_key_id)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.evidence.approvals[i])
+            .filter(|a| {
                 let p = &a.payload;
                 p.common.replay_id == g.subject_device_approval_replay_id
                     && p.subject_device_id == g.subject_device_id
                     && p.subject_account_id == g.subject_account_id
                     && p.subject_hpke_key_id == g.recipient_hpke_key_id
             })
+            .any(|a| self.approval_holds_at(a, g.common.issued_at_ms))
+    }
+
+    /// Rule 3 for one approval: in force at `t`, from an allowed issuer.
+    fn approval_holds_at(&self, a: &Usable<DeviceApprovalV2>, t: u64) -> bool {
+        let p = &a.payload;
+        let device_revoked = self
+            .evidence
+            .revoked_devices
+            .get(&p.subject_device_id)
+            .copied();
+        holds(
+            (
+                p.common.not_before_ms,
+                end_of(&p.common, a.revoked_at_ms, device_revoked),
+            ),
+            t,
+        ) && self.approval_issuer_ok(a)
     }
 
     /// Rule 3: the usable approvals of `key` valid at `t`, whatever their scope.
@@ -395,21 +430,7 @@ impl TrustChain {
             .into_iter()
             .flatten()
             .map(|&i| &self.evidence.approvals[i])
-            .filter(move |a| {
-                let p = &a.payload;
-                let device_revoked = self
-                    .evidence
-                    .revoked_devices
-                    .get(&p.subject_device_id)
-                    .copied();
-                holds(
-                    (
-                        p.common.not_before_ms,
-                        end_of(&p.common, a.revoked_at_ms, device_revoked),
-                    ),
-                    t,
-                ) && self.approval_issuer_ok(a)
-            })
+            .filter(move |a| self.approval_holds_at(a, t))
     }
 
     fn approval_issuer_ok(&self, a: &Usable<DeviceApprovalV2>) -> bool {
@@ -444,9 +465,14 @@ impl TrustChain {
         if capability == Capability::RootCustody {
             return false;
         }
-        self.grants_by_subject
-            .get(key)
-            .into_iter()
+        let Some(by_issuer) = self.grants_by_subject.get(key) else {
+            return false;
+        };
+        // Only a custodian's grants can count, and the server cannot add
+        // custodians, so walk those rather than every issuer it lists.
+        self.custodians
+            .keys()
+            .filter_map(|issuer| by_issuer.get(issuer))
             .flatten()
             .map(|&i| &self.evidence.grants[i])
             .any(|g| {
@@ -996,6 +1022,71 @@ mod tests {
         assert!(!c.custodian_at(&m.key(), T0 + 1000));
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn junk_aimed_at_a_real_issuers_grants_and_approvals_stays_cheap() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let deep: Vec<Device> = (10..40).map(Device::new).collect();
+        let mut evidence = tenant(&a0, &b);
+        for (n, d) in deep.iter().enumerate() {
+            let at = T0 + (3 + n as u64) * DAY;
+            evidence.push(approval(&a0, d, 100 + n as u8, at, T0 + 365 * DAY));
+            evidence.push(root(
+                &a0,
+                d,
+                RootGrantVariant::ExistingRootGrant,
+                150 + n as u8,
+                100 + n as u8,
+                at,
+                T0 + 300 * DAY,
+            ));
+        }
+        let mut keys: Vec<&Device> = vec![&a0, &b];
+        keys.extend(deep.iter());
+        let mut ev = Evidence::collect(&BINDING, &[page(&keys, evidence)]).unwrap();
+        // device.approve grants and approvals for A0, each under its own
+        // throwaway issuer, built as usable entries.
+        let grant = ev.grants[0].payload.clone();
+        let approval = ev.approvals[0].payload.clone();
+        let (mut grants, mut approvals) = (Vec::new(), Vec::new());
+        for n in 0..30_000u32 {
+            let mut issuer = [0xee; 32];
+            issuer[..4].copy_from_slice(&n.to_be_bytes());
+            let (mut g, mut a) = (grant.clone(), approval.clone());
+            g.common.replay_id[..4].copy_from_slice(&n.to_be_bytes());
+            a.common.replay_id[..4].copy_from_slice(&n.to_be_bytes());
+            grants.push(Usable {
+                issuer,
+                payload: g,
+                revoked_at_ms: None,
+            });
+            approvals.push(Usable {
+                issuer,
+                payload: a,
+                revoked_at_ms: None,
+            });
+        }
+        // Listed ahead of the real ones.
+        grants.append(&mut ev.grants);
+        approvals.append(&mut ev.approvals);
+        (ev.grants, ev.approvals) = (grants, approvals);
+        let started = std::time::Instant::now();
+        let c = TrustChain::evaluate(ev, None).unwrap();
+        assert!(c.custodian_at(&deep[29].key(), T0 + 40 * DAY));
+        for _ in 0..1000 {
+            assert!(c.capability_at(
+                &a0.key(),
+                Capability::DeviceApprove,
+                Scope::Tenant,
+                T0 + DAY
+            ));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
             "{:?}",
             started.elapsed()
         );
