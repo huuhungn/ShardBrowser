@@ -50,17 +50,19 @@ Enrollment (`server/src/enrollment.rs`) registers two keys per device:
 
 | Key | Purpose | Stored |
 | --- | --- | --- |
-| Ed25519 signing | Proof of possession; signs snapshot manifests | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
-| X25519 HPKE recipient | Opens root key grants sealed to this device | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
+| Ed25519 signing | Proof of possession; signs snapshot manifests | OS credential store; else the key file or `team.json` |
+| X25519 HPKE recipient | Opens root key grants sealed to this device | OS credential store; else the key file or `team.json` |
 
 `team_collect_custody` uses the HPKE key to open root key grants. Fleet key
 grants are sealed to it too, but are not opened until verified key
 distribution ships (see the threat model below).
 
-On Windows both seeds are stored DPAPI-protected for the current user
-(`src-tauri/src/dpapi.rs`). Elsewhere `team.json` holds them as plaintext hex,
-protected by filesystem permissions alone; Keychain and kernel keyring are not
-wired up.
+Both seeds move into Windows Credential Manager (ADR 0004, `credential.rs`),
+and `team.json` keeps only their references. Without a usable store they go
+to the passphrase-protected key file (ADR 0002 D-5, `key_file.rs`) once the
+operator creates one. A seed still in `team.json` is DPAPI-protected for the
+current Windows user (`dpapi.rs`); elsewhere it is plaintext hex, protected by
+file permissions alone. Keychain and kernel keyring are not wired up.
 
 ## What the design calls for
 
@@ -194,9 +196,9 @@ Roughly the sequence the constraints force:
    and should stay openable on a machine that has never enrolled.
 5. **Recovery bundle plus readback**, before any of this is called
    production-ready.
-6. **Move device keys into the OS credential store.** Partly done: on
-   Windows the seeds and cached fleet keys are DPAPI-protected for the current
-   user. Keychain and kernel keyring are not wired up.
+6. **Move device keys into the OS credential store.** Done on Windows
+   (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
+   key file as the fallback. Keychain and kernel keyring are not wired up.
 
 Steps 1–3 are prerequisites for 4; shipping 4 first would mean inventing a
 distribution mechanism that the frozen design already specifies.
@@ -225,14 +227,16 @@ What holds today:
   containers only.
 - A stolen container is useless without the passphrase.
 - Tenant boundaries are enforced on every `/v2/` route (`require_tenant_member`).
-  Root key generation begin and activate are restricted to the tenant owner.
+  Root key generations are created, acknowledged and activated through signed
+  requests (`v2_root`, `v2_root_grants`), not by membership alone.
 - A stale push is refused: version fencing stops one device silently
   overwriting another.
-- Key material at rest is DPAPI-protected (current Windows user) on Windows:
-  the device signing and HPKE seeds in `team.json` and any cached fleet keys.
-  A plaintext file from an earlier version is rewritten protected the first
-  time it is read. Elsewhere these stay plaintext hex, protected by file
-  permissions alone (`fleet-keys.json` is written 0600 on Unix).
+- Key material at rest is in Windows Credential Manager (`persistence =
+  Local`, so it never roams). What has to stay in `team.json` or
+  `fleet-keys.json` is DPAPI-protected for the current Windows user. A file
+  from an earlier version is rewritten protected the first time it is read,
+  and its keys move to the store on the next protection pass. Elsewhere they
+  stay plaintext hex, protected by file permissions alone (0600 on Unix).
 
 DPAPI recovery caveat. A protected `team.json` or `fleet-keys.json` opens only
 under the same Windows account with the same DPAPI master key. An
@@ -250,7 +254,8 @@ What does not hold:
 - Per-device revocation. Everyone shares one passphrase.
 - Forward secrecy across rotations. There are no rotations.
 - Device key confidentiality against code running as the same Windows user,
-  which can call DPAPI too, or against local disk access on other platforms.
+  which can ask Credential Manager and DPAPI too, or against local disk access
+  on other platforms.
 - Integrity of snapshots pulled under a fleet key cached by an earlier
   version: if the server chose that key, it can forge a snapshot that opens.
 - Recovery of anything, if the passphrase is lost.
