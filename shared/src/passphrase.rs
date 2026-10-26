@@ -29,6 +29,11 @@ const BACKUP_KDF_CONTEXT: &[u8] = b"SHARDX-LOCAL-BACKUP-FKEK-V1\0";
 /// Launcher targets while keeping GPU cracking costly. These values are part of
 /// the on-disk format: changing them makes existing backups underivable, so a
 /// change needs a new format version, not an edit here.
+///
+/// Recorded deviation (G2-46): the plan's profile (L1375) has 4 lanes, and the
+/// recovery bundle and the fallback key file use it
+/// (`recovery_bundle::argon2id_kek`). v1 local backups predate it and keep 1
+/// lane; a v2 backup format moves to the plan's profile.
 const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;
 const LANES: u32 = 1;
