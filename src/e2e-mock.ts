@@ -196,8 +196,18 @@ if (scenario === "folder-empty") {
   localStorage.setItem("shardx-folders", JSON.stringify(["Empty QA"]));
 }
 
+// A device enrolled as a tenant's first, before or part-way through custody
+// setup. The bootstrap itself is the backend's; the card only drives it.
+const firstDevice = scenario === "team-first-device" || scenario === "team-first-device-resume";
+let custodyBootstrap = scenario === "team-first-device-resume"
+  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery" }
+  : { started: false, activated: false, recovery_path: "" };
+
 mockIPC(async (cmd: string, payload?: InvokeArgs) => {
-  if ((cmd.startsWith("plugin:") || cmd.startsWith("tauri:")) && cmd !== "plugin:dialog|open") {
+  if (
+    (cmd.startsWith("plugin:") || cmd.startsWith("tauri:"))
+    && cmd !== "plugin:dialog|open" && cmd !== "plugin:dialog|save"
+  ) {
     return null;
   }
   switch (cmd) {
@@ -537,16 +547,43 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     case "profile_sync_status":
       return null;
     case "team_status":
-      return {
-        server_url: "",
-        tenant_id: "",
-        device_id: "",
-        has_token: false,
-        is_enrolled: false,
-        can_sync: false,
-        can_receive_custody: false,
-        has_fleet_key: false,
+      return firstDevice
+        ? {
+          server_url: "https://team.example.com",
+          tenant_id: "11111111-1111-4111-8111-111111111111",
+          device_id: "0123456789abcdef0123456789abcdef",
+          has_token: true,
+          is_enrolled: true,
+          can_sync: true,
+          can_receive_custody: true,
+          has_fleet_key: false,
+        }
+        : {
+          server_url: "",
+          tenant_id: "",
+          device_id: "",
+          has_token: false,
+          is_enrolled: false,
+          can_sync: false,
+          can_receive_custody: false,
+          has_fleet_key: false,
+        };
+    case "team_custody_bootstrap_status":
+      return custodyBootstrap;
+    case "plugin:dialog|save":
+      count("SaveDialogs");
+      return "C:\\Users\\Example\\shardx-recovery.shxrecovery";
+    case "team_bootstrap_custody": {
+      count("CustodyBootstraps");
+      const args = payload as { recoveryPath?: string; passphrase?: string };
+      document.documentElement.dataset.e2eCustodyPath = String(args?.recoveryPath ?? "");
+      custodyBootstrap = {
+        started: true,
+        activated: true,
+        recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
       };
+      return custodyBootstrap;
+    }
 
     default:
       throw new Error(`Unhandled E2E command: ${cmd}`);

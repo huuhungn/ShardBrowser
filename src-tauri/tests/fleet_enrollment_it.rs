@@ -696,6 +696,11 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         .expect("the bootstrap must resume and finish");
     let done = disk.borrow().clone();
     assert!(done.activated && state.activated);
+    assert_eq!(
+        done.recovery_path,
+        bundle.to_string_lossy(),
+        "the bundle's path is kept"
+    );
     assert_eq!(done.create_request, resumed.create_request);
 
     let active: serde_json::Value = reqwest::Client::new()

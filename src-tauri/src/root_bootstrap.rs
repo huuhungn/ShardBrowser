@@ -77,6 +77,9 @@ pub struct BootstrapState {
     pub self_grant: String,
     #[serde(default)]
     pub recovery_bundle_sha256: String,
+    /// Where that bundle was written: activation checks it is still there.
+    #[serde(default)]
+    pub recovery_path: String,
     #[serde(default)]
     pub create_request: String,
     #[serde(default)]
@@ -378,7 +381,7 @@ fn check_bundle(recovery: &RecoveryExport<'_>, pinned: &[u8; 32], trk: &[u8; 32]
 /// replaces `state`: what the caller holds is always what is on disk.
 fn commit(
     state: &mut BootstrapState,
-    save: &mut dyn FnMut(&BootstrapState) -> Result<()>,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
     change: impl FnOnce(&mut BootstrapState),
 ) -> Result<()> {
     let mut next = state.clone();
@@ -396,7 +399,7 @@ pub async fn bootstrap_root(
     device: &BootstrapDevice<'_>,
     recovery: &RecoveryExport<'_>,
     state: &mut BootstrapState,
-    save: &mut dyn FnMut(&BootstrapState) -> Result<()>,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<()> {
     let tenant_hex = device.login.tenant_id;
     if !state.tenant_id.is_empty()
@@ -476,7 +479,7 @@ impl Run<'_> {
     async fn steps(
         &self,
         state: &mut BootstrapState,
-        save: &mut dyn FnMut(&BootstrapState) -> Result<()>,
+        save: &mut impl FnMut(&BootstrapState) -> Result<()>,
     ) -> Result<()> {
         let (cx, signer, tenant_hex, access) = (
             self.cx,
@@ -536,7 +539,11 @@ impl Run<'_> {
                     .is_ok();
             if !reusable {
                 let sha = hex(&export_recovery_bundle(cx, &trk, self.recovery, now)?);
-                commit(state, save, |s| s.recovery_bundle_sha256 = sha)?;
+                let path = self.recovery.path.to_string_lossy().into_owned();
+                commit(state, save, |s| {
+                    s.recovery_bundle_sha256 = sha;
+                    s.recovery_path = path;
+                })?;
             }
             // 4. The create pins the bundle's hash.
             let hash = grant_ref.signed_container_hash;
@@ -682,18 +689,55 @@ impl Drop for Running {
 
 /// Runs the bootstrap from the saved state on disk, one run at a time: a
 /// second run while one is going is refused rather than queued, so two runs
-/// never build different requests from the same empty state.
+/// never build different requests from the same empty state. Once a bundle
+/// was written, a resumed run keeps its path and ignores `recovery_path`.
 pub async fn run(
     client: &FleetClient,
     device: &BootstrapDevice<'_>,
-    recovery: &RecoveryExport<'_>,
-) -> Result<()> {
+    recovery_path: &Path,
+    passphrase: &str,
+) -> Result<BootstrapStatus> {
     if RUNNING.swap(true, Ordering::SeqCst) {
         bail!(crate::errcode::code("fleet.custodyBusy"));
     }
     let _running = Running;
     let mut state = load()?;
-    bootstrap_root(client, device, recovery, &mut state, &mut |s| save(s)).await
+    let saved = std::path::PathBuf::from(&state.recovery_path);
+    let recovery = RecoveryExport {
+        path: if state.recovery_path.is_empty() {
+            recovery_path
+        } else {
+            &saved
+        },
+        passphrase,
+    };
+    let result = bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await;
+    result.map(|()| BootstrapStatus::of(&state))
+}
+
+/// How far the bootstrap got, for the UI: nothing of the state's secrets.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct BootstrapStatus {
+    /// Some step ran, so a new attempt resumes rather than starts over.
+    pub started: bool,
+    pub activated: bool,
+    /// Where the recovery bundle was written, once it was.
+    pub recovery_path: String,
+}
+
+impl BootstrapStatus {
+    fn of(state: &BootstrapState) -> Self {
+        Self {
+            started: !state.tenant_id.is_empty(),
+            activated: state.activated,
+            recovery_path: state.recovery_path.clone(),
+        }
+    }
+}
+
+/// The saved bootstrap's progress.
+pub fn status() -> Result<BootstrapStatus> {
+    Ok(BootstrapStatus::of(&load()?))
 }
 
 /// Loads the bootstrap state; none yet is the empty state.

@@ -5,8 +5,13 @@ import { toast } from "../../../shared/model/toast";
 import {
   teamStatus, teamSetConnection, teamTestConnection,
   teamEnrollDevice, teamCollectCustody, useTeam,
-  type TeamStatus,
+  teamCustodyBootstrapStatus, teamBootstrapCustody,
+  type TeamStatus, type CustodyBootstrapStatus,
 } from "../../../entities/team";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+
+/** The recovery bundle's passphrase floor, as the backend seals it. */
+const MIN_RECOVERY_PASSPHRASE = 8;
 import { t, useT } from "../../../shared/i18n";
 import { safeUiError } from "../../../shared/lib/utils";
 
@@ -51,14 +56,20 @@ export function TeamCard() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [boot, setBoot] = useState<CustodyBootstrapStatus | null>(null);
+  const [passphrase, setPassphrase] = useState("");
+  const [passphrase2, setPassphrase2] = useState("");
 
   const shareStatus = useTeam((s) => s.refresh);
 
-  const refresh = () => teamStatus().then((s) => {
-    setSt(s);
-    setUrl(s.server_url);
-    setTenant(s.tenant_id);
-  }).catch(() => {});
+  const refresh = () => {
+    teamStatus().then((s) => {
+      setSt(s);
+      setUrl(s.server_url);
+      setTenant(s.tenant_id);
+    }).catch(() => {});
+    teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+  };
   useEffect(() => { refresh(); }, []);
 
   const run = async (what: string, fn: () => Promise<void>) => {
@@ -91,6 +102,41 @@ export function TeamCard() {
     setSt(next);
     void shareStatus();
     toast.ok(t("team.deviceEnrolled"));
+  });
+
+  const bootstrap = () => run("bootstrap", async () => {
+    if (passphrase.length < MIN_RECOVERY_PASSPHRASE) {
+      toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
+      return;
+    }
+    if (passphrase !== passphrase2) {
+      toast.err(t("team.recoveryPassphrasesDiffer"));
+      return;
+    }
+    // A resumed setup keeps the bundle it already wrote; the backend ignores
+    // a new path then, so do not ask for one.
+    let path = boot?.recovery_path ?? "";
+    if (!path) {
+      const picked = await saveDialog({
+        defaultPath: "shardx-recovery.shxrecovery",
+        filters: [{ name: t("team.recoveryBundle"), extensions: ["shxrecovery"] }],
+      });
+      if (typeof picked !== "string") return; // cancelled
+      path = picked;
+    }
+    const typed = password;
+    setPassword("");
+    try {
+      const next = await teamBootstrapCustody(username, typed, path, passphrase);
+      setBoot(next);
+      setPassphrase("");
+      setPassphrase2("");
+      toast.ok(t("team.rootCustodyReady", { path: next.recovery_path }));
+    } catch (e) {
+      // Whatever step it reached is saved; show where the next try resumes.
+      teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+      throw e;
+    }
   });
 
   const collect = () => run("collect", async () => {
@@ -225,6 +271,60 @@ export function TeamCard() {
                 <span className="text-paragraph-xs text-text-soft-400">Device ID</span>
                 <CopyField value={st.device_id} />
               </div>
+
+              {st.can_receive_custody && st.can_sync && boot && !boot.activated && (
+                <div className="flex flex-col gap-2" data-testid="custody-bootstrap">
+                  <p className="m-0 text-paragraph-xs text-text-soft-400">
+                    {boot.started
+                      ? boot.recovery_path
+                        ? t("team.custodySetupResumeAt", { path: boot.recovery_path })
+                        : t("team.custodySetupResume")
+                      : t("team.firstDeviceCustodyHelp")}
+                  </p>
+                  <Input
+                    label={t("team.accountUsername")}
+                    inputSize="small"
+                    autoComplete="username"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.accountPassword")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.recoveryPassphrase")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="new-password"
+                    value={passphrase}
+                    onChange={(e) => setPassphrase(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.recoveryPassphraseAgain")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="new-password"
+                    value={passphrase2}
+                    onChange={(e) => setPassphrase2(e.target.value)}
+                  />
+                  <div>
+                    <Button
+                      size="small"
+                      disabled={!!busy || !username.trim() || !password || !passphrase || !passphrase2}
+                      onClick={bootstrap}
+                    >
+                      {busy === "bootstrap"
+                        ? t("busy.settingUpCustody")
+                        : boot.started ? t("team.resumeCustodySetup") : t("team.setUpRootCustody")}
+                    </Button>
+                  </div>
+                </div>
+              )}
 
               {st.can_receive_custody ? (
                 <>

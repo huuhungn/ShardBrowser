@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { TeamStatus, CustodyResult } from "./types";
+import type { TeamStatus, CustodyResult, CustodyBootstrapStatus } from "./types";
 
 export const teamStatus = () => invoke<TeamStatus>("team_status");
 
@@ -29,3 +29,22 @@ export const teamEnrollDevice = (label: string, username: string, password: stri
  */
 export const teamCollectCustody = () =>
   invoke<CustodyResult>("team_collect_custody");
+
+/** How far this device's first-device custody setup got. */
+export const teamCustodyBootstrapStatus = () =>
+  invoke<CustodyBootstrapStatus>("team_custody_bootstrap_status");
+
+/**
+ * Set up root custody as the tenant's first device, or resume it. The
+ * recovery bundle is written to `recoveryPath` under `passphrase`; a resumed
+ * run keeps the bundle it already wrote and needs the same passphrase.
+ */
+export const teamBootstrapCustody = (
+  username: string,
+  password: string,
+  recoveryPath: string,
+  passphrase: string,
+) =>
+  invoke<CustodyBootstrapStatus>("team_bootstrap_custody", {
+    username, password, recoveryPath, passphrase,
+  });

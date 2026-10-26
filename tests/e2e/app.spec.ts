@@ -212,6 +212,43 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
   await expect(page.getByRole("button", { name: /Save settings/ })).toBeEnabled();
 });
 
+test("the first device sets up root custody once its passphrases agree", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-first-device");
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  const card = page.getByTestId("custody-bootstrap");
+  await expect(card).toContainText("First device of a new tenant");
+  await card.getByLabel("Account username").fill("owner");
+  await card.getByLabel("Account password").fill("pw");
+  await card.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await card.getByLabel("Recovery passphrase again").fill("correct horsf");
+  await card.getByRole("button", { name: "Set up root custody" }).click();
+  await expect(page.getByText("The two passphrases differ")).toBeVisible();
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-custody-bootstraps", /.+/);
+
+  await card.getByLabel("Recovery passphrase again").fill("correct horse");
+  await card.getByRole("button", { name: "Set up root custody" }).click();
+  await expect(page.getByText("Root custody is set up")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-custody-path", "C:\\Users\\Example\\shardx-recovery.shxrecovery");
+  await expect(page.getByTestId("custody-bootstrap")).toHaveCount(0);
+});
+
+test("an interrupted custody setup resumes at its saved bundle without asking for a path", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-first-device-resume");
+  await page.getByRole("button", { name: "Settings" }).click();
+
+  const card = page.getByTestId("custody-bootstrap");
+  await expect(card).toContainText("C:\\Users\\Example\\kept.shxrecovery");
+  await card.getByLabel("Account username").fill("owner");
+  await card.getByLabel("Account password").fill("pw");
+  await card.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await card.getByLabel("Recovery passphrase again").fill("correct horse");
+  await card.getByRole("button", { name: "Resume custody setup" }).click();
+  await expect(page.getByText("Root custody is set up")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-custody-path", "C:\\Users\\Example\\kept.shxrecovery");
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-save-dialogs", /.+/);
+});
+
 test("choosing a language translates what has been moved into locales", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Settings" }).click();
