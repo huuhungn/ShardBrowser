@@ -148,6 +148,8 @@ pub enum IntentError {
     NonSequentialVersion { base: u64, target: u64 },
     /// `previous_signed_head_hash` is omitted (never null) iff `base_version == 0`.
     GenesisHeadMismatch { base_version: u64, has_prev: bool },
+    /// A size field outside the plan's bounds (L649-L652).
+    OutOfBounds(&'static str),
 }
 
 impl std::fmt::Display for IntentError {
@@ -164,6 +166,7 @@ impl std::fmt::Display for IntentError {
                 f,
                 "previous_signed_head_hash presence ({has_prev}) contradicts base_version ({base_version})"
             ),
+            Self::OutOfBounds(field) => write!(f, "{field} is outside its bounds"),
         }
     }
 }
@@ -178,6 +181,26 @@ pub fn build_envelope_intent(
     ids: &IntentIds,
     nums: &IntentNumbers,
     stream_nonce_prefix: &[u8; STREAM_NONCE_PREFIX_LEN],
+    previous_signed_head_hash: Option<&[u8; 32]>,
+    slot: &SlotMaterial,
+) -> Result<IntentMaterial, IntentError> {
+    build_intent(
+        ids,
+        nums,
+        ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
+        stream_nonce_prefix,
+        previous_signed_head_hash,
+        slot,
+    )
+}
+
+/// The intent for any envelope suite: the suite ID and its nonce prefix are
+/// the only fields that differ (`envelope_v2` builds suite 2 with this).
+pub(crate) fn build_intent(
+    ids: &IntentIds,
+    nums: &IntentNumbers,
+    envelope_suite_id: u16,
+    stream_nonce_prefix: &[u8],
     previous_signed_head_hash: Option<&[u8; 32]>,
     slot: &SlotMaterial,
 ) -> Result<IntentMaterial, IntentError> {
@@ -210,10 +233,7 @@ pub fn build_envelope_intent(
         ("key_generation", c::u(nums.key_generation)),
         ("fkek_key_id", c::b(&ids.fkek_key_id)),
         ("preamble_version", c::u(2)),
-        (
-            "envelope_suite_id",
-            c::u(ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM as u64),
-        ),
+        ("envelope_suite_id", c::u(envelope_suite_id as u64)),
         ("wrap_suite_id", c::u(WRAP_SUITE_ID_CHACHA20POLY1305 as u64)),
         ("archive_format_id", c::u(ARCHIVE_FORMAT_ID_TAR as u64)),
         (

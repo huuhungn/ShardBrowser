@@ -29,6 +29,9 @@ use crate::canonical as c;
 
 /// `envelope_suite_id` — STREAM AEAD over ChaCha20-Poly1305 (IETF, 96-bit nonce).
 pub const ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM: u16 = 1;
+/// `envelope_suite_id` 2 — `SHARDX_ENVELOPE_XCHACHA20POLY1305_STREAM_LE31_V1`,
+/// the `SHARDXBK` object (ADR 0003). Suite 1 is never valid in that preamble.
+pub const ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31: u16 = 2;
 /// `wrap_suite_id` — DEK wrap under FKEK with ChaCha20-Poly1305.
 pub const WRAP_SUITE_ID_CHACHA20POLY1305: u16 = 1;
 /// `archive_format_id` — tar, as `snapshot::pack` writes it.
