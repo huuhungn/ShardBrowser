@@ -371,9 +371,9 @@ fn init_refuses_an_identity_directory_inside_the_data_directory() {
 #[tokio::test]
 async fn a_running_server_holds_the_lock_against_commands_and_a_second_server() {
     let d = dirs("lock");
-    let _server = spawn(&d, 38151, false);
+    let _server = spawn(&d, 28151, false);
     let c = http();
-    ready(&c, 38151).await;
+    ready(&c, 28151).await;
 
     for args in [&["identity", "init"][..], &["identity", "show"]] {
         let out = cli(&d, args);
@@ -386,7 +386,7 @@ async fn a_running_server_holds_the_lock_against_commands_and_a_second_server() 
     }
     assert_eq!(std::fs::read_dir(&d.identity).unwrap().count(), 0);
 
-    let mut second = spawn(&d, 38152, false);
+    let mut second = spawn(&d, 28152, false);
     assert!(!second.0.wait().unwrap().success());
 }
 
@@ -428,10 +428,10 @@ async fn an_interrupted_init_is_reported_and_never_repaired() {
     assert_eq!(field(&show, "status"), "EPOCH_RECONCILIATION_REQUIRED");
 
     {
-        let _server = spawn(&d, 38153, true);
+        let _server = spawn(&d, 28153, true);
         let c = http();
-        let token = ready(&c, 38153).await;
-        let (ws, wb, rs, rb) = v2_state(&c, 38153, &token).await;
+        let token = ready(&c, 28153).await;
+        let (ws, wb, rs, rb) = v2_state(&c, 28153, &token).await;
         assert_eq!((ws, rs), (423, 423));
         assert_eq!(wb["code"], "EPOCH_RECONCILIATION_REQUIRED");
         assert_eq!(rb["code"], "EPOCH_RECONCILIATION_REQUIRED");
@@ -495,11 +495,11 @@ async fn show_detects_a_tampered_record_and_a_record_the_mirror_does_not_attest(
 #[tokio::test]
 async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
     let d = dirs("noidentity");
-    let _server = spawn(&d, 38154, false);
+    let _server = spawn(&d, 28154, false);
     let c = http();
-    let token = ready(&c, 38154).await;
+    let token = ready(&c, 28154).await;
 
-    let (ws, wb, rs, rb) = v2_state(&c, 38154, &token).await;
+    let (ws, wb, rs, rb) = v2_state(&c, 28154, &token).await;
     assert_eq!((ws, rs), (423, 423));
     assert_eq!(wb["code"], "EPOCH_AUTHORITY_MISSING");
     assert_eq!(rb["code"], "EPOCH_AUTHORITY_MISSING");
@@ -524,7 +524,7 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
         "/v2/fleet/uploads/abort",
     ] {
         let r = c
-            .post(format!("http://127.0.0.1:38154{path}"))
+            .post(format!("http://127.0.0.1:28154{path}"))
             .bearer_auth(&token)
             .json(&json!({}))
             .send()
@@ -534,7 +534,7 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
     }
 
     let folder = c
-        .post("http://127.0.0.1:38154/folders")
+        .post("http://127.0.0.1:28154/folders")
         .bearer_auth(&token)
         .json(&json!({ "name": "still-works" }))
         .send()
@@ -542,7 +542,7 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
         .unwrap();
     assert!(folder.status().is_success(), "{}", folder.status());
     let listed: Value = c
-        .get("http://127.0.0.1:38154/folders")
+        .get("http://127.0.0.1:28154/folders")
         .bearer_auth(&token)
         .send()
         .await
@@ -561,11 +561,11 @@ async fn a_verified_identity_opens_v2_writes() {
     let d = dirs("verified");
     let init = cli(&d, &["identity", "init"]);
     assert!(init.status.success(), "{}", stderr(&init));
-    let _server = spawn(&d, 38155, true);
+    let _server = spawn(&d, 28155, true);
     let c = http();
-    let token = ready(&c, 38155).await;
+    let token = ready(&c, 28155).await;
 
-    let (ws, _, rs, rb) = v2_state(&c, 38155, &token).await;
+    let (ws, _, rs, rb) = v2_state(&c, 28155, &token).await;
     assert_eq!(
         ws, 400,
         "the handler, not the gate, rejects the bad tenant id"

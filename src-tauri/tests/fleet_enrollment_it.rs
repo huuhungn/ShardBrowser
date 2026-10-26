@@ -62,7 +62,7 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
     if !bin.exists() {
         return None;
     }
-    let port = 41500 + (std::process::id() % 300) as u16 + slot * 400;
+    let port = 21500 + (std::process::id() % 300) as u16 + slot * 400;
     let data_dir = std::env::temp_dir().join(format!("shardx-enroll-it-{port}"));
     let identity_dir = std::env::temp_dir().join(format!("shardx-enroll-it-{port}-identity"));
     let _ = std::fs::remove_dir_all(&data_dir);
