@@ -9,6 +9,7 @@ mod codex_mcp;
 mod cookies;
 mod credential;
 pub mod db;
+mod durable;
 pub mod errcode;
 mod extensions;
 pub mod files;

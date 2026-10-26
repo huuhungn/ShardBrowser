@@ -188,26 +188,11 @@ pub fn protect() -> Result<bool> {
 
 fn write(s: &FleetKeyStore) -> Result<()> {
     let path = store::fleet_keys_path()?;
-    // Write-then-rename, as with team.json: a crash mid-write must not leave a
-    // file that reads back as "no keys" and silently strands the snapshots.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(s)?)?;
-    restrict(&tmp);
-    fs::rename(&tmp, &path)?;
+    // As with team.json: a crash mid-write must not leave a file that reads
+    // back as "no keys" and silently strands the snapshots.
+    crate::durable::write_private(&path, serde_json::to_string_pretty(s)?.as_bytes())?;
     Ok(())
 }
-
-/// Restrict the file to its owner where the platform expresses that in mode
-/// bits. A best-effort call: failure to tighten permissions must not lose the
-/// key that was just collected.
-#[cfg(unix)]
-pub(crate) fn restrict(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-pub(crate) fn restrict(_path: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
