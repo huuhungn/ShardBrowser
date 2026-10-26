@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 
 use crate::config::Config;
@@ -26,10 +26,18 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
     tokio::fs::create_dir_all(&cfg.data_dir).await?;
     tokio::fs::create_dir_all(&cfg.blob_dir).await?;
+    refuse_network_storage(cfg)?;
 
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", cfg.db_path))?
         .create_if_missing(true)
         .foreign_keys(true)
+        // The storage policy (G2-50; plan L2061): a rollback journal with full
+        // syncs, so a commit is on disk when it returns and a crash rolls back
+        // the hot journal on the next open. WAL comes only once the crash,
+        // checkpoint, busy and rollback harness passes on Windows. Pinned here
+        // so a library default can never switch it silently.
+        .journal_mode(SqliteJournalMode::Delete)
+        .synchronous(SqliteSynchronous::Full)
         // Writers queue instead of failing fast while another transaction
         // holds the write lock.
         .busy_timeout(BUSY_TIMEOUT);
@@ -38,6 +46,30 @@ pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
         .connect_with(opts)
         .await?;
     Ok(pool)
+}
+
+/// The database and blobs must be on a local disk: SQLite locking is not
+/// reliable on network filesystems, and the plan rejects them (L2061, L2335).
+fn refuse_network_storage(cfg: &Config) -> anyhow::Result<()> {
+    let db_dir = std::path::Path::new(&cfg.db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(
+            || cfg.data_dir.clone(),
+            |p| p.to_string_lossy().into_owned(),
+        );
+    for (name, dir) in [
+        ("SHARDX_DATA_DIR", cfg.data_dir.as_str()),
+        ("the database directory", db_dir.as_str()),
+        ("the blob directory", cfg.blob_dir.as_str()),
+    ] {
+        let resolved =
+            std::fs::canonicalize(dir).map_err(|e| anyhow::anyhow!("{name} {dir:?}: {e}"))?;
+        if crate::identity::is_network_path(&resolved) {
+            anyhow::bail!("{name} {dir:?} is on a network share, which is not supported");
+        }
+    }
+    Ok(())
 }
 
 /// On an empty DB, create the initial admin from config.
@@ -249,6 +281,80 @@ mod tests {
         }
         drop(conns);
         pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_database_runs_a_synced_rollback_journal_and_survives_an_unclosed_pool() {
+        let dir = std::env::temp_dir().join(format!("shardx-journal-{}", std::process::id()));
+        let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
+        let cfg = Config {
+            data_dir: path(""),
+            db_path: path("server.db"),
+            blob_dir: path("blobs"),
+            ..cfg("127.0.0.1:8080")
+        };
+        let pool = open_pool(&cfg).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            (mode.as_str(), sync),
+            ("delete", 2),
+            "rollback journal, FULL"
+        );
+        sqlx::query("CREATE TABLE t (v INTEGER NOT NULL)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES (9223372036854775807)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        // The process dies here: no close, no orderly shutdown.
+        std::mem::forget(conn);
+        std::mem::forget(pool);
+
+        let reopened = open_pool(&cfg).await.unwrap();
+        let v: i64 = sqlx::query_scalar("SELECT v FROM t")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(v, i64::MAX, "a returned commit survives");
+        let check: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+        assert_eq!(check, "ok");
+        for sidecar in ["server.db-journal", "server.db-wal"] {
+            assert!(!dir.join(sidecar).exists(), "{sidecar} left behind");
+        }
+        reopened.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_that_cannot_be_resolved_is_refused() {
+        let dir = std::env::temp_dir().join(format!("shardx-storage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
+        let cfg = Config {
+            data_dir: path(""),
+            db_path: path("server.db"),
+            blob_dir: path("missing-blobs"),
+            ..cfg("127.0.0.1:8080")
+        };
+        let err = refuse_network_storage(&cfg).unwrap_err().to_string();
+        assert!(err.contains("the blob directory"), "{err}");
+        std::fs::create_dir(dir.join("missing-blobs")).unwrap();
+        refuse_network_storage(&cfg).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
