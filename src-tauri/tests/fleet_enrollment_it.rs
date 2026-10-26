@@ -379,6 +379,126 @@ async fn an_enrolled_device_collects_and_opens_its_root_key_grant() {
     );
 }
 
+/// An enrolled device opens a v2 device session with both proofs, and the
+/// session's refresh token rotates once.
+///
+/// The client checks the server's binding before it opens or signs anything,
+/// so a device holding a different HPKE key than the one enrolled must stop
+/// at the binding check and never reach the proof.
+#[tokio::test]
+async fn an_enrolled_device_opens_and_refreshes_a_device_session() {
+    let Some(server) = start_server_slot(2).await else {
+        panic!(
+            "team server binary missing -- build it first: \
+             cargo build --manifest-path ../server/Cargo.toml"
+        );
+    };
+
+    let token = login(server.port).await.expect("admin login");
+    let user_id = admin_user_id(server.port, &token)
+        .await
+        .expect("admin user id");
+
+    let tenant = [0x3Cu8; 16];
+    let tenant_hex: String = tenant.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        seed_tenant(&server.data_dir, &tenant, &user_id).await,
+        "could not seed the tenant, so the test would prove nothing"
+    );
+
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = FleetClient::new(&base, &token).expect("construct client");
+
+    let signer = shardx_core::signing::Ed25519SigningKey::from_bytes(&[44u8; 32]);
+    let hpke_seed = [13u8; 32];
+    let (_sk, hpke_pk) = shardx_core::grants::derive_keypair(&hpke_seed);
+    let hpke_pk: [u8; 32] = hpke_pk.as_slice().try_into().expect("32-byte hpke key");
+    let device = client
+        .enroll_device(&account(&tenant_hex), &signer, &hpke_pk, b"session-device")
+        .await
+        .expect("enrollment must succeed");
+
+    // The wrong HPKE seed: the binding names the enrolled key, not this one.
+    let err = client
+        .open_device_session(
+            &account(&tenant_hex),
+            &device.device_id,
+            &signer,
+            &[14u8; 32],
+        )
+        .await
+        .expect_err("a binding for other keys must be refused");
+    assert!(
+        err.to_string().contains("fleet.sessionBindingMismatch"),
+        "expected the binding check to refuse, got: {err}"
+    );
+
+    let session = client
+        .open_device_session(
+            &account(&tenant_hex),
+            &device.device_id,
+            &signer,
+            &hpke_seed,
+        )
+        .await
+        .expect("an enrolled device must open a session");
+    assert_eq!(
+        session.class, "pending_setup",
+        "a new device is pending setup"
+    );
+    assert!(!session.access_token.is_empty() && !session.refresh_token.is_empty());
+    assert!(session.access_expires_at_ms <= session.absolute_expires_at_ms);
+
+    // The session's access token is the bearer a v2 route takes, and the
+    // server sees this device behind it.
+    let me: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/v2/me", server.port))
+        .bearer_auth(&session.access_token)
+        .send()
+        .await
+        .expect("me request")
+        .error_for_status()
+        .expect("the session must authenticate a v2 route")
+        .json()
+        .await
+        .expect("me body");
+    assert_eq!(me["kind"], "session");
+    assert_eq!(me["session_id"], session.session_id.as_str());
+    assert_eq!(me["device_id"], device.device_id.as_str());
+
+    let rotated = client
+        .refresh_device_session(&session.refresh_token)
+        .await
+        .expect("a fresh refresh token must rotate");
+    assert_eq!(rotated.session_id, session.session_id);
+    assert_ne!(rotated.access_token, session.access_token);
+    assert_ne!(rotated.refresh_token, session.refresh_token);
+
+    // A spent refresh token ends the session for every holder.
+    assert!(client
+        .refresh_device_session(&session.refresh_token)
+        .await
+        .is_err());
+    assert!(
+        client
+            .refresh_device_session(&rotated.refresh_token)
+            .await
+            .is_err(),
+        "reusing a spent refresh token must revoke the session"
+    );
+    let revoked = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/v2/me", server.port))
+        .bearer_auth(&rotated.access_token)
+        .send()
+        .await
+        .expect("me request");
+    assert_eq!(
+        revoked.status(),
+        401,
+        "a revoked session's access token must stop working"
+    );
+}
+
 fn hex_to_16(h: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     for (i, b) in out.iter_mut().enumerate() {
