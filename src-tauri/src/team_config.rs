@@ -17,7 +17,7 @@ use shardx_core::signing::Ed25519SigningKey;
 
 use crate::store;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TeamConfig {
     /// Base URL of the team server, e.g. `https://team.example.com`.
     #[serde(default)]
@@ -51,6 +51,26 @@ pub struct TeamConfig {
     /// The same for the HPKE seed.
     #[serde(default)]
     pub hpke_credential_ref: String,
+}
+
+/// Never prints the token or a seed: a stray `{:?}` in a log must not leak
+/// what lets anyone act as this device (G2-47).
+impl std::fmt::Debug for TeamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = |s: &str| if s.is_empty() { "<none>" } else { "<redacted>" };
+        f.debug_struct("TeamConfig")
+            .field("server_url", &self.server_url)
+            .field("token", &held(&self.token))
+            .field("tenant_id", &self.tenant_id)
+            .field("device_id", &self.device_id)
+            .field("account_id", &self.account_id)
+            .field("fleet_id", &self.fleet_id)
+            .field("signing_key_seed", &held(&self.signing_key_seed))
+            .field("hpke_key_seed", &held(&self.hpke_key_seed))
+            .field("signing_credential_ref", &self.signing_credential_ref)
+            .field("hpke_credential_ref", &self.hpke_credential_ref)
+            .finish()
+    }
 }
 
 impl TeamConfig {
@@ -318,6 +338,23 @@ mod tests {
         assert_eq!(saved.signing_key().unwrap().to_bytes(), [0x44; 32]);
         assert_eq!(saved.hpke_seed().unwrap(), [0x55; 32]);
         store::set_config_root(None);
+    }
+
+    #[test]
+    fn debug_never_prints_the_token_or_a_seed() {
+        let c = TeamConfig {
+            token: "tok-secret".into(),
+            device_id: "ab".repeat(16),
+            signing_key_seed: "5a".repeat(32),
+            hpke_key_seed: "6b".repeat(32),
+            ..Default::default()
+        };
+        let printed = format!("{c:?}");
+        for secret in ["tok-secret", "5a5a", "6b6b"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(printed.contains(&"ab".repeat(16)) && printed.contains("<redacted>"));
+        assert!(format!("{:?}", TeamConfig::default()).contains("<none>"));
     }
 
     #[test]

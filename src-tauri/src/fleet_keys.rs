@@ -29,7 +29,7 @@ use crate::store;
 use zeroize::Zeroizing;
 
 /// One fleet's collected keys, by generation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FleetKeys {
     /// Generation number to hex-encoded 32-byte key.
     #[serde(default)]
@@ -88,6 +88,17 @@ impl FleetKeyStore {
         if generation >= f.active_generation {
             f.active_generation = generation;
         }
+    }
+}
+
+/// Lists generations, never key bytes (G2-47).
+impl std::fmt::Debug for FleetKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetKeys")
+            .field("keys", &self.keys.keys().collect::<Vec<_>>())
+            .field("credential_refs", &self.credential_refs)
+            .field("active_generation", &self.active_generation)
+            .finish()
     }
 }
 
@@ -270,6 +281,15 @@ mod tests {
         crate::credential::forget(&again.fleets[&fleet].credential_refs[&1]).unwrap();
         assert_eq!(load().unwrap().keys_newest_first(&fleet), [([0x62; 32], 2)]);
         store::set_config_root(None);
+    }
+
+    #[test]
+    fn debug_never_prints_a_key() {
+        let mut s = FleetKeyStore::default();
+        s.insert("ab", 1, &[0xc3; 32]);
+        let printed = format!("{s:?}");
+        assert!(!printed.contains("c3c3"), "{printed}");
+        assert!(printed.contains("active_generation: 1"), "{printed}");
     }
 
     /// A fleet this device holds nothing for yields nothing, rather than a
