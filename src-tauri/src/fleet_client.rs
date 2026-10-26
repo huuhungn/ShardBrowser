@@ -29,7 +29,9 @@ use serde::Deserialize;
 
 use shardx_core::canonical as c;
 use shardx_core::fleet_manifest::{build_snapshot_manifest, ManifestFields};
-use shardx_core::session_binding::{sign_enrollment, EnrollmentBindingV2};
+use shardx_core::session_binding::{
+    open_pop_secret, sign_enrollment, sign_pop, DeviceSessionBindingV2, EnrollmentBindingV2,
+};
 use shardx_core::signing::Ed25519SigningKey;
 
 /// Upload chunk size. The server caps a ranged read at 8 MiB; staying below it
@@ -85,6 +87,72 @@ pub struct AccountLogin<'a> {
     pub tenant_id: &'a str,
     pub username: &'a str,
     pub password: &'a str,
+}
+
+/// A v2 device session: the bearer every custody route takes. Its class says
+/// what it may do (`pending_setup`, `root_setup`); the server decides it.
+#[derive(Clone, Deserialize)]
+pub struct DeviceSession {
+    pub session_id: String,
+    pub class: String,
+    pub access_token: String,
+    pub access_expires_at_ms: i64,
+    pub refresh_token: String,
+    pub absolute_expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for DeviceSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSession")
+            .field("session_id", &self.session_id)
+            .field("class", &self.class)
+            .field("access_token", &"<redacted>")
+            .field("access_expires_at_ms", &self.access_expires_at_ms)
+            .field("refresh_token", &"<redacted>")
+            .field("absolute_expires_at_ms", &self.absolute_expires_at_ms)
+            .finish()
+    }
+}
+
+/// What a device session binding must name. The device, its keys and the
+/// tenant come from this machine; the rest only has to agree with the ticket
+/// and challenge the same server issued.
+struct SessionExpectation {
+    device_id: [u8; 16],
+    signing_public_key: [u8; 32],
+    hpke_public_key: [u8; 32],
+    tenant_id: [u8; 16],
+    account_id: [u8; 16],
+    ticket_id: [u8; 16],
+    challenge_id: [u8; 16],
+    server_instance_id: [u8; 16],
+    restore_epoch: u64,
+}
+
+/// Whether `got` names exactly what `want` expects. The nonce and expiry are
+/// the server's to choose, and `parse` already pins the suites and derives
+/// the key ids from the keys compared here.
+fn session_binding_matches(got: &DeviceSessionBindingV2, want: &SessionExpectation) -> bool {
+    let f = &got.fields;
+    got.device_id == want.device_id
+        && f.signing_public_key == want.signing_public_key
+        && f.hpke_public_key == want.hpke_public_key
+        && f.tenant_id == want.tenant_id
+        && f.account_id == want.account_id
+        && f.pre_device_session_id == want.ticket_id
+        && f.challenge_id == want.challenge_id
+        && f.server_instance_id == want.server_instance_id
+        && f.restore_epoch == want.restore_epoch
+}
+
+/// Server response to a device session challenge request.
+#[derive(Deserialize)]
+struct SessionChallenge {
+    challenge_id: String,
+    /// Hex of the exact `DeviceSessionBindingV2` bytes the proofs cover.
+    binding: String,
+    encapsulated_key: String,
+    ciphertext: String,
 }
 
 /// An account-only pre-device ticket and the server facts it was issued under.
@@ -202,12 +270,21 @@ impl FleetClient {
         label_ciphertext: &[u8],
     ) -> Result<EnrolledDevice> {
         let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+        let ticket = self.login_ticket(login).await?;
+        let enrolled = self
+            .enroll_with_ticket(&ticket, &tenant, signer, hpke_public_key, label_ciphertext)
+            .await;
+        self.end_ticket(&ticket).await;
+        enrolled
+    }
+
+    /// Logs `login` in for an account-only ticket.
+    async fn login_ticket(&self, login: &AccountLogin<'_>) -> Result<Ticket> {
         // The password is a long-lived account secret, unlike the token, so
         // it never crosses a network in clear.
         if !sends_secrets_safely(&self.base_url) {
             bail!(crate::errcode::code("fleet.insecureLogin"));
         }
-
         let res = self
             .http
             .post(self.url("/v2/auth/login"))
@@ -219,24 +296,138 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableLogin"))?;
-        let ticket: Ticket = Self::ok_or_err(res, "fleet.refusedLogin")
+        Self::ok_or_err(res, "fleet.refusedLogin")
             .await?
             .json()
             .await
-            .context(crate::errcode::code("fleet.badReplyLogin"))?;
+            .context(crate::errcode::code("fleet.badReplyLogin"))
+    }
 
-        let enrolled = self
-            .enroll_with_ticket(&ticket, &tenant, signer, hpke_public_key, label_ciphertext)
-            .await;
-        // The ticket is only for this enrollment here; end it either way.
-        // Best effort: it expires in ten minutes regardless.
+    /// Ends a ticket that served one step. Best effort: it expires in ten
+    /// minutes regardless.
+    async fn end_ticket(&self, ticket: &Ticket) {
         let _ = self
             .http
             .post(self.url("/v2/auth/logout"))
             .bearer_auth(&ticket.ticket)
             .send()
             .await;
-        enrolled
+    }
+
+    /// Opens a v2 device session for this enrolled device, as `login`'s
+    /// account (ADR 0001 R2).
+    ///
+    /// The account logs in for a ticket; the server issues a
+    /// `DeviceSessionBindingV2` naming this device and its keys, with a secret
+    /// sealed to its HPKE key. Before anything is opened or signed, the
+    /// binding must name this device, its keys and the tenant, and agree with
+    /// the ticket and challenge, so a server cannot get a proof for another
+    /// device or key. Opening the secret proves the HPKE key; signing binding
+    /// and secret proves the signing key.
+    pub async fn open_device_session(
+        &self,
+        login: &AccountLogin<'_>,
+        device_id: &str,
+        signer: &Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+    ) -> Result<DeviceSession> {
+        let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+        let device = decode_hex16(device_id, "device_id")?;
+        let ticket = self.login_ticket(login).await?;
+        let session = self
+            .session_with_ticket(&ticket, &tenant, &device, signer, hpke_seed)
+            .await;
+        self.end_ticket(&ticket).await;
+        session
+    }
+
+    async fn session_with_ticket(
+        &self,
+        ticket: &Ticket,
+        tenant: &[u8; 16],
+        device: &[u8; 16],
+        signer: &Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+    ) -> Result<DeviceSession> {
+        let res = self
+            .http
+            .post(self.url("/v2/auth/device-session-challenges"))
+            .bearer_auth(&ticket.ticket)
+            .json(&serde_json::json!({ "device_id": hex(device) }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        let challenge: SessionChallenge = Self::ok_or_err(res, "fleet.refusedSession")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))?;
+
+        let mismatch = || anyhow!(crate::errcode::code("fleet.sessionBindingMismatch"));
+        let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
+        let parsed = DeviceSessionBindingV2::parse(&binding).map_err(|_| mismatch())?;
+        let (hpke_secret, hpke_public) = shardx_core::grants::derive_keypair(hpke_seed);
+        let want = SessionExpectation {
+            device_id: *device,
+            signing_public_key: signer.verifying_key().to_bytes(),
+            hpke_public_key: hpke_public.as_slice().try_into().map_err(|_| mismatch())?,
+            tenant_id: *tenant,
+            account_id: decode_hex16(&ticket.account_id, "account_id")?,
+            ticket_id: decode_hex16(&ticket.ticket_id, "ticket_id")?,
+            challenge_id: decode_hex16(&challenge.challenge_id, "challenge_id")?,
+            server_instance_id: decode_hex16(&ticket.server_instance_id, "server_instance_id")?,
+            restore_epoch: ticket.restore_epoch,
+        };
+        if !session_binding_matches(&parsed, &want) {
+            return Err(mismatch());
+        }
+        let unsealed = || anyhow!(crate::errcode::code("fleet.sessionProofFailed"));
+        let secret = open_pop_secret(
+            &hpke_secret,
+            &binding,
+            &decode_hex(&challenge.encapsulated_key).ok_or_else(unsealed)?,
+            &decode_hex(&challenge.ciphertext).ok_or_else(unsealed)?,
+        )
+        .map_err(|_| unsealed())?;
+        let signature = sign_pop(signer, &binding, &secret);
+
+        let res = self
+            .http
+            .post(self.url("/v2/auth/device-session-proofs"))
+            .bearer_auth(&ticket.ticket)
+            .json(&serde_json::json!({
+                "challenge_id": challenge.challenge_id,
+                "secret": hex(&*secret),
+                "signature": hex(&signature),
+            }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        Self::ok_or_err(res, "fleet.refusedSession")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))
+    }
+
+    /// Rotates a device session's tokens. The old refresh token is spent:
+    /// never retry with it, because a reused token revokes the session.
+    pub async fn refresh_device_session(&self, refresh_token: &str) -> Result<DeviceSession> {
+        if !sends_secrets_safely(&self.base_url) {
+            bail!(crate::errcode::code("fleet.insecureSession"));
+        }
+        let res = self
+            .http
+            .post(self.url("/v2/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": refresh_token }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        Self::ok_or_err(res, "fleet.refusedRefresh")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))
     }
 
     async fn enroll_with_ticket(
@@ -693,7 +884,7 @@ fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
@@ -710,6 +901,12 @@ fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
         bail!(crate::errcode::code_with(
             "fleet.malformedHex32",
+            &[("field", field)]
+        ));
+    }
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(crate::errcode::code_with(
+            "fleet.malformedHexDigits",
             &[("field", field)]
         ));
     }
@@ -770,7 +967,110 @@ pub fn random_id_hex() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex16, random_id_hex, sends_secrets_safely, FleetClient};
+    use super::{
+        decode_hex, decode_hex16, random_id_hex, sends_secrets_safely, session_binding_matches,
+        DeviceSession, FleetClient, SessionExpectation,
+    };
+    use shardx_core::session_binding::{BindingFields, DeviceSessionBindingV2};
+
+    fn binding() -> DeviceSessionBindingV2 {
+        DeviceSessionBindingV2 {
+            device_id: [1; 16],
+            fields: BindingFields {
+                server_instance_id: [2; 16],
+                restore_epoch: 3,
+                tenant_id: [4; 16],
+                account_id: [5; 16],
+                pre_device_session_id: [6; 16],
+                challenge_id: [7; 16],
+                nonce: [8; 16],
+                signing_suite: 1,
+                signing_public_key: [9; 32],
+                signing_key_id: [10; 32],
+                hpke_suite: 1,
+                hpke_public_key: [11; 32],
+                hpke_key_id: [12; 32],
+                expires_at_ms: 13,
+            },
+        }
+    }
+
+    fn expectation() -> SessionExpectation {
+        SessionExpectation {
+            device_id: [1; 16],
+            signing_public_key: [9; 32],
+            hpke_public_key: [11; 32],
+            tenant_id: [4; 16],
+            account_id: [5; 16],
+            ticket_id: [6; 16],
+            challenge_id: [7; 16],
+            server_instance_id: [2; 16],
+            restore_epoch: 3,
+        }
+    }
+
+    #[test]
+    fn a_session_binding_must_name_every_expected_field() {
+        assert!(session_binding_matches(&binding(), &expectation()));
+        // The server's own choices do not have to match anything.
+        let mut b = binding();
+        b.fields.nonce = [0xEE; 16];
+        b.fields.expires_at_ms = 99;
+        assert!(session_binding_matches(&b, &expectation()));
+
+        type Mutation = fn(&mut DeviceSessionBindingV2);
+        let changes: [(&str, Mutation); 9] = [
+            ("device_id", |b| b.device_id[0] ^= 1),
+            ("signing_public_key", |b| {
+                b.fields.signing_public_key[0] ^= 1
+            }),
+            ("hpke_public_key", |b| b.fields.hpke_public_key[0] ^= 1),
+            ("tenant_id", |b| b.fields.tenant_id[0] ^= 1),
+            ("account_id", |b| b.fields.account_id[0] ^= 1),
+            ("pre_device_session_id", |b| {
+                b.fields.pre_device_session_id[0] ^= 1
+            }),
+            ("challenge_id", |b| b.fields.challenge_id[0] ^= 1),
+            ("server_instance_id", |b| {
+                b.fields.server_instance_id[0] ^= 1
+            }),
+            ("restore_epoch", |b| b.fields.restore_epoch += 1),
+        ];
+        for (name, change) in changes {
+            let mut b = binding();
+            change(&mut b);
+            assert!(
+                !session_binding_matches(&b, &expectation()),
+                "a binding with another {name} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_debug_print_hides_its_tokens() {
+        let s = DeviceSession {
+            session_id: "sid".into(),
+            class: "pending_setup".into(),
+            access_token: "access-secret".into(),
+            access_expires_at_ms: 1,
+            refresh_token: "refresh-secret".into(),
+            absolute_expires_at_ms: 2,
+        };
+        let printed = format!("{s:?}");
+        assert!(printed.contains("sid"));
+        assert!(!printed.contains("access-secret") && !printed.contains("refresh-secret"));
+    }
+
+    #[test]
+    fn hex_from_the_server_never_panics_or_takes_signs() {
+        // 32 bytes, but a multi-byte char straddles a digit pair.
+        let straddle = format!("a\u{e9}{}", "0".repeat(29));
+        assert_eq!(straddle.len(), 32);
+        assert!(decode_hex16(&straddle, "x").is_err());
+        assert!(decode_hex16(&format!("+f{}", "0".repeat(30)), "x").is_err());
+        assert_eq!(decode_hex("+f"), None);
+        assert_eq!(decode_hex("0aFF"), Some(vec![0x0a, 0xff]));
+    }
 
     #[test]
     fn a_password_goes_only_over_https_or_to_this_machine() {

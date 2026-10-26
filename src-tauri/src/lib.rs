@@ -2068,7 +2068,6 @@ async fn team_enroll_device(
     // half only exists here. Discarding it would make enrollment permanently
     // unable to receive custody.
     c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
-    c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
     team_config::save(&c).map_err(|e| e.to_string())?;
 
     // Read the key back before reporting success. The server now trusts this
