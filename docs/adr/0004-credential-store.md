@@ -29,11 +29,12 @@ credential, and the review results.
 
 ## Decision
 
-1. **Crates (Windows only).** `keyring-core = "=1.0.0"` and
-   `windows-native-keyring-store = "=1.1.0"`. Both are declared under
-   `[target.'cfg(windows)'.dependencies]` in the launcher. Other platforms have
-   no OS backend yet and use the fallback key file. That is the plan's order,
-   Windows first.
+1. **Crates (a Windows backend).** `keyring-core = "=1.0.0"` is a plain
+   launcher dependency on every platform: it has no platform code, and its
+   mock store is what the unit tests run against. Only
+   `windows-native-keyring-store = "=1.1.0"` is declared under
+   `[target.'cfg(windows)'.dependencies]`. Other platforms have no OS backend
+   yet and use the fallback key file. That is the plan's order, Windows first.
 2. **One key, one credential.**
    - Every secret is a 32-byte key, stored as raw bytes with `set_secret` and
      read with `get_secret`. It is never stored as a password string.
@@ -90,7 +91,8 @@ both toolchains, against the real Windows Credential Manager):
   that (plan 9.5: zeroize is not protection against a compromised process).
 - A Windows profile reset or a move to a new machine loses the keys by design.
   Recovery goes through the recovery bundle (ADR 0002 D-5) and re-enrolment.
-- One `cfg(windows)` dependency pair. Linux and macOS builds are unchanged.
+- One `cfg(windows)` dependency. Linux and macOS builds gain only `keyring-core`,
+  which compiles no platform code.
 
 ## Unblocks and tests
 
