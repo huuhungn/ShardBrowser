@@ -38,6 +38,7 @@ use shared::mutation::{
 };
 use shared::session_binding::{self as sb, DeviceSessionBindingV2};
 use shared::signing::Ed25519SigningKey;
+use shared::trust_chain::{Binding, Evidence, TrustChain};
 use shared::trust_evidence::TenantTrustEvidencePageV2;
 
 const INSTANCE: [u8; 16] = [7; 16];
@@ -3981,6 +3982,17 @@ async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
         vec![dev.sk.verifying_key().to_bytes()]
     );
     assert!(pages[0].revocations.is_empty());
+
+    // What the server serves verifies on its own: the bootstrap anchor is
+    // the custodian, and it is one now.
+    let binding = Binding {
+        server_instance_id: INSTANCE,
+        tenant_id: TENANT,
+    };
+    let chain = TrustChain::evaluate(Evidence::collect(&binding, &pages).unwrap(), None).unwrap();
+    assert_eq!(chain.anchor(), &dev.signing_key_id);
+    assert!(chain.custodian_now(&dev.signing_key_id, now_ms()));
+    assert!(!chain.custodian_now(&other.signing_key_id, now_ms()));
 
     // Naming the other device's key adds its grant.
     let named = containers(&evidence(&server, &access, &[other.signing_key_id]).await);
