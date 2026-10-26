@@ -55,9 +55,11 @@ const _: () = assert!(VALIDITY_MS <= shardx_core::approval_receipt::MAX_DEVICE_A
 
 /// What the bootstrap keeps between attempts, hex-encoded, written before
 /// each request leaves the device.
-// shortcut: the TRK sits in this file in the clear (owner-only on Unix), like
-// the fleet keys in `fleet_keys.rs`, and in plain `String`s that are not
-// zeroized; it moves to the OS key store with W7 (G2-47, G2-48).
+// shortcut: while the bootstrap runs, the TRK sits in this file in the clear
+// (owner-only on Unix) and in plain `String`s that are not zeroized. It is
+// cleared once the generation is active: the device reopens its self-grant
+// with its HPKE key, and the recovery bundle holds it. Keeping it in the OS
+// store instead waits for the fallback key file (G2-48).
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct BootstrapState {
     #[serde(default)]
@@ -695,6 +697,7 @@ impl Run<'_> {
         commit(state, save, |s| {
             s.anchor = anchor;
             s.activated = true;
+            s.trk.clear();
         })
     }
 }
