@@ -1254,6 +1254,7 @@
   "team.generatedSaveToApply": "Generated — save to apply",
   "team.generationSuffix": " (generation {n})",
   "team.grantsOpened": "{opened} of {grants} opened; {failed} could not be opened",
+  "team.keysNotProtected": "This device's keys are not protected by the OS credential store: it was unavailable, so they stay in plaintext files in the app's data folder.",
   "team.linux": "Linux",
   "team.noGrantsAreWaitingForThisDeviceYet": "No grants are waiting for this device yet",
   "team.noGrantsWaitingACustodianDeviceHasToIs": "No grants waiting — a custodian device has to issue one",

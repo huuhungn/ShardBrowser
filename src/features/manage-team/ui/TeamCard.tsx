@@ -272,6 +272,12 @@ export function TeamCard() {
                 <CopyField value={st.device_id} />
               </div>
 
+              {!st.keys_protected && (
+                <p className="m-0 text-paragraph-xs text-state-error-base" data-testid="keys-unprotected">
+                  {t("team.keysNotProtected")}
+                </p>
+              )}
+
               {boot?.activated && boot.anchor && (
                 <div>
                   <span className="text-paragraph-xs text-text-soft-400">{t("team.bootstrapAnchor")}</span>

@@ -165,6 +165,10 @@ pub struct TeamStatus {
     /// Whether this device holds a fleet key. Once true, sync seals and opens
     /// snapshots with the fleet key and no passphrase is asked for.
     pub has_fleet_key: bool,
+    /// Whether every key this device holds is in the OS credential store.
+    /// False while a seed or fleet key is still in plaintext on disk because
+    /// no store was usable (ADR 0004, unavailable store).
+    pub keys_protected: bool,
 }
 
 pub fn load() -> Result<TeamConfig> {
@@ -201,6 +205,10 @@ pub fn status() -> Result<TeamStatus> {
         has_fleet_key: crate::fleet_keys::load()
             .map(|s| s.active_key(&c.fleet_id).is_some())
             .unwrap_or(false),
+        keys_protected: c.signing_key_seed.is_empty()
+            && c.hpke_key_seed.is_empty()
+            && crate::fleet_keys::load()
+                .is_ok_and(|s| s.fleets.values().all(|f| f.keys.is_empty())),
     })
 }
 
@@ -245,6 +253,7 @@ mod tests {
             format!("device-signing.{}", "ab".repeat(16))
         );
         assert!(saved.is_enrolled() && saved.can_receive_custody());
+        assert!(status().unwrap().keys_protected);
         assert_eq!(
             saved.signing_key().unwrap().verifying_key().to_bytes(),
             key_before
@@ -283,6 +292,10 @@ mod tests {
         assert!(protect_keys(&mut c).unwrap());
         let saved = load().unwrap();
         assert_eq!(saved.signing_key_seed, "44".repeat(32));
+        assert!(
+            !status().unwrap().keys_protected,
+            "a plaintext seed is reported"
+        );
         assert!(saved.signing_credential_ref.is_empty());
         assert!(saved.hpke_key_seed.is_empty() && !saved.hpke_credential_ref.is_empty());
         assert_eq!(saved.signing_key().unwrap().to_bytes(), [0x44; 32]);

@@ -557,6 +557,9 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
           can_sync: true,
           can_receive_custody: true,
           has_fleet_key: false,
+          // The resumed setup also stands for a host whose credential store
+          // refused the keys.
+          keys_protected: scenario !== "team-first-device-resume",
         }
         : {
           server_url: "",
@@ -567,6 +570,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
           can_sync: false,
           can_receive_custody: false,
           has_fleet_key: false,
+          keys_protected: true,
         };
     case "team_custody_bootstrap_status":
       return custodyBootstrap;
