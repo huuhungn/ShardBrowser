@@ -39,7 +39,12 @@ impl Drop for TestServer {
     }
 }
 
+/// The server built by `cargo build --manifest-path ../server/Cargo.toml`, or
+/// the one `SHARDX_TEAM_SERVER_BIN` names when it was built elsewhere.
 fn server_binary() -> std::path::PathBuf {
+    if let Some(bin) = std::env::var_os("SHARDX_TEAM_SERVER_BIN") {
+        return bin.into();
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -84,26 +89,62 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let child = Command::new(&bin)
-        .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
-        .env("SHARDX_DATA_DIR", &data_dir)
-        .env("SHARDX_IDENTITY_DIR", &identity_dir)
-        .env("SHARDX_TOKEN_SECRET", "enrollment-integration-secret")
-        .env("SHARDX_ADMIN_USER", "admin")
-        .env("SHARDX_ADMIN_PASS", "enrollment-integration-pass")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
+    let child = spawn(port, &data_dir, &identity_dir)?;
     let server = TestServer {
         child,
         port,
         data_dir,
         identity_dir,
     };
+    wait_ready(port).await;
+    Some(server)
+}
 
-    // Poll for readiness instead of sleeping a fixed amount.
+fn server_command(data_dir: &std::path::Path, identity_dir: &std::path::Path) -> Command {
+    let mut c = Command::new(server_binary());
+    c.env("SHARDX_DATA_DIR", data_dir)
+        .env("SHARDX_IDENTITY_DIR", identity_dir)
+        .env("SHARDX_TOKEN_SECRET", "enrollment-integration-secret")
+        .env("SHARDX_ADMIN_USER", "admin")
+        .env("SHARDX_ADMIN_PASS", "enrollment-integration-pass");
+    c
+}
+
+fn spawn(port: u16, data_dir: &std::path::Path, identity_dir: &std::path::Path) -> Option<Child> {
+    server_command(data_dir, identity_dir)
+        .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Stops `server`, runs one offline operator command against its data, and
+/// starts it again on the same port.
+async fn operator(server: &mut TestServer, args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+    let mut cli = server_command(&server.data_dir, &server.identity_dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the operator command");
+    cli.stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write the operator's answers");
+    let out = cli.wait_with_output().expect("operator command");
+    server.child = spawn(server.port, &server.data_dir, &server.identity_dir).expect("restart");
+    wait_ready(server.port).await;
+    out
+}
+
+/// Poll for readiness instead of sleeping a fixed amount.
+async fn wait_ready(port: u16) {
     let http = reqwest::Client::new();
     for _ in 0..100 {
         if http
@@ -113,11 +154,10 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
             .map(|r| r.status().is_success())
             .unwrap_or(false)
         {
-            return Some(server);
+            return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Some(server)
 }
 
 async fn login(port: u16) -> Option<String> {
@@ -497,6 +537,229 @@ async fn an_enrolled_device_opens_and_refreshes_a_device_session() {
         401,
         "a revoked session's access token must stop working"
     );
+}
+
+/// Turns the seeded tenant into one waiting for its first device: no root
+/// generation yet, and an unused bootstrap guard for this server instance.
+async fn make_bootstrappable(data_dir: &std::path::Path, tenant: &[u8; 16]) {
+    let db = data_dir.join("shardx.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}",
+            db.to_string_lossy().replace('\\', "/")
+        ))
+        .await
+        .expect("open the server database");
+    sqlx::query("UPDATE v2_tenants SET active_root_generation = NULL WHERE id = ?")
+        .bind(tenant.as_slice())
+        .execute(&pool)
+        .await
+        .expect("clear the root generation");
+    sqlx::query(
+        "INSERT INTO v2_bootstrap_guards
+         SELECT server_instance_id, ?, 'unused', NULL, 't' FROM v2_server_state",
+    )
+    .bind(tenant.as_slice())
+    .execute(&pool)
+    .await
+    .expect("add the bootstrap guard");
+}
+
+/// The first device becomes the tenant's root custodian, resuming from its
+/// saved state after a refused approval and after a lost save, and a full
+/// replay of every saved request is answered from the server's stored
+/// responses.
+#[tokio::test]
+async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_requests() {
+    use shardx_launcher_lib::root_bootstrap::{
+        bootstrap_root, BootstrapDevice, BootstrapState, RecoveryExport,
+    };
+
+    let Some(mut server) = start_server_slot(3).await else {
+        panic!(
+            "team server binary missing -- build it first: \
+             cargo build --manifest-path ../server/Cargo.toml"
+        );
+    };
+    let token = login(server.port).await.expect("admin login");
+    let user_id = admin_user_id(server.port, &token)
+        .await
+        .expect("admin user id");
+    let tenant = [0x2Du8; 16];
+    let tenant_hex: String = tenant.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(seed_tenant(&server.data_dir, &tenant, &user_id).await);
+    make_bootstrappable(&server.data_dir, &tenant).await;
+
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = FleetClient::new(&base, &token).expect("construct client");
+    let signer = shardx_core::signing::Ed25519SigningKey::from_bytes(&[45u8; 32]);
+    let hpke_seed = [15u8; 32];
+    let (_sk, hpke_pk) = shardx_core::grants::derive_keypair(&hpke_seed);
+    let hpke_pk_arr: [u8; 32] = hpke_pk.as_slice().try_into().expect("32-byte hpke key");
+    let enrolled = client
+        .enroll_device(&account(&tenant_hex), &signer, &hpke_pk_arr, b"custodian")
+        .await
+        .expect("enrollment must succeed");
+
+    let bundle = server.data_dir.join("recovery.bundle");
+    let passphrase = "correct horse battery staple";
+    let device = BootstrapDevice {
+        login: account(&tenant_hex),
+        device_id: &enrolled.device_id,
+        account_id: &enrolled.account_id,
+        signer: &signer,
+        hpke_seed: &hpke_seed,
+    };
+    let recovery = RecoveryExport {
+        path: &bundle,
+        passphrase,
+    };
+    let disk = std::cell::RefCell::new(BootstrapState::default());
+    let fail_ack = std::cell::Cell::new(false);
+    let mut save = |s: &BootstrapState| -> anyhow::Result<()> {
+        if fail_ack.get() && !s.ack_request.is_empty() {
+            anyhow::bail!("disk full");
+        }
+        *disk.borrow_mut() = s.clone();
+        Ok(())
+    };
+
+    // Before the operator confirms the device, D1 is refused, and the
+    // approval it would file is already saved for the retry.
+    let mut state = BootstrapState::default();
+    let err = bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("an unconfirmed first device cannot approve itself");
+    assert!(err.to_string().contains("fleet.refusedCustody"), "{err}");
+    let approval = disk.borrow().approval.clone();
+    assert!(!approval.is_empty() && disk.borrow().trk.is_empty());
+
+    let signing_key_id = enrolled.signing_key_id.clone();
+    let hpke_key_id: String = shardx_core::keys::hpke_key_id(&hpke_pk)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let out = operator(
+        &mut server,
+        &[
+            "tenant",
+            "confirm-first-device",
+            "--tenant",
+            "it-tenant",
+            "--device",
+            &enrolled.device_id,
+        ],
+        &format!("{signing_key_id}\n{hpke_key_id}\n"),
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The save of the acknowledgement fails: the run stops with the
+    // generation created but not acknowledged, and the caller's state is
+    // exactly what is on disk.
+    fail_ack.set(true);
+    let mut state = disk.borrow().clone();
+    bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("a failed save stops the run");
+    let resumed = disk.borrow().clone();
+    assert_eq!(resumed.approval, approval, "the same approval is resent");
+    assert!(!resumed.create_request.is_empty() && resumed.ack_request.is_empty());
+    assert_eq!(state.create_request, resumed.create_request);
+    assert!(
+        state.ack_request.is_empty(),
+        "an unsaved request never reaches the caller"
+    );
+
+    // Activation needs the pinned bundle where it was written: gone, the run
+    // stops after the acknowledgement; put back, the same in-memory state
+    // finishes and the create replays its stored response.
+    fail_ack.set(false);
+    let kept = std::fs::read(&bundle).expect("the recovery bundle was written");
+    std::fs::remove_file(&bundle).expect("remove the bundle");
+    let err = bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("activation without the pinned bundle is refused");
+    assert!(
+        err.to_string().contains("fleet.recoveryBundleChanged"),
+        "{err}"
+    );
+    std::fs::write(&bundle, &kept).expect("restore the bundle");
+    bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect("the bootstrap must resume and finish");
+    let done = disk.borrow().clone();
+    assert!(done.activated && state.activated);
+    assert_eq!(done.create_request, resumed.create_request);
+
+    let active: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "{base}/v2/tenants/{tenant_hex}/root-key-generation"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("active generation")
+        .json()
+        .await
+        .expect("active generation body");
+    let trk = hex_to_32(&done.trk);
+    let root_key_id: String = shardx_core::keys::root_key_id(&trk)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(active["active"], true, "{active}");
+    assert_eq!(active["generation"], 0);
+    assert_eq!(active["root_key_id"], root_key_id.as_str());
+
+    // The exported bundle recovers the same TRK, and its hash is the pinned one.
+    let file = std::fs::read(&bundle).expect("the recovery bundle was written");
+    let (_, plaintext) =
+        shardx_core::recovery_bundle::open(&file, passphrase).expect("the bundle opens");
+    assert_eq!(*plaintext.trk, trk);
+    let pinned: String = shardx_core::recovery_bundle::recovery_bundle_sha256(&file)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(done.recovery_bundle_sha256, pinned);
+
+    // Every saved request again, from the top: the server answers each from
+    // its stored responses.
+    let mut replay = BootstrapState {
+        activated: false,
+        ..done.clone()
+    };
+    bootstrap_root(&client, &device, &recovery, &mut replay, &mut save)
+        .await
+        .expect("a full replay is answered from stored responses");
+
+    // State saved for another device is never mixed in.
+    let mut other = BootstrapState {
+        device_id: "00".repeat(16),
+        activated: false,
+        ..done
+    };
+    let err = bootstrap_root(&client, &device, &recovery, &mut other, &mut save)
+        .await
+        .expect_err("another device's state is refused");
+    assert!(
+        err.to_string().contains("fleet.custodyOtherDevice"),
+        "{err}"
+    );
+}
+
+fn hex_to_32(h: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).expect("hex");
+    }
+    out
 }
 
 fn hex_to_16(h: &str) -> [u8; 16] {
