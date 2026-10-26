@@ -1093,6 +1093,34 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_issued_before_its_issuers_window_never_counts() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let mut evidence = tenant(&a0, &b);
+        // B is a custodian from day 2; a grant it dated day 1 does not count,
+        // one dated day 3 does.
+        evidence.push(grant(
+            &b,
+            &d,
+            Capability::DeviceApprove,
+            75,
+            T0 + DAY,
+            T0 + 365 * DAY,
+        ));
+        evidence.push(grant(
+            &b,
+            &d,
+            Capability::KeyRotate,
+            76,
+            T0 + 3 * DAY,
+            T0 + 365 * DAY,
+        ));
+        let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
+        let t = T0 + 10 * DAY;
+        assert!(!c.capability_at(&d.key(), Capability::DeviceApprove, Scope::Tenant, t));
+        assert!(c.capability_at(&d.key(), Capability::KeyRotate, Scope::Tenant, t));
+    }
+
+    #[test]
     fn containers_of_another_tenant_are_dropped() {
         let (a0, b) = (Device::new(1), Device::new(2));
         SIGNED_TENANT.set([8; 16]);
