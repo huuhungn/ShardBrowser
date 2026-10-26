@@ -718,7 +718,8 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         .json()
         .await
         .expect("active generation body");
-    let trk = hex_to_32(&done.trk);
+    assert!(done.trk.is_empty(), "the TRK leaves the state once active");
+    let trk = hex_to_32(&resumed.trk);
     let root_key_id: String = shardx_core::keys::root_key_id(&trk)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -742,6 +743,7 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     // its stored responses.
     let mut replay = BootstrapState {
         activated: false,
+        trk: resumed.trk.clone(),
         ..done.clone()
     };
     bootstrap_root(&client, &device, &recovery, &mut replay, &mut save)
