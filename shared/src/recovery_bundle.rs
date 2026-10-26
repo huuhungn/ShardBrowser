@@ -735,6 +735,46 @@ mod tests {
         );
     }
 
+    /// RFC 9106 section 5.3: the Argon2id test vector, so the KDF under
+    /// every passphrase file is the standard one (G2-46).
+    #[test]
+    fn argon2id_matches_the_rfc_9106_vector() {
+        use argon2::{AssociatedData, ParamsBuilder};
+        let params = ParamsBuilder::new()
+            .m_cost(32)
+            .t_cost(3)
+            .p_cost(4)
+            .data(AssociatedData::new(&[0x04; 12]).unwrap())
+            .output_len(32)
+            .build()
+            .unwrap();
+        let argon =
+            Argon2::new_with_secret(&[0x03; 8], Algorithm::Argon2id, Version::V0x13, params)
+                .unwrap();
+        let mut tag = [0u8; 32];
+        argon
+            .hash_password_into(&[0x01; 32], &[0x02; 16], &mut tag)
+            .unwrap();
+        assert_eq!(
+            hex(&tag),
+            "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659"
+        );
+    }
+
+    /// `argon2id_kek` is plain Argon2id v0x13 at `p = 4` over `context ||
+    /// salt`: the plan's profile (L1375), with no secret or associated data.
+    #[test]
+    fn the_kek_is_argon2id_over_the_labelled_salt() {
+        let params = Params::new(65_536, 3, 4, Some(32)).unwrap();
+        let salt = [b"LABEL\0".as_slice(), &[3; 16]].concat();
+        let mut want = [0u8; 32];
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(PASS.as_bytes(), &salt, &mut want)
+            .unwrap();
+        let got = argon2id_kek(PASS, b"LABEL\0", 65_536, 3, &[3; 16]).unwrap();
+        assert_eq!(*got, want);
+    }
+
     #[test]
     fn a_bundle_header_is_closed_and_bounded() {
         // Every check here fails before the KDF runs.
