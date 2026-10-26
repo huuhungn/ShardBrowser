@@ -19,6 +19,11 @@ export type TeamStatus = {
   can_receive_custody: boolean;
   /** True when this device holds a fleet key, so sync needs no passphrase. */
   has_fleet_key: boolean;
+  /**
+   * Whether every key this device holds is in the OS credential store. False
+   * while a key is still in plaintext on disk because no store was usable.
+   */
+  keys_protected: boolean;
 };
 
 /** How far `team_bootstrap_custody` got; none of its secrets. */

@@ -1254,6 +1254,7 @@
   "team.generatedSaveToApply": "Đã tạo — lưu để áp dụng",
   "team.generationSuffix": " (thế hệ {n})",
   "team.grantsOpened": "Đã mở {opened}/{grants}; {failed} không mở được",
+  "team.keysNotProtected": "Khóa của thiết bị này chưa được kho thông tin xác thực của hệ điều hành bảo vệ: kho không dùng được, nên khóa vẫn nằm trong tệp không mã hóa ở thư mục dữ liệu của ứng dụng.",
   "team.linux": "Linux",
   "team.noGrantsAreWaitingForThisDeviceYet": "Chưa có quyền nào chờ thiết bị này",
   "team.noGrantsWaitingACustodianDeviceHasToIs": "Không có quyền chờ — một thiết bị giữ khoá phải cấp trước",

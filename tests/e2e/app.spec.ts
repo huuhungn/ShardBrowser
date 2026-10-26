@@ -233,11 +233,13 @@ test("the first device sets up root custody once its passphrases agree", async (
   await expect(page.getByTestId("custody-bootstrap")).toHaveCount(0);
   await expect(page.getByText("Bootstrap anchor")).toBeVisible();
   await expect(page.locator(`input[value="${"a0".repeat(32)}"]`)).toBeVisible();
+  await expect(page.getByTestId("keys-unprotected")).toHaveCount(0);
 });
 
 test("an interrupted custody setup resumes at its saved bundle without asking for a path", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-first-device-resume");
   await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByTestId("keys-unprotected")).toContainText("not protected by the OS credential store");
 
   const card = page.getByTestId("custody-bootstrap");
   await expect(card).toContainText("C:\\Users\\Example\\kept.shxrecovery");
