@@ -47,6 +47,12 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 | **Q-19 Effective time of a revocation** (trust chain, rule 1) | **(A) First sight only, as written.** A record verified before the client counted the revocation stays verified. Rejected: (B) withdraw every record by the revoked device on counting; (C) an `issued_at_ms` cutoff | none |
 | **Q-20 Banner tiering** (Q-13) | **Split by reason code.** The banner is urgent for `compromised`/`lost` and routine for `retired`/`rekeyed`. Only wording and urgency change; the flag is unchanged. For `compromised`, the urgent banner also says that commits are blocked (Q-18) and names the rotation to run | none |
 
+### Decided by the user on 2026-10-26
+
+| Choice | Decision | Plan lines |
+|---|---|---|
+| **Q-21 Recovery passphrase bytes** (D-5) | **The exact UTF-8 bytes as entered, with no Unicode normalization.** The KDF of the recovery bundle and of the fallback key file takes the passphrase as typed. Rejected: NFC before the KDF, which needs a normalization library on every client and changes nothing for keyboard input, which is NFC on every supported OS. Cost: a passphrase pasted in another normalization form derives another key; the export UI asks for the passphrase twice, so the user types it in the form they will type again | L1386, L2448 |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
@@ -912,6 +918,12 @@ RecoveryBundlePlaintextV2 (closed map)
 
 recovery_bundle_sha256 = domain_hash("SHARDX-RECOVERY-BUNDLE-V2\0", exact file bytes)
 ```
+
+**Passphrase bytes (Q-21, decided by the user on 2026-10-26).** The
+passphrase enters the KDF as the exact UTF-8 bytes typed, without Unicode
+normalization. A minimum length binds only a new export, never the opening
+of an existing bundle, so a later build that raises it still opens older
+bundles.
 
 Content rule: `retained_fkeks` holds **every** retained FKEK of the tenant at
 export time (L1386). At bootstrap there are none. The bundle pinned by a
