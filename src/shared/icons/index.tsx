@@ -30,6 +30,7 @@ import {
   PlusSignIcon,
   Folder01Icon,
   InformationCircleIcon,
+  Alert02Icon,
   ArrowDown01Icon,
   Delete02Icon,
   Globe02Icon,
@@ -39,6 +40,7 @@ import {
   StopIcon as HugeStopIcon,
   MoreVerticalIcon,
   Link04Icon,
+  Link01Icon,
   PauseIcon as HugePauseIcon,
   SparklesIcon,
   StarIcon,
@@ -83,6 +85,7 @@ export const LinuxOsIcon = make(TerminalIcon);
 export const RouteIcon = make(Route01Icon);
 export const SearchIcon = make(Search01Icon);
 export const CopyIcon = make(Copy01Icon);
+export const LinkIcon = make(Link01Icon);
 export const DownloadIcon = make(Download04Icon);
 export const UploadIcon = make(Upload04Icon);
 export const SunIcon = make(Sun01Icon);
@@ -95,6 +98,7 @@ export const RefreshIcon = make(ArrowReloadHorizontalIcon);
 export const AddIcon = make(PlusSignIcon);
 export const FolderIcon = make(Folder01Icon);
 export const InfoIcon = make(InformationCircleIcon);
+export const WarningIcon = make(Alert02Icon);
 export const StarOutlineIcon = make(StarIcon);
 export const LockedIcon = make(LockIcon);
 export const ChevronDownIcon = make(ArrowDown01Icon);

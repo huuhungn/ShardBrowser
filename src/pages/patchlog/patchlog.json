@@ -3,6 +3,75 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.4.4",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "ui-alignment-and-fingerprint-noise",
+          "title": "Tidier tables, pages and fingerprint library",
+          "lead": "Columns line up on every screen size, and the fingerprint library warns about a GPU mismatch once instead of on every card.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Table headers on the Browsers and Proxies pages now stay over their columns at every window width, including 2K and 4K screens and while a profile is starting. Every page puts its title in the same place, and empty pages share one layout."
+            },
+            {
+              "type": "p",
+              "text": "The fingerprint library shows one line with how many fingerprints claim GPU features this machine does not have. Each of those cards keeps a small warning mark that opens the full explanation."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.3",
+      "date": "2026-10-25",
+      "entries": [
+        {
+          "id": "team-sync-passphrase-only",
+          "title": "Team sync no longer trusts keys from the server",
+          "lead": "Pushing a profile to your team always uses the team passphrase again.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The launcher used to accept a fleet key from the team server without checking who issued it, and then used that key for every push. A compromised server could have read those profiles. Pushes now always use the team passphrase. Snapshots pushed under a fleet key still restore on devices that already hold the key."
+            },
+            {
+              "type": "note",
+              "text": "Team keys on this computer are now encrypted for your Windows account. If you move the launcher to another account or machine, enroll the device again."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "version": "2.4.2",
+      "date": "2026-10-24",
+      "entries": [
+        {
+          "id": "selection-keeps-table-in-place",
+          "title": "Selecting profiles keeps the table still",
+          "lead": "The rows no longer jump when you tick a profile.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Ticking the first profile, and then a second one, used to push the table down, so a quick second click could land on a different row. The selection bar now sits next to the page title and the table stays where it is. The selection count is shown in your language."
+            },
+            {
+              "type": "note",
+              "text": "Also in this release: the team server opens a database created by a build for another operating system, and records device keys correctly when they enroll. The browser engine is unchanged."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.1",
       "date": "2026-10-24",
       "entries": [

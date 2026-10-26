@@ -3,6 +3,7 @@ import {
   PinIconApp,
   EditIcon,
   CopyIcon,
+  LinkIcon,
   DeleteIcon,
   MoreIcon,
   PlayIcon,
@@ -38,14 +39,14 @@ export function ProfileRowActions({ profile, onMore }: {
         mode="lighter"
         size="xsmall"
         fullRadius
-        className="min-w-[84px]"
+        className="min-w-[6rem]"
         leftIcon={
           isRunning
             ? <StopIcon className="size-3.5" />
             : <span className={isStarting ? "spin-icon inline-grid place-items-center" : "inline-grid place-items-center"}><PlayIcon className="size-3.5" /></span>
         }
         onClick={() => startStop(p)}
-        aria-label={`${isRunning ? t("profileTable.stop") : t("profileTable.start")} profile ${p.name}`}
+        aria-label={t(isRunning ? "profile.stopProfileNamed" : "profile.startProfileNamed", { name: p.name })}
         title={!isRunning && isStarting ? t("profileTable.startingHint") : undefined}
       >
         {isRunning ? t("profileTable.stop") : isStarting ? t("profileTable.cancelStart") : t("profileTable.start")}
@@ -56,7 +57,7 @@ export function ProfileRowActions({ profile, onMore }: {
         size="xsmall"
         onlyIcon
         onClick={() => togglePin(p)}
-        aria-label={`${p.pinned ? t("profileTable.unpin") : t("profileTable.pin")} profile ${p.name}`}
+        aria-label={t(p.pinned ? "profile.unpinProfileNamed" : "profile.pinProfileNamed", { name: p.name })}
         title={p.pinned ? t("profileTable.unpin") : t("profileTable.pinToTop")}
         leftIcon={<PinIconApp className="size-4" />}
       >
@@ -69,7 +70,7 @@ export function ProfileRowActions({ profile, onMore }: {
         leftIcon={<CopyIcon className="size-4" />}
       >
       </Button>}
-      {wide && <Button variant="error" mode='filled' size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
+      {wide && <Button variant="error" mode="stroke" size="xsmall" onlyIcon onClick={() => remove(p.id)} title={t("common.delete")} aria-label={t("profile.deleteProfileNamed", { name: p.name })}
         leftIcon={<DeleteIcon className="size-4" />}
       >
       </Button>}
@@ -81,7 +82,7 @@ export function ProfileRowActions({ profile, onMore }: {
         onClick={() => { void copyCdp(p.id); }}
         aria-label={t("profile.copyCdpFor", { name: p.name })}
         title={t("profile.copyCdpHttpUrl")}
-        leftIcon={<CopyIcon className="size-4" />}
+        leftIcon={<LinkIcon className="size-4" />}
       >
       </Button>}
       <Button

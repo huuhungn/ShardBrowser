@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, DialogModal, cn } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
+import { EmptyState } from "../../shared/ui/EmptyState";
 import { useStoreChanged } from "../../shared/hooks/useStoreChanged";
 import { Field } from "../../shared/ui/Field";
 import { CSSelect } from "../../shared/ui/CSSelect";
@@ -173,17 +174,11 @@ export function BookmarksPage() {
           </div>
         ))}
         {shown.length === 0 && (
-          <div className="flex flex-col items-center gap-2.5 px-6 py-14 text-center">
-            <div className="grid size-14 place-items-center rounded-[14px] bg-primary-alpha-10 text-primary-base ring-1 ring-inset ring-primary-alpha-24">
-              <NavBookmarksIcon className="size-6" />
-            </div>
-            <h3 className="m-0 text-label-sm text-text-strong-950">
-              {items.length === 0 ? t("bookmarks.none.title") : t("bookmarks.none.inFolder")}
-            </h3>
-            <p className="m-0 max-w-[420px] text-paragraph-sm text-text-sub-600">
-              {t("bookmarks.none.body")}
-            </p>
-          </div>
+          <EmptyState
+            icon={<NavBookmarksIcon className="size-6" />}
+            title={items.length === 0 ? t("bookmarks.none.title") : t("bookmarks.none.inFolder")}
+            body={t("bookmarks.none.body")}
+          />
         )}
       </div>
 
