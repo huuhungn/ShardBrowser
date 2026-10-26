@@ -7,6 +7,7 @@ mod bookmarks;
 pub mod cdp;
 mod codex_mcp;
 mod cookies;
+mod credential;
 pub mod db;
 pub mod errcode;
 mod extensions;
@@ -1973,13 +1974,21 @@ fn team_set_connection(
     c.server_url = url;
     c.token = token.trim().to_string();
     c.tenant_id = tenant_id.trim().to_string();
+    let mut stale_refs = Vec::new();
     if server_changed {
         c.device_id.clear();
         c.signing_key_seed.clear();
         c.hpke_key_seed.clear();
+        stale_refs.push(std::mem::take(&mut c.signing_credential_ref));
+        stale_refs.push(std::mem::take(&mut c.hpke_credential_ref));
     }
 
     team_config::save(&c).map_err(|e| e.to_string())?;
+    // The identity is gone from the file; its keys go with it. Best effort:
+    // a credential left behind names a device no config refers to.
+    for reference in stale_refs.iter().filter(|r| !r.is_empty()) {
+        let _ = credential::forget(reference);
+    }
     team_config::status().map_err(|e| e.to_string())
 }
 
@@ -2069,7 +2078,22 @@ async fn team_enroll_device(
     // half only exists here. Discarding it would make enrollment permanently
     // unable to receive custody.
     c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
+    let old_refs = [
+        std::mem::take(&mut c.signing_credential_ref),
+        std::mem::take(&mut c.hpke_credential_ref),
+    ];
     team_config::save(&c).map_err(|e| e.to_string())?;
+    // Best effort: while the OS store is unavailable the seeds stay in the
+    // file, and the read-back below still proves them.
+    if let Err(error) = team_config::protect_keys(&mut c) {
+        eprintln!("[team] device keys stay in team.json: {error}");
+    }
+    // A re-enrollment under a new device id leaves the old keys unreferenced.
+    for reference in old_refs.iter().filter(|r| {
+        !r.is_empty() && **r != c.signing_credential_ref && **r != c.hpke_credential_ref
+    }) {
+        let _ = credential::forget(reference);
+    }
 
     // Read the key back before reporting success. The server now trusts this
     // public key; if the file did not round-trip, the failure should surface
@@ -2750,6 +2774,14 @@ pub fn run() {
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+
+            // Devices enrolled before ADR 0004 still hold their seeds in
+            // team.json; move them into the OS credential store.
+            if let Ok(mut team) = team_config::load() {
+                if let Err(error) = team_config::protect_keys(&mut team) {
+                    eprintln!("[launcher] device keys stay in team.json: {error}");
+                }
+            }
 
             // The window is created hidden to avoid a login-time flash. Normal
             // launches show it immediately; a configured startup launch keeps

@@ -30,6 +30,10 @@ anyhow = "1"
 # Encrypted profile backup: pack/seal lives in the shared crate, the Tauri
 # commands in src/backup_cmd.rs are its first production caller.
 shardx-core = { path = "../shared" }
+# Device keys in the OS credential store (ADR 0004). The core crate has no
+# platform code; the Windows backend is below.
+keyring-core = "=1.0.0"
+zeroize = "1"
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
@@ -75,6 +79,7 @@ libc = "0.2"
 # Windows cookie crypto: AES-256-GCM + DPAPI key from Local State.
 [target.'cfg(windows)'.dependencies]
 aes-gcm = "0.10"
+windows-native-keyring-store = "=1.1.0"
 getrandom = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",            # HLOCAL + LocalFree live here in 0.59

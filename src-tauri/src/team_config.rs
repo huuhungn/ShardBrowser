@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use zeroize::Zeroizing;
 
 use shardx_core::signing::Ed25519SigningKey;
 
@@ -43,12 +44,20 @@ pub struct TeamConfig {
     /// HPKE recipient key seed, hex-encoded. Present once enrolled.
     #[serde(default)]
     pub hpke_key_seed: String,
+    /// Where the signing seed lives once it left this file: its reference in
+    /// the OS credential store (ADR 0004). Then `signing_key_seed` is empty.
+    #[serde(default)]
+    pub signing_credential_ref: String,
+    /// The same for the HPKE seed.
+    #[serde(default)]
+    pub hpke_credential_ref: String,
 }
 
 impl TeamConfig {
     /// Whether this device has completed enrollment against `server_url`.
     pub fn is_enrolled(&self) -> bool {
-        !self.device_id.is_empty() && !self.signing_key_seed.is_empty()
+        !self.device_id.is_empty()
+            && !(self.signing_key_seed.is_empty() && self.signing_credential_ref.is_empty())
     }
 
     /// Whether this device has everything the fleet routes require. A device
@@ -60,7 +69,7 @@ impl TeamConfig {
 
     /// The device signing key, if enrolled.
     pub fn signing_key(&self) -> Result<Ed25519SigningKey> {
-        let seed = decode_hex32(&self.signing_key_seed)
+        let seed = seed(&self.signing_key_seed, &self.signing_credential_ref)
             .context(crate::errcode::code("teamConfig.signingKeyCorrupt"))?;
         Ok(Ed25519SigningKey::from_bytes(&seed))
     }
@@ -70,14 +79,68 @@ impl TeamConfig {
     /// half registered server-side but no private half here, so they cannot
     /// open grants and must re-enroll.
     pub fn hpke_seed(&self) -> Result<[u8; 32]> {
-        decode_hex32(&self.hpke_key_seed)
+        seed(&self.hpke_key_seed, &self.hpke_credential_ref)
+            .map(|s| *s)
             .context(crate::errcode::code("teamConfig.hpkeKeyUnusable"))
     }
 
     /// Whether this device can open grants sealed to it.
     pub fn can_receive_custody(&self) -> bool {
-        self.is_enrolled() && !self.hpke_key_seed.is_empty()
+        self.is_enrolled()
+            && !(self.hpke_key_seed.is_empty() && self.hpke_credential_ref.is_empty())
     }
+}
+
+/// A seed from the file while it is still there, else from the credential
+/// store. The file copy is the newer one: a seed leaves it only once stored.
+fn seed(plaintext: &str, credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
+    if plaintext.is_empty() && !credential_ref.is_empty() {
+        crate::credential::load(credential_ref)
+    } else {
+        decode_hex32(plaintext).map(Zeroizing::new)
+    }
+}
+
+/// Moves this device's plaintext seeds into the OS credential store (ADR
+/// 0004) and saves the file without them. A seed leaves the file only after
+/// it read back from the store; while the store is unavailable it stays.
+/// Returns whether any seed moved.
+// shortcut: with no usable store the seeds stay in plaintext `team.json`
+// until the fallback key file (ADR 0002, G2-48) lands.
+pub fn protect_keys(c: &mut TeamConfig) -> Result<bool> {
+    if c.device_id.is_empty() {
+        return Ok(false);
+    }
+    let device = c.device_id.clone();
+    let mut moved = false;
+    for (plaintext, reference, kind) in [
+        (
+            &mut c.signing_key_seed,
+            &mut c.signing_credential_ref,
+            "device-signing",
+        ),
+        (
+            &mut c.hpke_key_seed,
+            &mut c.hpke_credential_ref,
+            "device-hpke",
+        ),
+    ] {
+        if plaintext.is_empty() {
+            continue;
+        }
+        let key = Zeroizing::new(decode_hex32(plaintext)?);
+        let name = format!("{kind}.{device}");
+        if crate::credential::store(&name, &key).is_err() {
+            continue;
+        }
+        *reference = name;
+        plaintext.clear();
+        moved = true;
+    }
+    if moved {
+        save(c)?;
+    }
+    Ok(moved)
 }
 
 /// Connection status shown in Settings, with no secret in it.
@@ -148,4 +211,92 @@ fn decode_hex32(s: &str) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrolled_seeds_move_to_the_credential_store_and_still_open() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let mut c = TeamConfig {
+            device_id: "ab".repeat(16),
+            signing_key_seed: "11".repeat(32),
+            hpke_key_seed: "22".repeat(32),
+            ..Default::default()
+        };
+        save(&c).unwrap();
+        let key_before = c.signing_key().unwrap().verifying_key().to_bytes();
+
+        assert!(protect_keys(&mut c).unwrap());
+        let saved = load().unwrap();
+        let body = fs::read_to_string(store::team_config_path().unwrap()).unwrap();
+        assert!(
+            !body.contains(&"11".repeat(32)) && !body.contains(&"22".repeat(32)),
+            "{body}"
+        );
+        assert_eq!(
+            saved.signing_credential_ref,
+            format!("device-signing.{}", "ab".repeat(16))
+        );
+        assert!(saved.is_enrolled() && saved.can_receive_custody());
+        assert_eq!(
+            saved.signing_key().unwrap().verifying_key().to_bytes(),
+            key_before
+        );
+        assert_eq!(saved.hpke_seed().unwrap(), [0x22; 32]);
+        // Nothing left to move.
+        let mut again = saved.clone();
+        assert!(!protect_keys(&mut again).unwrap());
+
+        // A seed written back to the file (re-enrollment) wins over the store.
+        let mut fresh = saved.clone();
+        fresh.signing_key_seed = "33".repeat(32);
+        assert_eq!(fresh.signing_key().unwrap().to_bytes(), [0x33; 32]);
+
+        // A reference whose credential is gone fails closed.
+        crate::credential::forget(&saved.hpke_credential_ref).unwrap();
+        assert!(saved.hpke_seed().is_err());
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn a_seed_the_store_refuses_stays_in_the_file() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let mut c = TeamConfig {
+            device_id: "cd".repeat(16),
+            signing_key_seed: "44".repeat(32),
+            hpke_key_seed: "55".repeat(32),
+            ..Default::default()
+        };
+        crate::credential::fail_next_call(&format!("device-signing.{}", "cd".repeat(16)));
+
+        assert!(protect_keys(&mut c).unwrap());
+        let saved = load().unwrap();
+        assert_eq!(saved.signing_key_seed, "44".repeat(32));
+        assert!(saved.signing_credential_ref.is_empty());
+        assert!(saved.hpke_key_seed.is_empty() && !saved.hpke_credential_ref.is_empty());
+        assert_eq!(saved.signing_key().unwrap().to_bytes(), [0x44; 32]);
+        assert_eq!(saved.hpke_seed().unwrap(), [0x55; 32]);
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn a_device_without_an_identity_moves_nothing() {
+        let mut c = TeamConfig {
+            signing_key_seed: "11".repeat(32),
+            ..Default::default()
+        };
+        assert!(!protect_keys(&mut c).unwrap());
+        assert_eq!(c.signing_key_seed, "11".repeat(32));
+    }
 }
