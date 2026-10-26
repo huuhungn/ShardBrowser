@@ -91,7 +91,7 @@ fn write(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    crate::root_bootstrap::write_durably(&path, &bytes)?;
+    crate::durable::write_private(&path, &bytes)?;
     let back = std::fs::read(&path)?;
     let (_, opened) =
         file::open(&back, passphrase).map_err(|_| code("credential.readBackMismatch"))?;

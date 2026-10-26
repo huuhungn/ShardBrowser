@@ -641,7 +641,7 @@ fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
                 &[("path", &temporary.display().to_string())],
             )
         })?;
-        replace_file(&temporary, path).with_context(|| {
+        crate::durable::replace_file(&temporary, path).with_context(|| {
             crate::errcode::code_with(
                 "profile.replaceRecord",
                 &[("path", &path.display().to_string())],
@@ -653,38 +653,6 @@ fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
-    fs::rename(source, destination)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination_wide: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let moved = unsafe {
-        MoveFileExW(
-            source_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
 }
 
 /// Deterministic non-zero 32-bit seed from the profile id + noise slot (FNV-1a).

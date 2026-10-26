@@ -217,11 +217,9 @@ pub fn load() -> Result<TeamConfig> {
 
 pub fn save(c: &TeamConfig) -> Result<()> {
     let path = store::team_config_path()?;
-    // Write-then-rename: a crash mid-write must not leave a half-written file
-    // that reads back as "not enrolled" and orphans the device on the server.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(c)?)?;
-    fs::rename(&tmp, &path)?;
+    // A crash mid-write must not leave a half-written file that reads back as
+    // "not enrolled" and orphans the device on the server.
+    crate::durable::write_private(&path, serde_json::to_string_pretty(c)?.as_bytes())?;
     Ok(())
 }
 

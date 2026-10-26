@@ -322,26 +322,6 @@ fn stored_payload(
     Ok(s.canonical_response_payload_bytes)
 }
 
-/// Writes `bytes` over `path` so a crash leaves the old file or the new one:
-/// a synced sibling `<path>.tmp`, owner-only on Unix, renamed into place.
-pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    crate::fleet_keys::restrict(&tmp);
-    std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
 /// Writes the bundle, re-reads it from its final path and checks it opens
 /// (L819, L1387). Returns the hash the create request pins.
 fn export_recovery_bundle(
@@ -365,7 +345,7 @@ fn export_recovery_bundle(
         recovery.passphrase,
     )
     .map_err(|e| anyhow!(e).context(failed()))?;
-    write_durably(recovery.path, &file).with_context(failed)?;
+    crate::durable::write_private(recovery.path, &file).with_context(failed)?;
     let reread = std::fs::read(recovery.path).with_context(failed)?;
     rb::verify_export(&reread, recovery.passphrase, &header)
         .map_err(|e| anyhow!(e).context(failed()))
@@ -784,7 +764,7 @@ pub fn load() -> Result<BootstrapState> {
 /// lose the TRK or a request the server may already hold.
 pub fn save(state: &BootstrapState) -> Result<()> {
     let path = crate::store::custody_bootstrap_path()?;
-    write_durably(&path, serde_json::to_string_pretty(state)?.as_bytes())?;
+    crate::durable::write_private(&path, serde_json::to_string_pretty(state)?.as_bytes())?;
     Ok(())
 }
 
@@ -1002,18 +982,6 @@ mod tests {
         };
         commit(&mut state, &mut accept, |s| s.trk = "ab".into()).unwrap();
         assert_eq!((state.trk.as_str(), saved), ("ab", vec!["ab".to_string()]));
-    }
-
-    #[test]
-    fn a_durable_write_replaces_the_file_and_leaves_no_temporary() {
-        let dir = std::env::temp_dir().join(format!("shardx-durable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        write_durably(&path, b"one").unwrap();
-        write_durably(&path, b"two").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"two");
-        assert!(!dir.join("state.json.tmp").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

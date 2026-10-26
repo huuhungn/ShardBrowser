@@ -481,9 +481,26 @@ pub async fn commit_upload(
     // exist if an earlier attempt promoted the blob but died before the
     // manifest insert committed. Clearing it first makes the retry succeed.
     let _ = tokio::fs::remove_file(&final_path).await;
+    // The manifest row below names this blob, so the bytes and the rename
+    // must be on disk before it commits (G2-49). Flushing needs a writable
+    // handle on Windows.
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
+        .await
+        .map_err(|_| FleetError::BlobUnavailable)?
+        .sync_all()
+        .await
+        .map_err(|_| FleetError::BlobUnavailable)?;
     tokio::fs::rename(&staging, &final_path)
         .await
         .map_err(|_| FleetError::BlobUnavailable)?;
+    if let Some(parent) = final_path.parent().map(Path::to_path_buf) {
+        tokio::task::spawn_blocking(move || crate::identity::sync_dir(&parent))
+            .await
+            .map_err(|_| FleetError::BlobUnavailable)?
+            .map_err(|_| FleetError::BlobUnavailable)?;
+    }
 
     let blob_str = final_path.to_string_lossy().to_string();
 

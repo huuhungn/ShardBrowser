@@ -414,12 +414,12 @@ fn write_record(dir: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(windows)]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     // FILE_FLAG_BACKUP_SEMANTICS opens the directory itself; FlushFileBuffers
     // on it needs write access.
