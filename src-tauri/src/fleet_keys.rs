@@ -66,7 +66,8 @@ impl FleetKeyStore {
     #[cfg(test)]
     pub fn active_key(&self, fleet_id: &str) -> Option<([u8; 32], u64)> {
         let f = self.fleets.get(fleet_id)?;
-        f.key(f.active_generation).map(|k| (*k, f.active_generation))
+        f.key(f.active_generation)
+            .map(|k| (*k, f.active_generation))
     }
 
     /// Every key this device holds for a fleet, newest generation first.
@@ -300,8 +301,10 @@ mod tests {
         let saved = load().unwrap();
         let body = fs::read_to_string(store::fleet_keys_path().unwrap()).unwrap();
         assert!(!body.contains(&"62".repeat(32)), "{body}");
-        assert!(body.contains(&"61".repeat(32)), "{body}");
+        // On Windows the key left in the file is a DPAPI blob, never plaintext.
+        assert_eq!(body.contains(&"61".repeat(32)), !cfg!(windows), "{body}");
         let f = &saved.fleets[&fleet];
+        assert_eq!(f.keys.get(&1), Some(&"61".repeat(32)), "kept in the file");
         assert_eq!(f.credential_refs.keys().collect::<Vec<_>>(), [&2]);
         assert_eq!(saved.active_key(&fleet), Some(([0x62; 32], 2)));
         let all = saved.keys_newest_first(&fleet);
@@ -366,7 +369,10 @@ mod tests {
         let after = load().unwrap().keys_newest_first(&fleet);
         store::set_config_root(None);
 
-        assert!(first.contains("dpapi:") && !first.contains(&"5a".repeat(32)), "{first}");
+        assert!(
+            first.contains("dpapi:") && !first.contains(&"5a".repeat(32)),
+            "{first}"
+        );
         assert_eq!(held, vec![([0x5A; 32], 1)]);
         assert!(moved);
         assert!(!second.contains("dpapi:"), "{second}");

@@ -492,7 +492,10 @@ mod tests {
         drop(lock);
 
         assert!(!moved, "an unopenable seed is not moved");
-        assert_eq!(copied, body, "re-enrolment keeps the old file byte for byte");
+        assert_eq!(
+            copied, body,
+            "re-enrolment keeps the old file byte for byte"
+        );
         assert!(!st.can_sync && !st.can_receive_custody, "{st:?}");
         let signing = loaded.signing_key().err().map(|e| format!("{e:#}"));
         let hpke = loaded.hpke_seed().err().map(|e| format!("{e:#}"));
@@ -504,7 +507,10 @@ mod tests {
             );
         }
         assert!(!loaded.blocks_enrollment(), "re-enrollment must be allowed");
-        assert!(enrolled().blocks_enrollment(), "a working identity still blocks");
+        assert!(
+            enrolled().blocks_enrollment(),
+            "a working identity still blocks"
+        );
         assert!(
             st.keys_unreadable && !st.is_enrolled,
             "the interface offers enrollment"
@@ -579,7 +585,10 @@ mod tests {
         store::set_config_root(None);
 
         assert!(moved);
-        assert!(!body.contains("dpapi:") && !body.contains(SIGNING), "{body}");
+        assert!(
+            !body.contains("dpapi:") && !body.contains(SIGNING),
+            "{body}"
+        );
         assert!(saved.signing_key_seed.is_empty() && !saved.signing_credential_ref.is_empty());
         assert_eq!(saved.hpke_seed().unwrap(), [0x22; 32]);
     }
