@@ -466,7 +466,7 @@ async fn session(server: &Server, dev: &Device) -> Value {
 
 #[tokio::test]
 async fn a_ticket_becomes_a_device_session_only_through_both_proofs() {
-    let server = start("journey", 38171).await;
+    let server = start("journey", 28171).await;
     let dev = device(&server, OWNER, 0x21, "pending").await;
 
     let ticket = server.login("owner").await;
@@ -534,7 +534,7 @@ async fn a_ticket_becomes_a_device_session_only_through_both_proofs() {
 
 #[tokio::test]
 async fn a_ticket_authorizes_nothing_but_its_own_proofs() {
-    let server = start("ticket-only", 38172).await;
+    let server = start("ticket-only", 28172).await;
     let dev = device(&server, OWNER, 0x22, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
@@ -568,7 +568,7 @@ async fn a_ticket_authorizes_nothing_but_its_own_proofs() {
 
 #[tokio::test]
 async fn only_the_accounts_own_pending_device_gets_a_challenge() {
-    let server = start("devices", 38173).await;
+    let server = start("devices", 28173).await;
     let other = device(&server, OTHER, 0x23, "pending").await;
     let active = device(&server, OWNER, 0x24, "active").await;
     let quarantined = device(&server, OWNER, 0x25, "quarantined").await;
@@ -593,7 +593,7 @@ async fn only_the_accounts_own_pending_device_gets_a_challenge() {
 
 #[tokio::test]
 async fn a_signing_only_proof_burns_the_challenge() {
-    let server = start("signing-only", 38174).await;
+    let server = start("signing-only", 28174).await;
     let dev = device(&server, OWNER, 0x27, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
@@ -658,7 +658,7 @@ async fn a_signing_only_proof_burns_the_challenge() {
 
 #[tokio::test]
 async fn a_proof_belongs_to_its_own_ticket() {
-    let server = start("other-ticket", 38175).await;
+    let server = start("other-ticket", 28175).await;
     let dev = device(&server, OWNER, 0x28, "pending").await;
     let first = server.login("owner").await;
     let second = server.login("owner").await;
@@ -676,7 +676,7 @@ async fn a_proof_belongs_to_its_own_ticket() {
 
 #[tokio::test]
 async fn live_state_ends_tickets_and_sessions() {
-    let server = start("live", 38176).await;
+    let server = start("live", 28176).await;
     let dev = device(&server, OWNER, 0x29, "pending").await;
     let s = session(&server, &dev).await;
     let access = s["access_token"].as_str().unwrap();
@@ -775,7 +775,7 @@ async fn live_state_ends_tickets_and_sessions() {
 
 #[tokio::test]
 async fn refresh_rotates_once_and_respects_expiry() {
-    let server = start("refresh", 38177).await;
+    let server = start("refresh", 28177).await;
     let dev = device(&server, OWNER, 0x2a, "pending").await;
     let s = session(&server, &dev).await;
     let refresh = s["refresh_token"].clone();
@@ -887,7 +887,7 @@ async fn refresh_rotates_once_and_respects_expiry() {
 
 #[tokio::test]
 async fn logout_ends_the_ticket_its_challenges_or_the_session() {
-    let server = start("logout", 38178).await;
+    let server = start("logout", 28178).await;
     let dev = device(&server, OWNER, 0x2b, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
@@ -923,7 +923,7 @@ async fn logout_ends_the_ticket_its_challenges_or_the_session() {
 
 #[tokio::test]
 async fn login_failures_are_throttled_and_say_nothing() {
-    let server = start("throttle", 38179).await;
+    let server = start("throttle", 28179).await;
     let wrong = |user: &str| json!({ "tenant": "acme", "username": user, "password": "nope" });
     // Unknown user and wrong password are the same 401.
     assert_eq!(
@@ -958,7 +958,7 @@ async fn login_failures_are_throttled_and_say_nothing() {
 
 #[tokio::test]
 async fn every_way_of_naming_the_tenant_shares_one_account_throttle() {
-    let server = start("throttle-forms", 38189).await;
+    let server = start("throttle-forms", 28189).await;
     let lower = hex(&TENANT);
     let upper = lower.to_ascii_uppercase();
     let forms = [
@@ -998,7 +998,7 @@ async fn every_way_of_naming_the_tenant_shares_one_account_throttle() {
 
 #[tokio::test]
 async fn after_a_restart_a_new_login_reaches_the_same_device() {
-    let mut server = start("restart", 38180).await;
+    let mut server = start("restart", 28180).await;
     let dev = device(&server, OWNER, 0x2c, "pending").await;
     let first = session(&server, &dev).await;
     server.restart().await;
@@ -1012,7 +1012,7 @@ async fn after_a_restart_a_new_login_reaches_the_same_device() {
 
 #[tokio::test]
 async fn a_device_that_changed_since_its_challenge_gets_no_session() {
-    let server = start("changed", 38181).await;
+    let server = start("changed", 28181).await;
     let dev = device(&server, OWNER, 0x3c, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
@@ -1159,7 +1159,7 @@ async fn forge_session(
 
 #[tokio::test]
 async fn a_session_from_another_epoch_is_refused() {
-    let server = start("epoch", 38182).await;
+    let server = start("epoch", 28182).await;
     let dev = device(&server, OWNER, 0x3e, "pending").await;
     let (_, hpk) = derive_keypair(&[0x3f; 32]);
     let hpk: [u8; 32] = hpk.as_slice().try_into().unwrap();
@@ -1172,7 +1172,7 @@ async fn a_session_from_another_epoch_is_refused() {
 
 #[tokio::test]
 async fn an_account_holds_a_bounded_number_of_tickets() {
-    let server = start("tickets", 38183).await;
+    let server = start("tickets", 28183).await;
     // Tickets from another epoch can never be used, so they take no slot.
     for tag in 0x80..0x8a {
         forge_ticket(&server, INSTANCE, 1, tag).await;
@@ -1221,7 +1221,7 @@ async fn an_account_holds_a_bounded_number_of_tickets() {
 
 #[tokio::test]
 async fn a_ticket_issues_five_challenges_in_its_life() {
-    let server = start("burn", 38187).await;
+    let server = start("burn", 28187).await;
     let dev = device(&server, OWNER, 0x3b, "pending").await;
     let ticket = server.login("owner").await;
     // Burning a challenge with a wrong answer does not give its slot back.
@@ -1247,7 +1247,7 @@ async fn a_ticket_issues_five_challenges_in_its_life() {
 
 #[tokio::test]
 async fn concurrent_challenges_stop_at_the_cap() {
-    let server = start("race", 38184).await;
+    let server = start("race", 28184).await;
     let dev = device(&server, OWNER, 0x3a, "pending").await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str().unwrap().to_string();
@@ -1289,7 +1289,7 @@ async fn concurrent_challenges_stop_at_the_cap() {
 
 #[tokio::test]
 async fn a_session_rotates_a_bounded_number_of_times() {
-    let server = start("rotations", 38188).await;
+    let server = start("rotations", 28188).await;
     let dev = device(&server, OWNER, 0x3d, "pending").await;
     let mut s = session(&server, &dev).await;
     for _ in 0..64 {
@@ -1323,7 +1323,7 @@ async fn a_session_rotates_a_bounded_number_of_times() {
 
 #[tokio::test]
 async fn a_ticket_enrolls_a_device_and_then_proves_it_into_a_session() {
-    let server = start("enroll", 38185).await;
+    let server = start("enroll", 28185).await;
     // The Launcher names the tenant by ID; naming it twice is refused.
     let (status, _) = server
         .post(
@@ -1444,7 +1444,7 @@ async fn a_ticket_enrolls_a_device_and_then_proves_it_into_a_session() {
 
 #[tokio::test]
 async fn a_wrong_enrollment_signature_burns_the_challenge() {
-    let server = start("enroll-wrong", 38186).await;
+    let server = start("enroll-wrong", 28186).await;
     let ticket = server.login("owner").await;
     let t = ticket["ticket"].as_str();
     let sk = Ed25519SigningKey::from_bytes(&[0x4f; 32]);
@@ -1570,7 +1570,7 @@ fn code(body: &[u8]) -> String {
 
 #[tokio::test]
 async fn the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt() {
-    let mut server = start("d1", 38190).await;
+    let mut server = start("d1", 28190).await;
     let dev = device(&server, OWNER, 0x61, "pending").await;
     let confirmation_id = server.confirm(&dev).await;
     // A second pending device of the same owner, with a live setup session.
@@ -1710,7 +1710,7 @@ async fn the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt
 #[tokio::test]
 async fn a_closed_or_recovering_guard_never_approves() {
     // An inconsistency found while the confirmation is still pending.
-    let mut server = start("d1-recovery", 38194).await;
+    let mut server = start("d1-recovery", 28194).await;
     let dev = device(&server, OWNER, 0x6a, "pending").await;
     server.confirm(&dev).await;
     server
@@ -1733,7 +1733,7 @@ async fn a_closed_or_recovering_guard_never_approves() {
     drop(server);
 
     // The operator cancelled the attempt: closed for good, not just refused.
-    let mut server = start("d1-cancelled", 38195).await;
+    let mut server = start("d1-cancelled", 28195).await;
     let dev = device(&server, OWNER, 0x6b, "pending").await;
     server.confirm(&dev).await;
     let out = server
@@ -1766,7 +1766,7 @@ async fn a_closed_or_recovering_guard_never_approves() {
 
 #[tokio::test]
 async fn an_approval_needs_the_confirmation_the_session_and_the_exact_subject() {
-    let mut server = start("d1-refusals", 38191).await;
+    let mut server = start("d1-refusals", 28191).await;
     let dev = device(&server, OWNER, 0x63, "pending").await;
     let s = session(&server, &dev).await;
     let access = s["access_token"].as_str().unwrap();
@@ -1914,7 +1914,7 @@ async fn an_approval_needs_the_confirmation_the_session_and_the_exact_subject() 
 
 #[tokio::test]
 async fn concurrent_identical_approvals_commit_once() {
-    let mut server = start("d1-race", 38192).await;
+    let mut server = start("d1-race", 28192).await;
     let dev = device(&server, OWNER, 0x66, "pending").await;
     server.confirm(&dev).await;
     let s = session(&server, &dev).await;
@@ -1937,7 +1937,7 @@ async fn concurrent_identical_approvals_commit_once() {
 
 #[tokio::test]
 async fn a_stored_receipt_that_disagrees_closes_the_approval_path() {
-    let mut server = start("d1-integrity", 38193).await;
+    let mut server = start("d1-integrity", 28193).await;
     let dev = device(&server, OWNER, 0x67, "pending").await;
     server.confirm(&dev).await;
     let s = session(&server, &dev).await;
@@ -2078,7 +2078,7 @@ fn code_of(body: &[u8]) -> String {
 
 #[tokio::test]
 async fn the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response() {
-    let mut server = start("s6", 38196).await;
+    let mut server = start("s6", 28196).await;
     let (dev, access) = approved(&mut server, 0x61).await;
     let create = bootstrap_create(&TRK, self_grant(&dev, &TRK, |_| {}), |_| {});
     let req = root_request(0x91, &create);
@@ -2193,7 +2193,7 @@ async fn the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_res
 
 #[tokio::test]
 async fn a_bootstrap_needs_d1_the_setup_session_and_an_exact_self_grant() {
-    let mut server = start("s6-refusals", 38197).await;
+    let mut server = start("s6-refusals", 28197).await;
     // Before D1 the device's session is pending_setup.
     let early = device(&server, OWNER, 0x62, "pending").await;
     let s = session(&server, &early).await;
@@ -2447,7 +2447,7 @@ async fn a_bootstrap_needs_d1_the_setup_session_and_an_exact_self_grant() {
 
 #[tokio::test]
 async fn concurrent_identical_bootstraps_commit_once_and_a_bad_ledger_is_refused() {
-    let mut server = start("s6-race", 38198).await;
+    let mut server = start("s6-race", 28198).await;
     let (dev, access) = approved(&mut server, 0x65).await;
     let req = root_request(
         0x95,
@@ -2490,7 +2490,7 @@ async fn concurrent_identical_bootstraps_commit_once_and_a_bad_ledger_is_refused
 
 #[tokio::test]
 async fn a_bootstrap_needs_a_first_self_grant_and_a_consumed_guard() {
-    let mut server = start("s6-state", 38199).await;
+    let mut server = start("s6-state", 28199).await;
     let (dev, access) = approved(&mut server, 0x66).await;
     let request = |key: u8, edit: fn(&mut TenantRootKeyGrantV2)| {
         root_request(
@@ -2538,7 +2538,7 @@ async fn a_bootstrap_needs_a_first_self_grant_and_a_consumed_guard() {
 
 #[tokio::test]
 async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_it() {
-    let mut server = start("s6-race-keys", 38200).await;
+    let mut server = start("s6-race-keys", 28200).await;
     let (dev, access) = approved(&mut server, 0x67).await;
 
     // An active `root.custody` capability is root history (rule 1). Only a
@@ -2738,7 +2738,7 @@ async fn read_self_grant(
 
 #[tokio::test]
 async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero() {
-    let mut server = start("s6-activate", 38201).await;
+    let mut server = start("s6-activate", 28201).await;
     let (dev, access, container, target) = bootstrapped(&mut server, 0x63).await;
     let read = || read_self_grant(&server, &dev, &access);
 
@@ -2927,7 +2927,7 @@ async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero(
 
 #[tokio::test]
 async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() {
-    let mut server = start("s6-lifecycle-refusals", 38202).await;
+    let mut server = start("s6-lifecycle-refusals", 28202).await;
     let (dev, access, container, target) = bootstrapped(&mut server, 0x64).await;
     let honest = grant_ref(&dev, &container);
     let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
@@ -3214,7 +3214,7 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
 
 #[tokio::test]
 async fn an_expired_self_grant_is_neither_counted_nor_acknowledged() {
-    let mut server = start("s6-expired", 38203).await;
+    let mut server = start("s6-expired", 28203).await;
     let (dev, access) = approved(&mut server, 0x66).await;
     let until = now_ms() + 15_000;
     let container = self_grant(&dev, &TRK, |g| g.common.not_after_ms = until);
@@ -3260,7 +3260,7 @@ async fn an_expired_self_grant_is_neither_counted_nor_acknowledged() {
 
 #[tokio::test]
 async fn a_row_holding_another_rows_container_is_not_that_grant() {
-    let mut server = start("s6-borrowed", 38204).await;
+    let mut server = start("s6-borrowed", 28204).await;
     let (_dev, access, _container, target) = bootstrapped(&mut server, 0x67).await;
     // Behind the triggers' back, a second row under another replay ID that
     // holds the self-grant's exact container and claims an acknowledgement.
@@ -3366,7 +3366,7 @@ const GRANTS: &str = "/v2/capability-grants";
 
 #[tokio::test]
 async fn the_active_custodian_files_capability_grants_once() {
-    let mut server = start("d2-file", 38205).await;
+    let mut server = start("d2-file", 28205).await;
     let (dev, access, container, target) = bootstrapped(&mut server, 0x68).await;
     let own = capability_grant(&dev, &dev.sk, |_| {});
 
@@ -3522,7 +3522,7 @@ async fn the_active_custodian_files_capability_grants_once() {
 
 #[tokio::test]
 async fn only_a_live_custodian_files_an_issuable_grant_for_a_live_subject() {
-    let mut server = start("d2-refusals", 38206).await;
+    let mut server = start("d2-refusals", 28206).await;
     let (dev, access, _) = custodian(&mut server, 0x69).await;
     let stranger = Ed25519SigningKey::from_bytes(&[0x5e; 32]);
 
@@ -3720,7 +3720,7 @@ async fn only_a_live_custodian_files_an_issuable_grant_for_a_live_subject() {
 
 #[tokio::test]
 async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
-    let mut server = start("d2-revoked", 38207).await;
+    let mut server = start("d2-revoked", 28207).await;
     let (dev, access, _) = custodian(&mut server, 0x6b).await;
     let grant = |replay: u8| capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [replay; 16]);
 
@@ -3777,7 +3777,7 @@ async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
 
 #[tokio::test]
 async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
-    let mut server = start("quarantine-pass", 38208).await;
+    let mut server = start("quarantine-pass", 28208).await;
     let (dev, access, bootstrap) = custodian(&mut server, 0x6c).await;
     // The v1 collection route lists the grant, and the bootstrap replays.
     server
@@ -3947,7 +3947,7 @@ fn containers(pages: &[TenantTrustEvidencePageV2]) -> Vec<Vec<u8>> {
 
 #[tokio::test]
 async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
-    let mut server = start("trust-evidence", 38209).await;
+    let mut server = start("trust-evidence", 28209).await;
     let (dev, access, _) = custodian(&mut server, 0x6d).await;
     let own = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xa5; 16]);
     assert_eq!(server.call(GRANTS, &access, Some(&own)).await.0, 201);
@@ -4056,7 +4056,7 @@ async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
 
 #[tokio::test]
 async fn the_trust_evidence_pages_past_a_thousand_containers_and_leaves_nothing_out() {
-    let mut server = start("trust-pages", 38210).await;
+    let mut server = start("trust-pages", 28210).await;
     let (_dev, access, _) = custodian(&mut server, 0x70).await;
     // 1100 more approvals of the root subject, each its own container.
     let pool = db(&server.data).await;
@@ -4137,7 +4137,7 @@ async fn the_trust_evidence_pages_past_a_thousand_containers_and_leaves_nothing_
 
 #[tokio::test]
 async fn a_trust_evidence_page_stays_within_four_mebibytes() {
-    let mut server = start("trust-bytes", 38211).await;
+    let mut server = start("trust-bytes", 28211).await;
     let (_dev, access, _) = custodian(&mut server, 0x71).await;
     // 40 revoked approvals of 128 KiB each: more than one page can carry.
     let pool = db(&server.data).await;
