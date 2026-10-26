@@ -272,6 +272,13 @@ export function TeamCard() {
                 <CopyField value={st.device_id} />
               </div>
 
+              {boot?.activated && boot.anchor && (
+                <div>
+                  <span className="text-paragraph-xs text-text-soft-400">{t("team.bootstrapAnchor")}</span>
+                  <CopyField value={boot.anchor} />
+                </div>
+              )}
+
               {st.can_receive_custody && st.can_sync && boot && !boot.activated && (
                 <div className="flex flex-col gap-2" data-testid="custody-bootstrap">
                   <p className="m-0 text-paragraph-xs text-text-soft-400">

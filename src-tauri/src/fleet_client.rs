@@ -496,6 +496,47 @@ impl FleetClient {
         Ok(body.to_vec())
     }
 
+    /// Every page of the tenant's trust evidence, following the cursors. The
+    /// pages are only parsed here; `trust_chain` verifies what they hold.
+    pub async fn trust_evidence(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2>> {
+        use shardx_core::trust_chain::MAX_EVIDENCE_PAGES;
+        use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
+        let mut pages = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            if pages.len() >= MAX_EVIDENCE_PAGES {
+                bail!(crate::errcode::code("fleet.trustEvidenceRefused"));
+            }
+            let mut url = self.url(&format!("/v2/tenants/{tenant_id}/trust-evidence"));
+            if !cursor.is_empty() {
+                url = format!("{url}?cursor={cursor}");
+            }
+            let res = self
+                .http
+                .get(url)
+                .bearer_auth(access_token)
+                .send()
+                .await
+                .context(crate::errcode::code("fleet.unreachableCustody"))?;
+            let body = Self::ok_or_err(res, "fleet.refusedCustody")
+                .await?
+                .bytes()
+                .await
+                .context(crate::errcode::code("fleet.badReplyCustody"))?;
+            let page = TenantTrustEvidencePageV2::parse(&body)
+                .map_err(|_| anyhow!(crate::errcode::code("fleet.badReplyCustody")))?;
+            cursor = hex(&page.next_cursor);
+            pages.push(page);
+            if cursor.is_empty() {
+                return Ok(pages);
+            }
+        }
+    }
+
     /// Acknowledges one root grant. Returns the exact stored response.
     pub async fn ack_root_grant(
         &self,

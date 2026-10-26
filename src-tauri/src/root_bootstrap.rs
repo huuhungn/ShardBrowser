@@ -41,6 +41,7 @@ use shardx_core::mutation::{
 };
 use shardx_core::recovery_bundle::{self as rb, RecoveryBundlePlaintextV2};
 use shardx_core::signing::Ed25519SigningKey;
+use shardx_core::trust_chain::{Binding, Evidence, TrustChain};
 
 use crate::fleet_client::{decode_hex, decode_hex16, hex, AccountLogin, FleetClient};
 
@@ -88,6 +89,10 @@ pub struct BootstrapState {
     pub activate_request: String,
     #[serde(default)]
     pub activated: bool,
+    /// The bootstrap anchor `A0` the server's trust evidence verified to:
+    /// this device's own signing key ID.
+    #[serde(default)]
+    pub anchor: String,
 }
 
 impl std::fmt::Debug for BootstrapState {
@@ -671,7 +676,26 @@ impl Run<'_> {
             return Err(mismatch());
         }
 
-        commit(state, save, |s| s.activated = true)
+        // 7. The trust evidence the server now serves must verify on its own,
+        // rooted at this device: it is the anchor every later device pins,
+        // and a custodian now.
+        let refused = || anyhow!(crate::errcode::code("fleet.trustEvidenceRefused"));
+        let pages = self.client.trust_evidence(access, tenant_hex).await?;
+        let binding = Binding {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+        };
+        let evidence = Evidence::collect(&binding, &pages).map_err(|_| refused())?;
+        let chain =
+            TrustChain::evaluate(evidence, Some(&cx.signing_key_id)).map_err(|_| refused())?;
+        if !chain.custodian_now(&cx.signing_key_id, now_ms()) {
+            return Err(refused());
+        }
+        let anchor = hex(chain.anchor());
+        commit(state, save, |s| {
+            s.anchor = anchor;
+            s.activated = true;
+        })
     }
 }
 
@@ -723,6 +747,8 @@ pub struct BootstrapStatus {
     pub activated: bool,
     /// Where the recovery bundle was written, once it was.
     pub recovery_path: String,
+    /// The bootstrap anchor, once the trust evidence verified to it.
+    pub anchor: String,
 }
 
 impl BootstrapStatus {
@@ -731,6 +757,7 @@ impl BootstrapStatus {
             started: !state.tenant_id.is_empty(),
             activated: state.activated,
             recovery_path: state.recovery_path.clone(),
+            anchor: state.anchor.clone(),
         }
     }
 }
