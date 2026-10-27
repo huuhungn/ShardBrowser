@@ -9,8 +9,9 @@
 
 use shardx_core::{
     approval_receipt as ar, authz_record as az, canonical as c, envelope as ev, envelope_v2 as e2,
-    fallback_key_file as fk, fleet_manifest as fm, grants as gr, keys as k, mutation as mu,
-    recovery_bundle as rb, session_binding as sb, signing as sg, trust_evidence as te,
+    fallback_key_file as fk, fleet_lifecycle as fl, fleet_manifest as fm, grants as gr, keys as k,
+    mutation as mu, recovery_bundle as rb, session_binding as sb, signing as sg,
+    trust_evidence as te,
 };
 
 const DOMAINS: &[&str] = &[
@@ -25,6 +26,16 @@ const DOMAINS: &[&str] = &[
     az::DOMAIN_FLEET_KEY_GRANT_HPKE_INFO,
     az::DOMAIN_FLEET_RECOVERY_WRAP_CONTEXT,
     fk::DOMAIN_FALLBACK_KEY_FILE,
+    fl::DOMAIN_FLEET_GENERATION_CREATE,
+    fl::DOMAIN_FLEET_GENERATION_CREATED,
+    fl::DOMAIN_FLEET_GRANT_CREATE,
+    fl::DOMAIN_FLEET_GRANT_CREATED,
+    fl::DOMAIN_FLEET_GRANT_ACK,
+    fl::DOMAIN_FLEET_GRANT_ACKED,
+    fl::DOMAIN_FLEET_GENERATION_ACTIVATE,
+    fl::DOMAIN_FLEET_GENERATION_ACTIVATED,
+    fl::DOMAIN_FLEET_GRANT_REVOKE,
+    fl::DOMAIN_FLEET_GRANT_REVOKED,
     fm::DOMAIN_SNAPSHOT_MANIFEST,
     mu::DOMAIN_MUTATION_REQUEST,
     mu::DOMAIN_STORED_RESPONSE,

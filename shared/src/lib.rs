@@ -17,6 +17,7 @@ pub mod envelope;
 pub mod envelope_v2;
 pub mod fallback_key_file;
 pub mod fleet_grants;
+pub mod fleet_lifecycle;
 pub mod fleet_manifest;
 pub mod grants;
 pub mod keys;
