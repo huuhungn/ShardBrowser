@@ -2454,8 +2454,15 @@ async fn team_bootstrap_custody(
 /// whether custody is in place, not the key. A grant that fails to open is
 /// reported rather than skipped, because silently ignoring it would hide a
 /// device that cannot actually decrypt anything.
+///
+/// A fleet grant is read through this device's own session (ADR 0002 D-9), so
+/// a fleet with an ACTIVE generation needs the account login; the password is
+/// used for one login and never stored.
 #[tauri::command]
-async fn team_collect_custody() -> Result<serde_json::Value, String> {
+async fn team_collect_custody(
+    username: String,
+    password: String,
+) -> Result<serde_json::Value, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
@@ -2471,16 +2478,90 @@ async fn team_collect_custody() -> Result<serde_json::Value, String> {
         .map_err(|e| e.to_string())?;
 
     // Fleet grants are only counted, never opened: see `custody_report`.
-    let fleet_grants = if c.fleet_id.is_empty() {
-        Vec::new()
+    let fleet_grants_waiting = if c.fleet_id.is_empty() {
+        0
     } else {
-        client
-            .fleet_key_grants(&c.tenant_id, &c.device_id)
-            .await
-            .map_err(|e| e.to_string())?
+        fleet_grants_waiting(&client, &c, username.trim(), &password).await?
     };
 
-    custody_report(&device_sk, &grants, &fleet_grants)
+    custody_report(&device_sk, &grants, fleet_grants_waiting)
+}
+
+/// How many live D-9 `DeviceHpkeGrant`s of the fleet's ACTIVE generation are
+/// filed for this device: the readback holds at most one.
+async fn fleet_grants_waiting(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    username: &str,
+    password: &str,
+) -> Result<usize, String> {
+    let Some(generation) = client
+        .active_fleet_generation(&c.tenant_id, &c.fleet_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(0);
+    };
+    if username.is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let hpke_seed = c.hpke_seed().map_err(|e| e.to_string())?;
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username,
+        password,
+    };
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &hpke_seed)
+        .await
+        .map_err(|e| e.to_string())?;
+    let access = session.access_token.as_str();
+    let read = client
+        .read_fleet_device_grant(access, &c.fleet_id, generation, &c.device_id)
+        .await;
+    client.end_session(access).await;
+    match read.map_err(|e| e.to_string())? {
+        None => Ok(0),
+        Some(d) => live_fleet_grant(&d, &c.fleet_id, generation, &c.device_id).map(usize::from),
+    }
+}
+
+/// Whether the descriptor is an unrevoked `DeviceHpkeGrant` of exactly this
+/// fleet, generation and device. A descriptor naming anything else is a bad
+/// reply. Its signature is not checked: the grant is only counted, and the
+/// issuer's key comes with verified key distribution.
+fn live_fleet_grant(
+    descriptor: &[u8],
+    fleet_id: &str,
+    generation: u64,
+    device_id: &str,
+) -> Result<bool, String> {
+    use shardx_core::canonical::{decode, Value};
+    let bad = || crate::errcode::code("fleet.badReplyTeamKeys");
+    let Ok(Value::Map(fields)) = decode(descriptor) else {
+        return Err(bad());
+    };
+    let field = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let text = |name: &str| match field(name) {
+        Some(Value::Text(t)) => Some(t.as_str()),
+        _ => None,
+    };
+    let names = |name: &str, want: &str| matches!(field(name), Some(Value::Bytes(b)) if fleet_client::hex(b) == want);
+    if text("domain") != Some(shardx_core::mutation::DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR)
+        || text("payload_domain")
+            != Some(shardx_core::authz_record::DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE)
+        || !names("fleet_id", &fleet_id.to_ascii_lowercase())
+        || !names("subject_device_id", &device_id.to_ascii_lowercase())
+        || !matches!(field("generation"), Some(Value::Uint(g)) if *g == generation)
+    {
+        return Err(bad());
+    }
+    match text("grant_state") {
+        Some("PENDING_ACK" | "ACKNOWLEDGED") => Ok(true),
+        Some("REVOKED") => Ok(false),
+        _ => Err(bad()),
+    }
 }
 
 /// Open the root key grants and report counts.
@@ -2494,7 +2575,7 @@ async fn team_collect_custody() -> Result<serde_json::Value, String> {
 fn custody_report(
     device_sk: &[u8],
     grants: &[fleet_client::RootKeyGrant],
-    fleet_grants: &[fleet_client::FleetKeyGrant],
+    fleet_grants_waiting: usize,
 ) -> Result<serde_json::Value, String> {
     let mut opened = 0usize;
     let mut failed = 0usize;
@@ -2526,7 +2607,7 @@ fn custody_report(
         "fleet_opened": 0,
         "fleet_failed": 0,
         "newest_fleet_generation": null,
-        "fleet_grants_waiting": fleet_grants.len(),
+        "fleet_grants_waiting": fleet_grants_waiting,
         "can_sync_without_passphrase": false,
     }))
 }
@@ -2578,8 +2659,8 @@ mod custody_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Even a fleet grant this device can open is only counted: the server
-    /// delivered it, and nothing yet proves who issued it.
+    /// A fleet grant is only counted: the server delivered it, and nothing yet
+    /// proves who issued it.
     #[test]
     fn a_server_delivered_fleet_key_is_counted_but_never_cached() {
         let _config = store::config_root_test_lock()
@@ -2588,37 +2669,8 @@ mod custody_tests {
         let dir = tempfile::tempdir().unwrap();
         store::set_config_root(Some(dir.path().to_path_buf()));
 
-        let (device_sk, device_pk) = shardx_core::grants::derive_keypair(&[7u8; 32]);
-        let fkek = [0x5Cu8; 32];
-        let scope = shardx_core::fleet_grants::FleetGrantScope {
-            replay_id: [1; 16],
-            tenant_id: [2; 16],
-            server_instance_id: [3; 16],
-            restore_epoch: 0,
-            fleet_id: [4; 16],
-            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&fkek),
-            generation: 1,
-            subject_account_id: [5; 16],
-            subject_device_id: [6; 16],
-            recipient_hpke_key_id: shardx_core::keys::hpke_key_id(&device_pk),
-        };
-        let sealed = shardx_core::fleet_grants::seal_fkek(&device_pk, &scope, &fkek).unwrap();
-        assert!(
-            shardx_core::fleet_grants::open_fkek_with_info(&device_sk, &sealed).is_ok(),
-            "the grant must be one this device could open"
-        );
-        let grant = fleet_client::FleetKeyGrant {
-            grant_variant: "DeviceHpkeGrant".into(),
-            fleet_id: hex(&scope.fleet_id),
-            fkek_key_id: hex(&scope.fkek_key_id),
-            fleet_generation: 1,
-            recipient_hpke_key_id: hex(&scope.recipient_hpke_key_id),
-            hpke_info_hex: hex(&sealed.hpke_info_bytes),
-            hpke_encapped_key_hex: hex(&sealed.encapped_key_bytes),
-            hpke_wrapped_fkek_hex: hex(&sealed.ciphertext_bytes),
-        };
-
-        let report = custody_report(&device_sk, &[], &[grant]).unwrap();
+        let (device_sk, _) = shardx_core::grants::derive_keypair(&[7u8; 32]);
+        let report = custody_report(&device_sk, &[], 1).unwrap();
         let cached = store::fleet_keys_path().unwrap().exists();
         store::set_config_root(None);
 
@@ -2626,6 +2678,68 @@ mod custody_tests {
         assert_eq!(report["fleet_opened"], 0);
         assert_eq!(report["fleet_grants_waiting"], 1);
         assert_eq!(report["can_sync_without_passphrase"], false);
+    }
+
+    /// The D-9 readback counts only an unrevoked grant of exactly this fleet,
+    /// generation and device; one naming anything else is a bad reply.
+    #[test]
+    fn a_fleet_descriptor_counts_only_for_this_device_and_generation() {
+        use shardx_core::authz_record::{
+            build_record, AuthorizationRecord, CommonFields, DeviceHpkeGrantV2,
+            DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        };
+        use shardx_core::mutation::{
+            FleetDeviceGrantDescriptorV2, RootGenerationState, RootGrantState,
+        };
+
+        let sk = shardx_core::signing::Ed25519SigningKey::from_bytes(&[9; 32]);
+        let grant = DeviceHpkeGrantV2 {
+            common: CommonFields {
+                replay_id: [1; 16],
+                tenant_id: [2; 16],
+                issued_at_ms: 1_700_000_000_000,
+                not_before_ms: 1_700_000_000_000,
+                not_after_ms: 1_700_086_400_000,
+                server_instance_id: [3; 16],
+                restore_epoch: 0,
+            },
+            fleet_id: [4; 16],
+            fkek_key_id: [5; 32],
+            generation: 1,
+            subject_account_id: [6; 16],
+            subject_device_id: [7; 16],
+            subject_signing_key_id: [8; 32],
+            recipient_hpke_key_id: [9; 32],
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        let container = build_record(&sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &grant.encode());
+        let descriptor = |state| {
+            let record = AuthorizationRecord::parse(&container)
+                .unwrap()
+                .verify_signature(sk.verifying_key().as_bytes())
+                .unwrap();
+            FleetDeviceGrantDescriptorV2::new(record, state, RootGenerationState::Active)
+                .unwrap()
+                .encode()
+        };
+        let (fleet, device) = (hex(&[4; 16]), hex(&[7; 16]));
+        let live = descriptor(RootGrantState::Acknowledged);
+        assert_eq!(live_fleet_grant(&live, &fleet, 1, &device), Ok(true));
+        assert_eq!(
+            live_fleet_grant(&live, &fleet.to_uppercase(), 1, &device),
+            Ok(true)
+        );
+        let revoked = descriptor(RootGrantState::Revoked);
+        assert_eq!(live_fleet_grant(&revoked, &fleet, 1, &device), Ok(false));
+        for (fleet, generation, device) in [
+            (hex(&[0; 16]), 1, device.clone()),
+            (fleet.clone(), 2, device.clone()),
+            (fleet.clone(), 1, hex(&[0; 16])),
+        ] {
+            assert!(live_fleet_grant(&live, &fleet, generation, &device).is_err());
+        }
+        assert!(live_fleet_grant(b"not cbor", &fleet, 1, &device).is_err());
     }
 }
 

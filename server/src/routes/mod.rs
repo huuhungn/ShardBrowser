@@ -107,6 +107,10 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
         .route(
+            "/v2/fleets/:fleet_id/key-generations/:generation/grants/:device_id",
+            get(v2_fleet::read_fleet_device_grant),
+        )
+        .route(
             "/v2/fleets/:fleet_id/key-generations/:generation/ack",
             post(v2_fleet::ack_fleet_grant)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
