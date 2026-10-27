@@ -5361,3 +5361,152 @@ async fn a_custodian_files_an_existing_root_grant_only_to_a_tenant_approved_devi
         assert_eq!(server.count(query).await, want, "{query}");
     }
 }
+
+#[tokio::test]
+async fn a_device_reads_back_only_its_own_fleet_grant_as_an_exact_descriptor() {
+    use shared::authz_record::{DeviceHpkeGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE};
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+    };
+    use shared::mutation::{
+        fleet_device_grant_set_hash, FleetDeviceGrantDescriptorV2, RootGenerationState,
+        RootGrantState,
+    };
+
+    let mut server = start("d9-fleet-read", 28216).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let grant = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa7; 16];
+        g.capability = Capability::FleetManage;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    let fkek = [0xe0; 32];
+    let device_grant = DeviceHpkeGrantV2 {
+        common: fleet_common(0xd0, 365),
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        recipient_hpke_key_id: dev.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let container = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &device_grant.encode(),
+    );
+    let terms = FleetGenerationTerms {
+        generation: FleetGenerationRef {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            fleet_id: FLEET,
+            generation: 0,
+            fkek_key_id: fkek,
+        },
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&container)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: [0x77; 32],
+        rotation: None,
+    };
+    let create = FleetKeyGenerationCreateV2 {
+        terms,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create.encode());
+    assert_eq!(
+        server
+            .call(&fleet_generation_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let read_path = |generation: u64, device: &[u8; 16]| {
+        format!("{}/{}", fleet_grants_path(generation), hex(device))
+    };
+    let path = read_path(0, &dev.id);
+    let issuer = *dev.sk.verifying_key().as_bytes();
+    let read = |status: u16, body: Vec<u8>| {
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let d = FleetDeviceGrantDescriptorV2::parse(&body, &issuer).unwrap();
+        assert_eq!(
+            d.record().record().exact_signed_container_bytes(),
+            &container[..]
+        );
+        (d.grant_state(), d.generation_state())
+    };
+
+    // Nothing filed yet.
+    assert_eq!(server.call(&path, &access, None).await.0, 404);
+    let request = fleet_grant_request(0xb1, 0, fkek, V::DeviceHpke, 0xd0, &container);
+    assert_eq!(
+        server
+            .call(&fleet_grants_path(0), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let (status, body) = server.call(&path, &access, None).await;
+    assert_eq!(
+        read(status, body),
+        (RootGrantState::PendingAck, RootGenerationState::Preparing)
+    );
+    let ack = lifecycle_request(
+        OperationKind::FleetGrantAck,
+        0xb2,
+        FleetKeyGrantAckV2 {
+            grant: fleet_grant_ref(0, fkek, V::DeviceHpke, 0xd0, &container),
+        }
+        .encode(),
+    );
+    let ack_path = format!("{}/0/ack", fleet_generation_path());
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
+    let (status, body) = server.call(&path, &access, None).await;
+    assert_eq!(
+        read(status, body),
+        (RootGrantState::Acknowledged, RootGenerationState::Preparing)
+    );
+
+    // Another device's grant, and another generation, do not exist for it.
+    let other = device(&server, OWNER, 0x7b, "pending").await;
+    let other_access = session(&server, &other).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(server.call(&path, &other_access, None).await.0, 404);
+    assert_eq!(
+        server.call(&read_path(1, &dev.id), &access, None).await.0,
+        404
+    );
+    assert_eq!(
+        server.call(&read_path(0, &other.id), &access, None).await.0,
+        404
+    );
+
+    // A row that left its container is never served.
+    server
+        .sql(
+            "DROP TRIGGER v2_fleet_device_hpke_grants_record_is_fixed",
+            &[],
+        )
+        .await;
+    server
+        .sql(
+            "UPDATE v2_fleet_device_hpke_grants SET not_after_ms = not_after_ms - 1",
+            &[],
+        )
+        .await;
+    assert_eq!(server.call(&path, &access, None).await.0, 422);
+}

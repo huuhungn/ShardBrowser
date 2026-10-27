@@ -169,7 +169,9 @@ export function TeamCard() {
   });
 
   const collect = () => run("collect", async () => {
-    const r = await teamCollectCustody();
+    const typed = password;
+    setPassword("");
+    const r = await teamCollectCustody(username, typed);
     if (r.grants === 0) {
       if (r.fleet_grants_waiting === 0) toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
@@ -414,6 +416,26 @@ export function TeamCard() {
 
               {st.can_receive_custody ? (
                 <>
+                  {/* The bootstrap form above already holds the account login. */}
+                  {!(st.can_sync && boot && !boot.activated) && (
+                    <>
+                      <Input
+                        label={t("team.accountUsername")}
+                        inputSize="small"
+                        autoComplete="username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.accountPassword")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                      />
+                    </>
+                  )}
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
                       {busy === "collect" ? t("busy.collecting") : t("team.collectKeyCustody")}

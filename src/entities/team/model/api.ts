@@ -25,10 +25,12 @@ export const teamEnrollDevice = (label: string, username: string, password: stri
 
 /**
  * Collect the root key grants issued to this device. Reports whether custody
- * is in place; the key itself never leaves the backend.
+ * is in place; the key itself never leaves the backend. A fleet grant is read
+ * through this device's own session, so the password is used for one login
+ * and never stored.
  */
-export const teamCollectCustody = () =>
-  invoke<CustodyResult>("team_collect_custody");
+export const teamCollectCustody = (username: string, password: string) =>
+  invoke<CustodyResult>("team_collect_custody", { username, password });
 
 /**
  * Create the passphrase-protected key file for a device whose OS credential

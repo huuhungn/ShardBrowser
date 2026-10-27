@@ -820,30 +820,57 @@ impl FleetClient {
         Ok(body.grants)
     }
 
-    /// Fleet key grants filed for this device.
-    ///
-    /// The fleet key is what actually opens profile snapshots, so this is the
-    /// call that lets an enrolled device read what its fleet has pushed.
-    pub async fn fleet_key_grants(
+    /// The fleet's ACTIVE key generation, if it has one.
+    pub async fn active_fleet_generation(
         &self,
         tenant_id: &str,
-        device_id: &str,
-    ) -> Result<Vec<FleetKeyGrant>> {
+        fleet_id: &str,
+    ) -> Result<Option<u64>> {
         let res = self
             .http
             .get(self.url(&format!(
-                "/v2/tenants/{tenant_id}/devices/{device_id}/fleet-key-grants"
+                "/v2/tenants/{tenant_id}/fleets/{fleet_id}/key-generation"
             )))
             .bearer_auth(&self.token)
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
-        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedTeamKeys")
+        let body: Option<ActiveFleetGeneration> = Self::ok_or_err(res, "fleet.refusedTeamKeys")
             .await?
             .json()
             .await
             .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
-        Ok(body.grants)
+        Ok(body.map(|g| g.generation))
+    }
+
+    /// This device's D-9 `DeviceHpkeGrant` of `generation` as its exact
+    /// `FleetDeviceGrantDescriptorV2` (plan L1131), `None` when none is filed.
+    /// The server serves it to this device's own session only.
+    pub async fn read_fleet_device_grant(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        generation: u64,
+        device_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let res = self
+            .http
+            .get(self.url(&format!(
+                "/v2/fleets/{fleet_id}/key-generations/{generation}/grants/{device_id}"
+            )))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = Self::ok_or_err(res, "fleet.refusedTeamKeys")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
+        Ok(Some(body.to_vec()))
     }
 
     /// Lease, stage, and publish a sealed container. Returns the new version.
@@ -1107,20 +1134,8 @@ struct RootKeyGrantsResponse {
 
 /// A fleet key grant as the server returns it.
 #[derive(Debug, serde::Deserialize)]
-pub struct FleetKeyGrant {
-    pub grant_variant: String,
-    pub fleet_id: String,
-    pub fkek_key_id: String,
-    pub fleet_generation: i64,
-    pub recipient_hpke_key_id: String,
-    pub hpke_info_hex: String,
-    pub hpke_encapped_key_hex: String,
-    pub hpke_wrapped_fkek_hex: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct FleetKeyGrantsResponse {
-    grants: Vec<FleetKeyGrant>,
+struct ActiveFleetGeneration {
+    generation: u64,
 }
 
 pub fn random_id_hex() -> String {

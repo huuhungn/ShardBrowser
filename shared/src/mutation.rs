@@ -36,6 +36,8 @@ pub const RECORD_TYPE_ROOT_GENERATION_ACTIVATED: &str = "TenantRootGenerationAct
 /// The plan names no domain for the GET readback descriptor; this is the one
 /// chosen here.
 pub const DOMAIN_ROOT_GRANT_DESCRIPTOR: &str = "shardx.keys.tenant-root-grant-descriptor.v2";
+pub const DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR: &str =
+    "shardx.keys.fleet-device-grant-descriptor.v2";
 pub(crate) const VERSION: u64 = 2;
 const L_REQUEST_HASH: &str = "SHARDX-IDEMPOTENT-MUTATION-REQUEST-V2\0";
 const L_RESPONSE_HASH: &str = "SHARDX-IDEMPOTENT-STORED-RESPONSE-V2\0";
@@ -1223,69 +1225,22 @@ impl TenantRootGrantDescriptorV2 {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let r = self.record.record();
-        // Every payload field under its own name, except the two that would
-        // clash with the descriptor's: they are the payload domain and version.
-        let Ok(Value::Map(payload)) = c::decode(r.canonical_payload_bytes()) else {
-            unreachable!("a parsed record's payload is a canonical map")
-        };
-        let mut out: Vec<(String, Value)> = payload
-            .into_iter()
-            .map(|(k, v)| match k.as_str() {
-                "domain" => ("payload_domain".to_string(), v),
-                "version" => ("payload_version".to_string(), v),
-                _ => (k, v),
-            })
-            .collect();
-        let (suite, version) = r.signature_suite();
-        for (k, v) in [
-            ("domain", c::t(DOMAIN_ROOT_GRANT_DESCRIPTOR)),
-            ("version", c::u(VERSION)),
-            ("container_domain", c::t(CONTAINER_DOMAIN)),
-            ("container_version", c::u(CONTAINER_VERSION.into())),
-            ("canonical_payload_bytes", c::b(r.canonical_payload_bytes())),
-            ("payload_sha256", c::b(r.payload_sha256())),
-            ("signature_suite_id", c::u(suite.into())),
-            ("signature_version", c::u(version.into())),
-            ("issuer_signing_key_id", c::b(r.issuer_signing_key_id())),
-            ("signature_bytes", c::b(r.signature_bytes())),
-            ("signed_container_hash", c::b(r.signed_container_hash())),
-            (
-                "exact_signed_container_bytes",
-                c::b(r.exact_signed_container_bytes()),
-            ),
-            (
-                "exact_signed_container_bytes_sha256",
-                c::b(r.exact_signed_container_bytes_sha256()),
-            ),
-            ("grant_state", c::t(self.grant_state.as_str())),
-            ("generation_state", c::t(self.generation_state.as_str())),
-        ] {
-            out.push((k.to_string(), v));
-        }
-        c::encode(&Value::Map(out))
+        encode_descriptor(
+            DOMAIN_ROOT_GRANT_DESCRIPTOR,
+            &self.record,
+            self.grant_state,
+            self.generation_state,
+        )
     }
 
     /// Verifies the embedded container under `issuer_public_key`.
     pub fn parse(exact: &[u8], issuer_public_key: &[u8; 32]) -> Result<Self> {
-        if exact.len() > MAX_DESCRIPTOR_BYTES {
-            return Err(RecordError::BadValue("descriptor"));
-        }
-        let mut f = Fields::decode("TenantRootGrantDescriptorV2", exact)?;
-        exact_version(&mut f, DOMAIN_ROOT_GRANT_DESCRIPTOR)?;
-        let container = f.bytes("exact_signed_container_bytes", 1, MAX_RECORD_BYTES)?;
-        let grant_state = f.text("grant_state")?;
-        let grant_state = RootGrantState::ALL
-            .into_iter()
-            .find(|s| s.as_str() == grant_state)
-            .ok_or(RecordError::BadValue("grant_state"))?;
-        let generation_state = f.text("generation_state")?;
-        let generation_state = RootGenerationState::ALL
-            .into_iter()
-            .find(|s| s.as_str() == generation_state)
-            .ok_or(RecordError::BadValue("generation_state"))?;
-        let parsed = AuthorizationRecord::parse(&container)?;
-        let record = parsed.verify_signature(issuer_public_key)?;
+        let (record, grant_state, generation_state) = parse_descriptor(
+            "TenantRootGrantDescriptorV2",
+            DOMAIN_ROOT_GRANT_DESCRIPTOR,
+            exact,
+            issuer_public_key,
+        )?;
         let descriptor = Self::new(record, grant_state, generation_state)
             .ok_or(RecordError::BadValue("payload_domain"))?;
         // The remaining fields are checked by rebuilding them from the record.
@@ -1294,6 +1249,146 @@ impl TenantRootGrantDescriptorV2 {
         }
         Ok(descriptor)
     }
+}
+
+/// Plan L1131 GET readback descriptor of a fleet `DeviceHpkeGrant`: the same
+/// closed shape as [`TenantRootGrantDescriptorV2`], under its own domain, with
+/// the grant's state and its fleet generation's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetDeviceGrantDescriptorV2 {
+    record: VerifiedRecord,
+    grant_state: RootGrantState,
+    generation_state: RootGenerationState,
+}
+
+impl FleetDeviceGrantDescriptorV2 {
+    /// `None` unless `record` holds a `DeviceHpkeGrant`.
+    pub fn new(
+        record: VerifiedRecord,
+        grant_state: RootGrantState,
+        generation_state: RootGenerationState,
+    ) -> Option<Self> {
+        matches!(record.payload(), Payload::DeviceHpkeGrant(_)).then_some(Self {
+            record,
+            grant_state,
+            generation_state,
+        })
+    }
+
+    pub fn record(&self) -> &VerifiedRecord {
+        &self.record
+    }
+
+    pub fn grant_state(&self) -> RootGrantState {
+        self.grant_state
+    }
+
+    pub fn generation_state(&self) -> RootGenerationState {
+        self.generation_state
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode_descriptor(
+            DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR,
+            &self.record,
+            self.grant_state,
+            self.generation_state,
+        )
+    }
+
+    /// Verifies the embedded container under `issuer_public_key`.
+    pub fn parse(exact: &[u8], issuer_public_key: &[u8; 32]) -> Result<Self> {
+        let (record, grant_state, generation_state) = parse_descriptor(
+            "FleetDeviceGrantDescriptorV2",
+            DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR,
+            exact,
+            issuer_public_key,
+        )?;
+        let descriptor = Self::new(record, grant_state, generation_state)
+            .ok_or(RecordError::BadValue("payload_domain"))?;
+        if descriptor.encode() != exact {
+            return Err(RecordError::BadValue("descriptor"));
+        }
+        Ok(descriptor)
+    }
+}
+
+fn encode_descriptor(
+    domain: &str,
+    record: &VerifiedRecord,
+    grant_state: RootGrantState,
+    generation_state: RootGenerationState,
+) -> Vec<u8> {
+    let r = record.record();
+    // Every payload field under its own name, except the two that would
+    // clash with the descriptor's: they are the payload domain and version.
+    let Ok(Value::Map(payload)) = c::decode(r.canonical_payload_bytes()) else {
+        unreachable!("a parsed record's payload is a canonical map")
+    };
+    let mut out: Vec<(String, Value)> = payload
+        .into_iter()
+        .map(|(k, v)| match k.as_str() {
+            "domain" => ("payload_domain".to_string(), v),
+            "version" => ("payload_version".to_string(), v),
+            _ => (k, v),
+        })
+        .collect();
+    let (suite, version) = r.signature_suite();
+    for (k, v) in [
+        ("domain", c::t(domain)),
+        ("version", c::u(VERSION)),
+        ("container_domain", c::t(CONTAINER_DOMAIN)),
+        ("container_version", c::u(CONTAINER_VERSION.into())),
+        ("canonical_payload_bytes", c::b(r.canonical_payload_bytes())),
+        ("payload_sha256", c::b(r.payload_sha256())),
+        ("signature_suite_id", c::u(suite.into())),
+        ("signature_version", c::u(version.into())),
+        ("issuer_signing_key_id", c::b(r.issuer_signing_key_id())),
+        ("signature_bytes", c::b(r.signature_bytes())),
+        ("signed_container_hash", c::b(r.signed_container_hash())),
+        (
+            "exact_signed_container_bytes",
+            c::b(r.exact_signed_container_bytes()),
+        ),
+        (
+            "exact_signed_container_bytes_sha256",
+            c::b(r.exact_signed_container_bytes_sha256()),
+        ),
+        ("grant_state", c::t(grant_state.as_str())),
+        ("generation_state", c::t(generation_state.as_str())),
+    ] {
+        out.push((k.to_string(), v));
+    }
+    c::encode(&Value::Map(out))
+}
+
+/// The verified container and the two states of a descriptor; the caller
+/// rebuilds the descriptor and requires it to equal `exact`.
+fn parse_descriptor(
+    map: &'static str,
+    domain: &str,
+    exact: &[u8],
+    issuer_public_key: &[u8; 32],
+) -> Result<(VerifiedRecord, RootGrantState, RootGenerationState)> {
+    if exact.len() > MAX_DESCRIPTOR_BYTES {
+        return Err(RecordError::BadValue("descriptor"));
+    }
+    let mut f = Fields::decode(map, exact)?;
+    exact_version(&mut f, domain)?;
+    let container = f.bytes("exact_signed_container_bytes", 1, MAX_RECORD_BYTES)?;
+    let grant_state = f.text("grant_state")?;
+    let grant_state = RootGrantState::ALL
+        .into_iter()
+        .find(|s| s.as_str() == grant_state)
+        .ok_or(RecordError::BadValue("grant_state"))?;
+    let generation_state = f.text("generation_state")?;
+    let generation_state = RootGenerationState::ALL
+        .into_iter()
+        .find(|s| s.as_str() == generation_state)
+        .ok_or(RecordError::BadValue("generation_state"))?;
+    let parsed = AuthorizationRecord::parse(&container)?;
+    let record = parsed.verify_signature(issuer_public_key)?;
+    Ok((record, grant_state, generation_state))
 }
 
 #[cfg(test)]
@@ -1863,8 +1958,9 @@ mod tests {
     // ------------------------------------------------- lifecycle maps ---
 
     use crate::authz_record::{
-        build_record, ApprovalScopeKind, CommonFields, DeviceApprovalV2, RootGrantVariant,
-        TenantRootKeyGrantV2, DOMAIN_DEVICE_APPROVAL, DOMAIN_TENANT_ROOT_KEY_GRANT,
+        build_record, ApprovalScopeKind, CommonFields, DeviceApprovalV2, DeviceHpkeGrantV2,
+        RootGrantVariant, TenantRootKeyGrantV2, DOMAIN_DEVICE_APPROVAL,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_TENANT_ROOT_KEY_GRANT,
     };
     use ed25519_dalek::SigningKey;
 
@@ -2330,6 +2426,74 @@ mod tests {
         "a6cb85d129e68fe2fed8b9b358bffd718c4da07405b810e3f45ccbe0dbb286da",
         "1eeede1fada9e91cd6a668bc2efd5060f96afcb2c1e5740dd8aa33553d0470f2",
     ];
+
+    fn fleet_record() -> Vec<u8> {
+        let g = DeviceHpkeGrantV2 {
+            common: common(),
+            fleet_id: fx("fleet"),
+            fkek_key_id: fx("fkek"),
+            generation: 1,
+            subject_account_id: fx("account"),
+            subject_device_id: fx("device"),
+            subject_signing_key_id: fx("device-signing"),
+            recipient_hpke_key_id: fx("device-hpke"),
+            hpke_encapped_key_bytes: fx::<32>("encapped").to_vec(),
+            hpke_wrapped_fleet_key_bytes: fx::<48>("wrapped").to_vec(),
+        };
+        build_record(
+            &custodian(),
+            DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+            &g.encode(),
+        )
+    }
+
+    #[test]
+    fn a_fleet_descriptor_holds_only_a_device_grant_under_its_own_domain() {
+        let issuer = *custodian().verifying_key().as_bytes();
+        let verify = |container: &[u8]| {
+            AuthorizationRecord::parse(container)
+                .unwrap()
+                .verify_signature(&issuer)
+                .unwrap()
+        };
+        let d = FleetDeviceGrantDescriptorV2::new(
+            verify(&fleet_record()),
+            RootGrantState::Acknowledged,
+            RootGenerationState::Active,
+        )
+        .unwrap();
+        let raw = d.encode();
+        assert_eq!(
+            hex(&c::sha256(&raw)),
+            "4fd18276735219923ab2df70d1c0815b383cddd54174deca0ee36799a597c2e6"
+        );
+        assert_eq!(FleetDeviceGrantDescriptorV2::parse(&raw, &issuer), Ok(d));
+        // A root grant is no fleet descriptor, and the two domains never mix.
+        let root = verify(&root_record(RootGrantVariant::FirstRootSelfGrant, 0));
+        assert!(FleetDeviceGrantDescriptorV2::new(
+            root.clone(),
+            RootGrantState::Acknowledged,
+            RootGenerationState::Active
+        )
+        .is_none());
+        let root_raw = TenantRootGrantDescriptorV2::new(
+            root,
+            RootGrantState::Acknowledged,
+            RootGenerationState::Active,
+        )
+        .unwrap()
+        .encode();
+        assert!(FleetDeviceGrantDescriptorV2::parse(&root_raw, &issuer).is_err());
+        assert!(TenantRootGrantDescriptorV2::parse(&raw, &issuer).is_err());
+        // Columns are rebuilt from the container, so an edited one fails.
+        assert_eq!(
+            FleetDeviceGrantDescriptorV2::parse(
+                &edit(&raw, |e| set(e, "generation", c::u(2))),
+                &issuer
+            ),
+            Err(RecordError::BadValue("descriptor"))
+        );
+    }
 
     #[test]
     fn a_descriptor_is_exactly_its_verified_container() {

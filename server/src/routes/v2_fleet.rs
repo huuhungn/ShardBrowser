@@ -21,8 +21,9 @@ use shared::approval_receipt::{
     MAX_FLEET_RECOVERY_GRANT_TTL_MS, MAX_FLEET_ROTATION_GRANT_TTL_MS,
 };
 use shared::authz_record::{
-    AuthorizationRecord, Capability, CommonFields, Payload, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
-    DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
+    AuthorizationRecord, Capability, CommonFields, Payload, VerifiedRecord,
+    DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    DOMAIN_FLEET_KEY_GRANT_ROTATION,
 };
 use shared::fleet_lifecycle::{
     FleetGenerationTerms, FleetGrantRevokeV2, FleetGrantRevokedV2, FleetGrantTarget,
@@ -33,7 +34,10 @@ use shared::fleet_lifecycle::{
     RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
     RECORD_TYPE_FLEET_GRANT_REVOKED,
 };
-use shared::mutation::{fleet_device_grant_set_hash, IdempotentMutationRequestV2, OperationKind};
+use shared::mutation::{
+    fleet_device_grant_set_hash, FleetDeviceGrantDescriptorV2, IdempotentMutationRequestV2,
+    OperationKind, RootGenerationState, RootGrantState,
+};
 
 use super::v2_approval::{cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, blob, reload_session, unhex, verified, Principal, Session};
@@ -990,6 +994,7 @@ fn integrity() -> AppError {
 
 /// A filed fleet grant whose row matched its verified container.
 struct StoredFleetGrant {
+    record: VerifiedRecord,
     payload: Payload,
     fleet: ([u8; 16], [u8; 32], u64),
     signed_container_hash: [u8; 32],
@@ -1049,6 +1054,7 @@ async fn load_fleet_grant(
         acked: row.get::<Option<String>, _>("acked_at").is_some(),
         revoked: row.get::<Option<String>, _>("revoked_at").is_some(),
         payload,
+        record,
     }))
 }
 
@@ -1684,4 +1690,81 @@ pub async fn revoke_fleet_grant(
     .await?;
     tx.commit().await?;
     Ok(cbor(StatusCode::CREATED, response))
+}
+
+/// `GET /v2/fleets/{f}/key-generations/{g}/grants/{device_id}` (plan L1131):
+/// the device's newest `DeviceHpkeGrant` of that generation as its exact
+/// `FleetDeviceGrantDescriptorV2`. Only the subject device's own session reads
+/// it; for any other session the grant does not exist.
+pub async fn read_fleet_device_grant(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((fleet, generation, device)): Path<(String, String, String)>,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let fleet = fleet_path(&fleet)?;
+    let generation = generation_path(&generation)?;
+    let device = unhex::<16>(&device)
+        .ok_or_else(|| AppError::BadRequest("device id must be 32 hex digits".into()))?;
+    let not_found = || {
+        coded(
+            StatusCode::NOT_FOUND,
+            "RESOURCE_NOT_FOUND",
+            "no such fleet grant",
+        )
+    };
+    let mut tx = app.db.begin().await?;
+    let s = reload_session(&mut tx, &presented, v, now_ms())
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.device_id != device {
+        return Err(not_found());
+    }
+    // A revoked grant may be followed by a new one; the newest is current.
+    let replay: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_fleet_device_hpke_grants
+          WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ? AND generation = ?
+            AND subject_device_id = ?
+          ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(int(generation)?)
+    .bind(device.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(replay) = replay else {
+        return Err(not_found());
+    };
+    let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+    let g = load_fleet_grant(
+        &mut tx,
+        v,
+        &s.tenant_id,
+        FleetGrantVariant::DeviceHpke,
+        &replay,
+    )
+    .await?
+    .ok_or_else(integrity)?;
+    let state = generation_row(&mut tx, v, &s.tenant_id, &fleet, generation)
+        .await?
+        .ok_or_else(integrity)?
+        .state;
+    let generation_state = RootGenerationState::ALL
+        .into_iter()
+        .find(|g| g.as_str() == state)
+        .ok_or_else(integrity)?;
+    let grant_state = match (g.acked, g.revoked) {
+        (_, true) => RootGrantState::Revoked,
+        (true, false) => RootGrantState::Acknowledged,
+        (false, false) => RootGrantState::PendingAck,
+    };
+    let descriptor = FleetDeviceGrantDescriptorV2::new(g.record, grant_state, generation_state)
+        .ok_or_else(integrity)?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::OK, descriptor.encode()))
 }
