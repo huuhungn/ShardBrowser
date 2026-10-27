@@ -30,14 +30,14 @@ pub const RECORD_TYPE_ROOT_GENERATION_ACTIVATED: &str = "TenantRootGenerationAct
 /// The plan names no domain for the GET readback descriptor; this is the one
 /// chosen here.
 pub const DOMAIN_ROOT_GRANT_DESCRIPTOR: &str = "shardx.keys.tenant-root-grant-descriptor.v2";
-const VERSION: u64 = 2;
+pub(crate) const VERSION: u64 = 2;
 const L_REQUEST_HASH: &str = "SHARDX-IDEMPOTENT-MUTATION-REQUEST-V2\0";
 const L_RESPONSE_HASH: &str = "SHARDX-IDEMPOTENT-STORED-RESPONSE-V2\0";
 const MAX_OPERATION_PAYLOAD: usize = 262144;
 /// Plan 5.6.4 bound on an embedded signed grant container.
 pub const MAX_EMBEDDED_GRANT_BYTES: usize = 131072;
 const OUTCOME_SUCCEEDED: &str = "succeeded";
-const GENERATION_STATE_PREPARING: &str = "PREPARING";
+pub(crate) const GENERATION_STATE_PREPARING: &str = "PREPARING";
 const L_ROOT_CUSTODIAN_SET: &str = "SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2\0";
 const L_FLEET_DEVICE_SET: &str = "SHARDX-FLEET-DEVICE-GRANT-SET-V2\0";
 
@@ -154,7 +154,7 @@ impl OperationKind {
     }
 }
 
-fn exact_version(f: &mut Fields, domain: &str) -> Result<()> {
+pub(crate) fn exact_version(f: &mut Fields, domain: &str) -> Result<()> {
     f.exact_text("domain", domain)?;
     if f.uint("version")? != VERSION {
         return Err(RecordError::BadValue("version"));
@@ -170,7 +170,7 @@ fn take_kind(f: &mut Fields) -> Result<OperationKind> {
     Ok(kind)
 }
 
-fn u32_in(f: &mut Fields, field: &'static str, min: u64, max: u64) -> Result<u32> {
+pub(crate) fn u32_in(f: &mut Fields, field: &'static str, min: u64, max: u64) -> Result<u32> {
     let n = f.uint(field)?;
     if !(min..=max).contains(&n) {
         return Err(f.bad(field));
@@ -749,7 +749,7 @@ impl TenantRootGrantAckV2 {
     }
 }
 
-const ACK_OUTCOME_ACKNOWLEDGED: &str = "acknowledged";
+pub(crate) const ACK_OUTCOME_ACKNOWLEDGED: &str = "acknowledged";
 
 /// Plan 5.6.5 `TenantRootGrantAckedV2`, the stored `ROOT_GRANT_ACK` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -858,8 +858,8 @@ impl TenantRootGenerationActivateV2 {
     }
 }
 
-const GENERATION_STATE_ACTIVE: &str = "ACTIVE";
-const GENERATION_STATE_RETIRED: &str = "RETIRED";
+pub(crate) const GENERATION_STATE_ACTIVE: &str = "ACTIVE";
+pub(crate) const GENERATION_STATE_RETIRED: &str = "RETIRED";
 
 /// Plan 5.6.5 `TenantRootGenerationActivatedV2`, the stored activation
 /// response. The tenant's active root pointer is the target generation, and
