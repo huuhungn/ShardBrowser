@@ -4590,9 +4590,16 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
 /// The copy's container no longer matches its columns; the fleet routes only
 /// ask whether a live approval of the subject's keys exists.
 async fn approve_by_copy(server: &Server, from: &Device, to: &Device, replay: u8) {
+    approve_by_copy_in(server, from, to, replay, "approval_scope_kind").await;
+}
+
+/// [`approve_by_copy`] with `scope` as the approval scope kind, a column name
+/// to keep the copy's or a quoted literal such as `'fleet'`.
+async fn approve_by_copy_in(server: &Server, from: &Device, to: &Device, replay: u8, scope: &str) {
     server
         .sql(
-            "INSERT INTO v2_device_approvals (
+            &format!(
+                "INSERT INTO v2_device_approvals (
                  tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
                  subject_device_id, subject_signing_key_id, subject_hpke_key_id,
                  approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
@@ -4601,12 +4608,13 @@ async fn approve_by_copy(server: &Server, from: &Device, to: &Device, replay: u8
                  signature_bytes, issuer_signing_key_id, signed_container_hash,
                  exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
              SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
-                    ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                    ?, ?, ?, {scope}, approval_scope_id, approved_use, issued_at_ms,
                     not_before_ms, not_after_ms, server_instance_id, restore_epoch,
                     canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
                     signature_bytes, issuer_signing_key_id, signed_container_hash,
                     exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
-               FROM v2_device_approvals WHERE subject_device_id = ?",
+               FROM v2_device_approvals WHERE subject_device_id = ?"
+            ),
             &[
                 &[replay; 16],
                 &to.id,
@@ -5119,19 +5127,43 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
     let wrong = format!("{}/revoke", grant_path("0", &[0x82; 16]));
     assert_eq!(server.call(&wrong, &access, Some(&request)).await.0, 422);
 
-    // shortcut: no route files an ExistingRootGrant yet, so a second
-    // acknowledged custodian row is copied in; only its presence is read.
-    let pool = db(&server.data).await;
-    let mut conn = pool.acquire().await.unwrap();
-    for statement in [
-        "CREATE TEMP TABLE second AS SELECT * FROM v2_tenant_root_key_grants",
-        "UPDATE second SET replay_id = zeroblob(16), grant_variant = 'ExistingRootGrant'",
-        "INSERT INTO v2_tenant_root_key_grants SELECT * FROM second",
-    ] {
-        sqlx::query(statement).execute(&mut *conn).await.unwrap();
-    }
-    drop(conn);
-    pool.close().await;
+    // A second custodian, through ROOT_GRANT_CREATE.
+    // shortcut: its device cannot open a session until ordinary approvals land
+    // (W2 PR5), so its acknowledgement is stamped; the grant itself is filed.
+    let peer = device(&server, OWNER, 0x7b, "active").await;
+    approve_by_copy(&server, &dev, &peer, 0x7b).await;
+    let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
+    let request = root_grant_create_request(0xc4, &dev, &existing);
+    assert_eq!(
+        server
+            .call(&root_grants_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET acked_at = 'now' WHERE replay_id = ?",
+            &[&[0x91; 16]],
+        )
+        .await;
+
+    // A grant whose device is no longer active makes no custodian, so it does
+    // not stand in for the last one.
+    let peer_status = |status: &'static str| {
+        format!(
+            "UPDATE v2_devices SET status = '{status}' WHERE id = X'{}'",
+            hex(&peer.id)
+        )
+    };
+    server.sql(&peer_status("revoked"), &[]).await;
+    let request = root_revoke_request(0xc5, grant.clone(), R::DeviceLost);
+    let (status, body) = server.call(&revoke_path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "LAST_ROOT_CUSTODIAN")
+    );
+    server.sql(&peer_status("active"), &[]).await;
 
     let request = root_revoke_request(0xc3, grant.clone(), R::DeviceLost);
     let (status, body) = server.call(&revoke_path, &access, Some(&request)).await;
@@ -5143,11 +5175,20 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
         (revoked.grant, revoked.reason_code),
         (grant.clone(), R::DeviceLost)
     );
-    // The subject's own live session is among those it ended.
-    assert!(revoked.sessions_invalidated_count >= 1);
+    // It ended the subject's one live session; a fresh session of the same
+    // device gets the stored bytes back.
+    assert_eq!(revoked.sessions_invalidated_count, 1);
     assert_eq!(
         server.call(&revoke_path, &access, Some(&request)).await.0,
         401
+    );
+    let fresh = session(&server, &dev).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        server.call(&revoke_path, &fresh, Some(&request)).await,
+        (201, body)
     );
 
     for (query, want) in [
@@ -5157,11 +5198,17 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
             1,
         ),
         (
+            "SELECT count(*) FROM v2_tenant_root_key_grants
+              WHERE grant_variant = 'ExistingRootGrant' AND revoked_at IS NULL",
+            1,
+        ),
+        (
             &format!(
                 "SELECT count(*) FROM v2_sessions WHERE revoked_at_ms IS NULL AND device_id = X'{}'",
                 hex(&dev.id)
             ),
-            0,
+            // Only the fresh session opened after the revocation.
+            1,
         ),
         (
             "SELECT count(*) FROM v2_audit_events WHERE action = 'root.grant_revoke'",
@@ -5169,6 +5216,145 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
         ),
         (
             "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'ROOT_GRANT_REVOKE'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+}
+
+// ------------------------------------------------------- ROOT_GRANT_CREATE ---
+
+fn root_grants_path() -> String {
+    format!("/v2/tenants/{}/root-key-generations/0/grants", hex(&TENANT))
+}
+
+/// An `ExistingRootGrant` of `TRK` from `issuer` to `subject`, linked to the
+/// subject's approval `approval` and sealed to its HPKE key.
+fn existing_root_grant(issuer: &Device, subject: &Device, approval: u8, replay: u8) -> Vec<u8> {
+    let start = now_ms() - 60_000;
+    let mut g = TenantRootKeyGrantV2 {
+        common: CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        variant: RootGrantVariant::ExistingRootGrant,
+        root_key_id: shared::keys::root_key_id(&TRK),
+        root_generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: subject.id,
+        subject_signing_key_id: subject.signing_key_id,
+        recipient_hpke_key_id: subject.hpke_key_id,
+        subject_device_approval_replay_id: [approval; 16],
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let sealed = shared::grants::seal_trk(&subject.hpke_pk, &g.scope(), &TRK).unwrap();
+    g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+    g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+    build_record(&issuer.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+}
+
+/// The `ROOT_GRANT_CREATE` request filing `container`, signed by `signer`.
+fn root_grant_create_request(key: u8, signer: &Device, container: &[u8]) -> Vec<u8> {
+    lifecycle_request(
+        OperationKind::RootGrantCreate,
+        key,
+        shared::mutation::TenantRootGrantCreateV2 {
+            grant: grant_ref(signer, container),
+            exact_signed_grant_container_bytes: container.to_vec(),
+        }
+        .encode(),
+    )
+}
+
+#[tokio::test]
+async fn a_custodian_files_an_existing_root_grant_only_to_a_tenant_approved_device() {
+    use shared::mutation::TenantRootGrantCreatedV2;
+
+    let mut server = start("root-existing", 28215).await;
+    let (dev, access, _) = custodian(&mut server, 0x6f).await;
+    let path = root_grants_path();
+    let peer = device(&server, OWNER, 0x7b, "active").await;
+    approve_by_copy(&server, &dev, &peer, 0x7b).await;
+
+    let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
+    let request = root_grant_create_request(0xc0, &dev, &existing);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    let created =
+        TenantRootGrantCreatedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (
+            created.grant,
+            created.grant_variant,
+            created.subject_device_id
+        ),
+        (grant_ref(&dev, &existing), "ExistingRootGrant", peer.id)
+    );
+    // The same bytes get the same answer; the replay ID is then spent.
+    assert_eq!(
+        server.call(&path, &access, Some(&request)).await,
+        (201, body)
+    );
+    let again = root_grant_create_request(0xc1, &dev, &existing);
+    let (status, body) = server.call(&path, &access, Some(&again)).await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "REPLAY_DETECTED"));
+
+    // Q-22: a fleet-scoped approval never carries root custody.
+    let fleet_only = device(&server, OWNER, 0x7a, "active").await;
+    approve_by_copy_in(&server, &dev, &fleet_only, 0x7a, "'fleet'").await;
+    let grant = existing_root_grant(&dev, &fleet_only, 0x7a, 0x92);
+    let request = root_grant_create_request(0xc2, &dev, &grant);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "SUBJECT_NOT_ELIGIBLE")
+    );
+    // A device without any approval, likewise.
+    let unapproved = device(&server, OWNER, 0x79, "active").await;
+    let grant = existing_root_grant(&dev, &unapproved, 0x79, 0x93);
+    let request = root_grant_create_request(0xc3, &dev, &grant);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "SUBJECT_NOT_ELIGIBLE")
+    );
+    // A grant signed by another key than the session's.
+    let forged = existing_root_grant(&peer, &peer, 0x7b, 0x94);
+    let request = root_grant_create_request(0xc4, &peer, &forged);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "KEY_SUBSTITUTION_DETECTED")
+    );
+    // A device that is no custodian files nothing.
+    let stranger = device(&server, OWNER, 0x78, "pending").await;
+    let stranger_access = session(&server, &stranger).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let grant = existing_root_grant(&dev, &peer, 0x7b, 0x95);
+    let request = root_grant_create_request(0xc5, &dev, &grant);
+    assert_eq!(
+        server.call(&path, &stranger_access, Some(&request)).await.0,
+        403
+    );
+
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_tenant_root_key_grants
+              WHERE grant_variant = 'ExistingRootGrant' AND acked_at IS NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.grant_create'",
             1,
         ),
     ] {

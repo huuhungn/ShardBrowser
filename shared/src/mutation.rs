@@ -23,6 +23,9 @@ pub const RECORD_TYPE_ROOT_GENERATION_CREATED: &str = "TenantRootGenerationCreat
 pub const DOMAIN_ROOT_GRANT_ACK: &str = "shardx.keys.tenant-root-grant-ack.v2";
 pub const DOMAIN_ROOT_GRANT_ACKED: &str = "shardx.keys.tenant-root-grant-acked.v2";
 pub const RECORD_TYPE_ROOT_GRANT_ACKED: &str = "TenantRootGrantAckedV2";
+pub const DOMAIN_ROOT_GRANT_CREATE: &str = "shardx.keys.tenant-root-grant-create.v2";
+pub const DOMAIN_ROOT_GRANT_CREATED: &str = "shardx.keys.tenant-root-grant-created.v2";
+pub const RECORD_TYPE_ROOT_GRANT_CREATED: &str = "TenantRootGrantCreatedV2";
 pub const DOMAIN_ROOT_GRANT_REVOKE: &str = "shardx.keys.tenant-root-grant-revoke.v2";
 pub const DOMAIN_ROOT_GRANT_REVOKED: &str = "shardx.keys.tenant-root-grant-revoked.v2";
 pub const RECORD_TYPE_ROOT_GRANT_REVOKED: &str = "TenantRootGrantRevokedV2";
@@ -781,6 +784,108 @@ impl TenantRootGrantAckedV2 {
         out.extend([
             ("ack_outcome", c::t(ACK_OUTCOME_ACKNOWLEDGED)),
             ("acked_at_ms", c::u(self.acked_at_ms)),
+        ]);
+        c::encode(&c::m(out))
+    }
+}
+
+// ------------------------------------------------------------------ create ---
+
+/// Plan L946 `TenantRootGrantCreateV2`, the `ROOT_GRANT_CREATE` payload: the
+/// grant's identity and its exact signed container, which must hash to both
+/// named hashes. Which variants a server files is the route's rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRootGrantCreateV2 {
+    pub grant: RootGrantRef,
+    pub exact_signed_grant_container_bytes: Vec<u8>,
+}
+
+impl TenantRootGrantCreateV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("TenantRootGrantCreateV2", payload)?;
+        exact_version(&mut f, DOMAIN_ROOT_GRANT_CREATE)?;
+        let grant = RootGrantRef::take(&mut f)?;
+        let bytes = f.bytes(
+            "exact_signed_grant_container_bytes",
+            1,
+            MAX_EMBEDDED_GRANT_BYTES,
+        )?;
+        f.finish()?;
+        if grant.exact_signed_container_bytes_sha256 != c::sha256(&bytes) {
+            return Err(RecordError::BadValue("exact_signed_container_bytes_sha256"));
+        }
+        Ok(Self {
+            grant,
+            exact_signed_grant_container_bytes: bytes,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![
+            ("domain", c::t(DOMAIN_ROOT_GRANT_CREATE)),
+            ("version", c::u(VERSION)),
+        ];
+        self.grant.put(&mut out);
+        out.push((
+            "exact_signed_grant_container_bytes",
+            c::b(&self.exact_signed_grant_container_bytes),
+        ));
+        c::encode(&c::m(out))
+    }
+}
+
+/// The grant variants `ROOT_GRANT_CREATE` carries (plan L946); the first
+/// self-grant arrives with the bootstrap instead.
+pub const ROOT_GRANT_CREATE_VARIANTS: [&str; 2] = ["ExistingRootGrant", "RotationGrant"];
+
+/// Plan L946 `TenantRootGrantCreatedV2`, the stored `ROOT_GRANT_CREATE`
+/// response. A filed grant is always pending its acknowledgement, and only
+/// the two variants this route files can be named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRootGrantCreatedV2 {
+    pub grant: RootGrantRef,
+    pub grant_variant: &'static str,
+    pub subject_device_id: [u8; 16],
+    pub recipient_hpke_key_id: [u8; 32],
+    pub created_at_ms: u64,
+}
+
+impl TenantRootGrantCreatedV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("TenantRootGrantCreatedV2", payload)?;
+        exact_version(&mut f, DOMAIN_ROOT_GRANT_CREATED)?;
+        let grant = RootGrantRef::take(&mut f)?;
+        let variant = f.text("grant_variant")?;
+        let grant_variant = ROOT_GRANT_CREATE_VARIANTS
+            .into_iter()
+            .find(|v| *v == variant)
+            .ok_or(RecordError::BadValue("grant_variant"))?;
+        let subject_device_id = f.fixed("subject_device_id")?;
+        let recipient_hpke_key_id = f.fixed("recipient_hpke_key_id")?;
+        f.exact_text("grant_state", RootGrantState::PendingAck.as_str())?;
+        let created_at_ms = f.uint("created_at_ms")?;
+        f.finish()?;
+        Ok(Self {
+            grant,
+            grant_variant,
+            subject_device_id,
+            recipient_hpke_key_id,
+            created_at_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![
+            ("domain", c::t(DOMAIN_ROOT_GRANT_CREATED)),
+            ("version", c::u(VERSION)),
+        ];
+        self.grant.put(&mut out);
+        out.extend([
+            ("grant_variant", c::t(self.grant_variant)),
+            ("subject_device_id", c::b(&self.subject_device_id)),
+            ("recipient_hpke_key_id", c::b(&self.recipient_hpke_key_id)),
+            ("grant_state", c::t(RootGrantState::PendingAck.as_str())),
+            ("created_at_ms", c::u(self.created_at_ms)),
         ]);
         c::encode(&c::m(out))
     }
@@ -1787,6 +1892,27 @@ mod tests {
         }
     }
 
+    fn grant_create() -> TenantRootGrantCreateV2 {
+        let bytes = b"an exact signed grant container".to_vec();
+        TenantRootGrantCreateV2 {
+            grant: RootGrantRef {
+                exact_signed_container_bytes_sha256: c::sha256(&bytes),
+                ..grant_ref()
+            },
+            exact_signed_grant_container_bytes: bytes,
+        }
+    }
+
+    fn grant_created() -> TenantRootGrantCreatedV2 {
+        TenantRootGrantCreatedV2 {
+            grant: grant_ref(),
+            grant_variant: "ExistingRootGrant",
+            subject_device_id: fx("subject-device"),
+            recipient_hpke_key_id: fx("recipient-hpke"),
+            created_at_ms: 1_700_000_000_004,
+        }
+    }
+
     fn revoke() -> TenantRootGrantRevokeV2 {
         TenantRootGrantRevokeV2 {
             grant: grant_ref(),
@@ -1891,6 +2017,12 @@ mod tests {
             ("activated 5", activated(5).encode(), |b| {
                 TenantRootGenerationActivatedV2::parse(b).map(|m| m.encode())
             }),
+            ("create", grant_create().encode(), |b| {
+                TenantRootGrantCreateV2::parse(b).map(|m| m.encode())
+            }),
+            ("created", grant_created().encode(), |b| {
+                TenantRootGrantCreatedV2::parse(b).map(|m| m.encode())
+            }),
             ("revoke", revoke().encode(), |b| {
                 TenantRootGrantRevokeV2::parse(b).map(|m| m.encode())
             }),
@@ -1935,7 +2067,7 @@ mod tests {
         assert_eq!(pinned, GOLDEN_LIFECYCLE.map(|(n, h)| (n, h.to_string())));
     }
 
-    const GOLDEN_LIFECYCLE: [(&str, &str); 8] = [
+    const GOLDEN_LIFECYCLE: [(&str, &str); 10] = [
         (
             "ack",
             "148a758a45a53e4f3abfac172ade4d2b3327596ec3b090c50bd7a9b38a018e2a",
@@ -1959,6 +2091,14 @@ mod tests {
         (
             "activated 5",
             "6adc9ba8a9030fd6a6bd92e9b8723e8f60bf3021edf5fcc0fa1db2acd7354b17",
+        ),
+        (
+            "create",
+            "852926543d82a0a6166aedfa8f2b5f27817aac2aac4363f6489a2ff49084f734",
+        ),
+        (
+            "created",
+            "aeba1738442af89e9a864a87fd8a32aa3a11b293a9379001e560e8e7ca7d66cc",
         ),
         (
             "revoke",
@@ -1989,6 +2129,8 @@ mod tests {
                 DOMAIN_ROOT_GRANT_DESCRIPTOR,
                 DOMAIN_ROOT_GRANT_REVOKE,
                 DOMAIN_ROOT_GRANT_REVOKED,
+                DOMAIN_ROOT_GRANT_CREATE,
+                DOMAIN_ROOT_GRANT_CREATED,
             ],
             [
                 "shardx.keys.tenant-root-grant-ack.v2",
@@ -1998,6 +2140,8 @@ mod tests {
                 "shardx.keys.tenant-root-grant-descriptor.v2",
                 "shardx.keys.tenant-root-grant-revoke.v2",
                 "shardx.keys.tenant-root-grant-revoked.v2",
+                "shardx.keys.tenant-root-grant-create.v2",
+                "shardx.keys.tenant-root-grant-created.v2",
             ]
         );
         assert_eq!(ACK_OUTCOME_ACKNOWLEDGED, "acknowledged");
@@ -2020,6 +2164,38 @@ mod tests {
             TenantRootGrantAckedV2::parse(&edit(&raw, |e| set(e, "ack_outcome", c::t("rejected")))),
             Err(RecordError::BadValue("ack_outcome"))
         );
+    }
+
+    #[test]
+    fn a_grant_create_carries_exactly_the_container_it_names() {
+        let raw = grant_create().encode();
+        assert_eq!(
+            TenantRootGrantCreateV2::parse(&edit(&raw, |e| set(
+                e,
+                "exact_signed_grant_container_bytes",
+                c::b(b"other bytes")
+            ))),
+            Err(RecordError::BadValue("exact_signed_container_bytes_sha256"))
+        );
+        for bytes in [vec![], vec![0; MAX_EMBEDDED_GRANT_BYTES + 1]] {
+            assert!(TenantRootGrantCreateV2::parse(&edit(&raw, |e| set(
+                e,
+                "exact_signed_grant_container_bytes",
+                c::b(&bytes)
+            )))
+            .is_err());
+        }
+        let raw = grant_created().encode();
+        for (key, value) in [
+            ("grant_state", c::t("ACKNOWLEDGED")),
+            ("grant_variant", c::t("SomeGrant")),
+        ] {
+            assert!(
+                TenantRootGrantCreatedV2::parse(&edit(&raw, |e| set(e, key, value.clone())))
+                    .is_err(),
+                "{key}"
+            );
+        }
     }
 
     #[test]

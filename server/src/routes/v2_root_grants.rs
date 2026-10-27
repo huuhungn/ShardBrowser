@@ -19,13 +19,15 @@ use sqlx::{Row, SqliteConnection};
 use shared::approval_receipt::AUTHORIZATION_REPLAY_RETENTION_MS;
 use shared::authz_record::{
     AuthorizationRecord, Payload, RootGrantVariant, TenantRootKeyGrantV2, VerifiedRecord,
+    DOMAIN_DEVICE_APPROVAL,
 };
 use shared::mutation::{
     root_custodian_grant_set_hash, IdempotentMutationRequestV2, OperationKind, RootGenerationState,
     RootGrantState, TenantRootGenerationActivateV2, TenantRootGenerationActivatedV2,
-    TenantRootGrantAckV2, TenantRootGrantAckedV2, TenantRootGrantDescriptorV2,
-    TenantRootGrantRevokeV2, TenantRootGrantRevokedV2, RECORD_TYPE_ROOT_GENERATION_ACTIVATED,
-    RECORD_TYPE_ROOT_GRANT_ACKED, RECORD_TYPE_ROOT_GRANT_REVOKED,
+    TenantRootGrantAckV2, TenantRootGrantAckedV2, TenantRootGrantCreateV2,
+    TenantRootGrantCreatedV2, TenantRootGrantDescriptorV2, TenantRootGrantRevokeV2,
+    TenantRootGrantRevokedV2, RECORD_TYPE_ROOT_GENERATION_ACTIVATED, RECORD_TYPE_ROOT_GRANT_ACKED,
+    RECORD_TYPE_ROOT_GRANT_CREATED, RECORD_TYPE_ROOT_GRANT_REVOKED,
 };
 
 use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sole_owner};
@@ -33,8 +35,8 @@ use super::v2_auth::{
     audit, blob, reload_session, revoke_session, unhex, verified, Principal, Session,
 };
 use super::v2_root::{
-    grant_row_matches, ledger_row, mismatch, record_error, same_request, stale, store_response,
-    stored_payload, stored_response, MAX_ROOT_REQUEST_BODY,
+    grant_row_matches, insert_grant, ledger_row, mismatch, record_error, same_request, stale,
+    store_response, stored_payload, stored_response, MAX_ROOT_GRANT_TTL_MS, MAX_ROOT_REQUEST_BODY,
 };
 use crate::error::AppError;
 use crate::identity::Verified;
@@ -646,6 +648,33 @@ fn inside_window(g: &TenantRootKeyGrantV2, now: i64) -> Result<bool, AppError> {
 /// generation, inside its window and issued to its exact keys, read back like
 /// every other grant. Any variant counts: the self-grant, a grant from another
 /// custodian, or the rotation grant that became this generation's.
+/// Whether the verified grant `g` makes its subject a custodian now (ADR 0002
+/// D-2 issuer matrix): acknowledged, not revoked, inside its window, and its
+/// subject an active device under exactly the keys it names.
+async fn confers_custody(
+    conn: &mut SqliteConnection,
+    tenant: &[u8; 16],
+    g: &StoredGrant,
+    now: i64,
+) -> Result<bool, AppError> {
+    let k = &g.grant;
+    if !g.acked || g.revoked || !inside_window(k, now)? {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_devices
+                         WHERE tenant_id = ? AND id = ? AND account_id = ? AND status = 'active'
+                           AND signing_key_id = ? AND hpke_key_id = ?)",
+    )
+    .bind(tenant.as_slice())
+    .bind(k.subject_device_id.as_slice())
+    .bind(k.subject_account_id.as_slice())
+    .bind(k.subject_signing_key_id.as_slice())
+    .bind(k.recipient_hpke_key_id.as_slice())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 pub(super) async fn is_active_custodian(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -680,13 +709,11 @@ pub(super) async fn is_active_custodian(
             continue;
         };
         let k = &g.grant;
-        if g.acked
-            && !g.revoked
-            && inside_window(k, now)?
-            && k.subject_account_id == s.account_id
+        if k.subject_account_id == s.account_id
             && k.subject_device_id == s.device_id
             && k.subject_signing_key_id == s.signing_key_id
             && k.recipient_hpke_key_id == s.hpke_key_id
+            && confers_custody(conn, &s.tenant_id, &g, now).await?
         {
             return Ok(true);
         }
@@ -787,8 +814,11 @@ pub async fn revoke_root_grant(
         && generation_state(&mut tx, v, &tenant, generation).await?
             == Some(RootGenerationState::Active)
     {
-        let others: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM v2_tenant_root_key_grants
+        // Another grant counts only if it makes a custodian by the same rule
+        // the issuer checks use; a row that disagrees with its container
+        // refuses the revocation (422) rather than being counted.
+        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT replay_id FROM v2_tenant_root_key_grants
               WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
                 AND replay_id <> ? AND acked_at IS NOT NULL AND revoked_at IS NULL",
         )
@@ -796,9 +826,19 @@ pub async fn revoke_root_grant(
         .bind(tenant.as_slice())
         .bind(int(generation)?)
         .bind(replay.as_slice())
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        if others == 0 {
+        let mut another = false;
+        for other in candidates {
+            let other: [u8; 16] = other.try_into().map_err(|_| integrity())?;
+            if let Some(o) = load_grant(&mut tx, v, &tenant, generation, &other).await? {
+                if confers_custody(&mut tx, &tenant, &o, now).await? {
+                    another = true;
+                    break;
+                }
+            }
+        }
+        if !another {
             return Err(coded(
                 StatusCode::CONFLICT,
                 "LAST_ROOT_CUSTODIAN",
@@ -869,6 +909,266 @@ pub async fn revoke_root_grant(
         "root.grant_revoke",
         "root_grant",
         &replay,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+/// `POST .../root-key-generations/{g}/grants` (plan L946, 5.6.4 rule 2): an
+/// active custodian files an `ExistingRootGrant` of the ACTIVE root to an
+/// approved device. The subject's linked approval must be tenant-scoped
+/// (ADR 0002 Q-22): a fleet approval never carries root custody. The grant
+/// waits for its subject's acknowledgement; filing activates nothing.
+pub async fn file_root_grant(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((tenant, generation)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let (tenant, generation) = path_ids(&tenant, &generation)?;
+    let outer = outer_request(v, &headers, &body, OperationKind::RootGrantCreate)?;
+    let create =
+        TenantRootGrantCreateV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
+    let r = &create.grant;
+    if r.tenant_id != tenant || r.root_generation != generation {
+        return Err(column_mismatch(
+            "the path names another generation than the request",
+        ));
+    }
+    if r.server_instance_id != v.server_instance_id {
+        return Err(AppError::Forbidden);
+    }
+    if r.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != tenant {
+        return Err(AppError::Forbidden);
+    }
+    if let Some(row) =
+        ledger_row(&mut tx, v, &s, outer.operation_kind, &outer.idempotency_key).await?
+    {
+        if !same_request(
+            &row,
+            outer.operation_kind,
+            &outer.canonical_request_hash(),
+            &body,
+        )? {
+            return Err(mismatch());
+        }
+        let (payload, response) = stored_payload(&row, &outer, RECORD_TYPE_ROOT_GRANT_CREATED, v)
+            .ok_or_else(response_mismatch)?;
+        let created = TenantRootGrantCreatedV2::parse(&payload).map_err(|_| response_mismatch())?;
+        let filed = load_grant(&mut tx, v, &tenant, generation, &r.replay_id)
+            .await?
+            .is_some_and(|g| *g.record.record().signed_container_hash() == r.signed_container_hash);
+        if created.grant != *r || !filed {
+            return Err(response_mismatch());
+        }
+        tx.commit().await?;
+        return Ok(cbor(StatusCode::CREATED, response));
+    }
+
+    // The actor holds custody of the ACTIVE root it hands on.
+    if !is_active_custodian(&mut tx, v, &s, now).await?
+        || active_pointer(&mut tx, &tenant).await? != Some(int(generation)?)
+    {
+        return Err(AppError::Forbidden);
+    }
+    let root_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT root_key_id FROM v2_root_key_generations
+          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(int(generation)?)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    if root_key != r.root_key_id {
+        return Err(column_mismatch("the grant names another root key"));
+    }
+
+    // The embedded container: signed by the actor, an ExistingRootGrant
+    // carrying exactly the request's identity.
+    let parsed = AuthorizationRecord::parse(&create.exact_signed_grant_container_bytes)
+        .map_err(record_error)?;
+    if *parsed.signed_container_hash() != r.signed_container_hash {
+        return Err(column_mismatch(
+            "the embedded container hash differs from the request",
+        ));
+    }
+    if *parsed.issuer_signing_key_id() != s.signing_key_id {
+        return Err(coded(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "KEY_SUBSTITUTION_DETECTED",
+            "the grant is not signed by the session's device",
+        ));
+    }
+    let issuer: Vec<u8> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices
+          WHERE tenant_id = ? AND id = ? AND signing_key_id = ? AND status = 'active'",
+    )
+    .bind(tenant.as_slice())
+    .bind(s.device_id.as_slice())
+    .bind(s.signing_key_id.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::Forbidden)?;
+    let issuer: [u8; 32] = issuer
+        .try_into()
+        .map_err(|_| AppError::Internal("a stored signing key is not 32 bytes".into()))?;
+    let record = parsed.verify_signature(&issuer).map_err(record_error)?;
+    let Payload::TenantRootKeyGrant(g) = record.payload().clone() else {
+        return Err(column_mismatch(
+            "the embedded record is not a root key grant",
+        ));
+    };
+    let record = record.record();
+    // shortcut: only ExistingRootGrant is filed; a RotationGrant needs a
+    // PREPARING N+1, which comes with root rotation.
+    if g.variant != RootGrantVariant::ExistingRootGrant {
+        return Err(column_mismatch(
+            "this route files an ExistingRootGrant only",
+        ));
+    }
+    let c = &g.common;
+    if (
+        c.tenant_id,
+        c.server_instance_id,
+        c.restore_epoch,
+        c.replay_id,
+        g.root_generation,
+        g.root_key_id,
+    ) != (
+        r.tenant_id,
+        r.server_instance_id,
+        r.restore_epoch,
+        r.replay_id,
+        r.root_generation,
+        r.root_key_id,
+    ) {
+        return Err(column_mismatch(
+            "the embedded grant differs from the request",
+        ));
+    }
+    if int(c.not_before_ms)? > now
+        || now >= int(c.not_after_ms)?
+        || c.not_after_ms - c.not_before_ms > MAX_ROOT_GRANT_TTL_MS
+    {
+        return Err(AppError::Forbidden);
+    }
+
+    // The subject: an active account and device under exactly these keys,
+    // linked to its live, tenant-scoped approval (plan 5.6.4, Q-22).
+    let eligible: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_accounts
+                         WHERE tenant_id = ? AND id = ? AND status = 'active')
+            AND EXISTS (SELECT 1 FROM v2_devices
+                         WHERE tenant_id = ? AND id = ? AND account_id = ? AND status = 'active'
+                           AND signing_key_id = ? AND hpke_key_id = ?)
+            AND EXISTS (SELECT 1 FROM v2_device_approvals
+                         WHERE server_instance_id = ? AND tenant_id = ? AND payload_domain = ?
+                           AND replay_id = ? AND subject_account_id = ?
+                           AND subject_device_id = ? AND subject_signing_key_id = ?
+                           AND subject_hpke_key_id = ? AND approval_scope_kind = 'tenant'
+                           AND revoked_at IS NULL
+                           AND not_before_ms <= ? AND ? < not_after_ms)",
+    )
+    .bind(tenant.as_slice())
+    .bind(g.subject_account_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(g.subject_device_id.as_slice())
+    .bind(g.subject_account_id.as_slice())
+    .bind(g.subject_signing_key_id.as_slice())
+    .bind(g.recipient_hpke_key_id.as_slice())
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(DOMAIN_DEVICE_APPROVAL)
+    .bind(g.subject_device_approval_replay_id.as_slice())
+    .bind(g.subject_account_id.as_slice())
+    .bind(g.subject_device_id.as_slice())
+    .bind(g.subject_signing_key_id.as_slice())
+    .bind(g.recipient_hpke_key_id.as_slice())
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !eligible {
+        return Err(coded(
+            StatusCode::CONFLICT,
+            "SUBJECT_NOT_ELIGIBLE",
+            "the subject has no active device or live tenant-scoped approval",
+        ));
+    }
+    let spent: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_tenant_root_key_grants
+                         WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(r.replay_id.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
+    if spent {
+        return Err(coded(
+            StatusCode::CONFLICT,
+            "REPLAY_DETECTED",
+            "this replay ID is already spent",
+        ));
+    }
+
+    insert_grant(&mut tx, &g, record, &at(now)).await?;
+    let created_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = TenantRootGrantCreatedV2 {
+        grant: r.clone(),
+        grant_variant: g.variant.as_str(),
+        subject_device_id: g.subject_device_id,
+        recipient_hpke_key_id: g.recipient_hpke_key_id,
+        created_at_ms,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_ROOT_GRANT_CREATED,
+        payload,
+        v,
+        created_at_ms,
+    )?;
+    let retained_until = c
+        .not_after_ms
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_ROOT_GRANT_CREATED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "root.grant_create",
+        "root_grant",
+        &r.replay_id,
     )
     .await?;
     tx.commit().await?;
