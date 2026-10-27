@@ -5046,3 +5046,132 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         assert_eq!(server.count(query).await, want, "{query}");
     }
 }
+
+// ------------------------------------------------------- ROOT_GRANT_REVOKE ---
+
+fn root_revoke_request(
+    key: u8,
+    grant: RootGrantRef,
+    reason: shared::mutation::RootGrantRevokeReason,
+) -> Vec<u8> {
+    lifecycle_request(
+        OperationKind::RootGrantRevoke,
+        key,
+        shared::mutation::TenantRootGrantRevokeV2 {
+            grant,
+            reason_code: reason,
+        }
+        .encode(),
+    )
+}
+
+#[tokio::test]
+async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
+    use shared::mutation::{RootGrantRevokeReason as R, TenantRootGrantRevokedV2};
+
+    let mut server = start("root-revoke", 28214).await;
+    let (dev, access, container, target, _) = bootstrapped_by(&mut server, 0x6e).await;
+    let ack_path = format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY));
+    let ack = ack_request(0xb1, grant_ref(&dev, &container));
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
+    let activate = activate_request(0xb3, target.clone());
+    assert_eq!(
+        server
+            .call(&activate_path("0"), &access, Some(&activate))
+            .await
+            .0,
+        201
+    );
+    let revoke_path = format!("{}/revoke", grant_path("0", &SELF_GRANT_REPLAY));
+    let grant = grant_ref(&dev, &container);
+
+    // A device that is no custodian revokes nothing.
+    let stranger = device(&server, OWNER, 0x7c, "pending").await;
+    let stranger_access = session(&server, &stranger).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let request = root_revoke_request(0xbf, grant.clone(), R::CustodyRemoved);
+    assert_eq!(
+        server
+            .call(&revoke_path, &stranger_access, Some(&request))
+            .await
+            .0,
+        403
+    );
+    // The ACTIVE root's only custodian cannot be revoked.
+    let request = root_revoke_request(0xc0, grant.clone(), R::CustodyRemoved);
+    let (status, body) = server.call(&revoke_path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "LAST_ROOT_CUSTODIAN")
+    );
+    // A request naming another container, or a path naming another grant,
+    // is refused.
+    let mut other = grant.clone();
+    other.signed_container_hash = [0x55; 32];
+    let request = root_revoke_request(0xc1, other, R::CustodyRemoved);
+    assert_eq!(
+        server.call(&revoke_path, &access, Some(&request)).await.0,
+        422
+    );
+    let request = root_revoke_request(0xc2, grant.clone(), R::CustodyRemoved);
+    let wrong = format!("{}/revoke", grant_path("0", &[0x82; 16]));
+    assert_eq!(server.call(&wrong, &access, Some(&request)).await.0, 422);
+
+    // shortcut: no route files an ExistingRootGrant yet, so a second
+    // acknowledged custodian row is copied in; only its presence is read.
+    let pool = db(&server.data).await;
+    let mut conn = pool.acquire().await.unwrap();
+    for statement in [
+        "CREATE TEMP TABLE second AS SELECT * FROM v2_tenant_root_key_grants",
+        "UPDATE second SET replay_id = zeroblob(16), grant_variant = 'ExistingRootGrant'",
+        "INSERT INTO v2_tenant_root_key_grants SELECT * FROM second",
+    ] {
+        sqlx::query(statement).execute(&mut *conn).await.unwrap();
+    }
+    drop(conn);
+    pool.close().await;
+
+    let request = root_revoke_request(0xc3, grant.clone(), R::DeviceLost);
+    let (status, body) = server.call(&revoke_path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    let revoked =
+        TenantRootGrantRevokedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (revoked.grant, revoked.reason_code),
+        (grant.clone(), R::DeviceLost)
+    );
+    // The subject's own live session is among those it ended.
+    assert!(revoked.sessions_invalidated_count >= 1);
+    assert_eq!(
+        server.call(&revoke_path, &access, Some(&request)).await.0,
+        401
+    );
+
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_tenant_root_key_grants
+              WHERE grant_variant = 'FirstRootSelfGrant' AND revoked_at IS NOT NULL",
+            1,
+        ),
+        (
+            &format!(
+                "SELECT count(*) FROM v2_sessions WHERE revoked_at_ms IS NULL AND device_id = X'{}'",
+                hex(&dev.id)
+            ),
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.grant_revoke'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'ROOT_GRANT_REVOKE'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+}

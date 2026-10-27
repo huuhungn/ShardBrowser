@@ -23,6 +23,9 @@ pub const RECORD_TYPE_ROOT_GENERATION_CREATED: &str = "TenantRootGenerationCreat
 pub const DOMAIN_ROOT_GRANT_ACK: &str = "shardx.keys.tenant-root-grant-ack.v2";
 pub const DOMAIN_ROOT_GRANT_ACKED: &str = "shardx.keys.tenant-root-grant-acked.v2";
 pub const RECORD_TYPE_ROOT_GRANT_ACKED: &str = "TenantRootGrantAckedV2";
+pub const DOMAIN_ROOT_GRANT_REVOKE: &str = "shardx.keys.tenant-root-grant-revoke.v2";
+pub const DOMAIN_ROOT_GRANT_REVOKED: &str = "shardx.keys.tenant-root-grant-revoked.v2";
+pub const RECORD_TYPE_ROOT_GRANT_REVOKED: &str = "TenantRootGrantRevokedV2";
 pub const DOMAIN_ROOT_GENERATION_ACTIVATE: &str = "shardx.keys.tenant-root-generation-activate.v2";
 pub const DOMAIN_ROOT_GENERATION_ACTIVATED: &str =
     "shardx.keys.tenant-root-generation-activated.v2";
@@ -778,6 +781,118 @@ impl TenantRootGrantAckedV2 {
         out.extend([
             ("ack_outcome", c::t(ACK_OUTCOME_ACKNOWLEDGED)),
             ("acked_at_ms", c::u(self.acked_at_ms)),
+        ]);
+        c::encode(&c::m(out))
+    }
+}
+
+// ------------------------------------------------------------------ revoke ---
+
+/// Plan L949 `reason_code` of a root grant revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootGrantRevokeReason {
+    DeviceLost,
+    CustodyRemoved,
+    RotationExclusion,
+}
+
+impl RootGrantRevokeReason {
+    pub const ALL: [Self; 3] = [
+        Self::DeviceLost,
+        Self::CustodyRemoved,
+        Self::RotationExclusion,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceLost => "device_lost",
+            Self::CustodyRemoved => "custody_removed",
+            Self::RotationExclusion => "rotation_exclusion",
+        }
+    }
+
+    fn take(f: &mut Fields) -> Result<Self> {
+        let reason = f.text("reason_code")?;
+        Self::ALL
+            .into_iter()
+            .find(|r| r.as_str() == reason)
+            .ok_or(RecordError::BadValue("reason_code"))
+    }
+}
+
+/// Plan L949 `TenantRootGrantRevokeV2`, the `ROOT_GRANT_REVOKE` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRootGrantRevokeV2 {
+    pub grant: RootGrantRef,
+    pub reason_code: RootGrantRevokeReason,
+}
+
+impl TenantRootGrantRevokeV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("TenantRootGrantRevokeV2", payload)?;
+        exact_version(&mut f, DOMAIN_ROOT_GRANT_REVOKE)?;
+        let grant = RootGrantRef::take(&mut f)?;
+        let reason_code = RootGrantRevokeReason::take(&mut f)?;
+        f.finish()?;
+        Ok(Self { grant, reason_code })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![
+            ("domain", c::t(DOMAIN_ROOT_GRANT_REVOKE)),
+            ("version", c::u(VERSION)),
+        ];
+        self.grant.put(&mut out);
+        out.push(("reason_code", c::t(self.reason_code.as_str())));
+        c::encode(&c::m(out))
+    }
+}
+
+pub(crate) const REVOKE_OUTCOME_REVOKED: &str = "revoked";
+
+/// Plan L949 `TenantRootGrantRevokedV2`, the stored `ROOT_GRANT_REVOKE`
+/// response. A replay returns these bytes, so the count and time never change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRootGrantRevokedV2 {
+    pub grant: RootGrantRef,
+    pub reason_code: RootGrantRevokeReason,
+    pub sessions_invalidated_count: u32,
+    pub revoked_at_ms: u64,
+}
+
+impl TenantRootGrantRevokedV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("TenantRootGrantRevokedV2", payload)?;
+        exact_version(&mut f, DOMAIN_ROOT_GRANT_REVOKED)?;
+        let grant = RootGrantRef::take(&mut f)?;
+        let reason_code = RootGrantRevokeReason::take(&mut f)?;
+        f.exact_text("revoke_outcome", REVOKE_OUTCOME_REVOKED)?;
+        let sessions_invalidated_count =
+            u32_in(&mut f, "sessions_invalidated_count", 0, u32::MAX.into())?;
+        let revoked_at_ms = f.uint("revoked_at_ms")?;
+        f.finish()?;
+        Ok(Self {
+            grant,
+            reason_code,
+            sessions_invalidated_count,
+            revoked_at_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![
+            ("domain", c::t(DOMAIN_ROOT_GRANT_REVOKED)),
+            ("version", c::u(VERSION)),
+        ];
+        self.grant.put(&mut out);
+        out.extend([
+            ("reason_code", c::t(self.reason_code.as_str())),
+            ("revoke_outcome", c::t(REVOKE_OUTCOME_REVOKED)),
+            (
+                "sessions_invalidated_count",
+                c::u(self.sessions_invalidated_count.into()),
+            ),
+            ("revoked_at_ms", c::u(self.revoked_at_ms)),
         ]);
         c::encode(&c::m(out))
     }
@@ -1672,6 +1787,22 @@ mod tests {
         }
     }
 
+    fn revoke() -> TenantRootGrantRevokeV2 {
+        TenantRootGrantRevokeV2 {
+            grant: grant_ref(),
+            reason_code: RootGrantRevokeReason::CustodyRemoved,
+        }
+    }
+
+    fn revoked() -> TenantRootGrantRevokedV2 {
+        TenantRootGrantRevokedV2 {
+            grant: grant_ref(),
+            reason_code: RootGrantRevokeReason::DeviceLost,
+            sessions_invalidated_count: 2,
+            revoked_at_ms: 1_700_000_000_003,
+        }
+    }
+
     fn activate(root_generation: u64) -> TenantRootGenerationActivateV2 {
         TenantRootGenerationActivateV2 {
             target: target(root_generation),
@@ -1760,6 +1891,12 @@ mod tests {
             ("activated 5", activated(5).encode(), |b| {
                 TenantRootGenerationActivatedV2::parse(b).map(|m| m.encode())
             }),
+            ("revoke", revoke().encode(), |b| {
+                TenantRootGrantRevokeV2::parse(b).map(|m| m.encode())
+            }),
+            ("revoked", revoked().encode(), |b| {
+                TenantRootGrantRevokedV2::parse(b).map(|m| m.encode())
+            }),
         ];
         for (name, raw, reparse) in &maps {
             assert_eq!(reparse(raw).as_ref(), Ok(raw), "{name}");
@@ -1798,7 +1935,7 @@ mod tests {
         assert_eq!(pinned, GOLDEN_LIFECYCLE.map(|(n, h)| (n, h.to_string())));
     }
 
-    const GOLDEN_LIFECYCLE: [(&str, &str); 6] = [
+    const GOLDEN_LIFECYCLE: [(&str, &str); 8] = [
         (
             "ack",
             "148a758a45a53e4f3abfac172ade4d2b3327596ec3b090c50bd7a9b38a018e2a",
@@ -1823,6 +1960,14 @@ mod tests {
             "activated 5",
             "6adc9ba8a9030fd6a6bd92e9b8723e8f60bf3021edf5fcc0fa1db2acd7354b17",
         ),
+        (
+            "revoke",
+            "1b119552d925bfabab02a362c61eab388bffa485fed2959cc04684c10db54b35",
+        ),
+        (
+            "revoked",
+            "174b89bac21fe64eec43051f56372b5cbaeb27c30952c36717a36352ad812f92",
+        ),
     ];
 
     #[test]
@@ -1842,6 +1987,8 @@ mod tests {
                 DOMAIN_ROOT_GENERATION_ACTIVATE,
                 DOMAIN_ROOT_GENERATION_ACTIVATED,
                 DOMAIN_ROOT_GRANT_DESCRIPTOR,
+                DOMAIN_ROOT_GRANT_REVOKE,
+                DOMAIN_ROOT_GRANT_REVOKED,
             ],
             [
                 "shardx.keys.tenant-root-grant-ack.v2",
@@ -1849,9 +1996,12 @@ mod tests {
                 "shardx.keys.tenant-root-generation-activate.v2",
                 "shardx.keys.tenant-root-generation-activated.v2",
                 "shardx.keys.tenant-root-grant-descriptor.v2",
+                "shardx.keys.tenant-root-grant-revoke.v2",
+                "shardx.keys.tenant-root-grant-revoked.v2",
             ]
         );
         assert_eq!(ACK_OUTCOME_ACKNOWLEDGED, "acknowledged");
+        assert_eq!(REVOKE_OUTCOME_REVOKED, "revoked");
     }
 
     #[test]
@@ -1870,6 +2020,41 @@ mod tests {
             TenantRootGrantAckedV2::parse(&edit(&raw, |e| set(e, "ack_outcome", c::t("rejected")))),
             Err(RecordError::BadValue("ack_outcome"))
         );
+    }
+
+    #[test]
+    fn a_revocation_names_a_known_reason_and_its_outcome() {
+        assert_eq!(
+            RootGrantRevokeReason::ALL.map(RootGrantRevokeReason::as_str),
+            ["device_lost", "custody_removed", "rotation_exclusion"]
+        );
+        for reason in RootGrantRevokeReason::ALL {
+            let r = TenantRootGrantRevokeV2 {
+                reason_code: reason,
+                ..revoke()
+            };
+            assert_eq!(TenantRootGrantRevokeV2::parse(&r.encode()), Ok(r));
+        }
+        let raw = revoke().encode();
+        assert_eq!(
+            TenantRootGrantRevokeV2::parse(&edit(&raw, |e| set(e, "reason_code", c::t("lost")))),
+            Err(RecordError::BadValue("reason_code"))
+        );
+        let raw = revoked().encode();
+        assert_eq!(
+            TenantRootGrantRevokedV2::parse(&edit(&raw, |e| set(
+                e,
+                "revoke_outcome",
+                c::t("refused")
+            ))),
+            Err(RecordError::BadValue("revoke_outcome"))
+        );
+        assert!(TenantRootGrantRevokedV2::parse(&edit(&raw, |e| set(
+            e,
+            "sessions_invalidated_count",
+            c::u(u64::from(u32::MAX) + 1)
+        )))
+        .is_err());
     }
 
     #[test]

@@ -24,11 +24,14 @@ use shared::mutation::{
     root_custodian_grant_set_hash, IdempotentMutationRequestV2, OperationKind, RootGenerationState,
     RootGrantState, TenantRootGenerationActivateV2, TenantRootGenerationActivatedV2,
     TenantRootGrantAckV2, TenantRootGrantAckedV2, TenantRootGrantDescriptorV2,
-    RECORD_TYPE_ROOT_GENERATION_ACTIVATED, RECORD_TYPE_ROOT_GRANT_ACKED,
+    TenantRootGrantRevokeV2, TenantRootGrantRevokedV2, RECORD_TYPE_ROOT_GENERATION_ACTIVATED,
+    RECORD_TYPE_ROOT_GRANT_ACKED, RECORD_TYPE_ROOT_GRANT_REVOKED,
 };
 
 use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sole_owner};
-use super::v2_auth::{audit, blob, reload_session, unhex, verified, Principal, Session};
+use super::v2_auth::{
+    audit, blob, reload_session, revoke_session, unhex, verified, Principal, Session,
+};
 use super::v2_root::{
     grant_row_matches, ledger_row, mismatch, record_error, same_request, stale, store_response,
     stored_payload, stored_response, MAX_ROOT_REQUEST_BODY,
@@ -689,4 +692,185 @@ pub(super) async fn is_active_custodian(
         }
     }
     Ok(false)
+}
+
+/// `POST .../root-key-generations/{g}/grants/{replay_id}/revoke` (plan L949,
+/// 5.6.4 rule 4): an active custodian marks one root grant revoked, never
+/// deleted, and ends every live session of its subject device in the same
+/// transaction. It cannot take back a TRK already unwrapped; excluding that
+/// device needs a new root generation.
+pub async fn revoke_root_grant(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((tenant, generation, replay)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let (tenant, generation) = path_ids(&tenant, &generation)?;
+    let replay = replay_id(&replay)?;
+    let outer = outer_request(v, &headers, &body, OperationKind::RootGrantRevoke)?;
+    let revoke =
+        TenantRootGrantRevokeV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
+    let r = &revoke.grant;
+    if r.tenant_id != tenant || r.root_generation != generation || r.replay_id != replay {
+        return Err(column_mismatch(
+            "the path names another grant than the request",
+        ));
+    }
+    if r.server_instance_id != v.server_instance_id {
+        return Err(AppError::Forbidden);
+    }
+    if r.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != tenant {
+        return Err(AppError::Forbidden);
+    }
+    if let Some(row) =
+        ledger_row(&mut tx, v, &s, outer.operation_kind, &outer.idempotency_key).await?
+    {
+        if !same_request(
+            &row,
+            outer.operation_kind,
+            &outer.canonical_request_hash(),
+            &body,
+        )? {
+            return Err(mismatch());
+        }
+        let (payload, response) = stored_payload(&row, &outer, RECORD_TYPE_ROOT_GRANT_REVOKED, v)
+            .ok_or_else(response_mismatch)?;
+        let revoked = TenantRootGrantRevokedV2::parse(&payload).map_err(|_| response_mismatch())?;
+        let still = load_grant(&mut tx, v, &tenant, generation, &replay)
+            .await?
+            .is_some_and(|g| g.revoked);
+        if revoked.grant != revoke.grant || revoked.reason_code != revoke.reason_code || !still {
+            return Err(response_mismatch());
+        }
+        tx.commit().await?;
+        return Ok(cbor(StatusCode::CREATED, response));
+    }
+
+    if !is_active_custodian(&mut tx, v, &s, now).await? {
+        return Err(AppError::Forbidden);
+    }
+    let g = load_grant(&mut tx, v, &tenant, generation, &replay)
+        .await?
+        .ok_or_else(not_found)?;
+    let rec = g.record.record();
+    if r.root_key_id != g.grant.root_key_id
+        || r.restore_epoch != g.grant.common.restore_epoch
+        || r.signed_container_hash != *rec.signed_container_hash()
+        || r.exact_signed_container_bytes_sha256 != *rec.exact_signed_container_bytes_sha256()
+    {
+        return Err(column_mismatch("the revocation names another grant"));
+    }
+    if g.revoked {
+        return Err(coded(
+            StatusCode::CONFLICT,
+            "ROOT_GRANT_REVOKED",
+            "this grant is already revoked",
+        ));
+    }
+    // An ACTIVE root keeps at least one custodian: with none, no device could
+    // sign the RotationGrant that excludes the revoked one.
+    if g.acked
+        && generation_state(&mut tx, v, &tenant, generation).await?
+            == Some(RootGenerationState::Active)
+    {
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM v2_tenant_root_key_grants
+              WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
+                AND replay_id <> ? AND acked_at IS NOT NULL AND revoked_at IS NULL",
+        )
+        .bind(v.server_instance_id.as_slice())
+        .bind(tenant.as_slice())
+        .bind(int(generation)?)
+        .bind(replay.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+        if others == 0 {
+            return Err(coded(
+                StatusCode::CONFLICT,
+                "LAST_ROOT_CUSTODIAN",
+                "the ACTIVE root would be left without a custodian",
+            ));
+        }
+    }
+
+    sqlx::query(
+        "UPDATE v2_tenant_root_key_grants SET revoked_at = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ? AND revoked_at IS NULL",
+    )
+    .bind(at(now))
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(replay.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    let sessions: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT id FROM v2_sessions
+          WHERE tenant_id = ? AND device_id = ? AND revoked_at_ms IS NULL",
+    )
+    .bind(tenant.as_slice())
+    .bind(g.grant.subject_device_id.as_slice())
+    .fetch_all(&mut *tx)
+    .await?;
+    for id in &sessions {
+        revoke_session(&mut tx, &tenant, id, now).await?;
+    }
+    let revoked_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = TenantRootGrantRevokedV2 {
+        grant: revoke.grant.clone(),
+        reason_code: revoke.reason_code,
+        sessions_invalidated_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
+        revoked_at_ms,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_ROOT_GRANT_REVOKED,
+        payload,
+        v,
+        revoked_at_ms,
+    )?;
+    let retained_until = g
+        .grant
+        .common
+        .not_after_ms
+        .max(revoked_at_ms)
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_ROOT_GRANT_REVOKED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "root.grant_revoke",
+        "root_grant",
+        &replay,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
 }

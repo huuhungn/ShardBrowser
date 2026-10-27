@@ -82,6 +82,11 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
         .route(
+            "/v2/tenants/:tenant_id/root-key-generations/:generation/grants/:replay_id/revoke",
+            post(v2_root_grants::revoke_root_grant)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
             "/v2/tenants/:tenant_id/root-key-generations/:generation/activate",
             post(v2_root_grants::activate_root_generation)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),

@@ -1243,7 +1243,7 @@ pub struct RefreshReq {
 
 /// Ends a session. Its spent refresh tokens go with it: once it is revoked a
 /// replayed token gets a plain 401, so the rows guard nothing.
-async fn revoke_session(
+pub(super) async fn revoke_session(
     conn: &mut SqliteConnection,
     tenant_id: &[u8],
     id: &[u8],
