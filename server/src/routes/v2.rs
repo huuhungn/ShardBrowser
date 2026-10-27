@@ -598,10 +598,15 @@ pub async fn commit_snapshot_upload(
     if verified.signed_id16("fleet_id") != Some(fleet_id) {
         return Err(signed_mismatch("fleet_id"));
     }
-    if verified.signed_uint("base_version") != Some(req.base_version.max(0) as u64) {
+    // A negative body value has no unsigned counterpart, so it never matches;
+    // clamping it would let -1 pass as 0 and fail only after the blob moved.
+    let signed_eq = |field: &'static str, body: i64| {
+        u64::try_from(body).is_ok_and(|v| verified.signed_uint(field) == Some(v))
+    };
+    if !signed_eq("base_version", req.base_version) {
         return Err(signed_mismatch("base_version"));
     }
-    if verified.signed_uint("key_generation") != Some(req.key_generation.max(0) as u64) {
+    if !signed_eq("key_generation", req.key_generation) {
         return Err(signed_mismatch("key_generation"));
     }
 
