@@ -514,6 +514,52 @@ async fn a_client_built_manifest_is_accepted_by_the_commit_endpoint() {
         },
     );
 
+    // A body value outside the unsigned domain is a mismatch, not a value to
+    // clamp: -1 must not pass as a signed 0 and fail only after the staged
+    // blob has been promoted, which would strand this session.
+    for (field, replay) in [("key_generation", 0x57u8), ("base_version", 0x58u8)] {
+        let fields = shared::fleet_manifest::ManifestFields {
+            tenant_id: TENANT_A,
+            server_instance_id: INSTANCE,
+            restore_epoch: restore_epoch as u64,
+            replay_id: [replay; 16],
+            profile_id: profile,
+            snapshot_id: snapshot,
+            fleet_id: fleet,
+            base_version: 0,
+            key_generation: 0,
+            container_sha256: container_sha,
+            not_before_ms: now_ms.saturating_sub(60_000),
+            not_after_ms: now_ms + 300_000,
+        };
+        let zero = shared::fleet_manifest::build_snapshot_manifest(&sk_a, &fields);
+        let mut body = json!({
+            "tenant_id": tenant_hex,
+            "profile_id": profile_hex,
+            "session_id": session_id,
+            "manifest_hex": hex(&zero),
+            "snapshot_id": hex(&snapshot),
+            "fleet_id": hex(&fleet),
+            "base_version": 0,
+            "key_generation": 0,
+            "container_sha256": hex(&container_sha),
+            "author_account_id": hex(&[1u8; 16]),
+            "author_device_id": hex(&[4u8; 16]),
+        });
+        body[field] = json!(-1);
+        let negative = cl
+            .post(format!("{}/v2/fleet/uploads/commit", base(port)))
+            .bearer_auth(&admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let st = negative.status();
+        let text = negative.text().await.unwrap();
+        assert_eq!(st, reqwest::StatusCode::BAD_REQUEST, "{field} -1: {text}");
+        assert!(text.contains("signed manifest"), "{field} -1: {text}");
+    }
+
     let commit = cl
         .post(format!("{}/v2/fleet/uploads/commit", base(port)))
         .bearer_auth(&admin)

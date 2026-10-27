@@ -19,7 +19,8 @@ so a minor release cannot change what a signature or tag covers.
 | Primitive | Crate | Pin | Notes |
 | --- | --- | --- | --- |
 | Ed25519 signatures | `ed25519-dalek` | `=3.0.0` | `verify_strict` only; RFC 8032 and speccheck vectors (G2 W1). |
-| AEAD | `chacha20poly1305` | `=0.11.0` | IETF ChaCha20-Poly1305, 96-bit nonce. |
+| AEAD | `chacha20poly1305` | `=0.11.0` | IETF ChaCha20-Poly1305, 96-bit nonce; XChaCha20-Poly1305, 192-bit nonce, for envelope suite 2. |
+| STREAM | `aead-stream` | `=0.6.0` | STREAM LE31 for envelope v2 frames (ADR 0003); draft-irtf-cfrg-xchacha-03 A.3.1 KAT and a raw-nonce proof in `envelope_v2.rs`. |
 | HPKE | `hpke` | `=0.14.0` | Default features off; only `x25519`, `chacha`, `hkdfsha2`. RFC 9180 base mode vectors. |
 | Password KDF | `argon2` | `=0.5.3` | Argon2id v0x13; RFC 9106 KAT (G2-46). |
 | Randomness | `getrandom` | `=0.4.3` | OS CSPRNG for keys, nonces and salts. |
@@ -30,7 +31,9 @@ The dependency audit of all three lockfiles is in `dependency-review.md`.
 
 ## Numeric registry
 
-Each registry has exactly one assigned value. Readers accept nothing else:
+Each registry has exactly one assigned value, except `envelope_suite_id`:
+suite 1 is the shipped body, and suite 2 is only valid inside a `SHARDXBK`
+envelope v2 object (ADR 0003). Readers accept nothing else:
 the parsers check these fields, and restore compares the signed intent bytes
 with bytes rebuilt from these constants. Adding a suite therefore means a new
 ID, never a new meaning for an old one.
@@ -39,6 +42,7 @@ ID, never a new meaning for an old one.
 | --- | --- | --- | --- |
 | `signature_suite_id` | 1 | Ed25519, strict verification | `signing::SIGNATURE_SUITE_ID_ED25519` |
 | `envelope_suite_id` | 1 | STREAM over ChaCha20-Poly1305 | `keys::ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM` |
+| `envelope_suite_id` | 2 | XChaCha20-Poly1305 under STREAM LE31, in a `SHARDXBK` object | `keys::ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31` |
 | `wrap_suite_id` | 1 | DEK wrap under the FKEK with ChaCha20-Poly1305 | `keys::WRAP_SUITE_ID_CHACHA20POLY1305` |
 | `archive_format_id` | 1 | tar, GNU and ustar headers | `keys::ARCHIVE_FORMAT_ID_TAR` |
 | `archive_policy_id` | 1 | profile snapshot policy: relative paths only, no links or devices, one entry per path on the target filesystem | `keys::ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT` |
@@ -52,7 +56,9 @@ ID, never a new meaning for an old one.
 | --- | --- | --- |
 | DEK, FKEK, TRK | 32 | ChaCha20-Poly1305 key size. |
 | `wrap_nonce_bytes` | 12 | The AEAD's nonce, inside the plan's bound of 1 to 64. |
-| `stream_nonce_prefix` | 7 | Leaves 5 bytes of the 12-byte nonce for a 4-byte frame counter and the final flag (ADR 0003). |
+| `stream_nonce_prefix` | 7 | Suite 1: leaves 5 bytes of the 12-byte nonce for a 4-byte frame counter and the final flag. |
+| `stream_nonce_prefix` | 20 | Suite 2: leaves 4 bytes of the 24-byte nonce for `u32le(position \| last << 31)` (ADR 0003). |
+| `PreambleV2` | 64 | Fixed `SHARDXBK` preamble; its hash is `preamble_sha256` under `SHARDX-ENVELOPE-PREAMBLE-V2`. |
 | AEAD tag | 16 | Poly1305. |
 | Ed25519 signature | 64 | RFC 8032. |
 | Recovery bundle KDF | 64 MiB, t=3, p=4 | ADR 0002 D-5; the same profile wraps the fallback key file. |
