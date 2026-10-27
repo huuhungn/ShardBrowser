@@ -97,6 +97,21 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
         .route(
+            "/v2/fleets/:fleet_id/key-generations/:generation/ack",
+            post(v2_fleet::ack_fleet_grant)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/fleets/:fleet_id/key-generations/:generation/activate",
+            post(v2_fleet::activate_fleet_generation)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/fleets/:fleet_id/key-generations/:generation/grants/:replay_id/revoke",
+            post(v2_fleet::revoke_fleet_grant)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
             "/v2/capability-grants",
             post(v2_capability::file_capability_grant).layer(DefaultBodyLimit::max(
                 v2_capability::MAX_CAPABILITY_GRANT_BODY,

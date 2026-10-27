@@ -25,20 +25,23 @@ use shared::authz_record::{
     DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
 };
 use shared::fleet_lifecycle::{
-    FleetGrantTarget, FleetGrantVariant, FleetKeyGenerationCreateV2, FleetKeyGenerationCreatedV2,
-    FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2, RECORD_TYPE_FLEET_GENERATION_CREATED,
-    RECORD_TYPE_FLEET_GRANT_CREATED,
+    FleetGrantRevokeV2, FleetGrantRevokedV2, FleetGrantTarget, FleetGrantVariant,
+    FleetKeyGenerationActivateV2, FleetKeyGenerationActivatedV2, FleetKeyGenerationCreateV2,
+    FleetKeyGenerationCreatedV2, FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2,
+    FleetKeyGrantCreatedV2, RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+    RECORD_TYPE_FLEET_GENERATION_CREATED, RECORD_TYPE_FLEET_GRANT_ACKED,
+    RECORD_TYPE_FLEET_GRANT_CREATED, RECORD_TYPE_FLEET_GRANT_REVOKED,
 };
-use shared::mutation::OperationKind;
+use shared::mutation::{fleet_device_grant_set_hash, IdempotentMutationRequestV2, OperationKind};
 
 use super::v2_approval::{cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, blob, reload_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
-    insert_row, ledger_row, mismatch, record_error, same_request, stale, store_response,
+    insert_row, ledger_row, mismatch, record_error, row_holds, same_request, stale, store_response,
     stored_payload, stored_response, Col,
 };
-use super::v2_root_grants::{is_active_custodian, outer_request};
+use super::v2_root_grants::{at, is_active_custodian, outer_request};
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::state::AppState;
@@ -861,6 +864,717 @@ pub async fn file_fleet_grant(
         "fleet.key_grant.create",
         "fleet_key_grant",
         &r.replay_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+// ------------------------------------------------------ stored fleet grants ---
+
+fn integrity() -> AppError {
+    column_mismatch("a stored fleet grant does not match its signed container")
+}
+
+/// A filed fleet grant whose row matched its verified container.
+struct StoredFleetGrant {
+    payload: Payload,
+    fleet: ([u8; 16], [u8; 32], u64),
+    signed_container_hash: [u8; 32],
+    exact_sha256: [u8; 32],
+    acked: bool,
+    revoked: bool,
+}
+
+/// The grant `replay` of `variant` on this instance, reparsed, verified under
+/// its issuer's key and required to hold exactly the columns its container
+/// determines; a row that disagrees refuses the request (422).
+async fn load_fleet_grant(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    variant: FleetGrantVariant,
+    replay: &[u8; 16],
+) -> Result<Option<StoredFleetGrant>, AppError> {
+    let table = table_of(variant);
+    let row = sqlx::query(&format!(
+        "SELECT exact_signed_container_bytes, acked_at, revoked_at FROM {table}
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?"
+    ))
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(replay.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let exact: Vec<u8> = row.get("exact_signed_container_bytes");
+    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| integrity())?;
+    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
+    )
+    .bind(tenant.as_slice())
+    .bind(parsed.issuer_signing_key_id().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let issuer: [u8; 32] = issuer
+        .and_then(|k| k.try_into().ok())
+        .ok_or_else(integrity)?;
+    let record = parsed.verify_signature(&issuer).map_err(|_| integrity())?;
+    let payload = record.payload().clone();
+    let f = filing(&payload, record.record())?;
+    let c = &f.common;
+    if variant_of(&payload) != Some(variant)
+        || (&c.server_instance_id, &c.tenant_id, &c.replay_id)
+            != (&v.server_instance_id, tenant, replay)
+        || !row_holds(conn, table, &f.cols).await?
+    {
+        return Err(integrity());
+    }
+    Ok(Some(StoredFleetGrant {
+        fleet: f.fleet,
+        signed_container_hash: *record.record().signed_container_hash(),
+        exact_sha256: *record.record().exact_signed_container_bytes_sha256(),
+        acked: row.get::<Option<String>, _>("acked_at").is_some(),
+        revoked: row.get::<Option<String>, _>("revoked_at").is_some(),
+        payload,
+    }))
+}
+
+fn common_of(payload: &Payload) -> &CommonFields {
+    match payload {
+        Payload::DeviceHpkeGrant(p) => &p.common,
+        Payload::RecoveryGrant(p) => &p.common,
+        Payload::RotationGrant(p) => &p.common,
+        _ => unreachable!("load_fleet_grant holds only fleet grants"),
+    }
+}
+
+/// The stored payload and response for this idempotency key, `None` when the
+/// key is new, or a refusal when the key holds another request.
+async fn replay_or_none(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    outer: &IdempotentMutationRequestV2,
+    body: &[u8],
+    record_type: &str,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, AppError> {
+    let Some(row) = ledger_row(conn, v, s, outer.operation_kind, &outer.idempotency_key).await?
+    else {
+        return Ok(None);
+    };
+    if !same_request(
+        &row,
+        outer.operation_kind,
+        &outer.canonical_request_hash(),
+        body,
+    )? {
+        return Err(mismatch());
+    }
+    stored_payload(&row, outer, record_type, v)
+        .map(Some)
+        .ok_or_else(response_mismatch)
+}
+
+// ---------------------------------------------------------- FLEET_GRANT_ACK ---
+
+/// `POST .../key-generations/{generation}/ack`: one grant per request (D-9).
+/// The actor opened the grant and the FKEK it got re-derived `fkek_key_id`.
+pub async fn ack_fleet_grant(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((fleet, generation)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let fleet = fleet_path(&fleet)?;
+    let generation = generation_path(&generation)?;
+    let outer = outer_request(v, &headers, &body, OperationKind::FleetGrantAck)?;
+    let ack = FleetKeyGrantAckV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
+    let r = &ack.grant;
+    let g = &r.generation;
+    if g.fleet_id != fleet || g.generation != generation {
+        return Err(column_mismatch(
+            "the path names another generation than the request",
+        ));
+    }
+    if g.server_instance_id != v.server_instance_id {
+        return Err(AppError::Forbidden);
+    }
+    if g.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != g.tenant_id {
+        return Err(AppError::Forbidden);
+    }
+    if let Some((payload, response)) =
+        replay_or_none(&mut tx, v, &s, &outer, &body, RECORD_TYPE_FLEET_GRANT_ACKED).await?
+    {
+        let acked = FleetKeyGrantAckedV2::parse(&payload).map_err(|_| response_mismatch())?;
+        let still = load_fleet_grant(&mut tx, v, &s.tenant_id, r.grant_variant, &r.replay_id)
+            .await?
+            .is_some_and(|stored| stored.acked);
+        if acked.grant != *r || !still {
+            return Err(response_mismatch());
+        }
+        tx.commit().await?;
+        return Ok(cbor(StatusCode::CREATED, response));
+    }
+
+    let stored = load_fleet_grant(&mut tx, v, &s.tenant_id, r.grant_variant, &r.replay_id)
+        .await?
+        .ok_or_else(|| {
+            coded(
+                StatusCode::NOT_FOUND,
+                "RESOURCE_NOT_FOUND",
+                "no such fleet grant",
+            )
+        })?;
+    let c = common_of(&stored.payload);
+    let names_grant = stored.signed_container_hash == r.signed_container_hash
+        && stored.exact_sha256 == r.exact_signed_grant_container_bytes_sha256
+        && c.restore_epoch == g.restore_epoch;
+    if !names_grant || stored.fleet != (g.fleet_id, g.fkek_key_id, g.generation) {
+        return Err(column_mismatch("the acknowledgement names another grant"));
+    }
+    if stored.revoked || stored.acked {
+        return Err(conflict(
+            "FLEET_GRANT_NOT_PENDING",
+            "this grant is revoked or already acknowledged",
+        ));
+    }
+    if int(c.not_before_ms)? > now || now >= int(c.not_after_ms)? {
+        return Err(AppError::Forbidden);
+    }
+    // D-9 ack actors.
+    let actor_ok = match &stored.payload {
+        Payload::DeviceHpkeGrant(p) => {
+            p.subject_account_id == s.account_id
+                && p.subject_device_id == s.device_id
+                && p.subject_signing_key_id == s.signing_key_id
+                && p.recipient_hpke_key_id == s.hpke_key_id
+        }
+        // shortcut: only a custodian of the ACTIVE recipient root acks; the
+        // PREPARING-root case comes with root rotation (D-5).
+        Payload::RecoveryGrant(p) => {
+            is_active_custodian(&mut tx, v, &s, now).await?
+                && active_root(&mut tx, v, &s.tenant_id).await?
+                    == Some((p.recipient_root_generation, p.recipient_root_key_id))
+        }
+        Payload::RotationGrant(_) => {
+            holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::KeyRotate, now).await?
+        }
+        _ => unreachable!("load_fleet_grant holds only fleet grants"),
+    };
+    if !actor_ok {
+        return Err(AppError::Forbidden);
+    }
+    let state = generation_row(&mut tx, v, &s.tenant_id, &fleet, generation)
+        .await?
+        .map(|row| row.state);
+    let ackable = match r.grant_variant {
+        // A recovery grant of any retained generation (D-9).
+        FleetGrantVariant::Recovery => state.is_some(),
+        FleetGrantVariant::DeviceHpke => {
+            matches!(state.as_deref(), Some("PREPARING" | "ACTIVE"))
+        }
+        FleetGrantVariant::Rotation => state.as_deref() == Some("PREPARING"),
+    };
+    if !ackable {
+        return Err(conflict(
+            "FLEET_GENERATION_STATE",
+            "the grant's generation does not take this acknowledgement",
+        ));
+    }
+
+    sqlx::query(&format!(
+        "UPDATE {} SET acked_at = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ? AND acked_at IS NULL",
+        table_of(r.grant_variant)
+    ))
+    .bind(at(now))
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(r.replay_id.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    let acked_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = FleetKeyGrantAckedV2 {
+        grant: *r,
+        acked_at_ms,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_FLEET_GRANT_ACKED,
+        payload,
+        v,
+        acked_at_ms,
+    )?;
+    let retained_until = c
+        .not_after_ms
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GRANT_ACKED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "fleet.key_grant.ack",
+        "fleet_key_grant",
+        &r.replay_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+// ------------------------------------------------ FLEET_GENERATION_ACTIVATE ---
+
+/// The acknowledged, live grants of `variant` for one generation, each
+/// reverified, with the container hash of each.
+async fn live_acked_grants(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    variant: FleetGrantVariant,
+    fleet: &[u8; 16],
+    generation: u64,
+    now: i64,
+) -> Result<Vec<StoredFleetGrant>, AppError> {
+    let replays: Vec<Vec<u8>> = sqlx::query_scalar(&format!(
+        "SELECT replay_id FROM {}
+          WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ? AND generation = ?
+            AND acked_at IS NOT NULL AND revoked_at IS NULL",
+        table_of(variant)
+    ))
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(int(generation)?)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut out = Vec::with_capacity(replays.len());
+    for replay in replays {
+        let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+        let g = load_fleet_grant(conn, v, &s.tenant_id, variant, &replay)
+            .await?
+            .ok_or_else(integrity)?;
+        let c = common_of(&g.payload);
+        // A grant outside its window holds nothing now.
+        if int(c.not_before_ms)? <= now && now < int(c.not_after_ms)? {
+            out.push(g);
+        }
+    }
+    Ok(out)
+}
+
+/// `POST .../key-generations/{generation}/activate`: PREPARING -> ACTIVE, and
+/// the previous ACTIVE generation -> RETIRED, once the required device set,
+/// the recovery grant and, for a rotation, the rotation grant are in (D-9).
+pub async fn activate_fleet_generation(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((fleet, generation)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let fleet = fleet_path(&fleet)?;
+    let generation = generation_path(&generation)?;
+    let outer = outer_request(v, &headers, &body, OperationKind::FleetGenerationActivate)?;
+    let activate = FleetKeyGenerationActivateV2::parse(&outer.canonical_payload_bytes)
+        .map_err(record_error)?;
+    let t = &activate.terms;
+    let g = &t.generation;
+    if g.fleet_id != fleet || g.generation != generation {
+        return Err(column_mismatch(
+            "the path names another generation than the request",
+        ));
+    }
+    if g.server_instance_id != v.server_instance_id {
+        return Err(AppError::Forbidden);
+    }
+    if g.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != g.tenant_id {
+        return Err(AppError::Forbidden);
+    }
+    if let Some((payload, response)) = replay_or_none(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+    )
+    .await?
+    {
+        let activated =
+            FleetKeyGenerationActivatedV2::parse(&payload).map_err(|_| response_mismatch())?;
+        let still = generation_row(&mut tx, v, &s.tenant_id, &fleet, generation)
+            .await?
+            .is_some_and(|row| row.state != "PREPARING" && row.fkek_key_id == g.fkek_key_id);
+        if activated.terms != *t || !still {
+            return Err(response_mismatch());
+        }
+        tx.commit().await?;
+        return Ok(cbor(StatusCode::CREATED, response));
+    }
+
+    let capability = match t.rotation {
+        None => Capability::FleetManage,
+        Some(_) => Capability::KeyRotate,
+    };
+    if !holds_fleet_capability(&mut tx, v, &s, &fleet, capability, now).await? {
+        return Err(AppError::Forbidden);
+    }
+    let row = generation_row(&mut tx, v, &s.tenant_id, &fleet, generation)
+        .await?
+        .ok_or_else(|| {
+            coded(
+                StatusCode::NOT_FOUND,
+                "RESOURCE_NOT_FOUND",
+                "no such fleet key generation",
+            )
+        })?;
+    let rotation = t.rotation.as_ref();
+    let same_terms = row.fkek_key_id == g.fkek_key_id
+        && row.required_device_grant_count == Some(i64::from(t.required_device_grant_count))
+        && row.required_grant_set_hash.as_deref() == Some(&t.required_device_grant_set_hash[..])
+        && row.recovery_grant_hash.as_deref() == Some(&t.recovery_grant_signed_container_hash[..])
+        && row.previous_fkek_key_id.as_deref() == rotation.map(|r| &r.previous_fkek_key_id[..])
+        && row.rotation_grant_hash.as_deref()
+            == rotation.map(|r| &r.rotation_grant_signed_container_hash[..]);
+    if !same_terms {
+        return Err(conflict(
+            "FLEET_GENERATION_MISMATCH",
+            "the activation restates other terms than the generation was created with",
+        ));
+    }
+    if row.state != "PREPARING" {
+        return Err(conflict(
+            "FLEET_GENERATION_STATE",
+            "only a PREPARING generation activates",
+        ));
+    }
+    if let Some(r) = rotation {
+        let previous =
+            generation_row(&mut tx, v, &s.tenant_id, &fleet, r.previous_generation).await?;
+        if !previous.is_some_and(|p| p.state == "ACTIVE" && p.fkek_key_id == r.previous_fkek_key_id)
+        {
+            return Err(conflict(
+                "FLEET_GENERATION_NOT_ACTIVE",
+                "the previous generation is no longer ACTIVE under that key",
+            ));
+        }
+    }
+
+    // D-4: the acknowledged live device grants are exactly the required set.
+    let devices = live_acked_grants(
+        &mut tx,
+        v,
+        &s,
+        FleetGrantVariant::DeviceHpke,
+        &fleet,
+        generation,
+        now,
+    )
+    .await?;
+    let hashes: Vec<[u8; 32]> = devices.iter().map(|d| d.signed_container_hash).collect();
+    let recovery = live_acked_grants(
+        &mut tx,
+        v,
+        &s,
+        FleetGrantVariant::Recovery,
+        &fleet,
+        generation,
+        now,
+    )
+    .await?;
+    let rotations = live_acked_grants(
+        &mut tx,
+        v,
+        &s,
+        FleetGrantVariant::Rotation,
+        &fleet,
+        generation,
+        now,
+    )
+    .await?;
+    if hashes.len() != t.required_device_grant_count as usize
+        || fleet_device_grant_set_hash(&hashes) != Some(t.required_device_grant_set_hash)
+    {
+        return Err(conflict(
+            "FLEET_GRANTS_INCOMPLETE",
+            "the acknowledged device grants are not the generation's required set",
+        ));
+    }
+    if !recovery
+        .iter()
+        .any(|g| g.signed_container_hash == t.recovery_grant_signed_container_hash)
+    {
+        return Err(conflict(
+            "FLEET_GRANTS_INCOMPLETE",
+            "the generation's recovery grant is not acknowledged",
+        ));
+    }
+    if let Some(r) = rotation {
+        let due = rotations.iter().any(|g| {
+            g.signed_container_hash == r.rotation_grant_signed_container_hash
+                && matches!(&g.payload, Payload::RotationGrant(p)
+                    if i64::try_from(p.activation_not_before_ms).is_ok_and(|nb| nb <= now))
+        });
+        if !due {
+            return Err(conflict(
+                "FLEET_GRANTS_INCOMPLETE",
+                "the rotation grant is not acknowledged or not yet due",
+            ));
+        }
+    }
+
+    let stamp = at(now);
+    if let Some(r) = rotation {
+        // Retire first: at most one generation of a fleet is ACTIVE (0007).
+        sqlx::query(
+            "UPDATE v2_fleet_key_generations SET state = 'RETIRED', retired_at = ?
+              WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ? AND generation = ?
+                AND state = 'ACTIVE'",
+        )
+        .bind(&stamp)
+        .bind(v.server_instance_id.as_slice())
+        .bind(s.tenant_id.as_slice())
+        .bind(fleet.as_slice())
+        .bind(int(r.previous_generation)?)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE v2_fleet_key_generations SET state = 'ACTIVE', activated_at = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ? AND generation = ?
+            AND state = 'PREPARING'",
+    )
+    .bind(&stamp)
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(int(generation)?)
+    .execute(&mut *tx)
+    .await?;
+
+    let activated_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = FleetKeyGenerationActivatedV2 {
+        terms: *t,
+        activated_at_ms,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+        payload,
+        v,
+        activated_at_ms,
+    )?;
+    let retained_until = activated_at_ms
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "fleet.key_generation.activate",
+        "fleet_key_generation",
+        &g.fkek_key_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+// ------------------------------------------------------- FLEET_GRANT_REVOKE ---
+
+/// `POST .../key-generations/{generation}/grants/{replay_id}/revoke`: one
+/// grant is marked revoked, never deleted; the fleet is left
+/// `rotation_required`, which clients derive (D-9, C-1).
+pub async fn revoke_fleet_grant(
+    State(app): State<AppState>,
+    who: Principal,
+    Path((fleet, generation, replay)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let fleet = fleet_path(&fleet)?;
+    let generation = generation_path(&generation)?;
+    let replay = unhex::<16>(&replay)
+        .ok_or_else(|| AppError::BadRequest("replay id must be 32 hex digits".into()))?;
+    let outer = outer_request(v, &headers, &body, OperationKind::FleetGrantRevoke)?;
+    let revoke = FleetGrantRevokeV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
+    let rv = &revoke.revocation;
+    let g = &rv.generation;
+    if g.fleet_id != fleet || g.generation != generation || rv.replay_id != replay {
+        return Err(column_mismatch(
+            "the path names another grant than the request",
+        ));
+    }
+    if g.server_instance_id != v.server_instance_id {
+        return Err(AppError::Forbidden);
+    }
+    if g.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != g.tenant_id {
+        return Err(AppError::Forbidden);
+    }
+    if let Some((payload, response)) = replay_or_none(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GRANT_REVOKED,
+    )
+    .await?
+    {
+        let revoked = FleetGrantRevokedV2::parse(&payload).map_err(|_| response_mismatch())?;
+        let still = load_fleet_grant(&mut tx, v, &s.tenant_id, rv.grant_variant, &replay)
+            .await?
+            .is_some_and(|stored| stored.revoked);
+        if revoked.revocation != *rv || !still {
+            return Err(response_mismatch());
+        }
+        tx.commit().await?;
+        return Ok(cbor(StatusCode::CREATED, response));
+    }
+
+    if !holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::FleetManage, now).await? {
+        return Err(AppError::Forbidden);
+    }
+    let stored = load_fleet_grant(&mut tx, v, &s.tenant_id, rv.grant_variant, &replay)
+        .await?
+        .ok_or_else(|| {
+            coded(
+                StatusCode::NOT_FOUND,
+                "RESOURCE_NOT_FOUND",
+                "no such fleet grant",
+            )
+        })?;
+    if stored.signed_container_hash != rv.signed_container_hash
+        || stored.fleet != (g.fleet_id, g.fkek_key_id, g.generation)
+        || common_of(&stored.payload).restore_epoch != g.restore_epoch
+    {
+        return Err(column_mismatch("the revocation names another grant"));
+    }
+    if stored.revoked {
+        return Err(conflict(
+            "FLEET_GRANT_REVOKED",
+            "this grant is already revoked",
+        ));
+    }
+
+    sqlx::query(&format!(
+        "UPDATE {} SET revoked_at = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ? AND revoked_at IS NULL",
+        table_of(rv.grant_variant)
+    ))
+    .bind(at(now))
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(replay.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    let revoked_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = FleetGrantRevokedV2 {
+        revocation: *rv,
+        revoked_at_ms,
+        // shortcut: a fleet grant backs no session or lease yet, so nothing
+        // else is invalidated; count those once leases check fleet grants.
+        invalidation_count: 0,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_FLEET_GRANT_REVOKED,
+        payload,
+        v,
+        revoked_at_ms,
+    )?;
+    let retained_until = common_of(&stored.payload)
+        .not_after_ms
+        .max(revoked_at_ms)
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GRANT_REVOKED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "fleet.key_grant.revoke",
+        "fleet_key_grant",
+        &replay,
     )
     .await?;
     tx.commit().await?;
