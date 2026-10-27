@@ -64,6 +64,8 @@ pub enum GrantError {
     BadTrkLength,
     /// The opened plaintext was not a well-formed fleet key.
     BadFkekLength,
+    /// The AEAD wrap of a recovery grant failed. Opaque for the same reason.
+    AeadFailure,
     /// A grant field did not match the expected value.
     FieldMismatch(&'static str),
 }
@@ -75,6 +77,7 @@ impl std::fmt::Display for GrantError {
             GrantError::HpkeFailure => write!(f, "HPKE operation failed"),
             GrantError::BadTrkLength => write!(f, "unwrapped tenant root key has wrong length"),
             GrantError::BadFkekLength => write!(f, "unwrapped fleet key has wrong length"),
+            GrantError::AeadFailure => write!(f, "AEAD wrap or unwrap failed"),
             GrantError::FieldMismatch(field) => write!(f, "grant field mismatch: {field}"),
         }
     }
