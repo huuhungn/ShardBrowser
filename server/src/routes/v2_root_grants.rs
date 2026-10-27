@@ -240,7 +240,7 @@ pub async fn read_root_grant(
 }
 
 /// Parses an exact outer request of `kind` and checks its instance and epoch.
-fn outer_request(
+pub(super) fn outer_request(
     v: &Verified,
     headers: &HeaderMap,
     body: &[u8],

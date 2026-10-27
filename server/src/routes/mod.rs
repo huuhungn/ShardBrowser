@@ -8,6 +8,7 @@ pub mod v2;
 pub mod v2_approval;
 pub mod v2_auth;
 pub mod v2_capability;
+pub mod v2_fleet;
 pub mod v2_root;
 pub mod v2_root_grants;
 pub mod v2_trust;
@@ -83,6 +84,16 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v2/tenants/:tenant_id/root-key-generations/:generation/activate",
             post(v2_root_grants::activate_root_generation)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/fleets/:fleet_id/key-generations",
+            post(v2_fleet::create_fleet_generation)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/fleets/:fleet_id/key-generations/:generation/grants",
+            post(v2_fleet::file_fleet_grant)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
         )
         .route(

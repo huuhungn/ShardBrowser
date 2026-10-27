@@ -4195,3 +4195,317 @@ async fn a_trust_evidence_page_stays_within_four_mebibytes() {
     let reported: usize = pages.iter().map(|p| p.revocations.len()).sum();
     assert_eq!(reported, 40);
 }
+
+// ------------------------------------------------ D-9 fleet create and grants ---
+
+const FLEET: [u8; 16] = [0xf5; 16];
+
+fn fleet_generation_path() -> String {
+    format!("/v2/fleets/{}/key-generations", hex(&FLEET))
+}
+
+fn fleet_grants_path(generation: u64) -> String {
+    format!("{}/{generation}/grants", fleet_generation_path())
+}
+
+fn fleet_common(replay: u8, days: u64) -> CommonFields {
+    let start = now_ms() - 60_000;
+    CommonFields {
+        replay_id: [replay; 16],
+        tenant_id: TENANT,
+        issued_at_ms: start,
+        not_before_ms: start,
+        not_after_ms: start + days * DAY_MS,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+    }
+}
+
+fn container_hash(container: &[u8]) -> [u8; 32] {
+    *AuthorizationRecord::parse(container)
+        .unwrap()
+        .signed_container_hash()
+}
+
+/// The `FLEET_GRANT_CREATE` request filing `container` as `variant`.
+fn fleet_grant_request(
+    key: u8,
+    generation: u64,
+    fkek: [u8; 32],
+    variant: shared::fleet_lifecycle::FleetGrantVariant,
+    replay: u8,
+    container: &[u8],
+) -> Vec<u8> {
+    use shared::fleet_lifecycle::{FleetGenerationRef, FleetKeyGrantCreateV2};
+    // Every fixture grant's replay ID is one repeated byte.
+    let replay_id = [replay; 16];
+    let create = FleetKeyGrantCreateV2::new(
+        FleetGenerationRef {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            fleet_id: FLEET,
+            generation,
+            fkek_key_id: fkek,
+        },
+        variant,
+        replay_id,
+        container_hash(container),
+        container.to_vec(),
+    );
+    lifecycle_request(OperationKind::FleetGrantCreate, key, create.encode())
+}
+
+#[tokio::test]
+async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, RotationGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationCreateV2, FleetKeyGenerationCreatedV2, FleetRotation,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let mut server = start("d9-fleet", 28212).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let (fkek0, fkek1) = ([0xe0; 32], [0xe1; 32]);
+    let device_grant = |replay: u8, generation: u64, fkek: [u8; 32], days: u64| {
+        let g = DeviceHpkeGrantV2 {
+            common: fleet_common(replay, days),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation,
+            subject_account_id: OWNER,
+            subject_device_id: dev.id,
+            subject_signing_key_id: dev.signing_key_id,
+            recipient_hpke_key_id: dev.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    };
+    let recovery_grant = |replay: u8, generation: u64, fkek: [u8; 32]| {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(replay, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation,
+            recipient_root_key_id: shared::keys::root_key_id(&TRK),
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    let gen_ref = |generation: u64, fkek: [u8; 32]| FleetGenerationRef {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        fleet_id: FLEET,
+        generation,
+        fkek_key_id: fkek,
+    };
+
+    // Generation 0 names its one device grant and its recovery grant (D-4).
+    let device0 = device_grant(0xd0, 0, fkek0, 365);
+    let recovery0 = recovery_grant(0xd1, 0, fkek0);
+    let create0 = FleetKeyGenerationCreateV2 {
+        terms: FleetGenerationTerms {
+            generation: gen_ref(0, fkek0),
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(
+                &device0,
+            )])
+            .unwrap(),
+            recovery_grant_signed_container_hash: container_hash(&recovery0),
+            rotation: None,
+        },
+        root_generation: 0,
+    };
+    let request0 = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc1, create0.encode());
+
+    // A custodian without `fleet.manage` creates nothing (D-2).
+    let path = fleet_generation_path();
+    assert_eq!(server.call(&path, &access, Some(&request0)).await.0, 403);
+    let manage = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa7; 16];
+        g.scope_kind = CapabilityScopeKind::Fleet;
+        g.scope_id = FLEET;
+        g.capability = Capability::FleetManage;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&manage)).await.0, 201);
+
+    let (status, body) = server.call(&path, &access, Some(&request0)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    let created =
+        FleetKeyGenerationCreatedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(created.create, create0);
+    // The same bytes get the same answer; a second bootstrap is refused.
+    assert_eq!(
+        server.call(&path, &access, Some(&request0)).await,
+        (201, body.clone())
+    );
+    let mut other = create0.clone();
+    other.terms.generation.fkek_key_id = [0xee; 32];
+    let again = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc2, other.encode());
+    let (status, body) = server.call(&path, &access, Some(&again)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "FLEET_GENERATION_EXISTS")
+    );
+
+    // Grants for generation 0: the device grant and the recovery grant.
+    let grants0 = fleet_grants_path(0);
+    let device_request = fleet_grant_request(0xc3, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
+    let (status, body) = server.call(&grants0, &access, Some(&device_request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.call(&grants0, &access, Some(&device_request)).await,
+        (201, body)
+    );
+    let recovery_request = fleet_grant_request(0xc4, 0, fkek0, V::Recovery, 0xd1, &recovery0);
+    let (status, body) = server
+        .call(&grants0, &access, Some(&recovery_request))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // A spent replay ID, a device grant past 365 days, a grant signed by
+    // another key, and a variant the request does not name are refused.
+    let reused = fleet_grant_request(0xc5, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
+    let (status, body) = server.call(&grants0, &access, Some(&reused)).await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "REPLAY_DETECTED"));
+    let long = fleet_grant_request(
+        0xc6,
+        0,
+        fkek0,
+        V::DeviceHpke,
+        0xd2,
+        &device_grant(0xd2, 0, fkek0, 366),
+    );
+    assert_eq!(server.call(&grants0, &access, Some(&long)).await.0, 403);
+    let stranger = Ed25519SigningKey::from_bytes(&[0x99; 32]);
+    let forged = {
+        let parsed = AuthorizationRecord::parse(&device_grant(0xd3, 0, fkek0, 30)).unwrap();
+        build_record(
+            &stranger,
+            DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+            parsed.canonical_payload_bytes(),
+        )
+    };
+    let forged = fleet_grant_request(0xc7, 0, fkek0, V::DeviceHpke, 0xd3, &forged);
+    let (status, body) = server.call(&grants0, &access, Some(&forged)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "KEY_SUBSTITUTION_DETECTED")
+    );
+    let misnamed = fleet_grant_request(
+        0xc8,
+        0,
+        fkek0,
+        V::Recovery,
+        0xd4,
+        &device_grant(0xd4, 0, fkek0, 30),
+    );
+    assert_eq!(server.call(&grants0, &access, Some(&misnamed)).await.0, 422);
+
+    // Rotation to generation 1 needs `key.rotate` and an ACTIVE generation 0.
+    // shortcut: activation is the next route; the test marks it ACTIVE.
+    server
+        .sql(
+            "UPDATE v2_fleet_key_generations SET state = 'ACTIVE', activated_at = 'now'
+              WHERE tenant_id = ? AND fleet_id = ? AND generation = 0",
+            &[&TENANT, &FLEET],
+        )
+        .await;
+    let device1 = device_grant(0xd5, 1, fkek1, 365);
+    let recovery1 = recovery_grant(0xd6, 1, fkek1);
+    let set1 = fleet_device_grant_set_hash(&[container_hash(&device1)]).unwrap();
+    let rotation_grant = |replay: u8, count: u32| {
+        let common = fleet_common(replay, 30);
+        let g = RotationGrantV2 {
+            activation_not_before_ms: common.not_before_ms,
+            common,
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            previous_fkek_key_id: fkek0,
+            previous_generation: 0,
+            required_device_grant_count: count,
+            required_device_grant_set_hash: set1,
+            recovery_grant_signed_container_hash: container_hash(&recovery1),
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &g.encode())
+    };
+    let rotation1 = rotation_grant(0xd7, 1);
+    let create1 = FleetKeyGenerationCreateV2 {
+        terms: FleetGenerationTerms {
+            generation: gen_ref(1, fkek1),
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: set1,
+            recovery_grant_signed_container_hash: container_hash(&recovery1),
+            rotation: Some(FleetRotation {
+                previous_generation: 0,
+                previous_fkek_key_id: fkek0,
+                rotation_grant_signed_container_hash: container_hash(&rotation1),
+            }),
+        },
+        root_generation: 0,
+    };
+    let request1 = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc9, create1.encode());
+    assert_eq!(server.call(&path, &access, Some(&request1)).await.0, 403);
+    let rotate = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::KeyRotate;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&rotate)).await.0, 201);
+    let (status, body) = server.call(&path, &access, Some(&request1)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // The rotation grant must be the one the generation names.
+    let grants1 = fleet_grants_path(1);
+    let wrong = fleet_grant_request(0xca, 1, fkek1, V::Rotation, 0xd8, &rotation_grant(0xd8, 2));
+    let (status, body) = server.call(&grants1, &access, Some(&wrong)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROTATION_GRANT_MISMATCH")
+    );
+    let right = fleet_grant_request(0xcb, 1, fkek1, V::Rotation, 0xd7, &rotation1);
+    let (status, body) = server.call(&grants1, &access, Some(&right)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_fleet_key_generations WHERE state = 'PREPARING'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE acked_at IS NULL",
+            1,
+        ),
+        ("SELECT count(*) FROM v2_fleet_recovery_grants", 1),
+        ("SELECT count(*) FROM v2_fleet_rotation_grants", 1),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_generation.create'",
+            2,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_grant.create'",
+            3,
+        ),
+        (
+            "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'FLEET_GRANT_CREATE'",
+            3,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+}
