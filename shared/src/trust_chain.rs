@@ -398,6 +398,10 @@ impl TrustChain {
                     && p.subject_device_id == g.subject_device_id
                     && p.subject_account_id == g.subject_account_id
                     && p.subject_hpke_key_id == g.recipient_hpke_key_id
+                    // Root custody spans the tenant: its TRK opens every
+                    // fleet's RecoveryGrant, so a fleet approval cannot carry
+                    // it (ADR 0002 rule 1).
+                    && approval_scope(p) == Scope::Tenant
             })
             .any(|a| self.approval_holds_at(a, g.common.issued_at_ms))
     }
@@ -844,6 +848,26 @@ mod tests {
         assert!(c.approval_valid_at(&d.key(), Scope::Fleet([5; 16]), t));
         assert!(!c.approval_valid_at(&d.key(), Scope::Fleet([6; 16]), t));
         assert!(!c.approval_valid_at(&d.key(), Scope::Tenant, t));
+    }
+
+    #[test]
+    fn a_root_grant_linked_to_a_fleet_approval_makes_no_custodian() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let mut evidence = tenant(&a0, &b);
+        // B's linked approval (replay 20) is for one fleet only.
+        let a = DeviceApprovalV2 {
+            common: common(20, T0 + DAY, T0 + 365 * DAY),
+            subject_account_id: [9; 16],
+            subject_device_id: b.id,
+            subject_signing_key_id: b.key(),
+            subject_hpke_key_id: [b.id[0]; 32],
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: [5; 16],
+        };
+        evidence[2] = build_record(&a0.sk, DOMAIN_DEVICE_APPROVAL, &a.encode());
+        let c = chain(page(&[&a0, &b], evidence)).unwrap();
+        assert!(c.approval_valid_at(&b.key(), Scope::Fleet([5; 16]), T0 + 3 * DAY));
+        assert!(!c.custodian_at(&b.key(), T0 + 50 * DAY));
     }
 
     #[test]
