@@ -57,7 +57,7 @@ fn integrity() -> AppError {
 
 /// The RFC 3339 form of `ms`, so a row's `*_at` and its response's `*_at_ms`
 /// are one instant.
-fn at(ms: i64) -> String {
+pub(super) fn at(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(now_rfc3339)
