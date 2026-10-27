@@ -11,11 +11,14 @@
 //! whether `server_now` is inside its window, are checked by the caller against
 //! live state (ADR 0002 D-2 issuer matrix).
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload as AeadPayload};
+use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::SigningKey;
 
 use zeroize::Zeroizing;
 
 use crate::canonical::{self as c, CborError, Value};
+use crate::fleet_grants::{fkek_key_id, FKEK_LEN};
 use crate::grants::{self, GrantError, GrantScope, TRK_LEN};
 use crate::keys::{root_key_id, signing_key_id};
 use crate::signing::{self, ED25519_SIG_LEN, SIGNATURE_SUITE_ID_ED25519, SIGNATURE_VERSION};
@@ -27,6 +30,11 @@ pub const PAYLOAD_VERSION: u16 = 2;
 pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.auth.device-approval.v2";
 pub const DOMAIN_TENANT_CAPABILITY_GRANT: &str = "shardx.auth.tenant-capability-grant.v2";
 pub const DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE: &str = "shardx.keys.fleet-key-grant.device-hpke.v2";
+pub const DOMAIN_FLEET_KEY_GRANT_RECOVERY: &str = "shardx.keys.fleet-key-grant.recovery.v2";
+pub const DOMAIN_FLEET_KEY_GRANT_ROTATION: &str = "shardx.keys.fleet-key-grant.rotation.v2";
+/// Domain of the closed AEAD context of a `RecoveryGrant` (ADR 0002 D-5).
+pub const DOMAIN_FLEET_RECOVERY_WRAP_CONTEXT: &str =
+    "shardx.keys.fleet-key-grant.recovery.wrap-context.v2";
 pub const DOMAIN_TENANT_ROOT_KEY_GRANT: &str = "shardx.keys.tenant-root-key-grant.v2";
 /// Domain of the closed HPKE `info` map of a `DeviceHpkeGrant` (ADR 0002 D-8).
 pub const DOMAIN_FLEET_KEY_GRANT_HPKE_INFO: &str =
@@ -259,13 +267,13 @@ impl Fields {
 
 /// The payload kinds this build can parse. Any other `payload_domain` is
 /// `SCHEMA_UNSUPPORTED`: the record may be valid, but not for this build.
-/// Fleet recovery and rotation grants are not here yet (W4); an endpoint that
-/// accepts them must add their parsers before it calls this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
     DeviceApproval(DeviceApprovalV2),
     TenantCapabilityGrant(TenantCapabilityGrantV2),
     DeviceHpkeGrant(DeviceHpkeGrantV2),
+    RecoveryGrant(RecoveryGrantV2),
+    RotationGrant(RotationGrantV2),
     TenantRootKeyGrant(TenantRootKeyGrantV2),
 }
 
@@ -278,6 +286,12 @@ impl Payload {
             }
             DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE => {
                 DeviceHpkeGrantV2::parse(bytes).map(Self::DeviceHpkeGrant)
+            }
+            DOMAIN_FLEET_KEY_GRANT_RECOVERY => {
+                RecoveryGrantV2::parse(bytes).map(Self::RecoveryGrant)
+            }
+            DOMAIN_FLEET_KEY_GRANT_ROTATION => {
+                RotationGrantV2::parse(bytes).map(Self::RotationGrant)
             }
             DOMAIN_TENANT_ROOT_KEY_GRANT => {
                 TenantRootKeyGrantV2::parse(bytes).map(Self::TenantRootKeyGrant)
@@ -1036,6 +1050,308 @@ impl DeviceHpkeGrantV2 {
     }
 }
 
+// ---------------------------------------------- FleetKeyGrantV2::Recovery ---
+
+/// `root_wrap_suite_id = 1`: ChaCha20-Poly1305 keyed by the TRK, a random
+/// 12-byte nonce, and the exact wrap context as AAD (ADR 0002 D-5).
+pub const ROOT_WRAP_SUITE_ID_CHACHA: u16 = 1;
+const ROOT_WRAP_NONCE_LEN: usize = 12;
+/// A 32-byte FKEK plus its 16-byte tag.
+const ROOT_WRAP_WRAPPED_FKEK_LEN: usize = 48;
+const GRANT_VARIANT_RECOVERY: &str = "RecoveryGrant";
+
+/// Plan 5.6.1 `FleetKeyGrantV2::RecoveryGrant`: the FKEK of one fleet
+/// generation wrapped under the TRK of root generation
+/// `recipient_root_generation`, suite 1 only (D-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryGrantV2 {
+    pub common: CommonFields,
+    pub fleet_id: [u8; 16],
+    pub fkek_key_id: [u8; 32],
+    pub generation: u64,
+    pub recipient_root_key_id: [u8; 32],
+    pub recipient_root_generation: u64,
+    pub root_wrap_nonce_bytes: [u8; ROOT_WRAP_NONCE_LEN],
+    pub wrapped_fleet_key_bytes: [u8; ROOT_WRAP_WRAPPED_FKEK_LEN],
+}
+
+impl RecoveryGrantV2 {
+    /// Exact `FleetRecoveryWrapContextV2` bytes (D-5). As with the HPKE info of
+    /// a device grant, parsing refuses a payload whose stored bytes differ.
+    pub fn root_wrap_context_bytes(&self) -> Vec<u8> {
+        let k = &self.common;
+        c::encode(&c::m(vec![
+            ("domain", c::t(DOMAIN_FLEET_RECOVERY_WRAP_CONTEXT)),
+            ("version", c::u(PAYLOAD_VERSION.into())),
+            ("replay_id", c::b(&k.replay_id)),
+            ("tenant_id", c::b(&k.tenant_id)),
+            ("server_instance_id", c::b(&k.server_instance_id)),
+            ("restore_epoch", c::u(k.restore_epoch)),
+            ("fleet_id", c::b(&self.fleet_id)),
+            ("fkek_key_id", c::b(&self.fkek_key_id)),
+            ("generation", c::u(self.generation)),
+            ("recipient_root_key_id", c::b(&self.recipient_root_key_id)),
+            (
+                "recipient_root_generation",
+                c::u(self.recipient_root_generation),
+            ),
+            ("root_wrap_suite_id", c::u(ROOT_WRAP_SUITE_ID_CHACHA.into())),
+            (
+                "grant_capability",
+                c::t(Capability::FleetKeyRecover.as_str()),
+            ),
+        ]))
+    }
+
+    /// Wraps `fkek` under `trk` with a fresh nonce. Refuses keys that do not
+    /// hash to the key IDs this grant names, so a sealed grant never lies.
+    pub fn seal(
+        &mut self,
+        trk: &[u8; TRK_LEN],
+        fkek: &[u8; FKEK_LEN],
+    ) -> std::result::Result<(), GrantError> {
+        if root_key_id(trk) != self.recipient_root_key_id {
+            return Err(GrantError::FieldMismatch("recipient_root_key_id"));
+        }
+        if fkek_key_id(fkek) != self.fkek_key_id {
+            return Err(GrantError::FieldMismatch("fkek_key_id"));
+        }
+        let mut nonce = [0u8; ROOT_WRAP_NONCE_LEN];
+        getrandom04::fill(&mut nonce).expect("OS entropy source unavailable");
+        self.root_wrap_nonce_bytes = nonce;
+        self.wrapped_fleet_key_bytes =
+            root_wrap(trk, &nonce, &self.root_wrap_context_bytes(), fkek)?;
+        Ok(())
+    }
+
+    /// Unwraps the FKEK and checks it hashes to `fkek_key_id` (D-5). The
+    /// plaintext is `Zeroizing`, so a refused key is wiped on drop.
+    pub fn open_fkek(
+        &self,
+        trk: &[u8; TRK_LEN],
+    ) -> std::result::Result<Zeroizing<[u8; FKEK_LEN]>, GrantError> {
+        if root_key_id(trk) != self.recipient_root_key_id {
+            return Err(GrantError::FieldMismatch("recipient_root_key_id"));
+        }
+        let plain = Zeroizing::new(
+            ChaCha20Poly1305::new(trk.into())
+                .decrypt(
+                    &self.root_wrap_nonce_bytes.into(),
+                    AeadPayload {
+                        msg: &self.wrapped_fleet_key_bytes,
+                        aad: &self.root_wrap_context_bytes(),
+                    },
+                )
+                .map_err(|_| GrantError::AeadFailure)?,
+        );
+        let fkek: Zeroizing<[u8; FKEK_LEN]> = Zeroizing::new(
+            plain
+                .as_slice()
+                .try_into()
+                .map_err(|_| GrantError::BadFkekLength)?,
+        );
+        if fkek_key_id(&fkek) != self.fkek_key_id {
+            return Err(GrantError::FieldMismatch("fkek_key_id"));
+        }
+        Ok(fkek)
+    }
+
+    fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("RecoveryGrant", payload)?;
+        let common = CommonFields::take(&mut f, DOMAIN_FLEET_KEY_GRANT_RECOVERY)?;
+        f.exact_text("grant_variant", GRANT_VARIANT_RECOVERY)?;
+        let fleet_id = f.fixed("fleet_id")?;
+        let fkek_key_id = f.fixed("fkek_key_id")?;
+        let generation = f.uint("generation")?;
+        f.exact_text("grant_capability", Capability::FleetKeyRecover.as_str())?;
+        let recipient_root_key_id = f.fixed("recipient_root_key_id")?;
+        let recipient_root_generation = f.uint("recipient_root_generation")?;
+        let root_wrap_suite_id = f.u16("root_wrap_suite_id")?;
+        let nonce = f.bytes("root_wrap_nonce_bytes", 1, 64)?;
+        let context = f.bytes("root_wrap_context_bytes", 1, 1024)?;
+        let wrapped = f.bytes("wrapped_fleet_key_bytes", 1, 4096)?;
+        f.finish()?;
+
+        if root_wrap_suite_id != ROOT_WRAP_SUITE_ID_CHACHA {
+            return Err(RecordError::Unsupported {
+                field: "root_wrap_suite_id",
+                id: root_wrap_suite_id.into(),
+            });
+        }
+        let bad = |field| RecordError::BadField {
+            map: "RecoveryGrant",
+            field,
+        };
+        let grant = Self {
+            common,
+            fleet_id,
+            fkek_key_id,
+            generation,
+            recipient_root_key_id,
+            recipient_root_generation,
+            root_wrap_nonce_bytes: nonce.try_into().map_err(|_| bad("root_wrap_nonce_bytes"))?,
+            wrapped_fleet_key_bytes: wrapped
+                .try_into()
+                .map_err(|_| bad("wrapped_fleet_key_bytes"))?,
+        };
+        if context != grant.root_wrap_context_bytes() {
+            return Err(RecordError::BadValue("root_wrap_context_bytes"));
+        }
+        Ok(grant)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.common.put(DOMAIN_FLEET_KEY_GRANT_RECOVERY, &mut out);
+        out.extend([
+            ("grant_variant", c::t(GRANT_VARIANT_RECOVERY)),
+            ("fleet_id", c::b(&self.fleet_id)),
+            ("fkek_key_id", c::b(&self.fkek_key_id)),
+            ("generation", c::u(self.generation)),
+            (
+                "grant_capability",
+                c::t(Capability::FleetKeyRecover.as_str()),
+            ),
+            ("recipient_root_key_id", c::b(&self.recipient_root_key_id)),
+            (
+                "recipient_root_generation",
+                c::u(self.recipient_root_generation),
+            ),
+            ("root_wrap_suite_id", c::u(ROOT_WRAP_SUITE_ID_CHACHA.into())),
+            ("root_wrap_nonce_bytes", c::b(&self.root_wrap_nonce_bytes)),
+            (
+                "root_wrap_context_bytes",
+                c::b(&self.root_wrap_context_bytes()),
+            ),
+            (
+                "wrapped_fleet_key_bytes",
+                c::b(&self.wrapped_fleet_key_bytes),
+            ),
+        ]);
+        c::encode(&c::m(out))
+    }
+}
+
+fn root_wrap(
+    trk: &[u8; TRK_LEN],
+    nonce: &[u8; ROOT_WRAP_NONCE_LEN],
+    context: &[u8],
+    fkek: &[u8; FKEK_LEN],
+) -> std::result::Result<[u8; ROOT_WRAP_WRAPPED_FKEK_LEN], GrantError> {
+    let sealed = ChaCha20Poly1305::new(trk.into())
+        .encrypt(
+            nonce.into(),
+            AeadPayload {
+                msg: fkek,
+                aad: context,
+            },
+        )
+        .map_err(|_| GrantError::AeadFailure)?;
+    sealed.try_into().map_err(|_| GrantError::AeadFailure)
+}
+
+// ---------------------------------------------- FleetKeyGrantV2::Rotation ---
+
+const GRANT_VARIANT_ROTATION: &str = "RotationGrant";
+/// D-4 and Q-4: a required set has `1..=65535` members on the wire.
+const MAX_REQUIRED_GRANT_COUNT: u64 = 65535;
+
+/// Plan 5.6.1 `FleetKeyGrantV2::RotationGrant`. The common `fkek_key_id` and
+/// `generation` name the target generation; the previous pair names the one it
+/// replaces. The set hash and the recovery grant hash bind the exact grants an
+/// activation must find (D-4); checking them against stored rows is the caller's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationGrantV2 {
+    pub common: CommonFields,
+    pub fleet_id: [u8; 16],
+    pub fkek_key_id: [u8; 32],
+    pub generation: u64,
+    pub previous_fkek_key_id: [u8; 32],
+    pub previous_generation: u64,
+    pub required_device_grant_count: u32,
+    pub required_device_grant_set_hash: [u8; 32],
+    pub recovery_grant_signed_container_hash: [u8; 32],
+    pub activation_not_before_ms: u64,
+}
+
+impl RotationGrantV2 {
+    fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("RotationGrant", payload)?;
+        let common = CommonFields::take(&mut f, DOMAIN_FLEET_KEY_GRANT_ROTATION)?;
+        f.exact_text("grant_variant", GRANT_VARIANT_ROTATION)?;
+        let fleet_id = f.fixed("fleet_id")?;
+        let fkek_key_id = f.fixed("fkek_key_id")?;
+        let generation = f.uint("generation")?;
+        f.exact_text("grant_capability", Capability::KeyRotate.as_str())?;
+        let previous_fkek_key_id = f.fixed("previous_fkek_key_id")?;
+        let previous_generation = f.uint("previous_generation")?;
+        let count = f.uint("required_device_grant_count")?;
+        let required_device_grant_count =
+            u32::try_from(count).map_err(|_| f.bad("required_device_grant_count"))?;
+        let required_device_grant_set_hash = f.fixed("required_device_grant_set_hash")?;
+        let recovery_grant_signed_container_hash =
+            f.fixed("recovery_grant_signed_container_hash")?;
+        let activation_not_before_ms = f.uint("activation_not_before_ms")?;
+        f.finish()?;
+
+        if previous_generation.checked_add(1) != Some(generation) {
+            return Err(RecordError::BadValue("generation"));
+        }
+        if fkek_key_id == previous_fkek_key_id {
+            return Err(RecordError::BadValue("fkek_key_id"));
+        }
+        if !(1..=MAX_REQUIRED_GRANT_COUNT).contains(&count) {
+            return Err(RecordError::BadValue("required_device_grant_count"));
+        }
+        if !(common.not_before_ms..common.not_after_ms).contains(&activation_not_before_ms) {
+            return Err(RecordError::BadValue("activation_not_before_ms"));
+        }
+        Ok(Self {
+            common,
+            fleet_id,
+            fkek_key_id,
+            generation,
+            previous_fkek_key_id,
+            previous_generation,
+            required_device_grant_count,
+            required_device_grant_set_hash,
+            recovery_grant_signed_container_hash,
+            activation_not_before_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.common.put(DOMAIN_FLEET_KEY_GRANT_ROTATION, &mut out);
+        out.extend([
+            ("grant_variant", c::t(GRANT_VARIANT_ROTATION)),
+            ("fleet_id", c::b(&self.fleet_id)),
+            ("fkek_key_id", c::b(&self.fkek_key_id)),
+            ("generation", c::u(self.generation)),
+            ("grant_capability", c::t(Capability::KeyRotate.as_str())),
+            ("previous_fkek_key_id", c::b(&self.previous_fkek_key_id)),
+            ("previous_generation", c::u(self.previous_generation)),
+            (
+                "required_device_grant_count",
+                c::u(self.required_device_grant_count.into()),
+            ),
+            (
+                "required_device_grant_set_hash",
+                c::b(&self.required_device_grant_set_hash),
+            ),
+            (
+                "recovery_grant_signed_container_hash",
+                c::b(&self.recovery_grant_signed_container_hash),
+            ),
+            (
+                "activation_not_before_ms",
+                c::u(self.activation_not_before_ms),
+            ),
+        ]);
+        c::encode(&c::m(out))
+    }
+}
+
 // ------------------------------------------------- TenantRootKeyGrantV2 ---
 
 /// Which root grant this is (plan 5.6.4). The previous-root pair exists only on
@@ -1373,6 +1689,34 @@ mod tests {
         }
     }
 
+    fn recovery_grant() -> RecoveryGrantV2 {
+        RecoveryGrantV2 {
+            common: common(),
+            fleet_id: fx("fleet-1"),
+            fkek_key_id: fx("fkek-1"),
+            generation: 3,
+            recipient_root_key_id: fx("root-key-1"),
+            recipient_root_generation: 2,
+            root_wrap_nonce_bytes: fx("root-wrap-nonce"),
+            wrapped_fleet_key_bytes: fx("root-wrapped-fkek"),
+        }
+    }
+
+    fn rotation_grant() -> RotationGrantV2 {
+        RotationGrantV2 {
+            common: common(),
+            fleet_id: fx("fleet-1"),
+            fkek_key_id: fx("fkek-1"),
+            generation: 3,
+            previous_fkek_key_id: fx("fkek-0"),
+            previous_generation: 2,
+            required_device_grant_count: 2,
+            required_device_grant_set_hash: fx("device-grant-set"),
+            recovery_grant_signed_container_hash: fx("recovery-grant"),
+            activation_not_before_ms: 1_700_000_300_000,
+        }
+    }
+
     /// The subject signs its own grant, which a first self-grant requires.
     fn root_grant(variant: RootGrantVariant, root_generation: u64) -> TenantRootKeyGrantV2 {
         TenantRootKeyGrantV2 {
@@ -1466,6 +1810,18 @@ mod tests {
                 "4a9150a067d5951fbaf6bb672d38c0b0271b5005daa87593cb4b34d5135fbc42",
             ),
             (
+                DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+                recovery_grant().encode(),
+                "b56bf03af50a7c5918681001896cd52e661337f1e1d2c66cedc078f8ecbf4b80",
+                "73f67cd320747df9c490a2a797be805897a9b74bfc916be58dcf60dbfab13e94",
+            ),
+            (
+                DOMAIN_FLEET_KEY_GRANT_ROTATION,
+                rotation_grant().encode(),
+                "f97f4939add237ed907d2371b83c9c72c81c98f6dfbd1637180a275714cddff9",
+                "3f61b5444dd347870b8efbdd55d4dc183046fed1c56171c9eb97b3b8ff0a85ca",
+            ),
+            (
                 DOMAIN_TENANT_ROOT_KEY_GRANT,
                 root_grant(RootGrantVariant::FirstRootSelfGrant, 0).encode(),
                 "bf221871b815b09dc45a849639431b139009a3dddf1a2ba9c8e4242b5ee42627",
@@ -1498,6 +1854,13 @@ mod tests {
         assert_eq!(
             hex(&c::sha256(&info)),
             "2a4877e5df7b46a2c00c6809e334f58cdffdeefe063b36d78c7611c593f8e518"
+        );
+        // D-5 wrap context, pinned the same way.
+        let ctx = recovery_grant().root_wrap_context_bytes();
+        assert_eq!(ctx.len(), 399);
+        assert_eq!(
+            hex(&c::sha256(&ctx)),
+            "6b7d2dfe351d2b078875dcb142be28e627c6d290120884b53fc60d3dca2945d1"
         );
         let info = root_grant(RootGrantVariant::FirstRootSelfGrant, 0).hpke_info_bytes();
         assert_eq!(info.len(), 460);
@@ -1962,6 +2325,190 @@ mod tests {
         assert_eq!(
             DeviceHpkeGrantV2::parse(&same_keys.encode()),
             Err(RecordError::BadValue("recipient_hpke_key_id"))
+        );
+    }
+
+    // ------------------------------------------ fleet recovery and rotation ---
+
+    #[test]
+    fn recovery_and_rotation_grants_roundtrip_inside_a_record() {
+        let g = recovery_grant();
+        let verified = sign_and_verify(DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode()).unwrap();
+        assert_eq!(verified.payload(), &Payload::RecoveryGrant(g));
+
+        let g = rotation_grant();
+        let verified = sign_and_verify(DOMAIN_FLEET_KEY_GRANT_ROTATION, &g.encode()).unwrap();
+        assert_eq!(verified.payload(), &Payload::RotationGrant(g));
+
+        // A variant signed under another variant's domain is refused.
+        assert_eq!(
+            code_of(sign_and_verify(
+                DOMAIN_FLEET_KEY_GRANT_ROTATION,
+                &recovery_grant().encode()
+            )),
+            "NON_CANONICAL_RECORD"
+        );
+    }
+
+    #[test]
+    fn recovery_grant_binds_context_suite_and_lengths() {
+        let raw = recovery_grant().encode();
+        let edited =
+            |key: &str, v: Value| RecoveryGrantV2::parse(&edit_map(&raw, |e| set(e, key, v)));
+
+        let other_ctx = RecoveryGrantV2 {
+            recipient_root_generation: 3,
+            ..recovery_grant()
+        }
+        .root_wrap_context_bytes();
+        assert_eq!(
+            edited("root_wrap_context_bytes", c::b(&other_ctx)),
+            Err(RecordError::BadValue("root_wrap_context_bytes"))
+        );
+        assert_eq!(
+            code_of(edited("root_wrap_suite_id", c::u(2))),
+            "SCHEMA_UNSUPPORTED"
+        );
+        assert_eq!(
+            code_of(edited("root_wrap_nonce_bytes", c::b(&[1u8; 24]))),
+            "NON_CANONICAL_RECORD"
+        );
+        assert_eq!(
+            code_of(edited("wrapped_fleet_key_bytes", c::b(&[1u8; 47]))),
+            "NON_CANONICAL_RECORD"
+        );
+        assert_eq!(
+            edited("grant_capability", c::t("fleet.key.receive")),
+            Err(RecordError::BadValue("grant_capability"))
+        );
+        assert_eq!(
+            edited("grant_variant", c::t("DeviceHpkeGrant")),
+            Err(RecordError::BadValue("grant_variant"))
+        );
+        // Plan L495: no device or HPKE fields.
+        assert!(matches!(
+            edited("recipient_hpke_key_id", c::b(&[1u8; 32])),
+            Err(RecordError::UnknownField { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_grant_opens_only_under_its_root_and_to_its_fkek() {
+        let trk = fx::<32>("tenant-root-key");
+        let fkek = fx::<32>("fleet-key");
+        let named = || RecoveryGrantV2 {
+            recipient_root_key_id: root_key_id(&trk),
+            fkek_key_id: fkek_key_id(&fkek),
+            ..recovery_grant()
+        };
+        let mut g = named();
+        g.seal(&trk, &fkek).unwrap();
+        let g = RecoveryGrantV2::parse(&g.encode()).unwrap();
+        assert_eq!(*g.open_fkek(&trk).unwrap(), fkek);
+
+        // seal refuses keys the grant does not name.
+        assert_eq!(
+            named().seal(&fx("other-root"), &fkek),
+            Err(GrantError::FieldMismatch("recipient_root_key_id"))
+        );
+        assert_eq!(
+            named().seal(&trk, &fx("other-fkek")),
+            Err(GrantError::FieldMismatch("fkek_key_id"))
+        );
+        // Another TRK is refused before any unwrap.
+        assert_eq!(
+            g.open_fkek(&fx("other-root")),
+            Err(GrantError::FieldMismatch("recipient_root_key_id"))
+        );
+        // A grant whose signed fields moved no longer unwraps.
+        let moved = RecoveryGrantV2 {
+            generation: 4,
+            ..g.clone()
+        };
+        assert_eq!(moved.open_fkek(&trk), Err(GrantError::AeadFailure));
+        // Wrapped honestly under its own context, but around another FKEK:
+        // refused after unwrap.
+        let mut lying = named();
+        lying.wrapped_fleet_key_bytes = root_wrap(
+            &trk,
+            &lying.root_wrap_nonce_bytes,
+            &lying.root_wrap_context_bytes(),
+            &fx("other-fkek"),
+        )
+        .unwrap();
+        assert_eq!(
+            lying.open_fkek(&trk),
+            Err(GrantError::FieldMismatch("fkek_key_id"))
+        );
+    }
+
+    #[test]
+    fn rotation_grant_follows_its_generation_window_and_count_rules() {
+        let parse = |g: RotationGrantV2| RotationGrantV2::parse(&g.encode());
+        let base = rotation_grant();
+
+        assert_eq!(
+            parse(RotationGrantV2 {
+                generation: 4,
+                ..base.clone()
+            }),
+            Err(RecordError::BadValue("generation"))
+        );
+        assert_eq!(
+            parse(RotationGrantV2 {
+                previous_fkek_key_id: base.fkek_key_id,
+                ..base.clone()
+            }),
+            Err(RecordError::BadValue("fkek_key_id"))
+        );
+        for count in [0, 65536] {
+            assert_eq!(
+                parse(RotationGrantV2 {
+                    required_device_grant_count: count,
+                    ..base.clone()
+                }),
+                Err(RecordError::BadValue("required_device_grant_count"))
+            );
+        }
+        assert!(parse(RotationGrantV2 {
+            required_device_grant_count: 65535,
+            ..base.clone()
+        })
+        .is_ok());
+        let raw = base.encode();
+        assert_eq!(
+            code_of(RotationGrantV2::parse(&edit_map(&raw, |e| set(
+                e,
+                "required_device_grant_count",
+                c::u(1 << 32)
+            )))),
+            "NON_CANONICAL_RECORD"
+        );
+        // activation_not_before_ms is inside [not_before_ms, not_after_ms).
+        let k = &base.common;
+        for (at, ok) in [
+            (k.not_before_ms - 1, false),
+            (k.not_before_ms, true),
+            (k.not_after_ms - 1, true),
+            (k.not_after_ms, false),
+        ] {
+            let r = parse(RotationGrantV2 {
+                activation_not_before_ms: at,
+                ..base.clone()
+            });
+            if ok {
+                assert!(r.is_ok(), "{at}");
+            } else {
+                assert_eq!(r, Err(RecordError::BadValue("activation_not_before_ms")));
+            }
+        }
+        assert_eq!(
+            RotationGrantV2::parse(&edit_map(&raw, |e| set(
+                e,
+                "grant_capability",
+                c::t("fleet.manage")
+            ))),
+            Err(RecordError::BadValue("grant_capability"))
         );
     }
 

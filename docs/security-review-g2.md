@@ -44,6 +44,7 @@ ID, never a new meaning for an old one.
 | `envelope_suite_id` | 1 | STREAM over ChaCha20-Poly1305 | `keys::ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM` |
 | `envelope_suite_id` | 2 | XChaCha20-Poly1305 under STREAM LE31, in a `SHARDXBK` object | `keys::ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31` |
 | `wrap_suite_id` | 1 | DEK wrap under the FKEK with ChaCha20-Poly1305 | `keys::WRAP_SUITE_ID_CHACHA20POLY1305` |
+| `root_wrap_suite_id` | 1 | FKEK wrap under the TRK in a fleet `RecoveryGrant`, ChaCha20-Poly1305 (ADR 0002 D-5) | `authz_record::ROOT_WRAP_SUITE_ID_CHACHA` |
 | `archive_format_id` | 1 | tar, GNU and ustar headers | `keys::ARCHIVE_FORMAT_ID_TAR` |
 | `archive_policy_id` | 1 | profile snapshot policy: relative paths only, no links or devices, one entry per path on the target filesystem | `keys::ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT` |
 | `compression_id` | 1 | gzip (RFC 1952) | `keys::COMPRESSION_ID_GZIP` |
@@ -55,7 +56,7 @@ ID, never a new meaning for an old one.
 | Value | Bytes | Why |
 | --- | --- | --- |
 | DEK, FKEK, TRK | 32 | ChaCha20-Poly1305 key size. |
-| `wrap_nonce_bytes` | 12 | The AEAD's nonce, inside the plan's bound of 1 to 64. |
+| `wrap_nonce_bytes`, `root_wrap_nonce_bytes` | 12 | The AEAD's nonce, inside the plan's bound of 1 to 64. |
 | `stream_nonce_prefix` | 7 | Suite 1: leaves 5 bytes of the 12-byte nonce for a 4-byte frame counter and the final flag. |
 | `stream_nonce_prefix` | 20 | Suite 2: leaves 4 bytes of the 24-byte nonce for `u32le(position \| last << 31)` (ADR 0003). |
 | `PreambleV2` | 64 | Fixed `SHARDXBK` preamble; its hash is `preamble_sha256` under `SHARDX-ENVELOPE-PREAMBLE-V2`. |
@@ -79,6 +80,8 @@ published, so the test cannot see them; each has its own golden vector:
 - `shardx.local.fallback-key-file-plaintext.v2` (`fallback_key_file.rs`)
 - `shardx.recovery.bundle-plaintext.v2`, `shardx.recovery.readiness-probe.v2`
   (`recovery_bundle.rs`)
+- `SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2`, `SHARDX-FLEET-DEVICE-GRANT-SET-V2`
+  (`mutation.rs`, ADR 0002 D-4)
 - `shardx.authorization.fleet-key-grant.v2` (server, legacy v2 fleet grants)
 
 ## Open items

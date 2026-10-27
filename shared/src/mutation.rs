@@ -39,18 +39,29 @@ pub const MAX_EMBEDDED_GRANT_BYTES: usize = 131072;
 const OUTCOME_SUCCEEDED: &str = "succeeded";
 const GENERATION_STATE_PREPARING: &str = "PREPARING";
 const L_ROOT_CUSTODIAN_SET: &str = "SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2\0";
+const L_FLEET_DEVICE_SET: &str = "SHARDX-FLEET-DEVICE-GRANT-SET-V2\0";
 
 /// ADR 0002 D-4 `required_custodian_grant_set_hash`: the members' internal
 /// `signed_container_hash` values, sorted ascending, concatenated and domain
 /// hashed. `None` for an empty set or a repeated member, which D-4 forbids.
 pub fn root_custodian_grant_set_hash(members: &[[u8; 32]]) -> Option<[u8; 32]> {
+    grant_set_hash(L_ROOT_CUSTODIAN_SET, members)
+}
+
+/// ADR 0002 D-4 `required_device_grant_set_hash`, built like the root set over
+/// the required `DeviceHpkeGrant`s, under its own label.
+pub fn fleet_device_grant_set_hash(members: &[[u8; 32]]) -> Option<[u8; 32]> {
+    grant_set_hash(L_FLEET_DEVICE_SET, members)
+}
+
+fn grant_set_hash(label: &str, members: &[[u8; 32]]) -> Option<[u8; 32]> {
     let mut sorted = members.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     if sorted.is_empty() || sorted.len() != members.len() {
         return None;
     }
-    Some(c::domain_hash(L_ROOT_CUSTODIAN_SET, &sorted.concat()))
+    Some(c::domain_hash(label, &sorted.concat()))
 }
 
 /// The closed `operation_kind` enum of plan L913 with the six D-9 kinds, and
@@ -1378,6 +1389,31 @@ mod tests {
         );
         assert_eq!(root_custodian_grant_set_hash(&[]), None);
         assert_eq!(root_custodian_grant_set_hash(&[a, a]), None);
+    }
+
+    /// D-4 vectors n = 1, 2, 3, and the label keeps the two sets apart.
+    #[test]
+    fn the_fleet_device_set_hash_has_its_own_label() {
+        let m: Vec<[u8; 32]> = ["grant-a", "grant-b", "grant-c"].map(fx).to_vec();
+        for n in 1..=3 {
+            let mut sorted = m[..n].to_vec();
+            sorted.sort_unstable();
+            let mut pre = L_FLEET_DEVICE_SET.as_bytes().to_vec();
+            pre.extend((32 * n as u32).to_be_bytes());
+            pre.extend(sorted.concat());
+            let mut reversed = m[..n].to_vec();
+            reversed.reverse();
+            assert_eq!(
+                fleet_device_grant_set_hash(&reversed),
+                Some(c::sha256(&pre))
+            );
+            assert_ne!(
+                fleet_device_grant_set_hash(&m[..n]),
+                root_custodian_grant_set_hash(&m[..n])
+            );
+        }
+        assert_eq!(fleet_device_grant_set_hash(&[]), None);
+        assert_eq!(fleet_device_grant_set_hash(&[m[0], m[1], m[0]]), None);
     }
 
     #[test]
