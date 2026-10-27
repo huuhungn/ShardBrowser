@@ -53,6 +53,12 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 |---|---|---|
 | **Q-21 Recovery passphrase bytes** (D-5) | **The exact UTF-8 bytes as entered, with no Unicode normalization.** The KDF of the recovery bundle and of the fallback key file takes the passphrase as typed. Rejected: NFC before the KDF, which needs a normalization library on every client and changes nothing for keyboard input, which is NFC on every supported OS. Cost: a passphrase pasted in another normalization form derives another key; the export UI asks for the passphrase twice, so the user types it in the form they will type again | L1386, L2448 |
 
+### Decided on 2026-10-27 (choice delegated by the user)
+
+| Choice | Decision | Plan lines |
+|---|---|---|
+| **Q-22 Approval scope of a root custodian** (trust chain, rule 1) | **Tenant scope only.** An `ExistingRootGrant` or `RotationGrant` counts toward custody only when its linked approval has `approval_scope_kind = tenant`. A fleet-scoped approval admits a device to that fleet and never carries root custody: the TRK opens every fleet's `RecoveryGrant`, and custodians issue tenant-wide grants. The base `g0` is unaffected, because D1 approvals are tenant-scoped (ADR 0001). The server applies the same rule when it files a root grant other than the S6 self-grant. **Cost:** an admin approves a device at tenant scope before appointing it custodian. Rejected: any scope, the reading rule 3 alone gave | none (narrows rule 1 of this ADR) |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
@@ -1419,7 +1425,7 @@ A container is **usable** if all of the following hold:
    - **Base.** The `FirstRootSelfGrant` `g0`, whose issuer and subject are both `A0`, together with its linked approval (`subject_device_approval_replay_id`). That approval must be `A0`'s D1 self-issued `DeviceApprovalV2`.
    - **Step.** An `ExistingRootGrant` or `RotationGrant` `r` adds its window to `Cust(subject)` when both hold:
      - the issuer `X` has a window in `Cust(X)` containing `r.issued_at_ms`;
-     - `r`'s linked approval is valid at `r.issued_at_ms` (rule 3).
+     - `r`'s linked approval is valid at `r.issued_at_ms` (rule 3) and is tenant-scoped (Q-22).
    - **Clipping.** Every window of `K` is clipped at `first_not_before(K) + MAX_CUSTODIAN_KEY_AGE` (D-6 (c)).
    - **Sticky lapse.** An extension of a ledger key with an observed lapse counts only under D-6 (b).
    - **Sticky proven revocation (critic r7 M23).** Once the client counts a `DeviceRevocationV2` of device `D` (rule 6), `D`'s signing key leaves `Cust` for every check about a container the client first sees afterwards: the issuer condition of the step above, rules 2-4, and the first-sight custodian check of rule 6. A backdated self-renewal therefore cannot restore it. For containers first seen before the count, `D`'s windows still count as before, so earlier-verified approvals and grants that `D` issued keep their standing. A refused renewal of `D` first seen afterwards still raises `custodian.renewed_after_revocation` (D-6 (a)).
