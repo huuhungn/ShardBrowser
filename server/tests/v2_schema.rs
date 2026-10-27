@@ -513,3 +513,95 @@ async fn only_offline_operator_audit_rows_may_omit_the_actor() {
         assert_eq!(err_code(err), SQLITE_CONSTRAINT_CHECK, "row {n}");
     }
 }
+
+/// 0021: a fleet generation keeps its D-9 terms, carries all of them or none,
+/// and only moves forward (ADR 0002 D-9).
+#[tokio::test]
+async fn a_fleet_generation_keeps_its_terms_and_moves_forward() {
+    const TRIGGER: &str = "1811";
+    // The generation's foreign keys are not what this test is about.
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .foreign_keys(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+    let insert = |generation: i64, fkek: u8, terms: bool, previous: bool| {
+        sqlx::query(
+            "INSERT INTO v2_fleet_key_generations (
+                 server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                 root_generation, state, created_at, required_device_grant_count,
+                 required_grant_set_hash, recovery_grant_hash, previous_fkek_key_id,
+                 rotation_grant_hash)
+             VALUES (?, ?, ?, ?, ?, 0, 'PREPARING', 'now', ?, ?, ?, ?, ?)",
+        )
+        .bind(id(1))
+        .bind(id(2))
+        .bind(id(3))
+        .bind(generation)
+        .bind(key32(fkek))
+        .bind(terms.then_some(1_i64))
+        .bind(terms.then(|| key32(0x51)))
+        .bind(terms.then(|| key32(0x52)))
+        .bind(previous.then(|| key32(0x53)))
+        .bind(previous.then(|| key32(0x54)))
+        .execute(&pool)
+    };
+    // Generation 0 has no rotation pair, a rotation has one, and a legacy row
+    // has no terms at all.
+    for (generation, fkek, terms, previous) in [(0, 0x60, true, true), (1, 0x61, true, false)] {
+        let e = insert(generation, fkek, terms, previous).await.unwrap_err();
+        assert_eq!(err_code(e), TRIGGER, "generation {generation}");
+    }
+    insert(0, 0x62, true, false).await.unwrap();
+    insert(1, 0x63, true, true).await.unwrap();
+    insert(2, 0x64, false, false).await.unwrap();
+
+    let update = |set: &'static str| {
+        let statement = format!("UPDATE v2_fleet_key_generations SET {set} WHERE generation = 0");
+        let pool = pool.clone();
+        async move { sqlx::query(&statement).execute(&pool).await }
+    };
+    for set in [
+        "required_grant_set_hash = zeroblob(32)",
+        "recovery_grant_hash = zeroblob(32)",
+        "root_generation = 1",
+        "state = 'ACTIVE'",
+    ] {
+        assert_eq!(err_code(update(set).await.unwrap_err()), TRIGGER, "{set}");
+    }
+    update("state = 'ACTIVE', activated_at = 'now'")
+        .await
+        .unwrap();
+    for set in [
+        "state = 'PREPARING', activated_at = NULL",
+        "activated_at = 'later'",
+        "state = 'RETIRED'",
+    ] {
+        assert_eq!(err_code(update(set).await.unwrap_err()), TRIGGER, "{set}");
+    }
+    update("state = 'RETIRED', retired_at = 'now'")
+        .await
+        .unwrap();
+
+    // The grant-side guards are present; the routes' tests drive them.
+    for name in [
+        "v2_fleet_key_grants_not_for_d9_generations",
+        "v2_fleet_device_hpke_grants_window_is_bounded",
+        "v2_fleet_recovery_grants_window_is_bounded",
+        "v2_fleet_rotation_grants_window_is_bounded",
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{name}");
+    }
+}
