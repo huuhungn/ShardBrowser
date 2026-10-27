@@ -112,7 +112,10 @@ jobs:
         run: cargo test --manifest-path sdks/rust/Cargo.toml --all-features
 
   macos-check:
-    runs-on: macos-14
+    # The hosted arm64 pool repeatedly leaves this job unacquired ("capacity
+    # constraints"); the Intel image compiles the same cfg(target_os = "macos")
+    # code. The release build keeps arm64.
+    runs-on: macos-15-intel
     name: Rust compiles on macOS
     timeout-minutes: 30
 
