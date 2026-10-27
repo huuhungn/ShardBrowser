@@ -44,7 +44,7 @@ use crate::util::{now_ms, now_rfc3339};
 /// this is.
 pub const MAX_ROOT_REQUEST_BODY: usize = 262_144;
 /// ADR 0002 D-6: every root grant variant has the device approval's 730 days.
-const MAX_ROOT_GRANT_TTL_MS: u64 = MAX_DEVICE_APPROVAL_TTL_MS;
+pub(super) const MAX_ROOT_GRANT_TTL_MS: u64 = MAX_DEVICE_APPROVAL_TTL_MS;
 
 pub(super) fn record_error(e: RecordError) -> AppError {
     coded(StatusCode::UNPROCESSABLE_ENTITY, e.code(), &e.to_string())
@@ -625,7 +625,7 @@ pub(super) async fn row_holds(
 }
 
 /// Files the exact grant row: every column from the verified record.
-async fn insert_grant(
+pub(super) async fn insert_grant(
     conn: &mut SqliteConnection,
     g: &TenantRootKeyGrantV2,
     record: &AuthorizationRecord,
