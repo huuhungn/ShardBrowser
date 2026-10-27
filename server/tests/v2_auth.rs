@@ -4426,6 +4426,65 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
             &[&TENANT, &FLEET],
         )
         .await;
+    // An issuer that does not hold generation 0 hands it to nobody else (D-2).
+    let peer = device(&server, OWNER, 0x7d, "active").await;
+    approve_by_copy(&server, &dev, &peer, 0x7d).await;
+    let to_peer = DeviceHpkeGrantV2 {
+        common: fleet_common(0xdd, 30),
+        fleet_id: FLEET,
+        fkek_key_id: fkek0,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: peer.id,
+        subject_signing_key_id: peer.signing_key_id,
+        recipient_hpke_key_id: peer.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let to_peer = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &to_peer.encode(),
+    );
+    let request = fleet_grant_request(0xcf, 0, fkek0, V::DeviceHpke, 0xdd, &to_peer);
+    assert_eq!(server.call(&grants0, &access, Some(&request)).await.0, 403);
+    // The rotation issuer holds generation 0 (D-2): it acknowledges its grant.
+    let ack0 = lifecycle_request(
+        OperationKind::FleetGrantAck,
+        0xcc,
+        shared::fleet_lifecycle::FleetKeyGrantAckV2 {
+            grant: fleet_grant_ref(0, fkek0, V::DeviceHpke, 0xd0, &device0),
+        }
+        .encode(),
+    );
+    let ack0_path = format!("{path}/0/ack");
+    assert_eq!(server.call(&ack0_path, &access, Some(&ack0)).await.0, 201);
+    // A subject without a live approval gets no fleet key (D-2).
+    let unapproved = device(&server, OWNER, 0x7f, "active").await;
+    let to_unapproved = DeviceHpkeGrantV2 {
+        common: fleet_common(0xdb, 30),
+        fleet_id: FLEET,
+        fkek_key_id: fkek0,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: unapproved.id,
+        subject_signing_key_id: unapproved.signing_key_id,
+        recipient_hpke_key_id: unapproved.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let to_unapproved = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &to_unapproved.encode(),
+    );
+    let request = fleet_grant_request(0xcd, 0, fkek0, V::DeviceHpke, 0xdb, &to_unapproved);
+    let (status, body) = server.call(&grants0, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "SUBJECT_NOT_ELIGIBLE")
+    );
+
     let device1 = device_grant(0xd5, 1, fkek1, 365);
     let recovery1 = recovery_grant(0xd6, 1, fkek1);
     let set1 = fleet_device_grant_set_hash(&[container_hash(&device1)]).unwrap();
@@ -4481,6 +4540,23 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
     let right = fleet_grant_request(0xcb, 1, fkek1, V::Rotation, 0xd7, &rotation1);
     let (status, body) = server.call(&grants1, &access, Some(&right)).await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // An archived fleet takes no new device grant.
+    server
+        .sql(
+            "UPDATE v2_fleets SET status = 'archived' WHERE tenant_id = ? AND id = ?",
+            &[&TENANT, &FLEET],
+        )
+        .await;
+    let late = fleet_grant_request(
+        0xce,
+        1,
+        fkek1,
+        V::DeviceHpke,
+        0xdc,
+        &device_grant(0xdc, 1, fkek1, 30),
+    );
+    let (status, body) = server.call(&grants1, &access, Some(&late)).await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "FLEET_ARCHIVED"));
 
     for (query, want) in [
         (
@@ -4488,7 +4564,7 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
             1,
         ),
         (
-            "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE acked_at IS NULL",
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE acked_at IS NOT NULL",
             1,
         ),
         ("SELECT count(*) FROM v2_fleet_recovery_grants", 1),
@@ -4508,6 +4584,38 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
     ] {
         assert_eq!(server.count(query).await, want, "{query}");
     }
+}
+
+/// Gives `to` a live approval by copying `from`'s stored one with `to`'s keys.
+/// The copy's container no longer matches its columns; the fleet routes only
+/// ask whether a live approval of the subject's keys exists.
+async fn approve_by_copy(server: &Server, from: &Device, to: &Device, replay: u8) {
+    server
+        .sql(
+            "INSERT INTO v2_device_approvals (
+                 tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
+                 subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+                 approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                 not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                 canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
+                 signature_bytes, issuer_signing_key_id, signed_container_hash,
+                 exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
+             SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
+                    ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                    not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                    canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
+                    signature_bytes, issuer_signing_key_id, signed_container_hash,
+                    exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
+               FROM v2_device_approvals WHERE subject_device_id = ?",
+            &[
+                &[replay; 16],
+                &to.id,
+                &to.signing_key_id,
+                &to.hpke_key_id,
+                &from.id,
+            ],
+        )
+        .await;
 }
 
 fn fleet_grant_ref(
@@ -4661,8 +4769,16 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         (409, "FLEET_GRANTS_INCOMPLETE")
     );
     let device_ack = ack(0xb4, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
+    let (status, body) = server.call(&ack0, &access, Some(&device_ack)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // An exact retry gets the stored answer; a second ack is refused.
+    assert_eq!(
+        server.call(&ack0, &access, Some(&device_ack)).await,
+        (201, body)
+    );
     // Only the grant's subject acknowledges a device grant (D-9).
     let other = device(&server, OWNER, 0x7e, "active").await;
+    approve_by_copy(&server, &dev, &other, 0x7e).await;
     let to_other = DeviceHpkeGrantV2 {
         common: fleet_common(0xd9, 365),
         fleet_id: FLEET,
@@ -4683,13 +4799,6 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     file!(0xba, 0, fkek0, V::DeviceHpke, 0xd9, &to_other);
     let foreign_ack = ack(0xbb, 0, fkek0, V::DeviceHpke, 0xd9, &to_other);
     assert_eq!(server.call(&ack0, &access, Some(&foreign_ack)).await.0, 403);
-    let (status, body) = server.call(&ack0, &access, Some(&device_ack)).await;
-    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
-    // An exact retry gets the stored answer; a second ack is refused.
-    assert_eq!(
-        server.call(&ack0, &access, Some(&device_ack)).await,
-        (201, body)
-    );
     let again = ack(0xb5, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
     let (status, body) = server.call(&ack0, &access, Some(&again)).await;
     assert_eq!(
@@ -4797,6 +4906,30 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
     file!(0xc1, 1, fkek1, V::DeviceHpke, 0xd5, &device1);
     file!(0xc2, 1, fkek1, V::Recovery, 0xd6, &recovery1);
+    // Once its generation-0 grant is revoked the issuer no longer holds it,
+    // and files no rotation grant until it holds generation 0 again (D-2).
+    let drop0 = FleetGrantRevokeV2 {
+        revocation: FleetGrantRevocation {
+            generation: gen_ref(0, fkek0),
+            grant_variant: V::DeviceHpke,
+            replay_id: [0xd0; 16],
+            signed_container_hash: container_hash(&device0),
+            reason_code: FleetGrantRevokeReason::Superseded,
+        },
+    };
+    let request = lifecycle_request(OperationKind::FleetGrantRevoke, 0xe2, drop0.encode());
+    let drop_path = format!("{path}/0/grants/{}/revoke", hex(&[0xd0; 16]));
+    assert_eq!(
+        server.call(&drop_path, &access, Some(&request)).await.0,
+        201
+    );
+    let early = fleet_grant_request(0xe3, 1, fkek1, V::Rotation, 0xd7, &rotation1);
+    let grants1 = fleet_grants_path(1);
+    assert_eq!(server.call(&grants1, &access, Some(&early)).await.0, 403);
+    let renewed = device_grant(0xde, 0, fkek0);
+    file!(0xe4, 0, fkek0, V::DeviceHpke, 0xde, &renewed);
+    let request = ack(0xe5, 0, fkek0, V::DeviceHpke, 0xde, &renewed);
+    assert_eq!(server.call(&ack0, &access, Some(&request)).await.0, 201);
     file!(0xc3, 1, fkek1, V::Rotation, 0xd7, &rotation1);
     let ack1 = format!("{path}/1/ack");
     for (key, variant, replay, c) in [
@@ -4891,7 +5024,7 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         ),
         (
             "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE revoked_at IS NOT NULL",
-            2,
+            3,
         ),
         (
             "SELECT count(*) FROM v2_fleet_rotation_grants WHERE acked_at IS NOT NULL",
@@ -4899,7 +5032,7 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         ),
         (
             "SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_grant.ack'",
-            6,
+            7,
         ),
         (
             "SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_generation.activate'",
@@ -4907,7 +5040,7 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         ),
         (
             "SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_grant.revoke'",
-            2,
+            3,
         ),
     ] {
         assert_eq!(server.count(query).await, want, "{query}");

@@ -25,12 +25,13 @@ use shared::authz_record::{
     DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
 };
 use shared::fleet_lifecycle::{
-    FleetGrantRevokeV2, FleetGrantRevokedV2, FleetGrantTarget, FleetGrantVariant,
-    FleetKeyGenerationActivateV2, FleetKeyGenerationActivatedV2, FleetKeyGenerationCreateV2,
-    FleetKeyGenerationCreatedV2, FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2,
-    FleetKeyGrantCreatedV2, RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
-    RECORD_TYPE_FLEET_GENERATION_CREATED, RECORD_TYPE_FLEET_GRANT_ACKED,
-    RECORD_TYPE_FLEET_GRANT_CREATED, RECORD_TYPE_FLEET_GRANT_REVOKED,
+    FleetGenerationTerms, FleetGrantRevokeV2, FleetGrantRevokedV2, FleetGrantTarget,
+    FleetGrantVariant, FleetKeyGenerationActivateV2, FleetKeyGenerationActivatedV2,
+    FleetKeyGenerationCreateV2, FleetKeyGenerationCreatedV2, FleetKeyGrantAckV2,
+    FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
+    RECORD_TYPE_FLEET_GENERATION_ACTIVATED, RECORD_TYPE_FLEET_GENERATION_CREATED,
+    RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
+    RECORD_TYPE_FLEET_GRANT_REVOKED,
 };
 use shared::mutation::{fleet_device_grant_set_hash, IdempotentMutationRequestV2, OperationKind};
 
@@ -141,6 +142,21 @@ async fn active_root(
     Ok(Some((generation, blob::<32>(&row, "root_key_id")?)))
 }
 
+async fn fleet_is_active(
+    conn: &mut SqliteConnection,
+    tenant: &[u8; 16],
+    fleet: &[u8; 16],
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleets
+                         WHERE tenant_id = ? AND id = ? AND status = 'active')",
+    )
+    .bind(tenant.as_slice())
+    .bind(fleet.as_slice())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// A fleet generation row as D-9 reads it.
 struct GenerationRow {
     fkek_key_id: [u8; 32],
@@ -150,6 +166,53 @@ struct GenerationRow {
     recovery_grant_hash: Option<Vec<u8>>,
     previous_fkek_key_id: Option<Vec<u8>>,
     rotation_grant_hash: Option<Vec<u8>>,
+}
+
+impl GenerationRow {
+    /// The row was created with exactly `t`.
+    fn holds_terms(&self, t: &FleetGenerationTerms) -> bool {
+        let rotation = t.rotation.as_ref();
+        self.fkek_key_id == t.generation.fkek_key_id
+            && self.required_device_grant_count == Some(i64::from(t.required_device_grant_count))
+            && self.required_grant_set_hash.as_deref()
+                == Some(&t.required_device_grant_set_hash[..])
+            && self.recovery_grant_hash.as_deref()
+                == Some(&t.recovery_grant_signed_container_hash[..])
+            && self.previous_fkek_key_id.as_deref() == rotation.map(|r| &r.previous_fkek_key_id[..])
+            && self.rotation_grant_hash.as_deref()
+                == rotation.map(|r| &r.rotation_grant_signed_container_hash[..])
+    }
+}
+
+/// The session's device holds `generation` of `fleet`: an acknowledged, live
+/// device grant of it names the device under its current keys (D-2).
+async fn holds_generation(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    fleet: &[u8; 16],
+    generation: u64,
+    now: i64,
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleet_device_hpke_grants
+                         WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ?
+                           AND generation = ? AND subject_device_id = ?
+                           AND subject_signing_key_id = ? AND recipient_hpke_key_id = ?
+                           AND acked_at IS NOT NULL AND revoked_at IS NULL
+                           AND not_before_ms <= ? AND ? < not_after_ms)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(int(generation)?)
+    .bind(s.device_id.as_slice())
+    .bind(s.signing_key_id.as_slice())
+    .bind(s.hpke_key_id.as_slice())
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?)
 }
 
 async fn generation_row(
@@ -242,7 +305,7 @@ pub async fn create_fleet_generation(
             FleetKeyGenerationCreatedV2::parse(&payload).map_err(|_| response_mismatch())?;
         let still = generation_row(&mut tx, v, &s.tenant_id, &fleet, g.generation)
             .await?
-            .is_some_and(|r| r.fkek_key_id == g.fkek_key_id);
+            .is_some_and(|r| r.holds_terms(t));
         if created.create != create || !still {
             return Err(response_mismatch());
         }
@@ -258,15 +321,7 @@ pub async fn create_fleet_generation(
     if !holds_fleet_capability(&mut tx, v, &s, &fleet, capability, now).await? {
         return Err(AppError::Forbidden);
     }
-    let fleet_live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_fleets
-                         WHERE tenant_id = ? AND id = ? AND status = 'active')",
-    )
-    .bind(s.tenant_id.as_slice())
-    .bind(fleet.as_slice())
-    .fetch_one(&mut *tx)
-    .await?;
-    if !fleet_live {
+    if !fleet_is_active(&mut tx, &s.tenant_id, &fleet).await? {
         return Err(coded(
             StatusCode::NOT_FOUND,
             "RESOURCE_NOT_FOUND",
@@ -656,12 +711,14 @@ pub async fn file_fleet_grant(
         let filed: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS (SELECT 1 FROM {table}
                              WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?
-                               AND signed_container_hash = ?)"
+                               AND signed_container_hash = ?
+                               AND exact_signed_container_bytes_sha256 = ?)"
         ))
         .bind(v.server_instance_id.as_slice())
         .bind(s.tenant_id.as_slice())
         .bind(r.replay_id.as_slice())
         .bind(r.signed_container_hash.as_slice())
+        .bind(r.exact_signed_grant_container_bytes_sha256.as_slice())
         .fetch_one(&mut *tx)
         .await?;
         if created.grant != *r || !filed {
@@ -746,11 +803,21 @@ pub async fn file_fleet_grant(
     // D-2 issuers and D-9 generation states, per variant.
     match &payload {
         Payload::DeviceHpkeGrant(p) => {
-            // shortcut: "holding that FKEK generation" is not checked here; the
-            // issuer's own grant for it is acknowledged only with the ack route.
+            // The issuer holds the generation it hands out (D-2), except for
+            // its own first grant of it, which it acknowledges afterwards.
+            let own = p.subject_device_id == s.device_id
+                && p.subject_signing_key_id == s.signing_key_id
+                && p.recipient_hpke_key_id == s.hpke_key_id;
             if !holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::FleetManage, now).await?
+                || !(own || holds_generation(&mut tx, v, &s, &fleet, generation, now).await?)
             {
                 return Err(AppError::Forbidden);
+            }
+            if !fleet_is_active(&mut tx, &s.tenant_id, &fleet).await? {
+                return Err(conflict(
+                    "FLEET_ARCHIVED",
+                    "an archived fleet takes no new member",
+                ));
             }
             if gen.state != "PREPARING" && gen.state != "ACTIVE" {
                 return Err(conflict(
@@ -775,6 +842,42 @@ pub async fn file_fleet_grant(
                     "the grant names no active device under these keys",
                 ));
             }
+            // D-2 subject eligibility: an active account and a live approval
+            // of exactly these keys, tenant-wide or for this fleet.
+            // shortcut: fleet membership is not checked, there is no member
+            // table yet; add it with the L1126 membership routes.
+            let eligible: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM v2_accounts
+                                 WHERE tenant_id = ? AND id = ? AND status = 'active')
+                    AND EXISTS (SELECT 1 FROM v2_device_approvals
+                                 WHERE server_instance_id = ? AND tenant_id = ?
+                                   AND subject_account_id = ? AND subject_device_id = ?
+                                   AND subject_signing_key_id = ? AND subject_hpke_key_id = ?
+                                   AND revoked_at IS NULL
+                                   AND not_before_ms <= ? AND ? < not_after_ms
+                                   AND (approval_scope_kind = 'tenant'
+                                        OR (approval_scope_kind = 'fleet'
+                                            AND approval_scope_id = ?)))",
+            )
+            .bind(s.tenant_id.as_slice())
+            .bind(p.subject_account_id.as_slice())
+            .bind(v.server_instance_id.as_slice())
+            .bind(s.tenant_id.as_slice())
+            .bind(p.subject_account_id.as_slice())
+            .bind(p.subject_device_id.as_slice())
+            .bind(p.subject_signing_key_id.as_slice())
+            .bind(p.recipient_hpke_key_id.as_slice())
+            .bind(now)
+            .bind(now)
+            .bind(fleet.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !eligible {
+                return Err(conflict(
+                    "SUBJECT_NOT_ELIGIBLE",
+                    "the subject has no active account or live approval for this fleet",
+                ));
+            }
         }
         Payload::RecoveryGrant(p) => {
             // shortcut: only the ACTIVE root is a recipient; the D-5 rewrap
@@ -787,8 +890,17 @@ pub async fn file_fleet_grant(
             }
         }
         Payload::RotationGrant(p) => {
-            if !holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::KeyRotate, now).await? {
+            // The issuer holds the generation it rotates away from (D-2).
+            if !holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::KeyRotate, now).await?
+                || !holds_generation(&mut tx, v, &s, &fleet, p.previous_generation, now).await?
+            {
                 return Err(AppError::Forbidden);
+            }
+            if !fleet_is_active(&mut tx, &s.tenant_id, &fleet).await? {
+                return Err(conflict(
+                    "FLEET_ARCHIVED",
+                    "an archived fleet is not rotated",
+                ));
             }
             let matches = gen.state == "PREPARING"
                 && gen.previous_fkek_key_id.as_deref() == Some(&p.previous_fkek_key_id[..])
@@ -1270,14 +1382,7 @@ pub async fn activate_fleet_generation(
             )
         })?;
     let rotation = t.rotation.as_ref();
-    let same_terms = row.fkek_key_id == g.fkek_key_id
-        && row.required_device_grant_count == Some(i64::from(t.required_device_grant_count))
-        && row.required_grant_set_hash.as_deref() == Some(&t.required_device_grant_set_hash[..])
-        && row.recovery_grant_hash.as_deref() == Some(&t.recovery_grant_signed_container_hash[..])
-        && row.previous_fkek_key_id.as_deref() == rotation.map(|r| &r.previous_fkek_key_id[..])
-        && row.rotation_grant_hash.as_deref()
-            == rotation.map(|r| &r.rotation_grant_signed_container_hash[..]);
-    if !same_terms {
+    if !row.holds_terms(t) {
         return Err(conflict(
             "FLEET_GENERATION_MISMATCH",
             "the activation restates other terms than the generation was created with",
