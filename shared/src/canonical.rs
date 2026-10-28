@@ -393,6 +393,8 @@ pub const L_DEK_SLOT_CONTEXT: &str = "SHARDX-DEK-SLOT-CONTEXT-V2\0";
 pub const L_DEK_SLOT: &str = "SHARDX-DEK-SLOT-V2\0";
 pub const L_ENVELOPE_INTENT: &str = "SHARDX-ENVELOPE-INTENT-V2\0";
 pub const L_COMMIT_REQUEST: &str = "SHARDX-COMMIT-REQUEST-V2\0";
+/// `head_hash` label (plan L535-L537).
+pub const L_SNAPSHOT_HEAD: &str = "SHARDX-SNAPSHOT-HEAD-V2\0";
 pub const L_RESTORE_EPOCH_LEAF: &str = "SHARDX-RESTORE-EPOCH-LEAF-V2\0";
 pub const L_RESTORE_EPOCH_NODE2: &str = "SHARDX-RESTORE-EPOCH-NODE2-V2\0";
 pub const L_RESTORE_EPOCH_NODE1: &str = "SHARDX-RESTORE-EPOCH-NODE1-V2\0";
@@ -642,6 +644,7 @@ mod tests {
             L_DEK_SLOT,
             L_ENVELOPE_INTENT,
             L_COMMIT_REQUEST,
+            L_SNAPSHOT_HEAD,
             L_RESTORE_EPOCH_LEAF,
             L_RESTORE_EPOCH_NODE2,
             L_RESTORE_EPOCH_NODE1,

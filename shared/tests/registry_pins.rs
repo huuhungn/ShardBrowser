@@ -11,7 +11,7 @@ use shardx_core::{
     approval_receipt as ar, authz_record as az, canonical as c, envelope as ev, envelope_v2 as e2,
     fallback_key_file as fk, fleet_lifecycle as fl, fleet_manifest as fm, grants as gr, keys as k,
     mutation as mu, recovery_bundle as rb, restore_epoch as re, session_binding as sb,
-    signing as sg, trust_evidence as te,
+    signing as sg, snapshot_v2 as s2, trust_evidence as te,
 };
 
 const DOMAINS: &[&str] = &[
@@ -61,6 +61,10 @@ const DOMAINS: &[&str] = &[
     re::DOMAIN_RESTORE_EPOCH_SIGNED_TRANSITION_CONTAINER,
     sb::DOMAIN_ENROLLMENT_BINDING,
     sb::DOMAIN_DEVICE_SESSION_BINDING,
+    s2::DOMAIN_MANIFEST_PAYLOAD,
+    s2::DOMAIN_SIGNED_MANIFEST_CONTAINER,
+    s2::DOMAIN_COMMIT_REQUEST,
+    s2::DOMAIN_COMMIT_RECEIPT_BINDING,
     te::DOMAIN_TRUST_EVIDENCE_PAGE,
 ];
 
@@ -82,6 +86,7 @@ const LABELS: &[&str] = &[
     k::L_SIGNING_KEY_ID,
     k::L_HPKE_KEY_ID,
     k::L_TENANT_ROOT_KEY_ID,
+    s2::L_SNAPSHOT_HEAD,
 ];
 
 fn assert_distinct(what: &str, values: &[&str]) {
