@@ -351,7 +351,10 @@ pub fn restore_epoch_leaf_bytes(
     new_signed_head_hash: &[u8; 32],
 ) -> Vec<u8> {
     c::encode(&c::m(vec![
-        ("domain", c::t("shardx.restore-epoch.profile-head-leaf.v2")),
+        (
+            "domain",
+            c::t(crate::restore_epoch::DOMAIN_RESTORE_EPOCH_LEAF),
+        ),
         ("version", c::u(2)),
         ("tenant_id", c::b(tenant_id)),
         ("profile_id", c::b(profile_id)),
@@ -401,6 +404,14 @@ pub enum MerkleError {
     DuplicateTuple,
     /// Leaves must be in ascending raw tuple order.
     UnsortedLeaves,
+    /// A leaf belongs to another tenant than the transition.
+    ForeignTenant,
+    /// A leaf restores no previous head (L676).
+    ZeroPreviousHead,
+    /// The leaf index is outside the set.
+    IndexOutOfRange,
+    /// The set is not the one the transition commits to.
+    NotTheTransition,
 }
 
 impl std::fmt::Display for MerkleError {
@@ -410,6 +421,10 @@ impl std::fmt::Display for MerkleError {
             Self::TooManyLeaves(n) => write!(f, "too many leaves: {n}"),
             Self::DuplicateTuple => write!(f, "duplicate (tenant_id, profile_id) leaf"),
             Self::UnsortedLeaves => write!(f, "leaves are not in ascending tuple order"),
+            Self::ForeignTenant => write!(f, "a leaf belongs to another tenant"),
+            Self::ZeroPreviousHead => write!(f, "a leaf has no previous head"),
+            Self::IndexOutOfRange => write!(f, "leaf index is outside the set"),
+            Self::NotTheTransition => write!(f, "leaf set is not the transition's"),
         }
     }
 }

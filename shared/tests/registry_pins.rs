@@ -10,8 +10,8 @@
 use shardx_core::{
     approval_receipt as ar, authz_record as az, canonical as c, envelope as ev, envelope_v2 as e2,
     fallback_key_file as fk, fleet_lifecycle as fl, fleet_manifest as fm, grants as gr, keys as k,
-    mutation as mu, recovery_bundle as rb, session_binding as sb, signing as sg,
-    trust_evidence as te,
+    mutation as mu, recovery_bundle as rb, restore_epoch as re, session_binding as sb,
+    signing as sg, trust_evidence as te,
 };
 
 const DOMAINS: &[&str] = &[
@@ -55,6 +55,10 @@ const DOMAINS: &[&str] = &[
     mu::DOMAIN_ROOT_GRANT_DESCRIPTOR,
     mu::DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR,
     rb::DOMAIN_RECOVERY_BUNDLE,
+    re::DOMAIN_RESTORE_EPOCH_LEAF,
+    re::DOMAIN_RESTORE_EPOCH_INCLUSION_PROOF,
+    re::DOMAIN_RESTORE_EPOCH_TRANSITION_PAYLOAD,
+    re::DOMAIN_RESTORE_EPOCH_SIGNED_TRANSITION_CONTAINER,
     sb::DOMAIN_ENROLLMENT_BINDING,
     sb::DOMAIN_DEVICE_SESSION_BINDING,
     te::DOMAIN_TRUST_EVIDENCE_PAGE,
@@ -71,6 +75,8 @@ const LABELS: &[&str] = &[
     c::L_RESTORE_EPOCH_NODE2,
     c::L_RESTORE_EPOCH_NODE1,
     c::L_RESTORE_EPOCH_PROOF,
+    c::L_RESTORE_EPOCH_TRANSITION_TBS,
+    c::L_RESTORE_EPOCH_TRANSITION_CONTAINER,
     ev::L_ENVELOPE_FRAME,
     e2::L_ENVELOPE_PREAMBLE,
     k::L_SIGNING_KEY_ID,
