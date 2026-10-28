@@ -14,7 +14,8 @@
 //! The tables so far are `schema_meta`, exactly as the plan's reference DDL
 //! (L1450-L1458), and the W6 trust ledger (ADR 0002 D-6, Q-12, Q-13), which
 //! the plan's DDL leaves to W6. The ledger keeps hashes, key IDs and times,
-//! and the exact bytes of counted revocations, never a key (L2048).
+//! the exact bytes of counted revocations, and the exact grant behind each
+//! collected fleet key with its evidence (G2-35), never a key (L2048).
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
@@ -121,6 +122,41 @@ CREATE TABLE trust_fleet_generations (
     REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
 ) STRICT;
 
+-- D-6 (a)-(c): each key this device saw as a custodian. The cached
+-- first_not_before starts the 1095-day clip and only moves earlier; the
+-- first evaluation that computed no window containing now, and its local
+-- time, is the key's sticky lapse.
+CREATE TABLE trust_custodian_keys (
+  server_instance_id    TEXT NOT NULL,
+  tenant_id             TEXT NOT NULL,
+  signing_key_id        TEXT NOT NULL CHECK (length(signing_key_id) = 64 AND signing_key_id NOT GLOB '*[^0-9a-f]*'),
+  first_seen_evaluation INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  first_not_before_ms   INTEGER NOT NULL CHECK (first_not_before_ms BETWEEN 0 AND 9223372036854775807),
+  lapsed_evaluation     INTEGER REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  observed_lapsed_at_ms INTEGER CHECK (observed_lapsed_at_ms BETWEEN 0 AND 9223372036854775807),
+  PRIMARY KEY(server_instance_id, tenant_id, signing_key_id),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT,
+  CHECK ((lapsed_evaluation IS NULL) = (observed_lapsed_at_ms IS NULL))
+) STRICT;
+
+-- G2-35 (plan L2056): the exact DeviceHpkeGrant behind each fleet key this
+-- device collected, and the pages it verified against. Sync reverifies it
+-- before using the key; the key itself is never here.
+CREATE TABLE trust_fleet_key_grants (
+  server_instance_id           TEXT NOT NULL,
+  tenant_id                    TEXT NOT NULL,
+  fleet_id                     TEXT NOT NULL CHECK (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*'),
+  generation                   INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  fkek_key_id                  TEXT NOT NULL CHECK (length(fkek_key_id) = 64 AND fkek_key_id NOT GLOB '*[^0-9a-f]*'),
+  verified_evaluation          INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  exact_signed_container_bytes BLOB NOT NULL,
+  evidence_pages               BLOB NOT NULL,
+  PRIMARY KEY(server_instance_id, tenant_id, fleet_id, generation),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
+) STRICT;
+
 -- What the ledger learns is never taken back.
 CREATE TRIGGER trust_anchors_fixed BEFORE UPDATE ON trust_anchors
 BEGIN SELECT RAISE(ABORT, 'a pinned anchor never changes'); END;
@@ -149,6 +185,17 @@ BEGIN SELECT RAISE(ABORT, 'a reported revocation only moves earlier'); END;
 CREATE TRIGGER trust_fleet_generations_forward BEFORE UPDATE ON trust_fleet_generations
 WHEN NEW.highest_verified_generation < OLD.highest_verified_generation
 BEGIN SELECT RAISE(ABORT, 'a verified generation never goes backwards'); END;
+CREATE TRIGGER trust_custodian_keys_kept BEFORE DELETE ON trust_custodian_keys
+BEGIN SELECT RAISE(ABORT, 'a custodian key is never forgotten'); END;
+CREATE TRIGGER trust_custodian_keys_earlier BEFORE UPDATE ON trust_custodian_keys
+WHEN NEW.first_not_before_ms > OLD.first_not_before_ms
+  OR NEW.first_seen_evaluation IS NOT OLD.first_seen_evaluation
+BEGIN SELECT RAISE(ABORT, 'a cached first_not_before only moves earlier'); END;
+CREATE TRIGGER trust_custodian_keys_lapse_kept BEFORE UPDATE ON trust_custodian_keys
+WHEN OLD.lapsed_evaluation IS NOT NULL
+  AND (NEW.lapsed_evaluation IS NOT OLD.lapsed_evaluation
+       OR NEW.observed_lapsed_at_ms IS NOT OLD.observed_lapsed_at_ms)
+BEGIN SELECT RAISE(ABORT, 'an observed lapse never changes'); END;
 "#;
 
 /// An open `team-sync.db` whose schema this binary reads.
@@ -330,11 +377,20 @@ mod tests {
                    ('{i}', '{t}', '{k}', 'LOCAL_DISTRUST', 0, 0, NULL);
                  INSERT INTO trust_reported_revocations VALUES ('{i}', '{t}', 'd', '{i}', 5);
                  INSERT INTO trust_reported_device_revocations VALUES ('{i}', '{t}', '{i}', 5);
-                 INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);",
+                 INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);
+                 INSERT INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);
+                 INSERT INTO trust_evaluations VALUES (2, '{i}', '{t}', 0);
+                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{k}', 1, 5, 1, 7);",
                 k = "33".repeat(32)
             ))
             .unwrap();
         for sql in [
+            "UPDATE trust_custodian_keys SET first_not_before_ms = 6",
+            "UPDATE trust_custodian_keys SET first_seen_evaluation = 2",
+            "UPDATE trust_custodian_keys SET observed_lapsed_at_ms = 8",
+            "UPDATE trust_custodian_keys SET lapsed_evaluation = 2",
+            "UPDATE trust_custodian_keys SET lapsed_evaluation = NULL, observed_lapsed_at_ms = NULL",
+            "DELETE FROM trust_custodian_keys",
             "UPDATE trust_anchors SET anchor_key_id = lower(hex(zeroblob(32)))",
             "UPDATE trust_proven_revocations SET counted_evaluation = 9",
             "DELETE FROM trust_proven_revocations",
@@ -352,7 +408,8 @@ mod tests {
             .execute_batch(
                 "UPDATE trust_reported_revocations SET revoked_at_ms = 4;
                  UPDATE trust_reported_device_revocations SET revoked_at_ms = 4;
-                 UPDATE trust_fleet_generations SET highest_verified_generation = 4;",
+                 UPDATE trust_fleet_generations SET highest_verified_generation = 4;
+                 UPDATE trust_custodian_keys SET first_not_before_ms = 4;",
             )
             .unwrap();
         // Each row on its own, so only its trigger can refuse the delete.

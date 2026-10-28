@@ -1053,7 +1053,7 @@ impl FleetClient {
     }
 }
 
-fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
         bail!(crate::errcode::code_with(
             "fleet.malformedHex64",

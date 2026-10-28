@@ -2565,15 +2565,7 @@ async fn collect_fleet_grant(
     let Ok(pages) = pages else {
         return Ok(FleetGrant::Failed);
     };
-    let (_, hpke_public) = shardx_core::grants::derive_keypair(&hpke_seed);
-    let me = shardx_core::trust_chain::Recipient {
-        account_id: fleet_client::decode_hex16(&c.account_id, "account_id")
-            .map_err(|e| e.to_string())?,
-        device_id: fleet_client::decode_hex16(&c.device_id, "device_id")
-            .map_err(|e| e.to_string())?,
-        signing_key_id: shardx_core::keys::signing_key_id(signer.verifying_key().as_bytes()),
-        hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
-    };
+    let me = recipient(c).map_err(|e| e.to_string())?;
     let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id").map_err(|e| e.to_string())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2641,8 +2633,9 @@ fn pinned_anchor(
 ///
 /// The W6 ledger (`team::ledger`) holds the anchor this device pinned first,
 /// refuses a generation other than the highest one verified or the next, and evaluates the
-/// evidence as this device's history lets it see it: sticky revocations and
-/// local distrust. Each evaluation that reaches the anchor is recorded.
+/// evidence as this device's history lets it see it: sticky revocations,
+/// local distrust, sticky lapse and the cached key age. Each evaluation that
+/// reaches the anchor is recorded, with the grant it opened (G2-35).
 #[allow(clippy::too_many_arguments)]
 fn open_fleet_grant(
     container: &[u8],
@@ -2655,7 +2648,6 @@ fn open_fleet_grant(
     now: u64,
     ledger: &mut team::db::Db,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, String> {
-    use shardx_core::trust_chain::{Evidence, TrustChain};
     use team::ledger;
     let failed = |e: anyhow::Error| {
         eprintln!("[fleet] trust ledger: {e:#}");
@@ -2670,19 +2662,88 @@ fn open_fleet_grant(
     {
         return Ok(None);
     }
-    let seen = ledger::prepare(ledger, binding, pages).map_err(failed)?;
-    let Some(chain) = Evidence::collect(binding, &seen)
-        .ok()
-        .and_then(|evidence| TrustChain::evaluate(evidence, Some(anchor)).ok())
+    let Some((seen, chain)) = ledger::evaluate(ledger, binding, anchor, pages).map_err(failed)?
     else {
         return Ok(None);
     };
-    let fkek = chain
-        .device_hpke_grant(container, me, fleet_id, generation, now)
-        .and_then(|grant| shardx_core::grants::open_device_fkek(device_sk, grant).ok());
-    let opened = fkek.is_some().then_some((fleet_id, generation));
+    let grant = chain.device_hpke_grant(container, me, fleet_id, generation, now);
+    let fkek = grant.and_then(|g| shardx_core::grants::open_device_fkek(device_sk, g).ok());
+    let opened = grant.filter(|_| fkek.is_some()).map(|g| ledger::Opened {
+        fleet_id,
+        generation,
+        fkek_key_id: g.fkek_key_id,
+        container,
+        pages,
+    });
     ledger::record(ledger, binding, &seen, &chain, opened, now).map_err(failed)?;
     Ok(fkek)
+}
+
+/// This device as a fleet key grant must name it (rule 5).
+fn recipient(c: &team_config::TeamConfig) -> anyhow::Result<shardx_core::trust_chain::Recipient> {
+    let signer = c.signing_key()?;
+    let (_, hpke_public) = shardx_core::grants::derive_keypair(&c.hpke_seed()?);
+    Ok(shardx_core::trust_chain::Recipient {
+        account_id: fleet_client::decode_hex16(&c.account_id, "account_id")?,
+        device_id: fleet_client::decode_hex16(&c.device_id, "device_id")?,
+        signing_key_id: shardx_core::keys::signing_key_id(signer.verifying_key().as_bytes()),
+        hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+    })
+}
+
+/// G2-35 (plan L2056): whether `key`, cached as `generation` of `fleet_id`
+/// from a verified grant, may be used at `now`. The cache grants nothing: the
+/// exact grant the team database keeps with it is reparsed and reverified
+/// against the pages it was accepted from, as the W6 ledger lets this device
+/// see them now (the revocation reports, distrust, lapses and key ages
+/// learned since), to the same pinned anchor, for this device, fleet and
+/// generation, in force now, and it must name `key`.
+fn fleet_key_verifies(
+    ledger: &team::db::Db,
+    (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
+    me: &shardx_core::trust_chain::Recipient,
+    fleet_id: &[u8; 16],
+    generation: u64,
+    key: &[u8; 32],
+    now: u64,
+) -> anyhow::Result<bool> {
+    use team::ledger;
+    let Some((container, pages)) =
+        ledger::fleet_key_grant(ledger, binding, anchor, fleet_id, generation)?
+    else {
+        return Ok(false);
+    };
+    let Some((_, chain)) = ledger::evaluate(ledger, binding, anchor, &pages)? else {
+        return Ok(false);
+    };
+    Ok(chain
+        .device_hpke_grant(&container, me, fleet_id, generation, now)
+        .is_some_and(|g| g.fkek_key_id == shardx_core::fleet_grants::fkek_key_id(key)))
+}
+
+/// The fleet keys sync pull tries, newest first: keys cached by 2.4.2, and
+/// keys from verified grants that still verify now (`fleet_key_verifies`).
+/// A store that cannot be read leaves only the passphrase, and a team
+/// database or identity that cannot be read leaves no verified key.
+pub(crate) fn pull_fleet_keys(c: &team_config::TeamConfig, now: u64) -> Vec<([u8; 32], u64)> {
+    let Ok(store) = fleet_keys::load() else {
+        return Vec::new();
+    };
+    let ready = || {
+        let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id").ok()?;
+        let me = recipient(c).ok()?;
+        Some((team::db::Db::open().ok()?, pinned_anchor(c)?, me, fleet))
+    };
+    let ready = ready();
+    store.keys_newest_first(&c.fleet_id, |generation, key| {
+        let Some((ledger, pin, me, fleet)) = &ready else {
+            return false;
+        };
+        fleet_key_verifies(ledger, pin, me, fleet, generation, key, now).unwrap_or_else(|e| {
+            eprintln!("[fleet] trust ledger: {e:#}");
+            false
+        })
+    })
 }
 
 /// The exact grant container of the descriptor when it is an unrevoked
@@ -2931,9 +2992,21 @@ mod custody_tests {
         fkek_key_id: [u8; 32],
         fkek: &[u8; 32],
     ) -> Vec<u8> {
+        grant_at(issuer, me, generation, common(replay), fkek_key_id, fkek)
+    }
+
+    /// `grant_by` with the common fields `common`.
+    fn grant_at(
+        issuer: &shardx_core::signing::Ed25519SigningKey,
+        me: &Me,
+        generation: u64,
+        common: shardx_core::authz_record::CommonFields,
+        fkek_key_id: [u8; 32],
+        fkek: &[u8; 32],
+    ) -> Vec<u8> {
         use shardx_core::authz_record::*;
         let mut g = DeviceHpkeGrantV2 {
-            common: common(replay),
+            common,
             fleet_id: FLEET,
             fkek_key_id,
             generation,
@@ -3096,6 +3169,13 @@ mod custody_tests {
         let lying = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&[1; 32]), &fkek);
         let pages = evidence(&me, lying.clone());
         assert!(open(&lying, &pages, &pin, &me.to, 1, &me.hpke_sk).is_none());
+        // A grant that did not open raises no generation and is not kept.
+        let (_dir, path) = ledger_at();
+        assert_eq!(collect(&path, &pages, &lying, 1), None);
+        let db = team::db::Db::open_at(&path).unwrap();
+        let highest = team::ledger::highest_generation(&db, &binding, &FLEET).unwrap();
+        let kept = team::ledger::fleet_key_grant(&db, &binding, &pin.1, &FLEET, 1).unwrap();
+        assert_eq!((highest, kept.is_none()), (None, true));
     }
 
     /// A collected key is pinned for its generation: the same key again is
@@ -3137,9 +3217,11 @@ mod custody_tests {
                 Ok(FleetGrant::Failed)
             ]
         );
-        // Marked as from a verified grant, so sync does not use them yet.
+        // Marked as from a verified grant: sync uses them only while their
+        // grant reverifies.
         assert_eq!(held.fleets[&fleet].verified, [1, 2].into());
-        assert!(held.keys_newest_first(&fleet).is_empty());
+        assert!(held.keys_newest_first(&fleet, |_, _| false).is_empty());
+        assert_eq!(held.keys_newest_first(&fleet, |g, _| g == 2).len(), 1);
         assert!(!unreadable);
     }
 
@@ -3572,6 +3654,361 @@ mod custody_tests {
         assert_eq!(collect(&path, &pages, &grant, 1), None);
         let (_fresh, fresh) = ledger_at();
         assert_eq!(collect(&fresh, &pages, &grant, 1), Some(fkek));
+    }
+
+    /// The end of the records `custody` builds.
+    const LONG: u64 = T0 + 3000 * DAY;
+
+    /// `common(replay)` in force over `[from, until)`, issued at `from`.
+    fn lasting(replay: u8, from: u64, until: u64) -> shardx_core::authz_record::CommonFields {
+        shardx_core::authz_record::CommonFields {
+            issued_at_ms: from,
+            not_before_ms: from,
+            not_after_ms: until,
+            ..common(replay)
+        }
+    }
+
+    /// `issuer`'s root grant making D a custodian over `[from, until)`.
+    fn d_root(
+        issuer: &shardx_core::signing::Ed25519SigningKey,
+        replay: u8,
+        from: u64,
+        until: u64,
+    ) -> Vec<u8> {
+        use shardx_core::authz_record::*;
+        let root = TenantRootKeyGrantV2 {
+            common: lasting(replay, from, until),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: [6; 16],
+            subject_device_id: D_DEVICE,
+            subject_signing_key_id: d_id(),
+            recipient_hpke_key_id: [13; 32],
+            subject_device_approval_replay_id: [20; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        build_record(issuer, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode())
+    }
+
+    /// A tenant this device bootstrapped, its records in force until `LONG`
+    /// (so its own custody ends at the 1095-day clip), in which D holds an
+    /// approval and `fleet.manage` until `LONG`, custody through `d_roots`,
+    /// and `extra`.
+    fn custody(me: &Me, d_roots: &[Vec<u8>], extra: &[Vec<u8>]) -> Vec<Page> {
+        use shardx_core::authz_record::*;
+        let mine = GrantSubject::Device {
+            account_id: me.to.account_id,
+            device_id: me.to.device_id,
+            signing_key_id: me.to.signing_key_id,
+            hpke_key_id: me.to.hpke_key_id,
+        };
+        let d = GrantSubject::Device {
+            account_id: [6; 16],
+            device_id: D_DEVICE,
+            signing_key_id: d_id(),
+            hpke_key_id: [13; 32],
+        };
+        let grant = |subject: GrantSubject, capability, replay| {
+            let g = TenantCapabilityGrantV2 {
+                common: lasting(replay, T0, LONG),
+                subject,
+                scope_kind: CapabilityScopeKind::Tenant,
+                scope_id: TENANT,
+                capability,
+            };
+            build_record(&me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let approval = |replay, account, device, signing, hpke| {
+            let a = DeviceApprovalV2 {
+                common: lasting(replay, T0, LONG),
+                subject_account_id: account,
+                subject_device_id: device,
+                subject_signing_key_id: signing,
+                subject_hpke_key_id: hpke,
+                approval_scope_kind: ApprovalScopeKind::Tenant,
+                approval_scope_id: TENANT,
+            };
+            build_record(&me.sk, DOMAIN_DEVICE_APPROVAL, &a.encode())
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: lasting(11, T0, LONG),
+            variant: RootGrantVariant::FirstRootSelfGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: me.to.account_id,
+            subject_device_id: me.to.device_id,
+            subject_signing_key_id: me.to.signing_key_id,
+            recipient_hpke_key_id: me.to.hpke_key_id,
+            subject_device_approval_replay_id: [10; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let mut containers = vec![
+            approval(
+                10,
+                me.to.account_id,
+                me.to.device_id,
+                me.to.signing_key_id,
+                me.to.hpke_key_id,
+            ),
+            build_record(&me.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+            grant(mine.clone(), Capability::FleetManage, 12),
+            grant(mine, Capability::DeviceApprove, 13),
+            approval(20, [6; 16], D_DEVICE, d_id(), [13; 32]),
+            grant(d, Capability::FleetManage, 22),
+        ];
+        containers.extend(d_roots.iter().chain(extra).cloned());
+        let mut pages = evidence(me, Vec::new());
+        pages[0].containers = containers;
+        pages[0]
+            .signing_public_keys
+            .push(d_key().verifying_key().to_bytes());
+        pages
+    }
+
+    /// The custodian keys whose lapse the ledger at `path` observed, and when.
+    fn lapsed(path: &std::path::Path) -> Vec<(String, i64)> {
+        let db = team::db::Db::open_at(path).unwrap();
+        let mut s = db
+            .conn
+            .prepare(
+                "SELECT signing_key_id, observed_lapsed_at_ms FROM trust_custodian_keys
+                 WHERE lapsed_evaluation IS NOT NULL",
+            )
+            .unwrap();
+        let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// D-6 (b) against the attack it exists for: custodian D's custody ends,
+    /// this device observes the lapse, then a hostile server serves a fleet
+    /// grant with a key of its choosing, signed by D's stolen key and dated
+    /// inside D's old window, alone or with a self-extension dated there too.
+    /// A device with that history refuses it across reopens; one without
+    /// accepts it (the D-6 limit). A re-appointment by another custodian
+    /// after the lapse restores D.
+    #[test]
+    fn a_lapsed_custodians_backdated_grant_is_refused_with_history() {
+        let me = me();
+        let (stolen, honest) = ([0x66; 32], [0x67; 32]);
+        let kid = shardx_core::fleet_grants::fkek_key_id;
+        let first = d_root(&me.sk, 21, T0, T0 + 30 * DAY);
+        let extension = d_root(&d_key(), 23, T0 + 10 * DAY, LONG);
+        let c = lasting(41, T0 + 10 * DAY, LONG);
+        let backdated = grant_at(&d_key(), &me, 1, c, kid(&stolen), &stolen);
+        let alone = custody(
+            &me,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&backdated),
+        );
+        let extended = custody(
+            &me,
+            &[first.clone(), extension],
+            std::slice::from_ref(&backdated),
+        );
+        let at = T0 + 41 * DAY;
+        for pages in [&alone, &extended] {
+            let (_fresh, fresh) = ledger_at();
+            let got = collect_at(&fresh, pages, &backdated, 1, at);
+            assert_eq!(got, Some(stolen), "no history");
+        }
+
+        let (_dir, path) = ledger_at();
+        let before = custody(&me, std::slice::from_ref(&first), &[]);
+        assert_eq!(collect_at(&path, &before, &[], 1, T0 + DAY), None);
+        assert!(lapsed(&path).is_empty(), "both are custodians");
+        assert_eq!(collect_at(&path, &before, &[], 1, T0 + 40 * DAY), None);
+        let observed = (T0 + 40 * DAY) as i64;
+        assert_eq!(lapsed(&path), [(hex(&d_id()), observed)]);
+        for pages in [&alone, &extended, &alone] {
+            let got = collect_at(&path, pages, &backdated, 1, at);
+            assert_eq!(got, None, "with history");
+        }
+        assert_eq!(lapsed(&path), [(hex(&d_id()), observed)], "sticky");
+
+        let again = d_root(&me.sk, 24, T0 + 42 * DAY, LONG);
+        let c = lasting(42, T0 + 43 * DAY, LONG);
+        let renewed = grant_at(&d_key(), &me, 1, c, kid(&honest), &honest);
+        let reappointed = custody(&me, &[first, again], std::slice::from_ref(&renewed));
+        let got = collect_at(&path, &reappointed, &renewed, 1, T0 + 44 * DAY);
+        assert_eq!(got, Some(honest), "re-appointed after the lapse");
+    }
+
+    /// D-6 (c): the clip starts from the earliest root grant of a key this
+    /// device ever saw. A server that omits D's first root grant stretches
+    /// D's 1095 days on a device without history (the D-6 limit), never on
+    /// one that saw it.
+    #[test]
+    fn an_omitted_first_root_grant_never_stretches_the_key_age_with_history() {
+        let me = me();
+        let fkek = [0x68; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&fkek);
+        let first = d_root(&me.sk, 21, T0, T0 + 30 * DAY);
+        let later = d_root(&me.sk, 24, T0 + 500 * DAY, LONG);
+        let c = lasting(41, T0 + 1100 * DAY, LONG);
+        let grant = grant_at(&d_key(), &me, 1, c, kid, &fkek);
+        let omitted = custody(
+            &me,
+            std::slice::from_ref(&later),
+            std::slice::from_ref(&grant),
+        );
+        let full = custody(&me, &[first.clone(), later], std::slice::from_ref(&grant));
+        let at = T0 + 1101 * DAY;
+
+        let (_full, full_path) = ledger_at();
+        assert_eq!(collect_at(&full_path, &full, &grant, 1, at), None);
+        let (_dir, path) = ledger_at();
+        let seen_first = custody(&me, std::slice::from_ref(&first), &[]);
+        assert_eq!(collect_at(&path, &seen_first, &[], 1, T0 + DAY), None);
+        let got = collect_at(&path, &omitted, &grant, 1, at);
+        assert_eq!(got, None, "with history");
+
+        let (_fresh, fresh) = ledger_at();
+        let got = collect_at(&fresh, &omitted, &grant, 1, at);
+        assert_eq!(got, Some(fkek), "no history");
+    }
+
+    /// G2-35: a key from a verified grant is used only while the exact grant
+    /// kept with it reverifies for this device, fleet, generation, key and
+    /// anchor, in force now, as the ledger sees it now. A revocation report
+    /// learned since that ends the issuer's custody before the grant ends
+    /// its use. Local distrust learned since does not: the grant was first
+    /// seen before it (D-6 (d), Q-19 (A)).
+    #[test]
+    fn a_kept_grant_is_reverified_before_its_key_is_used() {
+        let me = me();
+        let fkek = [0x69; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&fkek);
+        let from_d = grant_by(&d_key(), &me, 1, 41, kid, &fkek);
+        // Pages as the server sends them: no empty container.
+        let pages = with_d(
+            &me,
+            evidence(&me, from_d.clone()),
+            Some(T0 + 300 * DAY),
+            Vec::new(),
+        );
+        let (_dir, path) = ledger_at();
+        let pin = (BINDING, me.to.signing_key_id);
+        let now = T0 + 2 * DAY;
+        type To = shardx_core::trust_chain::Recipient;
+        type Pin = (shardx_core::trust_chain::Binding, [u8; 32]);
+        let verifies = |pin: &Pin, generation, key: &[u8; 32], to: &To, now| {
+            let db = team::db::Db::open_at(&path).unwrap();
+            fleet_key_verifies(&db, pin, to, &FLEET, generation, key, now).unwrap()
+        };
+        assert!(!verifies(&pin, 1, &fkek, &me.to, now), "nothing kept yet");
+        assert_eq!(collect(&path, &pages, &from_d, 1), Some(fkek));
+        assert!(verifies(&pin, 1, &fkek, &me.to, now));
+        assert!(!verifies(&pin, 1, &[0x6a; 32], &me.to, now), "another key");
+        assert!(!verifies(&pin, 2, &fkek, &me.to, now), "another generation");
+        let other = To {
+            device_id: [9; 16],
+            ..me.to
+        };
+        assert!(!verifies(&pin, 1, &fkek, &other, now), "another device");
+        assert!(!verifies(&(BINDING, [9; 32]), 1, &fkek, &me.to, now));
+        let ended = T0 + 301 * DAY;
+        assert!(!verifies(&pin, 1, &fkek, &me.to, ended), "the grant ended");
+        // A verified grant of another key for the generation never replaces
+        // the kept one (rule 5, `KEY_SUBSTITUTION_DETECTED`).
+        let swap = [0x6d; 32];
+        let swapped = grant_by(
+            &d_key(),
+            &me,
+            1,
+            42,
+            shardx_core::fleet_grants::fkek_key_id(&swap),
+            &swap,
+        );
+        let mut both = pages.clone();
+        both[0].containers.push(swapped.clone());
+        assert_eq!(collect(&path, &both, &swapped, 1), Some(swap));
+        assert!(
+            verifies(&pin, 1, &fkek, &me.to, now),
+            "still the kept grant"
+        );
+        assert!(!verifies(&pin, 1, &swap, &me.to, now));
+
+        let db = team::db::Db::open_at(&path).unwrap();
+        team::ledger::distrust_key(&db, &BINDING, &d_id(), now).unwrap();
+        drop(db);
+        assert!(verifies(&pin, 1, &fkek, &me.to, now), "seen before");
+
+        let mut reported = pages.clone();
+        reported[0]
+            .device_revocations
+            .push(shardx_core::trust_evidence::RevokedDevice {
+                device_id: D_DEVICE,
+                revoked_at_ms: T0,
+            });
+        assert_eq!(collect(&path, &reported, &[], 1), None);
+        assert!(!verifies(&pin, 1, &fkek, &me.to, now), "reported since");
+    }
+
+    /// Pull tries a key from a verified grant only while that grant
+    /// reverifies, and a key cached by 2.4.2 always: a verified key with no
+    /// grant kept, whose grant ended, or with no anchor pinned, is not tried.
+    #[test]
+    fn pull_uses_a_verified_key_only_while_its_grant_verifies() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let me = me();
+        team_config::save(&team_config::TeamConfig {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&me.to.device_id),
+            account_id: hex(&me.to.account_id),
+            fleet_id: hex(&FLEET),
+            signing_key_seed: hex(&[1; 32]),
+            hpke_key_seed: hex(&[7; 32]),
+            ..Default::default()
+        })
+        .unwrap();
+        let state = root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&me.to.device_id),
+            server_instance_id: hex(&INSTANCE),
+            activated: true,
+            anchor: hex(&me.to.signing_key_id),
+            ..Default::default()
+        };
+        let state = serde_json::to_string(&state).unwrap();
+        std::fs::write(store::custody_bootstrap_path().unwrap(), state).unwrap();
+        let c = team_config::load().unwrap();
+        let (fkek, legacy) = ([0x6b; 32], [0x6c; 32]);
+        let grant = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&fkek), &fkek);
+        let fleet = hex(&FLEET);
+        assert!(fleet_keys::collect(&fleet, 1, &fkek).unwrap());
+        let mut keys = fleet_keys::load().unwrap();
+        keys.insert(&fleet, 2, &legacy);
+        fleet_keys::save(&keys).unwrap();
+        let db = store::config_root().unwrap().join("team-sync");
+        std::fs::create_dir_all(&db).unwrap();
+        let now = T0 + 2 * DAY;
+
+        let unkept = pull_fleet_keys(&c, now);
+        let opened = collect(
+            &db.join("team-sync.db"),
+            &evidence(&me, grant.clone()),
+            &grant,
+            1,
+        );
+        let kept = pull_fleet_keys(&c, now);
+        let ended = pull_fleet_keys(&c, T0 + 301 * DAY);
+        std::fs::remove_file(store::custody_bootstrap_path().unwrap()).unwrap();
+        let unpinned = pull_fleet_keys(&c, now);
+        store::set_config_root(None);
+
+        assert_eq!(opened, Some(fkek));
+        assert_eq!(unkept, [(legacy, 2)]);
+        assert_eq!(kept, [(legacy, 2), (fkek, 1)]);
+        assert_eq!(ended, [(legacy, 2)]);
+        assert_eq!(unpinned, [(legacy, 2)], "no pinned anchor");
     }
 
     /// Only the device that bootstrapped this tenant's custody, with the

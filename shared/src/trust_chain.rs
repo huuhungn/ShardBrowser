@@ -13,10 +13,10 @@
 //! dropped, and the server's revocation reports only end windows early. So an
 //! omission or a forgery can only make the client refuse.
 //!
-//! shortcut: this is the evaluation of a device without history. The W6
+//! This is the evaluation of a device without history. A client with a W6
 //! ledger (first sighting, sticky lapse, sticky proven revocation, local
-//! distrust) and `DeviceRevocationV2` arrive with W6 and Q-13; until then a
-//! client evaluates every container as first seen now.
+//! distrust) filters the pages before [`Evidence::collect`], and hands its
+//! cached `first_not_before` to [`Evidence::remember_first_not_before`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +109,8 @@ pub struct Evidence {
     device_grants: BTreeMap<[u8; 32], Usable<DeviceHpkeGrantV2>>,
     /// Devices the server reported revoked, and from when.
     revoked_devices: BTreeMap<[u8; 16], u64>,
+    /// D-6 (c): the `first_not_before` the client cached for each key.
+    first_not_before: BTreeMap<KeyId, u64>,
 }
 
 fn names(common: &CommonFields, binding: &Binding) -> bool {
@@ -230,6 +232,14 @@ impl Evidence {
         }
         Ok(out)
     }
+
+    /// D-6 (c): the client's cached `first_not_before(key)`. The clip starts
+    /// from the earlier of it and every root grant here, so a server that
+    /// omits the key's earliest root grant cannot stretch it.
+    pub fn remember_first_not_before(&mut self, key: KeyId, at: u64) {
+        let held = self.first_not_before.entry(key).or_insert(u64::MAX);
+        *held = (*held).min(at);
+    }
 }
 
 /// The end of a record's standing: its `not_after_ms`, or earlier when the
@@ -264,7 +274,8 @@ pub struct TrustChain {
     /// `Cust(K)`: clipped, non-empty windows.
     custodians: BTreeMap<KeyId, Vec<(u64, u64)>>,
     /// D-6 (c): the first `not_before_ms` of any usable root grant naming a
-    /// key, over every usable root grant so the clip is fixed up front.
+    /// key, over every usable root grant so the clip is fixed up front, or
+    /// the earlier one the client cached.
     first_not_before: BTreeMap<KeyId, u64>,
     approvals_by_subject: BTreeMap<KeyId, Vec<usize>>,
     /// Capability grants by subject, then issuer: a question reads only the
@@ -291,7 +302,7 @@ impl TrustChain {
         if pinned.is_some_and(|p| *p != anchor) {
             return Err(TrustError::AnchorMismatch);
         }
-        let mut first_not_before: BTreeMap<KeyId, u64> = BTreeMap::new();
+        let mut first_not_before = evidence.first_not_before.clone();
         for r in &evidence.roots {
             let at = first_not_before
                 .entry(r.payload.subject_signing_key_id)
@@ -382,6 +393,14 @@ impl TrustChain {
                 .or_default()
                 .push((nb, na));
         }
+    }
+
+    /// Every key with a custodian window, and its `first_not_before`: what the
+    /// client's custodian ledger tracks (D-6 (a)-(c)).
+    pub fn custodians(&self) -> impl Iterator<Item = (&KeyId, u64)> + '_ {
+        self.custodians
+            .keys()
+            .map(|k| (k, self.first_not_before[k]))
     }
 
     fn windows(&self, key: &KeyId) -> &[(u64, u64)] {
@@ -1293,6 +1312,43 @@ mod tests {
         let c = chain(page(&[&a0, &b], evidence)).unwrap();
         assert!(c.custodian_at(&a0.key(), T0 + 1094 * DAY));
         assert!(!c.custodian_at(&a0.key(), T0 + 1095 * DAY));
+    }
+
+    /// D-6 (c): a cached `first_not_before` earlier than every root grant the
+    /// evidence holds clips from there, and a later one never stretches it.
+    #[test]
+    fn a_cached_first_not_before_clips_what_an_omission_would_stretch() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let with = |cached: Option<u64>| {
+            let mut e = Evidence::collect(&BINDING, &[page(&[&a0, &b], tenant(&a0, &b))]).unwrap();
+            if let Some(at) = cached {
+                e.remember_first_not_before(b.key(), at);
+            }
+            let c = TrustChain::evaluate(e, None).unwrap();
+            let listed: BTreeMap<KeyId, u64> = c.custodians().map(|(k, at)| (*k, at)).collect();
+            (c, listed)
+        };
+        let (c, listed) = with(None);
+        assert_eq!(
+            listed,
+            BTreeMap::from([(a0.key(), T0), (b.key(), T0 + 2 * DAY)])
+        );
+        assert!(c.custodian_at(&b.key(), T0 + 99 * DAY));
+
+        let early = T0 + 40 * DAY - MAX_CUSTODIAN_KEY_AGE_MS;
+        let (c, listed) = with(Some(early));
+        assert!(c.custodian_at(&b.key(), T0 + 39 * DAY));
+        assert!(!c.custodian_at(&b.key(), T0 + 40 * DAY), "clipped");
+        assert_eq!(listed[&b.key()], early);
+
+        let (c, listed) = with(Some(T0 + 50 * DAY));
+        assert!(c.custodian_at(&b.key(), T0 + 99 * DAY), "never stretched");
+        assert_eq!(listed[&b.key()], T0 + 2 * DAY);
+
+        // A clip that empties every window leaves no custodian to list.
+        let (c, listed) = with(Some(T0 + DAY - MAX_CUSTODIAN_KEY_AGE_MS));
+        assert!(!c.custodian_at(&b.key(), T0 + 3 * DAY));
+        assert!(!listed.contains_key(&b.key()));
     }
 
     #[test]
