@@ -410,6 +410,69 @@ mod tests {
     use super::*;
     use crate::keys::root_key_id;
 
+    fn h(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 9180 known answer for the pinned suite (mode 0, KEM 0x0020, KDF
+    /// 0x0001, AEAD 0x0003): the cfrg `test-vectors.json` at commit 5f503c5,
+    /// the final HPKE-v1 vectors. The receiver key derives from `ikmR`, and
+    /// the context opens the first two published ciphertexts in sequence.
+    #[test]
+    fn the_pinned_suite_matches_the_rfc_9180_vectors() {
+        let ikm: [u8; 32] = h("1ac01f181fdf9f352797655161c58b75c656a6cc2716dcb66372da835542e1df")
+            .try_into()
+            .unwrap();
+        let (sk, pk) = derive_keypair(&ikm);
+        assert_eq!(
+            pk,
+            h("4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a")
+        );
+        assert_eq!(
+            sk.as_slice(),
+            h("8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb")
+        );
+        let sk = <Kem as KemTrait>::PrivateKey::from_bytes(&sk).unwrap();
+        let enc = <Kem as KemTrait>::EncappedKey::from_bytes(&h(
+            "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a",
+        ))
+        .unwrap();
+        let info = h("4f6465206f6e2061204772656369616e2055726e");
+        let mut ctx =
+            hpke::setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &sk, &enc, &info).unwrap();
+        let pt = h("4265617574792069732074727574682c20747275746820626561757479");
+        for (aad, ct) in [
+            (
+                "436f756e742d30",
+                "1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28",
+            ),
+            (
+                "436f756e742d31",
+                "6b53c051e4199c518de79594e1c4ab18b96f081549d45ce015be002090bb119e85285337cc95ba5f59992dc98c",
+            ),
+        ] {
+            assert_eq!(ctx.open(&h(ct), &h(aad)).unwrap(), pt);
+        }
+        // The exporter secret checks the rest of the key schedule.
+        for (context, value) in [
+            (
+                "",
+                "4bbd6243b8bb54cec311fac9df81841b6fd61f56538a775e7c80a9f40160606e",
+            ),
+            (
+                "54657374436f6e74657874",
+                "5acb09211139c43b3090489a9da433e8a30ee7188ba8b0a9a1ccf0c229283e53",
+            ),
+        ] {
+            let mut exported = [0u8; 32];
+            ctx.export(&h(context), &mut exported).unwrap();
+            assert_eq!(exported.to_vec(), h(value));
+        }
+    }
+
     /// Same derivation as the G2 gate's fixtures, so values here line up with
     /// the audited conformance vectors.
     fn fixture_bytes<const N: usize>(label: &str) -> [u8; N] {
