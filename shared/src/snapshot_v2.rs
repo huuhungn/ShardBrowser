@@ -13,8 +13,9 @@
 //! and profile rows, the pinned head, the client's accepted epoch, the signer's
 //! capabilities) belong to the caller.
 //!
-//! The legacy flat manifest in [`crate::fleet_manifest`] is still what the
-//! server commit route and the launcher use; these codecs are not wired yet.
+//! The server's v2 upload routes use these codecs; the legacy flat manifest
+//! in [`crate::fleet_manifest`] is still what the launcher and the legacy
+//! commit route use.
 
 use ed25519_dalek::SigningKey;
 
@@ -636,6 +637,147 @@ impl CommitRequestV2 {
     /// `exact_commit_request_bytes_sha256` (plan L557-L558).
     pub fn exact_bytes_sha256(&self) -> &[u8; 32] {
         &self.exact_bytes_sha256
+    }
+}
+
+// ------------------------------------------------------ FinalizeUploadV2 ---
+
+/// Plan L951 request domain.
+pub const DOMAIN_FINALIZE_UPLOAD_REQUEST: &str = "shardx.sync.finalize-upload-request.v2";
+
+/// The `FINALIZE_UPLOAD` payload (plan L951, L1174): the exact manifest and
+/// commit request the client persisted before finalize. Every other field
+/// repeats the request or its manifest, so the request is the one source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeUploadV2 {
+    commit: CommitRequestV2,
+}
+
+impl FinalizeUploadV2 {
+    pub fn new(commit: CommitRequestV2) -> Self {
+        Self { commit }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let (r, m) = (&self.commit, &self.commit.manifest);
+        let p = &m.payload;
+        c::encode(&c::m(vec![
+            ("domain", c::t(DOMAIN_FINALIZE_UPLOAD_REQUEST)),
+            ("version", c::u(VERSION.into())),
+            ("tenant_id", c::b(&p.tenant_id)),
+            ("profile_id", c::b(&p.profile_id)),
+            ("upload_id", c::b(&r.upload_id)),
+            ("snapshot_id", c::b(&p.snapshot_id)),
+            ("manifest_replay_id", c::b(&p.manifest_replay_id)),
+            ("signed_manifest_container_bytes", c::b(&m.exact_bytes)),
+            (
+                "signed_manifest_container_hash",
+                c::b(&m.signed_container_hash),
+            ),
+            (
+                "signed_manifest_container_bytes_sha256",
+                c::b(&m.exact_bytes_sha256),
+            ),
+            ("exact_commit_request_bytes", c::b(&r.exact_bytes)),
+            ("canonical_request_hash", c::b(&r.canonical_request_hash)),
+            (
+                "exact_commit_request_bytes_sha256",
+                c::b(&r.exact_bytes_sha256),
+            ),
+            ("expected_ciphertext_size", c::u(p.ciphertext_size)),
+            ("expected_ciphertext_sha256", c::b(&p.ciphertext_sha256)),
+            ("server_instance_id", c::b(&p.server_instance_id)),
+            ("restore_epoch", c::u(p.restore_epoch)),
+        ]))
+    }
+
+    /// Parses the exact payload: a closed map whose embedded request parses,
+    /// and whose every other field equals that request or its manifest
+    /// (`MANIFEST_REPLAY_MISMATCH` otherwise).
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("FinalizeUploadV2", bytes)?;
+        f.exact_text("domain", DOMAIN_FINALIZE_UPLOAD_REQUEST)?;
+        let version = f.u16("version")?;
+        if version != VERSION {
+            return Err(unsupported("version", version));
+        }
+        let tenant_id = f.fixed::<16>("tenant_id")?;
+        let profile_id = f.fixed::<16>("profile_id")?;
+        let upload_id = f.fixed::<16>("upload_id")?;
+        let snapshot_id = f.fixed::<16>("snapshot_id")?;
+        let manifest_replay_id = f.fixed::<16>("manifest_replay_id")?;
+        let container = f.bytes(
+            "signed_manifest_container_bytes",
+            1,
+            MAX_SIGNED_MANIFEST_CONTAINER_BYTES,
+        )?;
+        let container_hash = f.fixed::<32>("signed_manifest_container_hash")?;
+        let container_sha256 = f.fixed::<32>("signed_manifest_container_bytes_sha256")?;
+        let request = f.bytes("exact_commit_request_bytes", 1, MAX_COMMIT_REQUEST_BYTES)?;
+        let request_hash = f.fixed::<32>("canonical_request_hash")?;
+        let request_sha256 = f.fixed::<32>("exact_commit_request_bytes_sha256")?;
+        let size = f.uint("expected_ciphertext_size")?;
+        let sha256 = f.fixed::<32>("expected_ciphertext_sha256")?;
+        let server_instance_id = f.fixed::<16>("server_instance_id")?;
+        let restore_epoch = f.uint("restore_epoch")?;
+        f.finish()?;
+
+        let commit = CommitRequestV2::parse(&request)?;
+        let (m, p) = (&commit.manifest, &commit.manifest.payload);
+        let copied = [
+            (
+                "signed_manifest_container_bytes",
+                container == m.exact_bytes,
+            ),
+            (
+                "signed_manifest_container_hash",
+                container_hash == m.signed_container_hash,
+            ),
+            (
+                "signed_manifest_container_bytes_sha256",
+                container_sha256 == m.exact_bytes_sha256,
+            ),
+            (
+                "canonical_request_hash",
+                request_hash == commit.canonical_request_hash,
+            ),
+            (
+                "exact_commit_request_bytes_sha256",
+                request_sha256 == commit.exact_bytes_sha256,
+            ),
+            ("tenant_id", tenant_id == p.tenant_id),
+            ("profile_id", profile_id == p.profile_id),
+            ("upload_id", upload_id == commit.upload_id),
+            ("snapshot_id", snapshot_id == p.snapshot_id),
+            (
+                "manifest_replay_id",
+                manifest_replay_id == p.manifest_replay_id,
+            ),
+            ("expected_ciphertext_size", size == p.ciphertext_size),
+            ("expected_ciphertext_sha256", sha256 == p.ciphertext_sha256),
+            (
+                "server_instance_id",
+                server_instance_id == p.server_instance_id,
+            ),
+            ("restore_epoch", restore_epoch == p.restore_epoch),
+        ];
+        if let Some((field, _)) = copied.iter().find(|(_, equal)| !equal) {
+            return Err(SnapshotError::ManifestReplayMismatch(field));
+        }
+        Ok(Self { commit })
+    }
+
+    /// The tenant the request names; equal to its manifest's.
+    pub fn tenant_id(&self) -> &[u8; 16] {
+        &self.commit.manifest.payload.tenant_id
+    }
+
+    pub fn commit(&self) -> &CommitRequestV2 {
+        &self.commit
+    }
+
+    pub fn into_commit(self) -> CommitRequestV2 {
+        self.commit
     }
 }
 
@@ -1601,5 +1743,49 @@ mod tests {
             .verify_signature(&signer_pk())
             .unwrap();
         assert_eq!(v.manifest(), &p);
+    }
+    #[test]
+    fn a_finalize_request_repeats_its_commit_request_exactly() {
+        let r = request(&signed(&payload(0)));
+        let f = FinalizeUploadV2::new(r.clone());
+        let bytes = f.encode();
+        let back = FinalizeUploadV2::parse(&bytes).unwrap();
+        assert_eq!((back.commit(), back.tenant_id()), (&r, &fx("tenant-a")));
+        let other = request(&signed(&payload(1)));
+        for (field, v) in [
+            (
+                "signed_manifest_container_bytes",
+                c::b(other.manifest().exact_bytes()),
+            ),
+            ("signed_manifest_container_hash", c::b(&[1; 32])),
+            ("signed_manifest_container_bytes_sha256", c::b(&[1; 32])),
+            ("canonical_request_hash", c::b(&[1; 32])),
+            ("exact_commit_request_bytes_sha256", c::b(&[1; 32])),
+            ("tenant_id", c::b(&[1; 16])),
+            ("profile_id", c::b(&[1; 16])),
+            ("upload_id", c::b(&[1; 16])),
+            ("snapshot_id", c::b(&[1; 16])),
+            ("manifest_replay_id", c::b(&[1; 16])),
+            ("expected_ciphertext_size", c::u(1)),
+            ("expected_ciphertext_sha256", c::b(&[1; 32])),
+            ("server_instance_id", c::b(&[1; 16])),
+            ("restore_epoch", c::u(1)),
+        ] {
+            let bad = edit_map(&bytes, |e| set(e, field, v));
+            assert_eq!(
+                FinalizeUploadV2::parse(&bad),
+                Err(SnapshotError::ManifestReplayMismatch(field)),
+                "{field}"
+            );
+        }
+        let wrong = edit_map(&bytes, |e| {
+            set(e, "exact_commit_request_bytes", c::b(&[0xa0]))
+        });
+        assert!(matches!(
+            FinalizeUploadV2::parse(&wrong),
+            Err(SnapshotError::Record(_))
+        ));
+        let extra = edit_map(&bytes, |e| set(e, "extra", c::u(1)));
+        assert!(FinalizeUploadV2::parse(&extra).is_err());
     }
 }

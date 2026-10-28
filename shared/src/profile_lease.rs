@@ -1,6 +1,9 @@
 //! Plan 5.6.5 profile lease maps: the `PROFILE_PUBLISH_CREATE` (L948),
-//! `PROFILE_CHECKOUT` (L949) and `RELEASE_LEASE` (L952) payloads and their
-//! stored response payloads, and the lease renew map of L1139/L1143.
+//! `PROFILE_CHECKOUT` (L949), `CREATE_UPLOAD` (L950) and `RELEASE_LEASE`
+//! (L952) payloads, their stored response payloads and the `FINALIZE_UPLOAD`
+//! response (L951), and the lease renew map of L1139/L1143. The
+//! `FINALIZE_UPLOAD` request wraps a commit request, so it is
+//! [`crate::snapshot_v2::FinalizeUploadV2`].
 //!
 //! Built like the maps in `mutation`, and wrapped the same way in an
 //! `IdempotentMutationRequestV2` (renew is not: L913 has no kind for it).
@@ -10,6 +13,7 @@
 
 use crate::authz_record::{Fields, RecordError};
 use crate::canonical::{self as c, Value};
+use crate::envelope_v2::MAX_OBJECT_SIZE;
 use crate::mutation::{exact_version, u32_in, VERSION};
 
 type Result<T> = std::result::Result<T, RecordError>;
@@ -30,6 +34,14 @@ pub const RECORD_TYPE_LEASE_RELEASED: &str = "ReleaseLeaseResponseV2";
 pub const DOMAIN_LEASE_RENEW_REQUEST: &str = "shardx.sync.lease-renew-request.v2";
 pub const DOMAIN_LEASE_RENEW_RESPONSE: &str = "shardx.sync.lease-renew-response.v2";
 const RELEASE_OUTCOME_RELEASED: &str = "released";
+pub const DOMAIN_CREATE_UPLOAD_REQUEST: &str = "shardx.sync.create-upload-request.v2";
+pub const DOMAIN_CREATE_UPLOAD_RESPONSE: &str = "shardx.sync.create-upload-response.v2";
+pub const DOMAIN_FINALIZE_UPLOAD_RESPONSE: &str = "shardx.sync.finalize-upload-response.v2";
+/// Chosen here, like the lease record types above.
+pub const RECORD_TYPE_UPLOAD_CREATED: &str = "CreateUploadResponseV2";
+pub const RECORD_TYPE_UPLOAD_FINALIZED: &str = "FinalizeUploadResponseV2";
+const UPLOAD_STATE_OPEN: &str = "OPEN";
+const UPLOAD_STATE_READY: &str = "READY";
 /// L948 `label_ciphertext:Bytes(1,4096)`.
 pub const MAX_LABEL_CIPHERTEXT: usize = 4096;
 /// L948/L949 `requested_lease_ttl_seconds` in `30..900`.
@@ -270,6 +282,194 @@ impl ProfileLeaseV2 {
         map.push(("server_instance_id", c::b(&self.server_instance_id)));
         map.push(("restore_epoch", c::u(self.restore_epoch)));
         c::encode(&c::m(map))
+    }
+}
+
+// ---------------------------------------------------------- CREATE_UPLOAD ---
+
+/// L950 request: everything an upload binds before its first byte. The
+/// expected size is `1..536870912`, the envelope object cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUploadV2 {
+    pub profile: ProfileRef,
+    pub snapshot_id: [u8; 16],
+    pub manifest_replay_id: [u8; 16],
+    pub lease: LeaseRef,
+    pub intent_hash: [u8; 32],
+    pub preamble_sha256: [u8; 32],
+    pub dek_slot_sha256: [u8; 32],
+    pub fkek_key_id: [u8; 32],
+    pub key_generation: u64,
+    pub expected_ciphertext_size: u64,
+    pub expected_ciphertext_sha256: [u8; 32],
+}
+
+impl CreateUploadV2 {
+    fn take(f: &mut Fields) -> Result<Self> {
+        let profile = ProfileRef::take(f)?;
+        let snapshot_id = f.fixed("snapshot_id")?;
+        let manifest_replay_id = f.fixed("manifest_replay_id")?;
+        let lease = LeaseRef::take(f)?;
+        let intent_hash = f.fixed("intent_hash")?;
+        let preamble_sha256 = f.fixed("preamble_sha256")?;
+        let dek_slot_sha256 = f.fixed("dek_slot_sha256")?;
+        let fkek_key_id = f.fixed("fkek_key_id")?;
+        let key_generation = f.uint("key_generation")?;
+        let expected_ciphertext_size = f.uint("expected_ciphertext_size")?;
+        if !(1..=MAX_OBJECT_SIZE).contains(&expected_ciphertext_size) {
+            return Err(f.bad("expected_ciphertext_size"));
+        }
+        let expected_ciphertext_sha256 = f.fixed("expected_ciphertext_sha256")?;
+        Ok(Self {
+            profile,
+            snapshot_id,
+            manifest_replay_id,
+            lease,
+            intent_hash,
+            preamble_sha256,
+            dek_slot_sha256,
+            fkek_key_id,
+            key_generation,
+            expected_ciphertext_size,
+            expected_ciphertext_sha256,
+        })
+    }
+
+    fn map(&self, domain: &'static str) -> Vec<(&'static str, Value)> {
+        let mut map = self.profile.head(domain);
+        map.push(("snapshot_id", c::b(&self.snapshot_id)));
+        map.push(("manifest_replay_id", c::b(&self.manifest_replay_id)));
+        self.lease.push(&mut map);
+        map.push(("intent_hash", c::b(&self.intent_hash)));
+        map.push(("preamble_sha256", c::b(&self.preamble_sha256)));
+        map.push(("dek_slot_sha256", c::b(&self.dek_slot_sha256)));
+        map.push(("fkek_key_id", c::b(&self.fkek_key_id)));
+        map.push(("key_generation", c::u(self.key_generation)));
+        map.push((
+            "expected_ciphertext_size",
+            c::u(self.expected_ciphertext_size),
+        ));
+        map.push((
+            "expected_ciphertext_sha256",
+            c::b(&self.expected_ciphertext_sha256),
+        ));
+        map
+    }
+
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("CreateUploadV2", payload)?;
+        exact_version(&mut f, DOMAIN_CREATE_UPLOAD_REQUEST)?;
+        let r = Self::take(&mut f)?;
+        f.finish()?;
+        Ok(r)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        c::encode(&c::m(self.map(DOMAIN_CREATE_UPLOAD_REQUEST)))
+    }
+}
+
+/// The L950 response: the same bindings, the server's upload ID and expiry,
+/// at offset 0 in state `OPEN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadCreatedV2 {
+    pub terms: CreateUploadV2,
+    pub upload_id: [u8; 16],
+    pub expires_at_ms: u64,
+    pub server_instance_id: [u8; 16],
+    pub restore_epoch: u64,
+}
+
+impl UploadCreatedV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("UploadCreatedV2", payload)?;
+        exact_version(&mut f, DOMAIN_CREATE_UPLOAD_RESPONSE)?;
+        let terms = CreateUploadV2::take(&mut f)?;
+        let upload_id = f.fixed("upload_id")?;
+        if f.uint("committed_offset")? != 0 {
+            return Err(f.bad("committed_offset"));
+        }
+        f.exact_text("state", UPLOAD_STATE_OPEN)?;
+        let expires_at_ms = f.uint("expires_at_ms")?;
+        let server_instance_id = f.fixed("server_instance_id")?;
+        let restore_epoch = f.uint("restore_epoch")?;
+        f.finish()?;
+        Ok(Self {
+            terms,
+            upload_id,
+            expires_at_ms,
+            server_instance_id,
+            restore_epoch,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut map = self.terms.map(DOMAIN_CREATE_UPLOAD_RESPONSE);
+        map.push(("upload_id", c::b(&self.upload_id)));
+        map.push(("committed_offset", c::u(0)));
+        map.push(("state", c::t(UPLOAD_STATE_OPEN)));
+        map.push(("expires_at_ms", c::u(self.expires_at_ms)));
+        map.push(("server_instance_id", c::b(&self.server_instance_id)));
+        map.push(("restore_epoch", c::u(self.restore_epoch)));
+        c::encode(&c::m(map))
+    }
+}
+
+// -------------------------------------------------------- FINALIZE_UPLOAD ---
+
+/// The L951 response: the upload is `READY` under its immutable size and hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadFinalizedV2 {
+    pub upload_id: [u8; 16],
+    pub snapshot_id: [u8; 16],
+    pub manifest_replay_id: [u8; 16],
+    pub ciphertext_size: u64,
+    pub ciphertext_sha256: [u8; 32],
+    pub object_receipt_id: [u8; 16],
+    pub server_instance_id: [u8; 16],
+    pub restore_epoch: u64,
+}
+
+impl UploadFinalizedV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("UploadFinalizedV2", payload)?;
+        exact_version(&mut f, DOMAIN_FINALIZE_UPLOAD_RESPONSE)?;
+        let upload_id = f.fixed("upload_id")?;
+        let snapshot_id = f.fixed("snapshot_id")?;
+        let manifest_replay_id = f.fixed("manifest_replay_id")?;
+        f.exact_text("state", UPLOAD_STATE_READY)?;
+        let ciphertext_size = f.uint("ciphertext_size")?;
+        let ciphertext_sha256 = f.fixed("ciphertext_sha256")?;
+        let object_receipt_id = f.fixed("object_receipt_id")?;
+        let server_instance_id = f.fixed("server_instance_id")?;
+        let restore_epoch = f.uint("restore_epoch")?;
+        f.finish()?;
+        Ok(Self {
+            upload_id,
+            snapshot_id,
+            manifest_replay_id,
+            ciphertext_size,
+            ciphertext_sha256,
+            object_receipt_id,
+            server_instance_id,
+            restore_epoch,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        c::encode(&c::m(vec![
+            ("domain", c::t(DOMAIN_FINALIZE_UPLOAD_RESPONSE)),
+            ("version", c::u(VERSION)),
+            ("upload_id", c::b(&self.upload_id)),
+            ("snapshot_id", c::b(&self.snapshot_id)),
+            ("manifest_replay_id", c::b(&self.manifest_replay_id)),
+            ("state", c::t(UPLOAD_STATE_READY)),
+            ("ciphertext_size", c::u(self.ciphertext_size)),
+            ("ciphertext_sha256", c::b(&self.ciphertext_sha256)),
+            ("object_receipt_id", c::b(&self.object_receipt_id)),
+            ("server_instance_id", c::b(&self.server_instance_id)),
+            ("restore_epoch", c::u(self.restore_epoch)),
+        ]))
     }
 }
 
@@ -545,6 +745,67 @@ mod tests {
             expires_at_ms: 10,
         };
         assert_eq!(LeaseRenewedV2::parse(&r.encode()).unwrap(), r);
+    }
+
+    fn upload() -> CreateUploadV2 {
+        CreateUploadV2 {
+            profile: P,
+            snapshot_id: [10; 16],
+            manifest_replay_id: [11; 16],
+            lease: L,
+            intent_hash: [12; 32],
+            preamble_sha256: [13; 32],
+            dek_slot_sha256: [14; 32],
+            fkek_key_id: [5; 32],
+            key_generation: 1,
+            expected_ciphertext_size: 4096,
+            expected_ciphertext_sha256: [15; 32],
+        }
+    }
+
+    #[test]
+    fn the_upload_maps_round_trip_and_fix_their_constants() {
+        let u = upload();
+        assert_eq!(CreateUploadV2::parse(&u.encode()).unwrap(), u);
+        for size in [0, MAX_OBJECT_SIZE + 1] {
+            let bad = edit(&u.encode(), |e| {
+                set(e, "expected_ciphertext_size", c::u(size))
+            });
+            assert!(CreateUploadV2::parse(&bad).is_err(), "{size}");
+        }
+        let ok = edit(&u.encode(), |e| {
+            set(e, "expected_ciphertext_size", c::u(MAX_OBJECT_SIZE))
+        });
+        assert!(CreateUploadV2::parse(&ok).is_ok());
+
+        let created = UploadCreatedV2 {
+            terms: u,
+            upload_id: [16; 16],
+            expires_at_ms: 9,
+            server_instance_id: [6; 16],
+            restore_epoch: 1,
+        };
+        let bytes = created.encode();
+        assert_eq!(UploadCreatedV2::parse(&bytes).unwrap(), created);
+        for (field, v) in [("committed_offset", c::u(1)), ("state", c::t("READY"))] {
+            let bad = edit(&bytes, |e| set(e, field, v));
+            assert!(UploadCreatedV2::parse(&bad).is_err(), "{field}");
+        }
+
+        let ready = UploadFinalizedV2 {
+            upload_id: [16; 16],
+            snapshot_id: [10; 16],
+            manifest_replay_id: [11; 16],
+            ciphertext_size: 4096,
+            ciphertext_sha256: [15; 32],
+            object_receipt_id: [17; 16],
+            server_instance_id: [6; 16],
+            restore_epoch: 1,
+        };
+        let bytes = ready.encode();
+        assert_eq!(UploadFinalizedV2::parse(&bytes).unwrap(), ready);
+        let bad = edit(&bytes, |e| set(e, "state", c::t("OPEN")));
+        assert!(UploadFinalizedV2::parse(&bad).is_err());
     }
 
     #[test]

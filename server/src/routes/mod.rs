@@ -15,6 +15,7 @@ pub mod v2_restore_epoch;
 pub mod v2_root;
 pub mod v2_root_grants;
 pub mod v2_trust;
+pub mod v2_uploads;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::Method;
@@ -156,6 +157,36 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v2/profiles/:profile_id/leases/:lease_id/force-expire",
             post(v2_profiles::force_expire_lease),
+        )
+        .route(
+            "/v2/profiles/:profile_id/uploads",
+            post(v2_uploads::create_upload)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/uploads/:upload_id",
+            patch(v2_uploads::patch_upload)
+                .head(v2_uploads::head_upload)
+                .layer(DefaultBodyLimit::max(v2_uploads::MAX_CHUNK_BYTES)),
+        )
+        .route(
+            "/v2/uploads/:upload_id/finalize",
+            post(v2_uploads::finalize_upload)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/uploads/:upload_id/commit",
+            post(v2_uploads::commit_upload).layer(DefaultBodyLimit::max(
+                shared::snapshot_v2::MAX_COMMIT_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/v2/profiles/:profile_id/snapshots/:version",
+            get(v2_uploads::read_snapshot),
+        )
+        .route(
+            "/v2/profiles/:profile_id/snapshots/:version/manifest",
+            get(v2_uploads::read_snapshot_manifest),
         )
         .route(
             "/v2/capability-grants",

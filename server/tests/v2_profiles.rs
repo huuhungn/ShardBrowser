@@ -1913,3 +1913,1174 @@ async fn a_stored_response_naming_another_profile_or_lease_is_never_replayed() {
         expect(&server, &rel, &access, &rel_req, mismatch).await;
     }
 }
+
+// ------------------------------------------------- uploads and commits ---
+//
+// CREATE_UPLOAD, chunks, FINALIZE_UPLOAD and COMMIT (plan 8.1 L1145-L1176,
+// 5.6.2, 5.6.5 L950/L951; G2-23, G2-24).
+
+use shared::canonical::sha256;
+use shared::envelope::{build_dek_slot, IntentIds, IntentNumbers, SlotIds};
+use shared::envelope_v2::{build_intent_v2, seal, MAX_OBJECT_SIZE, MIN_FRAME_PLAINTEXT_SIZE};
+use shared::profile_lease::{
+    CreateUploadV2, UploadCreatedV2, UploadFinalizedV2, RECORD_TYPE_UPLOAD_CREATED,
+    RECORD_TYPE_UPLOAD_FINALIZED,
+};
+use shared::snapshot_v2::{
+    CommitReceiptBindingV2, CommitRequestV2, FinalizeUploadV2, LeaseReleaseOutcome,
+    SignedSnapshotManifestV2, SnapshotManifestV2,
+};
+
+/// The FKEK itself: the server only ever sees its key ID, `FKEK`.
+const FKEK_SECRET: [u8; 32] = [0x3e; 32];
+const DEK: [u8; 32] = [0x2d; 32];
+/// Three 64 KiB frames, the last one short.
+const PLAINTEXT_LEN: usize = 150_000;
+const CHUNK: usize = 65_536;
+
+/// What a client seals and signs for one snapshot of `p` under `lease`.
+#[derive(Clone)]
+struct Snap {
+    object: Vec<u8>,
+    terms: CreateUploadV2,
+    manifest: SnapshotManifestV2,
+}
+
+fn snap(p: ProfileRef, lease: LeaseRef, signer: &Device, tag: u8, prev: Option<[u8; 32]>) -> Snap {
+    let snapshot_id = [tag; 16];
+    let manifest_replay_id = [tag ^ 0xff; 16];
+    let slot = build_dek_slot(
+        &FKEK_SECRET,
+        &DEK,
+        &[tag; shared::keys::WRAP_NONCE_LEN],
+        &SlotIds {
+            tenant_id: &p.tenant_id,
+            fleet_id: &p.fleet_id,
+            profile_id: &p.profile_id,
+            snapshot_id: &snapshot_id,
+            fkek_key_id: &FKEK,
+            envelope_context_nonce: &[tag; 16],
+        },
+        0,
+    )
+    .unwrap();
+    let created_at_ms = now_ms();
+    let intent = build_intent_v2(
+        &IntentIds {
+            snapshot_id,
+            tenant_id: p.tenant_id,
+            fleet_id: p.fleet_id,
+            profile_id: p.profile_id,
+            lease_id: lease.lease_id,
+            manifest_replay_id,
+            server_instance_id: INSTANCE,
+            fkek_key_id: FKEK,
+            intended_signer_signing_key_id: signer.signing_key_id,
+        },
+        &IntentNumbers {
+            target_version: lease.base_version + 1,
+            base_version: lease.base_version,
+            fencing_token: lease.fencing_token,
+            key_generation: 0,
+            restore_epoch: 0,
+            frame_plaintext_size: MIN_FRAME_PLAINTEXT_SIZE,
+            max_plaintext_size: MAX_OBJECT_SIZE,
+            max_ciphertext_size: MAX_OBJECT_SIZE,
+            created_at_ms,
+        },
+        &[tag; 20],
+        prev.as_ref(),
+        &slot,
+    )
+    .unwrap();
+    let plaintext: Vec<u8> = (0..PLAINTEXT_LEN)
+        .map(|i| (i * 7 + usize::from(tag)) as u8)
+        .collect();
+    let mut object = Vec::new();
+    let d = seal(
+        &mut std::io::Cursor::new(plaintext),
+        &mut object,
+        &DEK,
+        &intent,
+        &slot,
+    )
+    .unwrap();
+    let manifest = SnapshotManifestV2 {
+        snapshot_id,
+        tenant_id: p.tenant_id,
+        fleet_id: p.fleet_id,
+        profile_id: p.profile_id,
+        lease_id: lease.lease_id,
+        target_version: lease.base_version + 1,
+        base_version: lease.base_version,
+        fencing_token: lease.fencing_token,
+        key_generation: 0,
+        fkek_key_id: FKEK,
+        preamble_sha256: d.preamble_sha256,
+        intent_hash: intent.intent_hash,
+        dek_slot_sha256: slot.dek_slot_sha256,
+        ciphertext_sha256: d.ciphertext_sha256,
+        ciphertext_size: d.ciphertext_size,
+        previous_signed_head_hash: prev,
+        signer_signing_key_id: signer.signing_key_id,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        manifest_replay_id,
+        created_at_ms,
+    };
+    let terms = CreateUploadV2 {
+        profile: p,
+        snapshot_id,
+        manifest_replay_id,
+        lease,
+        intent_hash: intent.intent_hash,
+        preamble_sha256: d.preamble_sha256,
+        dek_slot_sha256: slot.dek_slot_sha256,
+        fkek_key_id: FKEK,
+        key_generation: 0,
+        expected_ciphertext_size: d.ciphertext_size,
+        expected_ciphertext_sha256: d.ciphertext_sha256,
+    };
+    Snap {
+        object,
+        terms,
+        manifest,
+    }
+}
+
+impl Snap {
+    /// The same snapshot over other bytes: terms and manifest name them.
+    fn with_object(mut self, object: Vec<u8>) -> Self {
+        let (size, sha) = (object.len() as u64, sha256(&object));
+        self.terms.expected_ciphertext_size = size;
+        self.terms.expected_ciphertext_sha256 = sha;
+        self.manifest.ciphertext_size = size;
+        self.manifest.ciphertext_sha256 = sha;
+        self.object = object;
+        self
+    }
+}
+
+fn commit_request(
+    m: &SnapshotManifestV2,
+    signer: &Device,
+    upload: [u8; 16],
+    key: u8,
+    nonce: u8,
+) -> CommitRequestV2 {
+    let signed = SignedSnapshotManifestV2::sign(&signer.sk, m).unwrap();
+    CommitRequestV2::build(&signed, upload, [key; 16], [nonce; 16])
+}
+
+fn upload_req(key: u8, terms: &CreateUploadV2) -> Vec<u8> {
+    outer(OperationKind::CreateUpload, key, terms.encode())
+}
+
+fn finalize_req(key: u8, c: &CommitRequestV2) -> Vec<u8> {
+    outer(
+        OperationKind::FinalizeUpload,
+        key,
+        FinalizeUploadV2::new(c.clone()).encode(),
+    )
+}
+
+fn uploads_path(profile: [u8; 16]) -> String {
+    format!("/v2/profiles/{}/uploads", hex(&profile))
+}
+
+fn upload_path(upload: &[u8; 16], action: &str) -> String {
+    format!("/v2/uploads/{}/{action}", hex(upload))
+}
+
+fn snapshot_path(profile: [u8; 16], version: u64) -> String {
+    format!("/v2/profiles/{}/snapshots/{version}", hex(&profile))
+}
+
+fn checkout_at(key: u8, p: ProfileRef, version: u64, head: Option<[u8; 32]>) -> Vec<u8> {
+    let payload = ProfileCheckoutV2 {
+        profile: p,
+        observed_version: version,
+        observed_signed_head_hash: head,
+        requested_lease_ttl_seconds: 300,
+    };
+    outer(OperationKind::ProfileCheckout, key, payload.encode())
+}
+
+fn created(body: &[u8]) -> UploadCreatedV2 {
+    let stored = IdempotentStoredResponseV2::parse(body).unwrap();
+    assert_eq!(stored.response_record_type, RECORD_TYPE_UPLOAD_CREATED);
+    UploadCreatedV2::parse(&stored.canonical_response_payload_bytes).unwrap()
+}
+
+impl Server {
+    fn staging_file(&self, upload: &[u8; 16]) -> PathBuf {
+        self.data
+            .join("blobs")
+            .join(hex(&TENANT))
+            .join("staging")
+            .join(format!("{}.part", hex(upload)))
+    }
+
+    fn object_file(&self, profile: [u8; 16], snapshot: &[u8; 16]) -> PathBuf {
+        self.data
+            .join("blobs")
+            .join(hex(&TENANT))
+            .join("objects")
+            .join(hex(&profile))
+            .join(format!("{}.bin", hex(snapshot)))
+    }
+
+    /// One chunk at `offset`, under its own digest unless `digest` is given:
+    /// the status, the code and the returned offset.
+    async fn chunk(
+        &self,
+        upload: &[u8; 16],
+        bearer: &str,
+        offset: usize,
+        bytes: &[u8],
+        digest: Option<[u8; 32]>,
+    ) -> (u16, String, Option<u64>) {
+        let r = client()
+            .patch(format!(
+                "http://127.0.0.1:{}/v2/uploads/{}",
+                self.port,
+                hex(upload)
+            ))
+            .header("upload-offset", offset.to_string())
+            .header(
+                "upload-chunk-sha256",
+                hex(&digest.unwrap_or_else(|| sha256(bytes))),
+            )
+            .body(bytes.to_vec())
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        let offset = r
+            .headers()
+            .get("upload-offset")
+            .map(|h| h.to_str().unwrap().parse().unwrap());
+        (status, code(&r.bytes().await.unwrap()), offset)
+    }
+
+    async fn patch(
+        &self,
+        upload: &[u8; 16],
+        bearer: &str,
+        offset: usize,
+        bytes: &[u8],
+    ) -> (u16, String, Option<u64>) {
+        self.chunk(upload, bearer, offset, bytes, None).await
+    }
+
+    /// `HEAD`: the status, and the offset and state it reports.
+    async fn head(&self, upload: &[u8; 16], bearer: &str) -> (u16, Option<(u64, String)>) {
+        let r = client()
+            .head(format!(
+                "http://127.0.0.1:{}/v2/uploads/{}",
+                self.port,
+                hex(upload)
+            ))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        let h = r.headers();
+        let state = h
+            .get("upload-offset")
+            .zip(h.get("upload-state"))
+            .map(|(o, s)| {
+                (
+                    o.to_str().unwrap().parse().unwrap(),
+                    s.to_str().unwrap().to_string(),
+                )
+            });
+        (r.status().as_u16(), state)
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+        bearer: &str,
+        range: Option<&str>,
+    ) -> (u16, reqwest::header::HeaderMap, Vec<u8>) {
+        let mut req = client()
+            .get(format!("http://127.0.0.1:{}{path}", self.port))
+            .bearer_auth(bearer);
+        if let Some(r) = range {
+            req = req.header("range", r);
+        }
+        let r = req.send().await.unwrap();
+        let (status, headers) = (r.status().as_u16(), r.headers().clone());
+        (status, headers, r.bytes().await.unwrap().to_vec())
+    }
+
+    /// Creates the upload of `s` and sends all of `object` from `from`.
+    async fn uploaded(&self, bearer: &str, key: u8, s: &Snap) -> [u8; 16] {
+        let path = uploads_path(s.terms.profile.profile_id);
+        let (status, body) = self.call(&path, bearer, &upload_req(key, &s.terms)).await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        let id = created(&body).upload_id;
+        self.send(&id, bearer, &s.object, 0).await;
+        id
+    }
+
+    async fn send(&self, upload: &[u8; 16], bearer: &str, object: &[u8], from: usize) {
+        for at in (from..object.len()).step_by(CHUNK) {
+            let end = (at + CHUNK).min(object.len());
+            let got = self.patch(upload, bearer, at, &object[at..end]).await;
+            assert_eq!(got, (200, String::new(), Some(end as u64)), "chunk at {at}");
+        }
+    }
+}
+
+/// A refusal whose code is `code` and whose message names `field` first.
+async fn expect_field(
+    server: &Server,
+    path: &str,
+    bearer: &str,
+    body: &[u8],
+    code_want: &str,
+    field: &str,
+) {
+    let (status, got) = server.call(path, bearer, body).await;
+    let error = serde_json::from_slice::<Value>(&got).unwrap_or(Value::Null)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        (status, code(&got).as_str()),
+        (422, code_want),
+        "{field}: {error}"
+    );
+    assert!(error.starts_with(field), "{field}: {error}");
+}
+
+#[tokio::test]
+async fn an_upload_commits_once_and_the_next_checkout_starts_at_its_head() {
+    let mut server = start("commit", 28264).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (K::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (K::Fleet, FLEET)),
+        (0xa3, Capability::ProfileCommit, (K::Fleet, FLEET)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+    let p = pref(P1);
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x01, p))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+
+    // Create-upload binds the terms; its retry returns the same upload.
+    let s1 = snap(p, first.lease, &dev, 0x11, None);
+    let req = upload_req(0x02, &s1.terms);
+    let (status, body) = server.call(&uploads_path(P1), &access, &req).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let up = created(&body);
+    assert_eq!(up.terms, s1.terms);
+    assert_eq!((up.server_instance_id, up.restore_epoch), (INSTANCE, 0));
+    assert!(up.expires_at_ms > now_ms());
+    assert_eq!(
+        server.call(&uploads_path(P1), &access, &req).await,
+        (201, body.clone())
+    );
+    let id = up.upload_id;
+    for q in [
+        "SELECT count(*) FROM v2_uploads WHERE state = 'OPEN' AND committed_offset = 0",
+        "SELECT count(*) FROM v2_audit_events WHERE action = 'profile.create_upload'",
+        "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'CREATE_UPLOAD'",
+    ] {
+        assert_eq!(server.count(q).await, 1, "{q}");
+    }
+
+    // Chunks land at the exact offset under their digest; an old offset is
+    // a duplicate only with the same bytes.
+    let o = &s1.object;
+    let n = o.len();
+    let at = |end: usize| (200, String::new(), Some(end as u64));
+    assert_eq!(server.patch(&id, &access, 0, &o[..CHUNK]).await, at(CHUNK));
+    assert_eq!(server.patch(&id, &access, 0, &o[..CHUNK]).await, at(CHUNK));
+    let mismatch = |got: (u16, String, Option<u64>)| (got.0, got.1);
+    let offset = (409, "UPLOAD_OFFSET_MISMATCH".to_string());
+    assert_eq!(
+        mismatch(server.patch(&id, &access, 0, &o[1..=CHUNK]).await),
+        offset
+    );
+    assert_eq!(
+        mismatch(server.patch(&id, &access, 2 * CHUNK, &o[2 * CHUNK..]).await),
+        offset
+    );
+    assert_eq!(
+        mismatch(
+            server
+                .chunk(&id, &access, CHUNK, &o[CHUNK..2 * CHUNK], Some([1; 32]))
+                .await
+        ),
+        (422, "CIPHERTEXT_HASH_MISMATCH".to_string())
+    );
+    assert_eq!(
+        mismatch(
+            server
+                .patch(&id, &access, CHUNK, &[&o[CHUNK..], &[0][..]].concat())
+                .await
+        ),
+        (413, "SNAPSHOT_TOO_LARGE".to_string())
+    );
+    assert_eq!(
+        server.head(&id, &access).await,
+        (200, Some((CHUNK as u64, "OPEN".to_string())))
+    );
+    // A write that crashed before its offset committed left a tail; resume
+    // drops it.
+    let staging = server.staging_file(&id);
+    let mut tail = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&staging)
+        .unwrap();
+    tail.write_all(&vec![0x5c; n]).unwrap();
+    drop(tail);
+    server.send(&id, &access, o, CHUNK).await;
+    assert_eq!(
+        server.count("SELECT count(*) FROM v2_upload_chunks").await,
+        n.div_ceil(CHUNK) as i64
+    );
+
+    // Finalize: READY under the exact manifest and request, the object
+    // immutable; its retry is the same READY receipt.
+    let c1 = commit_request(&s1.manifest, &dev, id, 0x31, 0x41);
+    let fin = finalize_req(0x03, &c1);
+    let (status, body) = server
+        .call(&upload_path(&id, "finalize"), &access, &fin)
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    assert_eq!(stored.response_record_type, RECORD_TYPE_UPLOAD_FINALIZED);
+    let ready = UploadFinalizedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (ready.upload_id, ready.snapshot_id, ready.manifest_replay_id),
+        (id, s1.terms.snapshot_id, s1.terms.manifest_replay_id)
+    );
+    assert_eq!(
+        (ready.ciphertext_size, ready.ciphertext_sha256),
+        (n as u64, sha256(o))
+    );
+    assert_eq!(
+        server
+            .call(&upload_path(&id, "finalize"), &access, &fin)
+            .await,
+        (200, body)
+    );
+    let object = server.object_file(P1, &s1.terms.snapshot_id);
+    assert_eq!(std::fs::read(&object).unwrap(), *o);
+    assert!(!staging.exists());
+    assert_eq!(
+        server.head(&id, &access).await,
+        (200, Some((n as u64, "READY".to_string())))
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_profiles WHERE current_version = 0")
+            .await,
+        1
+    );
+
+    // Commit: version 1, its signed head, the lease gone, all at once.
+    let commit = upload_path(&id, "commit");
+    let (status, receipt) = server.call(&commit, &access, c1.exact_bytes()).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt));
+    let bound = CommitReceiptBindingV2::parse(&receipt).unwrap();
+    bound.check_binds(&c1).unwrap();
+    assert_eq!(
+        (bound.resulting_version, bound.lease_release_outcome),
+        (1, LeaseReleaseOutcome::Released)
+    );
+    for q in [
+        "SELECT count(*) FROM v2_profiles WHERE current_version = 1",
+        "SELECT count(*) FROM v2_snapshots WHERE version = 1 AND previous_head_hash IS NULL",
+        "SELECT count(*) FROM v2_uploads WHERE state = 'COMMITTED'",
+        "SELECT count(*) FROM v2_audit_events WHERE action = 'profile.commit'",
+        "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'COMMIT'",
+    ] {
+        assert_eq!(server.count(q).await, 1, "{q}");
+    }
+    assert_eq!(
+        server.count("SELECT count(*) FROM v2_profile_leases").await,
+        0
+    );
+    // The retry after the lease is gone gets the same bytes; the same key
+    // with another request is refused.
+    assert_eq!(
+        server.call(&commit, &access, c1.exact_bytes()).await,
+        (201, receipt.clone())
+    );
+    let other = commit_request(&s1.manifest, &dev, id, 0x31, 0x42);
+    expect(
+        &server,
+        &commit,
+        &access,
+        other.exact_bytes(),
+        (409, "IDEMPOTENCY_MISMATCH"),
+    )
+    .await;
+
+    // Readback: the object whole or ranged, and the exact manifest.
+    let (status, headers, bytes) = server.get(&snapshot_path(P1, 1), &access, None).await;
+    assert_eq!((status, bytes == *o), (200, true));
+    assert_eq!(headers["etag"], format!("\"{}\"", hex(&sha256(o))).as_str());
+    assert_eq!(headers["shardx-key-generation"], "0");
+    let (status, headers, bytes) = server
+        .get(&snapshot_path(P1, 1), &access, Some("bytes=10-19"))
+        .await;
+    assert_eq!((status, bytes.as_slice()), (206, &o[10..20]));
+    assert_eq!(
+        headers["content-range"],
+        format!("bytes 10-19/{n}").as_str()
+    );
+    let manifest_path = format!("{}/manifest", snapshot_path(P1, 1));
+    let (status, _, manifest) = server.get(&manifest_path, &access, None).await;
+    assert_eq!(
+        (status, manifest.as_slice()),
+        (200, c1.manifest().exact_bytes())
+    );
+    assert_eq!(
+        server.get(&snapshot_path(P1, 2), &access, None).await.0,
+        404
+    );
+    let head1 = c1.manifest().head_hash();
+
+    // Checkout of version 1 names its stored head.
+    let co = checkout_path(P1);
+    let stale = (409, "BASE_VERSION_MISMATCH");
+    expect(
+        &server,
+        &co,
+        &access,
+        &checkout_at(0x04, p, 1, Some([0x44; 32])),
+        stale,
+    )
+    .await;
+    expect(&server, &co, &access, &checkout(0x05, p, 0), stale).await;
+    let (status, body) = server
+        .call(&co, &access, &checkout_at(0x06, p, 1, Some(head1)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let second = granted(LeaseOrigin::Checkout, &body);
+    assert_eq!(
+        (second.lease.base_version, second.lease.fencing_token),
+        (1, 2)
+    );
+    assert_eq!(second.current_signed_head_hash, Some(head1));
+
+    // Version 2 chains from the stored head, or does not commit.
+    let forked = snap(p, second.lease, &dev, 0x12, Some([0x45; 32]));
+    let fid = server.uploaded(&access, 0x07, &forked).await;
+    let fc = commit_request(&forked.manifest, &dev, fid, 0x32, 0x43);
+    let (status, body) = server
+        .call(
+            &upload_path(&fid, "finalize"),
+            &access,
+            &finalize_req(0x08, &fc),
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    expect(
+        &server,
+        &upload_path(&fid, "commit"),
+        &access,
+        fc.exact_bytes(),
+        stale,
+    )
+    .await;
+    let s2 = snap(p, second.lease, &dev, 0x13, Some(head1));
+    let id2 = server.uploaded(&access, 0x09, &s2).await;
+    // A finalize that crashed after its rename is finished by the next one.
+    server
+        .sql(
+            "UPDATE v2_uploads SET state = 'FINALIZING' WHERE upload_id = ?",
+            &[&id2],
+        )
+        .await;
+    let object2 = server.object_file(P1, &s2.terms.snapshot_id);
+    std::fs::rename(server.staging_file(&id2), &object2).unwrap();
+    let c2 = commit_request(&s2.manifest, &dev, id2, 0x33, 0x44);
+    let (status, body) = server
+        .call(
+            &upload_path(&id2, "finalize"),
+            &access,
+            &finalize_req(0x0a, &c2),
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, receipt2) = server
+        .call(&upload_path(&id2, "commit"), &access, c2.exact_bytes())
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt2));
+    assert_eq!(
+        CommitReceiptBindingV2::parse(&receipt2)
+            .unwrap()
+            .resulting_version,
+        2
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_snapshots WHERE version = 2 AND previous_head_hash IS NOT NULL")
+            .await,
+        1
+    );
+
+    // A stored receipt that does not bind its request is never replayed,
+    // nor one whose snapshot a restore rolled back (ADR 0002 D-1).
+    server
+        .sql("DROP TRIGGER v2_idempotency_succeeded_is_fixed", &[])
+        .await;
+    let forged = CommitReceiptBindingV2 {
+        snapshot_id: [0x77; 16],
+        ..bound.clone()
+    }
+    .encode();
+    let set_receipt = "UPDATE v2_idempotency SET exact_response_bytes = ?
+                        WHERE idempotency_key = ? AND operation_kind = 'COMMIT'";
+    server.sql(set_receipt, &[&forged, &[0x31; 16]]).await;
+    expect(
+        &server,
+        &commit,
+        &access,
+        c1.exact_bytes(),
+        (422, "RECEIPT_MISMATCH"),
+    )
+    .await;
+    server.sql(set_receipt, &[&receipt, &[0x31; 16]]).await;
+    assert_eq!(server.call(&commit, &access, c1.exact_bytes()).await.0, 201);
+    server
+        .sql("DELETE FROM v2_snapshots WHERE version = 1", &[])
+        .await;
+    expect(&server, &commit, &access, c1.exact_bytes(), stale).await;
+}
+
+#[tokio::test]
+async fn every_upload_refusal_has_its_status_and_code() {
+    let mut server = start("upload-refusals", 28265).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (K::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (K::Tenant, TENANT)),
+        (0xa3, Capability::ProfileCommit, (K::Fleet, FLEET)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+    // The peer holds `profile.commit` only through its account, which no
+    // manifest signer may use (ADR 0002 D-2).
+    let (other, other_access) = peer(&server, &dev, 0x7d).await;
+    grant(
+        &server,
+        c,
+        Some(&other),
+        0xa4,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        None,
+        0xa5,
+        Capability::ProfileCommit,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let mut leases = Vec::new();
+    for (key, profile) in [(0x01, P1), (0x02, P2), (0x03, P3), (0x04, P4)] {
+        let (status, body) = server
+            .call(&publish_path(FLEET), &access, &publish(key, pref(profile)))
+            .await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        leases.push(granted(LeaseOrigin::PublishCreate, &body).lease);
+    }
+    let (l1, l2, l3, l4) = (leases[0], leases[1], leases[2], leases[3]);
+    let p1 = pref(P1);
+    let up1 = uploads_path(P1);
+    let s = snap(p1, l1, &dev, 0x11, None);
+    let forbidden = (403, "");
+    let gone = (404, "RESOURCE_NOT_FOUND");
+    let expired = (409, "LEASE_EXPIRED");
+    let no_key = (409, "FLEET_GENERATION_NOT_ACTIVE");
+    let offset = (409, "UPLOAD_OFFSET_MISMATCH");
+    let quarantined = (422, "UPLOAD_QUARANTINED");
+
+    // CREATE_UPLOAD: path, tenant and epoch.
+    let column = (422, "AUTH_CLAIM_COLUMN_MISMATCH");
+    expect(
+        &server,
+        &uploads_path(P2),
+        &access,
+        &upload_req(0x10, &s.terms),
+        column,
+    )
+    .await;
+    let mut t = s.terms.clone();
+    t.profile.tenant_id = [0x99; 16];
+    expect(&server, &up1, &access, &upload_req(0x10, &t), forbidden).await;
+    let epoch = outer_with(
+        OperationKind::CreateUpload,
+        0x10,
+        s.terms.encode(),
+        [0x92; 16],
+        INSTANCE,
+        1,
+    );
+    expect(&server, &up1, &access, &epoch, (409, "STALE_CONTEXT")).await;
+
+    // The caller's own live lease with its exact fence, and a device-scoped
+    // `profile.commit`.
+    let release_path = lease_path(P3, &l3.lease_id, "release");
+    assert_eq!(
+        server
+            .call(&release_path, &access, &release(0x05, pref(P3), l3))
+            .await
+            .0,
+        200
+    );
+    let (status, body) = server
+        .call(
+            &checkout_path(P3),
+            &other_access,
+            &checkout(0x06, pref(P3), 0),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let l3o = granted(LeaseOrigin::Checkout, &body).lease;
+    let theirs = snap(pref(P3), l3o, &other, 0x13, None);
+    expect(
+        &server,
+        &uploads_path(P3),
+        &other_access,
+        &upload_req(0x11, &theirs.terms),
+        forbidden,
+    )
+    .await;
+    let not_mine = snap(pref(P3), l3o, &dev, 0x13, None);
+    expect(
+        &server,
+        &uploads_path(P3),
+        &access,
+        &upload_req(0x12, &not_mine.terms),
+        forbidden,
+    )
+    .await;
+    let stale = snap(
+        p1,
+        LeaseRef {
+            fencing_token: 9,
+            ..l1
+        },
+        &dev,
+        0x11,
+        None,
+    );
+    expect(
+        &server,
+        &up1,
+        &access,
+        &upload_req(0x13, &stale.terms),
+        (409, "FENCE_STALE"),
+    )
+    .await;
+    // A lease ID that is not the profile's current lease.
+    let replaced = LeaseRef {
+        lease_id: [9; 16],
+        ..l1
+    };
+    let replaced = snap(p1, replaced, &dev, 0x11, None);
+    expect(
+        &server,
+        &up1,
+        &access,
+        &upload_req(0x13, &replaced.terms),
+        expired,
+    )
+    .await;
+    let release_path = lease_path(P2, &l2.lease_id, "release");
+    assert_eq!(
+        server
+            .call(&release_path, &access, &release(0x07, pref(P2), l2))
+            .await
+            .0,
+        200
+    );
+    let released = snap(pref(P2), l2, &dev, 0x12, None);
+    expect(
+        &server,
+        &uploads_path(P2),
+        &access,
+        &upload_req(0x14, &released.terms),
+        expired,
+    )
+    .await;
+    server
+        .sql(
+            "UPDATE v2_profile_leases SET expires_at_ms = 1 WHERE profile_id = ?",
+            &[&P4],
+        )
+        .await;
+    let lapsed = snap(pref(P4), l4, &dev, 0x14, None);
+    expect(
+        &server,
+        &uploads_path(P4),
+        &access,
+        &upload_req(0x15, &lapsed.terms),
+        expired,
+    )
+    .await;
+
+    // The fleet's ACTIVE generation and key; an active published profile of
+    // the named fleet.
+    let mut t = s.terms.clone();
+    t.key_generation = 1;
+    expect(&server, &up1, &access, &upload_req(0x16, &t), no_key).await;
+    let mut t = s.terms.clone();
+    t.fkek_key_id = [0xe9; 32];
+    expect(&server, &up1, &access, &upload_req(0x16, &t), no_key).await;
+    let mut t = s.terms.clone();
+    // Another fleet is judged by its own grants first.
+    t.profile.fleet_id = ARCHIVED;
+    expect(&server, &up1, &access, &upload_req(0x16, &t), forbidden).await;
+    let unpublished = snap(pref(P5), l1, &dev, 0x15, None);
+    expect(
+        &server,
+        &uploads_path(P5),
+        &access,
+        &upload_req(0x16, &unpublished.terms),
+        gone,
+    )
+    .await;
+
+    // One snapshot ID and one manifest replay ID per upload.
+    let (status, body) = server
+        .call(&up1, &access, &upload_req(0x17, &s.terms))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let u1 = created(&body).upload_id;
+    let replayed = (422, "SNAPSHOT_REPLAY_MISMATCH");
+    let mut t = s.terms.clone();
+    t.manifest_replay_id = [0x55; 16];
+    expect(&server, &up1, &access, &upload_req(0x18, &t), replayed).await;
+    let mut t = s.terms.clone();
+    t.snapshot_id = [0x56; 16];
+    expect(&server, &up1, &access, &upload_req(0x18, &t), replayed).await;
+
+    // PATCH and HEAD: only the lease holder.
+    let o = &s.object;
+    let n = o.len();
+    let short = |got: (u16, String, Option<u64>)| (got.0, got.1);
+    assert_eq!(
+        short(server.patch(&u1, &other_access, 0, &o[..CHUNK]).await),
+        (403, String::new())
+    );
+    assert_eq!(server.head(&u1, &other_access).await, (403, None));
+    assert_eq!(server.head(&[0x66; 16], &access).await, (404, None));
+    assert_eq!(
+        server.patch(&u1, &access, 0, &o[..CHUNK]).await,
+        (200, String::new(), Some(CHUNK as u64))
+    );
+
+    // FINALIZE_UPLOAD: the whole object, the path, the tenant, the signer
+    // and every binding.
+    let fin = upload_path(&u1, "finalize");
+    let c1 = commit_request(&s.manifest, &dev, u1, 0x30, 0x40);
+    expect(&server, &fin, &access, &finalize_req(0x20, &c1), offset).await;
+    server.send(&u1, &access, o, CHUNK).await;
+    let elsewhere = upload_path(&[0x66; 16], "finalize");
+    expect(
+        &server,
+        &elsewhere,
+        &access,
+        &finalize_req(0x20, &c1),
+        column,
+    )
+    .await;
+    let mut m = s.manifest.clone();
+    m.tenant_id = [0x99; 16];
+    let foreign = commit_request(&m, &dev, u1, 0x30, 0x40);
+    expect(
+        &server,
+        &fin,
+        &access,
+        &finalize_req(0x20, &foreign),
+        forbidden,
+    )
+    .await;
+    let mut m = s.manifest.clone();
+    m.signer_signing_key_id = other.signing_key_id;
+    let by_other = commit_request(&m, &other, u1, 0x30, 0x40);
+    expect(
+        &server,
+        &fin,
+        &access,
+        &finalize_req(0x20, &by_other),
+        (422, "KEY_SUBSTITUTION_DETECTED"),
+    )
+    .await;
+    type Edit = fn(&mut SnapshotManifestV2);
+    let edits: [(&str, Edit); 16] = [
+        ("profile_id", |m| m.profile_id = P2),
+        ("fleet_id", |m| m.fleet_id = ARCHIVED),
+        ("snapshot_id", |m| m.snapshot_id = [1; 16]),
+        ("manifest_replay_id", |m| m.manifest_replay_id = [1; 16]),
+        ("lease_id", |m| m.lease_id = [1; 16]),
+        ("fencing_token", |m| m.fencing_token = 9),
+        ("base_version", |m| {
+            m.base_version = 1;
+            m.target_version = 2;
+            m.previous_signed_head_hash = Some([1; 32]);
+        }),
+        ("intent_hash", |m| m.intent_hash = [1; 32]),
+        ("preamble_sha256", |m| m.preamble_sha256 = [1; 32]),
+        ("dek_slot_sha256", |m| m.dek_slot_sha256 = [1; 32]),
+        ("fkek_key_id", |m| m.fkek_key_id = [1; 32]),
+        ("key_generation", |m| m.key_generation = 1),
+        ("ciphertext_size", |m| m.ciphertext_size -= 1),
+        ("ciphertext_sha256", |m| m.ciphertext_sha256 = [1; 32]),
+        ("server_instance_id", |m| m.server_instance_id = [1; 16]),
+        ("restore_epoch", |m| m.restore_epoch = 1),
+    ];
+    for (field, edit) in edits {
+        let mut m = s.manifest.clone();
+        edit(&mut m);
+        let r = commit_request(&m, &dev, u1, 0x30, 0x40);
+        expect_field(
+            &server,
+            &fin,
+            &access,
+            &finalize_req(0x20, &r),
+            "MANIFEST_REPLAY_MISMATCH",
+            field,
+        )
+        .await;
+    }
+    let revoke = "UPDATE v2_capability_grants SET revoked_at = 't' WHERE replay_id = ?";
+    server.sql(revoke, &[&[0xa3; 16]]).await;
+    expect(&server, &fin, &access, &finalize_req(0x20, &c1), forbidden).await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa6,
+        Capability::ProfileCommit,
+        (K::Profile, P1),
+    )
+    .await;
+    let (status, body) = server.call(&fin, &access, &finalize_req(0x21, &c1)).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    // READY takes no more chunks and no second finalize.
+    assert_eq!(
+        short(server.patch(&u1, &access, 0, &o[..CHUNK]).await),
+        (409, "UPLOAD_OFFSET_MISMATCH".into())
+    );
+    expect(&server, &fin, &access, &finalize_req(0x22, &c1), offset).await;
+
+    // Objects that do not match their terms are quarantined, with evidence.
+    let flipped = {
+        let mut f = snap(p1, l1, &dev, 0x21, None);
+        let terms = f.terms.clone();
+        let manifest = f.manifest.clone();
+        let mut bytes = f.object.clone();
+        bytes[n / 2] ^= 1;
+        f = f.with_object(bytes);
+        f.terms = terms;
+        f.manifest = manifest;
+        f
+    };
+    let trailing = {
+        let f = snap(p1, l1, &dev, 0x22, None);
+        let bytes = [&f.object[..], &[0][..]].concat();
+        f.with_object(bytes)
+    };
+    let mut misnamed = snap(p1, l1, &dev, 0x23, None);
+    misnamed.terms.manifest_replay_id = [0x5a; 16];
+    misnamed.manifest.manifest_replay_id = [0x5a; 16];
+    for (key, f, want) in [
+        (0x19, &flipped, (422, "CIPHERTEXT_HASH_MISMATCH")),
+        (0x1a, &trailing, quarantined),
+        (0x1b, &misnamed, quarantined),
+    ] {
+        let id = server.uploaded(&access, key, f).await;
+        let r = commit_request(&f.manifest, &dev, id, 0x34, 0x40);
+        let path = upload_path(&id, "finalize");
+        expect(&server, &path, &access, &finalize_req(0x23, &r), want).await;
+        expect(
+            &server,
+            &path,
+            &access,
+            &finalize_req(0x23, &r),
+            quarantined,
+        )
+        .await;
+        assert_eq!(server.head(&id, &access).await.1.unwrap().1, "QUARANTINED");
+    }
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'upload.quarantine'")
+            .await,
+        3
+    );
+    // A staging file shorter than the offset, or missing, cannot resume.
+    let truncated = snap(p1, l1, &dev, 0x24, None);
+    let (status, body) = server
+        .call(&up1, &access, &upload_req(0x1c, &truncated.terms))
+        .await;
+    assert_eq!(status, 201);
+    let tid = created(&body).upload_id;
+    assert_eq!(
+        server
+            .patch(&tid, &access, 0, &truncated.object[..CHUNK])
+            .await
+            .0,
+        200
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(server.staging_file(&tid))
+        .unwrap()
+        .set_len(10)
+        .unwrap();
+    let next = &truncated.object[CHUNK..2 * CHUNK];
+    assert_eq!(
+        short(server.patch(&tid, &access, CHUNK, next).await),
+        (422, "UPLOAD_QUARANTINED".into())
+    );
+    assert_eq!(
+        short(server.patch(&tid, &access, CHUNK, next).await),
+        (422, "UPLOAD_QUARANTINED".into())
+    );
+    let missing = snap(p1, l1, &dev, 0x25, None);
+    let (status, body) = server
+        .call(&up1, &access, &upload_req(0x1d, &missing.terms))
+        .await;
+    assert_eq!(status, 201);
+    let mid = created(&body).upload_id;
+    std::fs::remove_file(server.staging_file(&mid)).unwrap();
+    assert_eq!(
+        short(
+            server
+                .patch(&mid, &access, 0, &missing.object[..CHUNK])
+                .await
+        ),
+        (422, "UPLOAD_QUARANTINED".into())
+    );
+
+    // An upload past its expiry is gone (stands in for a day passing).
+    server
+        .sql("DROP TRIGGER v2_uploads_terms_are_fixed", &[])
+        .await;
+    let late = snap(p1, l1, &dev, 0x26, None);
+    let lid = server.uploaded(&access, 0x1e, &late).await;
+    // Complete, for a finalize after the lease lapsed.
+    let unleased = snap(p1, l1, &dev, 0x27, None);
+    let nid = server.uploaded(&access, 0x1f, &unleased).await;
+    server
+        .sql(
+            "UPDATE v2_uploads SET expires_at_ms = 1 WHERE upload_id = ?",
+            &[&lid],
+        )
+        .await;
+    assert_eq!(
+        short(server.patch(&lid, &access, 0, &late.object[..CHUNK]).await),
+        (404, "RESOURCE_NOT_FOUND".into())
+    );
+    let lr = commit_request(&late.manifest, &dev, lid, 0x35, 0x40);
+    expect(
+        &server,
+        &upload_path(&lid, "finalize"),
+        &access,
+        &finalize_req(0x24, &lr),
+        gone,
+    )
+    .await;
+
+    // COMMIT: the exact finalized request, `profile.commit`, the base and
+    // head, the ACTIVE generation and the live lease.
+    let commit = upload_path(&u1, "commit");
+    let renonced = commit_request(&s.manifest, &dev, u1, 0x30, 0x4f);
+    expect_field(
+        &server,
+        &commit,
+        &access,
+        renonced.exact_bytes(),
+        "MANIFEST_REPLAY_MISMATCH",
+        "exact_commit_request_bytes",
+    )
+    .await;
+    server.sql(revoke, &[&[0xa6; 16]]).await;
+    expect(&server, &commit, &access, c1.exact_bytes(), forbidden).await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa7,
+        Capability::ProfileCommit,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let version = |n: u8| format!("UPDATE v2_profiles SET current_version = {n} WHERE id = ?");
+    server.sql(&version(5), &[&P1]).await;
+    expect(
+        &server,
+        &commit,
+        &access,
+        c1.exact_bytes(),
+        (409, "BASE_VERSION_MISMATCH"),
+    )
+    .await;
+    server.sql(&version(0), &[&P1]).await;
+    server
+        .sql(
+            "UPDATE v2_fleet_key_generations SET state = 'RETIRED', retired_at = 't'
+              WHERE fleet_id = ? AND generation = 0",
+            &[&FLEET],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_fleet_key_generations
+                 (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                  root_generation, state, created_at, activated_at)
+             VALUES (?, ?, ?, 1, ?, 0, 'ACTIVE', 't', 't')",
+            &[&INSTANCE, &TENANT, &FLEET, &[0xe1; 32]],
+        )
+        .await;
+    expect(&server, &commit, &access, c1.exact_bytes(), no_key).await;
+    server
+        .sql(
+            "UPDATE v2_profile_leases SET expires_at_ms = 1 WHERE profile_id = ?",
+            &[&P1],
+        )
+        .await;
+    expect(&server, &commit, &access, c1.exact_bytes(), expired).await;
+    let nr = commit_request(&unleased.manifest, &dev, nid, 0x36, 0x40);
+    let nfin = upload_path(&nid, "finalize");
+    expect(&server, &nfin, &access, &finalize_req(0x25, &nr), expired).await;
+
+    // ADR 0002 D-1: an upload from before a restore is gone, and so are the
+    // stored responses that name it.
+    server
+        .sql(
+            "UPDATE v2_uploads SET restore_epoch = 1 WHERE upload_id = ?",
+            &[&u1],
+        )
+        .await;
+    expect(&server, &fin, &access, &finalize_req(0x21, &c1), gone).await;
+    expect(&server, &commit, &access, c1.exact_bytes(), gone).await;
+    expect(&server, &up1, &access, &upload_req(0x17, &s.terms), gone).await;
+    assert_eq!(server.head(&u1, &access).await, (404, None));
+}

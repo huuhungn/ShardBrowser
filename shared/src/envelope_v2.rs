@@ -686,19 +686,13 @@ fn read_vec(r: &mut impl Read, len: usize, rule: &'static str) -> Result<Vec<u8>
     Ok(buf)
 }
 
-/// Open a downloaded object (ADR 0003 reader steps 3-7) into `out`.
-///
-/// Pass 1 hashes the whole object; pass 2 reads the same file again, never a
-/// second download. Plaintext reaches `out` only after the object, preamble,
-/// intent and slot all match `expected`, and the caller promotes `out` only on
-/// `Ok`: a frame that fails later leaves `out` partly written, for the caller
-/// to discard.
-pub fn open<R: Read + Seek>(
+/// Pass 1 and the head of pass 2 (ADR 0003 reader steps 3-6): the object is
+/// the one `expected` names, and its preamble, intent and slot all match it.
+/// Leaves `object` at the first frame.
+fn read_head<R: Read + Seek>(
     object: &mut R,
-    out: &mut impl Write,
-    fkek: &[u8; 32],
     expected: &Expected<'_>,
-) -> Result<OpenOutcome, EnvelopeError> {
+) -> Result<(Preamble, [u8; 32], EnvelopeIntentV2, DekSlotV2), EnvelopeError> {
     // Pass 1: the exact object the manifest names, before reading any field.
     if expected.ciphertext_size > MAX_OBJECT_SIZE {
         return Err(EnvelopeError::Malformed("object exceeds the size cap"));
@@ -749,6 +743,87 @@ pub fn open<R: Read + Seek>(
         return Err(EnvelopeError::Mismatch("dek_slot_sha256"));
     }
     let slot = bind_slot(&slot_bytes, &view)?;
+    Ok((pre, intent_hash, view, slot))
+}
+
+/// One frame header's rules: its kind, its counter, the frame budget of
+/// `max_plaintext_size`, and its length. Returns whether it is FINAL and its
+/// ciphertext length.
+fn frame_head(
+    head: &[u8; FRAME_HEADER_LEN as usize],
+    counter: u32,
+    max_frames: u64,
+    size: usize,
+) -> Result<(bool, usize), EnvelopeError> {
+    let is_final = match head[0] {
+        KIND_DATA => false,
+        KIND_FINAL => true,
+        _ => return Err(EnvelopeError::Malformed("frame kind")),
+    };
+    let frame_counter = u32::from_be_bytes([head[1], head[2], head[3], head[4]]);
+    if frame_counter != counter {
+        return Err(EnvelopeError::Malformed("frame counter"));
+    }
+    if u64::from(counter) >= max_frames {
+        return Err(EnvelopeError::Malformed(
+            "frame counter beyond max_plaintext_size",
+        ));
+    }
+    let ciphertext_len = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) as usize;
+    if is_final && !(TAG_LEN + 1..=size + TAG_LEN).contains(&ciphertext_len) {
+        return Err(EnvelopeError::Malformed("FINAL frame length"));
+    }
+    if !is_final && ciphertext_len != size + TAG_LEN {
+        return Err(EnvelopeError::Malformed("DATA frame length"));
+    }
+    Ok((is_final, ciphertext_len))
+}
+
+/// What a server checks without the FKEK (plan L1170): everything [`open`]
+/// checks before the DEK unwrap, then the DATA/FINAL framing up to the exact
+/// end of the object, without decrypting. Returns the intent, for the
+/// caller's own bindings.
+pub fn check_public<R: Read + Seek>(
+    object: &mut R,
+    expected: &Expected<'_>,
+) -> Result<EnvelopeIntentV2, EnvelopeError> {
+    let (pre, _, view, _) = read_head(object, expected)?;
+    let size = pre.frame_plaintext_size as usize;
+    let max_frames = view.max_plaintext_size.div_ceil(size as u64);
+    let mut at = object.stream_position()?;
+    let mut counter: u32 = 0;
+    loop {
+        let mut head = [0u8; FRAME_HEADER_LEN as usize];
+        read_exact_or(object, &mut head, "missing FINAL frame")?;
+        let (is_final, ciphertext_len) = frame_head(&head, counter, max_frames, size)?;
+        // A frame past the end leaves no next header, or fails the end check.
+        at += FRAME_HEADER_LEN + ciphertext_len as u64;
+        object.seek(SeekFrom::Start(at))?;
+        if is_final {
+            break;
+        }
+        counter += 1;
+    }
+    if at != expected.ciphertext_size {
+        return Err(EnvelopeError::Malformed("bytes after the FINAL frame"));
+    }
+    Ok(view)
+}
+
+/// Open a downloaded object (ADR 0003 reader steps 3-7) into `out`.
+///
+/// Pass 1 hashes the whole object; pass 2 reads the same file again, never a
+/// second download. Plaintext reaches `out` only after the object, preamble,
+/// intent and slot all match `expected`, and the caller promotes `out` only on
+/// `Ok`: a frame that fails later leaves `out` partly written, for the caller
+/// to discard.
+pub fn open<R: Read + Seek>(
+    object: &mut R,
+    out: &mut impl Write,
+    fkek: &[u8; 32],
+    expected: &Expected<'_>,
+) -> Result<OpenOutcome, EnvelopeError> {
+    let (pre, intent_hash, view, slot) = read_head(object, expected)?;
     let dek = unwrap_dek(
         fkek,
         &slot.wrap_nonce_bytes,
@@ -768,27 +843,7 @@ pub fn open<R: Read + Seek>(
     loop {
         let mut head = [0u8; FRAME_HEADER_LEN as usize];
         read_exact_or(object, &mut head, "missing FINAL frame")?;
-        let is_final = match head[0] {
-            KIND_DATA => false,
-            KIND_FINAL => true,
-            _ => return Err(EnvelopeError::Malformed("frame kind")),
-        };
-        let frame_counter = u32::from_be_bytes([head[1], head[2], head[3], head[4]]);
-        if frame_counter != counter {
-            return Err(EnvelopeError::Malformed("frame counter"));
-        }
-        if u64::from(counter) >= max_frames {
-            return Err(EnvelopeError::Malformed(
-                "frame counter beyond max_plaintext_size",
-            ));
-        }
-        let ciphertext_len = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) as usize;
-        if is_final && !(TAG_LEN + 1..=size + TAG_LEN).contains(&ciphertext_len) {
-            return Err(EnvelopeError::Malformed("FINAL frame length"));
-        }
-        if !is_final && ciphertext_len != size + TAG_LEN {
-            return Err(EnvelopeError::Malformed("DATA frame length"));
-        }
+        let (is_final, ciphertext_len) = frame_head(&head, counter, max_frames, size)?;
         let ciphertext = read_vec(object, ciphertext_len, "frame ciphertext")?;
         let aad = frame_aad(&intent_hash, counter, is_final);
         let payload = Payload {
@@ -980,6 +1035,65 @@ mod tests {
             },
         );
         (result, out)
+    }
+
+    /// [`check_public`] of `object` against the manifest fields it has as it is.
+    fn public_rule(f: &Fixture, object: &[u8]) -> String {
+        let e = exp_for(f, object);
+        let r = check_public(
+            &mut Cursor::new(object),
+            &Expected {
+                ciphertext_sha256: &e.sha,
+                ciphertext_size: e.size,
+                preamble_sha256: &e.pre,
+                intent_hash: &e.intent,
+                dek_slot_sha256: &e.slot,
+                scope: &e.scope,
+            },
+        );
+        match r {
+            Ok(view) => {
+                assert_eq!(
+                    view,
+                    EnvelopeIntentV2::parse(&f.intent.exact_intent_bytes).unwrap()
+                );
+                "ok".into()
+            }
+            Err(e) => rule_of(Err(e)),
+        }
+    }
+
+    /// The server's check (plan L1170) walks the frames to the exact end
+    /// without the FKEK, and refuses what `open` would refuse there.
+    #[test]
+    fn the_public_check_walks_the_framing_to_the_exact_end() {
+        let f = fixture();
+        let (object, _) = seal_vec(&f, &plaintext(2 * FRAME as usize + 1));
+        assert_eq!(public_rule(&f, &object), "ok");
+        let first =
+            PREAMBLE_LEN + f.intent.exact_intent_bytes.len() + f.slot.exact_slot_bytes.len();
+        let last = first + 2 * (9 + FRAME as usize + TAG_LEN);
+        let with = |at: usize, byte: u8| {
+            let mut o = object.clone();
+            o[at] = byte;
+            o
+        };
+        for (o, rule) in [
+            (
+                [&object[..], &[0]].concat(),
+                "malformed bytes after the FINAL frame",
+            ),
+            (
+                object[..object.len() - 1].to_vec(),
+                "malformed bytes after the FINAL frame",
+            ),
+            (object[..last].to_vec(), "malformed missing FINAL frame"),
+            (with(first, 2), "malformed frame kind"),
+            (with(first + 4, 1), "malformed frame counter"),
+            (with(first + 8, 0), "malformed DATA frame length"),
+        ] {
+            assert_eq!(public_rule(&f, &o), rule);
+        }
     }
 
     fn rule_of(r: Result<OpenOutcome, EnvelopeError>) -> String {
