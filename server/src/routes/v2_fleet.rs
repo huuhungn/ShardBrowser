@@ -46,7 +46,7 @@ use super::v2_root::{
     insert_row, ledger_row, mismatch, record_error, row_holds, same_request, stale, store_response,
     stored_payload, stored_response, Col,
 };
-use super::v2_root_grants::{at, is_active_custodian, outer_request};
+use super::v2_root_grants::{at, is_active_custodian, outer_request, wraps_under};
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::state::AppState;
@@ -944,13 +944,19 @@ pub async fn file_fleet_grant(
             }
         }
         Payload::RecoveryGrant(p) => {
-            // shortcut: only the ACTIVE root is a recipient; the D-5 rewrap
-            // under a PREPARING root comes with root rotation.
-            if !is_active_custodian(&mut tx, v, &s, now).await?
-                || active_root(&mut tx, v, &s.tenant_id).await?
-                    != Some((p.recipient_root_generation, p.recipient_root_key_id))
-            {
+            let recipient = (p.recipient_root_generation, p.recipient_root_key_id);
+            if !wraps_under(&mut tx, v, &s, recipient, now).await? {
                 return Err(AppError::Forbidden);
+            }
+            // A PREPARING generation activates under the ACTIVE root, so its
+            // recovery grant is under that root, never a PREPARING one.
+            if gen.state == "PREPARING"
+                && active_root(&mut tx, v, &s.tenant_id).await? != Some(recipient)
+            {
+                return Err(conflict(
+                    "FLEET_GRANTS_INCOMPLETE",
+                    "a PREPARING fleet generation's recovery grant goes under the ACTIVE root",
+                ));
             }
         }
         Payload::RotationGrant(p) => {
@@ -1242,12 +1248,9 @@ pub async fn ack_fleet_grant(
                 && p.subject_signing_key_id == s.signing_key_id
                 && p.recipient_hpke_key_id == s.hpke_key_id
         }
-        // shortcut: only a custodian of the ACTIVE recipient root acks; the
-        // PREPARING-root case comes with root rotation (D-5).
         Payload::RecoveryGrant(p) => {
-            is_active_custodian(&mut tx, v, &s, now).await?
-                && active_root(&mut tx, v, &s.tenant_id).await?
-                    == Some((p.recipient_root_generation, p.recipient_root_key_id))
+            let recipient = (p.recipient_root_generation, p.recipient_root_key_id);
+            wraps_under(&mut tx, v, &s, recipient, now).await?
         }
         Payload::RotationGrant(_) => {
             holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::KeyRotate, now).await?
@@ -1366,6 +1369,53 @@ async fn live_acked_grants(
         }
     }
     Ok(out)
+}
+
+/// ADR 0002 D-5: every fleet generation of the tenant, ACTIVE, RETIRED and
+/// kept, or PREPARING, has an acknowledged, live RecoveryGrant under `root`.
+/// A PREPARING one never has (its recovery grant is under the ACTIVE root),
+/// so a root rotation waits for it to activate: once that root is RETIRED it
+/// never could.
+///
+/// shortcut: a quarantined fleet grant refuses the whole check, so it blocks
+/// the tenant's root rotation until the row is resolved; upgrade when a
+/// quarantined grant can be cleared.
+pub(super) async fn fleet_keys_wrapped_under(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    root: (u64, [u8; 32]),
+    now: i64,
+) -> Result<bool, AppError> {
+    let rows = sqlx::query(
+        "SELECT fleet_id, generation FROM v2_fleet_key_generations
+          WHERE server_instance_id = ? AND tenant_id = ?",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in rows {
+        let fleet = blob::<16>(&row, "fleet_id")?;
+        let generation = u64::try_from(row.get::<i64, _>("generation")).map_err(|_| integrity())?;
+        let grants = live_acked_grants(
+            conn,
+            v,
+            s,
+            FleetGrantVariant::Recovery,
+            &fleet,
+            generation,
+            now,
+        )
+        .await?;
+        if !grants.iter().any(|g| {
+            matches!(&g.payload, Payload::RecoveryGrant(p)
+                if (p.recipient_root_generation, p.recipient_root_key_id) == root)
+        }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// `POST .../key-generations/{generation}/activate`: PREPARING -> ACTIVE, and
@@ -1512,13 +1562,18 @@ pub async fn activate_fleet_generation(
             "the acknowledged device grants are not the generation's required set",
         ));
     }
-    if !recovery
-        .iter()
-        .any(|g| g.signed_container_hash == t.recovery_grant_signed_container_hash)
-    {
+    // The recovery grant is under the root ACTIVE now, not one since retired.
+    // Filing and root activation keep this true, so no request reaches it;
+    // it stays as the invariant the fleet key depends on.
+    let active = active_root(&mut tx, v, &s.tenant_id).await?;
+    if !recovery.iter().any(|g| {
+        g.signed_container_hash == t.recovery_grant_signed_container_hash
+            && matches!(&g.payload, Payload::RecoveryGrant(p)
+                if active == Some((p.recipient_root_generation, p.recipient_root_key_id)))
+    }) {
         return Err(conflict(
             "FLEET_GRANTS_INCOMPLETE",
-            "the generation's recovery grant is not acknowledged",
+            "the generation's recovery grant is not acknowledged under the ACTIVE root",
         ));
     }
     if let Some(r) = rotation {

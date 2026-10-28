@@ -6588,8 +6588,9 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
         (409, "ROOT_GENERATION_MISMATCH")
     );
 
-    // D-5: a fleet generation in any state has no recovery grant under the
-    // new root, so it keeps a rotation from being created or activated.
+    // D-5: a rotation is created while a fleet generation holds its key under
+    // the ACTIVE root, but activates only once that key is rewrapped under
+    // the new root.
     let trk2 = [0x7f; 32];
     let grant2 = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe9, &trk2, 2, after1);
     let target2 = rotation_target(&trk2, 2, &[grant2.as_slice()]);
@@ -6600,25 +6601,14 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
             &[&FLEET, &TENANT],
         )
         .await;
-    let fleet_generation = "INSERT INTO v2_fleet_key_generations
-         (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
-          root_generation, state, created_at)
-     VALUES (?, ?, ?, 0, ?, 1, 'PREPARING', 'now')";
     server
-        .sql(fleet_generation, &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]])
-        .await;
-    let early = rotation_create(0xe6, target2.clone(), gen1);
-    let (status, body) = server.root(&TENANT, &access, &early).await;
-    assert_eq!(
-        (status, code_of(&body).as_str()),
-        (409, "ROOT_GENERATION_MISMATCH")
-    );
-    // Behind the trigger's back, so the same tenant can go on.
-    server
-        .sql("DROP TRIGGER v2_fleet_key_generations_no_delete", &[])
-        .await;
-    server
-        .sql("DELETE FROM v2_fleet_key_generations", &[])
+        .sql(
+            "INSERT INTO v2_fleet_key_generations
+                 (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                  root_generation, state, created_at, activated_at)
+             VALUES (?, ?, ?, 0, ?, 1, 'ACTIVE', 'now', 'now')",
+            &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]],
+        )
         .await;
     let create2 = rotation_create(0xe2, target2.clone(), gen1);
     assert_eq!(server.root(&TENANT, &access, &create2).await.0, 201);
@@ -6638,10 +6628,6 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
             .0,
         201
     );
-    // A fleet generation still PREPARING after the create blocks it too.
-    server
-        .sql(fleet_generation, &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]])
-        .await;
     let request = rotation_activate(0xe5, target2, gen1);
     let (status, body) = server
         .call(&activate_path("2"), &access, Some(&request))
@@ -7043,4 +7029,414 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
         (409, "STALE_CONTEXT".into())
     );
     assert_eq!(server.call(&path, &peer_access, None).await, (200, signed));
+}
+
+/// D-5: a root rotation activates once every retained fleet generation has an
+/// acknowledged RecoveryGrant under the new root, wrapped by a custodian of
+/// the ACTIVE root that holds the new one; a fleet generation then activates
+/// only under the root that is ACTIVE.
+#[tokio::test]
+async fn a_root_rotation_rewraps_every_retained_fleet_key_before_it_activates() {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, RotationGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationActivateV2, FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+        FleetRotation,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let mut server = start("d5-rewrap", 28222).await;
+    let (a, access, _) = custodian(&mut server, 0x6a).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    for (replay, capability) in [
+        (0xa6, Capability::DeviceApprove),
+        (0xa7, Capability::FleetManage),
+        (0xa8, Capability::KeyRotate),
+    ] {
+        let grant = capability_grant(&a, &a.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let gen_ref = |generation: u64, fkek: [u8; 32]| FleetGenerationRef {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        fleet_id: FLEET,
+        generation,
+        fkek_key_id: fkek,
+    };
+    let device_grant = |replay: u8, generation: u64, fkek: [u8; 32]| {
+        let g = DeviceHpkeGrantV2 {
+            common: fleet_common(replay, 365),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation,
+            subject_account_id: OWNER,
+            subject_device_id: a.id,
+            subject_signing_key_id: a.signing_key_id,
+            recipient_hpke_key_id: a.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    };
+    // A wrap of generation 0's key under `root`, signed by `by`.
+    let rewrap = |by: &Device, replay: u8, root: (u64, [u8; 32])| {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(replay, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: [0xe0; 32],
+            generation: 0,
+            recipient_root_key_id: root.1,
+            recipient_root_generation: root.0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&by.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    let path = fleet_generation_path();
+    macro_rules! file {
+        ($who:expr, $key:expr, $generation:expr, $fkek:expr, $variant:expr, $replay:expr, $c:expr) => {{
+            let request = fleet_grant_request($key, $generation, $fkek, $variant, $replay, $c);
+            server
+                .call(&fleet_grants_path($generation), $who, Some(&request))
+                .await
+                .0
+        }};
+    }
+    macro_rules! ack {
+        ($who:expr, $key:expr, $generation:expr, $fkek:expr, $variant:expr, $replay:expr, $c:expr) => {{
+            let grant = fleet_grant_ref($generation, $fkek, $variant, $replay, $c);
+            let request = lifecycle_request(
+                OperationKind::FleetGrantAck,
+                $key,
+                FleetKeyGrantAckV2 { grant }.encode(),
+            );
+            let ack_path = format!("{path}/{}/ack", $generation);
+            server.call(&ack_path, $who, Some(&request)).await.0
+        }};
+    }
+    let activate = |key: u8, terms: FleetGenerationTerms| {
+        lifecycle_request(
+            OperationKind::FleetGenerationActivate,
+            key,
+            FleetKeyGenerationActivateV2 { terms }.encode(),
+        )
+    };
+    let k0 = shared::keys::root_key_id(&TRK);
+    let root0 = (0, k0);
+
+    // Fleet generation 0 is ACTIVE, its key wrapped under root 0.
+    let (fkek0, fkek1) = ([0xe0; 32], [0xe1; 32]);
+    let (device0, recovery0) = (device_grant(0xd0, 0, fkek0), rewrap(&a, 0xd1, root0));
+    let terms0 = FleetGenerationTerms {
+        generation: gen_ref(0, fkek0),
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device0)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery0),
+        rotation: None,
+    };
+    let create0 = FleetKeyGenerationCreateV2 {
+        terms: terms0,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create0.encode());
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    assert_eq!(
+        file!(&access, 0xb1, 0, fkek0, V::DeviceHpke, 0xd0, &device0),
+        201
+    );
+    assert_eq!(
+        file!(&access, 0xb2, 0, fkek0, V::Recovery, 0xd1, &recovery0),
+        201
+    );
+    assert_eq!(
+        ack!(&access, 0xb4, 0, fkek0, V::DeviceHpke, 0xd0, &device0),
+        201
+    );
+    assert_eq!(
+        ack!(&access, 0xb5, 0, fkek0, V::Recovery, 0xd1, &recovery0),
+        201
+    );
+    let activate0_path = format!("{path}/0/activate");
+    let request = activate(0xb3, terms0);
+    assert_eq!(
+        server
+            .call(&activate0_path, &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+
+    // Fleet generation 1 is fully acknowledged but stays PREPARING, its
+    // recovery grant under root 0.
+    let device1 = device_grant(0xd5, 1, fkek1);
+    let recovery1 = {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(0xd6, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            recipient_root_key_id: k0,
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    let set1 = fleet_device_grant_set_hash(&[container_hash(&device1)]).unwrap();
+    let rotation1 = {
+        let common = fleet_common(0xd7, 30);
+        let g = RotationGrantV2 {
+            activation_not_before_ms: common.not_before_ms,
+            common,
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            previous_fkek_key_id: fkek0,
+            previous_generation: 0,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: set1,
+            recovery_grant_signed_container_hash: container_hash(&recovery1),
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &g.encode())
+    };
+    let terms1 = FleetGenerationTerms {
+        generation: gen_ref(1, fkek1),
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: set1,
+        recovery_grant_signed_container_hash: container_hash(&recovery1),
+        rotation: Some(FleetRotation {
+            previous_generation: 0,
+            previous_fkek_key_id: fkek0,
+            rotation_grant_signed_container_hash: container_hash(&rotation1),
+        }),
+    };
+    let create1 = FleetKeyGenerationCreateV2 {
+        terms: terms1,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc0, create1.encode());
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    for (key, variant, replay, c) in [
+        (0xc1, V::DeviceHpke, 0xd5, &device1),
+        (0xc2, V::Recovery, 0xd6, &recovery1),
+        (0xc3, V::Rotation, 0xd7, &rotation1),
+    ] {
+        assert_eq!(file!(&access, key, 1, fkek1, variant, replay, c), 201);
+    }
+    for (key, variant, replay, c) in [
+        (0xc4, V::DeviceHpke, 0xd5, &device1),
+        (0xc5, V::Recovery, 0xd6, &recovery1),
+        (0xc6, V::Rotation, 0xd7, &rotation1),
+    ] {
+        assert_eq!(ack!(&access, key, 1, fkek1, variant, replay, c), 201);
+    }
+
+    // B will hold root 1 only; C holds root 0 only.
+    let joined = |seed: u8, approval_replay: u8| {
+        let server = &server;
+        let a = &a;
+        let access = &access;
+        async move {
+            let d = device(server, OWNER, seed, "pending").await;
+            session(server, &d).await;
+            let rec = approval(&d, &a.sk, approval_replay, 0, 30);
+            assert_eq!(server.approve(&d.id, access, &rec).await.0, 201);
+            let token = session(server, &d).await["access_token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            (d, token)
+        }
+    };
+    let (b, b_access) = joined(0x5b, 0x5c).await;
+    let (c, c_access) = joined(0x5d, 0x5e).await;
+    let to_c = existing_root_grant(&a, &c, 0x5e, 0x96);
+    let request = root_grant_create_request(0xc8, &a, &to_c);
+    assert_eq!(
+        server
+            .call(&root_grants_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let request = ack_request(0xc9, grant_ref(&a, &to_c));
+    let c_ack = format!("{}/ack", grant_path("0", &[0x96; 16]));
+    assert_eq!(server.call(&c_ack, &c_access, Some(&request)).await.0, 201);
+
+    // The tenant's fleet keys no longer keep a rotation from being created.
+    let gen0 = PreviousRoot {
+        root_key_id: k0,
+        root_generation: 0,
+    };
+    let after0 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: k0,
+        previous_root_generation: 0,
+    };
+    let trk1 = [0x7d; 32];
+    let k1 = shared::keys::root_key_id(&trk1);
+    let root1 = (1, k1);
+    let grant_a = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe1, &trk1, 1, after0);
+    let grant_b = root_grant_of(&a, &b, 0x5c, 0xe2, &trk1, 1, after0);
+    let target = rotation_target(&trk1, 1, &[grant_a.as_slice(), grant_b.as_slice()]);
+    let create = rotation_create(0xd1, target.clone(), gen0);
+    let (status, body) = server.root(&TENANT, &access, &create).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let grants1 = format!("/v2/tenants/{}/root-key-generations/1/grants", hex(&TENANT));
+    for (key, grant) in [(0xd8, &grant_a), (0xd9, &grant_b)] {
+        let request = root_grant_create_request(key, &a, grant);
+        assert_eq!(server.call(&grants1, &access, Some(&request)).await.0, 201);
+    }
+    for (key, grant, replay, who) in [
+        (0xda, &grant_a, 0xe1, &access),
+        (0xdc, &grant_b, 0xe2, &b_access),
+    ] {
+        let request = ack_request(key, grant_ref(&a, grant));
+        let ack_path = format!("{}/ack", grant_path("1", &[replay; 16]));
+        assert_eq!(server.call(&ack_path, who, Some(&request)).await.0, 201);
+    }
+
+    // ACTIVE fleet generation 0 has no recovery grant under root 1 yet.
+    let activate_root = rotation_activate(0xdb, target.clone(), gen0);
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    // The rewrap names root 1 exactly and comes from a custodian of root 0
+    // that holds root 1: not B (root 1 only), not C (root 0 only).
+    for (who, by, key, replay, root) in [
+        (&access, &a, 0xf0, 0xf1, (1, [0x33; 32])),
+        (&access, &a, 0xf2, 0xf3, (0, k1)),
+        (&b_access, &b, 0xf4, 0xf5, root1),
+        (&c_access, &c, 0xf6, 0xf7, root1),
+    ] {
+        let wrap = rewrap(by, replay, root);
+        assert_eq!(file!(who, key, 0, fkek0, V::Recovery, replay, &wrap), 403);
+    }
+    let rewrapped = rewrap(&a, 0xf9, root1);
+    assert_eq!(
+        file!(&access, 0xf8, 0, fkek0, V::Recovery, 0xf9, &rewrapped),
+        201
+    );
+    // Nor does C acknowledge it.
+    assert_eq!(
+        ack!(&c_access, 0xe6, 0, fkek0, V::Recovery, 0xf9, &rewrapped),
+        403
+    );
+    assert_eq!(
+        ack!(&access, 0xe7, 0, fkek0, V::Recovery, 0xf9, &rewrapped),
+        201
+    );
+
+    // Generation 1 is still PREPARING: its recovery grant stays under the
+    // ACTIVE root, and the root waits for it.
+    let early = {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(0xfd, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            recipient_root_key_id: k1,
+            recipient_root_generation: 1,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    assert_eq!(
+        file!(&access, 0xfc, 1, fkek1, V::Recovery, 0xfd, &early),
+        409
+    );
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    let request = activate(0xea, terms1);
+    let (status, body) = server
+        .call(&format!("{path}/1/activate"), &access, Some(&request))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // Generation 1 is ACTIVE now and generation 0 RETIRED: both need a
+    // rewrap, and only an acknowledged one counts.
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    let rewrapped1 = {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(0xee, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            recipient_root_key_id: k1,
+            recipient_root_generation: 1,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    assert_eq!(
+        file!(&access, 0xed, 1, fkek1, V::Recovery, 0xee, &rewrapped1),
+        201
+    );
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    assert_eq!(
+        ack!(&access, 0xec, 1, fkek1, V::Recovery, 0xee, &rewrapped1),
+        201
+    );
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 0 AND state = 'RETIRED'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 1 AND state = 'ACTIVE'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+
+    // Root 0 is RETIRED: nothing is wrapped under it any more.
+    let late = rewrap(&a, 0xfb, root0);
+    assert_eq!(
+        file!(&access, 0xfa, 0, fkek0, V::Recovery, 0xfb, &late),
+        403
+    );
 }
