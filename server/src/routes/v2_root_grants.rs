@@ -34,7 +34,7 @@ use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sol
 use super::v2_auth::{
     audit, blob, reload_session, revoke_session, unhex, verified, Principal, Session,
 };
-use super::v2_fleet::{active_root, holds_capability};
+use super::v2_fleet::{active_root, fleet_keys_wrapped_under, holds_capability};
 use super::v2_root::{
     grant_row_matches, insert_grant, ledger_row, mismatch, record_error, same_request, stale,
     store_response, stored_payload, stored_response, MAX_ROOT_GRANT_TTL_MS, MAX_ROOT_REQUEST_BODY,
@@ -51,34 +51,6 @@ fn not_found() -> AppError {
         "RESOURCE_NOT_FOUND",
         "no such root grant or generation",
     )
-}
-
-/// D-5: no FKEK may be left reachable only through a RETIRED root. A fleet
-/// generation in any state holds its key under the ACTIVE root, so its
-/// tenant cannot rotate.
-///
-/// shortcut: a RecoveryGrant under a PREPARING root cannot be filed yet
-/// (v2_fleet), so any fleet generation blocks a rotation; check each one's
-/// acknowledged RecoveryGrant under `N + 1` when the D-5 rewrap lands.
-pub(super) async fn refuse_with_fleet_keys(
-    conn: &mut SqliteConnection,
-    v: &Verified,
-    tenant: &[u8; 16],
-) -> Result<(), AppError> {
-    let held: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_fleet_key_generations
-                         WHERE server_instance_id = ? AND tenant_id = ?)",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .fetch_one(&mut *conn)
-    .await?;
-    if held {
-        return Err(generation_mismatch(
-            "a fleet generation has no recovery grant under the new root",
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn generation_mismatch(msg: &str) -> AppError {
@@ -567,8 +539,11 @@ pub async fn activate_root_generation(
             "the generation is not the next to activate",
         ));
     }
-    if activate.previous.is_some() {
-        refuse_with_fleet_keys(&mut tx, v, &tenant).await?;
+    // D-5: no retained FKEK is left reachable only through a RETIRED root.
+    if !fleet_keys_wrapped_under(&mut tx, v, &s, (generation, t.root_key_id), now).await? {
+        return Err(generation_mismatch(
+            "a fleet generation has no recovery grant under the new root",
+        ));
     }
 
     // The acknowledged, unrevoked grants of the generation, each read back,
@@ -759,6 +734,49 @@ pub(super) async fn is_active_custodian(
     {
         return Ok(false);
     }
+    holds_root_grant(conn, v, s, generation, now).await
+}
+
+/// ADR 0002 D-2, D-9: whether the session's device wraps a fleet key under
+/// `recipient` and acknowledges such a wrap. A custodian of the ACTIVE root
+/// wraps under it; during a root rotation (D-5) one that also holds a grant
+/// of the PREPARING generation, always a RotationGrant, wraps under that.
+pub(super) async fn wraps_under(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    recipient: (u64, [u8; 32]),
+    now: i64,
+) -> Result<bool, AppError> {
+    if !is_active_custodian(conn, v, s, now).await? {
+        return Ok(false);
+    }
+    if active_root(conn, v, &s.tenant_id).await? == Some(recipient) {
+        return Ok(true);
+    }
+    let preparing: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_root_key_generations
+                         WHERE server_instance_id = ? AND tenant_id = ? AND generation = ?
+                           AND root_key_id = ? AND state = 'PREPARING')",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(int(recipient.0)?)
+    .bind(recipient.1.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(preparing && holds_root_grant(conn, v, s, recipient.0, now).await?)
+}
+
+/// Whether the session's device holds an acknowledged, unrevoked grant of
+/// root `generation`, inside its window and issued to its exact keys.
+async fn holds_root_grant(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    generation: u64,
+    now: i64,
+) -> Result<bool, AppError> {
     let replays: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT replay_id FROM v2_tenant_root_key_grants
           WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
@@ -766,7 +784,7 @@ pub(super) async fn is_active_custodian(
     )
     .bind(v.server_instance_id.as_slice())
     .bind(s.tenant_id.as_slice())
-    .bind(pointer)
+    .bind(int(generation)?)
     .bind(s.device_id.as_slice())
     .fetch_all(&mut *conn)
     .await?;

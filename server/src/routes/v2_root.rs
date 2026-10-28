@@ -37,7 +37,7 @@ use super::v2_auth::{
     audit, blob, d1_approval_replay_id, random, reload_session, unhex, verified, Principal, Session,
 };
 use super::v2_fleet::{active_root, holds_capability};
-use super::v2_root_grants::{generation_mismatch, refuse_with_fleet_keys};
+use super::v2_root_grants::generation_mismatch;
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::quarantine::{self, Kind, Mark};
@@ -519,8 +519,6 @@ async fn rotate(
             "the rotation names another previous root than the ACTIVE one",
         ));
     }
-    // A rotation that could never activate would block every later one.
-    refuse_with_fleet_keys(&mut tx, v, &s.tenant_id).await?;
     // shortcut: a PREPARING generation that can never activate (Q-24) blocks
     // every later rotation, since the target is always ACTIVE + 1; upgrade
     // when a stuck generation can be abandoned.
