@@ -597,7 +597,7 @@ async fn first_approval(
 
     // The tenant's one confirmation, pending, for exactly this subject.
     let confirmation = sqlx::query(
-        "SELECT confirmation_id, account_id, device_id, restore_epoch, signing_key_id,
+        "SELECT confirmation_id, account_id, device_id, signing_key_id,
                 hpke_key_id, signing_public_key, hpke_public_key
            FROM v2_first_device_confirmations
           WHERE server_instance_id = ? AND tenant_id = ? AND state = 'pending'",
@@ -607,9 +607,6 @@ async fn first_approval(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(AppError::Forbidden)?;
-    if confirmation.get::<i64, _>("restore_epoch") != epoch(v)? {
-        return Err(stale());
-    }
     let matches = blob::<16>(&confirmation, "account_id")? == s.account_id
         && blob::<16>(&confirmation, "device_id")? == *path_device
         && blob::<32>(&confirmation, "signing_key_id")? == a.subject_signing_key_id

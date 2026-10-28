@@ -231,8 +231,9 @@ fn session_from(row: &sqlx::sqlite::SqliteRow) -> Result<Session, AppError> {
 }
 
 /// The device's D1 approval is live: unrevoked, inside its window, for these
-/// keys on this instance and epoch, the one the first-device confirmation
-/// consumed, and the tenant's guard still `consumed` (not `recovery_required`).
+/// keys on this instance, issued in any epoch (Q-1), the one the first-device
+/// confirmation consumed, and the tenant's guard still `consumed` (not
+/// `recovery_required`).
 /// It is the only approval that grants `root_setup` (ADR 0001 R2).
 pub(super) async fn d1_approval_is_live(
     conn: &mut SqliteConnection,
@@ -256,8 +257,9 @@ pub(super) async fn d1_approval_is_live(
     .is_some())
 }
 
-/// Whether the device holds any live approval of this instance and epoch
-/// under exactly these keys: the D1 one or an ordinary one (ADR 0002 D-2).
+/// Whether the device holds any live approval of this instance, issued in any
+/// epoch (Q-1), under exactly these keys: the D1 one or an ordinary one (ADR
+/// 0002 D-2).
 pub(super) async fn approval_is_live(
     conn: &mut SqliteConnection,
     tenant_id: &[u8; 16],
@@ -271,7 +273,7 @@ pub(super) async fn approval_is_live(
         "SELECT EXISTS (SELECT 1 FROM v2_device_approvals
                          WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
                            AND subject_hpke_key_id = ? AND server_instance_id = ?
-                           AND restore_epoch = ? AND revoked_at IS NULL
+                           AND revoked_at IS NULL
                            AND not_before_ms <= ? AND not_after_ms > ?)",
     )
     .bind(tenant_id.as_slice())
@@ -279,7 +281,6 @@ pub(super) async fn approval_is_live(
     .bind(signing_key_id.as_slice())
     .bind(hpke_key_id.as_slice())
     .bind(v.server_instance_id.as_slice())
-    .bind(epoch(v)?)
     .bind(now)
     .bind(now)
     .fetch_one(&mut *conn)
@@ -306,7 +307,7 @@ pub(super) async fn d1_approval_replay_id(
              ON g.server_instance_id = a.server_instance_id AND g.tenant_id = a.tenant_id
             AND g.state = 'consumed'
           WHERE a.tenant_id = ? AND a.subject_device_id = ? AND a.subject_signing_key_id = ?
-            AND a.subject_hpke_key_id = ? AND a.server_instance_id = ? AND a.restore_epoch = ?
+            AND a.subject_hpke_key_id = ? AND a.server_instance_id = ?
             AND a.revoked_at IS NULL
             AND a.not_before_ms <= ? AND a.not_after_ms > ?
             AND c.state = 'consumed' AND c.device_id = a.subject_device_id",
@@ -316,7 +317,6 @@ pub(super) async fn d1_approval_replay_id(
     .bind(signing_key_id.as_slice())
     .bind(hpke_key_id.as_slice())
     .bind(v.server_instance_id.as_slice())
-    .bind(epoch(v)?)
     .bind(now)
     .bind(now)
     .fetch_optional(&mut *conn)
