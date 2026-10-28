@@ -4,16 +4,13 @@
 //! The evidence is the full ancestry, expired and revoked records included:
 //! every root grant of the tenant, and every approval and capability grant
 //! whose subject signing key is a root grant subject or a `signer` the client
-//! names, and every filed `DeviceRevocationV2` (Q-13) with an unsigned report
-//! of its subject device. Containers are served as their exact signed bytes
+//! names, every filed `DeviceRevocationV2` (Q-13) with an unsigned report
+//! of its subject device, and every fleet key grant of the tenant
+//! (`DeviceHpkeGrant`, `RecoveryGrant`, `RotationGrant`). Containers are served as their exact signed bytes
 //! with the issuers' public keys; the client verifies everything itself, so
 //! the server only has to leave nothing out. Pages are read from one snapshot
 //! each and ordered by kind, then by row, so a cursor names where the next
 //! page starts.
-//!
-//! shortcut: the fleet evidence (`DeviceHpkeGrant`, `RotationGrant`,
-//! `RecoveryGrant`) is not served yet; add it with the fleet trust rules (W4).
-//! Its absence can only make a client refuse.
 
 use std::collections::BTreeSet;
 
@@ -38,13 +35,17 @@ use shared::canonical::sha256;
 pub const MAX_SIGNERS: usize = 64;
 
 /// The evidence tables, in page order, with the quarantine kind of their
-/// rows. Approvals and capability grants are those of the root grant subjects
-/// and of the named signers; root grants and revocations are all served.
-const KINDS: [(&str, Option<&str>); 4] = [
-    ("v2_tenant_root_key_grants", Some("root_grant")),
-    ("v2_device_approvals", None),
-    ("v2_capability_grants", Some("capability_grant")),
-    (REVOCATIONS, None),
+/// rows and whether they are scoped. Approvals and capability grants are
+/// scoped: those of the root grant subjects and of the named signers. Every
+/// other table is served whole.
+const KINDS: [(&str, Option<&str>, bool); 7] = [
+    ("v2_tenant_root_key_grants", Some("root_grant"), false),
+    ("v2_device_approvals", None, true),
+    ("v2_capability_grants", Some("capability_grant"), true),
+    (REVOCATIONS, None, false),
+    ("v2_fleet_device_hpke_grants", None, false),
+    ("v2_fleet_recovery_grants", None, false),
+    ("v2_fleet_rotation_grants", None, false),
 ];
 const REVOCATIONS: &str = "v2_device_revocations";
 
@@ -146,7 +147,7 @@ async fn rows(
     after: i64,
     limit: i64,
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, AppError> {
-    let (table, quarantine_kind) = KINDS[usize::from(kind)];
+    let (table, quarantine_kind, scoped) = KINDS[usize::from(kind)];
     let quarantined = quarantine_kind.map_or(String::new(), |k| {
         format!(
             " AND NOT EXISTS (SELECT 1 FROM v2_grant_quarantine q
@@ -154,7 +155,7 @@ async fn rows(
                                  AND q.tenant_id = t.tenant_id AND q.replay_id = t.replay_id)"
         )
     });
-    let subjects = if kind == 0 || table == REVOCATIONS {
+    let subjects = if !scoped {
         String::new()
     } else {
         // Numbered after the four fixed parameters.
@@ -367,10 +368,10 @@ mod tests {
         let hex: String = c.encode().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(Cursor::decode(&hex), Some(c));
         for bad in [
-            // page 0 is never named by a cursor; kind 4 does not exist;
+            // page 0 is never named by a cursor; kind 7 does not exist;
             // a negative row; a short cursor.
             "00000000020000000000000001",
-            "00000001040000000000000001",
+            "00000001070000000000000001",
             "0000000102ffffffffffffffff",
             "000000010200",
         ] {
