@@ -21,10 +21,11 @@
 //! `dpapi`).
 //!
 //! Since 2.4.3 a fleet key the team server delivers is cached only once its
-//! grant verifies against the tenant trust chain (`open_fleet_grant`), and
-//! never over another key held for the same generation (`collect`). Sync does
-//! not use such a key yet (`keys_newest_first`). Keys cached by 2.4.2 still
-//! open old snapshots.
+//! grant verifies against the tenant trust chain, as the W6 trust ledger lets
+//! this device see it (`open_fleet_grant`, `team::ledger`), and never over
+//! another key held for the same generation (`collect`). Sync does not use
+//! such a key yet (`keys_newest_first`). Keys cached by 2.4.2 still open old
+//! snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -89,10 +90,11 @@ impl FleetKeyStore {
             .keys()
             .chain(f.credential_refs.keys())
             .copied()
-            // shortcut: revocation reaches this device only through the
-            // server's reports, so a hostile server holding a stolen, revoked
-            // custodian key could still pass a verified grant; sync uses
-            // such keys once the W6 sticky revocation (Q-13) lands.
+            // shortcut: a stolen key of a custodian whose custody lapsed can
+            // still pass a backdated grant; sync uses such keys once sticky
+            // lapse (ADR 0002 D-6 (b)), the cached `first_not_before` of the
+            // D-6 (c) clip (ADR L1413) and the reverify before key use of
+            // G2-35 (plan L2056: a cache flag grants no authority) land.
             .filter(|g| !f.verified.contains(g))
             .collect();
         let mut out: Vec<_> = generations

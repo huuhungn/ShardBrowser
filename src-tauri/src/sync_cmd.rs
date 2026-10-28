@@ -311,8 +311,8 @@ mod tests {
     }
 
     /// Pull tries a key cached by 2.4.2, never one collected from a verified
-    /// grant: until the W6 sticky revocation, such a key could come from a
-    /// stolen, revoked custodian key.
+    /// grant: until sticky lapse and the reverify before use, such a key could
+    /// come from a stolen custodian key whose custody lapsed.
     #[test]
     fn pull_does_not_try_a_key_from_a_verified_grant() {
         let _config = crate::store::config_root_test_lock()
