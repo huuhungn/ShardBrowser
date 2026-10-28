@@ -515,6 +515,9 @@ pub fn seal(
     intent: &IntentMaterial,
     slot: &SlotMaterial,
 ) -> Result<ObjectDigest, EnvelopeError> {
+    if EnvelopeIntentV2::hash(&intent.exact_intent_bytes) != intent.intent_hash {
+        return Err(EnvelopeError::Mismatch("intent_hash"));
+    }
     let view = EnvelopeIntentV2::parse(&intent.exact_intent_bytes)?;
     bind_slot(&slot.exact_slot_bytes, &view)?;
     let len_in = |bytes: &[u8], max: u32, name| {
@@ -606,6 +609,50 @@ pub fn seal(
 
 // ------------------------------------------------------------------- open ----
 
+/// The snapshot the manifest and upload name; the intent must name exactly
+/// it before the DEK is unwrapped (plan L1335).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub snapshot_id: [u8; 16],
+    pub tenant_id: [u8; 16],
+    pub fleet_id: [u8; 16],
+    pub profile_id: [u8; 16],
+    pub target_version: u64,
+    pub key_generation: u64,
+}
+
+impl Scope {
+    pub fn of(i: &EnvelopeIntentV2) -> Self {
+        Self {
+            snapshot_id: i.snapshot_id,
+            tenant_id: i.tenant_id,
+            fleet_id: i.fleet_id,
+            profile_id: i.profile_id,
+            target_version: i.target_version,
+            key_generation: i.key_generation,
+        }
+    }
+
+    fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        [
+            ("snapshot_id", self.snapshot_id == other.snapshot_id),
+            ("tenant_id", self.tenant_id == other.tenant_id),
+            ("fleet_id", self.fleet_id == other.fleet_id),
+            ("profile_id", self.profile_id == other.profile_id),
+            (
+                "target_version",
+                self.target_version == other.target_version,
+            ),
+            (
+                "key_generation",
+                self.key_generation == other.key_generation,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(field, equal)| (!equal).then_some(field))
+    }
+}
+
 /// What the verified `SignedSnapshotManifestV2` says the object must be.
 pub struct Expected<'a> {
     pub ciphertext_sha256: &'a [u8; 32],
@@ -613,6 +660,7 @@ pub struct Expected<'a> {
     pub preamble_sha256: &'a [u8; 32],
     pub intent_hash: &'a [u8; 32],
     pub dek_slot_sha256: &'a [u8; 32],
+    pub scope: &'a Scope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,6 +733,9 @@ pub fn open<R: Read + Seek>(
         return Err(EnvelopeError::Mismatch("intent_hash"));
     }
     let view = EnvelopeIntentV2::parse(&intent_bytes)?;
+    if let Some(field) = Scope::of(&view).first_difference(expected.scope) {
+        return Err(EnvelopeError::Mismatch(field));
+    }
     if view.frame_plaintext_size != pre.frame_plaintext_size {
         return Err(EnvelopeError::Mismatch("frame_plaintext_size"));
     }
@@ -887,6 +938,15 @@ mod tests {
         pre: [u8; 32],
         intent: [u8; 32],
         slot: [u8; 32],
+        scope: Scope,
+    }
+
+    /// The scope `intent` names, or none when it does not parse (the parse
+    /// refusal then fires first).
+    fn scope_of(intent: &[u8]) -> Scope {
+        EnvelopeIntentV2::parse(intent)
+            .map(|i| Scope::of(&i))
+            .unwrap_or_default()
     }
 
     fn exp_for(f: &Fixture, object: &[u8]) -> Exp {
@@ -896,6 +956,7 @@ mod tests {
             pre: preamble_sha256(object[..PREAMBLE_LEN].try_into().unwrap()),
             intent: f.intent.intent_hash,
             slot: f.slot.dek_slot_sha256,
+            scope: scope_of(&f.intent.exact_intent_bytes),
         }
     }
 
@@ -915,6 +976,7 @@ mod tests {
                 preamble_sha256: &e.pre,
                 intent_hash: &e.intent,
                 dek_slot_sha256: &e.slot,
+                scope: &e.scope,
             },
         );
         (result, out)
@@ -1429,6 +1491,60 @@ mod tests {
             rule_of(open_with(&good, &FKEK, &too_big).0),
             "malformed object exceeds the size cap"
         );
+        // The intent must name exactly the snapshot the manifest names.
+        let named = exp_for(&f, &good).scope;
+        for (field, scope) in [
+            (
+                "snapshot_id",
+                Scope {
+                    snapshot_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "tenant_id",
+                Scope {
+                    tenant_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "fleet_id",
+                Scope {
+                    fleet_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "profile_id",
+                Scope {
+                    profile_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "target_version",
+                Scope {
+                    target_version: named.target_version + 1,
+                    ..named
+                },
+            ),
+            (
+                "key_generation",
+                Scope {
+                    key_generation: named.key_generation + 1,
+                    ..named
+                },
+            ),
+        ] {
+            let e = Exp {
+                scope,
+                ..exp_for(&f, &good)
+            };
+            let (result, out) = open_with(&good, &FKEK, &e);
+            assert_eq!(rule_of(result), format!("mismatch {field}"));
+            assert!(out.is_empty());
+        }
     }
 
     #[test]
@@ -1491,6 +1607,20 @@ mod tests {
             r,
             Err(EnvelopeError::Malformed("plaintext is empty"))
         ));
+
+        // An intent whose hash is stale would seal an object nobody can open.
+        let stale = IntentMaterial {
+            exact_intent_bytes: f.intent.exact_intent_bytes.clone(),
+            intent_hash: [0x5a; 32],
+        };
+        let r = seal(
+            &mut Cursor::new(plaintext(10)),
+            &mut Vec::new(),
+            &DEK,
+            &stale,
+            &f.slot,
+        );
+        assert!(matches!(r, Err(EnvelopeError::Mismatch("intent_hash"))));
 
         // A suite 1 intent (the shipped body) never goes into a SHARDXBK object.
         let legacy = build_envelope_intent(
@@ -2028,6 +2158,7 @@ mod tests {
             pre: preamble_sha256(o[..PREAMBLE_LEN].try_into().unwrap()),
             intent: ih,
             slot: c::domain_hash(c::L_DEK_SLOT, slot),
+            scope: scope_of(intent),
         };
         (o, e)
     }
