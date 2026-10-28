@@ -948,6 +948,16 @@ pub async fn file_fleet_grant(
             if !wraps_under(&mut tx, v, &s, recipient, now).await? {
                 return Err(AppError::Forbidden);
             }
+            // A PREPARING generation activates under the ACTIVE root, so its
+            // recovery grant is under that root, never a PREPARING one.
+            if gen.state == "PREPARING"
+                && active_root(&mut tx, v, &s.tenant_id).await? != Some(recipient)
+            {
+                return Err(conflict(
+                    "FLEET_GRANTS_INCOMPLETE",
+                    "a PREPARING fleet generation's recovery grant goes under the ACTIVE root",
+                ));
+            }
         }
         Payload::RotationGrant(p) => {
             // The issuer holds the generation it rotates away from (D-2).
@@ -1361,8 +1371,15 @@ async fn live_acked_grants(
     Ok(out)
 }
 
-/// ADR 0002 D-5: every retained fleet generation of the tenant (ACTIVE, or
-/// RETIRED and kept) has an acknowledged, live RecoveryGrant under `root`.
+/// ADR 0002 D-5: every fleet generation of the tenant, ACTIVE, RETIRED and
+/// kept, or PREPARING, has an acknowledged, live RecoveryGrant under `root`.
+/// A PREPARING one never has (its recovery grant is under the ACTIVE root),
+/// so a root rotation waits for it to activate: once that root is RETIRED it
+/// never could.
+///
+/// shortcut: a quarantined fleet grant refuses the whole check, so it blocks
+/// the tenant's root rotation until the row is resolved; upgrade when a
+/// quarantined grant can be cleared.
 pub(super) async fn fleet_keys_wrapped_under(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -1372,7 +1389,7 @@ pub(super) async fn fleet_keys_wrapped_under(
 ) -> Result<bool, AppError> {
     let rows = sqlx::query(
         "SELECT fleet_id, generation FROM v2_fleet_key_generations
-          WHERE server_instance_id = ? AND tenant_id = ? AND state <> 'PREPARING'",
+          WHERE server_instance_id = ? AND tenant_id = ?",
     )
     .bind(v.server_instance_id.as_slice())
     .bind(s.tenant_id.as_slice())
@@ -1546,9 +1563,8 @@ pub async fn activate_fleet_generation(
         ));
     }
     // The recovery grant is under the root ACTIVE now, not one since retired.
-    // shortcut: a PREPARING generation whose bound recovery grant is under a
-    // root rotated away never activates; upgrade when a stuck fleet
-    // generation can be abandoned.
+    // Filing and root activation keep this true, so no request reaches it;
+    // it stays as the invariant the fleet key depends on.
     let active = active_root(&mut tx, v, &s.tenant_id).await?;
     if !recovery.iter().any(|g| {
         g.signed_container_hash == t.recovery_grant_signed_container_hash

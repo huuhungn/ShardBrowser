@@ -7345,7 +7345,75 @@ async fn a_root_rotation_rewraps_every_retained_fleet_key_before_it_activates() 
         201
     );
 
-    // Generation 1, still PREPARING, needs no rewrap; root 1 activates.
+    // Generation 1 is still PREPARING: its recovery grant stays under the
+    // ACTIVE root, and the root waits for it.
+    let early = {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(0xfd, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            recipient_root_key_id: k1,
+            recipient_root_generation: 1,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    assert_eq!(
+        file!(&access, 0xfc, 1, fkek1, V::Recovery, 0xfd, &early),
+        409
+    );
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    let request = activate(0xea, terms1);
+    let (status, body) = server
+        .call(&format!("{path}/1/activate"), &access, Some(&request))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // Generation 1 is ACTIVE now and generation 0 RETIRED: both need a
+    // rewrap, and only an acknowledged one counts.
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    let rewrapped1 = {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(0xee, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            recipient_root_key_id: k1,
+            recipient_root_generation: 1,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    assert_eq!(
+        file!(&access, 0xed, 1, fkek1, V::Recovery, 0xee, &rewrapped1),
+        201
+    );
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate_root))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    assert_eq!(
+        ack!(&access, 0xec, 1, fkek1, V::Recovery, 0xee, &rewrapped1),
+        201
+    );
     let (status, body) = server
         .call(&activate_path("1"), &access, Some(&activate_root))
         .await;
@@ -7365,19 +7433,10 @@ async fn a_root_rotation_rewraps_every_retained_fleet_key_before_it_activates() 
         assert_eq!(server.count(query).await, want, "{query}");
     }
 
-    // Root 0 is RETIRED: nothing is wrapped under it any more, and fleet
-    // generation 1, whose recovery grant is under it, does not activate.
+    // Root 0 is RETIRED: nothing is wrapped under it any more.
     let late = rewrap(&a, 0xfb, root0);
     assert_eq!(
         file!(&access, 0xfa, 0, fkek0, V::Recovery, 0xfb, &late),
         403
-    );
-    let request = activate(0xea, terms1);
-    let (status, body) = server
-        .call(&format!("{path}/1/activate"), &access, Some(&request))
-        .await;
-    assert_eq!(
-        (status, code_of(&body).as_str()),
-        (409, "FLEET_GRANTS_INCOMPLETE")
     );
 }
