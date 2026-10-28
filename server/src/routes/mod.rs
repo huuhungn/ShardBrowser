@@ -10,6 +10,7 @@ pub mod v2_auth;
 pub mod v2_capability;
 pub mod v2_device_revoke;
 pub mod v2_fleet;
+pub mod v2_restore_epoch;
 pub mod v2_root;
 pub mod v2_root_grants;
 pub mod v2_trust;
@@ -136,6 +137,19 @@ pub fn router(state: AppState) -> Router {
             post(v2_capability::file_capability_grant).layer(DefaultBodyLimit::max(
                 v2_capability::MAX_CAPABILITY_GRANT_BODY,
             )),
+        )
+        .route(
+            "/v2/recovery/restore-epoch-transitions",
+            post(v2_restore_epoch::file_restore_epoch_transition)
+                .layer(DefaultBodyLimit::max(v2_restore_epoch::MAX_FILING_BODY)),
+        )
+        .route(
+            "/v2/recovery/restore-epoch-transitions/:tenant_id/:previous_epoch/:new_epoch",
+            get(v2_restore_epoch::read_restore_epoch_transition),
+        )
+        .route(
+            "/v2/recovery/restore-epoch-transitions/:tenant_id/:previous_epoch/:new_epoch/proofs/:profile_id",
+            get(v2_restore_epoch::read_restore_epoch_proof),
         )
         .route(
             "/v2/tenants/:tenant_id/trust-evidence",

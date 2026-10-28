@@ -6680,3 +6680,367 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
         (422, "MUTATION_RESPONSE_MISMATCH")
     );
 }
+
+// ------------------------------------------------ restore-epoch transitions ---
+
+const TRANSITIONS: &str = "/v2/recovery/restore-epoch-transitions";
+const TENANT2: [u8; 16] = [0x42; 16];
+
+/// Moves the authority and its mirror to `epoch`, as a finished D-1 restore
+/// leaves them.
+/// shortcut: sessions and approvals stay bound to the epoch they were made
+/// in, so no device could sign in after a restore; the fixture moves them.
+async fn restored_to(server: &mut Server, epoch: u64) {
+    let record = IdentityRecordV2 {
+        server_instance_id: INSTANCE,
+        restore_epoch: epoch,
+        restore_txn_id: [0x99; 16],
+        restored_db_sha256: [0x98; 32],
+        transition_set_sha256: [0x97; 32],
+        written_at_ms: 1_790_985_600_000,
+    }
+    .encode()
+    .unwrap();
+    let identity = server.data.with_extension("identity");
+    std::fs::write(identity.join("identity-record-v2.bin"), record).unwrap();
+    server
+        .sql(
+            &format!(
+                "UPDATE v2_server_state SET restore_epoch = {epoch}, external_record_sha256 = ?"
+            ),
+            &[&external_record_sha256(&record)],
+        )
+        .await;
+    for statement in [
+        "DROP TRIGGER IF EXISTS v2_sessions_binding_is_fixed".to_string(),
+        "DROP TRIGGER IF EXISTS v2_device_approvals_record_is_fixed".to_string(),
+        format!("UPDATE v2_sessions SET restore_epoch = {epoch}"),
+        format!("UPDATE v2_device_approvals SET restore_epoch = {epoch}"),
+    ] {
+        server.sql(&statement, &[]).await;
+    }
+    server.restart().await;
+}
+
+type Leaf = shared::restore_epoch::RestoreEpochLeafV2;
+type Transition = shared::restore_epoch::RestoreEpochTransitionV2;
+
+/// Three sorted leaves of `tenant`.
+fn restore_leaves(tenant: [u8; 16]) -> Vec<Leaf> {
+    (1..=3u8)
+        .map(|i| Leaf {
+            tenant_id: tenant,
+            profile_id: [0xd0 + i; 16],
+            previous_signed_head_hash: [0xe0 + i; 32],
+            new_signed_head_hash: [0xf0 + i; 32],
+        })
+        .collect()
+}
+
+/// `dev`'s `0 -> 1` transition over `leaves`, with `edit` applied.
+fn restore_transition(dev: &Device, leaves: &[Leaf], edit: fn(&mut Transition)) -> Transition {
+    let tenant = leaves[0].tenant_id;
+    let mut t = Transition {
+        transition_replay_id: [0x31; 16],
+        server_instance_id: INSTANCE,
+        tenant_id: tenant,
+        previous_epoch: 0,
+        new_epoch: 1,
+        mapping_count: leaves.len() as u64,
+        profile_head_mapping_root: shared::restore_epoch::mapping_root(&tenant, leaves).unwrap(),
+        reason_code: shared::restore_epoch::RestoreReason::OperatorRestore,
+        approver_account_id: OWNER,
+        approver_device_id: dev.id,
+        approver_signing_key_id: dev.signing_key_id,
+        issued_at_ms: now_ms(),
+        nonce: [0x32; 16],
+    };
+    edit(&mut t);
+    t
+}
+
+fn restore_proofs(t: &Transition, leaves: &[Leaf]) -> Vec<Vec<u8>> {
+    (0..leaves.len())
+        .map(|i| {
+            shared::restore_epoch::RestoreEpochInclusionProofV2::build(t, leaves, i)
+                .unwrap()
+                .encode()
+        })
+        .collect()
+}
+
+/// The filing body: the exact signed transition and `proofs`, in order.
+fn filing(signed: &[u8], proofs: &[Vec<u8>]) -> Vec<u8> {
+    use shared::canonical as c;
+    let proofs = c::Value::Array(proofs.iter().map(|p| c::b(p)).collect());
+    c::encode(&c::m(vec![
+        ("domain", c::t("shardx.restore-epoch.transition-filing.v2")),
+        ("version", c::u(2)),
+        ("exact_signed_transition_bytes", c::b(signed)),
+        ("canonical_inclusion_proofs", proofs),
+    ]))
+}
+
+/// `dev`'s filing of `edit`ed transition over `leaves` with all its proofs.
+fn signed_filing(dev: &Device, leaves: &[Leaf], edit: fn(&mut Transition)) -> Vec<u8> {
+    let t = restore_transition(dev, leaves, edit);
+    let signed = shared::restore_epoch::build_signed_transition(&dev.sk, &t);
+    filing(&signed, &restore_proofs(&t, leaves))
+}
+
+/// `signed` with one signature bit flipped and its container hash redone.
+fn with_bad_signature(signed: &[u8]) -> Vec<u8> {
+    use shared::canonical::{self as c, Value};
+    let Value::Map(mut entries) = c::decode(signed).unwrap() else {
+        panic!("a container is a map");
+    };
+    entries.retain(|(k, _)| k != "signed_transition_container_hash");
+    for (k, v) in &mut entries {
+        if let (true, Value::Bytes(b)) = (k == "signature_bytes", v) {
+            b[0] ^= 1;
+        }
+    }
+    let hash = c::domain_hash(
+        c::L_RESTORE_EPOCH_TRANSITION_CONTAINER,
+        &c::encode(&Value::Map(entries.clone())),
+    );
+    entries.push(("signed_transition_container_hash".into(), c::b(&hash)));
+    c::encode(&Value::Map(entries))
+}
+
+impl Server {
+    /// Posts a filing; returns the status and the error code, if any.
+    async fn file(&self, bearer: &str, body: &[u8]) -> (u16, String) {
+        let (status, out) = self.call(TRANSITIONS, bearer, Some(body)).await;
+        (status, code_of(&out))
+    }
+}
+
+#[tokio::test]
+async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_it_back() {
+    use shared::restore_epoch::{build_signed_transition, RestoreEpochInclusionProofV2};
+    let mut server = start("g2-restore-epoch", 28230).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    let peer = device(&server, OWNER, 0x7c, "active").await;
+    approve_by_copy(&server, &dev, &peer, 0x7c).await;
+    let peer_access = session(&server, &peer).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let leaves = restore_leaves(TENANT);
+    let t = restore_transition(&dev, &leaves, |_| {});
+    let signed = build_signed_transition(&dev.sk, &t);
+    let proofs = restore_proofs(&t, &leaves);
+    let body = filing(&signed, &proofs);
+    let refused = |code: &str| (422, code.to_string());
+
+    // Custody comes before the body is decoded: garbage is a custodian's
+    // problem only.
+    let garbage = vec![0xff; 1 << 20];
+    assert_eq!(server.file(&peer_access, &garbage).await.0, 403);
+    assert_eq!(
+        server.file(&access, &garbage).await,
+        refused("NON_CANONICAL_RECORD")
+    );
+    // Not a closed filing map.
+    assert_eq!(
+        server.file(&access, &signed).await,
+        refused("NON_CANONICAL_RECORD")
+    );
+    for (domain, version) in [
+        (None, 2),
+        (Some("shardx.restore-epoch.transition-filing.v3"), 2),
+        (Some("shardx.restore-epoch.transition-filing.v2"), 3),
+    ] {
+        use shared::canonical as c;
+        let mut map = vec![
+            ("version", c::u(version)),
+            ("exact_signed_transition_bytes", c::b(&signed)),
+            (
+                "canonical_inclusion_proofs",
+                c::Value::Array(proofs.iter().map(|p| c::b(p)).collect()),
+            ),
+        ];
+        map.extend(domain.map(|d| ("domain", c::t(d))));
+        assert_eq!(
+            server.file(&access, &c::encode(&c::m(map))).await,
+            refused("NON_CANONICAL_RECORD")
+        );
+    }
+    // Exact CBOR only.
+    let (status, _) = server.post(TRANSITIONS, Some(&access), json!({})).await;
+    assert_eq!(status, 400);
+    // Only a custodian, signing as its own session's device, for its own
+    // tenant and instance.
+    let by_peer = signed_filing(&peer, &leaves, |_| {});
+    assert_eq!(server.file(&peer_access, &by_peer).await.0, 403);
+    assert_eq!(server.file(&access, &by_peer).await.0, 403);
+    let foreign_leaves = restore_leaves(TENANT2);
+    let foreign = restore_transition(&dev, &foreign_leaves, |_| {});
+    let foreign_body = filing(
+        &build_signed_transition(&dev.sk, &foreign),
+        &restore_proofs(&foreign, &foreign_leaves),
+    );
+    assert_eq!(server.file(&access, &foreign_body).await.0, 403);
+    for edit in [
+        (|t| t.server_instance_id = [8; 16]) as fn(&mut Transition),
+        |t| t.approver_account_id = OTHER,
+        |t| t.approver_device_id = [0x7c; 16],
+    ] {
+        let b = signed_filing(&dev, &leaves, edit);
+        assert_eq!(server.file(&access, &b).await.0, 403);
+    }
+    // The epochs are `E -> E+1`, staged at the current `E`.
+    for edit in [
+        (|t| (t.previous_epoch, t.new_epoch) = (1, 2)) as fn(&mut Transition),
+        |t| t.new_epoch = 2,
+    ] {
+        assert_eq!(
+            server
+                .file(&access, &signed_filing(&dev, &leaves, edit))
+                .await,
+            (409, "STALE_CONTEXT".into())
+        );
+    }
+    // A broken signature, and proofs that are not the signed set.
+    assert_eq!(
+        server
+            .file(&access, &filing(&with_bad_signature(&signed), &proofs))
+            .await,
+        refused("SIGNATURE_INVALID")
+    );
+    assert_eq!(
+        server.file(&access, &filing(&signed, &proofs[..2])).await,
+        (423, "RESTORE_EPOCH_PROOF_MISSING".into())
+    );
+    let mut bent = RestoreEpochInclusionProofV2::parse(&proofs[0]).unwrap();
+    bent.steps[0].1 = Some([0xee; 32]);
+    let bent = [bent.encode(), proofs[1].clone(), proofs[2].clone()];
+    assert_eq!(
+        server.file(&access, &filing(&signed, &bent)).await,
+        (423, "RESTORE_EPOCH_TRANSITION_INVALID".into())
+    );
+    let crossed = [
+        restore_proofs(&foreign, &foreign_leaves)[0].clone(),
+        proofs[1].clone(),
+        proofs[2].clone(),
+    ];
+    assert_eq!(
+        server.file(&access, &filing(&signed, &crossed)).await,
+        (423, "RESTORE_EPOCH_CROSS_TENANT".into())
+    );
+    let reordered = [proofs[1].clone(), proofs[0].clone(), proofs[2].clone()];
+    assert_eq!(
+        server.file(&access, &filing(&signed, &reordered)).await,
+        (423, "RESTORE_EPOCH_TRANSITION_INVALID".into())
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_restore_epoch_transitions")
+            .await,
+        0
+    );
+
+    // Filed once; the same bytes get the same answer.
+    let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
+    assert_eq!((status, &out), (201, &signed), "{}", code_of(&out));
+    let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
+    assert_eq!((status, &out), (201, &signed));
+    // Staged for a restore that has not happened: not found.
+    let tenant = hex(&TENANT);
+    let path = format!("{TRANSITIONS}/{tenant}/0/1");
+    let first_proof = format!("{path}/proofs/{}", hex(&leaves[0].profile_id));
+    assert_eq!(server.call(&path, &peer_access, None).await.0, 404);
+    assert_eq!(server.call(&first_proof, &peer_access, None).await.0, 404);
+    // Other bytes under the same epochs, replay ID or nonce conflict; only a
+    // custodian learns it.
+    for edit in [
+        (|t| t.nonce = [0x33; 16]) as fn(&mut Transition),
+        |t| t.transition_replay_id = [0x34; 16],
+        |t| (t.nonce, t.transition_replay_id) = ([0x35; 16], [0x36; 16]),
+    ] {
+        let b = signed_filing(&dev, &leaves, edit);
+        assert_eq!(
+            server.file(&access, &b).await,
+            (409, "IDEMPOTENCY_MISMATCH".into())
+        );
+    }
+    assert_eq!(
+        server.file(&access, &filing(&signed, &reordered)).await,
+        (409, "IDEMPOTENCY_MISMATCH".into())
+    );
+    assert_eq!(server.file(&peer_access, &by_peer).await.0, 403);
+
+    // After the restore to `E+1`, any session of the tenant reads the exact
+    // bytes back, and a lost response is still answered.
+    restored_to(&mut server, 1).await;
+    let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
+    assert_eq!((status, &out), (201, &signed));
+    assert_eq!(
+        server.call(&path, &peer_access, None).await,
+        (200, signed.clone())
+    );
+    for (leaf, proof) in leaves.iter().zip(&proofs) {
+        let at = format!("{path}/proofs/{}", hex(&leaf.profile_id));
+        assert_eq!(
+            server.call(&at, &peer_access, None).await,
+            (200, proof.clone())
+        );
+    }
+    let other = hex(&TENANT2);
+    for (missing, status) in [
+        (format!("{TRANSITIONS}/{tenant}/0/2"), 404),
+        (format!("{TRANSITIONS}/{other}/0/1"), 404),
+        (format!("{path}/proofs/{}", hex(&[0xd9; 16])), 404),
+        (
+            format!("{TRANSITIONS}/{other}/0/1/proofs/{}", hex(&[0xd1; 16])),
+            404,
+        ),
+        (format!("{TRANSITIONS}/{tenant}/00/1"), 400),
+    ] {
+        assert_eq!(
+            server.call(&missing, &access, None).await.0,
+            status,
+            "{missing}"
+        );
+    }
+    for (query, n) in [
+        ("SELECT count(*) FROM v2_restore_epoch_transitions", 1),
+        ("SELECT count(*) FROM v2_restore_epoch_transition_proofs", 3),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'tenant.restore_epoch_transition'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, n, "{query}");
+    }
+
+    // The next step may not reuse a filed replay ID or nonce.
+    for edit in [
+        (|t| (t.previous_epoch, t.new_epoch, t.nonce) = (1, 2, [0x39; 16])) as fn(&mut Transition),
+        |t| (t.previous_epoch, t.new_epoch, t.transition_replay_id) = (1, 2, [0x3a; 16]),
+    ] {
+        assert_eq!(
+            server
+                .file(&access, &signed_filing(&dev, &leaves, edit))
+                .await,
+            (409, "IDEMPOTENCY_MISMATCH".into())
+        );
+    }
+    let next = signed_filing(&dev, &leaves, |t| {
+        (
+            t.previous_epoch,
+            t.new_epoch,
+            t.nonce,
+            t.transition_replay_id,
+        ) = (1, 2, [0x39; 16], [0x3a; 16])
+    });
+    // Once the epoch passed it, a step can no longer be staged.
+    restored_to(&mut server, 2).await;
+    assert_eq!(
+        server.file(&access, &next).await,
+        (409, "STALE_CONTEXT".into())
+    );
+    assert_eq!(server.call(&path, &peer_access, None).await, (200, signed));
+}
