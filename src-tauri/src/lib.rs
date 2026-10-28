@@ -2640,7 +2640,7 @@ fn pinned_anchor(
 /// refuses it, and a refused key is wiped on drop.
 ///
 /// The W6 ledger (`team::ledger`) holds the anchor this device pinned first,
-/// refuses a generation below the highest one verified, and evaluates the
+/// refuses a generation other than the highest one verified or the next, and evaluates the
 /// evidence as this device's history lets it see it: sticky revocations and
 /// local distrust. Each evaluation that reaches the anchor is recorded.
 #[allow(clippy::too_many_arguments)]
@@ -2661,8 +2661,12 @@ fn open_fleet_grant(
         eprintln!("[fleet] trust ledger: {e:#}");
         crate::errcode::code("team.trustLedgerUnreadable")
     };
+    // Rotation steps one generation at a time (plan L824, L1642; ADR 0002
+    // L1311), so a grant below the highest verified generation, or past the
+    // next one, is refused: one stolen key cannot poison the ledger forward.
+    let highest = ledger::highest_generation(ledger, binding, fleet_id).map_err(failed)?;
     if !ledger::pin_anchor(ledger, binding, anchor, now).map_err(failed)?
-        || ledger::highest_generation(ledger, binding, fleet_id).map_err(failed)? > Some(generation)
+        || highest.is_some_and(|h| generation < h || generation > h.saturating_add(1))
     {
         return Ok(None);
     }
@@ -3133,9 +3137,9 @@ mod custody_tests {
                 Ok(FleetGrant::Failed)
             ]
         );
-        // Marked as from a verified grant, and used by sync.
+        // Marked as from a verified grant, so sync does not use them yet.
         assert_eq!(held.fleets[&fleet].verified, [1, 2].into());
-        assert_eq!(held.keys_newest_first(&fleet).len(), 2);
+        assert!(held.keys_newest_first(&fleet).is_empty());
         assert!(!unreadable);
     }
 
@@ -3457,8 +3461,8 @@ mod custody_tests {
         }
     }
 
-    /// The highest verified generation of a fleet never goes back, across
-    /// reopens, and only a grant that opened raises it.
+    /// The highest verified generation of a fleet never goes back or jumps,
+    /// across reopens, and only a grant that opened raises it.
     #[test]
     fn a_fleet_generation_never_goes_back() {
         let me = me();
@@ -3493,6 +3497,12 @@ mod custody_tests {
         assert_eq!(collect(&path, &pages, &one, 1), None, "lower than verified");
         let (_fresh, fresh) = ledger_at();
         assert_eq!(collect(&fresh, &pages, &one, 1), Some(key(1)));
+        // Rotation steps by one: a jump past the next generation is refused
+        // and leaves the next one collectable.
+        pages[0].containers.push(three.clone());
+        assert_eq!(collect(&fresh, &pages, &three, 3), None, "a jump");
+        assert_eq!(collect(&fresh, &pages, &two, 2), Some(key(2)));
+        assert_eq!(collect(&fresh, &pages, &three, 3), Some(key(3)));
     }
 
     /// D-6 (d): a distrusted key's records first seen after the distrust are

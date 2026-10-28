@@ -21,7 +21,9 @@
 //!   earliest time and handed back to every later evaluation: reports only
 //!   tighten (ADR 0002, "Server-reported revocations only tighten").
 //! - **Highest verified generation** per fleet, which never goes back
-//!   ("Fleet generation freshness").
+//!   ("Fleet generation freshness") and moves one step at a time.
+//!
+//! Sync pull still does not use a key from a verified grant (`fleet_keys`).
 //!
 //! Not here yet: the custodian ledger and its events (D-6 (a)), sticky lapse
 //! (b), and the cached `first_not_before` of the clip (c). They need the

@@ -124,6 +124,14 @@ CREATE TABLE trust_fleet_generations (
 -- What the ledger learns is never taken back.
 CREATE TRIGGER trust_anchors_fixed BEFORE UPDATE ON trust_anchors
 BEGIN SELECT RAISE(ABORT, 'a pinned anchor never changes'); END;
+CREATE TRIGGER trust_anchors_kept BEFORE DELETE ON trust_anchors
+BEGIN SELECT RAISE(ABORT, 'a pinned anchor is never forgotten'); END;
+CREATE TRIGGER trust_evaluations_kept BEFORE DELETE ON trust_evaluations
+BEGIN SELECT RAISE(ABORT, 'an evaluation is never forgotten'); END;
+CREATE TRIGGER trust_sightings_kept BEFORE DELETE ON trust_sightings
+BEGIN SELECT RAISE(ABORT, 'a first sighting is never forgotten'); END;
+CREATE TRIGGER trust_fleet_generations_kept BEFORE DELETE ON trust_fleet_generations
+BEGIN SELECT RAISE(ABORT, 'a verified generation is never forgotten'); END;
 CREATE TRIGGER trust_proven_revocations_fixed BEFORE UPDATE ON trust_proven_revocations
 BEGIN SELECT RAISE(ABORT, 'a proven revocation never changes'); END;
 CREATE TRIGGER trust_proven_revocations_kept BEFORE DELETE ON trust_proven_revocations
@@ -347,5 +355,33 @@ mod tests {
                  UPDATE trust_fleet_generations SET highest_verified_generation = 4;",
             )
             .unwrap();
+        // Each row on its own, so only its trigger can refuse the delete.
+        let anchor = format!(
+            "INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{}', 'BOOTSTRAP', 0);",
+            "33".repeat(32)
+        );
+        let evaluation =
+            format!("{anchor} INSERT INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);");
+        for (rows, table) in [
+            (anchor.clone(), "trust_anchors"),
+            (evaluation.clone(), "trust_evaluations"),
+            (
+                format!(
+                    "{evaluation} INSERT INTO trust_sightings VALUES ('{i}', '{t}', '{k}', '{k}', 1, 0);",
+                    k = "44".repeat(32)
+                ),
+                "trust_sightings",
+            ),
+            (
+                format!("{anchor} INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);"),
+                "trust_fleet_generations",
+            ),
+        ] {
+            let (_dir, path) = fresh();
+            let db = Db::open_at(&path).unwrap();
+            db.conn.execute_batch(&rows).unwrap();
+            let sql = format!("DELETE FROM {table}");
+            assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
+        }
     }
 }

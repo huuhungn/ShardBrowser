@@ -23,8 +23,9 @@
 //! Since 2.4.3 a fleet key the team server delivers is cached only once its
 //! grant verifies against the tenant trust chain, as the W6 trust ledger lets
 //! this device see it (`open_fleet_grant`, `team::ledger`), and never over
-//! another key held for the same generation (`collect`). Keys cached by 2.4.2
-//! still open old snapshots.
+//! another key held for the same generation (`collect`). Sync does not use
+//! such a key yet (`keys_newest_first`). Keys cached by 2.4.2 still open old
+//! snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,8 +54,8 @@ pub struct FleetKeys {
     /// every generation, because an older snapshot is still valid.
     #[serde(default)]
     pub active_generation: u64,
-    /// Generations collected from a verified grant (`collect`). Keys cached
-    /// by 2.4.2 are not listed.
+    /// Generations collected from a verified grant (`collect`), which sync
+    /// skips. Keys cached by 2.4.2 are not listed and keep their use.
     #[serde(default)]
     pub verified: BTreeSet<u64>,
 }
@@ -89,6 +90,12 @@ impl FleetKeyStore {
             .keys()
             .chain(f.credential_refs.keys())
             .copied()
+            // shortcut: a stolen key of a custodian whose custody lapsed can
+            // still pass a backdated grant; sync uses such keys once sticky
+            // lapse (ADR 0002 D-6 (b)), the cached `first_not_before` of the
+            // D-6 (c) clip (ADR L1413) and the reverify before key use of
+            // G2-35 (plan L2056: a cache flag grants no authority) land.
+            .filter(|g| !f.verified.contains(g))
             .collect();
         let mut out: Vec<_> = generations
             .into_iter()

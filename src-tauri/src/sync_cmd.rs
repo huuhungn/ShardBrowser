@@ -310,10 +310,11 @@ mod tests {
         assert_ne!(profile_ref("a"), profile_ref("b"));
     }
 
-    /// Pull tries a key collected from a verified grant as well as one
-    /// cached by 2.4.2: the W6 ledger keeps a counted revocation sticky.
+    /// Pull tries a key cached by 2.4.2, never one collected from a verified
+    /// grant: until sticky lapse and the reverify before use, such a key could
+    /// come from a stolen custodian key whose custody lapsed.
     #[test]
-    fn pull_tries_a_key_from_a_verified_grant() {
+    fn pull_does_not_try_a_key_from_a_verified_grant() {
         let _config = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -340,8 +341,12 @@ mod tests {
         let from_legacy = open_pulled(&under_legacy, &out, "p", &candidates, "");
         crate::store::set_config_root(None);
 
-        assert_eq!(candidates, [(legacy, 2), (verified, 1)]);
-        assert!(from_verified.is_ok());
+        assert_eq!(candidates, [(legacy, 2)]);
+        let err = from_verified.expect_err("the verified grant's key is not tried");
+        assert!(
+            crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+            "{err}"
+        );
         assert!(from_legacy.is_ok());
     }
 
