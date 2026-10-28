@@ -771,10 +771,24 @@ fn hex16(b: &[u8; 16]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn staging_path(root: &Path, tenant_id: &[u8; 16], session_id: &[u8; 16]) -> PathBuf {
+pub(crate) fn staging_path(root: &Path, tenant_id: &[u8; 16], session_id: &[u8; 16]) -> PathBuf {
     root.join(hex16(tenant_id))
         .join("staging")
         .join(format!("{}.part", hex16(session_id)))
+}
+
+/// A v2 object's immutable path, keyed by `snapshot_id` and never
+/// overwritten (ADR 0002 C-2).
+pub(crate) fn object_path(
+    root: &Path,
+    tenant_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    snapshot_id: &[u8; 16],
+) -> PathBuf {
+    root.join(hex16(tenant_id))
+        .join("objects")
+        .join(hex16(profile_id))
+        .join(format!("{}.bin", hex16(snapshot_id)))
 }
 
 fn blob_path(root: &Path, tenant_id: &[u8; 16], profile_id: &[u8; 16], version: i64) -> PathBuf {

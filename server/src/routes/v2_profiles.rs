@@ -14,11 +14,9 @@
 //!
 //! These routes serve only published profiles (a label ciphertext and key
 //! generation). The legacy JSON routes (`/v2/fleet/leases`) keep their own
-//! `v2_leases` rows and do not see `v2_profile_leases`.
-//!
-//! shortcut: no signed head is stored before COMMIT (phase 2), so a profile
-//! past version 0 cannot be checked out here; compare
-//! `observed_signed_head_hash` with the stored head when commit lands.
+//! `v2_leases` rows and do not see `v2_profile_leases`. A profile past
+//! version 0 is checked out against the signed head its last commit stored
+//! (`v2_uploads`).
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -47,15 +45,15 @@ use crate::identity::Verified;
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339, sql_int, stored_uint};
 
-fn id_path(id: &str) -> Result<[u8; 16], AppError> {
+pub(super) fn id_path(id: &str) -> Result<[u8; 16], AppError> {
     unhex::<16>(id).ok_or_else(|| AppError::BadRequest("ids must be 32 hex digits".into()))
 }
 
-fn conflict(code: &'static str, msg: &str) -> AppError {
+pub(super) fn conflict(code: &'static str, msg: &str) -> AppError {
     coded(StatusCode::CONFLICT, code, msg)
 }
 
-fn not_found() -> AppError {
+pub(super) fn not_found() -> AppError {
     coded(
         StatusCode::NOT_FOUND,
         "RESOURCE_NOT_FOUND",
@@ -63,7 +61,7 @@ fn not_found() -> AppError {
     )
 }
 
-fn response_mismatch() -> AppError {
+pub(super) fn response_mismatch() -> AppError {
     coded(
         StatusCode::UNPROCESSABLE_ENTITY,
         "MUTATION_RESPONSE_MISMATCH",
@@ -71,14 +69,14 @@ fn response_mismatch() -> AppError {
     )
 }
 
-fn lease_expired() -> AppError {
+pub(super) fn lease_expired() -> AppError {
     conflict(
         "LEASE_EXPIRED",
         "the lease is no longer the profile's lease",
     )
 }
 
-fn session_of(who: Principal) -> Result<Session, AppError> {
+pub(super) fn session_of(who: Principal) -> Result<Session, AppError> {
     match who {
         Principal::Session(s) => Ok(s),
         Principal::Ticket(_) => Err(AppError::Forbidden),
@@ -93,13 +91,18 @@ fn session_of(who: Principal) -> Result<Session, AppError> {
 /// The device itself must be approved for the tenant or this fleet: a
 /// fleet-scoped approval admits a device to that fleet only (plan L459-L460,
 /// ADR 0002 Q-22). The session's own liveness already checked the epoch.
-async fn may(
+///
+/// `device_only` counts device-scoped grants alone: a manifest signer must
+/// hold `profile.commit` itself (ADR 0002 D-2 issuer matrix).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn may(
     conn: &mut SqliteConnection,
     v: &Verified,
     s: &Session,
     fleet: &[u8; 16],
     profile: Option<&[u8; 16]>,
     capability: Capability,
+    device_only: bool,
     now: i64,
 ) -> Result<bool, AppError> {
     let admitted: bool = sqlx::query_scalar(
@@ -131,7 +134,8 @@ async fn may(
                      AND subject_signing_key_id = ?))
             AND (scope_kind = 'tenant' OR (scope_kind = 'fleet' AND scope_id = ?)
                  OR (scope_kind = 'profile' AND scope_id = ?))
-            AND revoked_at IS NULL AND not_before_ms <= ? AND ? < not_after_ms",
+            AND revoked_at IS NULL AND not_before_ms <= ? AND ? < not_after_ms
+            AND (subject_kind = 'device' OR NOT ?)",
     )
     .bind(v.server_instance_id.as_slice())
     .bind(s.tenant_id.as_slice())
@@ -143,6 +147,7 @@ async fn may(
     .bind(profile.map(|p| p.as_slice()))
     .bind(now)
     .bind(now)
+    .bind(device_only)
     .fetch_all(&mut *conn)
     .await?;
     for replay in &replays {
@@ -160,7 +165,7 @@ async fn may(
 }
 
 /// The fleet's ACTIVE FKEK generation on this instance and its key ID.
-async fn active_key(
+pub(super) async fn active_key(
     conn: &mut SqliteConnection,
     v: &Verified,
     tenant: &[u8; 16],
@@ -182,7 +187,7 @@ async fn active_key(
     )))
 }
 
-fn no_active_key() -> AppError {
+pub(super) fn no_active_key() -> AppError {
     conflict(
         "FLEET_GENERATION_NOT_ACTIVE",
         "the fleet has no ACTIVE key generation with this key",
@@ -190,7 +195,7 @@ fn no_active_key() -> AppError {
 }
 
 /// A published, active profile of an active fleet: its version and last fence.
-async fn published(
+pub(super) async fn published(
     conn: &mut SqliteConnection,
     p: &ProfileRef,
 ) -> Result<Option<(u64, u64)>, AppError> {
@@ -247,6 +252,55 @@ async fn current_lease(
     }))
 }
 
+/// Refuses unless the caller holds `lease` on `p` right now: the current row,
+/// its own device, the exact fence and base, not expired (L1174).
+pub(super) async fn held_lease(
+    conn: &mut SqliteConnection,
+    p: &ProfileRef,
+    s: &Session,
+    lease: &LeaseRef,
+    now: i64,
+) -> Result<(), AppError> {
+    let held = current_lease(conn, p)
+        .await?
+        .filter(|l| l.lease.lease_id == lease.lease_id)
+        .ok_or_else(lease_expired)?;
+    if held.owner_device_id != s.device_id {
+        return Err(AppError::Forbidden);
+    }
+    if held.lease != *lease {
+        return Err(conflict(
+            "FENCE_STALE",
+            "the lease holds another fence or base",
+        ));
+    }
+    if held.expires_at_ms <= now {
+        return Err(lease_expired());
+    }
+    Ok(())
+}
+
+/// The signed head the commit of `version` stored; `None` at version 0, and
+/// for a version without its snapshot row, which then matches no request.
+pub(super) async fn head(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    p: &ProfileRef,
+    version: u64,
+) -> Result<Option<[u8; 32]>, AppError> {
+    let row = sqlx::query(
+        "SELECT head_hash FROM v2_snapshots
+          WHERE server_instance_id = ? AND tenant_id = ? AND profile_id = ? AND version = ?",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(p.tenant_id.as_slice())
+    .bind(p.profile_id.as_slice())
+    .bind(sql_int(version)?)
+    .fetch_optional(&mut *conn)
+    .await?;
+    row.map(|r| blob::<32>(&r, "head_hash")).transpose()
+}
+
 /// Sets the profile's fence to `fence` and inserts the lease it grants.
 #[allow(clippy::too_many_arguments)]
 async fn grant_lease(
@@ -297,7 +351,7 @@ fn expiry(now: i64, ttl_seconds: u32) -> i64 {
 /// Stores the exact response under the actor's key, with the audit row, and
 /// commits nothing yet: the caller commits.
 #[allow(clippy::too_many_arguments)]
-async fn finish(
+pub(super) async fn finish(
     conn: &mut SqliteConnection,
     v: &Verified,
     s: &Session,
@@ -341,7 +395,7 @@ async fn finish(
 /// The stored response of `row` for this request, if the request is the same
 /// exact bytes (else `IDEMPOTENCY_MISMATCH`) and the response is the exact map
 /// of `record_type` (else `MUTATION_RESPONSE_MISMATCH`).
-fn replay(
+pub(super) fn replay(
     row: &sqlx::sqlite::SqliteRow,
     outer: &IdempotentMutationRequestV2,
     body: &[u8],
@@ -411,6 +465,7 @@ pub async fn publish_profile(
         &fleet,
         None,
         Capability::ProfilePublish,
+        false,
         now,
     )
     .await?
@@ -556,6 +611,7 @@ pub async fn checkout_profile(
         &p.fleet_id,
         Some(&profile),
         Capability::ProfileCheckout,
+        false,
         now,
     )
     .await?
@@ -563,10 +619,11 @@ pub async fn checkout_profile(
         return Err(AppError::Forbidden);
     }
     let (current_version, last_fence) = published(&mut tx, &p).await?.ok_or_else(not_found)?;
-    if req.observed_version != current_version || current_version != 0 {
+    let current_head = head(&mut tx, v, &p, current_version).await?;
+    if req.observed_version != current_version || req.observed_signed_head_hash != current_head {
         return Err(conflict(
             "BASE_VERSION_MISMATCH",
-            "the profile is not at the observed version",
+            "the profile is not at the observed version and head",
         ));
     }
     let (key_generation, fkek_key_id) = active_key(&mut tx, v, &p.tenant_id, &p.fleet_id)
@@ -597,7 +654,7 @@ pub async fn checkout_profile(
         expires_at_ms: u64::try_from(expires_at_ms).unwrap_or_default(),
         fkek_key_id,
         key_generation,
-        current_signed_head_hash: None,
+        current_signed_head_hash: current_head,
         server_instance_id: v.server_instance_id,
         restore_epoch: v.restore_epoch,
     }
@@ -746,6 +803,7 @@ pub async fn renew_lease(
         &p.fleet_id,
         Some(&profile),
         Capability::ProfileCheckout,
+        false,
         now,
     )
     .await?
@@ -824,6 +882,7 @@ pub async fn force_expire_lease(
         &fleet,
         Some(&profile),
         Capability::LeaseForceExpire,
+        false,
         now,
     )
     .await?
