@@ -11,21 +11,27 @@
 //!
 //! Bytes live in the blob store of the legacy upload path: staging at
 //! [`fleet::staging_path`], immutable objects keyed by `snapshot_id` and never
-//! overwritten (ADR 0002 C-2). A chunk is written and flushed inside the
-//! PATCH's own `BEGIN IMMEDIATE`, so writes to one upload never interleave
-//! (L1157). Finalize hashes and promotes outside any transaction, between its
-//! `OPEN -> FINALIZING` and `FINALIZING -> READY` writes.
+//! overwritten (ADR 0002 C-2). One process-local writer per upload runs a
+//! PATCH or a finalize (L1159); neither holds a transaction across its file
+//! I/O. A PATCH reads its offset, writes and flushes the chunk, then
+//! re-checks and records it in a short `BEGIN IMMEDIATE` (L1163-L1166).
+//! Finalize hashes and promotes between its `OPEN -> FINALIZING` and
+//! `FINALIZING -> READY` writes.
 //!
 //! An upload row is looked up under the current restore epoch, and a replay
 //! whose upload or snapshot a restore dropped gets the ADR 0002 D-1 error,
 //! never its stored bytes.
 //!
-//! shortcut: no startup reconciler (L1177-L1215). PATCH drops a tail past the
-//! committed offset and quarantines a short file, and the next finalize of a
-//! FINALIZING upload finishes it; add the reconciliation matrix with restore
-//! and GC.
+//! shortcut: no startup reconciler or GC (L1177-L1215). PATCH drops a tail
+//! past the committed offset and quarantines a short file, the next finalize
+//! of a FINALIZING upload finishes it, and create-upload aborts the tenant's
+//! expired OPEN uploads and deletes their staging files. Quarantined
+//! evidence, expired FINALIZING files and READY objects that never commit
+//! stay on disk; add the reconciliation matrix with restore and GC.
 
+use std::collections::BTreeSet;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Mutex;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -72,6 +78,30 @@ fn offset_mismatch() -> AppError {
         "UPLOAD_OFFSET_MISMATCH",
         "the upload is not at this offset or state; HEAD it and resume",
     )
+}
+
+/// The uploads a PATCH or finalize is working on (L1159).
+static WRITERS: Mutex<BTreeSet<[u8; 16]>> = Mutex::new(BTreeSet::new());
+
+/// The one writer of an upload, until dropped. A second is refused, not
+/// queued: its client HEADs and resumes.
+struct Writer([u8; 16]);
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        WRITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+fn writer(upload_id: [u8; 16]) -> Result<Writer, AppError> {
+    let mut held = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.insert(upload_id) {
+        return Err(offset_mismatch());
+    }
+    Ok(Writer(upload_id))
 }
 
 fn quarantined() -> AppError {
@@ -320,6 +350,19 @@ pub async fn create_upload(
     {
         return Err(no_active_key());
     }
+    // The tenant's expired OPEN uploads are dead (PATCH and finalize refuse
+    // them): ABORTED here, and their staging files go once this commits.
+    let aborted: Vec<String> = sqlx::query_scalar(
+        "UPDATE v2_uploads SET state = 'ABORTED'
+          WHERE server_instance_id = ? AND tenant_id = ? AND state = 'OPEN'
+            AND expires_at_ms <= ?
+         RETURNING staging_path",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(p.tenant_id.as_slice())
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
     // L1102: one snapshot ID and one manifest replay ID per upload.
     let bound: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM v2_uploads
@@ -338,6 +381,25 @@ pub async fn create_upload(
             StatusCode::UNPROCESSABLE_ENTITY,
             "SNAPSHOT_REPLAY_MISMATCH",
             "this snapshot or manifest replay ID is already bound",
+        ));
+    }
+    // L1155 upload slots: one OPEN or FINALIZING upload per lease, so at most
+    // one object size of live staging each. The sweep above frees an expired
+    // OPEN one.
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_uploads
+                         WHERE server_instance_id = ? AND tenant_id = ? AND lease_id = ?
+                           AND state IN ('OPEN', 'FINALIZING'))",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(p.tenant_id.as_slice())
+    .bind(req.lease.lease_id.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
+    if busy {
+        return Err(conflict(
+            "UPLOAD_CAPACITY",
+            "this lease already has an open upload; finish it or let it expire",
         ));
     }
 
@@ -413,6 +475,10 @@ pub async fn create_upload(
     )
     .await?;
     tx.commit().await?;
+    for path in aborted {
+        // A file left behind costs only disk; its row is ABORTED for good.
+        let _ = tokio::fs::remove_file(path).await;
+    }
     Ok(cbor(StatusCode::CREATED, response))
 }
 
@@ -422,28 +488,67 @@ fn offset_response(offset: u64, status: StatusCode) -> Response {
     (status, [("upload-offset", offset.to_string())]).into_response()
 }
 
-/// Writes `bytes` at `offset` of the staging file and flushes them (L1160,
-/// L1161). `Ok(false)` when the file is missing or shorter than the committed
-/// offset: that upload cannot resume (L1162).
-async fn write_chunk(path: &str, offset: u64, bytes: &[u8]) -> std::io::Result<bool> {
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-    let mut f = match tokio::fs::OpenOptions::new().write(true).open(path).await {
+/// Writes `bytes` at `offset` of the staging file and flushes them (L1164,
+/// L1165). `Ok(false)` when the file is missing or shorter than the committed
+/// offset: that upload cannot resume (L1167).
+fn write_at(path: &str, offset: u64, bytes: &[u8]) -> std::io::Result<bool> {
+    use std::io::{Seek, Write};
+    let mut f = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    if f.metadata().await?.len() < offset {
+    if f.metadata()?.len() < offset {
         return Ok(false);
     }
-    // L1162: a crashed write's tail past the committed offset goes first.
-    f.set_len(offset).await?;
-    f.seek(std::io::SeekFrom::Start(offset)).await?;
-    f.write_all(bytes).await?;
-    f.sync_data().await?;
+    // L1167: a crashed write's tail past the committed offset goes first.
+    f.set_len(offset)?;
+    f.seek(std::io::SeekFrom::Start(offset))?;
+    f.write_all(bytes)?;
+    f.sync_data()?;
     Ok(true)
 }
 
-/// `PATCH /v2/uploads/{upload_id}` (L1147, L1157-L1162): one chunk at
+/// [`write_at`] off the async runtime. The writer goes with it, so a dropped
+/// request cannot free the upload while its write still runs.
+async fn write_chunk(
+    w: Writer,
+    path: String,
+    offset: u64,
+    bytes: Bytes,
+) -> Result<(Writer, bool), AppError> {
+    let (w, written) = tokio::task::spawn_blocking(move || (w, write_at(&path, offset, &bytes)))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok((w, written.map_err(|e| AppError::Internal(e.to_string()))?))
+}
+
+/// The caller's OPEN, unexpired upload under its held lease.
+async fn writable(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    presented: &Session,
+    upload_id: &[u8; 16],
+) -> Result<(Session, Upload), AppError> {
+    let now = now_ms();
+    let s = reload_session(conn, presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let u = load(conn, v, &s.tenant_id, upload_id)
+        .await?
+        .filter(|u| u.expires_at_ms > now)
+        .ok_or_else(not_found)?;
+    held_lease(conn, &u.p, &s, &u.lease, now).await?;
+    if u.state == "QUARANTINED" {
+        return Err(quarantined());
+    }
+    if u.state != "OPEN" {
+        return Err(offset_mismatch());
+    }
+    Ok((s, u))
+}
+
+/// `PATCH /v2/uploads/{upload_id}` (L1147, L1163-L1167): one chunk at
 /// `Upload-Offset`, checked against `Upload-Chunk-SHA256`, written and
 /// flushed before the offset and its receipt commit. An older offset is a
 /// duplicate success only with the same receipt.
@@ -475,22 +580,9 @@ pub async fn patch_upload(
         ));
     }
 
-    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
-    let now = now_ms();
-    let s = reload_session(&mut tx, &presented, v, now)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    let u = load(&mut tx, v, &s.tenant_id, &upload_id)
-        .await?
-        .filter(|u| u.expires_at_ms > now)
-        .ok_or_else(not_found)?;
-    held_lease(&mut tx, &u.p, &s, &u.lease, now).await?;
-    if u.state == "QUARANTINED" {
-        return Err(quarantined());
-    }
-    if u.state != "OPEN" {
-        return Err(offset_mismatch());
-    }
+    let w = writer(upload_id)?;
+    let mut conn = app.db.acquire().await?;
+    let (s, u) = writable(&mut conn, v, &presented, &upload_id).await?;
     let length = body.len() as u64;
     if offset < u.committed_offset {
         let same: bool = sqlx::query_scalar(
@@ -504,12 +596,11 @@ pub async fn patch_upload(
         .bind(sql_int(offset)?)
         .bind(sql_int(length)?)
         .bind(digest.as_slice())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await?;
         if !same {
             return Err(offset_mismatch());
         }
-        tx.commit().await?;
         return Ok(offset_response(u.committed_offset, StatusCode::OK));
     }
     if offset != u.committed_offset {
@@ -523,9 +614,22 @@ pub async fn patch_upload(
             "the chunk runs past the expected ciphertext size",
         ));
     }
-    let written = write_chunk(&u.staging_path, offset, &body)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    drop(conn);
+    let path = u.staging_path;
+    let (w, written) = write_chunk(w, path.clone(), offset, body).await?;
+
+    // L1166: the CAS re-checks all the write did not hold. A chunk that does
+    // not record is cut back to the committed offset.
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let s = match writable(&mut tx, v, &presented, &upload_id).await {
+        Ok((s, u)) if u.committed_offset == offset => s,
+        refused => {
+            drop(tx);
+            // Best effort: the next write drops a tail too.
+            let _ = write_chunk(w, path, offset, Bytes::new()).await;
+            return Err(refused.err().unwrap_or_else(offset_mismatch));
+        }
+    };
     if !written {
         quarantine(&mut tx, v, &s, &upload_id).await?;
         tx.commit().await?;
@@ -555,6 +659,7 @@ pub async fn patch_upload(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    drop(w);
     Ok(offset_response(end, StatusCode::OK))
 }
 
@@ -663,6 +768,7 @@ pub async fn finalize_upload(
         ));
     }
 
+    let w = writer(upload_id)?;
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
     let s = reload_session(&mut tx, &presented, v, now)
@@ -729,9 +835,11 @@ pub async fn finalize_upload(
         &u.snapshot_id,
     );
     let staging = PathBuf::from(&u.staging_path);
-    let (outcome, u) = tokio::task::spawn_blocking(move || (promote(&staging, &object, &u), u))
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // The writer goes with the blocking task and is held to the READY write.
+    let (outcome, u, _w) =
+        tokio::task::spawn_blocking(move || (promote(&staging, &object, &u), u, w))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
     let refused = match outcome {
         Err(e) => return Err(AppError::Internal(e.to_string())),
         Ok(refused) => refused,
@@ -779,7 +887,6 @@ pub async fn finalize_upload(
         &u.p.profile_id,
         &u.snapshot_id,
     );
-    // The artifacts are written once; a concurrent finalize fails here.
     sqlx::query(
         "UPDATE v2_uploads
             SET state = 'READY', immutable_path = ?, signed_manifest_container_bytes = ?,
@@ -824,6 +931,11 @@ pub async fn commit_upload(
     let upload_id = id_path(&upload)?;
     exact_cbor_body(&headers, &body, MAX_COMMIT_REQUEST_BYTES)?;
     let req = CommitRequestV2::parse(&body).map_err(snapshot_error)?;
+    if req.upload_id() != &upload_id {
+        return Err(column_mismatch(
+            "the path names another upload than the request",
+        ));
+    }
 
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
@@ -876,6 +988,7 @@ pub async fn commit_upload(
 
     let u = load(&mut tx, v, &s.tenant_id, &upload_id)
         .await?
+        .filter(|u| u.expires_at_ms > now)
         .ok_or_else(not_found)?;
     // L1174: byte-identical to the request finalize bound to this upload.
     if u.commit_request.as_deref() != Some(&body[..]) {
@@ -1198,4 +1311,19 @@ pub async fn read_snapshot(
         header::HeaderValue::from_static("application/octet-stream"),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writer;
+
+    #[test]
+    fn one_writer_holds_an_upload_until_it_drops() {
+        let first = writer([0x71; 16]);
+        assert!(first.is_ok());
+        assert!(writer([0x71; 16]).is_err());
+        assert!(writer([0x72; 16]).is_ok());
+        drop(first);
+        assert!(writer([0x71; 16]).is_ok());
+    }
 }

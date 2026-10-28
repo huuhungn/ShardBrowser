@@ -2346,6 +2346,13 @@ async fn an_upload_commits_once_and_the_next_checkout_starts_at_its_head() {
         .unwrap();
     tail.write_all(&vec![0x5c; n]).unwrap();
     drop(tail);
+    // A chunk at the wrong offset is refused before it touches the file.
+    let len = std::fs::metadata(&staging).unwrap().len();
+    assert_eq!(
+        mismatch(server.patch(&id, &access, 2 * CHUNK, &o[2 * CHUNK..]).await),
+        offset
+    );
+    assert_eq!(std::fs::metadata(&staging).unwrap().len(), len);
     server.send(&id, &access, o, CHUNK).await;
     assert_eq!(
         server.count("SELECT count(*) FROM v2_upload_chunks").await,
@@ -2427,6 +2434,14 @@ async fn an_upload_commits_once_and_the_next_checkout_starts_at_its_head() {
         &access,
         other.exact_bytes(),
         (409, "IDEMPOTENCY_MISMATCH"),
+    )
+    .await;
+    expect(
+        &server,
+        &upload_path(&[0x66; 16], "commit"),
+        &access,
+        c1.exact_bytes(),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
     )
     .await;
 
@@ -2778,6 +2793,27 @@ async fn every_upload_refusal_has_its_status_and_code() {
     let mut t = s.terms.clone();
     t.snapshot_id = [0x56; 16];
     expect(&server, &up1, &access, &upload_req(0x18, &t), replayed).await;
+    // One open upload per lease.
+    let second = snap(p1, l1, &dev, 0x28, None);
+    expect(
+        &server,
+        &up1,
+        &access,
+        &upload_req(0x0e, &second.terms),
+        (409, "UPLOAD_CAPACITY"),
+    )
+    .await;
+    // Another lease has its own slot.
+    let (status, body) = server
+        .call(&checkout_path(P2), &access, &checkout(0x08, pref(P2), 0))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let l2b = granted(LeaseOrigin::Checkout, &body).lease;
+    let own = snap(pref(P2), l2b, &dev, 0x29, None);
+    let (status, body) = server
+        .call(&uploads_path(P2), &access, &upload_req(0x0d, &own.terms))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
 
     // PATCH and HEAD: only the lease holder.
     let o = &s.object;
@@ -2880,8 +2916,18 @@ async fn every_upload_refusal_has_its_status_and_code() {
         (K::Profile, P1),
     )
     .await;
-    let (status, body) = server.call(&fin, &access, &finalize_req(0x21, &c1)).await;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    // Two finalizes at once: one is READY, the other is told to HEAD.
+    let (f1, f2) = (finalize_req(0x21, &c1), finalize_req(0x26, &c1));
+    let (a, b) = tokio::join!(
+        server.call(&fin, &access, &f1),
+        server.call(&fin, &access, &f2)
+    );
+    let mut got = [(a.0, code(&a.1)), (b.0, code(&b.1))];
+    got.sort();
+    assert_eq!(
+        got,
+        [(200, String::new()), (409, "UPLOAD_OFFSET_MISMATCH".into())]
+    );
     // READY takes no more chunks and no second finalize.
     assert_eq!(
         short(server.patch(&u1, &access, 0, &o[..CHUNK]).await),
@@ -2985,15 +3031,21 @@ async fn every_upload_refusal_has_its_status_and_code() {
         .await;
     let late = snap(p1, l1, &dev, 0x26, None);
     let lid = server.uploaded(&access, 0x1e, &late).await;
-    // Complete, for a finalize after the lease lapsed.
+    let lapse = "UPDATE v2_uploads SET expires_at_ms = 1 WHERE upload_id = ?";
+    server.sql(lapse, &[&lid]).await;
+    // Complete, for a finalize after the lease lapsed. Its create aborts the
+    // expired upload and deletes its staging file, but keeps the evidence of
+    // a quarantine.
     let unleased = snap(p1, l1, &dev, 0x27, None);
     let nid = server.uploaded(&access, 0x1f, &unleased).await;
-    server
-        .sql(
-            "UPDATE v2_uploads SET expires_at_ms = 1 WHERE upload_id = ?",
-            &[&lid],
-        )
-        .await;
+    assert!(!server.staging_file(&lid).exists());
+    assert!(server.staging_file(&tid).exists());
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_uploads WHERE state = 'ABORTED'")
+            .await,
+        1
+    );
     assert_eq!(
         short(server.patch(&lid, &access, 0, &late.object[..CHUNK]).await),
         (404, "RESOURCE_NOT_FOUND".into())
@@ -3011,6 +3063,14 @@ async fn every_upload_refusal_has_its_status_and_code() {
     // COMMIT: the exact finalized request, `profile.commit`, the base and
     // head, the ACTIVE generation and the live lease.
     let commit = upload_path(&u1, "commit");
+    server.sql(lapse, &[&u1]).await;
+    expect(&server, &commit, &access, c1.exact_bytes(), gone).await;
+    server
+        .sql(
+            "UPDATE v2_uploads SET expires_at_ms = created_at_ms + 86400000 WHERE upload_id = ?",
+            &[&u1],
+        )
+        .await;
     let renonced = commit_request(&s.manifest, &dev, u1, 0x30, 0x4f);
     expect_field(
         &server,
@@ -3079,7 +3139,9 @@ async fn every_upload_refusal_has_its_status_and_code() {
             &[&u1],
         )
         .await;
-    expect(&server, &fin, &access, &finalize_req(0x21, &c1), gone).await;
+    // Whichever of the two finalizes won is a stored response.
+    expect(&server, &fin, &access, &f1, gone).await;
+    expect(&server, &fin, &access, &f2, gone).await;
     expect(&server, &commit, &access, c1.exact_bytes(), gone).await;
     expect(&server, &up1, &access, &upload_req(0x17, &s.terms), gone).await;
     assert_eq!(server.head(&u1, &access).await, (404, None));
