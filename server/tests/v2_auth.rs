@@ -6827,9 +6827,6 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
         .as_str()
         .unwrap()
         .to_string();
-    restored_to(&mut server, 1).await;
-    assert_eq!(server.me(&access).await.0, 200);
-    assert_eq!(server.me(&peer_access).await.0, 200);
 
     let leaves = restore_leaves(TENANT);
     let t = restore_transition(&dev, &leaves, |_| {});
@@ -6838,6 +6835,14 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     let body = filing(&signed, &proofs);
     let refused = |code: &str| (422, code.to_string());
 
+    // Custody comes before the body is decoded: garbage is a custodian's
+    // problem only.
+    let garbage = vec![0xff; 1 << 20];
+    assert_eq!(server.file(&peer_access, &garbage).await.0, 403);
+    assert_eq!(
+        server.file(&access, &garbage).await,
+        refused("NON_CANONICAL_RECORD")
+    );
     // Not a closed filing map.
     assert_eq!(
         server.file(&access, &signed).await,
@@ -6886,12 +6891,18 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
         let b = signed_filing(&dev, &leaves, edit);
         assert_eq!(server.file(&access, &b).await.0, 403);
     }
-    // The epochs are `E -> E+1` at the current `E+1`.
-    let ahead = signed_filing(&dev, &leaves, |t| (t.previous_epoch, t.new_epoch) = (1, 2));
-    assert_eq!(
-        server.file(&access, &ahead).await,
-        (409, "STALE_CONTEXT".into())
-    );
+    // The epochs are `E -> E+1`, staged at the current `E`.
+    for edit in [
+        (|t| (t.previous_epoch, t.new_epoch) = (1, 2)) as fn(&mut Transition),
+        |t| t.new_epoch = 2,
+    ] {
+        assert_eq!(
+            server
+                .file(&access, &signed_filing(&dev, &leaves, edit))
+                .await,
+            (409, "STALE_CONTEXT".into())
+        );
+    }
     // A broken signature, and proofs that are not the signed set.
     assert_eq!(
         server
@@ -6936,6 +6947,12 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     assert_eq!((status, &out), (201, &signed), "{}", code_of(&out));
     let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
     assert_eq!((status, &out), (201, &signed));
+    // Staged for a restore that has not happened: not found.
+    let tenant = hex(&TENANT);
+    let path = format!("{TRANSITIONS}/{tenant}/0/1");
+    let first_proof = format!("{path}/proofs/{}", hex(&leaves[0].profile_id));
+    assert_eq!(server.call(&path, &peer_access, None).await.0, 404);
+    assert_eq!(server.call(&first_proof, &peer_access, None).await.0, 404);
     // Other bytes under the same epochs, replay ID or nonce conflict; only a
     // custodian learns it.
     for edit in [
@@ -6955,9 +6972,11 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     );
     assert_eq!(server.file(&peer_access, &by_peer).await.0, 403);
 
-    // Any session of the tenant reads the exact bytes back.
-    let tenant = hex(&TENANT);
-    let path = format!("{TRANSITIONS}/{tenant}/0/1");
+    // After the restore to `E+1`, any session of the tenant reads the exact
+    // bytes back, and a lost response is still answered.
+    restored_to(&mut server, 1).await;
+    let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
+    assert_eq!((status, &out), (201, &signed));
     assert_eq!(
         server.call(&path, &peer_access, None).await,
         (200, signed.clone())
@@ -6997,20 +7016,6 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
         assert_eq!(server.count(query).await, n, "{query}");
     }
 
-    // A later epoch takes only its own step and still serves the old one.
-    restored_to(&mut server, 2).await;
-    let skip = signed_filing(&dev, &leaves, |t| {
-        (
-            t.previous_epoch,
-            t.new_epoch,
-            t.nonce,
-            t.transition_replay_id,
-        ) = (0, 2, [0x37; 16], [0x38; 16])
-    });
-    assert_eq!(
-        server.file(&access, &skip).await,
-        (409, "STALE_CONTEXT".into())
-    );
     // The next step may not reuse a filed replay ID or nonce.
     for edit in [
         (|t| (t.previous_epoch, t.new_epoch, t.nonce) = (1, 2, [0x39; 16])) as fn(&mut Transition),
@@ -7031,6 +7036,11 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
             t.transition_replay_id,
         ) = (1, 2, [0x39; 16], [0x3a; 16])
     });
-    assert_eq!(server.file(&access, &next).await.0, 201);
+    // Once the epoch passed it, a step can no longer be staged.
+    restored_to(&mut server, 2).await;
+    assert_eq!(
+        server.file(&access, &next).await,
+        (409, "STALE_CONTEXT".into())
+    );
     assert_eq!(server.call(&path, &peer_access, None).await, (200, signed));
 }

@@ -7,11 +7,12 @@
 //! `RestoreEpochInclusionProofV2` per leaf, in leaf order. One
 //! `BEGIN IMMEDIATE` checks that the signer is the presenting device, an
 //! ACTIVE root custodian of the transition's own tenant, that the transition
-//! is `E -> E+1` for the server's current epoch `E+1`, and that the proofs
-//! are exactly the signed sorted leaf set; then it files the transition, its
-//! proofs and the audit row together. The same bytes again get the same
-//! answer; other bytes under the same epochs, replay ID or nonce are refused.
-//! Readback returns the exact stored bytes to any live session of the tenant.
+//! is `E -> E+1` for the server's current epoch `E` (staged for the next
+//! restore), and that the proofs are exactly the signed sorted leaf set; then
+//! it files the transition, its proofs and the audit row together. The same
+//! bytes again get the same answer; other bytes under the same epochs, replay
+//! ID or nonce are refused. Readback returns the exact stored bytes to any
+//! live session of the tenant once the server has reached `E+1`.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -27,7 +28,7 @@ use shared::restore_epoch::{
 use shared::signing::{SIGNATURE_SUITE_ID_ED25519, SIGNATURE_VERSION};
 
 use super::v2_approval::{cbor, coded, exact_cbor_body};
-use super::v2_auth::{audit, reload_session, unhex, verified, Principal};
+use super::v2_auth::{audit, epoch, reload_session, unhex, verified, Principal};
 use super::v2_root::{insert_row, mismatch, record_error, stale, Col};
 use super::v2_root_grants::is_active_custodian;
 use crate::error::AppError;
@@ -122,6 +123,18 @@ pub async fn file_restore_epoch_transition(
         return Err(AppError::Forbidden);
     };
     exact_cbor_body(&headers, &body, MAX_FILING_BODY)?;
+
+    // Custody first, so only a custodian makes the server decode a body.
+    // ADR 0002 D-2 (L724): an ACTIVE root custodian, which is what
+    // `root.custody` means (Q-2).
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if !is_active_custodian(&mut tx, v, &s, now).await? {
+        return Err(AppError::Forbidden);
+    }
     let (exact, proof_bytes) = parse_filing(&body)?;
     let parsed = SignedRestoreEpochTransitionV2::parse(&exact).map_err(record_error)?;
     let proofs = proof_bytes
@@ -129,12 +142,6 @@ pub async fn file_restore_epoch_transition(
         .map(|p| RestoreEpochInclusionProofV2::parse(p))
         .collect::<Result<Vec<_>, _>>()
         .map_err(record_error)?;
-
-    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
-    let now = now_ms();
-    let s = reload_session(&mut tx, &presented, v, now)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
     // The approver is the presenting device, verified under its own key.
     if parsed.approver_signing_key_id() != &s.signing_key_id {
         return Err(AppError::Forbidden);
@@ -160,17 +167,12 @@ pub async fn file_restore_epoch_transition(
     {
         return Err(AppError::Forbidden);
     }
-    // L2251, L2254 (ADR 0002 D-1 step 5): the set for `E -> E+1` is filed
-    // once the authority is at `E+1`.
-    if t.new_epoch != v.restore_epoch || t.new_epoch - t.previous_epoch != 1 {
-        return Err(stale());
-    }
     let (instance, tenant) = (&v.server_instance_id, &t.tenant_id);
     let (previous, new) = (sql_int(t.previous_epoch)?, sql_int(t.new_epoch)?);
 
-    // A lost response: the same transition and proofs get the same answer.
-    // Anything else under these epochs, replay ID or nonce is another
-    // request; only a custodian learns that they are spent.
+    // A lost response, even after the epoch moved: the same transition and
+    // proofs get the same answer. Anything else under these epochs, replay
+    // ID or nonce is another request.
     let filed: Vec<Vec<u8>> = sqlx::query_scalar(&format!(
         "SELECT exact_signed_transition_bytes FROM {TRANSITIONS}
           WHERE server_instance_id = ? AND tenant_id = ?
@@ -192,16 +194,12 @@ pub async fn file_restore_epoch_transition(
             tx.commit().await?;
             return Ok(cbor(StatusCode::CREATED, exact));
         }
-        if !is_active_custodian(&mut tx, v, &s, now).await? {
-            return Err(AppError::Forbidden);
-        }
         return Err(mismatch());
     }
-
-    // ADR 0002 D-2 (L724): an ACTIVE root custodian, which is what
-    // `root.custody` means (Q-2).
-    if !is_active_custodian(&mut tx, v, &s, now).await? {
-        return Err(AppError::Forbidden);
+    // L2250-L2252 (ADR 0002 D-1 step 2): the set for `E -> E+1` is signed and
+    // staged while the authority is still at `E`, before the restore moves it.
+    if t.previous_epoch != v.restore_epoch || t.new_epoch - t.previous_epoch != 1 {
+        return Err(stale());
     }
     // L1112: one proof per signed leaf, each against the signed root, and
     // together exactly the sorted unique leaf set the root commits to.
@@ -317,7 +315,13 @@ fn epoch_path(epoch: &str) -> Result<i64, AppError> {
 }
 
 /// The exact stored bytes the path names: the transition, or with `profile`
-/// that profile's proof. Another tenant's are not found (L1131, L1226).
+/// that profile's proof. Another tenant's are not found (L1131, L1226), and
+/// so is one staged for an epoch the server has not reached: a restore that
+/// never happened never becomes visible.
+/// shortcut: the restore tool (D-1 step 5) does not yet bind the served set
+/// to the external record's `transition_set_sha256`, so a staged transition
+/// becomes visible after any restore to its epoch; bind it when the restore
+/// tool lands (G2-52..60).
 async fn read_back(
     app: &AppState,
     who: Principal,
@@ -354,13 +358,15 @@ async fn read_back(
     };
     let sql = format!(
         "SELECT {column} FROM {table}
-          WHERE server_instance_id = ? AND tenant_id = ? AND previous_epoch = ? AND new_epoch = ?{extra}"
+          WHERE server_instance_id = ? AND tenant_id = ? AND previous_epoch = ? AND new_epoch = ?
+            AND new_epoch <= ?{extra}"
     );
     let mut q = sqlx::query_scalar::<_, Vec<u8>>(&sql)
         .bind(v.server_instance_id.as_slice())
         .bind(s.tenant_id.as_slice())
         .bind(previous)
-        .bind(new);
+        .bind(new)
+        .bind(epoch(v)?);
     if let Some(p) = &profile {
         q = q.bind(p.as_slice());
     }
