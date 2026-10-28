@@ -5808,6 +5808,20 @@ async fn a_revoked_device_cannot_sign_in_again() {
             .0,
         422
     );
+    // A record naming this device with another device's keys, filed on that
+    // device's path, would revoke one device and store the other.
+    let mut swapped = device(&server, OWNER, 0x7f, "pending").await;
+    swapped.id = pending.id;
+    swapped.signing_key_id = approved.signing_key_id;
+    swapped.hpke_key_id = approved.hpke_key_id;
+    let swapped = revocation(&dev.sk, &swapped, 0x98, 30);
+    assert_eq!(
+        server
+            .call(&other_path, &access, Some(&revoke_request(0xac, &swapped)))
+            .await
+            .0,
+        422
+    );
     // The last custodian cannot revoke itself (C-1: someone must rotate).
     let own = revocation(&dev.sk, &dev, 0x94, 30);
     let (status, body) = server
@@ -5920,6 +5934,15 @@ async fn a_revoked_device_cannot_sign_in_again() {
             ),
             0,
         ),
+        (
+            format!(
+                "SELECT count(*) FROM v2_sessions
+                  WHERE device_id IN (X'{}', X'{}') AND revoked_at_ms IS NULL",
+                hex(&pending.id),
+                hex(&approved.id)
+            ),
+            0,
+        ),
         ("SELECT count(*) FROM v2_device_revocations".to_string(), 3),
         (
             "SELECT count(*) FROM v2_audit_events WHERE action = 'device.revoke'".to_string(),
@@ -5928,6 +5951,27 @@ async fn a_revoked_device_cannot_sign_in_again() {
     ] {
         assert_eq!(server.count(&query).await, want, "{query}");
     }
+
+    // Without root custody the same issuer cannot revoke, even with its grant.
+    server
+        .sql(
+            "UPDATE v2_tenant_root_key_grants SET revoked_at = 'now' WHERE subject_device_id = ?",
+            &[&dev.id],
+        )
+        .await;
+    let bystander = device(&server, OWNER, 0x7c, "pending").await;
+    let late = revocation(&dev.sk, &bystander, 0x9a, 30);
+    assert_eq!(
+        server
+            .call(
+                &device_revoke_path(&bystander.id),
+                &access,
+                Some(&revoke_request(0xae, &late))
+            )
+            .await
+            .0,
+        403
+    );
 
     // A revoked device never becomes usable again, and its revocation stays.
     let pool = db(&server.data).await;
