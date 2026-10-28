@@ -59,6 +59,13 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 |---|---|---|
 | **Q-22 Approval scope of a root custodian** (trust chain, rule 1) | **Tenant scope only.** An `ExistingRootGrant` or `RotationGrant` counts toward custody only when its linked approval has `approval_scope_kind = tenant`. A fleet-scoped approval admits a device to that fleet and never carries root custody: the TRK opens every fleet's `RecoveryGrant`, and custodians issue tenant-wide grants. The base `g0` is unaffected, because D1 approvals are tenant-scoped (ADR 0001). The server applies the same rule when it files a root grant other than the S6 self-grant. **Cost:** an admin approves a device at tenant scope before appointing it custodian. Rejected: any scope, the reading rule 3 alone gave | none (narrows rule 1 of this ADR) |
 
+### Decided on 2026-10-28 (strict defaults chosen by the user)
+
+| Choice | Decision | Plan lines |
+|---|---|---|
+| **Q-23 Issuer of `ROOT_GRANT_REVOKE`** (L947) | **An ACTIVE root custodian only**, the D-2 issuer rule as implemented: a custodian of the tenant's ACTIVE root generation, signing in with its session, may revoke any root grant of that tenant, including its own. The server refuses a revoke that would leave the ACTIVE root with no other custodian (`LAST_ROOT_CUSTODIAN`). No separate capability is added. Rejected: a dedicated `root.revoke` capability (more records for no new guarantee, since custodians already hold the TRK) | none (confirms L947) |
+| **Q-24 A generation stuck before activation** (L949, S6) | **Never re-filed.** If the creator's `FirstRootSelfGrant` or `FirstFleetSelfGrant` is revoked before it is acknowledged, that generation can never activate: no second self-grant is accepted for it, and the creator does not regain the right to file one. Recovery is a new generation (a root rotation, or the next fleet generation). Rejected: allowing a re-filed self-grant, which would let a revoked device regain a key the revoke meant to withhold | none (narrows S6) |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
