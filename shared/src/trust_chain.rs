@@ -1,13 +1,13 @@
 //! Client-side verification of a tenant's trust evidence (ADR 0002 B2,
-//! "Verification algorithm", rules 1-4).
+//! "Verification algorithm", rules 1-5).
 //!
 //! [`Evidence::collect`] keeps the usable containers of a full set of
 //! [`TenantTrustEvidencePageV2`] pages: they parse exactly, their signature
 //! verifies under a public key whose ID matches, and they name the binding's
 //! tenant and instance. [`TrustChain::evaluate`] then derives, as a least
 //! fixpoint rooted at the tenant's one `FirstRootSelfGrant`, the custodian
-//! windows of every key, and answers approval and capability questions from
-//! them.
+//! windows of every key, and answers approval, capability and fleet key grant
+//! questions from them.
 //!
 //! Nothing a page says is taken on trust: a container that fails a check is
 //! dropped, and the server's revocation reports only end windows early. So an
@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::authz_record::{
     ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind, CommonFields,
-    DeviceApprovalV2, GrantSubject, Payload, RootGrantVariant, TenantCapabilityGrantV2,
-    TenantRootKeyGrantV2,
+    DeviceApprovalV2, DeviceHpkeGrantV2, GrantSubject, Payload, RootGrantVariant,
+    TenantCapabilityGrantV2, TenantRootKeyGrantV2,
 };
 use crate::keys::signing_key_id;
 use crate::trust_evidence::{TenantTrustEvidencePageV2, MAX_EVIDENCE_CONTAINERS};
@@ -81,6 +81,15 @@ pub enum Scope {
     Profile([u8; 16]),
 }
 
+/// A device as rule 5 compares a `DeviceHpkeGrant`'s subject to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recipient {
+    pub account_id: [u8; 16],
+    pub device_id: [u8; 16],
+    pub signing_key_id: KeyId,
+    pub hpke_key_id: KeyId,
+}
+
 /// A usable container: checked bytes, signature, tenant and instance.
 #[derive(Debug, Clone)]
 struct Usable<T> {
@@ -96,6 +105,8 @@ pub struct Evidence {
     roots: Vec<Usable<TenantRootKeyGrantV2>>,
     approvals: Vec<Usable<DeviceApprovalV2>>,
     grants: Vec<Usable<TenantCapabilityGrantV2>>,
+    /// `DeviceHpkeGrant`s by `signed_container_hash`.
+    device_grants: BTreeMap<[u8; 32], Usable<DeviceHpkeGrantV2>>,
     /// Devices the server reported revoked, and from when.
     revoked_devices: BTreeMap<[u8; 16], u64>,
 }
@@ -169,6 +180,7 @@ impl Evidence {
                 continue;
             }
             let issuer = *record.issuer_signing_key_id();
+            let hash = *record.signed_container_hash();
             let domain = record.payload_domain().to_string();
             let Some(pk) = keys.get(&issuer) else {
                 continue;
@@ -201,6 +213,17 @@ impl Evidence {
                         payload: g,
                         revoked_at_ms,
                     });
+                }
+                Payload::DeviceHpkeGrant(g) if names(&g.common, binding) => {
+                    let revoked_at_ms = revoked_at(&g.common.replay_id);
+                    out.device_grants.insert(
+                        hash,
+                        Usable {
+                            issuer,
+                            payload: g,
+                            revoked_at_ms,
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -497,6 +520,53 @@ impl TrustChain {
                     && self.custodian_at(&g.issuer, p.common.issued_at_ms)
             })
     }
+
+    /// Rule 5 up to the HPKE open: the usable `DeviceHpkeGrant` whose exact
+    /// container is `container`, for fleet `fleet_id` generation
+    /// `generation`, naming `to` as its subject and recipient, in force at
+    /// `now`, from an issuer that at the grant's `issued_at_ms` was a
+    /// custodian with an approval and `fleet.manage` covering the fleet. The
+    /// parser already pinned `grant_capability`, the suite and the info bytes.
+    /// The caller opens it, checks `fkek_key_id`, and checks no other key is
+    /// pinned for the generation.
+    pub fn device_hpke_grant(
+        &self,
+        container: &[u8],
+        to: &Recipient,
+        fleet_id: &[u8; 16],
+        generation: u64,
+        now: u64,
+    ) -> Option<&DeviceHpkeGrantV2> {
+        let record = AuthorizationRecord::parse(container).ok()?;
+        let g = self
+            .evidence
+            .device_grants
+            .get(record.signed_container_hash())?;
+        let p = &g.payload;
+        let device_revoked = self
+            .evidence
+            .revoked_devices
+            .get(&p.subject_device_id)
+            .copied();
+        let (fleet, t) = (Scope::Fleet(p.fleet_id), p.common.issued_at_ms);
+        (p.fleet_id == *fleet_id
+            && p.generation == generation
+            && p.subject_account_id == to.account_id
+            && p.subject_device_id == to.device_id
+            && p.subject_signing_key_id == to.signing_key_id
+            && p.recipient_hpke_key_id == to.hpke_key_id
+            && holds(
+                (
+                    p.common.not_before_ms,
+                    end_of(&p.common, g.revoked_at_ms, device_revoked),
+                ),
+                now,
+            )
+            && self.custodian_at(&g.issuer, t)
+            && self.approval_valid_at(&g.issuer, fleet, t)
+            && self.capability_at(&g.issuer, Capability::FleetManage, fleet, t))
+        .then_some(p)
+    }
 }
 
 fn approval_scope(a: &DeviceApprovalV2) -> Scope {
@@ -524,8 +594,8 @@ fn covers(kind: CapabilityScopeKind, id: &[u8; 16], scope: Scope) -> bool {
 mod tests {
     use super::*;
     use crate::authz_record::{
-        build_record, DOMAIN_DEVICE_APPROVAL, DOMAIN_TENANT_CAPABILITY_GRANT,
-        DOMAIN_TENANT_ROOT_KEY_GRANT,
+        build_record, DOMAIN_DEVICE_APPROVAL, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_TENANT_CAPABILITY_GRANT, DOMAIN_TENANT_ROOT_KEY_GRANT,
     };
     use crate::trust_evidence::{RevokedDevice, RevokedRecord};
     use ed25519_dalek::SigningKey;
@@ -1316,5 +1386,305 @@ mod tests {
             Evidence::collect(&BINDING, &[twice, last]).is_err(),
             "an index repeats"
         );
+    }
+
+    const FLEET: [u8; 16] = [5; 16];
+
+    fn recipient(d: &Device) -> Recipient {
+        Recipient {
+            account_id: [9; 16],
+            device_id: d.id,
+            signing_key_id: d.key(),
+            hpke_key_id: [d.id[0]; 32],
+        }
+    }
+
+    /// A `DeviceHpkeGrant` of `FLEET` generation 1 to `subject`, issued at
+    /// `nb`; the chain never opens it, so the HPKE bytes are placeholders.
+    fn fleet_grant(issuer: &Device, subject: &Device, replay: u8, nb: u64, na: u64) -> Vec<u8> {
+        let g = DeviceHpkeGrantV2 {
+            common: common(replay, nb, na),
+            fleet_id: FLEET,
+            fkek_key_id: [6; 32],
+            generation: 1,
+            subject_account_id: [9; 16],
+            subject_device_id: subject.id,
+            subject_signing_key_id: subject.key(),
+            recipient_hpke_key_id: [subject.id[0]; 32],
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        build_record(&issuer.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    }
+
+    /// The tenant, A0 holding `fleet.manage`, D approved by A0, and A0's
+    /// grant to D issued on day 3 for a year.
+    fn fleet_tenant(a0: &Device, b: &Device, d: &Device) -> Vec<Vec<u8>> {
+        let mut evidence = tenant(a0, b);
+        evidence.push(grant(
+            a0,
+            a0,
+            Capability::FleetManage,
+            13,
+            T0,
+            T0 + 365 * DAY,
+        ));
+        evidence.push(approval(a0, d, 30, T0 + DAY, T0 + 365 * DAY));
+        evidence.push(fleet_grant(a0, d, 31, T0 + 3 * DAY, T0 + 300 * DAY));
+        evidence
+    }
+
+    const NOW: u64 = T0 + 10 * DAY;
+
+    fn accepts(p: TenantTrustEvidencePageV2, container: &[u8], to: &Recipient) -> bool {
+        chain(p)
+            .unwrap()
+            .device_hpke_grant(container, to, &FLEET, 1, NOW)
+            .is_some()
+    }
+
+    #[test]
+    fn a_fleet_grant_from_a_custodian_with_fleet_manage_is_accepted() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let evidence = fleet_tenant(&a0, &b, &d);
+        let g = evidence.last().unwrap().clone();
+        let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
+        let got = c
+            .device_hpke_grant(&g, &recipient(&d), &FLEET, 1, NOW)
+            .unwrap();
+        assert_eq!(got.subject_device_id, d.id);
+        // Another fleet or generation is not this grant.
+        assert!(c
+            .device_hpke_grant(&g, &recipient(&d), &[6; 16], 1, NOW)
+            .is_none());
+        assert!(c
+            .device_hpke_grant(&g, &recipient(&d), &FLEET, 2, NOW)
+            .is_none());
+        // Its window, half-open.
+        for (now, ok) in [
+            (T0 + 3 * DAY - 1, false),
+            (T0 + 3 * DAY, true),
+            (T0 + 300 * DAY - 1, true),
+            (T0 + 300 * DAY, false),
+        ] {
+            let got = c.device_hpke_grant(&g, &recipient(&d), &FLEET, 1, now);
+            assert_eq!(got.is_some(), ok, "{now}");
+        }
+        // Bytes the evidence does not hold, and junk.
+        let unlisted = fleet_grant(&a0, &d, 32, T0 + 3 * DAY, T0 + 300 * DAY);
+        assert!(c
+            .device_hpke_grant(&unlisted, &recipient(&d), &FLEET, 1, NOW)
+            .is_none());
+        assert!(c
+            .device_hpke_grant(b"junk", &recipient(&d), &FLEET, 1, NOW)
+            .is_none());
+    }
+
+    #[test]
+    fn a_fleet_grant_names_exactly_this_device() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let evidence = fleet_tenant(&a0, &b, &d);
+        let g = evidence.last().unwrap().clone();
+        let p = page(&[&a0, &b, &d], evidence);
+        assert!(accepts(p.clone(), &g, &recipient(&d)));
+        type Edit = fn(&mut Recipient);
+        let edits: [Edit; 4] = [
+            |r| r.account_id = [6; 16],
+            |r| r.device_id = [6; 16],
+            |r| r.signing_key_id = [6; 32],
+            |r| r.hpke_key_id = [6; 32],
+        ];
+        for (n, edit) in edits.into_iter().enumerate() {
+            let mut to = recipient(&d);
+            edit(&mut to);
+            assert!(!accepts(p.clone(), &g, &to), "edit {n}");
+        }
+    }
+
+    #[test]
+    fn a_fleet_grant_needs_a_custodian_with_approval_and_fleet_manage() {
+        let (a0, b, d, m) = (
+            Device::new(1),
+            Device::new(2),
+            Device::new(4),
+            Device::new(3),
+        );
+        let keys = [&a0, &b, &d, &m];
+        let with = |extra: Vec<Vec<u8>>, g: &[u8]| {
+            let mut evidence = fleet_tenant(&a0, &b, &d);
+            evidence.extend(extra);
+            evidence.push(g.to_vec());
+            accepts(page(&keys, evidence), g, &recipient(&d))
+        };
+        // M is approved and holds fleet.manage, but is no custodian.
+        let g = fleet_grant(&m, &d, 40, T0 + 3 * DAY, T0 + 300 * DAY);
+        assert!(!with(
+            vec![
+                approval(&a0, &m, 41, T0 + DAY, T0 + 365 * DAY),
+                grant(
+                    &a0,
+                    &m,
+                    Capability::FleetManage,
+                    42,
+                    T0 + DAY,
+                    T0 + 365 * DAY
+                ),
+            ],
+            &g
+        ));
+        // B is a custodian with an approval, but without fleet.manage, or
+        // with it only for another fleet.
+        let g = fleet_grant(&b, &d, 43, T0 + 3 * DAY, T0 + 300 * DAY);
+        assert!(!with(Vec::new(), &g));
+        let other_fleet = TenantCapabilityGrantV2 {
+            common: common(44, T0 + 2 * DAY, T0 + 365 * DAY),
+            subject: GrantSubject::Device {
+                account_id: [9; 16],
+                device_id: b.id,
+                signing_key_id: b.key(),
+                hpke_key_id: [b.id[0]; 32],
+            },
+            scope_kind: CapabilityScopeKind::Fleet,
+            scope_id: [6; 16],
+            capability: Capability::FleetManage,
+        };
+        let other_fleet = build_record(
+            &a0.sk,
+            DOMAIN_TENANT_CAPABILITY_GRANT,
+            &other_fleet.encode(),
+        );
+        assert!(!with(vec![other_fleet], &g));
+        let fleet_manage = grant(
+            &a0,
+            &b,
+            Capability::FleetManage,
+            45,
+            T0 + 2 * DAY,
+            T0 + 365 * DAY,
+        );
+        assert!(with(vec![fleet_manage.clone()], &g));
+        // B, a custodian holding fleet.manage until day 100, issues on day 50
+        // after its approval ended on day 40.
+        let late = fleet_grant(&b, &d, 46, T0 + 50 * DAY, T0 + 300 * DAY);
+        let mut evidence = fleet_tenant(&a0, &b, &d);
+        evidence[2] = approval(&a0, &b, 20, T0 + DAY, T0 + 40 * DAY);
+        evidence.extend([fleet_manage, late.clone()]);
+        let c = chain(page(&keys, evidence)).unwrap();
+        assert!(c.custodian_at(&b.key(), T0 + 50 * DAY));
+        assert!(c.capability_at(
+            &b.key(),
+            Capability::FleetManage,
+            Scope::Fleet(FLEET),
+            T0 + 50 * DAY
+        ));
+        assert!(c
+            .device_hpke_grant(&late, &recipient(&d), &FLEET, 1, T0 + 60 * DAY)
+            .is_none());
+    }
+
+    #[test]
+    fn revocations_end_a_fleet_grant() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let keys = [&a0, &b, &d];
+        let evidence = fleet_tenant(&a0, &b, &d);
+        let g = evidence.last().unwrap().clone();
+        let p = page(&keys, evidence.clone());
+        // The grant itself, reported revoked before now.
+        let mut revoked = p.clone();
+        revoked.revocations.push(RevokedRecord {
+            payload_domain: DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE.into(),
+            replay_id: [31; 16],
+            revoked_at_ms: NOW - 1,
+        });
+        assert!(!accepts(revoked.clone(), &g, &recipient(&d)));
+        revoked.revocations[0].revoked_at_ms = NOW + 1;
+        assert!(accepts(revoked, &g, &recipient(&d)));
+        // Its subject device.
+        let mut revoked = p.clone();
+        revoked.device_revocations.push(RevokedDevice {
+            device_id: d.id,
+            revoked_at_ms: NOW - 1,
+        });
+        assert!(!accepts(revoked, &g, &recipient(&d)));
+        // Its issuer, B, revoked on day 5: a grant it issued on day 4 keeps
+        // its standing, one it issued on day 6 never had any.
+        let fleet_manage = grant(
+            &a0,
+            &b,
+            Capability::FleetManage,
+            45,
+            T0 + 2 * DAY,
+            T0 + 365 * DAY,
+        );
+        let early = fleet_grant(&b, &d, 47, T0 + 4 * DAY, T0 + 300 * DAY);
+        let late = fleet_grant(&b, &d, 48, T0 + 6 * DAY, T0 + 300 * DAY);
+        let mut evidence = evidence;
+        evidence.extend([fleet_manage, early.clone(), late.clone()]);
+        let mut p = page(&keys, evidence);
+        p.device_revocations.push(RevokedDevice {
+            device_id: b.id,
+            revoked_at_ms: T0 + 5 * DAY,
+        });
+        assert!(accepts(p.clone(), &early, &recipient(&d)));
+        assert!(!accepts(p, &late, &recipient(&d)));
+    }
+
+    #[test]
+    fn a_fleet_scoped_approval_and_fleet_manage_are_enough() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        // B's tenant approval ends on day 40; from then on only an approval
+        // and a fleet.manage for FLEET cover it, when it issues on day 50.
+        let mut evidence = fleet_tenant(&a0, &b, &d);
+        evidence[2] = approval(&a0, &b, 20, T0 + DAY, T0 + 40 * DAY);
+        let fleet_approval = DeviceApprovalV2 {
+            common: common(50, T0 + 30 * DAY, T0 + 365 * DAY),
+            subject_account_id: [9; 16],
+            subject_device_id: b.id,
+            subject_signing_key_id: b.key(),
+            subject_hpke_key_id: [b.id[0]; 32],
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: FLEET,
+        };
+        let fleet_manage = TenantCapabilityGrantV2 {
+            common: common(51, T0 + 2 * DAY, T0 + 365 * DAY),
+            subject: GrantSubject::Device {
+                account_id: [9; 16],
+                device_id: b.id,
+                signing_key_id: b.key(),
+                hpke_key_id: [b.id[0]; 32],
+            },
+            scope_kind: CapabilityScopeKind::Fleet,
+            scope_id: FLEET,
+            capability: Capability::FleetManage,
+        };
+        let late = fleet_grant(&b, &d, 52, T0 + 50 * DAY, T0 + 300 * DAY);
+        evidence.extend([
+            build_record(&a0.sk, DOMAIN_DEVICE_APPROVAL, &fleet_approval.encode()),
+            build_record(
+                &a0.sk,
+                DOMAIN_TENANT_CAPABILITY_GRANT,
+                &fleet_manage.encode(),
+            ),
+            late.clone(),
+        ]);
+        let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
+        assert!(c
+            .device_hpke_grant(&late, &recipient(&d), &FLEET, 1, T0 + 60 * DAY)
+            .is_some());
+    }
+
+    #[test]
+    fn a_fleet_grant_of_another_tenant_is_dropped() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        SIGNED_TENANT.set([8; 16]);
+        let foreign = fleet_grant(&a0, &d, 60, T0 + 3 * DAY, T0 + 300 * DAY);
+        SIGNED_TENANT.set(TENANT);
+        let mut evidence = fleet_tenant(&a0, &b, &d);
+        evidence.push(foreign.clone());
+        assert!(!accepts(
+            page(&[&a0, &b, &d], evidence),
+            &foreign,
+            &recipient(&d)
+        ));
     }
 }

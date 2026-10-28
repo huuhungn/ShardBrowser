@@ -20,9 +20,10 @@
 //! profiles it opens: 0600 on Unix, and DPAPI-protected on Windows (see
 //! `dpapi`).
 //!
-//! Since 2.4.3 nothing new is collected: fleet keys the team server delivers
-//! are counted, never cached, because nothing yet proves who issued them
-//! (`custody_report`). Keys cached by 2.4.2 still open old snapshots.
+//! Since 2.4.3 a fleet key the team server delivers is cached only once its
+//! grant verifies against the tenant trust chain (`open_fleet_grant`), and
+//! never over another key held for the same generation (`collect`). Keys
+//! cached by 2.4.2 still open old snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,7 +94,6 @@ impl FleetKeyStore {
     }
 
     /// Record a collected key.
-    #[cfg(test)]
     pub fn insert(&mut self, fleet_id: &str, generation: u64, key: &[u8; 32]) {
         let f = self.fleets.entry(fleet_id.to_string()).or_default();
         f.keys.insert(generation, to_hex(key));
@@ -148,7 +148,6 @@ impl FleetKeys {
 }
 
 /// Hex-encode a key for storage.
-#[cfg(test)]
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -195,9 +194,7 @@ fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
 }
 
 /// Writes `s`, then moves its plaintext keys into the credential store. The
-/// keys are durable once written, so the move is best effort. Nothing is
-/// collected any more (see the module note), so only the tests save.
-#[cfg(test)]
+/// keys are durable once written, so the move is best effort.
 pub fn save(s: &FleetKeyStore) -> Result<()> {
     {
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -207,6 +204,22 @@ pub fn save(s: &FleetKeyStore) -> Result<()> {
         eprintln!("[fleet] fleet keys stay in fleet_keys.json: {error}");
     }
     Ok(())
+}
+
+/// Keeps `key`, opened from a verified grant, as `generation` of `fleet_id`.
+/// Returns false, and saves nothing, when the store already holds a
+/// different key for that generation, or one it cannot read (ADR 0002 trust
+/// chain, rule 5: `KEY_SUBSTITUTION_DETECTED`).
+pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> {
+    let mut s = load()?;
+    if let Some(f) = s.fleets.get(fleet_id) {
+        if f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation) {
+            return Ok(f.key(generation).is_some_and(|held| *held == *key));
+        }
+    }
+    s.insert(fleet_id, generation, key);
+    save(&s)?;
+    Ok(true)
 }
 
 /// Moves every plaintext key in the saved file into the OS credential store,
