@@ -24,7 +24,9 @@ use hpke::kem::X25519HkdfSha256;
 use hpke::{Deserializable, Kem as KemTrait, OpModeR, OpModeS, Serializable};
 use zeroize::Zeroizing;
 
+use crate::authz_record::DeviceHpkeGrantV2;
 use crate::canonical::{self as c, Value};
+use crate::fleet_grants::{fkek_key_id, FKEK_LEN};
 use crate::keys::{
     hpke_key_id, HPKE_AEAD_CHACHA20POLY1305, HPKE_KDF_HKDF_SHA256, HPKE_KEM_X25519_HKDF_SHA256,
     HPKE_MODE_BASE,
@@ -335,6 +337,82 @@ pub fn open_trk(
     let mut trk = Zeroizing::new([0u8; TRK_LEN]);
     trk.copy_from_slice(&pt);
     Ok(trk)
+}
+
+/// AAD label of a `DeviceHpkeGrant` (ADR 0002 D-8).
+const L_FLEET_GRANT_AAD: &[u8] = b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0";
+
+/// Exact `DeviceHpkeGrant` AAD (ADR 0002 D-8), the root grant's pattern:
+/// label + u32be length + info bytes.
+pub fn fleet_grant_aad(hpke_info_bytes: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(L_FLEET_GRANT_AAD.len() + 4 + hpke_info_bytes.len());
+    aad.extend_from_slice(L_FLEET_GRANT_AAD);
+    aad.extend_from_slice(&(hpke_info_bytes.len() as u32).to_be_bytes());
+    aad.extend_from_slice(hpke_info_bytes);
+    aad
+}
+
+/// Seals `fkek` to `recipient_pk_bytes` into `grant`'s HPKE fields, under
+/// the grant's own D-8 info. Refuses a key that is not the recipient the
+/// grant names, as [`seal_trk`] does.
+pub fn seal_device_fkek(
+    recipient_pk_bytes: &[u8],
+    grant: &mut DeviceHpkeGrantV2,
+    fkek: &[u8; FKEK_LEN],
+) -> Result<(), GrantError> {
+    if hpke_key_id(recipient_pk_bytes) != grant.recipient_hpke_key_id {
+        return Err(GrantError::FieldMismatch("recipient_hpke_key_id"));
+    }
+    let pk = <Kem as KemTrait>::PublicKey::from_bytes(recipient_pk_bytes)
+        .map_err(|_| GrantError::BadKeyMaterial)?;
+    let info = grant.hpke_info_bytes();
+    let mut rng = OsRng;
+    let (encapped, ciphertext) = hpke::single_shot_seal_with_rng::<Aead, Kdf, Kem>(
+        &OpModeS::Base,
+        &pk,
+        &info,
+        fkek.as_slice(),
+        &fleet_grant_aad(&info),
+        &mut rng,
+    )
+    .map_err(|_| GrantError::HpkeFailure)?;
+    grant.hpke_encapped_key_bytes = encapped.to_bytes().to_vec();
+    grant.hpke_wrapped_fleet_key_bytes = ciphertext;
+    Ok(())
+}
+
+/// Opens a `DeviceHpkeGrant` with the recipient's HPKE private key, under the
+/// info rebuilt from the grant's fields, and checks the FKEK hashes to
+/// `fkek_key_id` (ADR 0002 trust chain, rule 5). The caller verifies the
+/// grant itself first; a refused key is wiped on drop.
+pub fn open_device_fkek(
+    recipient_sk_bytes: &[u8],
+    grant: &DeviceHpkeGrantV2,
+) -> Result<Zeroizing<[u8; FKEK_LEN]>, GrantError> {
+    let sk = <Kem as KemTrait>::PrivateKey::from_bytes(recipient_sk_bytes)
+        .map_err(|_| GrantError::BadKeyMaterial)?;
+    let encapped = <Kem as KemTrait>::EncappedKey::from_bytes(&grant.hpke_encapped_key_bytes)
+        .map_err(|_| GrantError::BadKeyMaterial)?;
+    let info = grant.hpke_info_bytes();
+    let pt = hpke::single_shot_open::<Aead, Kdf, Kem>(
+        &OpModeR::Base,
+        &sk,
+        &encapped,
+        &info,
+        &grant.hpke_wrapped_fleet_key_bytes,
+        &fleet_grant_aad(&info),
+    )
+    .map_err(|_| GrantError::HpkeFailure)
+    .map(Zeroizing::new)?;
+    let fkek: Zeroizing<[u8; FKEK_LEN]> = Zeroizing::new(
+        pt.as_slice()
+            .try_into()
+            .map_err(|_| GrantError::BadFkekLength)?,
+    );
+    if fkek_key_id(&fkek) != grant.fkek_key_id {
+        return Err(GrantError::FieldMismatch("fkek_key_id"));
+    }
+    Ok(fkek)
 }
 
 /// Which kind of grant this is. Recorded explicitly so a self-grant cannot be
@@ -812,6 +890,71 @@ mod tests {
             )
             .is_err(),
             "altered info must not open the grant"
+        );
+    }
+
+    fn device_grant(recipient_pk: &[u8], fkek: &[u8; FKEK_LEN]) -> DeviceHpkeGrantV2 {
+        DeviceHpkeGrantV2 {
+            common: crate::authz_record::CommonFields {
+                replay_id: [1; 16],
+                tenant_id: [2; 16],
+                issued_at_ms: 1_800_000_000_000,
+                not_before_ms: 1_800_000_000_000,
+                not_after_ms: 1_800_086_400_000,
+                server_instance_id: [3; 16],
+                restore_epoch: 0,
+            },
+            fleet_id: [4; 16],
+            fkek_key_id: fkek_key_id(fkek),
+            generation: 1,
+            subject_account_id: [6; 16],
+            subject_device_id: [7; 16],
+            subject_signing_key_id: [8; 32],
+            recipient_hpke_key_id: hpke_key_id(recipient_pk),
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_fleet_grant_aad_is_the_label_the_length_and_the_info() {
+        assert_eq!(
+            fleet_grant_aad(b"ab"),
+            b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0\0\0\0\x02ab".to_vec()
+        );
+    }
+
+    /// A device grant opens only for its recipient, only under its own
+    /// fields, and only to the key its `fkek_key_id` names.
+    #[test]
+    fn a_device_fleet_grant_opens_only_to_the_key_it_names() {
+        let (sk, pk) = derive_keypair(&[21; 32]);
+        let (other_sk, other_pk) = derive_keypair(&[22; 32]);
+        let fkek = [0x5a; FKEK_LEN];
+        let mut g = device_grant(&pk, &fkek);
+        assert_eq!(
+            seal_device_fkek(&other_pk, &mut g, &fkek),
+            Err(GrantError::FieldMismatch("recipient_hpke_key_id"))
+        );
+        seal_device_fkek(&pk, &mut g, &fkek).unwrap();
+        assert_eq!(g.hpke_encapped_key_bytes.len(), 32);
+        assert_eq!(g.hpke_wrapped_fleet_key_bytes.len(), 48);
+        assert_eq!(*open_device_fkek(&sk, &g).unwrap(), fkek);
+        assert_eq!(
+            open_device_fkek(&other_sk, &g),
+            Err(GrantError::HpkeFailure)
+        );
+        // Every field is in the info, so a moved grant does not open.
+        let mut moved = g.clone();
+        moved.generation = 2;
+        assert_eq!(open_device_fkek(&sk, &moved), Err(GrantError::HpkeFailure));
+
+        // A grant whose sealer put another key under the named ID.
+        let mut lying = device_grant(&pk, &[0x11; FKEK_LEN]);
+        seal_device_fkek(&pk, &mut lying, &fkek).unwrap();
+        assert_eq!(
+            open_device_fkek(&sk, &lying),
+            Err(GrantError::FieldMismatch("fkek_key_id"))
         );
     }
 }

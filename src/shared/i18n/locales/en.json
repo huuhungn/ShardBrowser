@@ -1209,6 +1209,7 @@
   "sync.closeEveryWindowInTheGroup": "Close every window in the group",
   "sync.deviceNotEnrolled": "This device is not enrolled. Enroll it in Settings.",
   "sync.enrolledBeforeSyncExisted": "This device was enrolled before profile sync existed — enroll it again in Settings.",
+  "sync.fleetKeyStoreUnreadable": "The saved fleet keys file cannot be read, so it was left untouched. Restore it from a backup before collecting fleet keys again.",
   "sync.holdWorkInOneWindowAlone": "Hold — work in one window alone",
   "sync.noDataToPush": "This profile has no data to push yet.",
   "sync.noTeamServer": "No team server is configured. Set one in Settings.",

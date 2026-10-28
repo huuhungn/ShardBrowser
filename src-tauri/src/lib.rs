@@ -2477,30 +2477,49 @@ async fn team_collect_custody(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Fleet grants are only counted, never opened: see `custody_report`.
-    let fleet_grants_waiting = if c.fleet_id.is_empty() {
-        0
+    // A fleet grant is opened only once it verifies: see `custody_report`.
+    let fleet = if c.fleet_id.is_empty() {
+        FleetGrant::None
     } else {
-        fleet_grants_waiting(&client, &c, username.trim(), &password).await?
+        collect_fleet_grant(&client, &c, username.trim(), &password, &device_sk).await?
     };
 
-    custody_report(&device_sk, &grants, fleet_grants_waiting)
+    custody_report(&device_sk, &grants, fleet)
 }
 
-/// How many live D-9 `DeviceHpkeGrant`s of the fleet's ACTIVE generation are
-/// filed for this device: the readback holds at most one.
-async fn fleet_grants_waiting(
+/// What became of this device's D-9 `DeviceHpkeGrant` of the fleet's ACTIVE
+/// generation: the readback holds at most one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetGrant {
+    /// No ACTIVE generation, no grant filed, or a revoked one.
+    None,
+    /// Filed, but this device pins no anchor to verify it against.
+    Waiting,
+    /// Verified, opened and in the fleet key store, for this generation.
+    Opened(u64),
+    /// Filed, but the evidence could not be fetched, or the grant did not
+    /// verify or open.
+    Failed,
+    /// Verified and opened, but the store holds another key, or one it
+    /// cannot read, for its generation (rule 5, `KEY_SUBSTITUTION_DETECTED`).
+    Substituted,
+}
+
+/// Reads this device's grant and, when this device pinned an anchor, the
+/// tenant trust evidence, and keeps the FKEK only if rule 5 accepts it.
+async fn collect_fleet_grant(
     client: &fleet_client::FleetClient,
     c: &team_config::TeamConfig,
     username: &str,
     password: &str,
-) -> Result<usize, String> {
+    device_sk: &[u8],
+) -> Result<FleetGrant, String> {
     let Some(generation) = client
         .active_fleet_generation(&c.tenant_id, &c.fleet_id)
         .await
         .map_err(|e| e.to_string())?
     else {
-        return Ok(0);
+        return Ok(FleetGrant::None);
     };
     if username.is_empty() || password.is_empty() {
         return Err(crate::errcode::code("fleet.setAccountFirst"));
@@ -2517,26 +2536,123 @@ async fn fleet_grants_waiting(
         .await
         .map_err(|e| e.to_string())?;
     let access = session.access_token.as_str();
-    let read = client
+    let grant = match client
         .read_fleet_device_grant(access, &c.fleet_id, generation, &c.device_id)
-        .await;
+        .await
+    {
+        Ok(Some(d)) => live_fleet_grant(&d, &c.fleet_id, generation, &c.device_id),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    };
+    let pin = pinned_anchor(c);
+    let pages = match (&grant, &pin) {
+        (Ok(Some(_)), Some(_)) => Some(client.trust_evidence(access, &c.tenant_id).await),
+        _ => None,
+    };
     client.end_session(access).await;
-    match read.map_err(|e| e.to_string())? {
-        None => Ok(0),
-        Some(d) => live_fleet_grant(&d, &c.fleet_id, generation, &c.device_id).map(usize::from),
-    }
+    let Some(container) = grant? else {
+        return Ok(FleetGrant::None);
+    };
+    let (Some(pin), Some(pages)) = (pin, pages) else {
+        return Ok(FleetGrant::Waiting);
+    };
+    // Root custody is still reported when only the evidence fetch failed.
+    let Ok(pages) = pages else {
+        return Ok(FleetGrant::Failed);
+    };
+    let (_, hpke_public) = shardx_core::grants::derive_keypair(&hpke_seed);
+    let me = shardx_core::trust_chain::Recipient {
+        account_id: fleet_client::decode_hex16(&c.account_id, "account_id")
+            .map_err(|e| e.to_string())?,
+        device_id: fleet_client::decode_hex16(&c.device_id, "device_id")
+            .map_err(|e| e.to_string())?,
+        signing_key_id: shardx_core::keys::signing_key_id(signer.verifying_key().as_bytes()),
+        hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+    };
+    let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id").map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let fkek = open_fleet_grant(
+        &container, &pages, &pin, &me, &fleet, generation, device_sk, now,
+    );
+    keep_fleet_key(&c.fleet_id, generation, fkek)
 }
 
-/// Whether the descriptor is an unrevoked `DeviceHpkeGrant` of exactly this
-/// fleet, generation and device. A descriptor naming anything else is a bad
-/// reply. Its signature is not checked: the grant is only counted, and the
-/// issuer's key comes with verified key distribution.
+/// Keeps the FKEK `open_fleet_grant` accepted, unless the store holds
+/// another key for its generation. A store that does not parse is an error.
+fn keep_fleet_key(
+    fleet_id: &str,
+    generation: u64,
+    fkek: Option<zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<FleetGrant, String> {
+    let Some(fkek) = fkek else {
+        return Ok(FleetGrant::Failed);
+    };
+    if !fleet_keys::collect(fleet_id, generation, &fkek).map_err(|e| e.to_string())? {
+        return Ok(FleetGrant::Substituted);
+    }
+    Ok(FleetGrant::Opened(generation))
+}
+
+/// The binding and anchor `A0` this device pinned: only the device that
+/// bootstrapped the tenant's custody has them. A joining device pins its own
+/// in the join ceremony (ADR 0002 Q-12), which has not shipped.
+fn pinned_anchor(
+    c: &team_config::TeamConfig,
+) -> Option<(shardx_core::trust_chain::Binding, [u8; 32])> {
+    let s = root_bootstrap::load().ok()?;
+    if !s.activated
+        || !s.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+        || !s.device_id.eq_ignore_ascii_case(&c.device_id)
+    {
+        return None;
+    }
+    let binding = shardx_core::trust_chain::Binding {
+        server_instance_id: fleet_client::decode_hex16(&s.server_instance_id, "server_instance_id")
+            .ok()?,
+        tenant_id: fleet_client::decode_hex16(&s.tenant_id, "tenant_id").ok()?,
+    };
+    Some((
+        binding,
+        fleet_client::decode_hex(&s.anchor)?.try_into().ok()?,
+    ))
+}
+
+/// ADR 0002 trust chain, rule 5: the FKEK of the `DeviceHpkeGrant` whose
+/// exact container is `container`, once the evidence verifies to the pinned
+/// anchor and accepts the grant for this device, fleet and generation, opened
+/// with this device's HPKE key and checked against `fkek_key_id`. `None`
+/// refuses it, and a refused key is wiped on drop.
+#[allow(clippy::too_many_arguments)]
+fn open_fleet_grant(
+    container: &[u8],
+    pages: &[shardx_core::trust_evidence::TenantTrustEvidencePageV2],
+    (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
+    me: &shardx_core::trust_chain::Recipient,
+    fleet_id: &[u8; 16],
+    generation: u64,
+    device_sk: &[u8],
+    now: u64,
+) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    use shardx_core::trust_chain::{Evidence, TrustChain};
+    let evidence = Evidence::collect(binding, pages).ok()?;
+    let chain = TrustChain::evaluate(evidence, Some(anchor)).ok()?;
+    let grant = chain.device_hpke_grant(container, me, fleet_id, generation, now)?;
+    shardx_core::grants::open_device_fkek(device_sk, grant).ok()
+}
+
+/// The exact grant container of the descriptor when it is an unrevoked
+/// `DeviceHpkeGrant` of exactly this fleet, generation and device, `None`
+/// when it is revoked. A descriptor naming anything else is a bad reply.
+/// Nothing here is trusted: the container is verified against the trust
+/// evidence (`open_fleet_grant`).
 fn live_fleet_grant(
     descriptor: &[u8],
     fleet_id: &str,
     generation: u64,
     device_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<Vec<u8>>, String> {
     use shardx_core::canonical::{decode, Value};
     let bad = || crate::errcode::code("fleet.badReplyTeamKeys");
     let Ok(Value::Map(fields)) = decode(descriptor) else {
@@ -2557,25 +2673,30 @@ fn live_fleet_grant(
     {
         return Err(bad());
     }
-    match text("grant_state") {
-        Some("PENDING_ACK" | "ACKNOWLEDGED") => Ok(true),
-        Some("REVOKED") => Ok(false),
+    let live = match text("grant_state") {
+        Some("PENDING_ACK" | "ACKNOWLEDGED") => true,
+        Some("REVOKED") => false,
+        _ => return Err(bad()),
+    };
+    match field("exact_signed_container_bytes") {
+        Some(Value::Bytes(container)) => Ok(live.then(|| container.clone())),
         _ => Err(bad()),
     }
 }
 
 /// Open the root key grants and report counts.
 ///
-/// Fleet key grants are counted but not opened, and nothing is written to the
-/// fleet key store. The team server delivers them, and nothing yet proves who
-/// issued one: a hostile server could seal a key of its own choosing to this
-/// device, and a device that synced under it would hand the server every
-/// profile. Until verified key distribution ships, sync uses the team
-/// passphrase, and the interface uses `fleet_grants_waiting` to say why.
+/// The team server delivers the fleet key grant, so a hostile server could
+/// seal a key of its own choosing to this device. Its FKEK reaches the fleet
+/// key store only once the grant verifies against the trust chain rooted at
+/// the anchor this device pinned (`open_fleet_grant`); a device that pinned
+/// none reports it in `fleet_grants_waiting`, as does a grant that failed.
+/// Push still seals under the team passphrase, so the report never claims
+/// sync without it.
 fn custody_report(
     device_sk: &[u8],
     grants: &[fleet_client::RootKeyGrant],
-    fleet_grants_waiting: usize,
+    fleet: FleetGrant,
 ) -> Result<serde_json::Value, String> {
     let mut opened = 0usize;
     let mut failed = 0usize;
@@ -2599,15 +2720,26 @@ fn custody_report(
         }
     }
 
+    let (fleet_opened, fleet_failed, newest_fleet_generation) = match fleet {
+        FleetGrant::Opened(g) => (1, 0, Some(g)),
+        FleetGrant::Failed | FleetGrant::Substituted => (0, 1, None),
+        FleetGrant::None | FleetGrant::Waiting => (0, 0, None),
+    };
+    let fleet_grants_waiting = usize::from(matches!(
+        fleet,
+        FleetGrant::Waiting | FleetGrant::Failed | FleetGrant::Substituted
+    ));
+    let fleet_refusal = (fleet == FleetGrant::Substituted).then_some("KEY_SUBSTITUTION_DETECTED");
     Ok(serde_json::json!({
         "grants": grants.len(),
         "opened": opened,
         "failed": failed,
         "newest_generation": newest_generation,
-        "fleet_opened": 0,
-        "fleet_failed": 0,
-        "newest_fleet_generation": null,
+        "fleet_opened": fleet_opened,
+        "fleet_failed": fleet_failed,
+        "newest_fleet_generation": newest_fleet_generation,
         "fleet_grants_waiting": fleet_grants_waiting,
+        "fleet_refusal": fleet_refusal,
         "can_sync_without_passphrase": false,
     }))
 }
@@ -2659,8 +2791,8 @@ mod custody_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// A fleet grant is only counted: the server delivered it, and nothing yet
-    /// proves who issued it.
+    /// A fleet grant this device cannot verify is only counted: the server
+    /// delivered it, and nothing proves who issued it.
     #[test]
     fn a_server_delivered_fleet_key_is_counted_but_never_cached() {
         let _config = store::config_root_test_lock()
@@ -2670,7 +2802,7 @@ mod custody_tests {
         store::set_config_root(Some(dir.path().to_path_buf()));
 
         let (device_sk, _) = shardx_core::grants::derive_keypair(&[7u8; 32]);
-        let report = custody_report(&device_sk, &[], 1).unwrap();
+        let report = custody_report(&device_sk, &[], FleetGrant::Waiting).unwrap();
         let cached = store::fleet_keys_path().unwrap().exists();
         store::set_config_root(None);
 
@@ -2678,6 +2810,316 @@ mod custody_tests {
         assert_eq!(report["fleet_opened"], 0);
         assert_eq!(report["fleet_grants_waiting"], 1);
         assert_eq!(report["can_sync_without_passphrase"], false);
+
+        let report = |fleet| custody_report(&device_sk, &[], fleet).unwrap();
+        let opened = report(FleetGrant::Opened(3));
+        assert_eq!(opened["fleet_opened"], 1);
+        assert_eq!(opened["newest_fleet_generation"], 3);
+        assert_eq!(opened["fleet_grants_waiting"], 0);
+        assert_eq!(opened["can_sync_without_passphrase"], false);
+        let failed = report(FleetGrant::Failed);
+        assert_eq!(failed["fleet_failed"], 1);
+        assert_eq!(failed["fleet_opened"], 0);
+        assert_eq!(failed["fleet_grants_waiting"], 1, "not accepted");
+        assert_eq!(failed["fleet_refusal"], serde_json::Value::Null);
+        let substituted = report(FleetGrant::Substituted);
+        assert_eq!(substituted["fleet_failed"], 1);
+        assert_eq!(substituted["fleet_grants_waiting"], 1);
+        assert_eq!(substituted["fleet_refusal"], "KEY_SUBSTITUTION_DETECTED");
+        assert_eq!(report(FleetGrant::None)["fleet_grants_waiting"], 0);
+    }
+
+    const T0: u64 = 1_800_000_000_000;
+    const DAY: u64 = 86_400_000;
+    const TENANT: [u8; 16] = [2; 16];
+    const INSTANCE: [u8; 16] = [3; 16];
+    const FLEET: [u8; 16] = [4; 16];
+
+    /// The tenant's bootstrap device, which is this device: its signing key,
+    /// HPKE key pair and the identity a grant must name.
+    struct Me {
+        sk: shardx_core::signing::Ed25519SigningKey,
+        hpke_sk: zeroize::Zeroizing<Vec<u8>>,
+        hpke_pk: Vec<u8>,
+        to: shardx_core::trust_chain::Recipient,
+    }
+
+    fn me() -> Me {
+        let sk = shardx_core::signing::Ed25519SigningKey::from_bytes(&[1; 32]);
+        let (hpke_sk, hpke_pk) = shardx_core::grants::derive_keypair(&[7; 32]);
+        let to = shardx_core::trust_chain::Recipient {
+            account_id: [6; 16],
+            device_id: [5; 16],
+            signing_key_id: shardx_core::keys::signing_key_id(sk.verifying_key().as_bytes()),
+            hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_pk),
+        };
+        Me {
+            sk,
+            hpke_sk,
+            hpke_pk,
+            to,
+        }
+    }
+
+    fn common(replay: u8) -> shardx_core::authz_record::CommonFields {
+        shardx_core::authz_record::CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: T0,
+            not_before_ms: T0,
+            not_after_ms: T0 + 300 * DAY,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        }
+    }
+
+    /// This device's grant of `FLEET` generation 1, naming `fkek_key_id` and
+    /// sealing `fkek` to its HPKE key.
+    fn fleet_grant(me: &Me, fkek_key_id: [u8; 32], fkek: &[u8; 32]) -> Vec<u8> {
+        use shardx_core::authz_record::*;
+        let mut g = DeviceHpkeGrantV2 {
+            common: common(40),
+            fleet_id: FLEET,
+            fkek_key_id,
+            generation: 1,
+            subject_account_id: me.to.account_id,
+            subject_device_id: me.to.device_id,
+            subject_signing_key_id: me.to.signing_key_id,
+            recipient_hpke_key_id: me.to.hpke_key_id,
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        };
+        shardx_core::grants::seal_device_fkek(&me.hpke_pk, &mut g, fkek).unwrap();
+        build_record(&me.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    }
+
+    /// The trust evidence of a tenant this device bootstrapped: its D1
+    /// approval, its first root self-grant, its own `fleet.manage`, and
+    /// `grant`.
+    fn evidence(
+        me: &Me,
+        grant: Vec<u8>,
+    ) -> Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2> {
+        use shardx_core::authz_record::*;
+        let approval = DeviceApprovalV2 {
+            common: common(10),
+            subject_account_id: me.to.account_id,
+            subject_device_id: me.to.device_id,
+            subject_signing_key_id: me.to.signing_key_id,
+            subject_hpke_key_id: me.to.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: common(11),
+            variant: RootGrantVariant::FirstRootSelfGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: me.to.account_id,
+            subject_device_id: me.to.device_id,
+            subject_signing_key_id: me.to.signing_key_id,
+            recipient_hpke_key_id: me.to.hpke_key_id,
+            subject_device_approval_replay_id: [10; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let fleet_manage = TenantCapabilityGrantV2 {
+            common: common(12),
+            subject: GrantSubject::Device {
+                account_id: me.to.account_id,
+                device_id: me.to.device_id,
+                signing_key_id: me.to.signing_key_id,
+                hpke_key_id: me.to.hpke_key_id,
+            },
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::FleetManage,
+        };
+        vec![shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+            server_instance_id: INSTANCE,
+            tenant_id: TENANT,
+            server_now_ms: T0,
+            page_index: 0,
+            next_cursor: Vec::new(),
+            signing_public_keys: vec![me.sk.verifying_key().to_bytes()],
+            containers: vec![
+                build_record(&me.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+                build_record(&me.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+                build_record(
+                    &me.sk,
+                    DOMAIN_TENANT_CAPABILITY_GRANT,
+                    &fleet_manage.encode(),
+                ),
+                grant,
+            ],
+            revocations: Vec::new(),
+            device_revocations: Vec::new(),
+        }]
+    }
+
+    /// The FKEK opens only from a grant the trust chain rooted at the pinned
+    /// anchor accepts for this device, fleet and generation, and only when it
+    /// hashes to the grant's `fkek_key_id`.
+    #[test]
+    fn a_verified_fleet_grant_opens_and_nothing_else_does() {
+        let me = me();
+        let fkek = [0x5a; 32];
+        let grant = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&fkek), &fkek);
+        let pages = evidence(&me, grant.clone());
+        let binding = shardx_core::trust_chain::Binding {
+            server_instance_id: INSTANCE,
+            tenant_id: TENANT,
+        };
+        let pin = (binding, me.to.signing_key_id);
+        let now = T0 + DAY;
+        type Pages = [shardx_core::trust_evidence::TenantTrustEvidencePageV2];
+        type Pin = (shardx_core::trust_chain::Binding, [u8; 32]);
+        type To = shardx_core::trust_chain::Recipient;
+        let open = |container: &[u8], pages: &Pages, pin: &Pin, to: &To, generation, sk: &[u8]| {
+            open_fleet_grant(container, pages, pin, to, &FLEET, generation, sk, now)
+        };
+        assert_eq!(
+            open(&grant, &pages, &pin, &me.to, 1, &me.hpke_sk).as_deref(),
+            Some(&fkek)
+        );
+        // Another anchor, tenant or instance than the pinned one.
+        for pin in [
+            (binding, [9; 32]),
+            (
+                shardx_core::trust_chain::Binding {
+                    tenant_id: [9; 16],
+                    ..binding
+                },
+                me.to.signing_key_id,
+            ),
+            (
+                shardx_core::trust_chain::Binding {
+                    server_instance_id: [9; 16],
+                    ..binding
+                },
+                me.to.signing_key_id,
+            ),
+        ] {
+            assert!(open(&grant, &pages, &pin, &me.to, 1, &me.hpke_sk).is_none());
+        }
+        // Another generation, or a grant the chain does not accept for this
+        // device.
+        assert!(open(&grant, &pages, &pin, &me.to, 2, &me.hpke_sk).is_none());
+        let other = shardx_core::trust_chain::Recipient {
+            device_id: [9; 16],
+            ..me.to
+        };
+        assert!(open(&grant, &pages, &pin, &other, 1, &me.hpke_sk).is_none());
+        // A grant the evidence does not hold.
+        assert!(open(
+            &grant,
+            &evidence(&me, Vec::new()),
+            &pin,
+            &me.to,
+            1,
+            &me.hpke_sk
+        )
+        .is_none());
+        // Another HPKE key.
+        let (other_sk, _) = shardx_core::grants::derive_keypair(&[8; 32]);
+        assert!(open(&grant, &pages, &pin, &me.to, 1, &other_sk).is_none());
+        // A verified grant whose sealed key is not the one it names.
+        let lying = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&[1; 32]), &fkek);
+        let pages = evidence(&me, lying.clone());
+        assert!(open(&lying, &pages, &pin, &me.to, 1, &me.hpke_sk).is_none());
+    }
+
+    /// A collected key is pinned for its generation: the same key again is
+    /// fine, another one is refused and leaves the store as it was.
+    #[test]
+    fn a_collected_fleet_key_is_never_replaced() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = hex(&FLEET);
+        assert!(fleet_keys::collect(&fleet, 1, &[0x5a; 32]).unwrap());
+        assert!(fleet_keys::collect(&fleet, 1, &[0x5a; 32]).unwrap());
+        assert!(!fleet_keys::collect(&fleet, 1, &[0x5b; 32]).unwrap());
+        assert!(fleet_keys::collect(&fleet, 2, &[0x5b; 32]).unwrap());
+        assert!(!fleet_keys::collect(&fleet, 2, &[0x5a; 32]).unwrap());
+        let held = fleet_keys::load().unwrap();
+        // An entry whose key cannot be read is held all the same.
+        let mut keys = fleet_keys::load().unwrap();
+        keys.fleets
+            .get_mut(&fleet)
+            .unwrap()
+            .keys
+            .insert(3, "zz".into());
+        fleet_keys::save(&keys).unwrap();
+        let unreadable = fleet_keys::collect(&fleet, 3, &[0x5c; 32]).unwrap();
+        let kept = [
+            keep_fleet_key(&fleet, 4, Some(zeroize::Zeroizing::new([0x5d; 32]))),
+            keep_fleet_key(&fleet, 4, Some(zeroize::Zeroizing::new([0x5e; 32]))),
+            keep_fleet_key(&fleet, 5, None),
+        ];
+        store::set_config_root(None);
+        assert_eq!(
+            kept,
+            [
+                Ok(FleetGrant::Opened(4)),
+                Ok(FleetGrant::Substituted),
+                Ok(FleetGrant::Failed)
+            ]
+        );
+        // Marked as from a verified grant, so sync does not use them yet.
+        assert_eq!(held.fleets[&fleet].verified, [1, 2].into());
+        assert!(held.keys_newest_first(&fleet).is_empty());
+        assert!(!unreadable);
+    }
+
+    /// Only the device that bootstrapped this tenant's custody, with the
+    /// generation active, has an anchor pinned.
+    #[test]
+    fn only_the_bootstrapped_device_has_a_pinned_anchor() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let c = team_config::TeamConfig {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&[5; 16]),
+            ..Default::default()
+        };
+        let pinned = |edit: fn(&mut root_bootstrap::BootstrapState)| {
+            let mut s = root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT).to_uppercase(),
+                device_id: hex(&[5; 16]),
+                server_instance_id: hex(&INSTANCE),
+                activated: true,
+                anchor: hex(&[1; 32]),
+                ..Default::default()
+            };
+            edit(&mut s);
+            std::fs::write(
+                store::custody_bootstrap_path().unwrap(),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+            pinned_anchor(&c)
+        };
+        let got = pinned(|_| {});
+        let none: [fn(&mut root_bootstrap::BootstrapState); 3] = [
+            |s| s.activated = false,
+            |s| s.tenant_id = hex(&[9; 16]),
+            |s| s.device_id = hex(&[9; 16]),
+        ];
+        let refused: Vec<bool> = none.into_iter().map(|e| pinned(e).is_none()).collect();
+        store::set_config_root(None);
+        let (binding, anchor) = got.unwrap();
+        assert_eq!(
+            (binding.tenant_id, binding.server_instance_id),
+            (TENANT, INSTANCE)
+        );
+        assert_eq!(anchor, [1; 32]);
+        assert_eq!(refused, [true; 3]);
     }
 
     /// The D-9 readback counts only an unrevoked grant of exactly this fleet,
@@ -2725,13 +3167,16 @@ mod custody_tests {
         };
         let (fleet, device) = (hex(&[4; 16]), hex(&[7; 16]));
         let live = descriptor(RootGrantState::Acknowledged);
-        assert_eq!(live_fleet_grant(&live, &fleet, 1, &device), Ok(true));
+        assert_eq!(
+            live_fleet_grant(&live, &fleet, 1, &device),
+            Ok(Some(container.clone()))
+        );
         assert_eq!(
             live_fleet_grant(&live, &fleet.to_uppercase(), 1, &device),
-            Ok(true)
+            Ok(Some(container.clone()))
         );
         let revoked = descriptor(RootGrantState::Revoked);
-        assert_eq!(live_fleet_grant(&revoked, &fleet, 1, &device), Ok(false));
+        assert_eq!(live_fleet_grant(&revoked, &fleet, 1, &device), Ok(None));
         for (fleet, generation, device) in [
             (hex(&[0; 16]), 1, device.clone()),
             (fleet.clone(), 2, device.clone()),

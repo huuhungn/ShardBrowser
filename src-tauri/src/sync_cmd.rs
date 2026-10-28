@@ -195,6 +195,14 @@ fn open_pulled(
     open_profile_for(container, udd, passphrase, profile_id).map_err(|e| format!("{e:#}"))
 }
 
+/// The fleet keys pull tries, newest first: a store that cannot be read
+/// leaves only the passphrase.
+fn pull_candidates(fleet_id: &str) -> Vec<([u8; 32], u64)> {
+    fleet_keys::load()
+        .map(|s| s.keys_newest_first(fleet_id))
+        .unwrap_or_default()
+}
+
 /// Pull the current snapshot of `profile_id` and restore it over the local
 /// profile.
 ///
@@ -232,9 +240,7 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    let candidates = fleet_keys::load()
-        .map(|s| s.keys_newest_first(&c.fleet_id))
-        .unwrap_or_default();
+    let candidates = pull_candidates(&c.fleet_id);
 
     tokio::task::spawn_blocking(move || {
         open_pulled(&container, &udd, &profile_id, &candidates, &passphrase)
@@ -302,6 +308,46 @@ mod tests {
     fn profile_ref_is_stable_and_distinct() {
         assert_eq!(profile_ref("a"), profile_ref("a"));
         assert_ne!(profile_ref("a"), profile_ref("b"));
+    }
+
+    /// Pull tries a key cached by 2.4.2, never one collected from a verified
+    /// grant: until the W6 sticky revocation, such a key could come from a
+    /// stolen, revoked custodian key.
+    #[test]
+    fn pull_does_not_try_a_key_from_a_verified_grant() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "dd".repeat(16);
+        let (verified, legacy) = ([0x5Du8; 32], [0x5Eu8; 32]);
+        assert!(fleet_keys::collect(&fleet, 1, &verified).unwrap());
+        let mut keys = fleet_keys::load().unwrap();
+        keys.insert(&fleet, 2, &legacy);
+        fleet_keys::save(&keys).unwrap();
+        let candidates = pull_candidates(&fleet);
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let seal = |key| {
+            shardx_core::backup_file::seal_profile_with_fkek("p", &udd, key)
+                .unwrap()
+                .bytes
+        };
+        let (under_verified, under_legacy) = (seal(&verified), seal(&legacy));
+        let out = dir.path().join("out");
+        let from_verified = open_pulled(&under_verified, &out, "p", &candidates, "");
+        let from_legacy = open_pulled(&under_legacy, &out, "p", &candidates, "");
+        crate::store::set_config_root(None);
+
+        assert_eq!(candidates, [(legacy, 2)]);
+        let err = from_verified.expect_err("the verified grant's key is not tried");
+        assert!(
+            crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+            "{err}"
+        );
+        assert!(from_legacy.is_ok());
     }
 
     /// With a fleet key cached and a passphrase given, push still seals a
