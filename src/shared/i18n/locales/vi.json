@@ -1304,6 +1304,8 @@
   "team.syncEnrolledBeforeSync": "Thiết bị này được ghi danh trước khi có đồng bộ — hãy ghi danh lại trong Cài đặt",
   "team.tenantId": "Mã tenant",
   "team.testConnection": "Kiểm tra kết nối",
+  "team.trustLedgerUnreadable": "Không đọc được cơ sở dữ liệu tin cậy của nhóm, nên tính năng Nhóm tạm dừng và chưa có gì bị thay đổi. Hãy khôi phục nó từ bản sao lưu.",
+  "team.trustLedgerUnsupported": "Cơ sở dữ liệu tin cậy của nhóm được ghi bởi phiên bản ShardX mới hơn hoặc đang chuyển đổi dở, nên tính năng Nhóm tạm dừng. Hãy cập nhật ShardX.",
   "team.thisDeviceWasEnrolledBeforeItsKeyMat": "Thiết bị này được ghi danh từ trước khi khoá được lưu giữ, nên các quyền niêm phong cho nó sẽ không bao giờ mở được. Hãy ghi danh lại để nhận quyền quản lý.",
   "team.tokenSavedPlaceholder": "•••••••• (đã lưu — gõ để thay)",
   "team.unlockKeys": "Mở khóa",

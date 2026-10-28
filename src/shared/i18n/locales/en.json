@@ -1304,6 +1304,8 @@
   "team.syncEnrolledBeforeSync": "This device was enrolled before sync existed — re-enrol it in Settings",
   "team.tenantId": "Tenant ID",
   "team.testConnection": "Test connection",
+  "team.trustLedgerUnreadable": "The team trust database cannot be read, so Team is paused and nothing was changed. Restore it from a backup.",
+  "team.trustLedgerUnsupported": "The team trust database was written by a newer ShardX or is mid-migration, so Team is paused. Update ShardX.",
   "team.thisDeviceWasEnrolledBeforeItsKeyMat": "This device was enrolled before its key material was kept, so grants sealed to it can never be opened. Re-enrol it to take custody.",
   "team.tokenSavedPlaceholder": "•••••••• (saved — type to replace)",
   "team.unlockKeys": "Unlock keys",
