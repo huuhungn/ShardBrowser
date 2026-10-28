@@ -10,6 +10,7 @@ pub mod v2_auth;
 pub mod v2_capability;
 pub mod v2_device_revoke;
 pub mod v2_fleet;
+pub mod v2_profiles;
 pub mod v2_restore_epoch;
 pub mod v2_root;
 pub mod v2_root_grants;
@@ -131,6 +132,30 @@ pub fn router(state: AppState) -> Router {
             "/v2/fleets/:fleet_id/key-generations/:generation/grants/:replay_id/revoke",
             post(v2_fleet::revoke_fleet_grant)
                 .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/fleets/:fleet_id/profiles",
+            post(v2_profiles::publish_profile)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/profiles/:profile_id/checkout",
+            post(v2_profiles::checkout_profile)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/profiles/:profile_id/leases/:lease_id/renew",
+            post(v2_profiles::renew_lease)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/profiles/:profile_id/leases/:lease_id/release",
+            post(v2_profiles::release_lease)
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+        )
+        .route(
+            "/v2/profiles/:profile_id/leases/:lease_id/force-expire",
+            post(v2_profiles::force_expire_lease),
         )
         .route(
             "/v2/capability-grants",

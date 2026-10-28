@@ -26,6 +26,7 @@ pub mod mutation;
 pub mod oscrypt;
 pub mod passphrase;
 pub mod portable;
+pub mod profile_lease;
 pub mod recovery_bundle;
 pub mod restore_epoch;
 pub mod session_binding;

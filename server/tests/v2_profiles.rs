@@ -1,0 +1,1647 @@
+//! Profile publish, checkout, renew, release and force-expire over HTTP
+//! (plan 8.1 L1137-L1143, 5.6.5 L948/L949/L952/L962-L970; G2-21, G2-22,
+//! G2-25).
+//!
+//! The server, device and custody helpers are the minimal ones copied from
+//! `v2_auth.rs`.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+use serde_json::{json, Value};
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::SqlitePool;
+use zeroize::Zeroizing;
+
+use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
+use shared::authz_record::{
+    build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
+    CommonFields, DeviceApprovalV2, GrantSubject, Payload, RootGrantVariant,
+    TenantCapabilityGrantV2, TenantRootKeyGrantV2, DOMAIN_DEVICE_APPROVAL,
+    DOMAIN_TENANT_CAPABILITY_GRANT, DOMAIN_TENANT_ROOT_KEY_GRANT,
+};
+use shared::grants::derive_keypair;
+use shared::keys::{hpke_key_id, signing_key_id};
+use shared::mutation::{
+    root_custodian_grant_set_hash, EmbeddedSelfGrant, IdempotentMutationRequestV2,
+    IdempotentStoredResponseV2, OperationKind, RootGenerationMode, RootGenerationTarget,
+    RootGrantRef, TenantRootGenerationActivateV2, TenantRootGenerationCreateV2,
+    TenantRootGrantAckV2,
+};
+use shared::profile_lease::{
+    LeaseOrigin, LeaseRef, LeaseReleasedV2, LeaseRenewV2, LeaseRenewedV2, ProfileCheckoutV2,
+    ProfileLeaseV2, ProfilePublishCreateV2, ProfileRef, ReleaseLeaseV2, ReleaseReason,
+    RECORD_TYPE_CHECKED_OUT, RECORD_TYPE_LEASE_RELEASED, RECORD_TYPE_PUBLISH_CREATED,
+};
+use shared::session_binding::{self as sb, DeviceSessionBindingV2};
+use shared::signing::Ed25519SigningKey;
+
+const INSTANCE: [u8; 16] = [7; 16];
+const TENANT: [u8; 16] = [0x41; 16];
+const OWNER: [u8; 16] = [0x51; 16];
+const PASSWORD: &str = "correct horse battery staple";
+const DAY_MS: u64 = 86_400_000;
+const TRK: [u8; 32] = [0x7c; 32];
+const APPROVAL_REPLAY: u8 = 0x71;
+const SELF_GRANT_REPLAY: [u8; 16] = [0x81; 16];
+const FLEET: [u8; 16] = [0xf5; 16];
+const ARCHIVED: [u8; 16] = [0xf6; 16];
+const FKEK: [u8; 32] = [0xe0; 32];
+const P1: [u8; 16] = [0xc1; 16];
+const P2: [u8; 16] = [0xc2; 16];
+const P3: [u8; 16] = [0xc3; 16];
+const P4: [u8; 16] = [0xc4; 16];
+const P5: [u8; 16] = [0xc5; 16];
+
+struct Server {
+    child: Child,
+    port: u16,
+    data: PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap()
+}
+
+async fn db(data: &Path) -> SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite://{}/shardx.db?mode=rwc",
+            data.to_string_lossy().replace('\\', "/")
+        ))
+        .await
+        .unwrap()
+}
+
+fn launch(data: &Path, port: u16) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_shardx-team-server"))
+        .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
+        .env("SHARDX_DATA_DIR", data)
+        .env("SHARDX_IDENTITY_DIR", data.with_extension("identity"))
+        .env("SHARDX_TOKEN_SECRET", "v2-auth-secret")
+        .env("SHARDX_ADMIN_USER", "admin")
+        .env("SHARDX_ADMIN_PASS", "secret")
+        .spawn()
+        .expect("spawn server binary")
+}
+
+async fn wait_health(port: u16) {
+    for _ in 0..75 {
+        if let Ok(r) = client()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("server did not become healthy on port {port}");
+}
+
+/// A verified identity, one tenant with its owner account, and a server.
+async fn start(tag: &str, port: u16) -> Server {
+    let data = std::env::temp_dir().join(format!("shardx-v2-profiles-{tag}"));
+    let identity = data.with_extension("identity");
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&identity);
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&identity).unwrap();
+    let record = IdentityRecordV2::genesis(INSTANCE, 1_790_985_600_000)
+        .encode()
+        .unwrap();
+    std::fs::write(identity.join("identity-record-v2.bin"), record).unwrap();
+
+    let pool = db(&data).await;
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+    sqlx::query("INSERT INTO v2_server_state VALUES (1, ?, 0, ?, 't')")
+        .bind(INSTANCE.as_slice())
+        .bind(external_record_sha256(&record).as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO v2_tenants VALUES (?, 'acme', 'active', NULL, 't')")
+        .bind(TENANT.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO v2_bootstrap_guards VALUES (?, ?, 'unused', NULL, 't')")
+        .bind(INSTANCE.as_slice())
+        .bind(TENANT.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let hash = argon2::Argon2::default()
+        .hash_password(PASSWORD.as_bytes(), &SaltString::generate(&mut OsRng))
+        .unwrap()
+        .to_string();
+    sqlx::query("INSERT INTO v2_accounts VALUES (?, ?, 'owner', ?, NULL, 0, 'active', 't')")
+        .bind(OWNER.as_slice())
+        .bind(TENANT.as_slice())
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO v2_tenant_memberships VALUES (?, ?, 'owner', 'active', 't')")
+        .bind(TENANT.as_slice())
+        .bind(OWNER.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let child = launch(&data, port);
+    wait_health(port).await;
+    Server { child, port, data }
+}
+
+impl Server {
+    async fn post(&self, path: &str, bearer: Option<&str>, body: Value) -> (u16, Value) {
+        let mut req = client()
+            .post(format!("http://127.0.0.1:{}{path}", self.port))
+            .json(&body);
+        if let Some(t) = bearer {
+            req = req.bearer_auth(t);
+        }
+        let r = req.send().await.unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Stops the server, runs one offline operator command with `stdin`, and
+    /// starts the server again.
+    async fn offline(&mut self, args: &[&str], stdin: &str) -> std::process::Output {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_shardx-team-server"))
+            .args(args)
+            .env("SHARDX_DATA_DIR", &self.data)
+            .env("SHARDX_IDENTITY_DIR", self.data.with_extension("identity"))
+            .env("SHARDX_TOKEN_SECRET", "v2-auth-secret")
+            .env("SHARDX_ADMIN_USER", "admin")
+            .env("SHARDX_ADMIN_PASS", "secret")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the operator command");
+        cli.stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = cli.wait_with_output().unwrap();
+        self.child = launch(&self.data, self.port);
+        wait_health(self.port).await;
+        out
+    }
+
+    /// The offline D1 confirmation, typed the way the operator types it.
+    async fn confirm(&mut self, dev: &Device) {
+        let out = self
+            .offline(
+                &[
+                    "tenant",
+                    "confirm-first-device",
+                    "--tenant",
+                    "acme",
+                    "--device",
+                    &hex(&dev.id),
+                ],
+                &format!("{}\n{}\n", hex(&dev.signing_key_id), hex(&dev.hpke_key_id)),
+            )
+            .await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A CBOR POST of `body` to `path`.
+    async fn call(&self, path: &str, bearer: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let r = client()
+            .post(format!("http://127.0.0.1:{}{path}", self.port))
+            .header("content-type", "application/cbor")
+            .body(body.to_vec())
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.bytes().await.unwrap().to_vec())
+    }
+
+    async fn try_sql(&self, statement: &str, binds: &[&[u8]]) -> bool {
+        let pool = db(&self.data).await;
+        let mut q = sqlx::query(statement);
+        for b in binds {
+            q = q.bind(b.to_vec());
+        }
+        let ok = q.execute(&pool).await.is_ok();
+        pool.close().await;
+        ok
+    }
+
+    async fn sql(&self, statement: &str, binds: &[&[u8]]) {
+        assert!(self.try_sql(statement, binds).await, "{statement}");
+    }
+
+    async fn count(&self, query: &str) -> i64 {
+        let pool = db(&self.data).await;
+        let n = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+        pool.close().await;
+        n
+    }
+
+    async fn login(&self) -> Value {
+        let (status, body) = self
+            .post(
+                "/v2/auth/login",
+                None,
+                json!({ "tenant": "acme", "username": "owner", "password": PASSWORD }),
+            )
+            .await;
+        assert_eq!(status, 201, "{body}");
+        body
+    }
+}
+
+struct Device {
+    id: [u8; 16],
+    sk: Ed25519SigningKey,
+    hpke_sk: Zeroizing<Vec<u8>>,
+    hpke_pk: Vec<u8>,
+    signing_key_id: [u8; 32],
+    hpke_key_id: [u8; 32],
+}
+
+/// A device enrolled for the owner, stored the way enrollment stores it.
+async fn device(server: &Server, seed: u8, status: &str) -> Device {
+    let sk = Ed25519SigningKey::from_bytes(&[seed; 32]);
+    let spk = sk.verifying_key().to_bytes();
+    let (hpke_sk, hpk) = derive_keypair(&[seed.wrapping_add(1); 32]);
+    let id = [seed; 16];
+    let pool = db(&server.data).await;
+    sqlx::query("INSERT INTO v2_devices VALUES (?, ?, ?, x'aa', ?, ?, 1, ?, ?, 1, ?, NULL, 't')")
+        .bind(id.as_slice())
+        .bind(TENANT.as_slice())
+        .bind(OWNER.as_slice())
+        .bind(signing_key_id(&spk).as_slice())
+        .bind(spk.as_slice())
+        .bind(hpke_key_id(&hpk).as_slice())
+        .bind(hpk.as_slice())
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    Device {
+        id,
+        sk,
+        hpke_sk,
+        signing_key_id: signing_key_id(&spk),
+        hpke_key_id: hpke_key_id(&hpk),
+        hpke_pk: hpk,
+    }
+}
+
+/// Login, challenge and proof; returns the access token.
+async fn session(server: &Server, dev: &Device) -> String {
+    let ticket = server.login().await;
+    let (status, ch) = server
+        .post(
+            "/v2/auth/device-session-challenges",
+            ticket["ticket"].as_str(),
+            json!({ "device_id": hex(&dev.id) }),
+        )
+        .await;
+    assert_eq!(status, 201, "{ch}");
+    let binding = unhex(ch["binding"].as_str().unwrap());
+    DeviceSessionBindingV2::parse(&binding).unwrap();
+    let secret = sb::open_pop_secret(
+        &dev.hpke_sk,
+        &binding,
+        &unhex(ch["encapsulated_key"].as_str().unwrap()),
+        &unhex(ch["ciphertext"].as_str().unwrap()),
+    )
+    .unwrap();
+    let (status, s) = server
+        .post(
+            "/v2/auth/device-session-proofs",
+            ticket["ticket"].as_str(),
+            json!({
+                "challenge_id": ch["challenge_id"],
+                "secret": hex(&*secret),
+                "signature": hex(&sb::sign_pop(&dev.sk, &binding, &secret)),
+            }),
+        )
+        .await;
+    assert_eq!(status, 201, "{s}");
+    s["access_token"].as_str().unwrap().to_string()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn code(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body).unwrap_or(Value::Null)["code"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn common(replay: [u8; 16], days: u64) -> CommonFields {
+    let start = now_ms() - 60_000;
+    CommonFields {
+        replay_id: replay,
+        tenant_id: TENANT,
+        issued_at_ms: start,
+        not_before_ms: start,
+        not_after_ms: start + days * DAY_MS,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+    }
+}
+
+/// The exact outer request of `kind` under idempotency key `key`.
+fn outer(kind: OperationKind, key: u8, payload: Vec<u8>) -> Vec<u8> {
+    outer_with(kind, key, payload, [0x92; 16], INSTANCE, 0)
+}
+
+fn outer_with(
+    kind: OperationKind,
+    key: u8,
+    payload: Vec<u8>,
+    nonce: [u8; 16],
+    instance: [u8; 16],
+    epoch: u64,
+) -> Vec<u8> {
+    IdempotentMutationRequestV2 {
+        operation_kind: kind,
+        idempotency_key: [key; 16],
+        canonical_payload_bytes: payload,
+        client_request_nonce: nonce,
+        server_instance_id: instance,
+        restore_epoch: epoch,
+    }
+    .encode()
+}
+
+/// D1, the root bootstrap, its acknowledgement and activation: the device is
+/// the tenant's ACTIVE root custodian. Returns it and its access token.
+async fn custodian(server: &mut Server, seed: u8) -> (Device, String) {
+    let dev = device(server, seed, "pending").await;
+    server.confirm(&dev).await;
+    let access = session(server, &dev).await;
+    let start = now_ms() - 60_000;
+    let approval = DeviceApprovalV2 {
+        common: common([APPROVAL_REPLAY; 16], 30),
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        subject_hpke_key_id: dev.hpke_key_id,
+        approval_scope_kind: ApprovalScopeKind::Tenant,
+        approval_scope_id: TENANT,
+    };
+    let rec = build_record(&dev.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+    let path = format!("/v2/devices/{}/approve", hex(&dev.id));
+    assert_eq!(server.call(&path, &access, &rec).await.0, 201);
+
+    let mut g = TenantRootKeyGrantV2 {
+        common: CommonFields {
+            replay_id: SELF_GRANT_REPLAY,
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        variant: RootGrantVariant::FirstRootSelfGrant,
+        root_key_id: shared::keys::root_key_id(&TRK),
+        root_generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        recipient_hpke_key_id: dev.hpke_key_id,
+        subject_device_approval_replay_id: [APPROVAL_REPLAY; 16],
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let sealed = shared::grants::seal_trk(&dev.hpke_pk, &g.scope(), &TRK).unwrap();
+    g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+    g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+    let container = build_record(&dev.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode());
+    let hash = *AuthorizationRecord::parse(&container)
+        .unwrap()
+        .signed_container_hash();
+    let target = RootGenerationTarget {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        root_key_id: shared::keys::root_key_id(&TRK),
+        root_generation: 0,
+        required_custodian_grant_count: 1,
+        required_custodian_grant_set_hash: root_custodian_grant_set_hash(&[hash]).unwrap(),
+        recovery_bundle_sha256: [0x5a; 32],
+    };
+    let create = TenantRootGenerationCreateV2 {
+        target: target.clone(),
+        mode: RootGenerationMode::Bootstrap(EmbeddedSelfGrant {
+            container_bytes: container.clone(),
+            signed_container_hash: hash,
+        }),
+    };
+    let request = outer(OperationKind::RootGenerationCreate, 0x91, create.encode());
+    let root = format!("/v2/tenants/{}/root-key-generations", hex(&TENANT));
+    assert_eq!(server.call(&root, &access, &request).await.0, 201);
+
+    let v = AuthorizationRecord::parse(&container)
+        .unwrap()
+        .verify_signature(dev.sk.verifying_key().as_bytes())
+        .unwrap();
+    let Payload::TenantRootKeyGrant(g) = v.payload() else {
+        panic!("a root grant")
+    };
+    let grant = RootGrantRef {
+        tenant_id: g.common.tenant_id,
+        server_instance_id: g.common.server_instance_id,
+        restore_epoch: g.common.restore_epoch,
+        root_generation: g.root_generation,
+        root_key_id: g.root_key_id,
+        replay_id: g.common.replay_id,
+        signed_container_hash: *v.record().signed_container_hash(),
+        exact_signed_container_bytes_sha256: *v.record().exact_signed_container_bytes_sha256(),
+    };
+    let ack = outer(
+        OperationKind::RootGrantAck,
+        0xb1,
+        TenantRootGrantAckV2 { grant }.encode(),
+    );
+    let ack_path = format!("{root}/0/grants/{}/ack", hex(&SELF_GRANT_REPLAY));
+    assert_eq!(server.call(&ack_path, &access, &ack).await.0, 201);
+    let activate = outer(
+        OperationKind::RootGenerationActivate,
+        0xb3,
+        TenantRootGenerationActivateV2 {
+            target,
+            previous: None,
+        }
+        .encode(),
+    );
+    assert_eq!(
+        server
+            .call(&format!("{root}/0/activate"), &access, &activate)
+            .await
+            .0,
+        201
+    );
+    (dev, access)
+}
+
+/// A second device of the owner under a copy of `from`'s tenant approval,
+/// and its access token.
+async fn peer(server: &Server, from: &Device, seed: u8) -> (Device, String) {
+    let to = device(server, seed, "active").await;
+    server
+        .sql(
+            "INSERT INTO v2_device_approvals (
+                 tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
+                 subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+                 approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                 not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                 canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
+                 signature_bytes, issuer_signing_key_id, signed_container_hash,
+                 exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
+             SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
+                    ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                    not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                    canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
+                    signature_bytes, issuer_signing_key_id, signed_container_hash,
+                    exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
+               FROM v2_device_approvals WHERE subject_device_id = ?",
+            &[
+                &[seed; 16],
+                &to.id,
+                &to.signing_key_id,
+                &to.hpke_key_id,
+                &from.id,
+            ],
+        )
+        .await;
+    let access = session(server, &to).await;
+    (to, access)
+}
+
+/// Files `capability` for `subject` (a device, or the owner account when
+/// `None`) over `scope`, signed by the custodian.
+async fn grant(
+    server: &Server,
+    custodian: (&Device, &str),
+    subject: Option<&Device>,
+    replay: u8,
+    capability: Capability,
+    scope: (CapabilityScopeKind, [u8; 16]),
+) {
+    let subject = match subject {
+        Some(d) => GrantSubject::Device {
+            account_id: OWNER,
+            device_id: d.id,
+            signing_key_id: d.signing_key_id,
+            hpke_key_id: d.hpke_key_id,
+        },
+        None => GrantSubject::Account { account_id: OWNER },
+    };
+    let g = TenantCapabilityGrantV2 {
+        common: common([replay; 16], 30),
+        subject,
+        scope_kind: scope.0,
+        scope_id: scope.1,
+        capability,
+    };
+    let rec = build_record(&custodian.0.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode());
+    let (status, body) = server
+        .call("/v2/capability-grants", custodian.1, &rec)
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+}
+
+/// `FLEET` active with ACTIVE generation 0 under `FKEK`, and `ARCHIVED`
+/// archived with its own ACTIVE generation.
+async fn fleets(server: &Server) {
+    for (fleet, name, status, fkek) in [
+        (FLEET, "f", "active", FKEK),
+        (ARCHIVED, "a", "archived", [0xe9; 32]),
+    ] {
+        server
+            .sql(
+                &format!(
+                    "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+                     VALUES (?, ?, '{name}', '{status}', 't')"
+                ),
+                &[&fleet, &TENANT],
+            )
+            .await;
+        server
+            .sql(
+                "INSERT INTO v2_fleet_key_generations
+                     (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                      root_generation, state, created_at, activated_at)
+                 VALUES (?, ?, ?, 0, ?, 0, 'ACTIVE', 't', 't')",
+                &[&INSTANCE, &TENANT, &fleet, &fkek],
+            )
+            .await;
+    }
+}
+
+fn pref(profile: [u8; 16]) -> ProfileRef {
+    ProfileRef {
+        tenant_id: TENANT,
+        fleet_id: FLEET,
+        profile_id: profile,
+    }
+}
+
+fn publish_payload(p: ProfileRef) -> ProfilePublishCreateV2 {
+    ProfilePublishCreateV2 {
+        profile: p,
+        label_ciphertext: vec![0x33; 24],
+        requested_lease_ttl_seconds: 300,
+        fkek_key_id: FKEK,
+        key_generation: 0,
+    }
+}
+
+fn publish(key: u8, p: ProfileRef) -> Vec<u8> {
+    outer(
+        OperationKind::ProfilePublishCreate,
+        key,
+        publish_payload(p).encode(),
+    )
+}
+
+fn checkout(key: u8, p: ProfileRef, observed_version: u64) -> Vec<u8> {
+    let payload = ProfileCheckoutV2 {
+        profile: p,
+        observed_version,
+        observed_signed_head_hash: (observed_version != 0).then_some([0x44; 32]),
+        requested_lease_ttl_seconds: 300,
+    };
+    outer(OperationKind::ProfileCheckout, key, payload.encode())
+}
+
+fn release(key: u8, p: ProfileRef, lease: LeaseRef) -> Vec<u8> {
+    let payload = ReleaseLeaseV2 {
+        profile: p,
+        lease,
+        reason_code: ReleaseReason::UserRelease,
+    };
+    outer(OperationKind::ReleaseLease, key, payload.encode())
+}
+
+fn renew(p: ProfileRef, lease: LeaseRef, ttl: u32) -> Vec<u8> {
+    LeaseRenewV2 {
+        profile: p,
+        lease,
+        requested_lease_ttl_seconds: ttl,
+    }
+    .encode()
+}
+
+fn publish_path(fleet: [u8; 16]) -> String {
+    format!("/v2/fleets/{}/profiles", hex(&fleet))
+}
+
+fn checkout_path(profile: [u8; 16]) -> String {
+    format!("/v2/profiles/{}/checkout", hex(&profile))
+}
+
+fn lease_path(profile: [u8; 16], lease: &[u8; 16], action: &str) -> String {
+    format!(
+        "/v2/profiles/{}/leases/{}/{action}",
+        hex(&profile),
+        hex(lease)
+    )
+}
+
+/// The lease a stored publish or checkout response grants.
+fn granted(origin: LeaseOrigin, body: &[u8]) -> ProfileLeaseV2 {
+    let stored = IdempotentStoredResponseV2::parse(body).unwrap();
+    assert_eq!(stored.response_record_type, origin.record_type());
+    ProfileLeaseV2::parse(origin, &stored.canonical_response_payload_bytes).unwrap()
+}
+
+async fn expect(server: &Server, path: &str, bearer: &str, body: &[u8], want: (u16, &str)) {
+    let (status, got) = server.call(path, bearer, body).await;
+    assert_eq!(
+        (status, code(&got).as_str()),
+        want,
+        "{path}: {}",
+        String::from_utf8_lossy(&got)
+    );
+}
+
+#[tokio::test]
+async fn one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes() {
+    let mut server = start("happy", 28261).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa1,
+        Capability::ProfilePublish,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa2,
+        Capability::ProfileCheckout,
+        (K::Fleet, FLEET),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa3,
+        Capability::LeaseForceExpire,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let p = pref(P1);
+
+    // Publish: the version-0 profile, fence 1 and its lease, at once.
+    let before = now_ms();
+    let req = publish(0x01, p);
+    let (status, body) = server.call(&publish_path(FLEET), &access, &req).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+    assert_eq!(first.profile, p);
+    assert_eq!(
+        (first.lease.fencing_token, first.lease.base_version),
+        (1, 0)
+    );
+    assert_eq!((first.fkek_key_id, first.key_generation), (FKEK, 0));
+    assert_eq!(first.current_signed_head_hash, None);
+    assert_eq!(
+        (first.server_instance_id, first.restore_epoch),
+        (INSTANCE, 0)
+    );
+    assert!(first.expires_at_ms >= before + 300_000 && first.expires_at_ms <= now_ms() + 300_000);
+    let state = [
+        "SELECT count(*) FROM v2_profiles WHERE label_ciphertext IS NOT NULL
+            AND last_fencing_token = 1 AND current_key_generation = 0 AND current_version = 0",
+        "SELECT count(*) FROM v2_profile_leases WHERE fencing_token = 1",
+        "SELECT count(*) FROM v2_audit_events WHERE action = 'profile.publish_create'",
+        "SELECT count(*) FROM v2_idempotency WHERE operation_kind = 'PROFILE_PUBLISH_CREATE'",
+    ];
+    for q in state {
+        assert_eq!(server.count(q).await, 1, "{q}");
+    }
+    // The exact retry gets the same bytes and creates nothing.
+    assert_eq!(
+        server.call(&publish_path(FLEET), &access, &req).await,
+        (201, body.clone())
+    );
+    for q in state {
+        assert_eq!(server.count(q).await, 1, "{q}");
+    }
+    // The same key with other bytes is refused.
+    let other = outer_with(
+        OperationKind::ProfilePublishCreate,
+        0x01,
+        publish_payload(p).encode(),
+        [0x93; 16],
+        INSTANCE,
+        0,
+    );
+    expect(
+        &server,
+        &publish_path(FLEET),
+        &access,
+        &other,
+        (409, "IDEMPOTENCY_MISMATCH"),
+    )
+    .await;
+
+    // One current lease: even its holder cannot check out again.
+    let held = checkout_path(P1);
+    expect(
+        &server,
+        &held,
+        &access,
+        &checkout(0x02, p, 0),
+        (409, "LEASE_HELD"),
+    )
+    .await;
+
+    // Renew moves only the expiry, and only for the exact lease.
+    let renew_path = lease_path(P1, &first.lease.lease_id, "renew");
+    let (status, body) = server
+        .call(&renew_path, &access, &renew(p, first.lease, 900))
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let renewed = LeaseRenewedV2::parse(&body).unwrap();
+    assert_eq!((renewed.profile, renewed.lease), (p, first.lease));
+    assert!(renewed.expires_at_ms > first.expires_at_ms);
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_profile_leases WHERE expires_at_ms = {}",
+                renewed.expires_at_ms
+            ))
+            .await,
+        1
+    );
+    let stale = LeaseRef {
+        fencing_token: 2,
+        ..first.lease
+    };
+    expect(
+        &server,
+        &renew_path,
+        &access,
+        &renew(p, stale, 60),
+        (409, "FENCE_STALE"),
+    )
+    .await;
+
+    // Release: a stale fence is refused; the exact lease is deleted, and the
+    // retry after the delete gets the stored bytes.
+    let release_path = lease_path(P1, &first.lease.lease_id, "release");
+    expect(
+        &server,
+        &release_path,
+        &access,
+        &release(0x03, p, stale),
+        (409, "FENCE_STALE"),
+    )
+    .await;
+    let req = release(0x04, p, first.lease);
+    let (status, body) = server.call(&release_path, &access, &req).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    assert_eq!(stored.response_record_type, RECORD_TYPE_LEASE_RELEASED);
+    let released = LeaseReleasedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!((released.profile, released.lease), (p, first.lease));
+    assert_eq!(
+        server.count("SELECT count(*) FROM v2_profile_leases").await,
+        0
+    );
+    assert_eq!(
+        server.call(&release_path, &access, &req).await,
+        (200, body.clone())
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'profile.release_lease'")
+            .await,
+        1
+    );
+
+    // A second device checks out under a profile-scoped grant: fence 2.
+    let (other, other_access) = peer(&server, &dev, 0x7d).await;
+    grant(
+        &server,
+        c,
+        Some(&other),
+        0xa4,
+        Capability::ProfileCheckout,
+        (K::Profile, P1),
+    )
+    .await;
+    let theirs = checkout(0x05, p, 0);
+    let (status, their_body) = server.call(&held, &other_access, &theirs).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&their_body));
+    let second = granted(LeaseOrigin::Checkout, &their_body);
+    assert_eq!(
+        (second.lease.fencing_token, second.lease.base_version),
+        (2, 0)
+    );
+    assert_eq!((second.fkek_key_id, second.key_generation), (FKEK, 0));
+    assert_eq!(second.current_signed_head_hash, None);
+    // Held by another device: no checkout, release or renew by this one.
+    expect(
+        &server,
+        &held,
+        &access,
+        &checkout(0x06, p, 0),
+        (409, "LEASE_HELD"),
+    )
+    .await;
+    let their_release = lease_path(P1, &second.lease.lease_id, "release");
+    let their_renew = lease_path(P1, &second.lease.lease_id, "renew");
+    expect(
+        &server,
+        &their_release,
+        &access,
+        &release(0x07, p, second.lease),
+        (403, ""),
+    )
+    .await;
+    expect(
+        &server,
+        &their_renew,
+        &access,
+        &renew(p, second.lease, 60),
+        (403, ""),
+    )
+    .await;
+
+    // Once it expired: the retry still returns the same bytes and no fence,
+    // renew is refused, and a new checkout replaces the row with fence 3.
+    server
+        .sql("UPDATE v2_profile_leases SET expires_at_ms = 1", &[])
+        .await;
+    assert_eq!(
+        server.call(&held, &other_access, &theirs).await,
+        (201, their_body.clone())
+    );
+    expect(
+        &server,
+        &their_renew,
+        &other_access,
+        &renew(p, second.lease, 60),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+    let (status, body) = server.call(&held, &access, &checkout(0x08, p, 0)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let third = granted(LeaseOrigin::Checkout, &body);
+    assert_eq!(third.lease.fencing_token, 3);
+    expect(
+        &server,
+        &their_renew,
+        &other_access,
+        &renew(p, second.lease, 60),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+    assert_eq!(
+        server.call(&held, &other_access, &theirs).await,
+        (201, their_body)
+    );
+    for (q, want) in [
+        (
+            "SELECT count(*) FROM v2_profiles WHERE last_fencing_token = 3",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_profile_leases WHERE fencing_token = 3",
+            1,
+        ),
+        ("SELECT count(*) FROM v2_profile_leases", 1),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'profile.checkout'",
+            2,
+        ),
+    ] {
+        assert_eq!(server.count(q).await, want, "{q}");
+    }
+    // The replaced lease is gone for its holder.
+    expect(
+        &server,
+        &their_release,
+        &other_access,
+        &release(0x09, p, second.lease),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+
+    // Force-expire needs `lease.force_expire`, deletes the row, and audits.
+    let force = lease_path(P1, &third.lease.lease_id, "force-expire");
+    // Only the named lease: a stale lease ID expires nothing.
+    let stale_force = lease_path(P1, &second.lease.lease_id, "force-expire");
+    expect(&server, &stale_force, &access, b"", (409, "LEASE_EXPIRED")).await;
+    expect(&server, &force, &other_access, b"", (403, "")).await;
+    let (status, body) = server.call(&force, &access, b"").await;
+    assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.count("SELECT count(*) FROM v2_profile_leases").await,
+        0
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'lease.force_expire'")
+            .await,
+        1
+    );
+    expect(&server, &force, &access, b"", (409, "LEASE_EXPIRED")).await;
+    let third_renew = lease_path(P1, &third.lease.lease_id, "renew");
+    expect(
+        &server,
+        &third_renew,
+        &access,
+        &renew(p, third.lease, 60),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+    let missing = lease_path(P5, &third.lease.lease_id, "force-expire");
+    expect(&server, &missing, &access, b"", (404, "RESOURCE_NOT_FOUND")).await;
+}
+
+#[tokio::test]
+async fn every_refusal_has_its_status_and_code() {
+    let mut server = start("refusals", 28262).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa1,
+        Capability::ProfilePublish,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa2,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let (peer_dev, other) = peer(&server, &dev, 0x7d).await;
+    let pub_path = publish_path(FLEET);
+    let p = pref(P1);
+
+    // Who: a ticket, a device without the capability, another tenant.
+    let ticket = server.login().await["ticket"].as_str().unwrap().to_string();
+    expect(&server, &pub_path, &ticket, &publish(0x10, p), (403, "")).await;
+    expect(&server, &pub_path, &other, &publish(0x10, p), (403, "")).await;
+    let foreign = ProfileRef {
+        tenant_id: [0x42; 16],
+        ..p
+    };
+    expect(
+        &server,
+        &pub_path,
+        &access,
+        &publish(0x10, foreign),
+        (403, ""),
+    )
+    .await;
+    // The request: another fleet than the path, instance or epoch.
+    expect(
+        &server,
+        &publish_path(ARCHIVED),
+        &access,
+        &publish(0x10, p),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    let payload = publish_payload(p).encode();
+    let kind = OperationKind::ProfilePublishCreate;
+    let wrong_instance = outer_with(kind, 0x10, payload.clone(), [0x92; 16], [8; 16], 0);
+    expect(&server, &pub_path, &access, &wrong_instance, (403, "")).await;
+    let wrong_epoch = outer_with(kind, 0x10, payload, [0x92; 16], INSTANCE, 1);
+    expect(
+        &server,
+        &pub_path,
+        &access,
+        &wrong_epoch,
+        (409, "STALE_CONTEXT"),
+    )
+    .await;
+    // Live state: an archived fleet, another key generation.
+    let archived = ProfileRef {
+        fleet_id: ARCHIVED,
+        ..p
+    };
+    expect(
+        &server,
+        &publish_path(ARCHIVED),
+        &access,
+        &publish(0x10, archived),
+        (404, "RESOURCE_NOT_FOUND"),
+    )
+    .await;
+    for (fkek, generation) in [([0xee; 32], 0), (FKEK, 1)] {
+        let mut wrong = publish_payload(p);
+        (wrong.fkek_key_id, wrong.key_generation) = (fkek, generation);
+        let req = outer(kind, 0x10, wrong.encode());
+        expect(
+            &server,
+            &pub_path,
+            &access,
+            &req,
+            (409, "FLEET_GENERATION_NOT_ACTIVE"),
+        )
+        .await;
+    }
+    // Nothing above was stored: the key still publishes once.
+    let (status, body) = server.call(&pub_path, &access, &publish(0x10, p)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let lease = granted(LeaseOrigin::PublishCreate, &body).lease;
+    expect(
+        &server,
+        &pub_path,
+        &access,
+        &publish(0x11, p),
+        (409, "PROFILE_EXISTS"),
+    )
+    .await;
+
+    // Release and renew: the path, the tenant, a lease that is not current.
+    let rel = lease_path(P1, &lease.lease_id, "release");
+    let ren = lease_path(P1, &lease.lease_id, "renew");
+    let other_lease = LeaseRef {
+        lease_id: [0x99; 16],
+        ..lease
+    };
+    expect(
+        &server,
+        &rel,
+        &access,
+        &release(0x12, p, other_lease),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    expect(
+        &server,
+        &ren,
+        &access,
+        &renew(p, other_lease, 60),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    expect(
+        &server,
+        &rel,
+        &access,
+        &release(0x12, foreign, lease),
+        (403, ""),
+    )
+    .await;
+    expect(
+        &server,
+        &ren,
+        &access,
+        &renew(foreign, lease, 60),
+        (403, ""),
+    )
+    .await;
+    let gone = lease_path(P1, &other_lease.lease_id, "release");
+    expect(
+        &server,
+        &gone,
+        &access,
+        &release(0x12, p, other_lease),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+    let rel2 = lease_path(P2, &lease.lease_id, "release");
+    let ren2 = lease_path(P2, &lease.lease_id, "renew");
+    expect(
+        &server,
+        &rel2,
+        &access,
+        &release(0x12, p, lease),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    expect(
+        &server,
+        &ren2,
+        &access,
+        &renew(p, lease, 60),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    expect(
+        &server,
+        &rel,
+        &access,
+        &release(0x12, archived, lease),
+        (409, "LEASE_EXPIRED"),
+    )
+    .await;
+    assert_eq!(
+        server.call(&rel, &access, &release(0x12, p, lease)).await.0,
+        200
+    );
+
+    // Checkout: the path, the capability, the tenant, the profile state.
+    let co = checkout_path(P1);
+    expect(
+        &server,
+        &checkout_path(P2),
+        &access,
+        &checkout(0x13, p, 0),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    expect(&server, &co, &other, &checkout(0x13, p, 0), (403, "")).await;
+    expect(
+        &server,
+        &co,
+        &access,
+        &checkout(0x13, foreign, 0),
+        (403, ""),
+    )
+    .await;
+    expect(
+        &server,
+        &co,
+        &access,
+        &checkout(0x13, archived, 0),
+        (404, "RESOURCE_NOT_FOUND"),
+    )
+    .await;
+    expect(
+        &server,
+        &co,
+        &access,
+        &checkout(0x13, p, 1),
+        (409, "BASE_VERSION_MISMATCH"),
+    )
+    .await;
+    let id = hex(&P1);
+    for (break_it, fix_it, want) in [
+        (
+            format!("UPDATE v2_profiles SET current_version = 1 WHERE id = x'{id}'"),
+            format!("UPDATE v2_profiles SET current_version = 0 WHERE id = x'{id}'"),
+            (409, "BASE_VERSION_MISMATCH"),
+        ),
+        (
+            format!("UPDATE v2_profiles SET status = 'archived' WHERE id = x'{id}'"),
+            format!("UPDATE v2_profiles SET status = 'active' WHERE id = x'{id}'"),
+            (404, "RESOURCE_NOT_FOUND"),
+        ),
+        (
+            format!(
+                "UPDATE v2_fleets SET status = 'archived' WHERE id = x'{}'",
+                hex(&FLEET)
+            ),
+            format!(
+                "UPDATE v2_fleets SET status = 'active' WHERE id = x'{}'",
+                hex(&FLEET)
+            ),
+            (404, "RESOURCE_NOT_FOUND"),
+        ),
+    ] {
+        server.sql(&break_it, &[]).await;
+        let observed = if want.1 == "BASE_VERSION_MISMATCH" {
+            1
+        } else {
+            0
+        };
+        expect(&server, &co, &access, &checkout(0x13, p, observed), want).await;
+        server.sql(&fix_it, &[]).await;
+    }
+    // A legacy profile (no label ciphertext) is not served here.
+    server
+        .sql(
+            "INSERT INTO v2_profiles (id, tenant_id, fleet_id, name, status, created_at, updated_at)
+             VALUES (?, ?, ?, 'legacy', 'active', 't', 't')",
+            &[&P2, &TENANT, &FLEET],
+        )
+        .await;
+    expect(
+        &server,
+        &checkout_path(P2),
+        &access,
+        &checkout(0x13, pref(P2), 0),
+        (404, "RESOURCE_NOT_FOUND"),
+    )
+    .await;
+
+    // An account-scoped grant is server RBAC (D-2); a row that left its
+    // container refuses the whole check.
+    grant(
+        &server,
+        c,
+        None,
+        0xa4,
+        Capability::ProfilePublish,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let (status, body) = server
+        .call(&pub_path, &other, &publish(0x14, pref(P3)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // A grant for another fleet or profile does not cover this one.
+    let other_fleet = [0xf7; 16];
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'o', 'active', 't')",
+            &[&other_fleet, &TENANT],
+        )
+        .await;
+    grant(
+        &server,
+        c,
+        Some(&peer_dev),
+        0xa5,
+        Capability::ProfileCheckout,
+        (K::Fleet, other_fleet),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        Some(&peer_dev),
+        0xa6,
+        Capability::ProfileCheckout,
+        (K::Profile, P3),
+    )
+    .await;
+    expect(&server, &co, &other, &checkout(0x13, p, 0), (403, "")).await;
+    // An attacker with DB write could edit a row; the check still refuses.
+    server
+        .sql("DROP TRIGGER v2_capability_grants_record_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET issued_at_ms = issued_at_ms - 1
+              WHERE subject_kind = 'account'",
+            &[],
+        )
+        .await;
+    expect(
+        &server,
+        &pub_path,
+        &other,
+        &publish(0x15, pref(P5)),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET issued_at_ms = issued_at_ms + 1
+              WHERE subject_kind = 'account'",
+            &[],
+        )
+        .await;
+
+    // A revoked or expired grant counts for nothing: renew needs the live
+    // checkout capability.
+    let (status, body) = server
+        .call(&pub_path, &access, &publish(0x16, pref(P4)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let held = granted(LeaseOrigin::PublishCreate, &body).lease;
+    let ren4 = lease_path(P4, &held.lease_id, "renew");
+    assert_eq!(
+        server
+            .call(&ren4, &access, &renew(pref(P4), held, 60))
+            .await
+            .0,
+        200
+    );
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET revoked_at = 't' WHERE capability = 'profile.checkout'",
+            &[],
+        )
+        .await;
+    expect(
+        &server,
+        &ren4,
+        &access,
+        &renew(pref(P4), held, 60),
+        (403, ""),
+    )
+    .await;
+    expect(&server, &co, &access, &checkout(0x17, p, 0), (403, "")).await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa7,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    // Outside its window a grant is not selected (403); a selected row would
+    // no longer match its container (422).
+    for window in [
+        "not_before_ms = issued_at_ms + 3600000000, not_after_ms = issued_at_ms + 3600000001",
+        "not_after_ms = issued_at_ms + 1",
+    ] {
+        server
+            .sql(&format!("UPDATE v2_capability_grants SET {window} WHERE revoked_at IS NULL AND capability = 'profile.checkout'"), &[])
+            .await;
+        expect(&server, &co, &access, &checkout(0x17, p, 0), (403, "")).await;
+        server
+            .sql(
+                "UPDATE v2_capability_grants SET not_before_ms = issued_at_ms,
+                        not_after_ms = issued_at_ms + 2592000000
+                  WHERE revoked_at IS NULL AND capability = 'profile.checkout'",
+                &[],
+            )
+            .await;
+    }
+    assert_eq!(
+        server.call(&co, &access, &checkout(0x17, p, 0)).await.0,
+        201
+    );
+    server
+        .sql("DELETE FROM v2_profile_leases WHERE profile_id = ?", &[&P1])
+        .await;
+
+    // L1098: the fence fails closed at i64::MAX, and never moves back.
+    server
+        .sql(
+            "UPDATE v2_profiles SET last_fencing_token = 9223372036854775807 WHERE id = ?",
+            &[&P1],
+        )
+        .await;
+    expect(
+        &server,
+        &co,
+        &access,
+        &checkout(0x18, p, 0),
+        (422, "WIRE_INTEGER_OUT_OF_RANGE"),
+    )
+    .await;
+    assert!(
+        !server
+            .try_sql(
+                "UPDATE v2_profiles SET last_fencing_token = 1 WHERE id = ?",
+                &[&P1]
+            )
+            .await
+    );
+    // A lease holds its profile's newest fence and keeps its terms.
+    assert!(
+        !server
+            .try_sql(
+                "INSERT INTO v2_profile_leases VALUES (?, ?, ?, ?, ?, 1, 0, 0, 1, ?)",
+                &[&TENANT, &P1, &[0x98; 16], &OWNER, &dev.id, &[0x18; 16]],
+            )
+            .await
+    );
+    assert!(
+        !server
+            .try_sql(
+                "UPDATE v2_profile_leases SET fencing_token = 9 WHERE profile_id = ?",
+                &[&P4]
+            )
+            .await
+    );
+
+    // The three kinds are stored with their responses.
+    for (kind, scope) in [
+        ("PROFILE_PUBLISH_CREATE", "profile.publish-create.v2"),
+        ("PROFILE_CHECKOUT", "profile.checkout.v2"),
+        ("RELEASE_LEASE", "profile.release-lease.v2"),
+    ] {
+        let statement = format!(
+            "INSERT INTO v2_idempotency
+                 (server_instance_id, tenant_id, actor_device_id, operation_scope, idempotency_key,
+                  operation_kind, canonical_request_hash, exact_request_bytes,
+                  exact_request_bytes_sha256, status, retained_until)
+             VALUES (?, ?, ?, '{scope}', ?, '{kind}', zeroblob(32), x'01', zeroblob(32),
+                     'in_flight', 0)"
+        );
+        assert!(
+            !server
+                .try_sql(&statement, &[&INSTANCE, &TENANT, &dev.id, &[0x5f; 16]])
+                .await,
+            "{kind}"
+        );
+    }
+
+    // No ACTIVE generation: no checkout.
+    server
+        .sql(
+            "UPDATE v2_fleet_key_generations SET state = 'RETIRED', retired_at = 't'
+              WHERE fleet_id = ?",
+            &[&FLEET],
+        )
+        .await;
+    server.sql("DELETE FROM v2_profile_leases", &[]).await;
+    expect(
+        &server,
+        &checkout_path(P4),
+        &access,
+        &checkout(0x19, pref(P4), 0),
+        (409, "FLEET_GENERATION_NOT_ACTIVE"),
+    )
+    .await;
+}
+
+/// Rewrites the stored response of `key` to an honest-looking one naming
+/// `payload`, with every hash recomputed.
+async fn forge(
+    server: &Server,
+    kind: OperationKind,
+    key: u8,
+    request: &[u8],
+    record_type: &str,
+    payload: Vec<u8>,
+) {
+    let outer = IdempotentMutationRequestV2::parse(request).unwrap();
+    let forged = IdempotentStoredResponseV2 {
+        operation_kind: kind,
+        idempotency_key: [key; 16],
+        exact_request_hash: outer.canonical_request_hash(),
+        response_record_type: record_type.into(),
+        canonical_response_payload_bytes: payload,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        committed_at_ms: now_ms(),
+        receipt_id: [0x55; 16],
+    }
+    .encode();
+    server
+        .sql(
+            "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?
+              WHERE idempotency_key = ?",
+            &[&forged, &shared::canonical::sha256(&forged), &[key; 16]],
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_stored_response_naming_another_profile_or_lease_is_never_replayed() {
+    let mut server = start("forged", 28263).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa1,
+        Capability::ProfilePublish,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa2,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let p = pref(P1);
+    let pub_req = publish(0x01, p);
+    let (status, body) = server.call(&publish_path(FLEET), &access, &pub_req).await;
+    assert_eq!(status, 201);
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+    let rel_req = release(0x02, p, first.lease);
+    let rel = lease_path(P1, &first.lease.lease_id, "release");
+    let (status, rel_body) = server.call(&rel, &access, &rel_req).await;
+    assert_eq!(status, 200);
+    let co_req = checkout(0x03, p, 0);
+    let (status, co_body) = server.call(&checkout_path(P1), &access, &co_req).await;
+    assert_eq!(status, 201);
+
+    let mismatch = (422, "MUTATION_RESPONSE_MISMATCH");
+    // Stands in for an attacker with DB write.
+    server
+        .sql("DROP TRIGGER v2_idempotency_succeeded_is_fixed", &[])
+        .await;
+    let elsewhere = ProfileLeaseV2 {
+        profile: pref(P2),
+        ..first.clone()
+    };
+    forge(
+        &server,
+        OperationKind::ProfilePublishCreate,
+        0x01,
+        &pub_req,
+        RECORD_TYPE_PUBLISH_CREATED,
+        elsewhere.encode(LeaseOrigin::PublishCreate),
+    )
+    .await;
+    expect(&server, &publish_path(FLEET), &access, &pub_req, mismatch).await;
+
+    let co = granted(LeaseOrigin::Checkout, &co_body);
+    forge(
+        &server,
+        OperationKind::ProfileCheckout,
+        0x03,
+        &co_req,
+        RECORD_TYPE_CHECKED_OUT,
+        ProfileLeaseV2 {
+            profile: pref(P2),
+            ..co
+        }
+        .encode(LeaseOrigin::Checkout),
+    )
+    .await;
+    expect(&server, &checkout_path(P1), &access, &co_req, mismatch).await;
+
+    let released = LeaseReleasedV2::parse(
+        &IdempotentStoredResponseV2::parse(&rel_body)
+            .unwrap()
+            .canonical_response_payload_bytes,
+    )
+    .unwrap();
+    for wrong in [
+        LeaseReleasedV2 {
+            profile: pref(P2),
+            ..released.clone()
+        },
+        LeaseReleasedV2 {
+            lease: LeaseRef {
+                fencing_token: 9,
+                ..released.lease
+            },
+            ..released.clone()
+        },
+    ] {
+        forge(
+            &server,
+            OperationKind::ReleaseLease,
+            0x02,
+            &rel_req,
+            RECORD_TYPE_LEASE_RELEASED,
+            wrong.encode(),
+        )
+        .await;
+        expect(&server, &rel, &access, &rel_req, mismatch).await;
+    }
+}
