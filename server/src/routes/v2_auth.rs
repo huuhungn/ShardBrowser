@@ -256,6 +256,36 @@ pub(super) async fn d1_approval_is_live(
     .is_some())
 }
 
+/// Whether the device holds any live approval of this instance and epoch
+/// under exactly these keys: the D1 one or an ordinary one (ADR 0002 D-2).
+pub(super) async fn approval_is_live(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8; 16],
+    device_id: &[u8; 16],
+    signing_key_id: &[u8; 32],
+    hpke_key_id: &[u8; 32],
+    v: &Verified,
+    now: i64,
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_device_approvals
+                         WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
+                           AND subject_hpke_key_id = ? AND server_instance_id = ?
+                           AND restore_epoch = ? AND revoked_at IS NULL
+                           AND not_before_ms <= ? AND not_after_ms > ?)",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(device_id.as_slice())
+    .bind(signing_key_id.as_slice())
+    .bind(hpke_key_id.as_slice())
+    .bind(v.server_instance_id.as_slice())
+    .bind(epoch(v)?)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// The replay ID of that live D1 approval, which the first root self-grant
 /// links to (plan 5.6.4 `subject_device_approval_replay_id`).
 pub(super) async fn d1_approval_replay_id(
@@ -296,7 +326,8 @@ pub(super) async fn d1_approval_replay_id(
 
 /// The predicates R2 rechecks on every use and refresh: this instance and
 /// epoch, the account, a device still in the state the class needs with the
-/// same two keys, and for `root_setup` the live D1 approval.
+/// same two keys, and for `root_setup` the live D1 approval, for `ordinary`
+/// any live approval.
 async fn session_is_live(
     conn: &mut SqliteConnection,
     row: &sqlx::sqlite::SqliteRow,
@@ -340,19 +371,17 @@ async fn session_is_live(
     if !device_ok || s.class == "pending_setup" {
         return Ok(device_ok);
     }
-    // `ordinary` sessions need ordinary approvals and capabilities, which do
-    // not exist yet, so none is live.
-    Ok(s.class == "root_setup"
-        && d1_approval_is_live(
-            conn,
-            &s.tenant_id,
-            &s.device_id,
-            &s.signing_key_id,
-            &s.hpke_key_id,
-            v,
-            now,
-        )
-        .await?)
+    let (t, d, k, h) = (
+        &s.tenant_id,
+        &s.device_id,
+        &s.signing_key_id,
+        &s.hpke_key_id,
+    );
+    if s.class == "root_setup" {
+        d1_approval_is_live(conn, t, d, k, h, v, now).await
+    } else {
+        approval_is_live(conn, t, d, k, h, v, now).await
+    }
 }
 
 /// Reloads a session by ID with every live predicate, for a handler that
@@ -938,10 +967,9 @@ pub async fn create_device_session_challenge(
     let status: String = row.get("status");
     let usable = match status.as_str() {
         "pending" => true,
-        // An active device starts a session only on its live D1 approval;
-        // ordinary approvals arrive with capability grants (W2 PR5).
+        // An active device starts a session only on a live approval.
         "active" => {
-            d1_approval_is_live(
+            approval_is_live(
                 &mut conn,
                 &ticket.tenant_id,
                 &device_id,
@@ -1108,7 +1136,8 @@ pub async fn prove_device_session(
 
     // The device must still be what the binding named, and its state now
     // decides the class: a pending device gets `pending_setup`, an active one
-    // `root_setup`, and only on its live D1 approval.
+    // `root_setup` on its live D1 approval, else `ordinary` on a live
+    // ordinary approval.
     let device_status = sqlx::query_scalar::<_, String>(
         "SELECT status FROM v2_devices
           WHERE tenant_id = ? AND id = ? AND account_id = ? AND status IN ('pending', 'active')
@@ -1139,6 +1168,20 @@ pub async fn prove_device_session(
             .await? =>
         {
             Some("root_setup")
+        }
+        Some(_)
+            if approval_is_live(
+                &mut tx,
+                &ticket.tenant_id,
+                &binding.device_id,
+                &f.signing_key_id,
+                &f.hpke_key_id,
+                v,
+                now,
+            )
+            .await? =>
+        {
+            Some("ordinary")
         }
         _ => None,
     };

@@ -89,6 +89,19 @@ pub(crate) async fn holds_fleet_capability(
     capability: Capability,
     now: i64,
 ) -> Result<bool, AppError> {
+    holds_capability(conn, v, s, Some(fleet), capability, now).await
+}
+
+/// The same for a scope that is the tenant (`fleet` is `None`), which only a
+/// tenant-scoped grant covers, or one fleet.
+pub(crate) async fn holds_capability(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    fleet: Option<&[u8; 16]>,
+    capability: Capability,
+    now: i64,
+) -> Result<bool, AppError> {
     if !is_active_custodian(conn, v, s, now).await? {
         return Ok(false);
     }
@@ -104,7 +117,7 @@ pub(crate) async fn holds_fleet_capability(
     .bind(s.device_id.as_slice())
     .bind(s.signing_key_id.as_slice())
     .bind(capability.as_str())
-    .bind(fleet.as_slice())
+    .bind(fleet.map(|f| f.as_slice()))
     .bind(now)
     .bind(now)
     .fetch_all(&mut *conn)
