@@ -52,7 +52,7 @@ pub async fn get_generation(
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
-    .bind(generation as i64)
+    .bind(crate::util::sql_int(generation)?)
     .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
@@ -64,7 +64,7 @@ pub async fn get_generation(
         .map_err(|_| AppError::Internal("stored fkek_key_id is not 32 bytes".into()))?;
 
     Ok(Some(FleetGeneration {
-        generation: row.try_get::<i64, _>("generation")? as u64,
+        generation: crate::util::stored_uint(row.try_get("generation")?)?,
         fkek_key_id,
         state: row.try_get("state")?,
         created_at: row.try_get("created_at")?,
@@ -102,7 +102,7 @@ pub async fn active_generation(
         .map_err(|_| AppError::Internal("stored fkek_key_id is not 32 bytes".into()))?;
 
     Ok(Some(FleetGeneration {
-        generation: row.try_get::<i64, _>("generation")? as u64,
+        generation: crate::util::stored_uint(row.try_get("generation")?)?,
         fkek_key_id,
         state: row.try_get("state")?,
         created_at: row.try_get("created_at")?,
@@ -152,10 +152,14 @@ pub async fn begin_first_generation(
     };
     // The pointer alone is not proof (ADR 0001 Q3): it must name this
     // instance's ACTIVE row.
-    let anchored =
-        crate::generations::get_generation(db, instance, tenant_id, root_generation as u64)
-            .await?
-            .is_some_and(|g| g.state == crate::generations::STATE_ACTIVE);
+    let anchored = crate::generations::get_generation(
+        db,
+        instance,
+        tenant_id,
+        crate::util::stored_uint(root_generation)?,
+    )
+    .await?
+    .is_some_and(|g| g.state == crate::generations::STATE_ACTIVE);
     if !anchored {
         return Err(AppError::Conflict(
             "the tenant's root pointer does not name an active root generation".into(),
@@ -211,7 +215,7 @@ pub async fn has_self_grant(
     )
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
-    .bind(generation as i64)
+    .bind(crate::util::sql_int(generation)?)
     .bind(VARIANT_FIRST_SELF)
     .bind(instance.as_slice())
     .fetch_optional(db)
@@ -323,7 +327,7 @@ pub async fn activate_generation(
     .bind(now)
     .bind(tenant_id.as_slice())
     .bind(fleet_id.as_slice())
-    .bind(generation as i64)
+    .bind(crate::util::sql_int(generation)?)
     .bind(instance.as_slice())
     .execute(db)
     .await?;

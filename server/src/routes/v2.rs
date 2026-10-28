@@ -94,7 +94,7 @@ async fn verification_context(
         server_instance_id: instance
             .try_into()
             .map_err(|_| AppError::BadRequest("corrupt server_instance_id".into()))?,
-        restore_epoch: epoch as u64,
+        restore_epoch: crate::util::stored_uint(epoch)?,
         now_ms,
         trusted_issuers: trusted,
     })
@@ -365,7 +365,7 @@ pub async fn acquire_profile_lease(
         &account_id,
         &device_id,
         &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
+        crate::util::sql_int(ctx.restore_epoch)?,
         &now.to_rfc3339(),
         &expires.to_rfc3339(),
     )
@@ -471,7 +471,7 @@ pub async fn open_snapshot_upload(
         &session_id,
         &lease_id,
         &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
+        crate::util::sql_int(ctx.restore_epoch)?,
         req.fencing_token,
         req.target_version,
         &intent_hash,
@@ -621,7 +621,7 @@ pub async fn commit_snapshot_upload(
             fleet_id,
             base_version: req.base_version,
             key_generation: req.key_generation,
-            restore_epoch: ctx.restore_epoch as i64,
+            restore_epoch: crate::util::sql_int(ctx.restore_epoch)?,
             server_instance_id: ctx.server_instance_id,
             // Binds the stored manifest row to the exact verified bytes.
             intent_hash: verified.exact_bytes_sha256,
