@@ -8,8 +8,8 @@
 //! and whether the payload matches live state, is the caller's to check.
 
 use crate::authz_record::{
-    AuthorizationRecord, Fields, Payload, RecordError, VerifiedRecord, CONTAINER_DOMAIN,
-    CONTAINER_VERSION, MAX_RECORD_BYTES,
+    AuthorizationRecord, DeviceRevocationReason, Fields, Payload, RecordError, VerifiedRecord,
+    CONTAINER_DOMAIN, CONTAINER_VERSION, MAX_RECORD_BYTES,
 };
 use crate::canonical::{self as c, Value};
 
@@ -29,6 +29,11 @@ pub const RECORD_TYPE_ROOT_GRANT_CREATED: &str = "TenantRootGrantCreatedV2";
 pub const DOMAIN_ROOT_GRANT_REVOKE: &str = "shardx.keys.tenant-root-grant-revoke.v2";
 pub const DOMAIN_ROOT_GRANT_REVOKED: &str = "shardx.keys.tenant-root-grant-revoked.v2";
 pub const RECORD_TYPE_ROOT_GRANT_REVOKED: &str = "TenantRootGrantRevokedV2";
+/// ADR 0002 Q-13 names the request body but no domain for it or for the
+/// stored response; these are the ones chosen here.
+pub const DOMAIN_DEVICE_REVOKE: &str = "shardx.authz.device-revoke.v2";
+pub const DOMAIN_DEVICE_REVOKED: &str = "shardx.authz.device-revoked.v2";
+pub const RECORD_TYPE_DEVICE_REVOKED: &str = "DeviceRevokedV2";
 pub const DOMAIN_ROOT_GENERATION_ACTIVATE: &str = "shardx.keys.tenant-root-generation-activate.v2";
 pub const DOMAIN_ROOT_GENERATION_ACTIVATED: &str =
     "shardx.keys.tenant-root-generation-activated.v2";
@@ -1002,6 +1007,118 @@ impl TenantRootGrantRevokedV2 {
             ("revoked_at_ms", c::u(self.revoked_at_ms)),
         ]);
         c::encode(&c::m(out))
+    }
+}
+
+// ----------------------------------------------------------- device revoke ---
+
+/// ADR 0002 Q-13 `DeviceRevokeRequestV2`, the `DEVICE_REVOKE` payload: the
+/// exact signed `DeviceRevocationV2` container and its hash.
+///
+/// shortcut: `activations` must be empty, so a revocation never carries the
+/// optional activations of C-1; accept them when the client sends any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRevokeRequestV2 {
+    pub signed_container_hash: [u8; 32],
+    pub exact_signed_revocation_container_bytes: Vec<u8>,
+}
+
+impl DeviceRevokeRequestV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("DeviceRevokeRequestV2", payload)?;
+        exact_version(&mut f, DOMAIN_DEVICE_REVOKE)?;
+        let signed_container_hash = f.fixed("signed_container_hash")?;
+        let bytes = f.bytes(
+            "exact_signed_revocation_container_bytes",
+            1,
+            MAX_EMBEDDED_GRANT_BYTES,
+        )?;
+        if !matches!(f.req("activations")?, Value::Array(a) if a.is_empty()) {
+            return Err(RecordError::BadValue("activations"));
+        }
+        f.finish()?;
+        let rec = AuthorizationRecord::parse(&bytes)?;
+        if *rec.signed_container_hash() != signed_container_hash {
+            return Err(RecordError::BadValue("signed_container_hash"));
+        }
+        Ok(Self {
+            signed_container_hash,
+            exact_signed_revocation_container_bytes: bytes,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        c::encode(&c::m(vec![
+            ("domain", c::t(DOMAIN_DEVICE_REVOKE)),
+            ("version", c::u(VERSION)),
+            ("signed_container_hash", c::b(&self.signed_container_hash)),
+            (
+                "exact_signed_revocation_container_bytes",
+                c::b(&self.exact_signed_revocation_container_bytes),
+            ),
+            ("activations", Value::Array(Vec::new())),
+        ]))
+    }
+}
+
+/// The stored `DEVICE_REVOKE` response. A replay returns these bytes, so the
+/// count and time never change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRevokedV2 {
+    pub tenant_id: [u8; 16],
+    pub subject_device_id: [u8; 16],
+    pub replay_id: [u8; 16],
+    pub signed_container_hash: [u8; 32],
+    pub reason_code: DeviceRevocationReason,
+    pub sessions_invalidated_count: u32,
+    pub revoked_at_ms: u64,
+}
+
+impl DeviceRevokedV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("DeviceRevokedV2", payload)?;
+        exact_version(&mut f, DOMAIN_DEVICE_REVOKED)?;
+        let tenant_id = f.fixed("tenant_id")?;
+        let subject_device_id = f.fixed("subject_device_id")?;
+        let replay_id = f.fixed("replay_id")?;
+        let signed_container_hash = f.fixed("signed_container_hash")?;
+        let reason = f.text("reason_code")?;
+        let reason_code = DeviceRevocationReason::ALL
+            .into_iter()
+            .find(|r| r.as_str() == reason)
+            .ok_or(RecordError::BadValue("reason_code"))?;
+        f.exact_text("revoke_outcome", REVOKE_OUTCOME_REVOKED)?;
+        let sessions_invalidated_count =
+            u32_in(&mut f, "sessions_invalidated_count", 0, u32::MAX.into())?;
+        let revoked_at_ms = f.uint("revoked_at_ms")?;
+        f.finish()?;
+        Ok(Self {
+            tenant_id,
+            subject_device_id,
+            replay_id,
+            signed_container_hash,
+            reason_code,
+            sessions_invalidated_count,
+            revoked_at_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        c::encode(&c::m(vec![
+            ("domain", c::t(DOMAIN_DEVICE_REVOKED)),
+            ("version", c::u(VERSION)),
+            ("tenant_id", c::b(&self.tenant_id)),
+            ("subject_device_id", c::b(&self.subject_device_id)),
+            ("replay_id", c::b(&self.replay_id)),
+            ("signed_container_hash", c::b(&self.signed_container_hash)),
+            ("reason_code", c::t(self.reason_code.as_str())),
+            ("revoke_outcome", c::t(REVOKE_OUTCOME_REVOKED)),
+            (
+                "sessions_invalidated_count",
+                c::u(self.sessions_invalidated_count.into()),
+            ),
+            ("revoked_at_ms", c::u(self.revoked_at_ms)),
+        ]))
     }
 }
 
@@ -2161,6 +2278,93 @@ mod tests {
             .map(|(name, raw, _)| (*name, hex(&c::sha256(raw))))
             .collect();
         assert_eq!(pinned, GOLDEN_LIFECYCLE.map(|(n, h)| (n, h.to_string())));
+    }
+
+    /// Q-13: the revoke request carries exactly one parseable container under
+    /// its own hash and no activation; the response roundtrips.
+    #[test]
+    fn device_revoke_maps_carry_one_container_and_roundtrip() {
+        use crate::authz_record::{
+            build_record, CommonFields, DeviceRevocationV2, DOMAIN_DEVICE_REVOCATION,
+        };
+        let sk = crate::signing::Ed25519SigningKey::from_bytes(&[9; 32]);
+        let revocation = DeviceRevocationV2 {
+            common: CommonFields {
+                replay_id: [1; 16],
+                tenant_id: [2; 16],
+                issued_at_ms: 1_700_000_000_000,
+                not_before_ms: 1_700_000_000_000,
+                not_after_ms: 1_700_086_400_000,
+                server_instance_id: [3; 16],
+                restore_epoch: 0,
+            },
+            subject_account_id: [4; 16],
+            subject_device_id: [5; 16],
+            subject_signing_key_id: [6; 32],
+            subject_hpke_key_id: [7; 32],
+            reason_code: DeviceRevocationReason::Lost,
+        };
+        let container = build_record(&sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        let request = DeviceRevokeRequestV2 {
+            signed_container_hash: *AuthorizationRecord::parse(&container)
+                .unwrap()
+                .signed_container_hash(),
+            exact_signed_revocation_container_bytes: container.clone(),
+        };
+        let raw = request.encode();
+        assert_eq!(DeviceRevokeRequestV2::parse(&raw), Ok(request.clone()));
+        for (field, value, err) in [
+            (
+                "signed_container_hash",
+                c::b(&[0; 32]),
+                "signed_container_hash",
+            ),
+            ("activations", Value::Array(vec![c::b(&[1])]), "activations"),
+            ("activations", c::u(0), "activations"),
+        ] {
+            assert_eq!(
+                DeviceRevokeRequestV2::parse(&edit(&raw, |e| set(e, field, value))),
+                Err(RecordError::BadValue(err)),
+                "{field}"
+            );
+        }
+        let garbage = edit(&raw, |e| {
+            set(
+                e,
+                "exact_signed_revocation_container_bytes",
+                c::b(b"not a container"),
+            )
+        });
+        assert!(DeviceRevokeRequestV2::parse(&garbage).is_err());
+
+        let revoked = DeviceRevokedV2 {
+            tenant_id: [2; 16],
+            subject_device_id: [5; 16],
+            replay_id: [1; 16],
+            signed_container_hash: request.signed_container_hash,
+            reason_code: DeviceRevocationReason::Compromised,
+            sessions_invalidated_count: 2,
+            revoked_at_ms: 1_700_000_000_123,
+        };
+        let raw_revoked = revoked.encode();
+        assert_eq!(DeviceRevokedV2::parse(&raw_revoked), Ok(revoked));
+        for (field, value) in [
+            ("revoke_outcome", c::t("kept")),
+            ("reason_code", c::t("stolen")),
+            ("domain", c::t(DOMAIN_DEVICE_REVOKE)),
+        ] {
+            assert!(
+                DeviceRevokedV2::parse(&edit(&raw_revoked, |e| set(e, field, value))).is_err(),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            [hex(&c::sha256(&raw)), hex(&c::sha256(&raw_revoked))],
+            [
+                "bbef370b40bd98ec9223503326328f74596a027557b0e63fa26a436eb4eba741",
+                "9b5dda131cc3ba8ca8ea9049751472762c7bed7672ef57c48f761cc03c4ed312"
+            ]
+        );
     }
 
     const GOLDEN_LIFECYCLE: [(&str, &str); 10] = [

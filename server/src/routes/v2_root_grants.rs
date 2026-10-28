@@ -721,6 +721,43 @@ pub(super) async fn is_active_custodian(
     Ok(false)
 }
 
+/// Whether a device other than `device` is a custodian of the tenant's
+/// ACTIVE root now, by the rule `is_active_custodian` uses. A broken grant
+/// row refuses the check (422) rather than being counted or skipped.
+pub(super) async fn custodian_besides(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    device: &[u8; 16],
+    now: i64,
+) -> Result<bool, AppError> {
+    let Some(pointer) = active_pointer(conn, tenant).await? else {
+        return Ok(false);
+    };
+    let generation = u64::try_from(pointer).map_err(|_| integrity())?;
+    let replays: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_tenant_root_key_grants
+          WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
+            AND subject_device_id <> ? AND acked_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(pointer)
+    .bind(device.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    for replay in replays {
+        let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+        let g = load_grant(conn, v, tenant, generation, &replay)
+            .await?
+            .ok_or_else(integrity)?;
+        if confers_custody(conn, tenant, &g, now).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// `POST .../root-key-generations/{g}/grants/{replay_id}/revoke` (plan L949,
 /// 5.6.4 rule 4): an active custodian marks one root grant revoked, never
 /// deleted, and ends every live session of its subject device in the same
