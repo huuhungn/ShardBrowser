@@ -280,6 +280,19 @@ pub enum Payload {
 }
 
 impl Payload {
+    /// The fields every payload carries.
+    pub fn common(&self) -> &CommonFields {
+        match self {
+            Self::DeviceApproval(p) => &p.common,
+            Self::TenantCapabilityGrant(p) => &p.common,
+            Self::DeviceHpkeGrant(p) => &p.common,
+            Self::RecoveryGrant(p) => &p.common,
+            Self::RotationGrant(p) => &p.common,
+            Self::TenantRootKeyGrant(p) => &p.common,
+            Self::DeviceRevocation(p) => &p.common,
+        }
+    }
+
     fn parse(domain: &str, bytes: &[u8]) -> Result<Self> {
         match domain {
             DOMAIN_DEVICE_APPROVAL => DeviceApprovalV2::parse(bytes).map(Self::DeviceApproval),

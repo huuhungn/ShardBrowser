@@ -13,10 +13,10 @@
 //! dropped, and the server's revocation reports only end windows early. So an
 //! omission or a forgery can only make the client refuse.
 //!
-//! shortcut: this is the evaluation of a device without history. The W6
+//! This is the evaluation of a device without history. A client with a W6
 //! ledger (first sighting, sticky lapse, sticky proven revocation, local
-//! distrust) and `DeviceRevocationV2` arrive with W6 and Q-13; until then a
-//! client evaluates every container as first seen now.
+//! distrust) filters the pages before [`Evidence::collect`], and hands its
+//! cached `first_not_before` to [`Evidence::remember_first_not_before`].
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +109,8 @@ pub struct Evidence {
     device_grants: BTreeMap<[u8; 32], Usable<DeviceHpkeGrantV2>>,
     /// Devices the server reported revoked, and from when.
     revoked_devices: BTreeMap<[u8; 16], u64>,
+    /// D-6 (c): the `first_not_before` the client cached for each key.
+    first_not_before: BTreeMap<KeyId, u64>,
 }
 
 fn names(common: &CommonFields, binding: &Binding) -> bool {
@@ -230,6 +232,14 @@ impl Evidence {
         }
         Ok(out)
     }
+
+    /// D-6 (c): the client's cached `first_not_before(key)`. The clip starts
+    /// from the earlier of it and every root grant here, so a server that
+    /// omits the key's earliest root grant cannot stretch it.
+    pub fn remember_first_not_before(&mut self, key: KeyId, at: u64) {
+        let held = self.first_not_before.entry(key).or_insert(u64::MAX);
+        *held = (*held).min(at);
+    }
 }
 
 /// The end of a record's standing: its `not_after_ms`, or earlier when the
@@ -264,8 +274,12 @@ pub struct TrustChain {
     /// `Cust(K)`: clipped, non-empty windows.
     custodians: BTreeMap<KeyId, Vec<(u64, u64)>>,
     /// D-6 (c): the first `not_before_ms` of any usable root grant naming a
-    /// key, over every usable root grant so the clip is fixed up front.
+    /// key, over every usable root grant so the clip is fixed up front, or
+    /// the earlier one the client cached.
     first_not_before: BTreeMap<KeyId, u64>,
+    /// The earliest `not_before_ms` and latest end of the root grants the
+    /// fixpoint counted for each key, before the clip.
+    counted: BTreeMap<KeyId, (u64, u64)>,
     approvals_by_subject: BTreeMap<KeyId, Vec<usize>>,
     /// Capability grants by subject, then issuer: a question reads only the
     /// grants that custodians issued, however many others name the subject.
@@ -291,7 +305,7 @@ impl TrustChain {
         if pinned.is_some_and(|p| *p != anchor) {
             return Err(TrustError::AnchorMismatch);
         }
-        let mut first_not_before: BTreeMap<KeyId, u64> = BTreeMap::new();
+        let mut first_not_before = evidence.first_not_before.clone();
         for r in &evidence.roots {
             let at = first_not_before
                 .entry(r.payload.subject_signing_key_id)
@@ -302,6 +316,7 @@ impl TrustChain {
             anchor,
             custodians: BTreeMap::new(),
             first_not_before,
+            counted: BTreeMap::new(),
             approvals_by_subject: index(&evidence.approvals, |a| {
                 Some(a.payload.subject_signing_key_id)
             }),
@@ -371,10 +386,16 @@ impl TrustChain {
             .copied();
         let cap = self.first_not_before[&g.subject_signing_key_id]
             .saturating_add(MAX_CUSTODIAN_KEY_AGE_MS);
-        let (nb, na) = (
+        let (nb, end) = (
             g.common.not_before_ms,
-            end_of(&g.common, r.revoked_at_ms, device_revoked).min(cap),
+            end_of(&g.common, r.revoked_at_ms, device_revoked),
         );
+        let known = self
+            .counted
+            .entry(g.subject_signing_key_id)
+            .or_insert((nb, end));
+        *known = (known.0.min(nb), known.1.max(end));
+        let na = end.min(cap);
         // A window the clip or a revocation emptied holds nothing.
         if nb < na {
             self.custodians
@@ -382,6 +403,15 @@ impl TrustChain {
                 .or_default()
                 .push((nb, na));
         }
+    }
+
+    /// Every key a counted root grant names, with the earliest `not_before_ms`
+    /// and the latest end of those grants, before the clip: what the client's
+    /// custodian ledger tracks (D-6 (a)-(c)). Only counted grants, whose
+    /// issuers the fixpoint verified from the anchor, so a root grant any key
+    /// can sign, or an omission, never moves them.
+    pub fn custodians(&self) -> impl Iterator<Item = (&KeyId, u64, u64)> + '_ {
+        self.counted.iter().map(|(k, &(nb, end))| (k, nb, end))
     }
 
     fn windows(&self, key: &KeyId) -> &[(u64, u64)] {
@@ -1293,6 +1323,66 @@ mod tests {
         let c = chain(page(&[&a0, &b], evidence)).unwrap();
         assert!(c.custodian_at(&a0.key(), T0 + 1094 * DAY));
         assert!(!c.custodian_at(&a0.key(), T0 + 1095 * DAY));
+    }
+
+    /// D-6 (c): a cached `first_not_before` earlier than every root grant the
+    /// evidence holds clips from there, and a later one never stretches it.
+    /// What the chain lists for the ledger comes only from counted root
+    /// grants: never from the cache, nor from a root grant a key with no
+    /// custody signed, which still clips this evaluation.
+    #[test]
+    fn a_cached_first_not_before_clips_what_an_omission_would_stretch() {
+        let (a0, b, junk) = (Device::new(1), Device::new(2), Device::new(3));
+        let b_counted = (T0 + 2 * DAY, T0 + 100 * DAY);
+        let with = |cached: Option<u64>, extra: Option<Vec<u8>>| {
+            let mut containers = tenant(&a0, &b);
+            containers.extend(extra);
+            let p = page(&[&a0, &b, &junk], containers);
+            let mut e = Evidence::collect(&BINDING, &[p]).unwrap();
+            if let Some(at) = cached {
+                e.remember_first_not_before(b.key(), at);
+            }
+            let c = TrustChain::evaluate(e, None).unwrap();
+            let listed: BTreeMap<KeyId, (u64, u64)> =
+                c.custodians().map(|(k, nb, end)| (*k, (nb, end))).collect();
+            (c, listed)
+        };
+        let (c, listed) = with(None, None);
+        assert_eq!(
+            listed,
+            BTreeMap::from([(a0.key(), (T0, T0 + 365 * DAY)), (b.key(), b_counted)])
+        );
+        assert!(c.custodian_at(&b.key(), T0 + 99 * DAY));
+
+        let early = T0 + 40 * DAY - MAX_CUSTODIAN_KEY_AGE_MS;
+        let (c, listed) = with(Some(early), None);
+        assert!(c.custodian_at(&b.key(), T0 + 39 * DAY));
+        assert!(!c.custodian_at(&b.key(), T0 + 40 * DAY), "clipped");
+        assert_eq!(listed[&b.key()], b_counted, "not the cache");
+
+        let (c, _) = with(Some(T0 + 50 * DAY), None);
+        assert!(c.custodian_at(&b.key(), T0 + 99 * DAY), "never stretched");
+
+        // A clip that empties every window leaves B no custody, but its
+        // counted grant is still listed.
+        let (c, listed) = with(Some(T0 + DAY - MAX_CUSTODIAN_KEY_AGE_MS), None);
+        assert!(!c.custodian_at(&b.key(), T0 + 3 * DAY));
+        assert_eq!(listed[&b.key()], b_counted);
+
+        // A key with no custody names B in a root grant from long before.
+        let forged = root(
+            &junk,
+            &b,
+            RootGrantVariant::ExistingRootGrant,
+            30,
+            20,
+            T0 + 40 * DAY - MAX_CUSTODIAN_KEY_AGE_MS,
+            T0 + 50 * DAY,
+        );
+        let (c, listed) = with(None, Some(forged));
+        assert!(!c.custodian_at(&b.key(), T0 + 40 * DAY), "clipped here");
+        assert_eq!(listed[&b.key()], b_counted, "never listed");
+        assert!(!listed.contains_key(&junk.key()));
     }
 
     #[test]

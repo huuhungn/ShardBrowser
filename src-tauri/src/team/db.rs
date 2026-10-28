@@ -14,16 +14,18 @@
 //! The tables so far are `schema_meta`, exactly as the plan's reference DDL
 //! (L1450-L1458), and the W6 trust ledger (ADR 0002 D-6, Q-12, Q-13), which
 //! the plan's DDL leaves to W6. The ledger keeps hashes, key IDs and times,
-//! and the exact bytes of counted revocations, never a key (L2048).
+//! the exact bytes of counted revocations, and the exact grant behind each
+//! collected fleet key with its evidence (G2-35), never a key (L2048).
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = r#"
+/// Version 1, as #188 shipped it.
+const SCHEMA_V1: &str = r#"
 CREATE TABLE schema_meta (
   singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
   schema_version      INTEGER NOT NULL CHECK (schema_version BETWEEN 1 AND 9223372036854775807),
@@ -151,6 +153,65 @@ WHEN NEW.highest_verified_generation < OLD.highest_verified_generation
 BEGIN SELECT RAISE(ABORT, 'a verified generation never goes backwards'); END;
 "#;
 
+/// Version 1 to 2: the custodian keys of D-6 (a)-(c) and the fleet key
+/// grants of G2-35. A version 1 reader would skip them, so 2 is also the
+/// minimum reader.
+const MIGRATE_V2: &str = r#"
+-- D-6 (a)-(c): each key a counted root grant made a custodian. The earliest
+-- not_before and latest end of its counted root grants: the first starts the
+-- 1095-day clip and only moves earlier, the second only moves later. The
+-- first evaluation that found that known custody ended, and its local time,
+-- is the key's sticky lapse.
+CREATE TABLE trust_custodian_keys (
+  server_instance_id    TEXT NOT NULL,
+  tenant_id             TEXT NOT NULL,
+  signing_key_id        TEXT NOT NULL CHECK (length(signing_key_id) = 64 AND signing_key_id NOT GLOB '*[^0-9a-f]*'),
+  first_seen_evaluation INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  first_not_before_ms   INTEGER NOT NULL CHECK (first_not_before_ms BETWEEN 0 AND 9223372036854775807),
+  latest_not_after_ms   INTEGER NOT NULL CHECK (latest_not_after_ms BETWEEN 0 AND 9223372036854775807),
+  lapsed_evaluation     INTEGER REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  observed_lapsed_at_ms INTEGER CHECK (observed_lapsed_at_ms BETWEEN 0 AND 9223372036854775807),
+  PRIMARY KEY(server_instance_id, tenant_id, signing_key_id),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT,
+  CHECK ((lapsed_evaluation IS NULL) = (observed_lapsed_at_ms IS NULL))
+) STRICT;
+
+-- G2-35 (plan L2056): the exact DeviceHpkeGrant behind each fleet key this
+-- device collected, and the pages it verified against, so sync can reverify
+-- it before using the key; the key itself is never here.
+CREATE TABLE trust_fleet_key_grants (
+  server_instance_id           TEXT NOT NULL,
+  tenant_id                    TEXT NOT NULL,
+  fleet_id                     TEXT NOT NULL CHECK (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*'),
+  generation                   INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  fkek_key_id                  TEXT NOT NULL CHECK (length(fkek_key_id) = 64 AND fkek_key_id NOT GLOB '*[^0-9a-f]*'),
+  verified_evaluation          INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  exact_signed_container_bytes BLOB NOT NULL,
+  evidence_pages               BLOB NOT NULL,
+  PRIMARY KEY(server_instance_id, tenant_id, fleet_id, generation),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER trust_custodian_keys_kept BEFORE DELETE ON trust_custodian_keys
+BEGIN SELECT RAISE(ABORT, 'a custodian key is never forgotten'); END;
+CREATE TRIGGER trust_custodian_keys_earlier BEFORE UPDATE ON trust_custodian_keys
+WHEN NEW.first_not_before_ms > OLD.first_not_before_ms
+  OR NEW.first_seen_evaluation IS NOT OLD.first_seen_evaluation
+BEGIN SELECT RAISE(ABORT, 'a cached first_not_before only moves earlier'); END;
+CREATE TRIGGER trust_custodian_keys_later BEFORE UPDATE ON trust_custodian_keys
+WHEN NEW.latest_not_after_ms < OLD.latest_not_after_ms
+BEGIN SELECT RAISE(ABORT, 'a known custody end only moves later'); END;
+CREATE TRIGGER trust_custodian_keys_lapse_kept BEFORE UPDATE ON trust_custodian_keys
+WHEN OLD.lapsed_evaluation IS NOT NULL
+  AND (NEW.lapsed_evaluation IS NOT OLD.lapsed_evaluation
+       OR NEW.observed_lapsed_at_ms IS NOT OLD.observed_lapsed_at_ms)
+BEGIN SELECT RAISE(ABORT, 'an observed lapse never changes'); END;
+UPDATE schema_meta SET schema_version = 2, min_reader_version = 2,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -164,7 +225,8 @@ impl Db {
         Self::open_at(&dir.join("team-sync.db"))
     }
 
-    /// Opens `path`, creating the schema only when the file holds nothing.
+    /// Opens `path`, creating the schema only when the file holds nothing, and
+    /// migrating a clean version 1 file forward.
     pub fn open_at(path: &Path) -> Result<Self> {
         let unreadable = || crate::errcode::code("team.trustLedgerUnreadable");
         let mut conn = Connection::open(path).with_context(unreadable)?;
@@ -185,7 +247,13 @@ impl Db {
             .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
             .with_context(unreadable)?;
         if objects == 0 {
-            tx.execute_batch(SCHEMA).with_context(unreadable)?;
+            tx.execute_batch(SCHEMA_V1).with_context(unreadable)?;
+        }
+        // Only from exactly one clean version 1 row: anything else is left as
+        // it is for `compatible` to refuse, and a step that fails rolls the
+        // whole migration back.
+        if matches!(meta(&tx).as_deref(), Ok([(1, 1, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V2).with_context(unreadable)?;
         }
         tx.commit().with_context(unreadable)?;
         if !compatible(&conn) {
@@ -198,23 +266,18 @@ impl Db {
 /// The startup compatibility query (plan L2032): exactly one row, clean, of a
 /// version this binary reads and whose minimum reader it meets.
 fn compatible(conn: &Connection) -> bool {
-    let rows = conn
-        .prepare("SELECT schema_version, min_reader_version, migration_state FROM schema_meta")
-        .and_then(|mut s| {
-            s.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        });
     matches!(
-        rows.as_deref(),
+        meta(conn).as_deref(),
         Ok([(version, min_reader, state)])
             if *version <= SCHEMA_VERSION && *min_reader <= SCHEMA_VERSION && state == "CLEAN"
     )
+}
+
+/// Every `schema_meta` row: version, minimum reader and migration state.
+fn meta(conn: &Connection) -> rusqlite::Result<Vec<(i64, i64, String)>> {
+    conn.prepare("SELECT schema_version, min_reader_version, migration_state FROM schema_meta")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect()
 }
 
 #[cfg(test)]
@@ -242,7 +305,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (1, 1, "CLEAN".into()));
+        assert_eq!(meta, (2, 2, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -262,8 +325,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 2",
-            "UPDATE schema_meta SET min_reader_version = 2",
+            "UPDATE schema_meta SET schema_version = 3",
+            "UPDATE schema_meta SET min_reader_version = 3",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -294,6 +357,65 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"not a database at all, not even close"
         );
+    }
+
+    /// A version 1 file, as #188 wrote it, moves to version 2 in one
+    /// transaction and keeps its rows; it then reopens as version 2.
+    #[test]
+    fn a_version_1_file_migrates_to_version_2_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        let pin = format!(
+            "INSERT INTO trust_anchors VALUES ('{}', '{}', '{}', 'BOOTSTRAP', 0);",
+            "11".repeat(16),
+            "22".repeat(16),
+            "33".repeat(32)
+        );
+        let v1 = Connection::open(&path).unwrap();
+        v1.execute_batch(SCHEMA_V1).unwrap();
+        v1.execute_batch(&pin).unwrap();
+        drop(v1);
+        for _ in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            let rows = meta(&db.conn).unwrap();
+            assert_eq!(rows, [(2, 2, "CLEAN".to_string())]);
+            let count = |table: &str| -> i64 {
+                let sql = format!("SELECT count(*) FROM {table}");
+                db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
+            };
+            assert_eq!(count("trust_anchors"), 1, "kept");
+            assert_eq!(count("trust_custodian_keys"), 0);
+            assert_eq!(count("trust_fleet_key_grants"), 0);
+        }
+    }
+
+    /// A version 1 file that is not clean, or already holds a table the
+    /// migration adds, is not migrated: it is refused and left as it was.
+    #[test]
+    fn an_unexpected_version_1_file_is_not_migrated() {
+        for (sql, code) in [
+            (
+                "UPDATE schema_meta SET migration_state = 'MIGRATING'",
+                "team.trustLedgerUnsupported",
+            ),
+            (
+                "CREATE TABLE trust_fleet_key_grants (x INTEGER)",
+                "team.trustLedgerUnreadable",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            let v1 = Connection::open(&path).unwrap();
+            v1.execute_batch(SCHEMA_V1).unwrap();
+            v1.execute_batch(sql).unwrap();
+            drop(v1);
+            let before = std::fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let err = Db::open_at(&path).err().expect(sql).to_string();
+                assert!(crate::errcode::has_code(&err, code), "{sql}: {err}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
+        }
     }
 
     /// A file another connection holds in WAL mode cannot leave it, and is
@@ -330,11 +452,21 @@ mod tests {
                    ('{i}', '{t}', '{k}', 'LOCAL_DISTRUST', 0, 0, NULL);
                  INSERT INTO trust_reported_revocations VALUES ('{i}', '{t}', 'd', '{i}', 5);
                  INSERT INTO trust_reported_device_revocations VALUES ('{i}', '{t}', '{i}', 5);
-                 INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);",
+                 INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);
+                 INSERT INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);
+                 INSERT INTO trust_evaluations VALUES (2, '{i}', '{t}', 0);
+                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{k}', 1, 5, 9, 1, 7);",
                 k = "33".repeat(32)
             ))
             .unwrap();
         for sql in [
+            "UPDATE trust_custodian_keys SET first_not_before_ms = 6",
+            "UPDATE trust_custodian_keys SET first_seen_evaluation = 2",
+            "UPDATE trust_custodian_keys SET latest_not_after_ms = 8",
+            "UPDATE trust_custodian_keys SET observed_lapsed_at_ms = 8",
+            "UPDATE trust_custodian_keys SET lapsed_evaluation = 2",
+            "UPDATE trust_custodian_keys SET lapsed_evaluation = NULL, observed_lapsed_at_ms = NULL",
+            "DELETE FROM trust_custodian_keys",
             "UPDATE trust_anchors SET anchor_key_id = lower(hex(zeroblob(32)))",
             "UPDATE trust_proven_revocations SET counted_evaluation = 9",
             "DELETE FROM trust_proven_revocations",
@@ -352,7 +484,9 @@ mod tests {
             .execute_batch(
                 "UPDATE trust_reported_revocations SET revoked_at_ms = 4;
                  UPDATE trust_reported_device_revocations SET revoked_at_ms = 4;
-                 UPDATE trust_fleet_generations SET highest_verified_generation = 4;",
+                 UPDATE trust_fleet_generations SET highest_verified_generation = 4;
+                 UPDATE trust_custodian_keys SET first_not_before_ms = 4;
+                 UPDATE trust_custodian_keys SET latest_not_after_ms = 10;",
             )
             .unwrap();
         // Each row on its own, so only its trigger can refuse the delete.

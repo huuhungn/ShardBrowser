@@ -90,11 +90,16 @@ impl FleetKeyStore {
             .keys()
             .chain(f.credential_refs.keys())
             .copied()
-            // shortcut: a stolen key of a custodian whose custody lapsed can
-            // still pass a backdated grant; sync uses such keys once sticky
-            // lapse (ADR 0002 D-6 (b)), the cached `first_not_before` of the
-            // D-6 (c) clip (ADR L1413) and the reverify before key use of
-            // G2-35 (plan L2056: a cache flag grants no authority) land.
+            // shortcut: a stolen key of a custodian whose custody lapsed still
+            // passes a grant backdated into its old window when the server
+            // sends it in this device's first evaluation after the lapse,
+            // because the lapse is derived from that same evidence (ADR 0002
+            // D-6 (b)); and under Q-19 (A) local distrust cannot take back a
+            // key already collected. Sync uses such keys, through
+            // `fleet_key_verifies` (G2-35), once the owner decides to derive
+            // a lapse from history before accepting new containers (which
+            // refuses a renewal this device has not seen yet) and settles
+            // Q-19 (A) against local distrust.
             .filter(|g| !f.verified.contains(g))
             .collect();
         let mut out: Vec<_> = generations
