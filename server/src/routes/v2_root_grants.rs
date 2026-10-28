@@ -18,8 +18,8 @@ use sqlx::{Row, SqliteConnection};
 
 use shared::approval_receipt::AUTHORIZATION_REPLAY_RETENTION_MS;
 use shared::authz_record::{
-    AuthorizationRecord, Payload, RootGrantVariant, TenantRootKeyGrantV2, VerifiedRecord,
-    DOMAIN_DEVICE_APPROVAL,
+    AuthorizationRecord, Capability, Payload, RootGrantVariant, TenantRootKeyGrantV2,
+    VerifiedRecord, DOMAIN_DEVICE_APPROVAL,
 };
 use shared::mutation::{
     root_custodian_grant_set_hash, IdempotentMutationRequestV2, OperationKind, RootGenerationState,
@@ -34,6 +34,7 @@ use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sol
 use super::v2_auth::{
     audit, blob, reload_session, revoke_session, unhex, verified, Principal, Session,
 };
+use super::v2_fleet::{active_root, holds_capability};
 use super::v2_root::{
     grant_row_matches, insert_grant, ledger_row, mismatch, record_error, same_request, stale,
     store_response, stored_payload, stored_response, MAX_ROOT_GRANT_TTL_MS, MAX_ROOT_REQUEST_BODY,
@@ -52,7 +53,35 @@ fn not_found() -> AppError {
     )
 }
 
-fn generation_mismatch(msg: &str) -> AppError {
+/// D-5: no FKEK may be left reachable only through a RETIRED root. A fleet
+/// generation in any state holds its key under the ACTIVE root, so its
+/// tenant cannot rotate.
+///
+/// shortcut: a RecoveryGrant under a PREPARING root cannot be filed yet
+/// (v2_fleet), so any fleet generation blocks a rotation; check each one's
+/// acknowledged RecoveryGrant under `N + 1` when the D-5 rewrap lands.
+pub(super) async fn refuse_with_fleet_keys(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+) -> Result<(), AppError> {
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleet_key_generations
+                         WHERE server_instance_id = ? AND tenant_id = ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    if held {
+        return Err(generation_mismatch(
+            "a fleet generation has no recovery grant under the new root",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn generation_mismatch(msg: &str) -> AppError {
     coded(StatusCode::CONFLICT, "ROOT_GENERATION_MISMATCH", msg)
 }
 
@@ -407,11 +436,15 @@ pub async fn ack_root_grant(
     Ok(cbor(StatusCode::CREATED, response))
 }
 
-/// `POST .../root-key-generations/{g}/activate`: generation 0 becomes ACTIVE
-/// once its required grants are all acknowledged and form the set it was
-/// created with. The restated `recovery_bundle_sha256` is the client's
-/// recovery-bundle readiness acknowledgement (plan 5.6.4 rule 1): it names the
-/// bundle it holds, which must be the one the generation was created with.
+/// `POST .../root-key-generations/{g}/activate`: a PREPARING generation
+/// becomes ACTIVE once its required grants are all acknowledged and form the
+/// set it was created with. The restated `recovery_bundle_sha256` is the
+/// client's recovery-bundle readiness acknowledgement (plan 5.6.4 rule 1): it
+/// names the bundle it holds, which must be the one the generation was created
+/// with. Generation 0 is activated by the first device on its setup session; a
+/// rotation `N + 1` by a custodian of the ACTIVE `N` holding `key.rotate`, the
+/// same rule as its create, and in the same transaction `N` is RETIRED and
+/// the tenant's pointer moves to `N + 1` (rule 3).
 pub async fn activate_root_generation(
     State(app): State<AppState>,
     who: Principal,
@@ -486,12 +519,12 @@ pub async fn activate_root_generation(
         return Ok(cbor(StatusCode::CREATED, response));
     }
 
-    // shortcut: only generation 0 activates; a rotation needs D-5 recovery
-    // evidence and rotation grants, which come with ROOT_GRANT_CREATE.
-    if generation != 0 {
-        return Err(AppError::Forbidden);
-    }
-    if s.class != "root_setup" || !sole_owner(&mut tx, &s).await? {
+    let allowed = if generation == 0 {
+        s.class == "root_setup" && sole_owner(&mut tx, &s).await?
+    } else {
+        holds_capability(&mut tx, v, &s, None, Capability::KeyRotate, now).await?
+    };
+    if !allowed {
         return Err(AppError::Forbidden);
     }
     let row = sqlx::query(
@@ -522,12 +555,20 @@ pub async fn activate_root_generation(
             "the activation names other terms than the generation was created with",
         ));
     }
-    if row.get::<String, _>("state") != RootGenerationState::Preparing.as_str()
-        || active_pointer(&mut tx, &tenant).await?.is_some()
-    {
+    // Generation 0 follows no root; a rotation follows exactly the ACTIVE one.
+    let follows = match activate.previous {
+        None => active_pointer(&mut tx, &tenant).await?.is_none(),
+        Some(p) => {
+            active_root(&mut tx, v, &tenant).await? == Some((p.root_generation, p.root_key_id))
+        }
+    };
+    if row.get::<String, _>("state") != RootGenerationState::Preparing.as_str() || !follows {
         return Err(generation_mismatch(
             "the generation is not the next to activate",
         ));
+    }
+    if activate.previous.is_some() {
+        refuse_with_fleet_keys(&mut tx, v, &tenant).await?;
     }
 
     // The acknowledged, unrevoked grants of the generation, each read back,
@@ -567,7 +608,28 @@ pub async fn activate_root_generation(
     }
 
     let activated_at = at(now);
-    sqlx::query(
+    let previous = activate
+        .previous
+        .map(|p| int(p.root_generation))
+        .transpose()?;
+    if let Some(p) = previous {
+        // Retire first: at most one root generation is ACTIVE (0011).
+        let retired = sqlx::query(
+            "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = ?
+              WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
+        )
+        .bind(&activated_at)
+        .bind(v.server_instance_id.as_slice())
+        .bind(tenant.as_slice())
+        .bind(p)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if retired != 1 {
+            return Err(integrity());
+        }
+    }
+    let activated = sqlx::query(
         "UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = ?
           WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'PREPARING'",
     )
@@ -576,15 +638,21 @@ pub async fn activate_root_generation(
     .bind(tenant.as_slice())
     .bind(int(generation)?)
     .execute(&mut *tx)
-    .await?;
-    sqlx::query(
+    .await?
+    .rows_affected();
+    let moved = sqlx::query(
         "UPDATE v2_tenants SET active_root_generation = ?
-          WHERE id = ? AND active_root_generation IS NULL",
+          WHERE id = ? AND active_root_generation IS ?",
     )
     .bind(int(generation)?)
     .bind(tenant.as_slice())
+    .bind(previous)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if (activated, moved) != (1, 1) {
+        return Err(integrity());
+    }
     let activated_at_ms = u64::try_from(now).unwrap_or_default();
     let payload = TenantRootGenerationActivatedV2 {
         target: t.clone(),
@@ -958,11 +1026,13 @@ pub async fn revoke_root_grant(
     Ok(cbor(StatusCode::CREATED, response))
 }
 
-/// `POST .../root-key-generations/{g}/grants` (plan L946, 5.6.4 rule 2): an
-/// active custodian files an `ExistingRootGrant` of the ACTIVE root to an
-/// approved device. The subject's linked approval must be tenant-scoped
-/// (ADR 0002 Q-22): a fleet approval never carries root custody. The grant
-/// waits for its subject's acknowledgement; filing activates nothing.
+/// `POST .../root-key-generations/{g}/grants` (plan L946, 5.6.4 rules 2 and
+/// 3): an active custodian files an `ExistingRootGrant` of the ACTIVE root,
+/// or a `RotationGrant` of the PREPARING generation after it that names that
+/// ACTIVE root exactly, to an approved device. The subject's linked approval
+/// must be tenant-scoped (ADR 0002 Q-22): a fleet approval never carries root
+/// custody. The grant waits for its subject's acknowledgement; filing
+/// activates nothing.
 pub async fn file_root_grant(
     State(app): State<AppState>,
     who: Principal,
@@ -1023,28 +1093,13 @@ pub async fn file_root_grant(
         return Ok(cbor(StatusCode::CREATED, response));
     }
 
-    // The actor holds custody of the ACTIVE root it hands on.
-    if !is_active_custodian(&mut tx, v, &s, now).await?
-        || active_pointer(&mut tx, &tenant).await? != Some(int(generation)?)
-    {
+    // The actor holds custody of the ACTIVE root it hands on or rotates.
+    if !is_active_custodian(&mut tx, v, &s, now).await? {
         return Err(AppError::Forbidden);
     }
-    let root_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT root_key_id FROM v2_root_key_generations
-          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .bind(int(generation)?)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(AppError::Forbidden)?;
-    if root_key != r.root_key_id {
-        return Err(column_mismatch("the grant names another root key"));
-    }
 
-    // The embedded container: signed by the actor, an ExistingRootGrant
-    // carrying exactly the request's identity.
+    // The embedded container: signed by the actor, an ExistingRootGrant or
+    // RotationGrant carrying exactly the request's identity.
     let parsed = AuthorizationRecord::parse(&create.exact_signed_grant_container_bytes)
         .map_err(record_error)?;
     if *parsed.signed_container_hash() != r.signed_container_hash {
@@ -1079,12 +1134,46 @@ pub async fn file_root_grant(
         ));
     };
     let record = record.record();
-    // shortcut: only ExistingRootGrant is filed; a RotationGrant needs a
-    // PREPARING N+1, which comes with root rotation.
-    if g.variant != RootGrantVariant::ExistingRootGrant {
-        return Err(column_mismatch(
-            "this route files an ExistingRootGrant only",
-        ));
+    // An ExistingRootGrant hands on the ACTIVE root; a RotationGrant targets
+    // the PREPARING generation after it and names it exactly (rule 3).
+    let active = active_root(&mut tx, v, &tenant).await?;
+    let state = match g.variant {
+        RootGrantVariant::ExistingRootGrant => {
+            if active.map(|a| a.0) != Some(generation) {
+                return Err(AppError::Forbidden);
+            }
+            RootGenerationState::Active
+        }
+        RootGrantVariant::RotationGrant {
+            previous_root_key_id,
+            previous_root_generation,
+        } => {
+            if active != Some((previous_root_generation, previous_root_key_id)) {
+                return Err(column_mismatch(
+                    "the rotation grant names another previous root than the ACTIVE one",
+                ));
+            }
+            RootGenerationState::Preparing
+        }
+        RootGrantVariant::FirstRootSelfGrant => {
+            return Err(column_mismatch(
+                "a FirstRootSelfGrant is filed only by the bootstrap",
+            ));
+        }
+    };
+    let root_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT root_key_id FROM v2_root_key_generations
+          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = ?",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(int(generation)?)
+    .bind(state.as_str())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| generation_mismatch("the grant's generation is not in the state it needs"))?;
+    if root_key != r.root_key_id {
+        return Err(column_mismatch("the grant names another root key"));
     }
     let c = &g.common;
     if (

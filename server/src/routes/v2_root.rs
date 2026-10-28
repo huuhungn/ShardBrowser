@@ -1,14 +1,16 @@
 //! `POST /v2/tenants/{tenant_id}/root-key-generations`: the S6 first root
-//! bootstrap (plan 5.6.4 rule 1, ADR 0001 S6).
+//! bootstrap (plan 5.6.4 rule 1, ADR 0001 S6) and the root rotation (rule 3).
 //!
 //! The body is an exact `IdempotentMutationRequestV2` (plan 5.6.5) whose
-//! payload is a `TenantRootGenerationCreateV2` in bootstrap mode, carrying the
-//! exact `FirstRootSelfGrant` container. One `BEGIN IMMEDIATE` checks that D1
+//! payload is a `TenantRootGenerationCreateV2`. In bootstrap mode it carries
+//! the exact `FirstRootSelfGrant` container. One `BEGIN IMMEDIATE` checks that D1
 //! completed and nothing root-related exists yet, that the actor is the
 //! approved first device on its `root_setup` session, and that the self-grant
 //! names exactly that device, its approval and the target key; then it writes
 //! generation 0 as `PREPARING`, the grant, the exact stored response and the
-//! audit row together. A retry with the same bytes by the same actor gets the
+//! audit row together. In rotation mode a custodian of the ACTIVE root `N`
+//! holding `key.rotate` creates `N + 1` as `PREPARING`; its `RotationGrant`s
+//! are filed afterwards. A retry with the same bytes by the same actor gets the
 //! stored response back, unchanged. Activation waits for readback and
 //! acknowledgement, which come later.
 
@@ -20,7 +22,7 @@ use sqlx::{Row, SqliteConnection};
 
 use shared::approval_receipt::{AUTHORIZATION_REPLAY_RETENTION_MS, MAX_DEVICE_APPROVAL_TTL_MS};
 use shared::authz_record::{
-    AuthorizationRecord, Payload, RecordError, RootGrantVariant, TenantRootKeyGrantV2,
+    AuthorizationRecord, Capability, Payload, RecordError, RootGrantVariant, TenantRootKeyGrantV2,
     DOMAIN_DEVICE_APPROVAL, DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shared::canonical::sha256;
@@ -34,6 +36,8 @@ use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sol
 use super::v2_auth::{
     audit, blob, d1_approval_replay_id, random, reload_session, unhex, verified, Principal, Session,
 };
+use super::v2_fleet::{active_root, holds_capability};
+use super::v2_root_grants::{generation_mismatch, refuse_with_fleet_keys};
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::quarantine::{self, Kind, Mark};
@@ -147,9 +151,13 @@ pub async fn create_root_generation(
 
     match &req.create.mode {
         RootGenerationMode::Bootstrap(g) => bootstrap(tx, &req, g, &s, v, &body, now).await,
-        // shortcut: only the bootstrap exists; a rotation needs an ACTIVE root
-        // and a custodian of it (plan 5.6.4 rule 3), which come with W3.
-        RootGenerationMode::Rotation { .. } => Err(AppError::Forbidden),
+        RootGenerationMode::Rotation {
+            previous_root_key_id,
+            previous_root_generation,
+        } => {
+            let previous = (*previous_root_generation, *previous_root_key_id);
+            rotate(tx, &req, previous, &s, v, &body, now).await
+        }
     }
 }
 
@@ -187,8 +195,8 @@ async fn replay(
 }
 
 /// Every equality a stored `ROOT_GENERATION_CREATE` row must hold: the
-/// response is the exact map for this request, and the generation and grant it
-/// names exist with the same terms.
+/// response is the exact map for this request, and the generation and, for a
+/// bootstrap, the grant it names exist with the same terms.
 async fn stored_response_is_consistent(
     conn: &mut SqliteConnection,
     row: &sqlx::sqlite::SqliteRow,
@@ -205,9 +213,6 @@ async fn stored_response_is_consistent(
     else {
         return Ok(false);
     };
-    let RootGenerationMode::Bootstrap(identity) = &created.mode else {
-        return Ok(false);
-    };
     let t = &req.create.target;
     let generation = sqlx::query(
         "SELECT root_key_id, required_custodian_grant_count, required_custodian_grant_set_hash,
@@ -220,31 +225,52 @@ async fn stored_response_is_consistent(
     .bind(int(t.root_generation)?)
     .fetch_optional(&mut *conn)
     .await?;
-    let grant = sqlx::query(
-        "SELECT signed_container_hash, exact_signed_container_bytes_sha256
-           FROM v2_tenant_root_key_grants
-          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?
-            AND grant_variant = 'FirstRootSelfGrant' AND subject_device_id = ?",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(s.tenant_id.as_slice())
-    .bind(identity.replay_id.as_slice())
-    .bind(s.device_id.as_slice())
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (Some(generation), Some(grant)) = (generation, grant) else {
+    let Some(generation) = generation else {
         return Ok(false);
     };
-    // A quarantined self-grant answers nothing, not even a lost response.
-    let mark = Mark {
-        kind: Kind::RootGrant,
-        server_instance_id: v.server_instance_id,
-        tenant_id: s.tenant_id,
-        replay_id: identity.replay_id,
+    let mode_holds = match (&created.mode, &req.create.mode) {
+        (RootGenerationMode::Bootstrap(identity), RootGenerationMode::Bootstrap(_)) => {
+            let grant = sqlx::query(
+                "SELECT signed_container_hash, exact_signed_container_bytes_sha256
+                   FROM v2_tenant_root_key_grants
+                  WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?
+                    AND grant_variant = 'FirstRootSelfGrant' AND subject_device_id = ?",
+            )
+            .bind(v.server_instance_id.as_slice())
+            .bind(s.tenant_id.as_slice())
+            .bind(identity.replay_id.as_slice())
+            .bind(s.device_id.as_slice())
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(grant) = grant else {
+                return Ok(false);
+            };
+            // A quarantined self-grant answers nothing, not even a lost response.
+            let mark = Mark {
+                kind: Kind::RootGrant,
+                server_instance_id: v.server_instance_id,
+                tenant_id: s.tenant_id,
+                replay_id: identity.replay_id,
+            };
+            if quarantine::holds(conn, &mark).await? {
+                return Err(AppError::Quarantine(Box::new(mark)));
+            }
+            blob::<32>(&grant, "signed_container_hash")? == identity.signed_container_hash
+                && blob::<32>(&grant, "exact_signed_container_bytes_sha256")?
+                    == identity.container_bytes_sha256
+        }
+        (
+            RootGenerationMode::Rotation {
+                previous_root_key_id: a,
+                previous_root_generation: b,
+            },
+            RootGenerationMode::Rotation {
+                previous_root_key_id: c,
+                previous_root_generation: d,
+            },
+        ) => (a, b) == (c, d),
+        _ => false,
     };
-    if quarantine::holds(conn, &mark).await? {
-        return Err(AppError::Quarantine(Box::new(mark)));
-    }
     Ok(stored.operation_kind == OperationKind::RootGenerationCreate
         && stored.idempotency_key == req.outer.idempotency_key
         && stored.exact_request_hash == req.request_hash
@@ -263,9 +289,7 @@ async fn stored_response_is_consistent(
             .get::<Option<Vec<u8>>, _>("recovery_bundle_sha256")
             .as_deref()
             == Some(&t.recovery_bundle_sha256[..])
-        && blob::<32>(&grant, "signed_container_hash")? == identity.signed_container_hash
-        && blob::<32>(&grant, "exact_signed_container_bytes_sha256")?
-            == identity.container_bytes_sha256
+        && mode_holds
         && row
             .get::<Option<String>, _>("response_record_type")
             .as_deref()
@@ -464,6 +488,113 @@ async fn bootstrap(
         &s.account_id,
         &s.device_id,
         "root.bootstrap",
+        "root_generation",
+        &t.root_key_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+/// Plan 5.6.4 rule 3: a custodian of the ACTIVE root `N` holding a live,
+/// device-scoped, tenant-wide `key.rotate` (ADR 0002 D-2) creates `N + 1` as
+/// `PREPARING`, naming `N` exactly. Its custodians come later, as
+/// `RotationGrant`s through `ROOT_GRANT_CREATE`; `N` stays ACTIVE until
+/// activation.
+async fn rotate(
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    req: &Request,
+    previous: (u64, [u8; 32]),
+    s: &Session,
+    v: &Verified,
+    exact_request: &[u8],
+    now: i64,
+) -> Result<Response, AppError> {
+    let t = &req.create.target;
+    if !holds_capability(&mut tx, v, s, None, Capability::KeyRotate, now).await? {
+        return Err(AppError::Forbidden);
+    }
+    if active_root(&mut tx, v, &s.tenant_id).await? != Some(previous) {
+        return Err(generation_mismatch(
+            "the rotation names another previous root than the ACTIVE one",
+        ));
+    }
+    // A rotation that could never activate would block every later one.
+    refuse_with_fleet_keys(&mut tx, v, &s.tenant_id).await?;
+    // shortcut: a PREPARING generation that can never activate (Q-24) blocks
+    // every later rotation, since the target is always ACTIVE + 1; upgrade
+    // when a stuck generation can be abandoned.
+    let taken: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_root_key_generations
+                         WHERE server_instance_id = ? AND tenant_id = ?
+                           AND (state = 'PREPARING' OR root_key_id = ?))",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(t.root_key_id.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
+    if taken {
+        return Err(generation_mismatch(
+            "a rotation is already PREPARING, or the target key belongs to another generation",
+        ));
+    }
+
+    let created_at = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO v2_root_key_generations
+             (server_instance_id, tenant_id, generation, root_key_id, state, created_at,
+              required_custodian_grant_count, required_custodian_grant_set_hash,
+              recovery_bundle_sha256)
+         VALUES (?, ?, ?, ?, 'PREPARING', ?, ?, ?, ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(int(t.root_generation)?)
+    .bind(t.root_key_id.as_slice())
+    .bind(&created_at)
+    .bind(i64::from(t.required_custodian_grant_count))
+    .bind(t.required_custodian_grant_set_hash.as_slice())
+    .bind(t.recovery_bundle_sha256.as_slice())
+    .execute(&mut *tx)
+    .await?;
+
+    let committed_at_ms = u64::try_from(now).unwrap_or_default();
+    let created = TenantRootGenerationCreatedV2 {
+        target: t.clone(),
+        mode: RootGenerationMode::Rotation {
+            previous_root_key_id: previous.1,
+            previous_root_generation: previous.0,
+        },
+        created_at_ms: committed_at_ms,
+    };
+    let response = stored_response(
+        &req.outer,
+        RECORD_TYPE_ROOT_GENERATION_CREATED,
+        created.encode(),
+        v,
+        committed_at_ms,
+    )?;
+    let retained_until = committed_at_ms
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        s,
+        &req.outer,
+        exact_request,
+        RECORD_TYPE_ROOT_GENERATION_CREATED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "root.rotate",
         "root_generation",
         &t.root_key_id,
     )
