@@ -857,22 +857,27 @@ pub async fn revoke_root_grant(
     .bind(replay.as_slice())
     .execute(&mut *tx)
     .await?;
-    let sessions: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT id FROM v2_sessions
+    // Every unrevoked session is ended; only one still usable is counted.
+    let sessions: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT id, absolute_expires_at_ms FROM v2_sessions
           WHERE tenant_id = ? AND device_id = ? AND revoked_at_ms IS NULL",
     )
     .bind(tenant.as_slice())
     .bind(g.grant.subject_device_id.as_slice())
     .fetch_all(&mut *tx)
     .await?;
-    for id in &sessions {
+    for (id, _) in &sessions {
         revoke_session(&mut tx, &tenant, id, now).await?;
     }
+    let live = sessions
+        .iter()
+        .filter(|(_, expires)| now < *expires)
+        .count();
     let revoked_at_ms = u64::try_from(now).unwrap_or_default();
     let payload = TenantRootGrantRevokedV2 {
         grant: revoke.grant.clone(),
         reason_code: revoke.reason_code,
-        sessions_invalidated_count: u32::try_from(sessions.len()).unwrap_or(u32::MAX),
+        sessions_invalidated_count: u32::try_from(live).unwrap_or(u32::MAX),
         revoked_at_ms,
     }
     .encode();

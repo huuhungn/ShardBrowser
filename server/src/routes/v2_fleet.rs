@@ -219,6 +219,49 @@ async fn holds_generation(
     .await?)
 }
 
+/// Whether this device filed the `FLEET_GENERATION_CREATE` of `fkek_key_id`:
+/// its audit event names the key, which is unique within the tenant.
+async fn created_generation(
+    conn: &mut SqliteConnection,
+    s: &Session,
+    fkek_key_id: &[u8; 32],
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_audit_events
+                         WHERE tenant_id = ? AND actor_device_id = ?
+                           AND action = 'fleet.key_generation.create'
+                           AND target_type = 'fleet_key_generation' AND target_id = ?
+                           AND outcome = 'success')",
+    )
+    .bind(s.tenant_id.as_slice())
+    .bind(s.device_id.as_slice())
+    .bind(fkek_key_id.as_slice())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Whether any grant of `generation` was ever filed for this device.
+async fn has_grant(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    fleet: &[u8; 16],
+    generation: u64,
+) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleet_device_hpke_grants
+                         WHERE server_instance_id = ? AND tenant_id = ? AND fleet_id = ?
+                           AND generation = ? AND subject_device_id = ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(int(generation)?)
+    .bind(s.device_id.as_slice())
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 async fn generation_row(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -808,10 +851,14 @@ pub async fn file_fleet_grant(
     match &payload {
         Payload::DeviceHpkeGrant(p) => {
             // The issuer holds the generation it hands out (D-2), except for
-            // its own first grant of it, which it acknowledges afterwards.
+            // the device that created it filing its own first grant of it,
+            // which it acknowledges afterwards. A revoked or expired grant is
+            // not replaced this way.
             let own = p.subject_device_id == s.device_id
                 && p.subject_signing_key_id == s.signing_key_id
-                && p.recipient_hpke_key_id == s.hpke_key_id;
+                && p.recipient_hpke_key_id == s.hpke_key_id
+                && created_generation(&mut tx, &s, &gen.fkek_key_id).await?
+                && !has_grant(&mut tx, v, &s, &fleet, generation).await?;
             if !holds_fleet_capability(&mut tx, v, &s, &fleet, Capability::FleetManage, now).await?
                 || !(own || holds_generation(&mut tx, v, &s, &fleet, generation, now).await?)
             {

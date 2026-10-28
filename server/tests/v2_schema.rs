@@ -605,3 +605,113 @@ async fn a_fleet_generation_keeps_its_terms_and_moves_forward() {
         assert_eq!(n, 1, "{name}");
     }
 }
+
+/// 0022: the mutations added after 0020 commit with their responses, and a
+/// fleet key generation is never removed or replaced.
+#[tokio::test]
+async fn later_mutations_store_their_responses_and_a_generation_is_never_removed() {
+    const TRIGGER: &str = "1811";
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .foreign_keys(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+
+    let mut key = 0u8;
+    let mut row =
+        |kind: &'static str, scope: &'static str, status: &'static str, record: &'static str| {
+            key += 1;
+            let (pool, idempotency_key) = (pool.clone(), id(key));
+            async move {
+                sqlx::query(
+                    "INSERT INTO v2_idempotency (
+                     server_instance_id, tenant_id, actor_device_id, operation_scope,
+                     idempotency_key, operation_kind, canonical_request_hash, exact_request_bytes,
+                     exact_request_bytes_sha256, status, response_record_type,
+                     exact_response_bytes, exact_response_bytes_sha256, retained_until)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, x'01', ?, ?, ?, x'02', ?, 0)",
+                )
+                .bind(id(1))
+                .bind(id(2))
+                .bind(id(3))
+                .bind(scope)
+                .bind(idempotency_key)
+                .bind(kind)
+                .bind(key32(4))
+                .bind(key32(5))
+                .bind(status)
+                .bind(record)
+                .bind(key32(6))
+                .execute(&pool)
+                .await
+            }
+        };
+    for (kind, scope, record) in [
+        (
+            "ROOT_GRANT_CREATE",
+            "tenant.root-grant-create.v2",
+            "TenantRootGrantCreatedV2",
+        ),
+        (
+            "ROOT_GRANT_REVOKE",
+            "tenant.root-grant-revoke.v2",
+            "TenantRootGrantRevokedV2",
+        ),
+        (
+            "FLEET_GRANT_ACK",
+            "fleet.key-grant-ack.v2",
+            "FleetKeyGrantAckedV2",
+        ),
+        (
+            "FLEET_GENERATION_ACTIVATE",
+            "fleet.key-generation-activate.v2",
+            "FleetKeyGenerationActivatedV2",
+        ),
+        (
+            "FLEET_GRANT_REVOKE",
+            "fleet.key-grant-revoke.v2",
+            "FleetGrantRevokedV2",
+        ),
+    ] {
+        for (k, s, st, r) in [
+            (kind, scope, "in_flight", record),
+            (kind, scope, "succeeded", "DeviceApprovalReceiptV2"),
+            (kind, "profile.checkout.v2", "succeeded", record),
+            ("PROFILE_CHECKOUT", scope, "succeeded", record),
+        ] {
+            let e = row(k, s, st, r).await.unwrap_err();
+            assert_eq!(err_code(e), TRIGGER, "{k} {s} {st} {r}");
+        }
+        row(kind, scope, "succeeded", record).await.unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO v2_fleet_key_generations (
+             server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+             root_generation, state, created_at)
+         VALUES (?, ?, ?, 0, ?, 0, 'PREPARING', 'now')",
+    )
+    .bind(id(1))
+    .bind(id(2))
+    .bind(id(3))
+    .bind(key32(7))
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT OR REPLACE INTO v2_fleet_key_generations (
+             server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+             root_generation, state, created_at)
+         SELECT server_instance_id, tenant_id, fleet_id, generation, zeroblob(32),
+                root_generation, state, created_at FROM v2_fleet_key_generations",
+        "DELETE FROM v2_fleet_key_generations",
+    ] {
+        let e = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        assert_eq!(err_code(e), TRIGGER, "{statement}");
+    }
+}
