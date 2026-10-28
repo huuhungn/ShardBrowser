@@ -1209,6 +1209,7 @@
   "sync.closeEveryWindowInTheGroup": "Đóng mọi cửa sổ trong nhóm",
   "sync.deviceNotEnrolled": "Thiết bị này chưa được ghi danh. Hãy ghi danh trong Cài đặt.",
   "sync.enrolledBeforeSyncExisted": "Thiết bị này được ghi danh trước khi có đồng bộ hồ sơ — hãy ghi danh lại trong Cài đặt.",
+  "sync.fleetKeyStoreUnreadable": "Không đọc được tệp khóa fleet đã lưu, nên tệp được giữ nguyên. Hãy khôi phục tệp từ bản sao lưu rồi mới nhận khóa fleet lại.",
   "sync.holdWorkInOneWindowAlone": "Tách riêng — làm việc trong một cửa sổ",
   "sync.noDataToPush": "Hồ sơ này chưa có dữ liệu nào để đẩy lên.",
   "sync.noTeamServer": "Chưa cấu hình máy chủ nhóm. Hãy đặt một máy chủ trong Cài đặt.",

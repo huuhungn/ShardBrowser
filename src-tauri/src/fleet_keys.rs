@@ -203,7 +203,7 @@ pub fn load() -> Result<FleetKeyStore> {
 /// keys it may still hold.
 fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
     let body = fs::read_to_string(path)?;
-    serde_json::from_str(&body).context("fleet_keys.json does not parse; it is left as it is")
+    serde_json::from_str(&body).context(crate::errcode::code("sync.fleetKeyStoreUnreadable"))
 }
 
 /// Writes `s`, then moves its plaintext keys into the credential store. The
