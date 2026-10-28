@@ -23,9 +23,8 @@
 //! Since 2.4.3 a fleet key the team server delivers is cached only once its
 //! grant verifies against the tenant trust chain, as the W6 trust ledger lets
 //! this device see it (`open_fleet_grant`, `team::ledger`), and never over
-//! another key held for the same generation (`collect`). Sync pull uses such
-//! a key only after reverifying the exact grant the team database keeps with
-//! it (G2-35, `keys_newest_first`). Keys cached by 2.4.2 still open old
+//! another key held for the same generation (`collect`). Sync does not use
+//! such a key yet (`keys_newest_first`). Keys cached by 2.4.2 still open old
 //! snapshots.
 
 use anyhow::{Context, Result};
@@ -56,8 +55,7 @@ pub struct FleetKeys {
     #[serde(default)]
     pub active_generation: u64,
     /// Generations collected from a verified grant (`collect`), which sync
-    /// uses only while that grant still verifies (`keys_newest_first`). Keys
-    /// cached by 2.4.2 are not listed and keep their use.
+    /// skips. Keys cached by 2.4.2 are not listed and keep their use.
     #[serde(default)]
     pub verified: BTreeSet<u64>,
 }
@@ -79,18 +77,11 @@ impl FleetKeyStore {
             .map(|k| (*k, f.active_generation))
     }
 
-    /// Every key this device holds for a fleet, newest generation first. A
-    /// key from a verified grant is listed only when `still_verifies` says
-    /// its grant does now: the `verified` flag grants nothing (G2-35, plan
-    /// L2056).
+    /// Every key this device holds for a fleet, newest generation first.
     ///
     /// Restore tries these in turn: a snapshot pushed before a rotation is
     /// still sealed under the older generation and must stay readable.
-    pub fn keys_newest_first(
-        &self,
-        fleet_id: &str,
-        still_verifies: impl Fn(u64, &[u8; 32]) -> bool,
-    ) -> Vec<([u8; 32], u64)> {
+    pub fn keys_newest_first(&self, fleet_id: &str) -> Vec<([u8; 32], u64)> {
         let Some(f) = self.fleets.get(fleet_id) else {
             return Vec::new();
         };
@@ -99,11 +90,21 @@ impl FleetKeyStore {
             .keys()
             .chain(f.credential_refs.keys())
             .copied()
+            // shortcut: a stolen key of a custodian whose custody lapsed still
+            // passes a grant backdated into its old window when the server
+            // sends it in this device's first evaluation after the lapse,
+            // because the lapse is derived from that same evidence (ADR 0002
+            // D-6 (b)); and under Q-19 (A) local distrust cannot take back a
+            // key already collected. Sync uses such keys, through
+            // `fleet_key_verifies` (G2-35), once the owner decides to derive
+            // a lapse from history before accepting new containers (which
+            // refuses a renewal this device has not seen yet) and settles
+            // Q-19 (A) against local distrust.
+            .filter(|g| !f.verified.contains(g))
             .collect();
         let mut out: Vec<_> = generations
             .into_iter()
             .filter_map(|g| f.key(g).map(|k| (*k, g)))
-            .filter(|(k, g)| !f.verified.contains(g) || still_verifies(*g, k))
             .collect();
         out.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
         out
@@ -316,7 +317,7 @@ mod tests {
         assert_eq!(gen, 2, "newest generation must be active");
         assert_eq!(key, [0x22u8; 32]);
 
-        let all = s.keys_newest_first("ab", |_, _| false);
+        let all = s.keys_newest_first("ab");
         assert_eq!(all.len(), 2, "the older key must be kept for old snapshots");
         assert_eq!(all[0].1, 2, "newest first");
         assert_eq!(all[1].1, 1);
@@ -379,14 +380,14 @@ mod tests {
         assert_eq!(f.keys.get(&1), Some(&"61".repeat(32)), "kept in the file");
         assert_eq!(f.credential_refs.keys().collect::<Vec<_>>(), [&2]);
         assert_eq!(saved.active_key(&fleet), Some(([0x62; 32], 2)));
-        let all = saved.keys_newest_first(&fleet, |_, _| false);
+        let all = saved.keys_newest_first(&fleet);
         assert_eq!(all, [([0x62; 32], 2), ([0x61; 32], 1)]);
 
         // The next save moves the rest; nothing is left to move after it.
         save(&saved).unwrap();
         let again = load().unwrap();
         assert!(again.fleets[&fleet].keys.is_empty());
-        assert_eq!(again.keys_newest_first(&fleet, |_, _| false).len(), 2);
+        assert_eq!(again.keys_newest_first(&fleet).len(), 2);
         assert!(!protect().unwrap());
 
         // A re-collected key in the file wins over its stored copy.
@@ -396,10 +397,7 @@ mod tests {
 
         // A key whose credential is gone is not held, rather than an error.
         crate::credential::forget(&again.fleets[&fleet].credential_refs[&1]).unwrap();
-        assert_eq!(
-            load().unwrap().keys_newest_first(&fleet, |_, _| false),
-            [([0x62; 32], 2)]
-        );
+        assert_eq!(load().unwrap().keys_newest_first(&fleet), [([0x62; 32], 2)]);
         store::set_config_root(None);
     }
 
@@ -418,7 +416,7 @@ mod tests {
     fn an_unknown_fleet_has_no_key() {
         let s = FleetKeyStore::default();
         assert!(s.active_key("nope").is_none());
-        assert!(s.keys_newest_first("nope", |_, _| false).is_empty());
+        assert!(s.keys_newest_first("nope").is_empty());
     }
 
     /// A key the store refused stays in the file DPAPI-protected, still opens,
@@ -438,10 +436,10 @@ mod tests {
         save(&s).unwrap();
         let path = store::fleet_keys_path().unwrap();
         let first = fs::read_to_string(&path).unwrap();
-        let held = load().unwrap().keys_newest_first(&fleet, |_, _| false);
+        let held = load().unwrap().keys_newest_first(&fleet);
         let moved = protect().unwrap();
         let second = fs::read_to_string(&path).unwrap();
-        let after = load().unwrap().keys_newest_first(&fleet, |_, _| false);
+        let after = load().unwrap().keys_newest_first(&fleet);
         store::set_config_root(None);
 
         assert!(

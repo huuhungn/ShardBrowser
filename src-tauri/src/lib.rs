@@ -2698,6 +2698,9 @@ fn recipient(c: &team_config::TeamConfig) -> anyhow::Result<shardx_core::trust_c
 /// see them now (the revocation reports, distrust, lapses and key ages
 /// learned since), to the same pinned anchor, for this device, fleet and
 /// generation, in force now, and it must name `key`.
+// Sync pull calls this once the shortcut in `fleet_keys::keys_newest_first`
+// lifts; until then only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
 fn fleet_key_verifies(
     ledger: &team::db::Db,
     (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
@@ -2719,31 +2722,6 @@ fn fleet_key_verifies(
     Ok(chain
         .device_hpke_grant(&container, me, fleet_id, generation, now)
         .is_some_and(|g| g.fkek_key_id == shardx_core::fleet_grants::fkek_key_id(key)))
-}
-
-/// The fleet keys sync pull tries, newest first: keys cached by 2.4.2, and
-/// keys from verified grants that still verify now (`fleet_key_verifies`).
-/// A store that cannot be read leaves only the passphrase, and a team
-/// database or identity that cannot be read leaves no verified key.
-pub(crate) fn pull_fleet_keys(c: &team_config::TeamConfig, now: u64) -> Vec<([u8; 32], u64)> {
-    let Ok(store) = fleet_keys::load() else {
-        return Vec::new();
-    };
-    let ready = || {
-        let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id").ok()?;
-        let me = recipient(c).ok()?;
-        Some((team::db::Db::open().ok()?, pinned_anchor(c)?, me, fleet))
-    };
-    let ready = ready();
-    store.keys_newest_first(&c.fleet_id, |generation, key| {
-        let Some((ledger, pin, me, fleet)) = &ready else {
-            return false;
-        };
-        fleet_key_verifies(ledger, pin, me, fleet, generation, key, now).unwrap_or_else(|e| {
-            eprintln!("[fleet] trust ledger: {e:#}");
-            false
-        })
-    })
 }
 
 /// The exact grant container of the descriptor when it is an unrevoked
@@ -3217,11 +3195,9 @@ mod custody_tests {
                 Ok(FleetGrant::Failed)
             ]
         );
-        // Marked as from a verified grant: sync uses them only while their
-        // grant reverifies.
+        // Marked as from a verified grant, so sync does not use them yet.
         assert_eq!(held.fleets[&fleet].verified, [1, 2].into());
-        assert!(held.keys_newest_first(&fleet, |_, _| false).is_empty());
-        assert_eq!(held.keys_newest_first(&fleet, |g, _| g == 2).len(), 1);
+        assert!(held.keys_newest_first(&fleet).is_empty());
         assert!(!unreadable);
     }
 
@@ -3948,67 +3924,133 @@ mod custody_tests {
         assert!(!verifies(&pin, 1, &fkek, &me.to, now), "reported since");
     }
 
-    /// Pull tries a key from a verified grant only while that grant
-    /// reverifies, and a key cached by 2.4.2 always: a verified key with no
-    /// grant kept, whose grant ended, or with no anchor pinned, is not tried.
+    /// The D-6 (b) gap that keeps sync pull off verified keys: with no
+    /// evaluation between the end of D's custody and the attack, the
+    /// backdated grant is accepted and kept, and the lapse is recorded in that
+    /// same evaluation, so the grant keeps its standing; a self-extension in
+    /// that evaluation keeps D from lapsing at all. Pull does not use the key.
     #[test]
-    fn pull_uses_a_verified_key_only_while_its_grant_verifies() {
+    fn without_an_evaluation_after_the_lapse_a_backdated_grant_is_kept_but_unused() {
         let _config = store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         store::set_config_root(Some(dir.path().to_path_buf()));
         let me = me();
-        team_config::save(&team_config::TeamConfig {
-            tenant_id: hex(&TENANT),
-            device_id: hex(&me.to.device_id),
-            account_id: hex(&me.to.account_id),
-            fleet_id: hex(&FLEET),
-            signing_key_seed: hex(&[1; 32]),
-            hpke_key_seed: hex(&[7; 32]),
-            ..Default::default()
-        })
-        .unwrap();
-        let state = root_bootstrap::BootstrapState {
-            tenant_id: hex(&TENANT),
-            device_id: hex(&me.to.device_id),
-            server_instance_id: hex(&INSTANCE),
-            activated: true,
-            anchor: hex(&me.to.signing_key_id),
-            ..Default::default()
-        };
-        let state = serde_json::to_string(&state).unwrap();
-        std::fs::write(store::custody_bootstrap_path().unwrap(), state).unwrap();
-        let c = team_config::load().unwrap();
-        let (fkek, legacy) = ([0x6b; 32], [0x6c; 32]);
-        let grant = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&fkek), &fkek);
-        let fleet = hex(&FLEET);
-        assert!(fleet_keys::collect(&fleet, 1, &fkek).unwrap());
-        let mut keys = fleet_keys::load().unwrap();
-        keys.insert(&fleet, 2, &legacy);
-        fleet_keys::save(&keys).unwrap();
-        let db = store::config_root().unwrap().join("team-sync");
-        std::fs::create_dir_all(&db).unwrap();
-        let now = T0 + 2 * DAY;
-
-        let unkept = pull_fleet_keys(&c, now);
-        let opened = collect(
-            &db.join("team-sync.db"),
-            &evidence(&me, grant.clone()),
-            &grant,
-            1,
+        let stolen = [0x66; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&stolen);
+        let first = d_root(&me.sk, 21, T0, T0 + 30 * DAY);
+        let extension = d_root(&d_key(), 23, T0 + 10 * DAY, LONG);
+        let c = lasting(41, T0 + 10 * DAY, LONG);
+        let backdated = grant_at(&d_key(), &me, 1, c, kid, &stolen);
+        let alone = custody(
+            &me,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&backdated),
         );
-        let kept = pull_fleet_keys(&c, now);
-        let ended = pull_fleet_keys(&c, T0 + 301 * DAY);
-        std::fs::remove_file(store::custody_bootstrap_path().unwrap()).unwrap();
-        let unpinned = pull_fleet_keys(&c, now);
+        let extended = custody(
+            &me,
+            &[first.clone(), extension],
+            std::slice::from_ref(&backdated),
+        );
+        let pin = (BINDING, me.to.signing_key_id);
+        let mut outcomes = Vec::new();
+        for pages in [&alone, &extended] {
+            let (_ledger, path) = ledger_at();
+            let before = custody(&me, std::slice::from_ref(&first), &[]);
+            assert_eq!(collect_at(&path, &before, &[], 1, T0 + DAY), None);
+            let got = collect_at(&path, pages, &backdated, 1, T0 + 41 * DAY);
+            let db = team::db::Db::open_at(&path).unwrap();
+            let kept = fleet_key_verifies(&db, &pin, &me.to, &FLEET, 1, &stolen, T0 + 42 * DAY);
+            outcomes.push((got, lapsed(&path).len(), kept.unwrap()));
+        }
+        let fleet = hex(&FLEET);
+        assert!(fleet_keys::collect(&fleet, 1, &stolen).unwrap());
+        let pulled = fleet_keys::load().unwrap().keys_newest_first(&fleet);
         store::set_config_root(None);
 
-        assert_eq!(opened, Some(fkek));
-        assert_eq!(unkept, [(legacy, 2)]);
-        assert_eq!(kept, [(legacy, 2), (fkek, 1)]);
-        assert_eq!(ended, [(legacy, 2)]);
-        assert_eq!(unpinned, [(legacy, 2)], "no pinned anchor");
+        assert_eq!(
+            outcomes,
+            [(Some(stolen), 1, true), (Some(stolen), 0, true)],
+            "accepted, kept, and lapsed only without the extension"
+        );
+        assert!(pulled.is_empty(), "pull does not use it");
+    }
+
+    /// The custodian ledger row of `key`: cached first window and known end.
+    fn custodian(path: &std::path::Path, key: &[u8; 32]) -> (i64, i64) {
+        let db = team::db::Db::open_at(path).unwrap();
+        db.conn
+            .query_row(
+                "SELECT first_not_before_ms, latest_not_after_ms FROM trust_custodian_keys
+                 WHERE signing_key_id = ?1",
+                [hex(key)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A server cannot make D's lapse or key age worse for good: leaving out
+    /// every root grant of D records no lapse while D's known custody runs,
+    /// and a root grant for D from a key with no custody, dated 1094 days
+    /// back, is never cached. Each refuses only in its own evaluation; the
+    /// next honest one accepts D's grant.
+    #[test]
+    fn a_server_cannot_lapse_a_custodian_or_age_its_key_for_good() {
+        let me = me();
+        let fkek = [0x6e; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&fkek);
+        let first = d_root(&me.sk, 21, T0, T0 + 30 * DAY);
+        let c = lasting(41, T0 + 3 * DAY, LONG);
+        let grant = grant_at(&d_key(), &me, 1, c, kid, &fkek);
+        let junk = shardx_core::signing::Ed25519SigningKey::from_bytes(&[9; 32]);
+        let early = T0 + 2 * DAY - shardx_core::trust_chain::MAX_CUSTODIAN_KEY_AGE_MS;
+        let forged = d_root(&junk, 25, early, T0 + 5 * DAY);
+        let honest = custody(
+            &me,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&grant),
+        );
+        let omitted = custody(&me, &[], std::slice::from_ref(&grant));
+        let mut aged = custody(&me, std::slice::from_ref(&first), &[grant.clone(), forged]);
+        aged[0]
+            .signing_public_keys
+            .push(junk.verifying_key().to_bytes());
+
+        let (_dir, path) = ledger_at();
+        let before = custody(&me, std::slice::from_ref(&first), &[]);
+        assert_eq!(collect_at(&path, &before, &[], 1, T0 + DAY), None);
+        let at = T0 + 5 * DAY;
+        assert_eq!(
+            collect_at(&path, &omitted, &grant, 1, at),
+            None,
+            "no custody"
+        );
+        assert_eq!(collect_at(&path, &aged, &grant, 1, at), None, "clipped");
+        assert!(lapsed(&path).is_empty());
+        let known = ((T0) as i64, (T0 + 30 * DAY) as i64);
+        assert_eq!(custodian(&path, &d_id()), known);
+        assert_eq!(collect_at(&path, &honest, &grant, 1, at), Some(fkek));
+    }
+
+    /// A lapse is recorded once D's known custody ends, within the clock
+    /// tolerance: at its counted end, or at its key age when that is sooner.
+    #[test]
+    fn a_lapse_is_the_known_end_of_custody_clipped_at_the_key_age() {
+        let me = me();
+        let lapses_at = |until: u64, now: u64| {
+            let (_dir, path) = ledger_at();
+            let pages = custody(&me, &[d_root(&me.sk, 21, T0, until)], &[]);
+            assert_eq!(collect_at(&path, &pages, &[], 1, now), None);
+            lapsed(&path).contains(&(hex(&d_id()), now as i64))
+        };
+        let end = T0 + 30 * DAY;
+        let tolerance = shardx_core::trust_chain::CLOCK_TOLERANCE_MS;
+        assert!(!lapses_at(end, end + tolerance - 1), "within the tolerance");
+        assert!(lapses_at(end, end + tolerance));
+        let age = T0 + shardx_core::trust_chain::MAX_CUSTODIAN_KEY_AGE_MS;
+        assert!(!lapses_at(LONG, age - DAY));
+        assert!(lapses_at(LONG, age + tolerance), "at the key age");
     }
 
     /// Only the device that bootstrapped this tenant's custody, with the

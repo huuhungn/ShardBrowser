@@ -277,6 +277,9 @@ pub struct TrustChain {
     /// key, over every usable root grant so the clip is fixed up front, or
     /// the earlier one the client cached.
     first_not_before: BTreeMap<KeyId, u64>,
+    /// The earliest `not_before_ms` and latest end of the root grants the
+    /// fixpoint counted for each key, before the clip.
+    counted: BTreeMap<KeyId, (u64, u64)>,
     approvals_by_subject: BTreeMap<KeyId, Vec<usize>>,
     /// Capability grants by subject, then issuer: a question reads only the
     /// grants that custodians issued, however many others name the subject.
@@ -313,6 +316,7 @@ impl TrustChain {
             anchor,
             custodians: BTreeMap::new(),
             first_not_before,
+            counted: BTreeMap::new(),
             approvals_by_subject: index(&evidence.approvals, |a| {
                 Some(a.payload.subject_signing_key_id)
             }),
@@ -382,10 +386,16 @@ impl TrustChain {
             .copied();
         let cap = self.first_not_before[&g.subject_signing_key_id]
             .saturating_add(MAX_CUSTODIAN_KEY_AGE_MS);
-        let (nb, na) = (
+        let (nb, end) = (
             g.common.not_before_ms,
-            end_of(&g.common, r.revoked_at_ms, device_revoked).min(cap),
+            end_of(&g.common, r.revoked_at_ms, device_revoked),
         );
+        let known = self
+            .counted
+            .entry(g.subject_signing_key_id)
+            .or_insert((nb, end));
+        *known = (known.0.min(nb), known.1.max(end));
+        let na = end.min(cap);
         // A window the clip or a revocation emptied holds nothing.
         if nb < na {
             self.custodians
@@ -395,12 +405,13 @@ impl TrustChain {
         }
     }
 
-    /// Every key with a custodian window, and its `first_not_before`: what the
-    /// client's custodian ledger tracks (D-6 (a)-(c)).
-    pub fn custodians(&self) -> impl Iterator<Item = (&KeyId, u64)> + '_ {
-        self.custodians
-            .keys()
-            .map(|k| (k, self.first_not_before[k]))
+    /// Every key a counted root grant names, with the earliest `not_before_ms`
+    /// and the latest end of those grants, before the clip: what the client's
+    /// custodian ledger tracks (D-6 (a)-(c)). Only counted grants, whose
+    /// issuers the fixpoint verified from the anchor, so a root grant any key
+    /// can sign, or an omission, never moves them.
+    pub fn custodians(&self) -> impl Iterator<Item = (&KeyId, u64, u64)> + '_ {
+        self.counted.iter().map(|(k, &(nb, end))| (k, nb, end))
     }
 
     fn windows(&self, key: &KeyId) -> &[(u64, u64)] {
@@ -1316,39 +1327,62 @@ mod tests {
 
     /// D-6 (c): a cached `first_not_before` earlier than every root grant the
     /// evidence holds clips from there, and a later one never stretches it.
+    /// What the chain lists for the ledger comes only from counted root
+    /// grants: never from the cache, nor from a root grant a key with no
+    /// custody signed, which still clips this evaluation.
     #[test]
     fn a_cached_first_not_before_clips_what_an_omission_would_stretch() {
-        let (a0, b) = (Device::new(1), Device::new(2));
-        let with = |cached: Option<u64>| {
-            let mut e = Evidence::collect(&BINDING, &[page(&[&a0, &b], tenant(&a0, &b))]).unwrap();
+        let (a0, b, junk) = (Device::new(1), Device::new(2), Device::new(3));
+        let b_counted = (T0 + 2 * DAY, T0 + 100 * DAY);
+        let with = |cached: Option<u64>, extra: Option<Vec<u8>>| {
+            let mut containers = tenant(&a0, &b);
+            containers.extend(extra);
+            let p = page(&[&a0, &b, &junk], containers);
+            let mut e = Evidence::collect(&BINDING, &[p]).unwrap();
             if let Some(at) = cached {
                 e.remember_first_not_before(b.key(), at);
             }
             let c = TrustChain::evaluate(e, None).unwrap();
-            let listed: BTreeMap<KeyId, u64> = c.custodians().map(|(k, at)| (*k, at)).collect();
+            let listed: BTreeMap<KeyId, (u64, u64)> =
+                c.custodians().map(|(k, nb, end)| (*k, (nb, end))).collect();
             (c, listed)
         };
-        let (c, listed) = with(None);
+        let (c, listed) = with(None, None);
         assert_eq!(
             listed,
-            BTreeMap::from([(a0.key(), T0), (b.key(), T0 + 2 * DAY)])
+            BTreeMap::from([(a0.key(), (T0, T0 + 365 * DAY)), (b.key(), b_counted)])
         );
         assert!(c.custodian_at(&b.key(), T0 + 99 * DAY));
 
         let early = T0 + 40 * DAY - MAX_CUSTODIAN_KEY_AGE_MS;
-        let (c, listed) = with(Some(early));
+        let (c, listed) = with(Some(early), None);
         assert!(c.custodian_at(&b.key(), T0 + 39 * DAY));
         assert!(!c.custodian_at(&b.key(), T0 + 40 * DAY), "clipped");
-        assert_eq!(listed[&b.key()], early);
+        assert_eq!(listed[&b.key()], b_counted, "not the cache");
 
-        let (c, listed) = with(Some(T0 + 50 * DAY));
+        let (c, _) = with(Some(T0 + 50 * DAY), None);
         assert!(c.custodian_at(&b.key(), T0 + 99 * DAY), "never stretched");
-        assert_eq!(listed[&b.key()], T0 + 2 * DAY);
 
-        // A clip that empties every window leaves no custodian to list.
-        let (c, listed) = with(Some(T0 + DAY - MAX_CUSTODIAN_KEY_AGE_MS));
+        // A clip that empties every window leaves B no custody, but its
+        // counted grant is still listed.
+        let (c, listed) = with(Some(T0 + DAY - MAX_CUSTODIAN_KEY_AGE_MS), None);
         assert!(!c.custodian_at(&b.key(), T0 + 3 * DAY));
-        assert!(!listed.contains_key(&b.key()));
+        assert_eq!(listed[&b.key()], b_counted);
+
+        // A key with no custody names B in a root grant from long before.
+        let forged = root(
+            &junk,
+            &b,
+            RootGrantVariant::ExistingRootGrant,
+            30,
+            20,
+            T0 + 40 * DAY - MAX_CUSTODIAN_KEY_AGE_MS,
+            T0 + 50 * DAY,
+        );
+        let (c, listed) = with(None, Some(forged));
+        assert!(!c.custodian_at(&b.key(), T0 + 40 * DAY), "clipped here");
+        assert_eq!(listed[&b.key()], b_counted, "never listed");
+        assert!(!listed.contains_key(&junk.key()));
     }
 
     #[test]

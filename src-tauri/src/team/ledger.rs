@@ -22,14 +22,15 @@
 //!   tighten (ADR 0002, "Server-reported revocations only tighten").
 //! - **Highest verified generation** per fleet, which never goes back
 //!   ("Fleet generation freshness") and moves one step at a time.
-//! - **Custodian keys** (D-6 (a)-(c)): every key this device saw as a
-//!   custodian, with its cached `first_not_before`, which only moves earlier
-//!   and starts the 1095-day clip of every later evaluation, and the local
-//!   time this device first computed that the key had no window containing
-//!   now (sticky lapse, [`lapse_allows`]).
+//! - **Custodian keys** (D-6 (a)-(c)): every key a counted root grant made a
+//!   custodian, with the earliest `not_before_ms` of those grants, which only
+//!   moves earlier and starts the 1095-day clip of every later evaluation,
+//!   the latest end, which only moves later, and the local time this device
+//!   first found that known custody ended (sticky lapse, [`lapse_allows`]).
 //! - **Fleet key grants** (G2-35): the exact grant behind each collected
-//!   fleet key and the pages it verified against, so sync reverifies it
-//!   before use ([`fleet_key_grant`]).
+//!   fleet key and the pages it verified against, so sync can reverify it
+//!   before use ([`fleet_key_grant`]); sync does not use such keys yet
+//!   (`fleet_keys::keys_newest_first`).
 //!
 //! Not here yet: the custodian change events of D-6 (a), whose wording and
 //! acknowledgement follow the Q-17 UX review.
@@ -43,7 +44,9 @@ use shardx_core::authz_record::{
     DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shardx_core::canonical::{decode, encode, Value};
-use shardx_core::trust_chain::{Binding, Evidence, Scope, TrustChain};
+use shardx_core::trust_chain::{
+    Binding, Evidence, Scope, TrustChain, CLOCK_TOLERANCE_MS, MAX_CUSTODIAN_KEY_AGE_MS,
+};
 use shardx_core::trust_evidence::{RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2};
 
 use super::db::Db;
@@ -250,7 +253,7 @@ fn prepare(
 }
 
 /// D-6 (b), sticky lapse, for `record` first seen in evaluation `seen`. Once
-/// this device observed that a key had no window containing now (`lapses`:
+/// this device found that a key's known custody had ended (`lapses`:
 /// the observing evaluation and its local time), a container first seen in a
 /// later evaluation:
 /// - signed by that key counts only when its `issued_at_ms` is after the
@@ -419,37 +422,44 @@ pub fn record(
             params![instance, tenant, hex(&d.device_id), at],
         )?;
     }
-    // D-6 (a)-(c): the cached `first_not_before` only moves earlier, and a
-    // key with no window containing now is held as lapsed from the first
-    // evaluation that computes it.
-    for (key, first_not_before) in chain.custodians() {
+    // D-6 (a)-(c), from counted root grants only: the cached
+    // `first_not_before` only moves earlier, the known end of custody only
+    // later, and a key whose known custody (clipped at its key age) has
+    // ended is held as lapsed from the first evaluation that finds it. A key
+    // the server leaves out keeps what this device already knows.
+    for (key, first_not_before, end) in chain.custodians() {
         // A window that starts past the year 292 million is no custody yet.
         let Ok(at) = wire(first_not_before) else {
             continue;
         };
         tx.execute(
-            "INSERT INTO trust_custodian_keys VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)
-             ON CONFLICT DO UPDATE SET first_not_before_ms =
-               min(first_not_before_ms, excluded.first_not_before_ms)",
-            params![instance, tenant, hex(key), evaluation, at],
+            "INSERT INTO trust_custodian_keys VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)
+             ON CONFLICT DO UPDATE SET
+               first_not_before_ms = min(first_not_before_ms, excluded.first_not_before_ms),
+               latest_not_after_ms = max(latest_not_after_ms, excluded.latest_not_after_ms)",
+            params![
+                instance,
+                tenant,
+                hex(key),
+                evaluation,
+                at,
+                wire(end.min(i64::MAX as u64))?
+            ],
         )?;
     }
-    let held: Vec<String> = tx
-        .prepare(
-            "SELECT signing_key_id FROM trust_custodian_keys
-             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND lapsed_evaluation IS NULL",
-        )?
-        .query_map(params![instance, tenant], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for key in held {
-        if !chain.custodian_now(&decode_hex32(&key, "signing_key_id")?, now) {
-            tx.execute(
-                "UPDATE trust_custodian_keys SET lapsed_evaluation = ?4, observed_lapsed_at_ms = ?5
-                 WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3",
-                params![instance, tenant, key, evaluation, wire(now)?],
-            )?;
-        }
-    }
+    tx.execute(
+        "UPDATE trust_custodian_keys SET lapsed_evaluation = ?3, observed_lapsed_at_ms = ?4
+         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND lapsed_evaluation IS NULL
+           AND min(latest_not_after_ms, first_not_before_ms + ?5) <= ?6",
+        params![
+            instance,
+            tenant,
+            evaluation,
+            wire(now)?,
+            wire(MAX_CUSTODIAN_KEY_AGE_MS)?,
+            wire(now.saturating_sub(CLOCK_TOLERANCE_MS))?
+        ],
+    )?;
     if let Some(o) = opened {
         tx.execute(
             "INSERT INTO trust_fleet_generations VALUES (?1, ?2, ?3, ?4)
@@ -621,8 +631,8 @@ mod tests {
             .execute_batch(&format!(
                 "INSERT INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);
                  INSERT INTO trust_evaluations VALUES (2, '{i}', '{t}', 0);
-                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{d}', 1, 0, 1, {L});
-                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{x}', 1, 0, NULL, NULL);
+                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{d}', 1, 0, 0, 1, {L});
+                 INSERT INTO trust_custodian_keys VALUES ('{i}', '{t}', '{x}', 1, 0, 0, NULL, NULL);
                  INSERT INTO trust_sightings VALUES ('{i}', '{t}', '{a}', '{d}', 1, 0);
                  INSERT INTO trust_sightings VALUES ('{i}', '{t}', '{b}', '{d}', 2, 0);",
                 d = hex(&id(&d)),
