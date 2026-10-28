@@ -2515,24 +2515,39 @@ async fn an_upload_commits_once_and_the_next_checkout_starts_at_its_head() {
     .await;
     let s2 = snap(p, second.lease, &dev, 0x13, Some(head1));
     let id2 = server.uploaded(&access, 0x09, &s2).await;
-    // A finalize that crashed after its rename is finished by the next one.
-    server
-        .sql(
-            "UPDATE v2_uploads SET state = 'FINALIZING' WHERE upload_id = ?",
-            &[&id2],
-        )
-        .await;
+    // A finalize whose promote fails stays FINALIZING, its response stored
+    // and its upload not yet committable. Its retry, after a crash past the
+    // rename, finishes it with the same bytes.
     let object2 = server.object_file(P1, &s2.terms.snapshot_id);
-    std::fs::rename(server.staging_file(&id2), &object2).unwrap();
+    std::fs::create_dir_all(&object2).unwrap();
     let c2 = commit_request(&s2.manifest, &dev, id2, 0x33, 0x44);
-    let (status, body) = server
-        .call(
-            &upload_path(&id2, "finalize"),
-            &access,
-            &finalize_req(0x0a, &c2),
+    let fin2 = finalize_req(0x0a, &c2);
+    let fin2_path = upload_path(&id2, "finalize");
+    assert_eq!(server.call(&fin2_path, &access, &fin2).await.0, 500);
+    assert_eq!(
+        server.head(&id2, &access).await,
+        (
+            200,
+            Some((s2.object.len() as u64, "FINALIZING".to_string()))
         )
-        .await;
+    );
+    assert_eq!(
+        server.abort(&id2, &access).await,
+        (409, "UPLOAD_OFFSET_MISMATCH".to_string())
+    );
+    expect(
+        &server,
+        &upload_path(&id2, "commit"),
+        &access,
+        c2.exact_bytes(),
+        (409, "UPLOAD_OFFSET_MISMATCH"),
+    )
+    .await;
+    std::fs::remove_dir(&object2).unwrap();
+    std::fs::rename(server.staging_file(&id2), &object2).unwrap();
+    let (status, body) = server.call(&fin2_path, &access, &fin2).await;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(server.call(&fin2_path, &access, &fin2).await, (200, body));
     let (status, receipt2) = server
         .call(&upload_path(&id2, "commit"), &access, c2.exact_bytes())
         .await;
@@ -2955,24 +2970,31 @@ async fn every_upload_refusal_has_its_status_and_code() {
     let mut misnamed = snap(p1, l1, &dev, 0x23, None);
     misnamed.terms.manifest_replay_id = [0x5a; 16];
     misnamed.manifest.manifest_replay_id = [0x5a; 16];
-    for (key, f, want) in [
-        (0x19, &flipped, (422, "CIPHERTEXT_HASH_MISMATCH")),
-        (0x1a, &trailing, quarantined),
-        (0x1b, &misnamed, quarantined),
+    // A refused finalize keeps its key: its retry is told the quarantine.
+    for (key, f, want, fin_key) in [
+        (0x19, &flipped, (422, "CIPHERTEXT_HASH_MISMATCH"), 0x23),
+        (0x1a, &trailing, quarantined, 0x27),
+        (0x1b, &misnamed, quarantined, 0x28),
     ] {
         let id = server.uploaded(&access, key, f).await;
         let r = commit_request(&f.manifest, &dev, id, 0x34, 0x40);
         let path = upload_path(&id, "finalize");
-        expect(&server, &path, &access, &finalize_req(0x23, &r), want).await;
+        expect(&server, &path, &access, &finalize_req(fin_key, &r), want).await;
         expect(
             &server,
             &path,
             &access,
-            &finalize_req(0x23, &r),
+            &finalize_req(fin_key, &r),
             quarantined,
         )
         .await;
         assert_eq!(server.head(&id, &access).await.1.unwrap().1, "QUARANTINED");
+        let commit = upload_path(&id, "commit");
+        expect(&server, &commit, &access, r.exact_bytes(), quarantined).await;
+        assert_eq!(
+            server.abort(&id, &access).await,
+            (422, "UPLOAD_QUARANTINED".to_string())
+        );
     }
     assert_eq!(
         server
@@ -3015,6 +3037,7 @@ async fn every_upload_refusal_has_its_status_and_code() {
         .await;
     assert_eq!(status, 201);
     let mid = created(&body).upload_id;
+    // At offset 0 a missing file is an empty one (L1193); past it, gone.
     std::fs::remove_file(server.staging_file(&mid)).unwrap();
     assert_eq!(
         short(
@@ -3022,8 +3045,18 @@ async fn every_upload_refusal_has_its_status_and_code() {
                 .patch(&mid, &access, 0, &missing.object[..CHUNK])
                 .await
         ),
+        (200, String::new())
+    );
+    std::fs::remove_file(server.staging_file(&mid)).unwrap();
+    assert_eq!(
+        short(
+            server
+                .patch(&mid, &access, CHUNK, &missing.object[CHUNK..2 * CHUNK])
+                .await
+        ),
         (422, "UPLOAD_QUARANTINED".into())
     );
+    assert!(!server.staging_file(&mid).exists());
 
     // An upload past its expiry is gone (stands in for a day passing).
     server
@@ -3145,4 +3178,209 @@ async fn every_upload_refusal_has_its_status_and_code() {
     expect(&server, &commit, &access, c1.exact_bytes(), gone).await;
     expect(&server, &up1, &access, &upload_req(0x17, &s.terms), gone).await;
     assert_eq!(server.head(&u1, &access).await, (404, None));
+}
+
+impl Server {
+    /// Stops the server and starts it on the same data: the upload
+    /// reconciler runs before it serves (plan L1216).
+    async fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = launch(&self.data, self.port);
+        wait_health(self.port).await;
+    }
+
+    /// `DELETE /v2/uploads/{upload_id}`: the status and the code.
+    async fn abort(&self, upload: &[u8; 16], bearer: &str) -> (u16, String) {
+        let r = client()
+            .delete(format!(
+                "http://127.0.0.1:{}/v2/uploads/{}",
+                self.port,
+                hex(upload)
+            ))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        (r.status().as_u16(), code(&r.bytes().await.unwrap()))
+    }
+}
+
+#[tokio::test]
+async fn a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot() {
+    let mut server = start("reconcile", 28266).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (K::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (K::Fleet, FLEET)),
+        (0xa3, Capability::ProfileCommit, (K::Fleet, FLEET)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+    let p = pref(P1);
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x01, p))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+
+    // A finalize that crashed past its rename: FINALIZING, the object in
+    // place, the staging file gone. The restart makes it READY (L1199).
+    let s1 = snap(p, first.lease, &dev, 0x11, None);
+    let id = server.uploaded(&access, 0x02, &s1).await;
+    let object = server.object_file(P1, &s1.terms.snapshot_id);
+    std::fs::create_dir_all(&object).unwrap();
+    let c1 = commit_request(&s1.manifest, &dev, id, 0x31, 0x41);
+    let fin = finalize_req(0x03, &c1);
+    let fin_path = upload_path(&id, "finalize");
+    assert_eq!(server.call(&fin_path, &access, &fin).await.0, 500);
+    std::fs::remove_dir(&object).unwrap();
+    std::fs::rename(server.staging_file(&id), &object).unwrap();
+    server.restart().await;
+    let n = s1.object.len() as u64;
+    assert_eq!(
+        server.head(&id, &access).await,
+        (200, Some((n, "READY".to_string())))
+    );
+    let (status, body) = server.call(&fin_path, &access, &fin).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, receipt) = server
+        .call(&upload_path(&id, "commit"), &access, c1.exact_bytes())
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt));
+    let head1 = c1.manifest().head_hash();
+
+    // Abort: the lease holder's, idempotent, and it frees the lease's one
+    // upload slot.
+    let (status, body) = server
+        .call(
+            &checkout_path(P1),
+            &access,
+            &checkout_at(0x04, p, 1, Some(head1)),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let second = granted(LeaseOrigin::Checkout, &body);
+    let s2 = snap(p, second.lease, &dev, 0x12, Some(head1));
+    let (status, body) = server
+        .call(&uploads_path(P1), &access, &upload_req(0x05, &s2.terms))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let id2 = created(&body).upload_id;
+    assert_eq!(
+        server.patch(&id2, &access, 0, &s2.object[..CHUNK]).await.0,
+        200
+    );
+    let s3 = snap(p, second.lease, &dev, 0x13, Some(head1));
+    let third = upload_req(0x06, &s3.terms);
+    expect(
+        &server,
+        &uploads_path(P1),
+        &access,
+        &third,
+        (429, "UPLOAD_CAPACITY"),
+    )
+    .await;
+    assert_eq!(server.abort(&id2, &access).await, (204, String::new()));
+    assert_eq!(server.abort(&id2, &access).await, (204, String::new()));
+    assert!(!server.staging_file(&id2).exists());
+    assert_eq!(
+        server.head(&id2, &access).await,
+        (200, Some((CHUNK as u64, "ABORTED".to_string())))
+    );
+    assert_eq!(
+        server
+            .patch(&id2, &access, CHUNK, &s2.object[CHUNK..2 * CHUNK])
+            .await
+            .1,
+        "UPLOAD_OFFSET_MISMATCH"
+    );
+    assert_eq!(
+        server.abort(&id, &access).await,
+        (409, "UPLOAD_OFFSET_MISMATCH".to_string())
+    );
+    assert_eq!(
+        server.abort(&[0x66; 16], &access).await,
+        (404, "RESOURCE_NOT_FOUND".to_string())
+    );
+    let (status, body) = server.call(&uploads_path(P1), &access, &third).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'upload.abort'")
+            .await,
+        1
+    );
+
+    // A READY upload aborts too, by the lease holder with `profile.commit`
+    // only, and never commits after; its object stays (L1176).
+    let id3 = created(&body).upload_id;
+    server.send(&id3, &access, &s3.object, 0).await;
+    let c3 = commit_request(&s3.manifest, &dev, id3, 0x32, 0x42);
+    let (status, body) = server
+        .call(
+            &upload_path(&id3, "finalize"),
+            &access,
+            &finalize_req(0x07, &c3),
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let lease =
+        |at: u64| format!("UPDATE v2_profile_leases SET expires_at_ms = {at} WHERE profile_id = ?");
+    server.sql(&lease(1), &[&P1]).await;
+    assert_eq!(
+        server.abort(&id3, &access).await,
+        (409, "LEASE_EXPIRED".to_string())
+    );
+    server.sql(&lease(now_ms() + 300_000), &[&P1]).await;
+    let revoke = "UPDATE v2_capability_grants SET revoked_at = 't' WHERE replay_id = ?";
+    server.sql(revoke, &[&[0xa3; 16]]).await;
+    assert_eq!(server.abort(&id3, &access).await.0, 403);
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa4,
+        Capability::ProfileCommit,
+        (K::Fleet, FLEET),
+    )
+    .await;
+    assert_eq!(server.abort(&id3, &access).await, (204, String::new()));
+    expect(
+        &server,
+        &upload_path(&id3, "commit"),
+        &access,
+        c3.exact_bytes(),
+        (409, "UPLOAD_OFFSET_MISMATCH"),
+    )
+    .await;
+    let object3 = server.object_file(P1, &s3.terms.snapshot_id);
+    assert!(object3.exists());
+
+    // L1210: a committed object gone is a security incident, and its
+    // snapshot is no longer served. The aborted object is not GC's.
+    std::fs::remove_file(&object).unwrap();
+    server.restart().await;
+    expect_get(&server, &snapshot_path(P1, 1), &access).await;
+    assert_eq!(
+        server
+            .count(
+                "SELECT count(*) FROM v2_upload_quarantine
+                  WHERE reason = 'object_invalid' AND security_incident = 1
+                    AND from_state = 'COMMITTED'"
+            )
+            .await,
+        1
+    );
+    assert_eq!(server.head(&id3, &access).await.1.unwrap().1, "ABORTED");
+    assert!(object3.exists());
+}
+
+/// A snapshot readback refused as quarantined.
+async fn expect_get(server: &Server, path: &str, bearer: &str) {
+    let (status, _, body) = server.get(path, bearer, None).await;
+    assert_eq!((status, code(&body).as_str()), (422, "UPLOAD_QUARANTINED"));
 }

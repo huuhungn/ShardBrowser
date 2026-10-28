@@ -15,6 +15,7 @@ pub mod v2_restore_epoch;
 pub mod v2_root;
 pub mod v2_root_grants;
 pub mod v2_trust;
+pub mod v2_upload_recovery;
 pub mod v2_uploads;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -167,6 +168,7 @@ pub fn router(state: AppState) -> Router {
             "/v2/uploads/:upload_id",
             patch(v2_uploads::patch_upload)
                 .head(v2_uploads::head_upload)
+                .delete(v2_uploads::abort_upload)
                 .layer(DefaultBodyLimit::max(v2_uploads::MAX_CHUNK_BYTES)),
         )
         .route(

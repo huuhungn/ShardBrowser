@@ -92,6 +92,18 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Plan L1216: no v2 write before every upload is reconciled.
+    if let Ok(verified) = &authority {
+        match routes::v2_upload_recovery::run(&pool, verified, &cfg.blob_dir).await {
+            Ok(report) => tracing::info!(?report, "v2 upload reconciliation"),
+            Err(e) => {
+                authority = Err(identity::Refusal {
+                    code: identity::ReasonCode::ControlPlaneIntegrityUntrusted,
+                    detail: format!("the upload reconciliation failed: {e:#}"),
+                })
+            }
+        }
+    }
     match &authority {
         Ok(v) => tracing::info!(
             "server identity verified: instance {} epoch {}",

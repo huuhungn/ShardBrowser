@@ -16,18 +16,14 @@
 //! I/O. A PATCH reads its offset, writes and flushes the chunk, then
 //! re-checks and records it in a short `BEGIN IMMEDIATE` (L1163-L1166).
 //! Finalize hashes and promotes between its `OPEN -> FINALIZING` and
-//! `FINALIZING -> READY` writes.
+//! `FINALIZING -> READY` writes. The first one already stores the exact
+//! manifest, request and READY response, so a finalize that fails after it
+//! is finished by its own retry or by the startup reconciler
+//! ([`super::v2_upload_recovery`], L1180-L1216); commit takes only `READY`.
 //!
 //! An upload row is looked up under the current restore epoch, and a replay
 //! whose upload or snapshot a restore dropped gets the ADR 0002 D-1 error,
 //! never its stored bytes.
-//!
-//! shortcut: no startup reconciler or GC (L1177-L1215). PATCH drops a tail
-//! past the committed offset and quarantines a short file, the next finalize
-//! of a FINALIZING upload finishes it, and create-upload aborts the tenant's
-//! expired OPEN uploads and deletes their staging files. Quarantined
-//! evidence, expired FINALIZING files and READY objects that never commit
-//! stay on disk; add the reconciliation matrix with restore and GC.
 
 use std::collections::BTreeSet;
 use std::path::{Path as FsPath, PathBuf};
@@ -85,7 +81,7 @@ static WRITERS: Mutex<BTreeSet<[u8; 16]>> = Mutex::new(BTreeSet::new());
 
 /// The one writer of an upload, until dropped. A second is refused, not
 /// queued: its client HEADs and resumes.
-struct Writer([u8; 16]);
+pub(super) struct Writer([u8; 16]);
 
 impl Drop for Writer {
     fn drop(&mut self) {
@@ -96,7 +92,7 @@ impl Drop for Writer {
     }
 }
 
-fn writer(upload_id: [u8; 16]) -> Result<Writer, AppError> {
+pub(super) fn writer(upload_id: [u8; 16]) -> Result<Writer, AppError> {
     let mut held = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
     if !held.insert(upload_id) {
         return Err(offset_mismatch());
@@ -132,9 +128,9 @@ fn snapshot_error(e: SnapshotError) -> AppError {
 }
 
 /// A `v2_uploads` row with the terms CREATE_UPLOAD bound.
-struct Upload {
-    p: ProfileRef,
-    snapshot_id: [u8; 16],
+pub(super) struct Upload {
+    pub(super) p: ProfileRef,
+    pub(super) snapshot_id: [u8; 16],
     manifest_replay_id: [u8; 16],
     lease: LeaseRef,
     intent_hash: [u8; 32],
@@ -142,13 +138,13 @@ struct Upload {
     dek_slot_sha256: [u8; 32],
     fkek_key_id: [u8; 32],
     key_generation: u64,
-    size: u64,
-    sha256: [u8; 32],
-    committed_offset: u64,
-    staging_path: String,
-    immutable_path: Option<String>,
-    state: String,
-    commit_request: Option<Vec<u8>>,
+    pub(super) size: u64,
+    pub(super) sha256: [u8; 32],
+    pub(super) committed_offset: u64,
+    pub(super) staging_path: String,
+    pub(super) immutable_path: Option<String>,
+    pub(super) state: String,
+    pub(super) commit_request: Option<Vec<u8>>,
     expires_at_ms: i64,
 }
 
@@ -170,34 +166,38 @@ async fn load(
     .bind(sql_int(v.restore_epoch)?)
     .fetch_optional(&mut *conn)
     .await?;
-    let Some(r) = row else { return Ok(None) };
-    Ok(Some(Upload {
+    row.as_ref().map(upload).transpose()
+}
+
+/// The upload of one `v2_uploads` row.
+pub(super) fn upload(r: &sqlx::sqlite::SqliteRow) -> Result<Upload, AppError> {
+    Ok(Upload {
         p: ProfileRef {
-            tenant_id: *tenant,
-            fleet_id: blob::<16>(&r, "fleet_id")?,
-            profile_id: blob::<16>(&r, "profile_id")?,
+            tenant_id: blob::<16>(r, "tenant_id")?,
+            fleet_id: blob::<16>(r, "fleet_id")?,
+            profile_id: blob::<16>(r, "profile_id")?,
         },
-        snapshot_id: blob::<16>(&r, "snapshot_id")?,
-        manifest_replay_id: blob::<16>(&r, "manifest_replay_id")?,
+        snapshot_id: blob::<16>(r, "snapshot_id")?,
+        manifest_replay_id: blob::<16>(r, "manifest_replay_id")?,
         lease: LeaseRef {
-            lease_id: blob::<16>(&r, "lease_id")?,
+            lease_id: blob::<16>(r, "lease_id")?,
             fencing_token: stored_uint(r.get("fencing_token"))?,
             base_version: stored_uint(r.get("base_version"))?,
         },
-        intent_hash: blob::<32>(&r, "intent_hash")?,
-        preamble_sha256: blob::<32>(&r, "preamble_sha256")?,
-        dek_slot_sha256: blob::<32>(&r, "dek_slot_sha256")?,
-        fkek_key_id: blob::<32>(&r, "fkek_key_id")?,
+        intent_hash: blob::<32>(r, "intent_hash")?,
+        preamble_sha256: blob::<32>(r, "preamble_sha256")?,
+        dek_slot_sha256: blob::<32>(r, "dek_slot_sha256")?,
+        fkek_key_id: blob::<32>(r, "fkek_key_id")?,
         key_generation: stored_uint(r.get("key_generation"))?,
         size: stored_uint(r.get("expected_ciphertext_size"))?,
-        sha256: blob::<32>(&r, "expected_ciphertext_sha256")?,
+        sha256: blob::<32>(r, "expected_ciphertext_sha256")?,
         committed_offset: stored_uint(r.get("committed_offset"))?,
         staging_path: r.get("staging_path"),
         immutable_path: r.get("immutable_path"),
         state: r.get("state"),
         commit_request: r.get("exact_commit_request_bytes"),
         expires_at_ms: r.get("expires_at_ms"),
-    }))
+    })
 }
 
 /// `OPEN`/`FINALIZING -> QUARANTINED` with its audit row: the evidence stays
@@ -398,8 +398,8 @@ pub async fn create_upload(
     .await?;
     if busy {
         // Plan L1244: UPLOAD_CAPACITY is a 429.
-        // shortcut: no Retry-After header yet; add one when the reconciler
-        // (L1177-L1215) can say when a slot frees.
+        // shortcut: no Retry-After header, as the plan sets no value for it;
+        // add one when it does (the slot frees at abort or expiry).
         return Err(coded(
             StatusCode::TOO_MANY_REQUESTS,
             "UPLOAD_CAPACITY",
@@ -494,10 +494,16 @@ fn offset_response(offset: u64, status: StatusCode) -> Response {
 
 /// Writes `bytes` at `offset` of the staging file and flushes them (L1164,
 /// L1165). `Ok(false)` when the file is missing or shorter than the committed
-/// offset: that upload cannot resume (L1167).
+/// offset: that upload cannot resume (L1167). At offset 0 a missing file is
+/// an empty one, which the reconciler keeps `OPEN` (L1193).
 fn write_at(path: &str, offset: u64, bytes: &[u8]) -> std::io::Result<bool> {
     use std::io::{Seek, Write};
-    let mut f = match std::fs::OpenOptions::new().write(true).open(path) {
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(offset == 0)
+        .truncate(false)
+        .open(path);
+    let mut f = match opened {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
@@ -696,12 +702,82 @@ pub async fn head_upload(
         .into_response())
 }
 
+/// `DELETE /v2/uploads/{upload_id}` (L1152): the lease holder aborts its OPEN
+/// or READY upload, and a retry on the ABORTED one succeeds the same way.
+/// 5.6.5 defines no ABORT mutation, so there is no stored response: the
+/// replay is the same `204`. FINALIZING finishes first (L1159), QUARANTINED
+/// and COMMITTED stay. The staging file goes once the abort commits; a READY
+/// object stays until GC (L1176).
+pub async fn abort_upload(
+    State(app): State<AppState>,
+    who: Principal,
+    Path(upload): Path<String>,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let presented = session_of(who)?;
+    let upload_id = id_path(&upload)?;
+    let _w = writer(upload_id)?;
+    let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let u = load(&mut tx, v, &s.tenant_id, &upload_id)
+        .await?
+        .ok_or_else(not_found)?;
+    if !may(
+        &mut tx,
+        v,
+        &s,
+        &u.p.fleet_id,
+        Some(&u.p.profile_id),
+        Capability::ProfileCommit,
+        true,
+        now,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    match u.state.as_str() {
+        "ABORTED" => return Ok(StatusCode::NO_CONTENT.into_response()),
+        "QUARANTINED" => return Err(quarantined()),
+        "OPEN" | "READY" => {}
+        _ => return Err(offset_mismatch()),
+    }
+    held_lease(&mut tx, &u.p, &s, &u.lease, now).await?;
+    sqlx::query(
+        "UPDATE v2_uploads SET state = 'ABORTED'
+          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(upload_id.as_slice())
+    .execute(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        &s.tenant_id,
+        &s.account_id,
+        &s.device_id,
+        "upload.abort",
+        "upload",
+        &upload_id,
+    )
+    .await?;
+    tx.commit().await?;
+    // Left behind, the startup GC removes it (ABORTED rows only).
+    let _ = tokio::fs::remove_file(&u.staging_path).await;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 // -------------------------------------------------------- FINALIZE_UPLOAD ---
 
 /// Checks the object's bytes and public envelope grammar, then makes it
-/// immutable at `object` (L1170-L1172). `Ok(Err(code))` refuses the bytes;
-/// an I/O error leaves the upload FINALIZING for the next finalize.
-fn promote(
+/// immutable at `object` and flushes it and its directory (L1170-L1173).
+/// `Ok(Err(code))` refuses the bytes; an I/O error leaves the upload
+/// FINALIZING for the finalize retry or the reconciler.
+pub(super) fn promote(
     staging: &FsPath,
     object: &FsPath,
     u: &Upload,
@@ -737,16 +813,20 @@ fn promote(
         Ok(_) => {}
     }
     drop(f);
+    let dir = object
+        .parent()
+        .ok_or_else(|| std::io::Error::other("an object path has a directory"))?;
     if !promoted {
-        // Each chunk was flushed when written; the rename and its directory
-        // are flushed here (L1171-L1172).
-        let dir = object
-            .parent()
-            .ok_or_else(|| std::io::Error::other("an object path has a directory"))?;
         std::fs::create_dir_all(dir)?;
         std::fs::rename(staging, object)?;
-        crate::identity::sync_dir(dir)?;
     }
+    // Also after a crash past the rename: neither flush may have run. A
+    // Windows flush needs write access; nothing is written.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(object)?
+        .sync_all()?;
+    crate::identity::sync_dir(dir)?;
     Ok(Ok(()))
 }
 
@@ -781,55 +861,107 @@ pub async fn finalize_upload(
     if &s.tenant_id != req.tenant_id() {
         return Err(AppError::Forbidden);
     }
-    if let Some(row) =
+    let (u, response) = if let Some(row) =
         ledger_row(&mut tx, v, &s, outer.operation_kind, &outer.idempotency_key).await?
     {
         // L970: the same READY receipt, unless a restore dropped the upload.
+        // A finalize that failed after its FINALIZING write resumes first.
         let (_, response) = replay(&row, &outer, &body, RECORD_TYPE_UPLOAD_FINALIZED, v)?;
-        load(&mut tx, v, &s.tenant_id, &upload_id)
+        let u = load(&mut tx, v, &s.tenant_id, &upload_id)
             .await?
             .ok_or_else(not_found)?;
-        tx.commit().await?;
-        return Ok(cbor(StatusCode::OK, response));
-    }
-
-    let u = load(&mut tx, v, &s.tenant_id, &upload_id)
+        if u.state == "QUARANTINED" {
+            return Err(quarantined());
+        }
+        if u.state != "FINALIZING" {
+            tx.commit().await?;
+            return Ok(cbor(StatusCode::OK, response));
+        }
+        (u, response)
+    } else {
+        let u = load(&mut tx, v, &s.tenant_id, &upload_id)
+            .await?
+            .filter(|u| u.expires_at_ms > now)
+            .ok_or_else(not_found)?;
+        if u.state == "QUARANTINED" {
+            return Err(quarantined());
+        }
+        // A FINALIZING upload belongs to the finalize that stored its bytes.
+        if u.state != "OPEN" || u.committed_offset != u.size {
+            return Err(offset_mismatch());
+        }
+        if !may(
+            &mut tx,
+            v,
+            &s,
+            &u.p.fleet_id,
+            Some(&u.p.profile_id),
+            Capability::ProfileCommit,
+            true,
+            now,
+        )
         .await?
-        .filter(|u| u.expires_at_ms > now)
-        .ok_or_else(not_found)?;
-    if u.state == "QUARANTINED" {
-        return Err(quarantined());
-    }
-    // FINALIZING is a finalize that failed after its first write.
-    if !(u.state == "OPEN" || u.state == "FINALIZING") || u.committed_offset != u.size {
-        return Err(offset_mismatch());
-    }
-    if !may(
-        &mut tx,
-        v,
-        &s,
-        &u.p.fleet_id,
-        Some(&u.p.profile_id),
-        Capability::ProfileCommit,
-        true,
-        now,
-    )
-    .await?
-    {
-        return Err(AppError::Forbidden);
-    }
-    held_lease(&mut tx, &u.p, &s, &u.lease, now).await?;
-    let request = verify_signed(&mut tx, &s, req.into_commit()).await?;
-    bind(&u, request.manifest(), v)?;
-    sqlx::query(
-        "UPDATE v2_uploads SET state = 'FINALIZING'
-          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(s.tenant_id.as_slice())
-    .bind(upload_id.as_slice())
-    .execute(&mut *tx)
-    .await?;
+        {
+            return Err(AppError::Forbidden);
+        }
+        held_lease(&mut tx, &u.p, &s, &u.lease, now).await?;
+        let request = verify_signed(&mut tx, &s, req.into_commit()).await?;
+        bind(&u, request.manifest(), v)?;
+        let payload = UploadFinalizedV2 {
+            upload_id,
+            snapshot_id: u.snapshot_id,
+            manifest_replay_id: u.manifest_replay_id,
+            ciphertext_size: u.size,
+            ciphertext_sha256: u.sha256,
+            object_receipt_id: random::<16>()?,
+            server_instance_id: v.server_instance_id,
+            restore_epoch: v.restore_epoch,
+        }
+        .encode();
+        let response = finish(
+            &mut tx,
+            v,
+            &s,
+            &outer,
+            &body,
+            RECORD_TYPE_UPLOAD_FINALIZED,
+            payload,
+            now,
+            "profile.finalize_upload",
+            ("upload", &upload_id),
+        )
+        .await?;
+        // L1174: everything READY needs is durable before the file moves, so
+        // the reconciler can finish a finalize that crashed (L1199-L1201).
+        let c = request.request();
+        let object = fleet::object_path(
+            FsPath::new(&app.cfg.blob_dir),
+            &s.tenant_id,
+            &u.p.profile_id,
+            &u.snapshot_id,
+        );
+        sqlx::query(
+            "UPDATE v2_uploads
+                SET state = 'FINALIZING', immutable_path = ?, signed_manifest_container_bytes = ?,
+                    signed_manifest_container_hash = ?,
+                    signed_manifest_container_bytes_sha256 = ?, exact_commit_request_bytes = ?,
+                    exact_commit_request_bytes_sha256 = ?, exact_finalize_response_bytes = ?
+              WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
+        )
+        .bind(object.to_string_lossy().to_string())
+        .bind(c.manifest().exact_bytes())
+        .bind(c.manifest().signed_container_hash().as_slice())
+        .bind(c.manifest().exact_bytes_sha256().as_slice())
+        .bind(c.exact_bytes())
+        .bind(c.exact_bytes_sha256().as_slice())
+        .bind(&response)
+        .bind(v.server_instance_id.as_slice())
+        .bind(s.tenant_id.as_slice())
+        .bind(upload_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+        (u, response)
+    };
     tx.commit().await?;
 
     let object: PathBuf = fleet::object_path(
@@ -840,14 +972,10 @@ pub async fn finalize_upload(
     );
     let staging = PathBuf::from(&u.staging_path);
     // The writer goes with the blocking task and is held to the READY write.
-    let (outcome, u, _w) =
-        tokio::task::spawn_blocking(move || (promote(&staging, &object, &u), u, w))
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    let refused = match outcome {
-        Err(e) => return Err(AppError::Internal(e.to_string())),
-        Ok(refused) => refused,
-    };
+    let (outcome, _w) = tokio::task::spawn_blocking(move || (promote(&staging, &object, &u), w))
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let refused = outcome.map_err(|e| AppError::Internal(e.to_string()))?;
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     if let Err(code) = refused {
         quarantine(&mut tx, v, &s, &upload_id).await?;
@@ -858,54 +986,10 @@ pub async fn finalize_upload(
             "the uploaded object does not match its terms",
         ));
     }
-
-    let now = now_ms();
-    let payload = UploadFinalizedV2 {
-        upload_id,
-        snapshot_id: u.snapshot_id,
-        manifest_replay_id: u.manifest_replay_id,
-        ciphertext_size: u.size,
-        ciphertext_sha256: u.sha256,
-        object_receipt_id: random::<16>()?,
-        server_instance_id: v.server_instance_id,
-        restore_epoch: v.restore_epoch,
-    }
-    .encode();
-    let response = finish(
-        &mut tx,
-        v,
-        &s,
-        &outer,
-        &body,
-        RECORD_TYPE_UPLOAD_FINALIZED,
-        payload,
-        now,
-        "profile.finalize_upload",
-        ("upload", &upload_id),
-    )
-    .await?;
-    let c = request.request();
-    let object = fleet::object_path(
-        FsPath::new(&app.cfg.blob_dir),
-        &s.tenant_id,
-        &u.p.profile_id,
-        &u.snapshot_id,
-    );
     sqlx::query(
-        "UPDATE v2_uploads
-            SET state = 'READY', immutable_path = ?, signed_manifest_container_bytes = ?,
-                signed_manifest_container_hash = ?, signed_manifest_container_bytes_sha256 = ?,
-                exact_commit_request_bytes = ?, exact_commit_request_bytes_sha256 = ?,
-                exact_finalize_response_bytes = ?
-          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
+        "UPDATE v2_uploads SET state = 'READY'
+          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ? AND state = 'FINALIZING'",
     )
-    .bind(object.to_string_lossy().to_string())
-    .bind(c.manifest().exact_bytes())
-    .bind(c.manifest().signed_container_hash().as_slice())
-    .bind(c.manifest().exact_bytes_sha256().as_slice())
-    .bind(c.exact_bytes())
-    .bind(c.exact_bytes_sha256().as_slice())
-    .bind(&response)
     .bind(v.server_instance_id.as_slice())
     .bind(s.tenant_id.as_slice())
     .bind(upload_id.as_slice())
@@ -994,6 +1078,14 @@ pub async fn commit_upload(
         .await?
         .filter(|u| u.expires_at_ms > now)
         .ok_or_else(not_found)?;
+    if u.state == "QUARANTINED" {
+        return Err(quarantined());
+    }
+    // L1174: only READY commits; FINALIZING already holds the request bytes
+    // and ABORTED keeps them.
+    if u.state != "READY" {
+        return Err(offset_mismatch());
+    }
     // L1174: byte-identical to the request finalize bound to this upload.
     if u.commit_request.as_deref() != Some(&body[..]) {
         return Err(replay_mismatch("exact_commit_request_bytes"));
@@ -1203,6 +1295,19 @@ async fn committed(
     .await?
     {
         return Err(AppError::Forbidden);
+    }
+    // L1209-L1211: a COMMITTED upload the reconciler quarantined is not served.
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_upload_quarantine
+                         WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(row.get::<Vec<u8>, _>("upload_id"))
+    .fetch_one(&mut *conn)
+    .await?;
+    if held {
+        return Err(quarantined());
     }
     Ok(Committed {
         path: row.get("immutable_blob_path"),
