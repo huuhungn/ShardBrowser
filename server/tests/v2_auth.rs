@@ -6553,11 +6553,38 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
         (409, "ROOT_GENERATION_MISMATCH")
     );
 
-    // D-5: a retained fleet generation keeps the next rotation from
-    // activating, since it has no recovery grant under the new root.
+    // D-5: a fleet generation in any state has no recovery grant under the
+    // new root, so it keeps a rotation from being created or activated.
     let trk2 = [0x7f; 32];
     let grant2 = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe9, &trk2, 2, after1);
     let target2 = rotation_target(&trk2, 2, &[grant2.as_slice()]);
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let fleet_generation = "INSERT INTO v2_fleet_key_generations
+         (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+          root_generation, state, created_at)
+     VALUES (?, ?, ?, 0, ?, 1, 'PREPARING', 'now')";
+    server
+        .sql(fleet_generation, &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]])
+        .await;
+    let early = rotation_create(0xe6, target2.clone(), gen1);
+    let (status, body) = server.root(&TENANT, &access, &early).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    // Behind the trigger's back, so the same tenant can go on.
+    server
+        .sql("DROP TRIGGER v2_fleet_key_generations_no_delete", &[])
+        .await;
+    server
+        .sql("DELETE FROM v2_fleet_key_generations", &[])
+        .await;
     let create2 = rotation_create(0xe2, target2.clone(), gen1);
     assert_eq!(server.root(&TENANT, &access, &create2).await.0, 201);
     let request = root_grant_create_request(0xe3, &a, &grant2);
@@ -6576,21 +6603,9 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
             .0,
         201
     );
+    // A fleet generation still PREPARING after the create blocks it too.
     server
-        .sql(
-            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
-             VALUES (?, ?, 'f', 'active', 'now')",
-            &[&FLEET, &TENANT],
-        )
-        .await;
-    server
-        .sql(
-            "INSERT INTO v2_fleet_key_generations
-                 (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
-                  root_generation, state, created_at, activated_at)
-             VALUES (?, ?, ?, 0, ?, 1, 'ACTIVE', 'now', 'now')",
-            &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]],
-        )
+        .sql(fleet_generation, &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]])
         .await;
     let request = rotation_activate(0xe5, target2, gen1);
     let (status, body) = server

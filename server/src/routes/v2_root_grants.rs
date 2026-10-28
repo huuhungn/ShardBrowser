@@ -53,6 +53,34 @@ fn not_found() -> AppError {
     )
 }
 
+/// D-5: no FKEK may be left reachable only through a RETIRED root. A fleet
+/// generation in any state holds its key under the ACTIVE root, so its
+/// tenant cannot rotate.
+///
+/// shortcut: a RecoveryGrant under a PREPARING root cannot be filed yet
+/// (v2_fleet), so any fleet generation blocks a rotation; check each one's
+/// acknowledged RecoveryGrant under `N + 1` when the D-5 rewrap lands.
+pub(super) async fn refuse_with_fleet_keys(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+) -> Result<(), AppError> {
+    let held: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleet_key_generations
+                         WHERE server_instance_id = ? AND tenant_id = ?)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    if held {
+        return Err(generation_mismatch(
+            "a fleet generation has no recovery grant under the new root",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn generation_mismatch(msg: &str) -> AppError {
     coded(StatusCode::CONFLICT, "ROOT_GENERATION_MISMATCH", msg)
 }
@@ -539,26 +567,8 @@ pub async fn activate_root_generation(
             "the generation is not the next to activate",
         ));
     }
-    // D-5: no retained FKEK may be left reachable only through a RETIRED root.
-    // shortcut: a RecoveryGrant under a PREPARING root cannot be filed yet
-    // (v2_fleet), so a tenant with any retained fleet generation cannot
-    // rotate; check each one's acknowledged RecoveryGrant under `N + 1` when
-    // the D-5 rewrap lands.
     if activate.previous.is_some() {
-        let retained: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM v2_fleet_key_generations
-                             WHERE server_instance_id = ? AND tenant_id = ?
-                               AND state IN ('ACTIVE', 'RETIRED'))",
-        )
-        .bind(v.server_instance_id.as_slice())
-        .bind(tenant.as_slice())
-        .fetch_one(&mut *tx)
-        .await?;
-        if retained {
-            return Err(generation_mismatch(
-                "a retained fleet generation has no recovery grant under this root",
-            ));
-        }
+        refuse_with_fleet_keys(&mut tx, v, &tenant).await?;
     }
 
     // The acknowledged, unrevoked grants of the generation, each read back,
@@ -604,7 +614,7 @@ pub async fn activate_root_generation(
         .transpose()?;
     if let Some(p) = previous {
         // Retire first: at most one root generation is ACTIVE (0011).
-        sqlx::query(
+        let retired = sqlx::query(
             "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = ?
               WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
         )
@@ -613,9 +623,13 @@ pub async fn activate_root_generation(
         .bind(tenant.as_slice())
         .bind(p)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if retired != 1 {
+            return Err(integrity());
+        }
     }
-    sqlx::query(
+    let activated = sqlx::query(
         "UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = ?
           WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'PREPARING'",
     )
@@ -624,8 +638,9 @@ pub async fn activate_root_generation(
     .bind(tenant.as_slice())
     .bind(int(generation)?)
     .execute(&mut *tx)
-    .await?;
-    sqlx::query(
+    .await?
+    .rows_affected();
+    let moved = sqlx::query(
         "UPDATE v2_tenants SET active_root_generation = ?
           WHERE id = ? AND active_root_generation IS ?",
     )
@@ -633,7 +648,11 @@ pub async fn activate_root_generation(
     .bind(tenant.as_slice())
     .bind(previous)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if (activated, moved) != (1, 1) {
+        return Err(integrity());
+    }
     let activated_at_ms = u64::try_from(now).unwrap_or_default();
     let payload = TenantRootGenerationActivatedV2 {
         target: t.clone(),
