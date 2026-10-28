@@ -147,9 +147,14 @@ async fn ready(c: &reqwest::Client, port: u16) -> String {
 /// Status and reason code of a v2 write and of the identity read.
 async fn v2_state(c: &reqwest::Client, port: u16, token: &str) -> (u16, Value, u16, Value) {
     let write = c
-        .post(format!("http://127.0.0.1:{port}/v2/fleet-key-generations"))
+        .post(format!("http://127.0.0.1:{port}/v2/operations"))
         .bearer_auth(token)
-        .json(&json!({ "tenant_id": "00", "fleet_id": "00", "fkek_key_id": "00" }))
+        .json(&json!({
+            "tenant_id": "00",
+            "idempotency_key": "00",
+            "operation_kind": "x",
+            "payload_hex": "",
+        }))
         .send()
         .await
         .unwrap();
@@ -511,9 +516,8 @@ async fn without_an_identity_directory_v2_writes_are_refused_and_v1_works() {
         "/v2/devices/00000000000000000000000000000000/approve",
         "/v2/capability-grants",
         "/v2/tenants/00000000000000000000000000000000/root-key-generations",
-        "/v2/fleet-key-grants",
-        "/v2/fleet-key-generations",
-        "/v2/fleet-key-generations/activate",
+        "/v2/fleets/00000000000000000000000000000000/key-generations",
+        "/v2/fleets/00000000000000000000000000000000/key-generations/0/activate",
         "/v2/operations",
         "/v2/operations/complete",
         "/v2/fleet/leases",
