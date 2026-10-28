@@ -36,6 +36,7 @@ pub const DOMAIN_FLEET_KEY_GRANT_ROTATION: &str = "shardx.keys.fleet-key-grant.r
 pub const DOMAIN_FLEET_RECOVERY_WRAP_CONTEXT: &str =
     "shardx.keys.fleet-key-grant.recovery.wrap-context.v2";
 pub const DOMAIN_TENANT_ROOT_KEY_GRANT: &str = "shardx.keys.tenant-root-key-grant.v2";
+pub const DOMAIN_DEVICE_REVOCATION: &str = "shardx.authz.device-revocation.v2";
 /// Domain of the closed HPKE `info` map of a `DeviceHpkeGrant` (ADR 0002 D-8).
 pub const DOMAIN_FLEET_KEY_GRANT_HPKE_INFO: &str =
     "shardx.keys.fleet-key-grant.device-hpke.hpke-info.v2";
@@ -275,6 +276,7 @@ pub enum Payload {
     RecoveryGrant(RecoveryGrantV2),
     RotationGrant(RotationGrantV2),
     TenantRootKeyGrant(TenantRootKeyGrantV2),
+    DeviceRevocation(DeviceRevocationV2),
 }
 
 impl Payload {
@@ -295,6 +297,9 @@ impl Payload {
             }
             DOMAIN_TENANT_ROOT_KEY_GRANT => {
                 TenantRootKeyGrantV2::parse(bytes).map(Self::TenantRootKeyGrant)
+            }
+            DOMAIN_DEVICE_REVOCATION => {
+                DeviceRevocationV2::parse(bytes).map(Self::DeviceRevocation)
             }
             other => Err(RecordError::UnknownPayloadDomain(other.to_string())),
         }
@@ -672,6 +677,83 @@ impl DeviceApprovalV2 {
             ),
             ("approval_scope_id", c::b(&self.approval_scope_id)),
             ("approved_use", c::t(APPROVED_USE_TEAM_DEVICE)),
+        ]);
+        c::encode(&c::m(out))
+    }
+}
+
+// ---------------------------------------------------- DeviceRevocationV2 ---
+
+/// ADR 0002 Q-13 `reason_code` of a device revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceRevocationReason {
+    Lost,
+    Compromised,
+    Retired,
+    Rekeyed,
+}
+
+impl DeviceRevocationReason {
+    pub const ALL: [Self; 4] = [Self::Lost, Self::Compromised, Self::Retired, Self::Rekeyed];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lost => "lost",
+            Self::Compromised => "compromised",
+            Self::Retired => "retired",
+            Self::Rekeyed => "rekeyed",
+        }
+    }
+}
+
+/// ADR 0002 Q-13 `DeviceRevocationV2`: a custodian's signed statement that a
+/// device, under exactly these keys, is revoked. Permanent once filed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRevocationV2 {
+    pub common: CommonFields,
+    pub subject_account_id: [u8; 16],
+    pub subject_device_id: [u8; 16],
+    pub subject_signing_key_id: [u8; 32],
+    pub subject_hpke_key_id: [u8; 32],
+    pub reason_code: DeviceRevocationReason,
+}
+
+impl DeviceRevocationV2 {
+    fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("DeviceRevocationV2", payload)?;
+        let common = CommonFields::take(&mut f, DOMAIN_DEVICE_REVOCATION)?;
+        let subject_account_id = f.fixed("subject_account_id")?;
+        let subject_device_id = f.fixed("subject_device_id")?;
+        let subject_signing_key_id = f.fixed("subject_signing_key_id")?;
+        let subject_hpke_key_id = f.fixed("subject_hpke_key_id")?;
+        let reason = f.text("reason_code")?;
+        let reason_code = DeviceRevocationReason::ALL
+            .into_iter()
+            .find(|r| r.as_str() == reason)
+            .ok_or(RecordError::BadValue("reason_code"))?;
+        f.finish()?;
+        if subject_signing_key_id == subject_hpke_key_id {
+            return Err(RecordError::BadValue("subject_hpke_key_id"));
+        }
+        Ok(Self {
+            common,
+            subject_account_id,
+            subject_device_id,
+            subject_signing_key_id,
+            subject_hpke_key_id,
+            reason_code,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.common.put(DOMAIN_DEVICE_REVOCATION, &mut out);
+        out.extend([
+            ("subject_account_id", c::b(&self.subject_account_id)),
+            ("subject_device_id", c::b(&self.subject_device_id)),
+            ("subject_signing_key_id", c::b(&self.subject_signing_key_id)),
+            ("subject_hpke_key_id", c::b(&self.subject_hpke_key_id)),
+            ("reason_code", c::t(self.reason_code.as_str())),
         ]);
         c::encode(&c::m(out))
     }
@@ -1652,6 +1734,17 @@ mod tests {
         }
     }
 
+    fn device_revocation() -> DeviceRevocationV2 {
+        DeviceRevocationV2 {
+            common: common(),
+            subject_account_id: fx("account-a"),
+            subject_device_id: fx("device-a"),
+            subject_signing_key_id: fx("device-a-signing"),
+            subject_hpke_key_id: fx("device-a-hpke"),
+            reason_code: DeviceRevocationReason::Compromised,
+        }
+    }
+
     fn device_grant(
         capability: Capability,
         scope_kind: CapabilityScopeKind,
@@ -1786,6 +1879,48 @@ mod tests {
         assert_eq!(verified.record().exact_signed_container_bytes(), exact);
     }
 
+    /// Q-13: a revocation parses back under its own domain, names one of the
+    /// four reasons, and never names one key for both uses.
+    #[test]
+    fn a_device_revocation_roundtrips_and_refuses_bad_fields() {
+        let sk = issuer();
+        let r = device_revocation();
+        let exact = build_record(&sk, DOMAIN_DEVICE_REVOCATION, &r.encode());
+        let verified = AuthorizationRecord::parse(&exact)
+            .unwrap()
+            .verify_signature(sk.verifying_key().as_bytes())
+            .unwrap();
+        assert_eq!(verified.payload(), &Payload::DeviceRevocation(r.clone()));
+        for reason in DeviceRevocationReason::ALL {
+            let mut other = r.clone();
+            other.reason_code = reason;
+            assert_eq!(DeviceRevocationV2::parse(&other.encode()), Ok(other));
+        }
+        let edit = |field: &str, value: Value| {
+            let Value::Map(mut m) = c::decode(&r.encode()).unwrap() else {
+                unreachable!()
+            };
+            m.iter_mut().find(|(k, _)| k == field).unwrap().1 = value;
+            c::encode(&Value::Map(m))
+        };
+        for (field, value) in [
+            ("reason_code", c::t("stolen")),
+            ("subject_hpke_key_id", c::b(&fx::<32>("device-a-signing"))),
+        ] {
+            assert!(
+                DeviceRevocationV2::parse(&edit(field, value)).is_err(),
+                "{field}"
+            );
+        }
+        // Another domain's payload is not a revocation.
+        assert!(AuthorizationRecord::parse(&build_record(
+            &sk,
+            DOMAIN_DEVICE_APPROVAL,
+            &r.encode()
+        ))
+        .is_err());
+    }
+
     /// Regression vectors pinned at this commit, so any change to a field set,
     /// a payload encoding or the container assembly shows up as a diff.
     #[test]
@@ -1832,6 +1967,12 @@ mod tests {
                 root_grant(rotation(4), 5).encode(),
                 "80ecf31281d0a761e65920d5f149169ff9e53ac246f28903648d30dc88629525",
                 "2ebf1f30cad074f2b343e4f3cd2850434a26f8d7a73b9ca442658c0d42a3768d",
+            ),
+            (
+                DOMAIN_DEVICE_REVOCATION,
+                device_revocation().encode(),
+                "e9b8ac22c4f31b1c5f09c11db34d88f06f04ed43b3375da3de73ed5532335e22",
+                "82920a2efb4124c1444f19bff7011b872fe9c71bdd4d4addd6fc197ee50fa051",
             ),
         ];
         for (domain, payload, container_hash, exact_sha) in cases {

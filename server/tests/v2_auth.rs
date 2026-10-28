@@ -5653,3 +5653,276 @@ async fn only_the_creator_files_its_own_grant_before_holding_the_generation() {
         403
     );
 }
+
+// ----------------------------------------------------------- DEVICE_REVOKE ---
+
+fn revocation(issuer: &Ed25519SigningKey, subject: &Device, replay: u8, days: u64) -> Vec<u8> {
+    use shared::authz_record::{
+        DeviceRevocationReason, DeviceRevocationV2, DOMAIN_DEVICE_REVOCATION,
+    };
+    let start = now_ms() - 60_000;
+    let r = DeviceRevocationV2 {
+        common: CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + days * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        subject_account_id: OWNER,
+        subject_device_id: subject.id,
+        subject_signing_key_id: subject.signing_key_id,
+        subject_hpke_key_id: subject.hpke_key_id,
+        reason_code: DeviceRevocationReason::Compromised,
+    };
+    build_record(issuer, DOMAIN_DEVICE_REVOCATION, &r.encode())
+}
+
+fn revoke_request(key: u8, container: &[u8]) -> Vec<u8> {
+    let request = shared::mutation::DeviceRevokeRequestV2 {
+        signed_container_hash: container_hash(container),
+        exact_signed_revocation_container_bytes: container.to_vec(),
+    };
+    lifecycle_request(OperationKind::DeviceRevoke, key, request.encode())
+}
+
+fn device_revoke_path(device: &[u8; 16]) -> String {
+    format!("/v2/devices/{}/revoke", hex(device))
+}
+
+/// Q-13: a custodian holding `device.revoke` files a signed revocation; the
+/// device's sessions end, its approvals and grants are revoked, and it can
+/// never open a session again.
+#[tokio::test]
+async fn a_revoked_device_cannot_sign_in_again() {
+    use shared::mutation::DeviceRevokedV2;
+
+    let mut server = start("q13-revoke", 28218).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    // A pending device can open a session; an approved one is revoked too.
+    let pending = device(&server, OWNER, 0x7b, "pending").await;
+    let pending_access = session(&server, &pending).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let approved = device(&server, OWNER, 0x7d, "active").await;
+    approve_by_copy(&server, &dev, &approved, 0x7d).await;
+    let path = device_revoke_path(&pending.id);
+    let good = revocation(&dev.sk, &pending, 0x90, 30);
+
+    // Without `device.revoke` nothing is revoked (Q-13 issuer rule).
+    assert_eq!(
+        server
+            .call(&path, &access, Some(&revoke_request(0xa0, &good)))
+            .await
+            .0,
+        403
+    );
+    // A fleet-scoped one covers only devices approved for that fleet alone.
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let fleet_duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa7; 16];
+        g.scope_kind = CapabilityScopeKind::Fleet;
+        g.scope_id = FLEET;
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&fleet_duty)).await.0, 201);
+    let approved_revoke = revocation(&dev.sk, &approved, 0x96, 30);
+    for (p, request) in [
+        (&path, revoke_request(0xa0, &good)),
+        (
+            &device_revoke_path(&approved.id),
+            revoke_request(0xaf, &approved_revoke),
+        ),
+    ] {
+        assert_eq!(server.call(p, &access, Some(&request)).await.0, 403);
+    }
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+
+    // Another key's signature, a window past 30 days, another device on the
+    // path, and other keys for the device are refused.
+    let stranger = Ed25519SigningKey::from_bytes(&[0x99; 32]);
+    let forged = revocation(&stranger, &pending, 0x91, 30);
+    let (status, body) = server
+        .call(&path, &access, Some(&revoke_request(0xa1, &forged)))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "KEY_SUBSTITUTION_DETECTED")
+    );
+    let long = revocation(&dev.sk, &pending, 0x92, 31);
+    assert_eq!(
+        server
+            .call(&path, &access, Some(&revoke_request(0xa2, &long)))
+            .await
+            .0,
+        403
+    );
+    let other_path = device_revoke_path(&approved.id);
+    assert_eq!(
+        server
+            .call(&other_path, &access, Some(&revoke_request(0xa3, &good)))
+            .await
+            .0,
+        422
+    );
+    let mut rekeyed = device(&server, OWNER, 0x7e, "pending").await;
+    rekeyed.id = pending.id;
+    let wrong_keys = revocation(&dev.sk, &rekeyed, 0x93, 30);
+    assert_eq!(
+        server
+            .call(&path, &access, Some(&revoke_request(0xa4, &wrong_keys)))
+            .await
+            .0,
+        422
+    );
+    // The last custodian cannot revoke itself (C-1: someone must rotate).
+    let own = revocation(&dev.sk, &dev, 0x94, 30);
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&dev.id),
+            &access,
+            Some(&revoke_request(0xa5, &own)),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "LAST_ROOT_CUSTODIAN")
+    );
+
+    let request = revoke_request(0xa6, &good);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let stored = IdempotentStoredResponseV2::parse(&body).unwrap();
+    let revoked = DeviceRevokedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (revoked.subject_device_id, revoked.replay_id),
+        (pending.id, [0x90; 16])
+    );
+    assert_eq!(revoked.sessions_invalidated_count, 1);
+    assert_eq!(
+        server.call(&path, &access, Some(&request)).await,
+        (201, body)
+    );
+
+    // The device's session is gone and it cannot open another.
+    assert_eq!(
+        server.call(&path, &pending_access, Some(&request)).await.0,
+        401
+    );
+    let ticket = server.login("owner").await;
+    assert_eq!(challenge(&server, &ticket, &pending).await.0, 409);
+    // A spent replay ID is refused; a fresh revocation is filed again.
+    let (status, body) = server
+        .call(&path, &access, Some(&revoke_request(0xa7, &good)))
+        .await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "REPLAY_DETECTED"));
+    let again = revocation(&dev.sk, &pending, 0x95, 30);
+    assert_eq!(
+        server
+            .call(&path, &access, Some(&revoke_request(0xa8, &again)))
+            .await
+            .0,
+        201
+    );
+
+    // The approved device loses its approval and its grants with it.
+    let root_grant = existing_root_grant(&dev, &approved, 0x7d, 0xc7);
+    assert_eq!(
+        server
+            .call(
+                &root_grants_path(),
+                &access,
+                Some(&root_grant_create_request(0xc8, &dev, &root_grant))
+            )
+            .await
+            .0,
+        201
+    );
+    let approve_duty = capability_grant(&approved, &dev.sk, |g| {
+        g.common.replay_id = [0xaa; 16];
+    });
+    let (status, body) = server.call(GRANTS, &access, Some(&approve_duty)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server
+            .call(
+                &other_path,
+                &access,
+                Some(&revoke_request(0xa9, &approved_revoke))
+            )
+            .await
+            .0,
+        201
+    );
+    for (query, want) in [
+        (
+            format!(
+                "SELECT count(*) FROM v2_devices WHERE status = 'revoked' AND id IN (X'{}', X'{}')",
+                hex(&pending.id),
+                hex(&approved.id)
+            ),
+            2,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM v2_device_approvals
+                  WHERE subject_device_id = X'{}' AND revoked_at IS NULL",
+                hex(&approved.id)
+            ),
+            0,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM v2_tenant_root_key_grants
+                  WHERE subject_device_id = X'{}' AND revoked_at IS NULL",
+                hex(&approved.id)
+            ),
+            0,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM v2_capability_grants
+                  WHERE subject_device_id = X'{}' AND revoked_at IS NULL",
+                hex(&approved.id)
+            ),
+            0,
+        ),
+        ("SELECT count(*) FROM v2_device_revocations".to_string(), 3),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'device.revoke'".to_string(),
+            3,
+        ),
+    ] {
+        assert_eq!(server.count(&query).await, want, "{query}");
+    }
+
+    // A revoked device never becomes usable again, and its revocation stays.
+    let pool = db(&server.data).await;
+    for statement in [
+        format!(
+            "UPDATE v2_devices SET status = 'active' WHERE id = X'{}'",
+            hex(&pending.id)
+        ),
+        "DELETE FROM v2_device_revocations".to_string(),
+        "UPDATE v2_device_revocations SET reason_code = 'lost'".to_string(),
+    ] {
+        assert!(
+            sqlx::query(&statement).execute(&pool).await.is_err(),
+            "{statement}"
+        );
+    }
+    pool.close().await;
+}
