@@ -23,13 +23,15 @@ use chacha20poly1305::XChaCha20Poly1305;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::authz_record::{Fields, RecordError};
 use crate::canonical::{self as c, Value};
 use crate::envelope::{
     build_intent, frame_aad, IntentError, IntentIds, IntentMaterial, IntentNumbers, SlotMaterial,
 };
 use crate::keys::{
-    unwrap_dek, DEK_LEN, ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31 as SUITE_ID,
-    WRAP_NONCE_LEN,
+    unwrap_dek, AEAD_TAG_LEN, ARCHIVE_FORMAT_ID_TAR, ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT,
+    COMPRESSION_ID_GZIP, DEK_LEN, ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31 as SUITE_ID,
+    WRAP_NONCE_LEN, WRAP_SUITE_ID_CHACHA20POLY1305,
 };
 
 pub const MAGIC: [u8; 8] = *b"SHARDXBK";
@@ -59,6 +61,8 @@ pub enum EnvelopeError {
     /// The object, or a part of it, is not what the manifest or the preamble
     /// commits to.
     Mismatch(&'static str),
+    /// The intent, slot or slot context is not its exact closed map.
+    Record(RecordError),
     /// The DEK did not unwrap under the given FKEK.
     KeyUnwrap,
     /// A frame failed authentication.
@@ -71,6 +75,7 @@ impl std::fmt::Display for EnvelopeError {
         match self {
             Self::Malformed(rule) => write!(f, "malformed envelope: {rule}"),
             Self::Mismatch(what) => write!(f, "envelope does not match its binding: {what}"),
+            Self::Record(e) => write!(f, "malformed envelope record: {e}"),
             Self::KeyUnwrap => write!(f, "the DEK did not unwrap"),
             Self::Aead => write!(f, "a frame failed authentication"),
             Self::Io(e) => write!(f, "envelope I/O: {e}"),
@@ -83,6 +88,12 @@ impl std::error::Error for EnvelopeError {}
 impl From<std::io::Error> for EnvelopeError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<RecordError> for EnvelopeError {
+    fn from(e: RecordError) -> Self {
+        Self::Record(e)
     }
 }
 
@@ -189,107 +200,274 @@ pub fn build_intent_v2(
     )
 }
 
-/// The intent fields the object format depends on.
-struct IntentView {
-    frame_plaintext_size: u32,
-    stream_nonce_prefix: [u8; STREAM_NONCE_PREFIX_LEN],
-    max_plaintext_size: u64,
-    max_ciphertext_size: u64,
-    dek_slot_sha256: [u8; 32],
-    dek_slot_context_hash: [u8; 32],
-}
+// ------------------------------------------------------------ closed maps ----
 
-fn field<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
-    match v {
-        Value::Map(entries) => entries.iter().find(|(k, _)| k == name).map(|(_, v)| v),
-        _ => None,
-    }
-}
+/// `wrapped_dek_bytes` under `wrap_suite_id` 1: the DEK and its tag (ADR 0002
+/// registry table: nonce 12, wrapped DEK 48, inside the plan's L628-L629 bounds).
+const WRAPPED_DEK_LEN: usize = DEK_LEN + AEAD_TAG_LEN;
+/// `canonical_dek_slot_context_bytes` is `Bytes(1,4096)` (plan L626).
+const MAX_DEK_SLOT_CONTEXT_LEN: usize = 4096;
 
-fn field_u64(v: &Value, name: &'static str) -> Result<u64, EnvelopeError> {
-    match field(v, name) {
-        Some(Value::Uint(n)) => Ok(*n),
-        _ => Err(EnvelopeError::Malformed(name)),
-    }
-}
-
-fn field_bytes<const N: usize>(v: &Value, name: &'static str) -> Result<[u8; N], EnvelopeError> {
-    match field(v, name) {
-        Some(Value::Bytes(b)) => b
-            .as_slice()
-            .try_into()
-            .map_err(|_| EnvelopeError::Malformed(name)),
-        _ => Err(EnvelopeError::Malformed(name)),
-    }
-}
-
-fn field_is(v: &Value, name: &'static str, want: &Value) -> Result<(), EnvelopeError> {
-    if field(v, name) == Some(want) {
+/// A `U16` with one valid value (`version`, `slot_index`, `preamble_version`).
+fn exact_u16(f: &mut Fields, field: &'static str, want: u16) -> Result<(), RecordError> {
+    if f.u16(field)? == want {
         Ok(())
     } else {
-        Err(EnvelopeError::Malformed(name))
+        Err(RecordError::BadValue(field))
     }
 }
 
-fn read_intent(intent_bytes: &[u8]) -> Result<IntentView, EnvelopeError> {
-    let v = c::assert_canonical_roundtrip(intent_bytes)
-        .map_err(|_| EnvelopeError::Malformed("intent is not canonical"))?;
-    field_is(&v, "domain", &c::t("shardx.envelope.intent.v2"))?;
-    field_is(&v, "version", &c::u(2))?;
-    field_is(&v, "preamble_version", &c::u(2))?;
-    field_is(&v, "envelope_suite_id", &c::u(SUITE_ID as u64))?;
-    field_is(&v, "final_frame_required", &Value::Bool(true))?;
-    let frame = field_u64(&v, "frame_plaintext_size")?;
-    let frame_plaintext_size = u32::try_from(frame)
-        .ok()
-        .filter(|s| frame_size_ok(*s))
-        .ok_or(EnvelopeError::Malformed("frame_plaintext_size"))?;
-    let max_plaintext_size = field_u64(&v, "max_plaintext_size")?;
-    let max_ciphertext_size = field_u64(&v, "max_ciphertext_size")?;
-    for (name, value) in [
-        ("max_plaintext_size", max_plaintext_size),
-        ("max_ciphertext_size", max_ciphertext_size),
+/// A registry ID that G2 pins to one value (ADR 0002 registry table).
+fn registry_id(f: &mut Fields, field: &'static str, pinned: u16) -> Result<(), RecordError> {
+    let id = f.u16(field)?;
+    if id == pinned {
+        Ok(())
+    } else {
+        Err(RecordError::Unsupported {
+            field,
+            id: id.into(),
+        })
+    }
+}
+
+/// `DekSlotContextV2` (plan L601-L617). `domain`, `version`, `wrap_suite_id`
+/// and `slot_index` have one valid value each, so only the IDs are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DekSlotContextV2 {
+    pub snapshot_id: [u8; 16],
+    pub tenant_id: [u8; 16],
+    pub fleet_id: [u8; 16],
+    pub profile_id: [u8; 16],
+    pub fkek_key_id: [u8; 32],
+    pub key_generation: u64,
+    pub envelope_context_nonce: [u8; 16],
+}
+
+impl DekSlotContextV2 {
+    /// Parses exact context bytes: canonical, closed, registry-pinned.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut f = Fields::decode("DekSlotContextV2", bytes)?;
+        f.exact_text("domain", "shardx.envelope.dek-slot-context.v2")?;
+        exact_u16(&mut f, "version", 2)?;
+        let snapshot_id = f.fixed("snapshot_id")?;
+        let tenant_id = f.fixed("tenant_id")?;
+        let fleet_id = f.fixed("fleet_id")?;
+        let profile_id = f.fixed("profile_id")?;
+        let fkek_key_id = f.fixed("fkek_key_id")?;
+        let key_generation = f.uint("key_generation")?;
+        registry_id(&mut f, "wrap_suite_id", WRAP_SUITE_ID_CHACHA20POLY1305)?;
+        exact_u16(&mut f, "slot_index", 0)?;
+        let envelope_context_nonce = f.fixed("envelope_context_nonce")?;
+        f.finish()?;
+        Ok(Self {
+            snapshot_id,
+            tenant_id,
+            fleet_id,
+            profile_id,
+            fkek_key_id,
+            key_generation,
+            envelope_context_nonce,
+        })
+    }
+}
+
+/// `DekSlotV2` (plan L619-L635), the one slot of a v2 envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DekSlotV2 {
+    pub context: DekSlotContextV2,
+    /// The exact context bytes, which are the DEK-wrap AAD (plan L616).
+    pub canonical_dek_slot_context_bytes: Vec<u8>,
+    pub dek_slot_context_hash: [u8; 32],
+    pub wrap_nonce_bytes: [u8; WRAP_NONCE_LEN],
+    pub wrapped_dek_bytes: [u8; WRAPPED_DEK_LEN],
+}
+
+impl DekSlotV2 {
+    /// Plan L631-L632: decode the context as its own closed canonical map,
+    /// then recompute its hash. The outer and inner `slot_index` are both
+    /// pinned to 0, so they are equal without a separate comparison.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut f = Fields::decode("DekSlotV2", bytes)?;
+        f.exact_text("domain", "shardx.envelope.dek-slot.v2")?;
+        exact_u16(&mut f, "version", 2)?;
+        exact_u16(&mut f, "slot_index", 0)?;
+        let context_bytes = f.bytes(
+            "canonical_dek_slot_context_bytes",
+            1,
+            MAX_DEK_SLOT_CONTEXT_LEN,
+        )?;
+        let context = DekSlotContextV2::parse(&context_bytes)?;
+        let dek_slot_context_hash = f.fixed("dek_slot_context_hash")?;
+        if dek_slot_context_hash != c::domain_hash(c::L_DEK_SLOT_CONTEXT, &context_bytes) {
+            return Err(RecordError::BadValue("dek_slot_context_hash"));
+        }
+        // The context pins wrap_suite_id 1, which fixes both lengths.
+        let wrap_nonce_bytes = f.fixed("wrap_nonce_bytes")?;
+        let wrapped_dek_bytes = f.fixed("wrapped_dek_bytes")?;
+        f.finish()?;
+        Ok(Self {
+            context,
+            canonical_dek_slot_context_bytes: context_bytes,
+            dek_slot_context_hash,
+            wrap_nonce_bytes,
+            wrapped_dek_bytes,
+        })
+    }
+}
+
+/// `EnvelopeIntentV2` of a suite 2 object (plan L637-L665).
+///
+/// `domain`, `version`, `preamble_version`, `final_frame_required` and the
+/// five registry IDs have one valid value each and are not kept. A later
+/// manifest check compares these fields one for one, and its `intent_hash`
+/// with [`EnvelopeIntentV2::hash`] of the same exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeIntentV2 {
+    pub snapshot_id: [u8; 16],
+    pub tenant_id: [u8; 16],
+    pub fleet_id: [u8; 16],
+    pub profile_id: [u8; 16],
+    pub lease_id: [u8; 16],
+    pub manifest_replay_id: [u8; 16],
+    pub target_version: u64,
+    pub base_version: u64,
+    pub fencing_token: u64,
+    pub key_generation: u64,
+    pub fkek_key_id: [u8; 32],
+    pub frame_plaintext_size: u32,
+    pub stream_nonce_prefix: [u8; STREAM_NONCE_PREFIX_LEN],
+    pub max_plaintext_size: u64,
+    pub max_ciphertext_size: u64,
+    pub created_at_ms: u64,
+    /// Omitted exactly at genesis, `base_version == 0` (plan L654).
+    pub previous_signed_head_hash: Option<[u8; 32]>,
+    pub intended_signer_signing_key_id: [u8; 32],
+    pub server_instance_id: [u8; 16],
+    pub restore_epoch: u64,
+    pub dek_slot_context_hash: [u8; 32],
+    pub dek_slot_sha256: [u8; 32],
+}
+
+impl EnvelopeIntentV2 {
+    /// Parses exact intent bytes: canonical, closed, bounded, registry-pinned,
+    /// with the version and genesis invariants of plan L645 and L654.
+    pub fn parse(bytes: &[u8]) -> Result<Self, RecordError> {
+        let mut f = Fields::decode("EnvelopeIntentV2", bytes)?;
+        f.exact_text("domain", "shardx.envelope.intent.v2")?;
+        exact_u16(&mut f, "version", 2)?;
+        let snapshot_id = f.fixed("snapshot_id")?;
+        let tenant_id = f.fixed("tenant_id")?;
+        let fleet_id = f.fixed("fleet_id")?;
+        let profile_id = f.fixed("profile_id")?;
+        let lease_id = f.fixed("lease_id")?;
+        let manifest_replay_id = f.fixed("manifest_replay_id")?;
+        let target_version = f.uint("target_version")?;
+        let base_version = f.uint("base_version")?;
+        let fencing_token = f.uint("fencing_token")?;
+        let key_generation = f.uint("key_generation")?;
+        let fkek_key_id = f.fixed("fkek_key_id")?;
+        exact_u16(&mut f, "preamble_version", 2)?;
+        registry_id(&mut f, "envelope_suite_id", SUITE_ID)?;
+        registry_id(&mut f, "wrap_suite_id", WRAP_SUITE_ID_CHACHA20POLY1305)?;
+        registry_id(&mut f, "archive_format_id", ARCHIVE_FORMAT_ID_TAR)?;
+        registry_id(
+            &mut f,
+            "archive_policy_id",
+            ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT,
+        )?;
+        registry_id(&mut f, "compression_id", COMPRESSION_ID_GZIP)?;
+        let frame_plaintext_size = u32::try_from(f.uint("frame_plaintext_size")?)
+            .ok()
+            .filter(|s| frame_size_ok(*s))
+            .ok_or(RecordError::BadValue("frame_plaintext_size"))?;
+        // Suite 2 pins the prefix to 20 bytes inside the plan's Bytes(1,64).
+        let stream_nonce_prefix = f.fixed("stream_nonce_prefix")?;
+        if f.req("final_frame_required")? != Value::Bool(true) {
+            return Err(RecordError::BadValue("final_frame_required"));
+        }
+        let max_plaintext_size = f.uint("max_plaintext_size")?;
+        let max_ciphertext_size = f.uint("max_ciphertext_size")?;
+        for (name, value) in [
+            ("max_plaintext_size", max_plaintext_size),
+            ("max_ciphertext_size", max_ciphertext_size),
+        ] {
+            if !(1..=MAX_OBJECT_SIZE).contains(&value) {
+                return Err(RecordError::BadValue(name));
+            }
+        }
+        let created_at_ms = f.uint("created_at_ms")?;
+        let previous_signed_head_hash = f.opt_fixed("previous_signed_head_hash")?;
+        let intended_signer_signing_key_id = f.fixed("intended_signer_signing_key_id")?;
+        let server_instance_id = f.fixed("server_instance_id")?;
+        let restore_epoch = f.uint("restore_epoch")?;
+        let dek_slot_context_hash = f.fixed("dek_slot_context_hash")?;
+        let dek_slot_sha256 = f.fixed("dek_slot_sha256")?;
+        f.finish()?;
+        // The decoder caps every integer at i64::MAX, so this cannot overflow.
+        if target_version != base_version + 1 {
+            return Err(RecordError::BadValue("target_version"));
+        }
+        if previous_signed_head_hash.is_some() != (base_version != 0) {
+            return Err(RecordError::BadValue("previous_signed_head_hash"));
+        }
+        Ok(Self {
+            snapshot_id,
+            tenant_id,
+            fleet_id,
+            profile_id,
+            lease_id,
+            manifest_replay_id,
+            target_version,
+            base_version,
+            fencing_token,
+            key_generation,
+            fkek_key_id,
+            frame_plaintext_size,
+            stream_nonce_prefix,
+            max_plaintext_size,
+            max_ciphertext_size,
+            created_at_ms,
+            previous_signed_head_hash,
+            intended_signer_signing_key_id,
+            server_instance_id,
+            restore_epoch,
+            dek_slot_context_hash,
+            dek_slot_sha256,
+        })
+    }
+
+    /// `intent_hash` of exact intent bytes (plan L660-L661).
+    pub fn hash(exact_intent_bytes: &[u8]) -> [u8; 32] {
+        c::domain_hash(c::L_ENVELOPE_INTENT, exact_intent_bytes)
+    }
+}
+
+/// The one slot, bound one for one to the intent before any unwrap (plan
+/// L631-L632, L1334-L1335). `wrap_suite_id` is pinned to 1 in both maps, so
+/// it is equal without a comparison.
+fn bind_slot(slot_bytes: &[u8], intent: &EnvelopeIntentV2) -> Result<DekSlotV2, EnvelopeError> {
+    if c::domain_hash(c::L_DEK_SLOT, slot_bytes) != intent.dek_slot_sha256 {
+        return Err(EnvelopeError::Mismatch("dek_slot_sha256"));
+    }
+    let slot = DekSlotV2::parse(slot_bytes)?;
+    let cx = &slot.context;
+    for (field, equal) in [
+        (
+            "dek_slot_context_hash",
+            slot.dek_slot_context_hash == intent.dek_slot_context_hash,
+        ),
+        ("snapshot_id", cx.snapshot_id == intent.snapshot_id),
+        ("tenant_id", cx.tenant_id == intent.tenant_id),
+        ("fleet_id", cx.fleet_id == intent.fleet_id),
+        ("profile_id", cx.profile_id == intent.profile_id),
+        ("fkek_key_id", cx.fkek_key_id == intent.fkek_key_id),
+        ("key_generation", cx.key_generation == intent.key_generation),
     ] {
-        if !(1..=MAX_OBJECT_SIZE).contains(&value) {
-            return Err(EnvelopeError::Malformed(name));
+        if !equal {
+            return Err(EnvelopeError::Mismatch(field));
         }
     }
-    Ok(IntentView {
-        frame_plaintext_size,
-        stream_nonce_prefix: field_bytes(&v, "stream_nonce_prefix")?,
-        max_plaintext_size,
-        max_ciphertext_size,
-        dek_slot_sha256: field_bytes(&v, "dek_slot_sha256")?,
-        dek_slot_context_hash: field_bytes(&v, "dek_slot_context_hash")?,
-    })
-}
-
-/// Check the one DEK slot against the intent, then unwrap its DEK.
-fn unwrap_slot(
-    slot_bytes: &[u8],
-    fkek: &[u8; 32],
-    intent: &IntentView,
-) -> Result<Zeroizing<[u8; DEK_LEN]>, EnvelopeError> {
-    let v = c::assert_canonical_roundtrip(slot_bytes)
-        .map_err(|_| EnvelopeError::Malformed("dek slot is not canonical"))?;
-    field_is(&v, "domain", &c::t("shardx.envelope.dek-slot.v2"))?;
-    field_is(&v, "version", &c::u(2))?;
-    field_is(&v, "slot_index", &c::u(0))?;
-    let context = match field(&v, "canonical_dek_slot_context_bytes") {
-        Some(Value::Bytes(b)) => b.as_slice(),
-        _ => return Err(EnvelopeError::Malformed("canonical_dek_slot_context_bytes")),
-    };
-    let context_hash = c::domain_hash(c::L_DEK_SLOT_CONTEXT, context);
-    let stored: [u8; 32] = field_bytes(&v, "dek_slot_context_hash")?;
-    if stored != context_hash || context_hash != intent.dek_slot_context_hash {
-        return Err(EnvelopeError::Mismatch("dek_slot_context_hash"));
-    }
-    let nonce: [u8; WRAP_NONCE_LEN] = field_bytes(&v, "wrap_nonce_bytes")?;
-    let wrapped = match field(&v, "wrapped_dek_bytes") {
-        Some(Value::Bytes(b)) => b.as_slice(),
-        _ => return Err(EnvelopeError::Malformed("wrapped_dek_bytes")),
-    };
-    unwrap_dek(fkek, &nonce, wrapped, context).map_err(|_| EnvelopeError::KeyUnwrap)
+    Ok(slot)
 }
 
 // ------------------------------------------------------------------- seal ----
@@ -337,12 +515,11 @@ pub fn seal(
     intent: &IntentMaterial,
     slot: &SlotMaterial,
 ) -> Result<ObjectDigest, EnvelopeError> {
-    let view = read_intent(&intent.exact_intent_bytes)?;
-    if view.dek_slot_sha256 != slot.dek_slot_sha256
-        || view.dek_slot_context_hash != slot.context_hash
-    {
-        return Err(EnvelopeError::Mismatch("dek_slot_sha256"));
+    if EnvelopeIntentV2::hash(&intent.exact_intent_bytes) != intent.intent_hash {
+        return Err(EnvelopeError::Mismatch("intent_hash"));
     }
+    let view = EnvelopeIntentV2::parse(&intent.exact_intent_bytes)?;
+    bind_slot(&slot.exact_slot_bytes, &view)?;
     let len_in = |bytes: &[u8], max: u32, name| {
         u32::try_from(bytes.len())
             .ok()
@@ -432,6 +609,50 @@ pub fn seal(
 
 // ------------------------------------------------------------------- open ----
 
+/// The snapshot the manifest and upload name; the intent must name exactly
+/// it before the DEK is unwrapped (plan L1335).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub snapshot_id: [u8; 16],
+    pub tenant_id: [u8; 16],
+    pub fleet_id: [u8; 16],
+    pub profile_id: [u8; 16],
+    pub target_version: u64,
+    pub key_generation: u64,
+}
+
+impl Scope {
+    pub fn of(i: &EnvelopeIntentV2) -> Self {
+        Self {
+            snapshot_id: i.snapshot_id,
+            tenant_id: i.tenant_id,
+            fleet_id: i.fleet_id,
+            profile_id: i.profile_id,
+            target_version: i.target_version,
+            key_generation: i.key_generation,
+        }
+    }
+
+    fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        [
+            ("snapshot_id", self.snapshot_id == other.snapshot_id),
+            ("tenant_id", self.tenant_id == other.tenant_id),
+            ("fleet_id", self.fleet_id == other.fleet_id),
+            ("profile_id", self.profile_id == other.profile_id),
+            (
+                "target_version",
+                self.target_version == other.target_version,
+            ),
+            (
+                "key_generation",
+                self.key_generation == other.key_generation,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(field, equal)| (!equal).then_some(field))
+    }
+}
+
 /// What the verified `SignedSnapshotManifestV2` says the object must be.
 pub struct Expected<'a> {
     pub ciphertext_sha256: &'a [u8; 32],
@@ -439,6 +660,7 @@ pub struct Expected<'a> {
     pub preamble_sha256: &'a [u8; 32],
     pub intent_hash: &'a [u8; 32],
     pub dek_slot_sha256: &'a [u8; 32],
+    pub scope: &'a Scope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,14 +725,17 @@ pub fn open<R: Read + Seek>(
         return Err(EnvelopeError::Mismatch("preamble_sha256"));
     }
     let intent_bytes = read_vec(object, pre.intent_len as usize, "intent")?;
-    let intent_hash = c::domain_hash(c::L_ENVELOPE_INTENT, &intent_bytes);
+    let intent_hash = EnvelopeIntentV2::hash(&intent_bytes);
     if intent_hash != pre.intent_sha256 {
         return Err(EnvelopeError::Mismatch("intent_sha256"));
     }
     if intent_hash != *expected.intent_hash {
         return Err(EnvelopeError::Mismatch("intent_hash"));
     }
-    let view = read_intent(&intent_bytes)?;
+    let view = EnvelopeIntentV2::parse(&intent_bytes)?;
+    if let Some(field) = Scope::of(&view).first_difference(expected.scope) {
+        return Err(EnvelopeError::Mismatch(field));
+    }
     if view.frame_plaintext_size != pre.frame_plaintext_size {
         return Err(EnvelopeError::Mismatch("frame_plaintext_size"));
     }
@@ -520,11 +745,17 @@ pub fn open<R: Read + Seek>(
         ));
     }
     let slot_bytes = read_vec(object, pre.dek_slot_len as usize, "dek slot")?;
-    let slot_hash = c::domain_hash(c::L_DEK_SLOT, &slot_bytes);
-    if slot_hash != view.dek_slot_sha256 || slot_hash != *expected.dek_slot_sha256 {
+    if c::domain_hash(c::L_DEK_SLOT, &slot_bytes) != *expected.dek_slot_sha256 {
         return Err(EnvelopeError::Mismatch("dek_slot_sha256"));
     }
-    let dek = unwrap_slot(&slot_bytes, fkek, &view)?;
+    let slot = bind_slot(&slot_bytes, &view)?;
+    let dek = unwrap_dek(
+        fkek,
+        &slot.wrap_nonce_bytes,
+        &slot.wrapped_dek_bytes,
+        &slot.canonical_dek_slot_context_bytes,
+    )
+    .map_err(|_| EnvelopeError::KeyUnwrap)?;
 
     let size = pre.frame_plaintext_size as usize;
     let max_frames = view.max_plaintext_size.div_ceil(size as u64);
@@ -707,6 +938,15 @@ mod tests {
         pre: [u8; 32],
         intent: [u8; 32],
         slot: [u8; 32],
+        scope: Scope,
+    }
+
+    /// The scope `intent` names, or none when it does not parse (the parse
+    /// refusal then fires first).
+    fn scope_of(intent: &[u8]) -> Scope {
+        EnvelopeIntentV2::parse(intent)
+            .map(|i| Scope::of(&i))
+            .unwrap_or_default()
     }
 
     fn exp_for(f: &Fixture, object: &[u8]) -> Exp {
@@ -716,6 +956,7 @@ mod tests {
             pre: preamble_sha256(object[..PREAMBLE_LEN].try_into().unwrap()),
             intent: f.intent.intent_hash,
             slot: f.slot.dek_slot_sha256,
+            scope: scope_of(&f.intent.exact_intent_bytes),
         }
     }
 
@@ -735,6 +976,7 @@ mod tests {
                 preamble_sha256: &e.pre,
                 intent_hash: &e.intent,
                 dek_slot_sha256: &e.slot,
+                scope: &e.scope,
             },
         );
         (result, out)
@@ -1249,6 +1491,60 @@ mod tests {
             rule_of(open_with(&good, &FKEK, &too_big).0),
             "malformed object exceeds the size cap"
         );
+        // The intent must name exactly the snapshot the manifest names.
+        let named = exp_for(&f, &good).scope;
+        for (field, scope) in [
+            (
+                "snapshot_id",
+                Scope {
+                    snapshot_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "tenant_id",
+                Scope {
+                    tenant_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "fleet_id",
+                Scope {
+                    fleet_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "profile_id",
+                Scope {
+                    profile_id: [0xee; 16],
+                    ..named
+                },
+            ),
+            (
+                "target_version",
+                Scope {
+                    target_version: named.target_version + 1,
+                    ..named
+                },
+            ),
+            (
+                "key_generation",
+                Scope {
+                    key_generation: named.key_generation + 1,
+                    ..named
+                },
+            ),
+        ] {
+            let e = Exp {
+                scope,
+                ..exp_for(&f, &good)
+            };
+            let (result, out) = open_with(&good, &FKEK, &e);
+            assert_eq!(rule_of(result), format!("mismatch {field}"));
+            assert!(out.is_empty());
+        }
     }
 
     #[test]
@@ -1312,6 +1608,20 @@ mod tests {
             Err(EnvelopeError::Malformed("plaintext is empty"))
         ));
 
+        // An intent whose hash is stale would seal an object nobody can open.
+        let stale = IntentMaterial {
+            exact_intent_bytes: f.intent.exact_intent_bytes.clone(),
+            intent_hash: [0x5a; 32],
+        };
+        let r = seal(
+            &mut Cursor::new(plaintext(10)),
+            &mut Vec::new(),
+            &DEK,
+            &stale,
+            &f.slot,
+        );
+        assert!(matches!(r, Err(EnvelopeError::Mismatch("intent_hash"))));
+
         // A suite 1 intent (the shipped body) never goes into a SHARDXBK object.
         let legacy = build_envelope_intent(
             &ids(),
@@ -1330,7 +1640,10 @@ mod tests {
         );
         assert!(matches!(
             r,
-            Err(EnvelopeError::Malformed("envelope_suite_id"))
+            Err(EnvelopeError::Record(RecordError::Unsupported {
+                field: "envelope_suite_id",
+                id: 1
+            }))
         ));
 
         // Over the intent's plaintext cap.
@@ -1373,5 +1686,622 @@ mod tests {
             &other,
         );
         assert!(matches!(r, Err(EnvelopeError::Mismatch("dek_slot_sha256"))));
+    }
+
+    // ---------------------------------------------------- closed maps ----
+
+    /// `bytes` decoded, edited as a map and re-encoded canonically.
+    fn edit(bytes: &[u8], change: impl FnOnce(&mut Vec<(String, Value)>)) -> Vec<u8> {
+        let Value::Map(mut entries) = c::decode(bytes).unwrap() else {
+            panic!("not a map")
+        };
+        change(&mut entries);
+        c::encode(&Value::Map(entries))
+    }
+
+    fn set(bytes: &[u8], name: &str, value: Value) -> Vec<u8> {
+        edit(bytes, |e| {
+            e.iter_mut().find(|(k, _)| k == name).expect("field").1 = value;
+        })
+    }
+
+    fn versioned_intent(slot: &SlotMaterial) -> IntentMaterial {
+        let mut n = nums(FRAME, MAX_OBJECT_SIZE);
+        n.base_version = 4;
+        n.target_version = 5;
+        build_intent_v2(&ids(), &n, &PREFIX, Some(&[0x55; 32]), slot).unwrap()
+    }
+
+    /// Every field missing in turn, an unknown and a duplicate field, and an
+    /// overlong `version`: the rules every closed canonical map shares.
+    fn closed_map_rules<T: std::fmt::Debug>(
+        map: &'static str,
+        good: &[u8],
+        parse: fn(&[u8]) -> Result<T, RecordError>,
+    ) {
+        parse(good).unwrap();
+        let Value::Map(entries) = c::decode(good).unwrap() else {
+            panic!("not a map")
+        };
+        for (name, _) in &entries {
+            let r = parse(&edit(good, |e| e.retain(|(k, _)| k != name)));
+            assert!(
+                matches!(&r, Err(RecordError::MissingField { map: m, field }) if *m == map && field == name),
+                "{map} without {name}: {r:?}"
+            );
+        }
+        let extra = edit(good, |e| e.push(("extra".into(), c::u(0))));
+        assert_eq!(
+            parse(&extra).err(),
+            Some(RecordError::UnknownField {
+                map,
+                field: "extra".into()
+            })
+        );
+        // The encoder merges equal keys, so the repeat is spliced in by hand.
+        let count = |n: usize| -> Vec<u8> {
+            if n < 24 {
+                vec![0xa0 | n as u8]
+            } else {
+                vec![0xb8, n as u8]
+            }
+        };
+        let (k, v) = &entries[0];
+        let mut twice = count(entries.len() + 1);
+        twice.extend(c::encode(&c::t(k)));
+        twice.extend(c::encode(v));
+        twice.extend_from_slice(&good[count(entries.len()).len()..]);
+        assert_eq!(
+            parse(&twice).err(),
+            Some(RecordError::Cbor(c::CborError::DuplicateKey(
+                entries[0].0.clone()
+            )))
+        );
+        let key: Vec<u8> = [&[0x67u8][..], b"version", &[0x02]].concat();
+        let at = good
+            .windows(key.len())
+            .position(|w| w == key)
+            .expect("version");
+        let mut overlong = good[..at + 8].to_vec();
+        overlong.extend_from_slice(&[0x18, 0x02]);
+        overlong.extend_from_slice(&good[at + 9..]);
+        assert_eq!(
+            parse(&overlong).err(),
+            Some(RecordError::Cbor(c::CborError::OverlongInteger))
+        );
+    }
+
+    fn bad_field(map: &'static str, field: &'static str) -> Option<RecordError> {
+        Some(RecordError::BadField { map, field })
+    }
+
+    fn unsupported(field: &'static str, id: u64) -> Option<RecordError> {
+        Some(RecordError::Unsupported { field, id })
+    }
+
+    #[test]
+    fn the_closed_maps_parse_what_the_builders_write() {
+        let f = fixture();
+        let cx = DekSlotContextV2::parse(&f.slot.context_bytes).unwrap();
+        assert_eq!(
+            cx,
+            DekSlotContextV2 {
+                snapshot_id: [4; 16],
+                tenant_id: [1; 16],
+                fleet_id: [2; 16],
+                profile_id: [3; 16],
+                fkek_key_id: [5; 32],
+                key_generation: 1,
+                envelope_context_nonce: [6; 16],
+            }
+        );
+        let s = DekSlotV2::parse(&f.slot.exact_slot_bytes).unwrap();
+        assert_eq!(s.context, cx);
+        assert_eq!(s.canonical_dek_slot_context_bytes, f.slot.context_bytes);
+        assert_eq!(s.dek_slot_context_hash, f.slot.context_hash);
+        assert_eq!(s.wrap_nonce_bytes, [0x33; WRAP_NONCE_LEN]);
+        let dek = unwrap_dek(
+            &FKEK,
+            &s.wrap_nonce_bytes,
+            &s.wrapped_dek_bytes,
+            &s.canonical_dek_slot_context_bytes,
+        )
+        .unwrap();
+        assert_eq!(*dek, DEK);
+
+        let i = EnvelopeIntentV2::parse(&f.intent.exact_intent_bytes).unwrap();
+        assert_eq!(
+            i,
+            EnvelopeIntentV2 {
+                snapshot_id: [4; 16],
+                tenant_id: [1; 16],
+                fleet_id: [2; 16],
+                profile_id: [3; 16],
+                lease_id: [7; 16],
+                manifest_replay_id: [8; 16],
+                target_version: 1,
+                base_version: 0,
+                fencing_token: 1,
+                key_generation: 1,
+                fkek_key_id: [5; 32],
+                frame_plaintext_size: FRAME,
+                stream_nonce_prefix: PREFIX,
+                max_plaintext_size: MAX_OBJECT_SIZE,
+                max_ciphertext_size: MAX_OBJECT_SIZE,
+                created_at_ms: 1_767_225_600_000,
+                previous_signed_head_hash: None,
+                intended_signer_signing_key_id: [10; 32],
+                server_instance_id: [9; 16],
+                restore_epoch: 0,
+                dek_slot_context_hash: f.slot.context_hash,
+                dek_slot_sha256: f.slot.dek_slot_sha256,
+            }
+        );
+        assert_eq!(
+            EnvelopeIntentV2::hash(&f.intent.exact_intent_bytes),
+            f.intent.intent_hash
+        );
+        let v = EnvelopeIntentV2::parse(&versioned_intent(&f.slot).exact_intent_bytes).unwrap();
+        assert_eq!(
+            (
+                v.base_version,
+                v.target_version,
+                v.previous_signed_head_hash
+            ),
+            (4, 5, Some([0x55; 32]))
+        );
+    }
+
+    #[test]
+    fn every_dek_slot_context_rule_is_enforced() {
+        const M: &str = "DekSlotContextV2";
+        let good = slot().context_bytes;
+        closed_map_rules(M, &good, DekSlotContextV2::parse);
+        let p = |b: Vec<u8>| DekSlotContextV2::parse(&b).err();
+        assert_eq!(
+            p(set(&good, "domain", c::t("shardx.envelope.dek-slot.v2"))),
+            Some(RecordError::BadValue("domain"))
+        );
+        assert_eq!(p(set(&good, "domain", c::u(0))), bad_field(M, "domain"));
+        assert_eq!(
+            p(set(&good, "version", c::u(3))),
+            Some(RecordError::BadValue("version"))
+        );
+        assert_eq!(
+            p(set(&good, "version", c::u(65_538))),
+            bad_field(M, "version")
+        );
+        assert_eq!(
+            p(set(&good, "slot_index", c::u(1))),
+            Some(RecordError::BadValue("slot_index"))
+        );
+        assert_eq!(
+            p(set(&good, "wrap_suite_id", c::u(2))),
+            unsupported("wrap_suite_id", 2)
+        );
+        for (name, len) in [
+            ("snapshot_id", 16),
+            ("tenant_id", 16),
+            ("fleet_id", 16),
+            ("profile_id", 16),
+            ("fkek_key_id", 32),
+            ("envelope_context_nonce", 16),
+        ] {
+            for wrong in [len - 1, len + 1] {
+                assert_eq!(
+                    p(set(&good, name, c::b(&vec![0; wrong]))),
+                    bad_field(M, name)
+                );
+            }
+            assert_eq!(p(set(&good, name, c::u(0))), bad_field(M, name));
+        }
+        assert_eq!(
+            p(set(&good, "key_generation", c::u(1 << 63))),
+            Some(RecordError::Cbor(c::CborError::IntegerOutOfSqliteDomain(
+                1 << 63
+            )))
+        );
+        let top = DekSlotContextV2::parse(&set(&good, "key_generation", c::u(i64::MAX as u64)));
+        assert_eq!(top.unwrap().key_generation, i64::MAX as u64);
+    }
+
+    /// A slot whose stored context hash is recomputed for `context`.
+    fn slot_around(context: &[u8]) -> Vec<u8> {
+        let s = set(
+            &slot().exact_slot_bytes,
+            "canonical_dek_slot_context_bytes",
+            c::b(context),
+        );
+        set(
+            &s,
+            "dek_slot_context_hash",
+            c::b(&c::domain_hash(c::L_DEK_SLOT_CONTEXT, context)),
+        )
+    }
+
+    #[test]
+    fn every_dek_slot_rule_is_enforced() {
+        const M: &str = "DekSlotV2";
+        const CX: &str = "canonical_dek_slot_context_bytes";
+        let good = slot().exact_slot_bytes;
+        closed_map_rules(M, &good, DekSlotV2::parse);
+        let p = |b: Vec<u8>| DekSlotV2::parse(&b).err();
+        assert_eq!(
+            p(set(
+                &good,
+                "domain",
+                c::t("shardx.envelope.dek-slot-context.v2")
+            )),
+            Some(RecordError::BadValue("domain"))
+        );
+        assert_eq!(
+            p(set(&good, "version", c::u(3))),
+            Some(RecordError::BadValue("version"))
+        );
+        assert_eq!(
+            p(set(&good, "slot_index", c::u(1))),
+            Some(RecordError::BadValue("slot_index"))
+        );
+
+        // The context bound, Bytes(1,4096), is checked before decoding it.
+        assert_eq!(p(slot_around(&[])), bad_field(M, CX));
+        assert_eq!(p(slot_around(&[0; 4097])), bad_field(M, CX));
+        assert_eq!(
+            p(slot_around(&[0; 4096])),
+            Some(RecordError::Cbor(c::CborError::TrailingBytes(4095)))
+        );
+        assert_eq!(
+            p(slot_around(&[0])),
+            Some(RecordError::NotAMap("DekSlotContextV2"))
+        );
+        assert_eq!(p(set(&good, CX, c::u(0))), bad_field(M, CX));
+
+        // The context is its own closed canonical map.
+        let cx = slot().context_bytes;
+        let extra = edit(&cx, |e| e.push(("extra".into(), c::u(0))));
+        assert_eq!(
+            p(slot_around(&extra)),
+            Some(RecordError::UnknownField {
+                map: "DekSlotContextV2",
+                field: "extra".into()
+            })
+        );
+        let mut overlong = cx.clone();
+        let at = cx.windows(8).position(|w| w == b"\x67version").unwrap();
+        overlong.splice(at + 8..at + 9, [0x18, 0x02]);
+        assert_eq!(
+            p(slot_around(&overlong)),
+            Some(RecordError::Cbor(c::CborError::OverlongInteger))
+        );
+
+        // The stored context hash is recomputed, not trusted.
+        let mut flipped = slot().context_hash;
+        flipped[0] ^= 1;
+        assert_eq!(
+            p(set(&good, "dek_slot_context_hash", c::b(&flipped))),
+            Some(RecordError::BadValue("dek_slot_context_hash"))
+        );
+        let other_tenant = set(&cx, "tenant_id", c::b(&[0xee; 16]));
+        assert_eq!(
+            p(set(&good, CX, c::b(&other_tenant))),
+            Some(RecordError::BadValue("dek_slot_context_hash"))
+        );
+        assert!(DekSlotV2::parse(&slot_around(&other_tenant)).is_ok());
+
+        // Suite 1 fixes a 12-byte nonce and a 48-byte wrapped DEK.
+        for (name, len) in [
+            ("dek_slot_context_hash", 32),
+            ("wrap_nonce_bytes", WRAP_NONCE_LEN),
+            ("wrapped_dek_bytes", WRAPPED_DEK_LEN),
+        ] {
+            for wrong in [len - 1, len + 1] {
+                assert_eq!(
+                    p(set(&good, name, c::b(&vec![0; wrong]))),
+                    bad_field(M, name)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_envelope_intent_rule_is_enforced() {
+        const M: &str = "EnvelopeIntentV2";
+        let s = slot();
+        let good = fixture().intent.exact_intent_bytes;
+        let versioned = versioned_intent(&s).exact_intent_bytes;
+        closed_map_rules(M, &good, EnvelopeIntentV2::parse);
+        let p = |b: Vec<u8>| EnvelopeIntentV2::parse(&b).err();
+        let bad = |field| Some(RecordError::BadValue(field));
+        let ok = |b: Vec<u8>| EnvelopeIntentV2::parse(&b).unwrap();
+
+        assert_eq!(
+            p(set(&good, "domain", c::t("shardx.envelope.dek-slot.v2"))),
+            bad("domain")
+        );
+        assert_eq!(p(set(&good, "version", c::u(3))), bad("version"));
+        assert_eq!(
+            p(set(&good, "preamble_version", c::u(1))),
+            bad("preamble_version")
+        );
+
+        // Registry values on read (ADR 0002 registry table).
+        for (name, wrong) in [
+            ("envelope_suite_id", 1),
+            ("envelope_suite_id", 3),
+            ("wrap_suite_id", 2),
+            ("archive_format_id", 2),
+            ("archive_policy_id", 2),
+            ("compression_id", 0),
+        ] {
+            assert_eq!(p(set(&good, name, c::u(wrong))), unsupported(name, wrong));
+        }
+        assert_eq!(
+            p(set(&good, "compression_id", c::u(65_537))),
+            bad_field(M, "compression_id")
+        );
+
+        // Bounds (plan L649-L652), both edges.
+        let frame = "frame_plaintext_size";
+        for wrong in [65_535, 4_194_305, (1 << 32) + 65_536] {
+            assert_eq!(p(set(&good, frame, c::u(wrong))), bad(frame));
+        }
+        for edge in [65_536, 4_194_304] {
+            assert_eq!(
+                ok(set(&good, frame, c::u(edge))).frame_plaintext_size as u64,
+                edge
+            );
+        }
+        for name in ["max_plaintext_size", "max_ciphertext_size"] {
+            for wrong in [0, MAX_OBJECT_SIZE + 1] {
+                assert_eq!(p(set(&good, name, c::u(wrong))), bad(name));
+            }
+            for edge in [1, MAX_OBJECT_SIZE] {
+                assert!(EnvelopeIntentV2::parse(&set(&good, name, c::u(edge))).is_ok());
+            }
+        }
+        for wrong in [STREAM_NONCE_PREFIX_LEN - 1, STREAM_NONCE_PREFIX_LEN + 1] {
+            assert_eq!(
+                p(set(&good, "stream_nonce_prefix", c::b(&vec![0; wrong]))),
+                bad_field(M, "stream_nonce_prefix")
+            );
+        }
+        for wrong in [Value::Bool(false), c::u(1)] {
+            assert_eq!(
+                p(set(&good, "final_frame_required", wrong)),
+                bad("final_frame_required")
+            );
+        }
+        assert_eq!(
+            p(set(&good, "restore_epoch", c::u(1 << 63))),
+            Some(RecordError::Cbor(c::CborError::IntegerOutOfSqliteDomain(
+                1 << 63
+            )))
+        );
+
+        // Scope IDs and hashes are exact-length byte strings.
+        for (name, len) in [
+            ("snapshot_id", 16),
+            ("tenant_id", 16),
+            ("fleet_id", 16),
+            ("profile_id", 16),
+            ("lease_id", 16),
+            ("manifest_replay_id", 16),
+            ("server_instance_id", 16),
+            ("fkek_key_id", 32),
+            ("intended_signer_signing_key_id", 32),
+            ("dek_slot_context_hash", 32),
+            ("dek_slot_sha256", 32),
+        ] {
+            for wrong in [len - 1, len + 1] {
+                assert_eq!(
+                    p(set(&good, name, c::b(&vec![0; wrong]))),
+                    bad_field(M, name)
+                );
+            }
+            assert_eq!(p(set(&good, name, c::t("x"))), bad_field(M, name));
+        }
+
+        // target_version = base_version + 1 (plan L645).
+        let target = "target_version";
+        assert_eq!(p(set(&good, target, c::u(0))), bad(target));
+        assert_eq!(p(set(&good, target, c::u(2))), bad(target));
+        assert_eq!(p(set(&versioned, target, c::u(4))), bad(target));
+        assert_eq!(p(set(&versioned, target, c::u(6))), bad(target));
+        let top = set(&versioned, "base_version", c::u(i64::MAX as u64));
+        assert_eq!(p(set(&top, target, c::u(i64::MAX as u64))), bad(target));
+
+        // previous_signed_head_hash is omitted iff base_version = 0 (plan L654).
+        let prev = "previous_signed_head_hash";
+        let with_prev = edit(&good, |e| e.push((prev.into(), c::b(&[0x55; 32]))));
+        assert_eq!(p(with_prev), bad(prev));
+        let without_prev = edit(&versioned, |e| e.retain(|(k, _)| k != prev));
+        assert_eq!(p(without_prev), bad(prev));
+        assert_eq!(
+            p(set(&versioned, prev, c::b(&[0x55; 31]))),
+            bad_field(M, prev)
+        );
+        let rebased = set(&set(&versioned, "base_version", c::u(1)), target, c::u(2));
+        assert_eq!(ok(rebased).base_version, 1);
+    }
+
+    /// An object around `intent` and `slot` whose every hash agrees, so only
+    /// the closed-map and equality rules can refuse it.
+    fn object_around(intent: &[u8], slot: &[u8]) -> (Vec<u8>, Exp) {
+        let ih = EnvelopeIntentV2::hash(intent);
+        let mut o = Preamble {
+            intent_len: intent.len() as u32,
+            dek_slot_len: slot.len() as u32,
+            frame_plaintext_size: FRAME,
+            intent_sha256: ih,
+        }
+        .encode()
+        .to_vec();
+        o.extend_from_slice(intent);
+        o.extend_from_slice(slot);
+        let ct = StreamLE31::<XChaCha20Poly1305>::new(&DEK.into(), &PREFIX.into())
+            .encrypt(
+                0,
+                true,
+                Payload {
+                    msg: b"x",
+                    aad: &frame_aad(&ih, 0, true),
+                },
+            )
+            .unwrap();
+        o.push(KIND_FINAL);
+        o.extend_from_slice(&0u32.to_be_bytes());
+        o.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+        o.extend_from_slice(&ct);
+        let e = Exp {
+            sha: c::sha256(&o),
+            size: o.len() as u64,
+            pre: preamble_sha256(o[..PREAMBLE_LEN].try_into().unwrap()),
+            intent: ih,
+            slot: c::domain_hash(c::L_DEK_SLOT, slot),
+            scope: scope_of(intent),
+        };
+        (o, e)
+    }
+
+    /// Both the writer and the reader refuse `intent` with `slot` for `rule`.
+    fn refused_both_ways(intent: &IntentMaterial, slot: &SlotMaterial, rule: &str) {
+        let r = seal(
+            &mut Cursor::new(plaintext(5)),
+            &mut Vec::new(),
+            &DEK,
+            intent,
+            slot,
+        );
+        assert_eq!(
+            rule_of(r.map(|_| OpenOutcome {
+                frame_count: 0,
+                plaintext_len: 0
+            })),
+            rule
+        );
+        let (o, e) = object_around(&intent.exact_intent_bytes, &slot.exact_slot_bytes);
+        let (r, out) = open_with(&o, &FKEK, &e);
+        assert_eq!(rule_of(r), rule);
+        assert!(out.is_empty());
+    }
+
+    struct SlotInputs {
+        snapshot_id: [u8; 16],
+        tenant_id: [u8; 16],
+        fleet_id: [u8; 16],
+        profile_id: [u8; 16],
+        fkek_key_id: [u8; 32],
+        key_generation: u64,
+    }
+
+    fn slot_from(s: &SlotInputs) -> SlotMaterial {
+        build_dek_slot(
+            &FKEK,
+            &DEK,
+            &[0x33; WRAP_NONCE_LEN],
+            &SlotIds {
+                tenant_id: &s.tenant_id,
+                fleet_id: &s.fleet_id,
+                profile_id: &s.profile_id,
+                snapshot_id: &s.snapshot_id,
+                fkek_key_id: &s.fkek_key_id,
+                envelope_context_nonce: &[6; 16],
+            },
+            s.key_generation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_slot_that_differs_from_the_intent_is_refused() {
+        let good = || SlotInputs {
+            snapshot_id: [4; 16],
+            tenant_id: [1; 16],
+            fleet_id: [2; 16],
+            profile_id: [3; 16],
+            fkek_key_id: [5; 32],
+            key_generation: 1,
+        };
+        let intent_for = |slot: &SlotMaterial| {
+            build_intent_v2(&ids(), &nums(FRAME, MAX_OBJECT_SIZE), &PREFIX, None, slot).unwrap()
+        };
+
+        // The helper object opens when nothing differs.
+        let slot = slot_from(&good());
+        let intent = intent_for(&slot);
+        let (o, e) = object_around(&intent.exact_intent_bytes, &slot.exact_slot_bytes);
+        let (r, out) = open_with(&o, &FKEK, &e);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(out, b"x");
+
+        type Tweak = fn(&mut SlotInputs);
+        let cases: [(&str, Tweak); 6] = [
+            ("snapshot_id", |s| s.snapshot_id[0] ^= 1),
+            ("tenant_id", |s| s.tenant_id[0] ^= 1),
+            ("fleet_id", |s| s.fleet_id[0] ^= 1),
+            ("profile_id", |s| s.profile_id[0] ^= 1),
+            ("fkek_key_id", |s| s.fkek_key_id[0] ^= 1),
+            ("key_generation", |s| s.key_generation = 2),
+        ];
+        for (field, change) in cases {
+            let mut inputs = good();
+            change(&mut inputs);
+            let slot = slot_from(&inputs);
+            refused_both_ways(&intent_for(&slot), &slot, &format!("mismatch {field}"));
+        }
+
+        // An intent naming the exact slot bytes but another context hash.
+        let named = SlotMaterial {
+            context_hash: [0xcc; 32],
+            ..slot_from(&good())
+        };
+        refused_both_ways(
+            &intent_for(&named),
+            &slot_from(&good()),
+            "mismatch dek_slot_context_hash",
+        );
+    }
+
+    #[test]
+    fn the_reader_refuses_an_open_map() {
+        // An intent with an unknown field, every hash agreeing.
+        let f = fixture();
+        let extra = edit(&f.intent.exact_intent_bytes, |e| {
+            e.push(("extra".into(), c::u(0)))
+        });
+        let (o, e) = object_around(&extra, &f.slot.exact_slot_bytes);
+        let (r, out) = open_with(&o, &FKEK, &e);
+        assert!(
+            matches!(&r, Err(EnvelopeError::Record(RecordError::UnknownField { map: "EnvelopeIntentV2", field })) if field == "extra"),
+            "{r:?}"
+        );
+        assert!(out.is_empty());
+
+        // A slot, then a slot context, with an unknown field, named by the intent.
+        let open_slot = edit(&f.slot.exact_slot_bytes, |e| {
+            e.push(("extra".into(), c::u(0)))
+        });
+        let cx = edit(&f.slot.context_bytes, |e| e.push(("extra".into(), c::u(0))));
+        for (slot_bytes, map) in [
+            (open_slot, "DekSlotV2"),
+            (slot_around(&cx), "DekSlotContextV2"),
+        ] {
+            let named = SlotMaterial {
+                dek_slot_sha256: c::domain_hash(c::L_DEK_SLOT, &slot_bytes),
+                exact_slot_bytes: slot_bytes,
+                ..slot()
+            };
+            let intent =
+                build_intent_v2(&ids(), &nums(FRAME, MAX_OBJECT_SIZE), &PREFIX, None, &named)
+                    .unwrap();
+            let want = format!(
+                "{:?}",
+                Err::<OpenOutcome, _>(EnvelopeError::Record(RecordError::UnknownField {
+                    map,
+                    field: "extra".into()
+                }))
+            );
+            refused_both_ways(&intent, &named, &want);
+        }
     }
 }
