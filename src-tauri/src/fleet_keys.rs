@@ -22,12 +22,13 @@
 //!
 //! Since 2.4.3 a fleet key the team server delivers is cached only once its
 //! grant verifies against the tenant trust chain (`open_fleet_grant`), and
-//! never over another key held for the same generation (`collect`). Keys
-//! cached by 2.4.2 still open old snapshots.
+//! never over another key held for the same generation (`collect`). Sync does
+//! not use such a key yet (`keys_newest_first`). Keys cached by 2.4.2 still
+//! open old snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::Mutex;
 
@@ -52,6 +53,10 @@ pub struct FleetKeys {
     /// every generation, because an older snapshot is still valid.
     #[serde(default)]
     pub active_generation: u64,
+    /// Generations collected from a verified grant (`collect`), which sync
+    /// skips. Keys cached by 2.4.2 are not listed and keep their use.
+    #[serde(default)]
+    pub verified: BTreeSet<u64>,
 }
 
 /// All fleets this device holds keys for, by hex fleet id.
@@ -84,6 +89,11 @@ impl FleetKeyStore {
             .keys()
             .chain(f.credential_refs.keys())
             .copied()
+            // shortcut: revocation reaches this device only through the
+            // server's reports, so a hostile server holding a stolen, revoked
+            // custodian key could still pass a verified grant; sync uses
+            // such keys once the W6 sticky revocation (Q-13) lands.
+            .filter(|g| !f.verified.contains(g))
             .collect();
         let mut out: Vec<_> = generations
             .into_iter()
@@ -127,6 +137,7 @@ impl std::fmt::Debug for FleetKeys {
             .field("keys", &self.keys.keys().collect::<Vec<_>>())
             .field("credential_refs", &self.credential_refs)
             .field("active_generation", &self.active_generation)
+            .field("verified", &self.verified)
             .finish()
     }
 }
@@ -187,14 +198,18 @@ pub fn load() -> Result<FleetKeyStore> {
     stored.map_keys(|v| Ok(dpapi::reveal(v)))
 }
 
-/// The file as stored: keys still in their on-disk form.
+/// The file as stored: keys still in their on-disk form. A file that does
+/// not parse is an error, never an empty store, so no writer replaces the
+/// keys it may still hold.
 fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
     let body = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&body).unwrap_or_default())
+    serde_json::from_str(&body).context("fleet_keys.json does not parse; it is left as it is")
 }
 
 /// Writes `s`, then moves its plaintext keys into the credential store. The
-/// keys are durable once written, so the move is best effort.
+/// keys are durable once written, so the move is best effort. Only the tests
+/// save a whole store; `collect` adds one key.
+#[cfg(test)]
 pub fn save(s: &FleetKeyStore) -> Result<()> {
     {
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -206,19 +221,34 @@ pub fn save(s: &FleetKeyStore) -> Result<()> {
     Ok(())
 }
 
-/// Keeps `key`, opened from a verified grant, as `generation` of `fleet_id`.
-/// Returns false, and saves nothing, when the store already holds a
-/// different key for that generation, or one it cannot read (ADR 0002 trust
-/// chain, rule 5: `KEY_SUBSTITUTION_DETECTED`).
+/// Keeps `key`, opened from a verified grant, as `generation` of `fleet_id`,
+/// marked `verified`. Returns false, and saves nothing, when the store
+/// already holds a different key for that generation, or one it cannot read
+/// (ADR 0002 trust chain, rule 5: `KEY_SUBSTITUTION_DETECTED`). Reads, checks
+/// and writes under one lock, and refuses a store that does not parse.
 pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> {
-    let mut s = load()?;
-    if let Some(f) = s.fleets.get(fleet_id) {
-        if f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation) {
-            return Ok(f.key(generation).is_some_and(|held| *held == *key));
+    {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = store::fleet_keys_path()?;
+        let mut s = if path.exists() {
+            read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?
+        } else {
+            FleetKeyStore::default()
+        };
+        if let Some(f) = s.fleets.get(fleet_id) {
+            if f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation) {
+                return Ok(f.key(generation).is_some_and(|held| *held == *key));
+            }
         }
+        s.insert(fleet_id, generation, key);
+        if let Some(f) = s.fleets.get_mut(fleet_id) {
+            f.verified.insert(generation);
+        }
+        write(&s)?;
     }
-    s.insert(fleet_id, generation, key);
-    save(&s)?;
+    if let Err(error) = protect() {
+        eprintln!("[fleet] fleet keys stay in fleet_keys.json: {error}");
+    }
     Ok(true)
 }
 
@@ -294,6 +324,29 @@ mod tests {
         s.insert("ab", 3, &[0x33u8; 32]);
         let (_k, gen) = s.active_key("ab").expect("active key");
         assert_eq!(gen, 5, "an older grant must not become active");
+    }
+
+    /// A store that does not parse is refused by every reader and writer and
+    /// left byte for byte as it was, so no 2.4.2 key is lost.
+    #[test]
+    fn an_unparseable_store_is_never_overwritten() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let path = store::fleet_keys_path().unwrap();
+        let body = br#"{"fleets": {"ab": {"keys": {"1": "#;
+        fs::write(&path, body).unwrap();
+        let collected = collect("ab", 1, &[0x61; 32]);
+        let loaded = load();
+        let protected = protect();
+        let after = fs::read(&path).unwrap();
+        store::set_config_root(None);
+        assert!(collected.is_err());
+        assert!(loaded.is_err());
+        assert!(protected.is_err());
+        assert_eq!(after, body);
     }
 
     #[test]

@@ -2497,9 +2497,12 @@ enum FleetGrant {
     Waiting,
     /// Verified, opened and in the fleet key store, for this generation.
     Opened(u64),
-    /// Filed, but it did not verify or open, or the store holds another key
-    /// for its generation.
+    /// Filed, but the evidence could not be fetched, or the grant did not
+    /// verify or open.
     Failed,
+    /// Verified and opened, but the store holds another key, or one it
+    /// cannot read, for its generation (rule 5, `KEY_SUBSTITUTION_DETECTED`).
+    Substituted,
 }
 
 /// Reads this device's grant and, when this device pinned an anchor, the
@@ -2553,7 +2556,10 @@ async fn collect_fleet_grant(
     let (Some(pin), Some(pages)) = (pin, pages) else {
         return Ok(FleetGrant::Waiting);
     };
-    let pages = pages.map_err(|e| e.to_string())?;
+    // Root custody is still reported when only the evidence fetch failed.
+    let Ok(pages) = pages else {
+        return Ok(FleetGrant::Failed);
+    };
     let (_, hpke_public) = shardx_core::grants::derive_keypair(&hpke_seed);
     let me = shardx_core::trust_chain::Recipient {
         account_id: fleet_client::decode_hex16(&c.account_id, "account_id")
@@ -2574,7 +2580,7 @@ async fn collect_fleet_grant(
 }
 
 /// Keeps the FKEK `open_fleet_grant` accepted, unless the store holds
-/// another key for its generation.
+/// another key for its generation. A store that does not parse is an error.
 fn keep_fleet_key(
     fleet_id: &str,
     generation: u64,
@@ -2584,7 +2590,7 @@ fn keep_fleet_key(
         return Ok(FleetGrant::Failed);
     };
     if !fleet_keys::collect(fleet_id, generation, &fkek).map_err(|e| e.to_string())? {
-        return Ok(FleetGrant::Failed);
+        return Ok(FleetGrant::Substituted);
     }
     Ok(FleetGrant::Opened(generation))
 }
@@ -2716,11 +2722,14 @@ fn custody_report(
 
     let (fleet_opened, fleet_failed, newest_fleet_generation) = match fleet {
         FleetGrant::Opened(g) => (1, 0, Some(g)),
-        FleetGrant::Failed => (0, 1, None),
+        FleetGrant::Failed | FleetGrant::Substituted => (0, 1, None),
         FleetGrant::None | FleetGrant::Waiting => (0, 0, None),
     };
-    let fleet_grants_waiting =
-        usize::from(matches!(fleet, FleetGrant::Waiting | FleetGrant::Failed));
+    let fleet_grants_waiting = usize::from(matches!(
+        fleet,
+        FleetGrant::Waiting | FleetGrant::Failed | FleetGrant::Substituted
+    ));
+    let fleet_refusal = (fleet == FleetGrant::Substituted).then_some("KEY_SUBSTITUTION_DETECTED");
     Ok(serde_json::json!({
         "grants": grants.len(),
         "opened": opened,
@@ -2730,6 +2739,7 @@ fn custody_report(
         "fleet_failed": fleet_failed,
         "newest_fleet_generation": newest_fleet_generation,
         "fleet_grants_waiting": fleet_grants_waiting,
+        "fleet_refusal": fleet_refusal,
         "can_sync_without_passphrase": false,
     }))
 }
@@ -2811,6 +2821,11 @@ mod custody_tests {
         assert_eq!(failed["fleet_failed"], 1);
         assert_eq!(failed["fleet_opened"], 0);
         assert_eq!(failed["fleet_grants_waiting"], 1, "not accepted");
+        assert_eq!(failed["fleet_refusal"], serde_json::Value::Null);
+        let substituted = report(FleetGrant::Substituted);
+        assert_eq!(substituted["fleet_failed"], 1);
+        assert_eq!(substituted["fleet_grants_waiting"], 1);
+        assert_eq!(substituted["fleet_refusal"], "KEY_SUBSTITUTION_DETECTED");
         assert_eq!(report(FleetGrant::None)["fleet_grants_waiting"], 0);
     }
 
@@ -3028,7 +3043,8 @@ mod custody_tests {
         assert!(fleet_keys::collect(&fleet, 1, &[0x5a; 32]).unwrap());
         assert!(!fleet_keys::collect(&fleet, 1, &[0x5b; 32]).unwrap());
         assert!(fleet_keys::collect(&fleet, 2, &[0x5b; 32]).unwrap());
-        let held = fleet_keys::load().unwrap().keys_newest_first(&fleet);
+        assert!(!fleet_keys::collect(&fleet, 2, &[0x5a; 32]).unwrap());
+        let held = fleet_keys::load().unwrap();
         // An entry whose key cannot be read is held all the same.
         let mut keys = fleet_keys::load().unwrap();
         keys.fleets
@@ -3048,11 +3064,13 @@ mod custody_tests {
             kept,
             [
                 Ok(FleetGrant::Opened(4)),
-                Ok(FleetGrant::Failed),
+                Ok(FleetGrant::Substituted),
                 Ok(FleetGrant::Failed)
             ]
         );
-        assert_eq!(held, [([0x5b; 32], 2), ([0x5a; 32], 1)]);
+        // Marked as from a verified grant, so sync does not use them yet.
+        assert_eq!(held.fleets[&fleet].verified, [1, 2].into());
+        assert!(held.keys_newest_first(&fleet).is_empty());
         assert!(!unreadable);
     }
 

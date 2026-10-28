@@ -555,13 +555,11 @@ impl TrustChain {
             && p.subject_device_id == to.device_id
             && p.subject_signing_key_id == to.signing_key_id
             && p.recipient_hpke_key_id == to.hpke_key_id
-            && holds(
-                (
-                    p.common.not_before_ms,
-                    end_of(&p.common, g.revoked_at_ms, device_revoked),
-                ),
-                now,
-            )
+            // The local clock, within its tolerance (ADR 0002 "Clocks", and
+            // the "now" of the verification algorithm).
+            && p.common.not_before_ms <= now.saturating_add(CLOCK_TOLERANCE_MS)
+            && now.saturating_sub(CLOCK_TOLERANCE_MS)
+                < end_of(&p.common, g.revoked_at_ms, device_revoked)
             && self.custodian_at(&g.issuer, t)
             && self.approval_valid_at(&g.issuer, fleet, t)
             && self.capability_at(&g.issuer, Capability::FleetManage, fleet, t))
@@ -1460,12 +1458,13 @@ mod tests {
         assert!(c
             .device_hpke_grant(&g, &recipient(&d), &FLEET, 2, NOW)
             .is_none());
-        // Its window, half-open.
+        // Its window, half-open and widened by the clock tolerance.
+        let tol = CLOCK_TOLERANCE_MS;
         for (now, ok) in [
-            (T0 + 3 * DAY - 1, false),
-            (T0 + 3 * DAY, true),
-            (T0 + 300 * DAY - 1, true),
-            (T0 + 300 * DAY, false),
+            (T0 + 3 * DAY - tol - 1, false),
+            (T0 + 3 * DAY - tol, true),
+            (T0 + 300 * DAY + tol - 1, true),
+            (T0 + 300 * DAY + tol, false),
         ] {
             let got = c.device_hpke_grant(&g, &recipient(&d), &FLEET, 1, now);
             assert_eq!(got.is_some(), ok, "{now}");
@@ -1594,16 +1593,16 @@ mod tests {
         revoked.revocations.push(RevokedRecord {
             payload_domain: DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE.into(),
             replay_id: [31; 16],
-            revoked_at_ms: NOW - 1,
+            revoked_at_ms: NOW - CLOCK_TOLERANCE_MS,
         });
         assert!(!accepts(revoked.clone(), &g, &recipient(&d)));
-        revoked.revocations[0].revoked_at_ms = NOW + 1;
+        revoked.revocations[0].revoked_at_ms = NOW - CLOCK_TOLERANCE_MS + 1;
         assert!(accepts(revoked, &g, &recipient(&d)));
         // Its subject device.
         let mut revoked = p.clone();
         revoked.device_revocations.push(RevokedDevice {
             device_id: d.id,
-            revoked_at_ms: NOW - 1,
+            revoked_at_ms: NOW - CLOCK_TOLERANCE_MS,
         });
         assert!(!accepts(revoked, &g, &recipient(&d)));
         // Its issuer, B, revoked on day 5: a grant it issued on day 4 keeps
