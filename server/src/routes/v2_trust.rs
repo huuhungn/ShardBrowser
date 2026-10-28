@@ -4,15 +4,16 @@
 //! The evidence is the full ancestry, expired and revoked records included:
 //! every root grant of the tenant, and every approval and capability grant
 //! whose subject signing key is a root grant subject or a `signer` the client
-//! names. Containers are served as their exact signed bytes with the issuers'
-//! public keys; the client verifies everything itself, so the server only
-//! has to leave nothing out. Pages are read from one snapshot each and
-//! ordered by kind, then by row, so a cursor names where the next page starts.
+//! names, and every filed `DeviceRevocationV2` (Q-13) with an unsigned report
+//! of its subject device. Containers are served as their exact signed bytes
+//! with the issuers' public keys; the client verifies everything itself, so
+//! the server only has to leave nothing out. Pages are read from one snapshot
+//! each and ordered by kind, then by row, so a cursor names where the next
+//! page starts.
 //!
-//! shortcut: the `DeviceRevocationV2` containers and device revocation
-//! reports (Q-13), and the fleet evidence (`DeviceHpkeGrant`, `RotationGrant`,
-//! `RecoveryGrant`), are not served yet; their tables come with W4 and Q-13.
-//! Their absence can only make a client refuse.
+//! shortcut: the fleet evidence (`DeviceHpkeGrant`, `RotationGrant`,
+//! `RecoveryGrant`) is not served yet; add it with the fleet trust rules (W4).
+//! Its absence can only make a client refuse.
 
 use std::collections::BTreeSet;
 
@@ -22,7 +23,7 @@ use axum::response::Response;
 use sqlx::{Row, SqliteConnection};
 
 use shared::trust_evidence::{
-    RevokedRecord, TenantTrustEvidencePageV2, MAX_PAGE_BYTES, MAX_PAGE_CONTAINERS,
+    RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2, MAX_PAGE_BYTES, MAX_PAGE_CONTAINERS,
 };
 
 use super::v2_approval::{cbor, coded};
@@ -38,12 +39,14 @@ pub const MAX_SIGNERS: usize = 64;
 
 /// The evidence tables, in page order, with the quarantine kind of their
 /// rows. Approvals and capability grants are those of the root grant subjects
-/// and of the named signers.
-const KINDS: [(&str, Option<&str>); 3] = [
+/// and of the named signers; root grants and revocations are all served.
+const KINDS: [(&str, Option<&str>); 4] = [
     ("v2_tenant_root_key_grants", Some("root_grant")),
     ("v2_device_approvals", None),
     ("v2_capability_grants", Some("capability_grant")),
+    (REVOCATIONS, None),
 ];
+const REVOCATIONS: &str = "v2_device_revocations";
 
 /// The page's fixed fields, well over their encoded size.
 const PAGE_HEADER_BYTES: usize = 1024;
@@ -151,7 +154,7 @@ async fn rows(
                                  AND q.tenant_id = t.tenant_id AND q.replay_id = t.replay_id)"
         )
     });
-    let subjects = if kind == 0 {
+    let subjects = if kind == 0 || table == REVOCATIONS {
         String::new()
     } else {
         // Numbered after the four fixed parameters.
@@ -166,8 +169,14 @@ async fn rows(
                    OR subject_signing_key_id IN ({named}))"
         )
     };
+    // A revocation is never itself revoked.
+    let revoked_at = if table == REVOCATIONS {
+        "NULL AS revoked_at"
+    } else {
+        "revoked_at"
+    };
     let sql = format!(
-        "SELECT rowid, payload_domain, replay_id, issuer_signing_key_id, revoked_at,
+        "SELECT rowid, payload_domain, replay_id, issuer_signing_key_id, {revoked_at},
                 length(exact_signed_container_bytes) AS len
            FROM {table} t
           WHERE server_instance_id = ?1 AND tenant_id = ?2 AND rowid > ?3{subjects}{quarantined}
@@ -238,8 +247,10 @@ pub async fn trust_evidence(
             let issuer: Vec<u8> = row.get("issuer_signing_key_id");
             let revoked_at: Option<String> = row.get("revoked_at");
             let payload_domain: String = row.get("payload_domain");
+            let table = KINDS[usize::from(kind)].0;
             let cost = len.saturating_add(ENTRY_OVERHEAD_BYTES)
                 + revoked_at.as_ref().map_or(0, |_| payload_domain.len() + 64)
+                + if table == REVOCATIONS { 64 } else { 0 }
                 + if issuers.contains(&issuer) {
                     0
                 } else {
@@ -261,7 +272,6 @@ pub async fn trust_evidence(
                 break 'kinds;
             }
             after = row.get("rowid");
-            let table = KINDS[usize::from(kind)].0;
             let container: Vec<u8> = sqlx::query_scalar(&format!(
                 "SELECT exact_signed_container_bytes FROM {table} WHERE rowid = ?"
             ))
@@ -284,6 +294,29 @@ pub async fn trust_evidence(
                         .map_err(|_| AppError::Internal("a replay id is not 16 bytes".into()))?,
                     revoked_at_ms: revoked_at_ms(&revoked_at),
                 });
+            }
+            if table == REVOCATIONS {
+                let (device, filed_at): (Vec<u8>, i64) = sqlx::query_as(
+                    "SELECT subject_device_id, filed_at_ms FROM v2_device_revocations WHERE rowid = ?",
+                )
+                .bind(after)
+                .fetch_one(&mut *tx)
+                .await?;
+                let device_id: [u8; 16] = device
+                    .try_into()
+                    .map_err(|_| AppError::Internal("a device id is not 16 bytes".into()))?;
+                // The earliest filing on this page; a client takes the
+                // earliest over all pages, so a later one only repeats it.
+                if !page
+                    .device_revocations
+                    .iter()
+                    .any(|d| d.device_id == device_id)
+                {
+                    page.device_revocations.push(RevokedDevice {
+                        device_id,
+                        revoked_at_ms: u64::try_from(filed_at).unwrap_or(0),
+                    });
+                }
             }
             page.containers.push(container);
         }
@@ -334,10 +367,10 @@ mod tests {
         let hex: String = c.encode().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(Cursor::decode(&hex), Some(c));
         for bad in [
-            // page 0 is never named by a cursor; kind 3 does not exist;
+            // page 0 is never named by a cursor; kind 4 does not exist;
             // a negative row; a short cursor.
             "00000000020000000000000001",
-            "00000001030000000000000001",
+            "00000001040000000000000001",
             "0000000102ffffffffffffffff",
             "000000010200",
         ] {

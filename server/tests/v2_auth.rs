@@ -5952,6 +5952,24 @@ async fn a_revoked_device_cannot_sign_in_again() {
         assert_eq!(server.count(&query).await, want, "{query}");
     }
 
+    // The trust evidence serves every filed revocation, and reports each
+    // revoked device once per page at its first filing.
+    let pages = evidence(&server, &access, &[]).await;
+    let served = containers(&pages);
+    for filed in [&good, &again, &approved_revoke] {
+        assert!(served.contains(filed));
+    }
+    let mut reported: Vec<[u8; 16]> = pages
+        .iter()
+        .flat_map(|p| p.device_revocations.iter().map(|d| d.device_id))
+        .collect();
+    reported.sort();
+    assert_eq!(reported, vec![pending.id, approved.id]);
+    assert!(pages
+        .iter()
+        .flat_map(|p| &p.signing_public_keys)
+        .any(|k| *k == dev.sk.verifying_key().to_bytes()));
+
     // Without root custody the same issuer cannot revoke, even with its grant.
     server
         .sql(
