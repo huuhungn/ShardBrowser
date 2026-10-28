@@ -5657,10 +5657,21 @@ async fn only_the_creator_files_its_own_grant_before_holding_the_generation() {
 // ----------------------------------------------------------- DEVICE_REVOKE ---
 
 fn revocation(issuer: &Ed25519SigningKey, subject: &Device, replay: u8, days: u64) -> Vec<u8> {
+    revocation_issued(issuer, subject, replay, days, 60_000)
+}
+
+/// A revocation issued `ago` ms before now, its window opening then.
+fn revocation_issued(
+    issuer: &Ed25519SigningKey,
+    subject: &Device,
+    replay: u8,
+    days: u64,
+    ago: u64,
+) -> Vec<u8> {
     use shared::authz_record::{
         DeviceRevocationReason, DeviceRevocationV2, DOMAIN_DEVICE_REVOCATION,
     };
-    let start = now_ms() - 60_000;
+    let start = now_ms() - ago;
     let r = DeviceRevocationV2 {
         common: CommonFields {
             replay_id: [replay; 16],
@@ -5766,6 +5777,15 @@ async fn a_revoked_device_cannot_sign_in_again() {
     assert_eq!(
         server
             .call(&path, &access, Some(&revoke_request(0xa2, &long)))
+            .await
+            .0,
+        403
+    );
+    // Issued long before it is filed: no client could tell custody held then.
+    let stale_issue = revocation_issued(&dev.sk, &pending, 0x97, 30, 400_000);
+    assert_eq!(
+        server
+            .call(&path, &access, Some(&revoke_request(0xab, &stale_issue)))
             .await
             .0,
         403
@@ -5918,6 +5938,15 @@ async fn a_revoked_device_cannot_sign_in_again() {
         ),
         "DELETE FROM v2_device_revocations".to_string(),
         "UPDATE v2_device_revocations SET reason_code = 'lost'".to_string(),
+        // REPLACE writes a fresh active row past the status trigger.
+        format!(
+            "INSERT OR REPLACE INTO v2_devices
+             SELECT id, tenant_id, account_id, label_ciphertext, signing_key_id,
+                    signing_public_key, signing_suite, hpke_key_id, hpke_public_key,
+                    hpke_suite, 'active', last_seen_at, created_at
+               FROM v2_devices WHERE id = X'{}'",
+            hex(&pending.id)
+        ),
     ] {
         assert!(
             sqlx::query(&statement).execute(&pool).await.is_err(),

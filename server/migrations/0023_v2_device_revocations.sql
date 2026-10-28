@@ -7,7 +7,8 @@
 
 CREATE TABLE v2_device_revocations (
     server_instance_id                  BLOB    NOT NULL CHECK (length(server_instance_id) = 16),
-    tenant_id                           BLOB    NOT NULL REFERENCES v2_tenants(id),
+    tenant_id                           BLOB    NOT NULL REFERENCES v2_tenants(id)
+        CHECK (length(tenant_id) = 16),
     replay_id                           BLOB    NOT NULL CHECK (length(replay_id) = 16),
     payload_domain                      TEXT    NOT NULL
         CHECK (payload_domain = 'shardx.authz.device-revocation.v2'),
@@ -77,6 +78,19 @@ BEFORE UPDATE OF status ON v2_devices
 WHEN NEW.status <> 'revoked'
  AND EXISTS (SELECT 1 FROM v2_device_revocations r
               WHERE r.tenant_id = OLD.tenant_id AND r.subject_device_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a device with a revocation stays revoked');
+END;
+
+-- REPLACE, or a row removed with its account, would otherwise bring the
+-- revoked keys back as a fresh device.
+CREATE TRIGGER v2_devices_revocation_no_reinsert
+BEFORE INSERT ON v2_devices
+WHEN NEW.status <> 'revoked'
+ AND EXISTS (SELECT 1 FROM v2_device_revocations r
+              WHERE r.tenant_id = NEW.tenant_id
+                AND (r.subject_device_id = NEW.id
+                     OR r.subject_signing_key_id = NEW.signing_key_id))
 BEGIN
     SELECT RAISE(ABORT, 'a device with a revocation stays revoked');
 END;

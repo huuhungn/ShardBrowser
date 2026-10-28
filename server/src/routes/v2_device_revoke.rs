@@ -42,6 +42,10 @@ use crate::util::now_ms;
 /// ADR 0002 D-6: a revocation's window, checked when it is filed.
 pub(super) const MAX_DEVICE_REVOCATION_TTL_MS: u64 = 30 * 86_400_000;
 
+/// ADR 0002 rule 2 tolerance: a client counts a revocation only if its issuer
+/// was a custodian at `issued_at_ms`, which the server checks as "now".
+const ISSUED_AT_SKEW_MS: i64 = 300_000;
+
 fn response_mismatch() -> AppError {
     coded(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -319,7 +323,8 @@ pub async fn revoke_device(
         ));
     }
     // D-6: the window is checked now, at filing, and never again.
-    if int(c.not_before_ms)? > now
+    if (int(c.issued_at_ms)? - now).abs() > ISSUED_AT_SKEW_MS
+        || int(c.not_before_ms)? > now
         || now >= int(c.not_after_ms)?
         || c.not_after_ms - c.not_before_ms > MAX_DEVICE_REVOCATION_TTL_MS
     {
