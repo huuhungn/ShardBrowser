@@ -4378,20 +4378,8 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
         .call(&grants0, &access, Some(&recovery_request))
         .await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
-    // A spent replay ID, a device grant past 365 days, a grant signed by
-    // another key, and a variant the request does not name are refused.
-    let reused = fleet_grant_request(0xc5, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
-    let (status, body) = server.call(&grants0, &access, Some(&reused)).await;
-    assert_eq!((status, code_of(&body).as_str()), (409, "REPLAY_DETECTED"));
-    let long = fleet_grant_request(
-        0xc6,
-        0,
-        fkek0,
-        V::DeviceHpke,
-        0xd2,
-        &device_grant(0xd2, 0, fkek0, 366),
-    );
-    assert_eq!(server.call(&grants0, &access, Some(&long)).await.0, 403);
+    // A grant signed by another key and a variant the request does not name
+    // are refused.
     let stranger = Ed25519SigningKey::from_bytes(&[0x99; 32]);
     let forged = {
         let parsed = AuthorizationRecord::parse(&device_grant(0xd3, 0, fkek0, 30)).unwrap();
@@ -4459,6 +4447,20 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
     );
     let ack0_path = format!("{path}/0/ack");
     assert_eq!(server.call(&ack0_path, &access, Some(&ack0)).await.0, 201);
+    // Holding it, the issuer still cannot reuse a spent replay ID or file a
+    // device grant past 365 days.
+    let reused = fleet_grant_request(0xc5, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
+    let (status, body) = server.call(&grants0, &access, Some(&reused)).await;
+    assert_eq!((status, code_of(&body).as_str()), (409, "REPLAY_DETECTED"));
+    let long = fleet_grant_request(
+        0xc6,
+        0,
+        fkek0,
+        V::DeviceHpke,
+        0xd2,
+        &device_grant(0xd2, 0, fkek0, 366),
+    );
+    assert_eq!(server.call(&grants0, &access, Some(&long)).await.0, 403);
     // A subject without a live approval gets no fleet key (D-2).
     let unapproved = device(&server, OWNER, 0x7f, "active").await;
     let to_unapproved = DeviceHpkeGrantV2 {
@@ -4914,8 +4916,11 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
     file!(0xc1, 1, fkek1, V::DeviceHpke, 0xd5, &device1);
     file!(0xc2, 1, fkek1, V::Recovery, 0xd6, &recovery1);
-    // Once its generation-0 grant is revoked the issuer no longer holds it,
-    // and files no rotation grant until it holds generation 0 again (D-2).
+    // The issuer renews its generation-0 grant while it holds generation 0;
+    // once the old grant is revoked it no longer holds it, and files no
+    // rotation grant until it acknowledges the renewal (D-2).
+    let renewed = device_grant(0xde, 0, fkek0);
+    file!(0xe4, 0, fkek0, V::DeviceHpke, 0xde, &renewed);
     let drop0 = FleetGrantRevokeV2 {
         revocation: FleetGrantRevocation {
             generation: gen_ref(0, fkek0),
@@ -4934,8 +4939,6 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     let early = fleet_grant_request(0xe3, 1, fkek1, V::Rotation, 0xd7, &rotation1);
     let grants1 = fleet_grants_path(1);
     assert_eq!(server.call(&grants1, &access, Some(&early)).await.0, 403);
-    let renewed = device_grant(0xde, 0, fkek0);
-    file!(0xe4, 0, fkek0, V::DeviceHpke, 0xde, &renewed);
     let request = ack(0xe5, 0, fkek0, V::DeviceHpke, 0xde, &renewed);
     assert_eq!(server.call(&ack0, &access, Some(&request)).await.0, 201);
     file!(0xc3, 1, fkek1, V::Rotation, 0xd7, &rotation1);
@@ -5165,6 +5168,26 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
     );
     server.sql(&peer_status("active"), &[]).await;
 
+    // A second, expired session of the subject is ended too, but not counted.
+    // shortcut: a session's expiry never changes, so the test drops that guard
+    // to age one.
+    session(&server, &dev).await;
+    server
+        .sql("DROP TRIGGER v2_sessions_binding_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            &format!(
+                "UPDATE v2_sessions
+                    SET access_expires_at_ms = 1, refresh_expires_at_ms = 1,
+                        absolute_expires_at_ms = 1
+                  WHERE rowid = (SELECT max(rowid) FROM v2_sessions WHERE device_id = X'{}')",
+                hex(&dev.id)
+            ),
+            &[],
+        )
+        .await;
+
     let request = root_revoke_request(0xc3, grant.clone(), R::DeviceLost);
     let (status, body) = server.call(&revoke_path, &access, Some(&request)).await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
@@ -5207,7 +5230,8 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
                 "SELECT count(*) FROM v2_sessions WHERE revoked_at_ms IS NULL AND device_id = X'{}'",
                 hex(&dev.id)
             ),
-            // Only the fresh session opened after the revocation.
+            // Only the fresh session opened after the revocation: the
+            // expired one was ended with the live one.
             1,
         ),
         (
@@ -5509,4 +5533,123 @@ async fn a_device_reads_back_only_its_own_fleet_grant_as_an_exact_descriptor() {
         )
         .await;
     assert_eq!(server.call(&path, &access, None).await.0, 422);
+}
+
+/// The device that created a generation files its own first grant of it
+/// before holding it (D-2); nobody else does, and a revoked one is not
+/// replaced that way.
+#[tokio::test]
+async fn only_the_creator_files_its_own_grant_before_holding_the_generation() {
+    use shared::authz_record::{DeviceHpkeGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE};
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationCreateV2,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let mut server = start("d9-fleet-own", 28217).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let grant = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa7; 16];
+        g.capability = Capability::FleetManage;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    let fkek = [0xe0; 32];
+    let own_grant = |replay: u8| {
+        let g = DeviceHpkeGrantV2 {
+            common: fleet_common(replay, 365),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation: 0,
+            subject_account_id: OWNER,
+            subject_device_id: dev.id,
+            subject_signing_key_id: dev.signing_key_id,
+            recipient_hpke_key_id: dev.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    };
+    let (first, second) = (own_grant(0xd0), own_grant(0xd1));
+    let create = FleetKeyGenerationCreateV2 {
+        terms: FleetGenerationTerms {
+            generation: FleetGenerationRef {
+                tenant_id: TENANT,
+                server_instance_id: INSTANCE,
+                restore_epoch: 0,
+                fleet_id: FLEET,
+                generation: 0,
+                fkek_key_id: fkek,
+            },
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&first)])
+                .unwrap(),
+            recovery_grant_signed_container_hash: [0x77; 32],
+            rotation: None,
+        },
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create.encode());
+    assert_eq!(
+        server
+            .call(&fleet_generation_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let grants = fleet_grants_path(0);
+    let file = |key: u8, replay: u8, container: &[u8]| {
+        fleet_grant_request(key, 0, fkek, V::DeviceHpke, replay, container)
+    };
+    let creator = |device: &[u8; 16]| {
+        format!(
+            "UPDATE v2_audit_events SET actor_device_id = X'{}'
+              WHERE action = 'fleet.key_generation.create'",
+            hex(device)
+        )
+    };
+
+    // Another fleet.manage holder that did not create the generation.
+    server.sql(&creator(&[0x55; 16]), &[]).await;
+    assert_eq!(
+        server
+            .call(&grants, &access, Some(&file(0xb1, 0xd0, &first)))
+            .await
+            .0,
+        403
+    );
+    server.sql(&creator(&dev.id), &[]).await;
+    let (status, body) = server
+        .call(&grants, &access, Some(&file(0xb2, 0xd0, &first)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // A second one is refused, before and after the first is revoked.
+    assert_eq!(
+        server
+            .call(&grants, &access, Some(&file(0xb3, 0xd1, &second)))
+            .await
+            .0,
+        403
+    );
+    server
+        .sql(
+            "UPDATE v2_fleet_device_hpke_grants SET revoked_at = 'now'",
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server
+            .call(&grants, &access, Some(&file(0xb4, 0xd1, &second)))
+            .await
+            .0,
+        403
+    );
 }
