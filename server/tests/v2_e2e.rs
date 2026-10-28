@@ -1496,6 +1496,21 @@ async fn a_fleet_generation_cannot_activate_without_a_self_grant() {
         409,
         "activation must be refused until a first self grant exists"
     );
+    // A generation past the storage range is refused, never wrapped (G2-45).
+    let resp = cl
+        .post(format!("{}/v2/fleet-key-generations/activate", base(port)))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "tenant_id": tenant_hex,
+            "fleet_id": fleet_hex,
+            "generation": u64::MAX,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 422);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "WIRE_INTEGER_OUT_OF_RANGE");
 
     let active: Value = cl
         .get(format!(

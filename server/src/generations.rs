@@ -39,7 +39,7 @@ pub async fn get_generation(
          WHERE server_instance_id = ?3 AND tenant_id = ?1 AND generation = ?2",
     )
     .bind(tenant_id.as_slice())
-    .bind(generation as i64)
+    .bind(crate::util::sql_int(generation)?)
     .bind(instance.as_slice())
     .fetch_optional(db)
     .await?;
@@ -51,7 +51,7 @@ pub async fn get_generation(
         .map_err(|_| AppError::Internal("stored root_key_id is not 32 bytes".into()))?;
 
     Ok(Some(Generation {
-        generation: row.try_get::<i64, _>("generation")? as u64,
+        generation: crate::util::stored_uint(row.try_get("generation")?)?,
         root_key_id,
         state: row.try_get("state")?,
         created_at: row.try_get("created_at")?,
@@ -87,7 +87,7 @@ pub async fn active_generation(
         .map_err(|_| AppError::Internal("stored root_key_id is not 32 bytes".into()))?;
 
     Ok(Some(Generation {
-        generation: row.try_get::<i64, _>("generation")? as u64,
+        generation: crate::util::stored_uint(row.try_get("generation")?)?,
         root_key_id,
         state: row.try_get("state")?,
         created_at: row.try_get("created_at")?,
