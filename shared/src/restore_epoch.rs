@@ -102,9 +102,21 @@ impl RestoreEpochLeafV2 {
     }
 }
 
-/// `profile_head_mapping_root` of a leaf set. Empty, oversized, duplicate and
-/// unsorted sets are refused (L677-L680), never normalized.
-pub fn mapping_root(leaves: &[RestoreEpochLeafV2]) -> std::result::Result<[u8; 32], MerkleError> {
+/// `profile_head_mapping_root` of `tenant_id`'s leaf set. Empty, oversized,
+/// duplicate, unsorted and cross-tenant sets, and leaves without a previous
+/// head, are refused (L676-L680, L1112), never normalized.
+pub fn mapping_root(
+    tenant_id: &[u8; 16],
+    leaves: &[RestoreEpochLeafV2],
+) -> std::result::Result<[u8; 32], MerkleError> {
+    for l in leaves {
+        if &l.tenant_id != tenant_id {
+            return Err(MerkleError::ForeignTenant);
+        }
+        if l.previous_signed_head_hash == [0; 32] {
+            return Err(MerkleError::ZeroPreviousHead);
+        }
+    }
     let leaves: Vec<EpochLeaf> = leaves.iter().map(RestoreEpochLeafV2::epoch_leaf).collect();
     merkle_root(&leaves)
 }
@@ -481,13 +493,22 @@ pub struct RestoreEpochInclusionProofV2 {
 
 impl RestoreEpochInclusionProofV2 {
     /// The proof of `leaves[leaf_index]` under `transition`. The leaf set is
-    /// checked as [`mapping_root`] checks it; `leaf_index` must be in range.
+    /// checked as [`mapping_root`] checks it and must be the one `transition`
+    /// commits to; `leaf_index` must be in range.
     pub fn build(
         transition: &RestoreEpochTransitionV2,
         leaves: &[RestoreEpochLeafV2],
         leaf_index: usize,
     ) -> std::result::Result<Self, MerkleError> {
-        let root = mapping_root(leaves)?;
+        let root = mapping_root(&transition.tenant_id, leaves)?;
+        if leaf_index >= leaves.len() {
+            return Err(MerkleError::IndexOutOfRange);
+        }
+        if leaves.len() as u64 != transition.mapping_count
+            || root != transition.profile_head_mapping_root
+        {
+            return Err(MerkleError::NotTheTransition);
+        }
         let epoch_leaves: Vec<EpochLeaf> =
             leaves.iter().map(RestoreEpochLeafV2::epoch_leaf).collect();
         Ok(Self {
@@ -747,7 +768,7 @@ mod tests {
             previous_epoch: 7,
             new_epoch: 8,
             mapping_count: l.len() as u64,
-            profile_head_mapping_root: mapping_root(l).unwrap(),
+            profile_head_mapping_root: mapping_root(&fx(tenant), l).unwrap(),
             reason_code: RestoreReason::OperatorRestore,
             approver_account_id: fx("approver-account"),
             approver_device_id: fx("approver-device"),
@@ -793,7 +814,7 @@ mod tests {
     #[test]
     fn golden_vectors() {
         let roots: Vec<String> = (1..=3)
-            .map(|n| hex(&mapping_root(&leaves("tenant-a", n)).unwrap()))
+            .map(|n| hex(&mapping_root(&fx("tenant-a"), &leaves("tenant-a", n)).unwrap()))
             .collect();
         assert_eq!(
             roots,
@@ -1113,22 +1134,56 @@ mod tests {
 
     #[test]
     fn leaf_sets_must_be_non_empty_sorted_and_unique() {
-        assert_eq!(mapping_root(&[]), Err(MerkleError::EmptyTree));
+        let a = fx("tenant-a");
+        assert_eq!(mapping_root(&a, &[]), Err(MerkleError::EmptyTree));
         let l = leaves("tenant-a", 2);
         assert_eq!(
-            mapping_root(&[l[1].clone(), l[0].clone()]),
+            mapping_root(&a, &[l[1].clone(), l[0].clone()]),
             Err(MerkleError::UnsortedLeaves)
         );
         assert_eq!(
-            mapping_root(&[l[0].clone(), l[0].clone()]),
+            mapping_root(&a, &[l[0].clone(), l[0].clone()]),
             Err(MerkleError::DuplicateTuple)
         );
         // Same tuple, different heads: still a duplicate.
         let mut twin = l[0].clone();
         twin.new_signed_head_hash = fx("other-new-head");
         assert_eq!(
-            mapping_root(&[l[0].clone(), twin]),
+            mapping_root(&a, &[l[0].clone(), twin]),
             Err(MerkleError::DuplicateTuple)
+        );
+        // Every leaf is the transition tenant's, and restores a previous head.
+        assert_eq!(
+            mapping_root(&fx("tenant-b"), &l),
+            Err(MerkleError::ForeignTenant)
+        );
+        let mut blank = l[1].clone();
+        blank.previous_signed_head_hash = [0; 32];
+        assert_eq!(
+            mapping_root(&a, &[l[0].clone(), blank]),
+            Err(MerkleError::ZeroPreviousHead)
+        );
+        // A proof is built only for the set the transition commits to.
+        let t = transition("tenant-a", &l);
+        assert_eq!(
+            RestoreEpochInclusionProofV2::build(&t, &l, 2),
+            Err(MerkleError::IndexOutOfRange)
+        );
+        assert_eq!(
+            RestoreEpochInclusionProofV2::build(&t, &l[..1], 0),
+            Err(MerkleError::NotTheTransition)
+        );
+        let mut miscounted = t.clone();
+        miscounted.mapping_count = 3;
+        assert_eq!(
+            RestoreEpochInclusionProofV2::build(&miscounted, &l, 0),
+            Err(MerkleError::NotTheTransition)
+        );
+        let mut other = l.clone();
+        other[1].new_signed_head_hash = fx("other-new-head");
+        assert_eq!(
+            RestoreEpochInclusionProofV2::build(&t, &other, 0),
+            Err(MerkleError::NotTheTransition)
         );
     }
 
