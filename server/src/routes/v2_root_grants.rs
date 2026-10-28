@@ -165,13 +165,14 @@ pub(crate) async fn load_grant(
     }))
 }
 
-/// shortcut: only the S6 subject acts on its own gen-0 self-grant; other
-/// readers and grants (custodians, `ExistingRootGrant`, rotation) need
-/// `ROOT_GRANT_CREATE` and D2 capabilities, which come later.
+/// The session is the grant's subject under exactly its keys. A live session
+/// of an active device needs a live approval, and a pending device holds no
+/// grant, so the session's class adds nothing.
+///
+/// shortcut: other readers (the issuing custodian, auditors) see nothing;
+/// widen this when a client needs to read grants it did not receive.
 fn subject_of(s: &Session, g: &TenantRootKeyGrantV2) -> Result<(), AppError> {
-    let own = g.variant == RootGrantVariant::FirstRootSelfGrant
-        && s.class == "root_setup"
-        && g.subject_account_id == s.account_id
+    let own = g.subject_account_id == s.account_id
         && g.subject_device_id == s.device_id
         && g.subject_signing_key_id == s.signing_key_id
         && g.recipient_hpke_key_id == s.hpke_key_id;
@@ -222,8 +223,8 @@ pub async fn read_root_grant(
         .await?
         .ok_or(AppError::Unauthorized)?;
     // For anyone but the subject the grant does not exist: another tenant's
-    // session, and any session but the setup one, learn nothing from a read.
-    if s.tenant_id != tenant || s.class != "root_setup" {
+    // session, and an unapproved one, learn nothing from a read.
+    if s.tenant_id != tenant || s.class == "pending_setup" {
         return Err(not_found());
     }
     let g = load_grant(&mut tx, v, &tenant, generation, &replay)

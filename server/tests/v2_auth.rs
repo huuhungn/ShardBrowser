@@ -1655,12 +1655,10 @@ async fn the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt
         (status, code(&body).as_str()),
         (409, "IDEMPOTENCY_MISMATCH")
     );
+    // After D1 a second self-approval is an ordinary renewal (ADR 0002 D-2),
+    // which needs `device.approve`; the device holds none yet.
     let second = approval(&dev, &dev.sk, 0x72, 0, 30);
-    let (status, _, body) = server.approve(&dev.id, access, &second).await;
-    assert_eq!(
-        (status, code(&body).as_str()),
-        (409, "FIRST_DEVICE_ALREADY_CLOSED")
-    );
+    assert_eq!(server.approve(&dev.id, access, &second).await.0, 403);
 
     // After a restart the device proves itself again into root_setup, and the
     // new session, same actor and keys, still gets the stored receipt.
@@ -5130,11 +5128,18 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
     let wrong = format!("{}/revoke", grant_path("0", &[0x82; 16]));
     assert_eq!(server.call(&wrong, &access, Some(&request)).await.0, 422);
 
-    // A second custodian, through ROOT_GRANT_CREATE.
-    // shortcut: its device cannot open a session until ordinary approvals land
-    // (W2 PR5), so its acknowledgement is stamped; the grant itself is filed.
-    let peer = device(&server, OWNER, 0x7b, "active").await;
-    approve_by_copy(&server, &dev, &peer, 0x7b).await;
+    // A second custodian: approved by the first (D-2), granted the root
+    // through ROOT_GRANT_CREATE, and acknowledging it on its own session.
+    let peer = device(&server, OWNER, 0x7b, "pending").await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xd7; 16];
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let peer_approval = approval(&peer, &dev.sk, 0x7b, 0, 30);
+    assert_eq!(
+        server.approve(&peer.id, &access, &peer_approval).await.0,
+        201
+    );
     let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
     let request = root_grant_create_request(0xc4, &dev, &existing);
     assert_eq!(
@@ -5144,12 +5149,29 @@ async fn a_custodian_revokes_a_root_grant_but_never_the_last_one() {
             .0,
         201
     );
-    server
-        .sql(
-            "UPDATE v2_tenant_root_key_grants SET acked_at = 'now' WHERE replay_id = ?",
-            &[&[0x91; 16]],
-        )
-        .await;
+    let peer_access = session(&server, &peer).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_grant = grant_path("0", &[0x91; 16]);
+    // Only its subject reads it, and acknowledges it once.
+    assert_eq!(server.call(&peer_grant, &peer_access, None).await.0, 200);
+    assert_eq!(
+        server.call(&peer_grant, &stranger_access, None).await.0,
+        404
+    );
+    let peer_ack = ack_request(0xd8, grant_ref(&dev, &existing));
+    let ack_peer = format!("{peer_grant}/ack");
+    assert_eq!(
+        server.call(&ack_peer, &access, Some(&peer_ack)).await.0,
+        403
+    );
+    let (status, body) = server.call(&ack_peer, &peer_access, Some(&peer_ack)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.call(&ack_peer, &peer_access, Some(&peer_ack)).await,
+        (201, body)
+    );
 
     // A grant whose device is no longer active makes no custodian, so it does
     // not stand in for the last one.
@@ -6016,4 +6038,116 @@ async fn a_revoked_device_cannot_sign_in_again() {
         );
     }
     pool.close().await;
+}
+
+// ------------------------------------------------------ ordinary approvals ---
+
+/// ADR 0002 D-2: after D1, a custodian holding `device.approve` approves a
+/// second device, which then opens an `ordinary` session.
+#[tokio::test]
+async fn a_custodian_approves_a_second_device_into_an_ordinary_session() {
+    let mut server = start("g201-approve", 28219).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    let joiner = device(&server, OWNER, 0x5b, "pending").await;
+    let setup = session(&server, &joiner).await;
+    assert_eq!(setup["class"], "pending_setup");
+    let setup_access = setup["access_token"].as_str().unwrap().to_string();
+    let rec = approval(&joiner, &dev.sk, 0x5c, 0, 30);
+
+    // Without `device.approve` nothing is approved.
+    assert_eq!(server.approve(&joiner.id, &access, &rec).await.0, 403);
+    // A fleet-scoped grant covers that fleet's approvals, not the tenant's.
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let fleet_duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xc1; 16];
+        g.scope_kind = CapabilityScopeKind::Fleet;
+        g.scope_id = FLEET;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&fleet_duty)).await.0, 201);
+    assert_eq!(server.approve(&joiner.id, &access, &rec).await.0, 403);
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xc2; 16];
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+
+    // Another key's signature, a pending session as the issuer, and a
+    // window past the limit are refused.
+    let forged = approval(&joiner, &joiner.sk, 0x5d, 0, 30);
+    let (status, _, body) = server.approve(&joiner.id, &access, &forged).await;
+    assert_eq!(
+        (status, code(&body).as_str()),
+        (422, "KEY_SUBSTITUTION_DETECTED")
+    );
+    assert_eq!(
+        server.approve(&joiner.id, &setup_access, &forged).await.0,
+        403
+    );
+    let long = approval(&joiner, &dev.sk, 0x5e, 0, 731);
+    assert_eq!(server.approve(&joiner.id, &access, &long).await.0, 403);
+
+    let (status, ct, receipt) = server.approve(&joiner.id, &access, &rec).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt));
+    assert_eq!(ct, "application/cbor");
+    let parsed = DeviceApprovalReceiptV2::parse(&receipt).unwrap();
+    assert_eq!(
+        (
+            parsed.subject_device_id,
+            parsed.actor_device_id,
+            parsed.confirmation_id
+        ),
+        (joiner.id, dev.id, None)
+    );
+    // A retry gets the stored receipt; another actor's is a conflict.
+    let (status, _, again) = server.approve(&joiner.id, &access, &rec).await;
+    assert_eq!((status, &again), (201, &receipt));
+    let (status, _, body) = server.approve(&joiner.id, &setup_access, &rec).await;
+    assert_ne!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // The joiner's setup session ends with the status change; a new one is
+    // ordinary, and approving it twice is refused.
+    assert_eq!(server.me(&setup_access).await.0, 401);
+    let ordinary = session(&server, &joiner).await;
+    assert_eq!(ordinary["class"], "ordinary");
+    let ordinary_access = ordinary["access_token"].as_str().unwrap().to_string();
+    assert_eq!(server.me(&ordinary_access).await.0, 200);
+    let twice = approval(&joiner, &dev.sk, 0x5f, 0, 30);
+    assert_eq!(server.approve(&joiner.id, &access, &twice).await.0, 403);
+    // The joiner is no custodian, so it cannot renew its own approval.
+    let renewal = approval(&joiner, &joiner.sk, 0x60, 0, 30);
+    assert_eq!(
+        server
+            .approve(&joiner.id, &ordinary_access, &renewal)
+            .await
+            .0,
+        403
+    );
+    // A retry after the actor lost `device.approve` is refused.
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET revoked_at = 'now' WHERE replay_id = ?",
+            &[&[0xc2; 16]],
+        )
+        .await;
+    assert_eq!(server.approve(&joiner.id, &access, &rec).await.0, 403);
+
+    // Revoking the approval ends the ordinary session at once.
+    server
+        .sql(
+            "UPDATE v2_device_approvals SET revoked_at = 'now' WHERE subject_device_id = ?",
+            &[&joiner.id],
+        )
+        .await;
+    assert_eq!(server.me(&ordinary_access).await.0, 401);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'")
+            .await,
+        2
+    );
 }
