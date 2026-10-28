@@ -2800,7 +2800,7 @@ async fn every_upload_refusal_has_its_status_and_code() {
         &up1,
         &access,
         &upload_req(0x0e, &second.terms),
-        (409, "UPLOAD_CAPACITY"),
+        (429, "UPLOAD_CAPACITY"),
     )
     .await;
     // Another lease has its own slot.

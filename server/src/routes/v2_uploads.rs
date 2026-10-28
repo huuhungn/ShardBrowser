@@ -397,7 +397,11 @@ pub async fn create_upload(
     .fetch_one(&mut *tx)
     .await?;
     if busy {
-        return Err(conflict(
+        // Plan L1244: UPLOAD_CAPACITY is a 429.
+        // shortcut: no Retry-After header yet; add one when the reconciler
+        // (L1177-L1215) can say when a slot frees.
+        return Err(coded(
+            StatusCode::TOO_MANY_REQUESTS,
             "UPLOAD_CAPACITY",
             "this lease already has an open upload; finish it or let it expire",
         ));
