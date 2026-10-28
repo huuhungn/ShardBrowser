@@ -397,6 +397,11 @@ pub const L_RESTORE_EPOCH_LEAF: &str = "SHARDX-RESTORE-EPOCH-LEAF-V2\0";
 pub const L_RESTORE_EPOCH_NODE2: &str = "SHARDX-RESTORE-EPOCH-NODE2-V2\0";
 pub const L_RESTORE_EPOCH_NODE1: &str = "SHARDX-RESTORE-EPOCH-NODE1-V2\0";
 pub const L_RESTORE_EPOCH_PROOF: &str = "SHARDX-RESTORE-EPOCH-PROOF-V2\0";
+/// Plan 5.6.3 L745 and L748: the transition signs and hashes under its own
+/// labels, not the authorization container's.
+pub const L_RESTORE_EPOCH_TRANSITION_TBS: &str = "SHARDX-RESTORE-EPOCH-TRANSITION-TBS-V2\0";
+pub const L_RESTORE_EPOCH_TRANSITION_CONTAINER: &str =
+    "SHARDX-RESTORE-EPOCH-TRANSITION-CONTAINER-V2\0";
 
 /// Bound on Merkle leaf count, enforced before any allocation sized by input.
 pub const MAX_RESTORE_EPOCH_LEAVES_V2: u64 = 1_000_000;
@@ -641,6 +646,8 @@ mod tests {
             L_RESTORE_EPOCH_NODE2,
             L_RESTORE_EPOCH_NODE1,
             L_RESTORE_EPOCH_PROOF,
+            L_RESTORE_EPOCH_TRANSITION_TBS,
+            L_RESTORE_EPOCH_TRANSITION_CONTAINER,
         ] {
             assert!(label.ends_with('\0'), "missing NUL: {label}");
             assert!(label.is_ascii(), "non-ASCII label: {label}");

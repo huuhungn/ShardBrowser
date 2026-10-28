@@ -27,6 +27,7 @@ pub mod oscrypt;
 pub mod passphrase;
 pub mod portable;
 pub mod recovery_bundle;
+pub mod restore_epoch;
 pub mod session_binding;
 pub mod signing;
 pub mod snapshot;

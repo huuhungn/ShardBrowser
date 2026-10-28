@@ -351,7 +351,10 @@ pub fn restore_epoch_leaf_bytes(
     new_signed_head_hash: &[u8; 32],
 ) -> Vec<u8> {
     c::encode(&c::m(vec![
-        ("domain", c::t("shardx.restore-epoch.profile-head-leaf.v2")),
+        (
+            "domain",
+            c::t(crate::restore_epoch::DOMAIN_RESTORE_EPOCH_LEAF),
+        ),
         ("version", c::u(2)),
         ("tenant_id", c::b(tenant_id)),
         ("profile_id", c::b(profile_id)),
