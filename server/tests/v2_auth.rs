@@ -7431,6 +7431,7 @@ async fn a_root_rotation_rewraps_every_retained_fleet_key_before_it_activates() 
     assert_eq!(
         file!(&access, 0xfa, 0, fkek0, V::Recovery, 0xfb, &late),
         403
+    );
 }
 
 /// Moves the identity record and its mirror to `epoch` and restarts, as a
