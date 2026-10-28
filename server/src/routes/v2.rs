@@ -16,7 +16,7 @@ use crate::auth::AuthUser;
 use crate::authz::{self, VerificationContext};
 use crate::error::AppError;
 use crate::fleet;
-use crate::idempotency::{self, OperationClaim, ReplayClaim, ReplayTable};
+use crate::idempotency::{self, OperationClaim};
 use crate::state::AppState;
 use crate::util;
 
@@ -26,14 +26,6 @@ fn parse_id16(hex: &str, field: &'static str) -> Result<[u8; 16], AppError> {
     bytes
         .try_into()
         .map_err(|_| AppError::BadRequest(format!("{field}: must be 16 bytes")))
-}
-
-/// Parse a 32-byte identifier such as a root key id.
-fn parse_id32(hex: &str, field: &'static str) -> Result<[u8; 32], AppError> {
-    let bytes = decode_hex(hex).ok_or_else(|| AppError::BadRequest(format!("{field}: not hex")))?;
-    bytes
-        .try_into()
-        .map_err(|_| AppError::BadRequest(format!("{field}: expected 32 bytes")))
 }
 
 pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
@@ -136,30 +128,6 @@ pub async fn server_identity(
         "server_instance_id": hex(&instance),
         "restore_epoch": epoch,
     })))
-}
-
-#[derive(Deserialize)]
-pub struct BeginFleetGenerationReq {
-    pub tenant_id: String,
-    pub fleet_id: String,
-    /// Identifier of a fleet key generated on the caller's device. The key
-    /// itself is never sent.
-    pub fkek_key_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct ActivateFleetGenerationReq {
-    pub tenant_id: String,
-    pub fleet_id: String,
-    pub generation: u64,
-}
-
-#[derive(Deserialize)]
-pub struct PresentRecordReq {
-    /// Tenant this operation targets, hex-encoded.
-    pub tenant_id: String,
-    /// Hex-encoded exact signed container bytes, verified as received.
-    pub record_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -837,66 +805,6 @@ fn fleet_error(e: fleet::FleetError) -> AppError {
     }
 }
 
-/// Begin a fleet's first key generation.
-///
-/// The caller generates the fleet key locally and sends only its identifier.
-/// The key never leaves the device, which is why the server can coordinate
-/// custody without being able to read anything sealed under it.
-pub async fn begin_fleet_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<BeginFleetGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let fleet_id = parse_id16(&req.fleet_id, "fleet_id")?;
-    let fkek_key_id = parse_id32(&req.fkek_key_id, "fkek_key_id")?;
-
-    let generation = crate::fleet_generations::begin_first_generation(
-        &app.db,
-        &verified_instance(&app)?,
-        &tenant_id,
-        &fleet_id,
-        &fkek_key_id,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": generation,
-        "state": crate::fleet_generations::STATE_PREPARING,
-    })))
-}
-
-/// Activate a prepared fleet key generation once its holder has proven it can
-/// unwrap the grant it filed.
-pub async fn activate_fleet_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ActivateFleetGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let fleet_id = parse_id16(&req.fleet_id, "fleet_id")?;
-
-    crate::fleet_generations::activate_generation(
-        &app.db,
-        &verified_instance(&app)?,
-        &tenant_id,
-        &fleet_id,
-        req.generation,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": req.generation,
-        "state": crate::fleet_generations::STATE_ACTIVE,
-    })))
-}
-
 /// The fleet's active key generation, or null before one is activated.
 ///
 /// A device reads this to learn which key to encrypt under. Null is a real
@@ -928,111 +836,4 @@ pub async fn get_active_fleet_generation(
         }),
         None => serde_json::Value::Null,
     }))
-}
-
-/// File a fleet key grant.
-///
-/// The record is verified, then read entirely from its signed fields. The
-/// server stores ciphertext it cannot open.
-pub async fn present_fleet_key_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_FLEET_KEY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Only a member may file a grant for this tenant. The signature proves an
-    // issuer wrote the record, not that the caller may deposit it here.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    // Read the grant from the signed fields before claiming the replay id, so a
-    // malformed record does not burn one.
-    let row = crate::fleet_grants::fleet_grant_row_from_record(&verified)?;
-
-    crate::fleet_generations::check_grant_against_generation(
-        &app.db,
-        &ctx.server_instance_id,
-        &tenant_id,
-        &row.fleet_id,
-        row.fleet_generation,
-        &row.fkek_key_id,
-        &row.grant_variant,
-    )
-    .await?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::FleetKeyGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record replay id has already been used".into(),
-            ));
-        }
-    }
-
-    crate::fleet_grants::insert_fleet_grant(
-        &app.db,
-        &tenant_id,
-        &ctx.server_instance_id,
-        ctx.restore_epoch,
-        &verified,
-        &record_bytes,
-        &row,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({ "stored": true })))
-}
-
-/// Every fleet key grant addressed to one device.
-pub async fn list_fleet_key_grants(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::extract::Path((tenant_hex, device_hex)): axum::extract::Path<(String, String)>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
-    let device_id = parse_id16(&device_hex, "device_id")?;
-
-    // Membership is checked against the authenticated user, not the path, so a
-    // caller cannot read another tenant's grants by naming that tenant.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let grants =
-        crate::fleet_grants::fleet_grants_for_device(&app.db, &tenant_id, &device_id).await?;
-
-    let items: Vec<_> = grants
-        .into_iter()
-        .map(|g| {
-            serde_json::json!({
-                "grant_variant": g.grant_variant,
-                "fleet_id": hex(&g.fleet_id),
-                "fkek_key_id": hex(&g.fkek_key_id),
-                "fleet_generation": g.fleet_generation,
-                "recipient_hpke_key_id": hex(&g.recipient_hpke_key_id),
-                "hpke_info_hex": hex(&g.hpke_info_bytes),
-                "hpke_encapped_key_hex": hex(&g.hpke_encapped_key_bytes),
-                "hpke_wrapped_fkek_hex": hex(&g.hpke_wrapped_fkek_bytes),
-                "signed_container_hex": hex(&g.exact_signed_container_bytes),
-                "created_at": g.created_at,
-            })
-        })
-        .collect();
-
-    Ok(axum::Json(serde_json::json!({ "grants": items })))
 }

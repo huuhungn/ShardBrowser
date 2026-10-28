@@ -149,22 +149,9 @@ pub fn router(state: AppState) -> Router {
             "/v2/tenants/:tenant_id/devices/:device_id/root-key-grants",
             get(v2::list_tenant_root_key_grants),
         )
-        .route("/v2/fleet-key-grants", post(v2::present_fleet_key_grant))
-        .route(
-            "/v2/fleet-key-generations",
-            post(v2::begin_fleet_generation),
-        )
-        .route(
-            "/v2/fleet-key-generations/activate",
-            post(v2::activate_fleet_generation),
-        )
         .route(
             "/v2/tenants/:tenant_id/fleets/:fleet_id/key-generation",
             get(v2::get_active_fleet_generation),
-        )
-        .route(
-            "/v2/tenants/:tenant_id/devices/:device_id/fleet-key-grants",
-            get(v2::list_fleet_key_grants),
         )
         .route("/v2/operations", post(v2::begin_idempotent_operation))
         .route(

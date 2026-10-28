@@ -24,9 +24,6 @@ pub const DOMAIN_DEVICE_APPROVAL: &str = "shardx.authorization.device-approval.v
 #[cfg(test)]
 pub const DOMAIN_CAPABILITY_GRANT: &str = "shardx.authorization.capability-grant.v2";
 
-/// Fleet key grant records. Distinct from the root domain so a root grant
-/// can never be verified as a fleet grant, or the reverse.
-pub const DOMAIN_FLEET_KEY_GRANT: &str = "shardx.authorization.fleet-key-grant.v2";
 /// Domain separator for snapshot manifests.
 ///
 /// Publishing a version is its own authorized action: reusing a capability
@@ -143,22 +140,6 @@ impl VerifiedRecord {
     }
 
     /// Read a signed unsigned integer.
-    /// Read a signed text field.
-    pub fn signed_text(&self, name: &'static str) -> Option<String> {
-        text_field(&self.fields, name).ok()
-    }
-
-    /// Read a signed byte string of unconstrained length.
-    ///
-    /// Separate from `signed_id16`/`signed_hash32` because the HPKE payload
-    /// fields have no fixed width; length is whatever the sealer produced.
-    pub fn signed_bytes(&self, name: &'static str) -> Option<Vec<u8>> {
-        match field(&self.fields, name).ok()? {
-            c::Value::Bytes(b) => Some(b.clone()),
-            _ => None,
-        }
-    }
-
     pub fn signed_uint(&self, name: &'static str) -> Option<u64> {
         uint_field(&self.fields, name).ok()
     }

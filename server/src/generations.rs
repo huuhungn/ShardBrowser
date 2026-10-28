@@ -2,8 +2,7 @@
 //!
 //! Generations are created by the S6 bootstrap (`routes::v2_root`) and, later,
 //! by rotation; activation follows readback and acknowledgement (plan 5.6.4).
-//! What remains here is the read side the fleet key paths use: which
-//! generation is ACTIVE, and what a given generation commits to.
+//! What remains here is the read side: which generation is ACTIVE.
 //!
 //! Every row and lookup is keyed by `server_instance_id + tenant_id` (plan
 //! 7.2/7.4): callers pass the instance the startup check verified.
@@ -24,39 +23,6 @@ pub struct Generation {
     #[allow(dead_code)]
     pub created_at: String,
     pub activated_at: Option<String>,
-}
-
-/// Look up one generation.
-pub async fn get_generation(
-    db: &SqlitePool,
-    instance: &[u8; 16],
-    tenant_id: &[u8; 16],
-    generation: u64,
-) -> Result<Option<Generation>, AppError> {
-    let row = sqlx::query(
-        "SELECT generation, root_key_id, state, created_at, activated_at \
-         FROM v2_root_key_generations \
-         WHERE server_instance_id = ?3 AND tenant_id = ?1 AND generation = ?2",
-    )
-    .bind(tenant_id.as_slice())
-    .bind(crate::util::sql_int(generation)?)
-    .bind(instance.as_slice())
-    .fetch_optional(db)
-    .await?;
-
-    let Some(row) = row else { return Ok(None) };
-    let key: Vec<u8> = row.try_get("root_key_id")?;
-    let root_key_id: [u8; 32] = key
-        .try_into()
-        .map_err(|_| AppError::Internal("stored root_key_id is not 32 bytes".into()))?;
-
-    Ok(Some(Generation {
-        generation: crate::util::stored_uint(row.try_get("generation")?)?,
-        root_key_id,
-        state: row.try_get("state")?,
-        created_at: row.try_get("created_at")?,
-        activated_at: row.try_get("activated_at")?,
-    }))
 }
 
 /// The tenant's ACTIVE generation, if it has one.

@@ -4765,6 +4765,30 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     file!(0xb1, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
     file!(0xb2, 0, fkek0, V::Recovery, 0xd1, &recovery0);
 
+    // The launcher's v1 read reports only what this lifecycle activates.
+    server
+        .sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin')
+              WHERE id = ?",
+            &[&OWNER],
+        )
+        .await;
+    let (_, login) = server
+        .post(
+            "/auth/login",
+            None,
+            json!({ "username": "admin", "password": "secret" }),
+        )
+        .await;
+    let v1 = login["token"].as_str().unwrap().to_string();
+    let active_path = format!(
+        "/v2/tenants/{}/fleets/{}/key-generation",
+        hex(&TENANT),
+        hex(&FLEET)
+    );
+    let (status, body) = server.call(&active_path, &v1, None).await;
+    assert_eq!((status, body.as_slice()), (200, b"null".as_slice()));
+
     // Activation waits for every required acknowledgement (D-4, D-9).
     let activate0 = activate(0xb3, terms0);
     let ack0 = format!("{path}/0/ack");
@@ -4965,6 +4989,17 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         .call(&activate1_path, &access, Some(&activate(0xc8, terms1)))
         .await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = server.call(&active_path, &v1, None).await;
+    let active: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, 200, "{active}");
+    assert_eq!(
+        (
+            &active["generation"],
+            &active["fkek_key_id"],
+            &active["state"]
+        ),
+        (&json!(1), &json!(hex(&fkek1)), &json!("ACTIVE"))
+    );
 
     // Revoking the generation-1 device grant marks it and keeps the row.
     let revocation = FleetGrantRevocation {
