@@ -31,6 +31,7 @@ pub mod restore_epoch;
 pub mod session_binding;
 pub mod signing;
 pub mod snapshot;
+pub mod snapshot_v2;
 pub mod trust_chain;
 pub mod trust_evidence;
 pub mod webdata;
