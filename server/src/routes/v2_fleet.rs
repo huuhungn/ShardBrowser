@@ -138,7 +138,7 @@ pub(crate) async fn holds_capability(
 
 /// The tenant's ACTIVE root generation and its key, if the pointer names this
 /// instance's ACTIVE row (ADR 0001 L419-L423).
-async fn active_root(
+pub(crate) async fn active_root(
     conn: &mut SqliteConnection,
     v: &Verified,
     tenant: &[u8; 16],

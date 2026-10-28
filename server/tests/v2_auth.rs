@@ -6166,3 +6166,467 @@ async fn a_custodian_approves_a_second_device_into_an_ordinary_session() {
         2
     );
 }
+
+/// A root grant of `trk` as `generation`, of `variant`, from `issuer` to
+/// `subject`, linked to the subject's approval `approval` and sealed to its
+/// HPKE key.
+fn root_grant_of(
+    issuer: &Device,
+    subject: &Device,
+    approval: u8,
+    replay: u8,
+    trk: &[u8; 32],
+    generation: u64,
+    variant: RootGrantVariant,
+) -> Vec<u8> {
+    let start = now_ms() - 60_000;
+    let mut g = TenantRootKeyGrantV2 {
+        common: CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        variant,
+        root_key_id: shared::keys::root_key_id(trk),
+        root_generation: generation,
+        subject_account_id: OWNER,
+        subject_device_id: subject.id,
+        subject_signing_key_id: subject.signing_key_id,
+        recipient_hpke_key_id: subject.hpke_key_id,
+        subject_device_approval_replay_id: [approval; 16],
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let sealed = shared::grants::seal_trk(&subject.hpke_pk, &g.scope(), trk).unwrap();
+    g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+    g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+    build_record(&issuer.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+}
+
+/// The terms of generation `generation` of `trk`, held by `members`.
+fn rotation_target(trk: &[u8; 32], generation: u64, members: &[&[u8]]) -> RootGenerationTarget {
+    let hashes: Vec<[u8; 32]> = members.iter().map(|m| container_hash(m)).collect();
+    RootGenerationTarget {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        root_key_id: shared::keys::root_key_id(trk),
+        root_generation: generation,
+        required_custodian_grant_count: hashes.len() as u32,
+        required_custodian_grant_set_hash: root_custodian_grant_set_hash(&hashes).unwrap(),
+        recovery_bundle_sha256: [0x5b; 32],
+    }
+}
+
+fn rotation_create(key: u8, target: RootGenerationTarget, previous: PreviousRoot) -> Vec<u8> {
+    root_request(
+        key,
+        &TenantRootGenerationCreateV2 {
+            target,
+            mode: RootGenerationMode::Rotation {
+                previous_root_key_id: previous.root_key_id,
+                previous_root_generation: previous.root_generation,
+            },
+        },
+    )
+}
+
+fn rotation_activate(key: u8, target: RootGenerationTarget, previous: PreviousRoot) -> Vec<u8> {
+    lifecycle_request(
+        OperationKind::RootGenerationActivate,
+        key,
+        TenantRootGenerationActivateV2 {
+            target,
+            previous: Some(previous),
+        }
+        .encode(),
+    )
+}
+
+#[tokio::test]
+async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
+    let mut server = start("root-rotate", 28220).await;
+    let (a, access, _) = custodian(&mut server, 0x6e).await;
+    let grants_path = |generation: u64| {
+        format!(
+            "/v2/tenants/{}/root-key-generations/{generation}/grants",
+            hex(&TENANT)
+        )
+    };
+    let ack_path =
+        |generation: &str, replay: u8| format!("{}/ack", grant_path(generation, &[replay; 16]));
+    let key_rotate = |replay: u8| {
+        capability_grant(&a, &a.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = Capability::KeyRotate;
+        })
+    };
+
+    // Only the bootstrap files a FirstRootSelfGrant.
+    let second_self = self_grant(&a, &TRK, |g| g.common.replay_id = [0xea; 16]);
+    let request = root_grant_create_request(0xcf, &a, &second_self);
+    let (status, body) = server.call(&grants_path(0), &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+
+    // B joins through A's `device.approve`, at tenant scope.
+    let duty = capability_grant(&a, &a.sk, |g| g.common.replay_id = [0xc2; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let b = device(&server, OWNER, 0x5b, "pending").await;
+    session(&server, &b).await;
+    let rec = approval(&b, &a.sk, 0x5c, 0, 30);
+    assert_eq!(server.approve(&b.id, &access, &rec).await.0, 201);
+    let b_access = session(&server, &b).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let k0 = shared::keys::root_key_id(&TRK);
+    let gen0 = PreviousRoot {
+        root_key_id: k0,
+        root_generation: 0,
+    };
+    let after0 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: k0,
+        previous_root_generation: 0,
+    };
+    let trk1 = [0x7d; 32];
+    let grant_a = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe1, &trk1, 1, after0);
+    let grant_b = root_grant_of(&a, &b, 0x5c, 0xe2, &trk1, 1, after0);
+    let target = rotation_target(&trk1, 1, &[grant_a.as_slice(), grant_b.as_slice()]);
+    let create = rotation_create(0xd1, target.clone(), gen0);
+
+    // A custodian without `key.rotate` rotates nothing.
+    assert_eq!(server.root(&TENANT, &access, &create).await.0, 403);
+    assert_eq!(
+        server
+            .call(GRANTS, &access, Some(&key_rotate(0xc3)))
+            .await
+            .0,
+        201
+    );
+    // A rotation follows exactly the ACTIVE root.
+    let wrong_previous = PreviousRoot {
+        root_key_id: [0x33; 32],
+        root_generation: 0,
+    };
+    let wrong = rotation_create(0xd2, target.clone(), wrong_previous);
+    let (status, body) = server.root(&TENANT, &access, &wrong).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    let (status, created) = server.root(&TENANT, &access, &create).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&created));
+    let stored = IdempotentStoredResponseV2::parse(&created).unwrap();
+    let parsed =
+        TenantRootGenerationCreatedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (parsed.target, parsed.mode),
+        (
+            target.clone(),
+            RootGenerationMode::Rotation {
+                previous_root_key_id: k0,
+                previous_root_generation: 0,
+            }
+        )
+    );
+    assert_eq!(server.root(&TENANT, &access, &create).await, (201, created));
+    // One rotation is PREPARING at a time.
+    let trk_other = [0x7e; 32];
+    let other = rotation_create(
+        0xd3,
+        rotation_target(&trk_other, 1, &[grant_a.as_slice()]),
+        gen0,
+    );
+    let (status, body) = server.root(&TENANT, &access, &other).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    // Rotation grants come from a custodian of the ACTIVE root, name it
+    // exactly and wrap the PREPARING key; an ExistingRootGrant cannot target
+    // a PREPARING generation.
+    let path1 = grants_path(1);
+    let by_b = root_grant_of(&b, &b, 0x5c, 0xe3, &trk1, 1, after0);
+    let request = root_grant_create_request(0xd4, &b, &by_b);
+    assert_eq!(server.call(&path1, &b_access, Some(&request)).await.0, 403);
+    let renamed = RootGrantVariant::RotationGrant {
+        previous_root_key_id: [0x33; 32],
+        previous_root_generation: 0,
+    };
+    let off = root_grant_of(&a, &b, 0x5c, 0xe4, &trk1, 1, renamed);
+    let request = root_grant_create_request(0xd5, &a, &off);
+    let (status, body) = server.call(&path1, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let other_key = root_grant_of(&a, &b, 0x5c, 0xe5, &trk_other, 1, after0);
+    let request = root_grant_create_request(0xd6, &a, &other_key);
+    let (status, body) = server.call(&path1, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let existing = root_grant_of(
+        &a,
+        &b,
+        0x5c,
+        0xe6,
+        &trk1,
+        1,
+        RootGrantVariant::ExistingRootGrant,
+    );
+    let request = root_grant_create_request(0xd7, &a, &existing);
+    assert_eq!(server.call(&path1, &access, Some(&request)).await.0, 403);
+    for (key, grant) in [(0xd8, &grant_a), (0xd9, &grant_b)] {
+        let request = root_grant_create_request(key, &a, grant);
+        let (status, body) = server.call(&path1, &access, Some(&request)).await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    }
+
+    // Each subject reads its own grant back and acknowledges it.
+    let (status, body) = server
+        .call(&grant_path("1", &[0xe2; 16]), &b_access, None)
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let read = TenantRootGrantDescriptorV2::parse(&body, a.sk.verifying_key().as_bytes()).unwrap();
+    assert_eq!(
+        (read.grant_state(), read.generation_state()),
+        (RootGrantState::PendingAck, RootGenerationState::Preparing)
+    );
+    let ack_a = ack_request(0xda, grant_ref(&a, &grant_a));
+    assert_eq!(
+        server
+            .call(&ack_path("1", 0xe1), &access, Some(&ack_a))
+            .await
+            .0,
+        201
+    );
+    // Not before every required grant is acknowledged.
+    let activate = rotation_activate(0xdb, target.clone(), gen0);
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&activate))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    let ack_b = ack_request(0xdc, grant_ref(&a, &grant_b));
+    assert_eq!(
+        server
+            .call(&ack_path("1", 0xe2), &b_access, Some(&ack_b))
+            .await
+            .0,
+        201
+    );
+
+    // B is no custodian yet; it neither activates nor issues.
+    let b_activate = rotation_activate(0xdd, target.clone(), gen0);
+    assert_eq!(
+        server
+            .call(&activate_path("1"), &b_access, Some(&b_activate))
+            .await
+            .0,
+        403
+    );
+    let b_duty = capability_grant(&b, &b.sk, |g| g.common.replay_id = [0xc6; 16]);
+    assert_eq!(server.call(GRANTS, &b_access, Some(&b_duty)).await.0, 403);
+    // Other terms, another previous root, or no `key.rotate` are refused.
+    let mut wrong_set = target.clone();
+    wrong_set.required_custodian_grant_set_hash = [0x44; 32];
+    let request = rotation_activate(0xde, wrong_set, gen0);
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&request))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let request = rotation_activate(0xdf, target.clone(), wrong_previous);
+    let (status, body) = server
+        .call(&activate_path("1"), &access, Some(&request))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+    server
+        .sql(
+            "UPDATE v2_capability_grants SET revoked_at = 'now' WHERE replay_id = ?",
+            &[&[0xc3; 16]],
+        )
+        .await;
+    assert_eq!(
+        server
+            .call(&activate_path("1"), &access, Some(&activate))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        server
+            .call(GRANTS, &access, Some(&key_rotate(0xc4)))
+            .await
+            .0,
+        201
+    );
+
+    let (status, activated) = server
+        .call(&activate_path("1"), &access, Some(&activate))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&activated));
+    let stored = IdempotentStoredResponseV2::parse(&activated).unwrap();
+    let parsed =
+        TenantRootGenerationActivatedV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+    assert_eq!(
+        (parsed.target, parsed.previous),
+        (target.clone(), Some(gen0))
+    );
+    assert_eq!(
+        server
+            .call(&activate_path("1"), &access, Some(&activate))
+            .await,
+        (201, activated)
+    );
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 0 AND state = 'RETIRED' AND retired_at IS NOT NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 1 AND state = 'ACTIVE' AND activated_at IS NOT NULL",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_tenants WHERE active_root_generation = 1",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.rotate'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_audit_events WHERE action = 'root.activate'",
+            2,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+    // B now holds custody of the ACTIVE root.
+    assert_eq!(server.call(GRANTS, &b_access, Some(&b_duty)).await.0, 201);
+
+    // A RotationGrant cannot target the now ACTIVE generation, and a new
+    // generation cannot reuse a key an older one had.
+    let late = root_grant_of(&a, &b, 0x5c, 0xe7, &trk1, 1, after0);
+    let request = root_grant_create_request(0xe0, &a, &late);
+    let (status, body) = server.call(&path1, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    let k1 = shared::keys::root_key_id(&trk1);
+    let gen1 = PreviousRoot {
+        root_key_id: k1,
+        root_generation: 1,
+    };
+    let after1 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: k1,
+        previous_root_generation: 1,
+    };
+    let reused = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe8, &TRK, 2, after1);
+    let request = rotation_create(0xe1, rotation_target(&TRK, 2, &[reused.as_slice()]), gen1);
+    let (status, body) = server.root(&TENANT, &access, &request).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    // D-5: a retained fleet generation keeps the next rotation from
+    // activating, since it has no recovery grant under the new root.
+    let trk2 = [0x7f; 32];
+    let grant2 = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe9, &trk2, 2, after1);
+    let target2 = rotation_target(&trk2, 2, &[grant2.as_slice()]);
+    let create2 = rotation_create(0xe2, target2.clone(), gen1);
+    assert_eq!(server.root(&TENANT, &access, &create2).await.0, 201);
+    let request = root_grant_create_request(0xe3, &a, &grant2);
+    assert_eq!(
+        server
+            .call(&grants_path(2), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let ack = ack_request(0xe4, grant_ref(&a, &grant2));
+    assert_eq!(
+        server
+            .call(&ack_path("2", 0xe9), &access, Some(&ack))
+            .await
+            .0,
+        201
+    );
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_fleet_key_generations
+                 (server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                  root_generation, state, created_at, activated_at)
+             VALUES (?, ?, ?, 0, ?, 1, 'ACTIVE', 'now', 'now')",
+            &[&INSTANCE, &TENANT, &FLEET, &[0xe0; 32]],
+        )
+        .await;
+    let request = rotation_activate(0xe5, target2, gen1);
+    let (status, body) = server
+        .call(&activate_path("2"), &access, Some(&request))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "ROOT_GENERATION_MISMATCH")
+    );
+
+    // Behind the trigger's back, store a create response that parses and
+    // hashes consistently but names another previous root.
+    let (status, created) = server.root(&TENANT, &access, &create2).await;
+    assert_eq!(status, 201);
+    let mut forged = IdempotentStoredResponseV2::parse(&created).unwrap();
+    let mut payload =
+        TenantRootGenerationCreatedV2::parse(&forged.canonical_response_payload_bytes).unwrap();
+    payload.mode = RootGenerationMode::Rotation {
+        previous_root_key_id: [0x33; 32],
+        previous_root_generation: 1,
+    };
+    forged.canonical_response_payload_bytes = payload.encode();
+    let forged = forged.encode();
+    server
+        .sql("DROP TRIGGER v2_idempotency_succeeded_is_fixed", &[])
+        .await;
+    server
+        .sql(
+            "UPDATE v2_idempotency SET exact_response_bytes = ?, exact_response_bytes_sha256 = ?
+              WHERE operation_kind = 'ROOT_GENERATION_CREATE' AND idempotency_key = ?",
+            &[&forged, &sha256(&forged), &[0xe2; 16]],
+        )
+        .await;
+    let (status, body) = server.root(&TENANT, &access, &create2).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+}
