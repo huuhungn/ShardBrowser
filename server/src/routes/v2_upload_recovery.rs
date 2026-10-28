@@ -4,14 +4,18 @@
 //! upload is classified by its receipt `R`, immutable object `I` and staging
 //! file `S` (L1182-L1185) and gets the one action its row of the L1187-L1214
 //! table names ([`decide`]). An upload is re-read after each write and settles
-//! in a few steps; a failed step is retried a bounded number of times and then
-//! quarantines the upload with a reason code (L1216). No pass deletes
-//! quarantined evidence or an immutable object, so a second pass changes
-//! nothing.
+//! in a few steps; a failed step is retried a bounded number of times, with a
+//! short backoff, and then quarantines the upload with a reason code (L1216).
+//! No pass deletes quarantined evidence or an immutable object, so a second
+//! pass changes nothing.
 //!
 //! A COMMITTED upload keeps its state when it quarantines: 0026 binds that
 //! state to the exact receipt. Its `v2_upload_quarantine` row is the
-//! quarantine, and its snapshot is no longer served.
+//! quarantine, and its snapshot is no longer served. A quarantine row is never
+//! removed, so the pass fails closed instead, writing none, when the evidence
+//! may only be out of reach: the blob root is missing (a volume not mounted,
+//! another data directory), a COMMITTED object is missing, or a COMMITTED
+//! upload keeps failing. v2 writes stay off until an operator fixes it.
 //!
 //! GC (L1175-L1176): expired OPEN uploads are ABORTED and every ABORTED
 //! upload's staging file goes.
@@ -20,11 +24,14 @@
 //! committed) stays on disk. L1176 deletes one only "after grace + audit", the
 //! plan sets no grace, and `v2_audit_events` takes an actor-less row only from
 //! the offline CLI (0010); add that GC with a grace value and a system actor.
-//! shortcut: every start re-hashes every COMMITTED object; record a verified
-//! pass when startup time matters.
+//! shortcut: every start re-hashes every COMMITTED object before the listener
+//! binds, so startup time grows with the stored ciphertext; move to
+//! incremental verification (a verified-at mark per object, re-hashed on
+//! change or on a schedule) once that exceeds the readiness budget.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use sha2::{Digest, Sha256};
@@ -34,7 +41,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use shared::canonical::sha256;
 use shared::snapshot_v2::{CommitReceiptBindingV2, CommitRequestV2, OPERATION_SCOPE_COMMIT};
 
-use super::v2_uploads::{promote, upload, writer, Upload};
+use super::v2_uploads::{promote, ready, upload, writer, Upload};
 use crate::error::AppError;
 use crate::fleet;
 use crate::identity::Verified;
@@ -42,6 +49,9 @@ use crate::util::{now_ms, stored_uint};
 
 /// Tries per upload before its failure quarantines it (L1216).
 const ATTEMPTS: usize = 3;
+/// The wait before try `n + 1` is `n` times this: a file another process
+/// holds for a moment (an antivirus scan) is not a quarantine.
+const BACKOFF_MS: u64 = 200;
 /// The longest chain of rows one upload walks: L1197, L1206, L1213, L1212.
 const STEPS: usize = 4;
 
@@ -63,7 +73,8 @@ enum Action {
     Keep,
     /// The reason code, and whether it is a security incident.
     Quarantine(&'static str, bool),
-    /// Re-hash, rename if still staged, flush file and directory, CAS `READY`.
+    /// Re-hash, rename if still staged, flush file and directory, then store
+    /// the READY response and CAS `READY` ([`ready`]).
     Promote,
     /// CAS `COMMITTED` with the exact receipt.
     Commit,
@@ -114,7 +125,7 @@ fn decide(state: &str, r: C, i: C, s: C) -> Action {
         ("READY", Absent, Valid, Valid) => DropStaging,
         // L1209
         ("COMMITTED", Invalid | Absent, _, _) => Quarantine("receipt_invalid", true),
-        // L1210
+        // L1210 (`I = Ø` fails the pass first: see `run`)
         ("COMMITTED", Valid, Invalid | Absent, _) => Quarantine("object_invalid", true),
         // L1211
         ("COMMITTED", Valid, Valid, Invalid) => Quarantine("staging_invalid", false),
@@ -122,8 +133,9 @@ fn decide(state: &str, r: C, i: C, s: C) -> Action {
         ("COMMITTED", Valid, Valid, Absent) => Keep,
         // L1213
         ("COMMITTED", Valid, Valid, Valid) => DropStaging,
-        // L1214: QUARANTINED (and ABORTED, for GC) never reach the table.
-        _ => Keep,
+        // L1214: QUARANTINED and ABORTED never reach the table, and the arms
+        // above cover every other input (a test enumerates them). Fail closed.
+        _ => Quarantine("unclassified", true),
     }
 }
 
@@ -157,47 +169,86 @@ pub async fn run(pool: &SqlitePool, v: &Verified, blob_dir: &str) -> anyhow::Res
     .bind(v.server_instance_id.as_slice())
     .fetch_all(pool)
     .await?;
+    if !ids.is_empty() && !root.try_exists()? {
+        bail!(
+            "the blob root {} is missing; mount it or fix SHARDX_DATA_DIR",
+            root.display()
+        );
+    }
+    out_of_reach(pool, v).await?;
     for (tenant, id) in ids {
         let mut attempt = 0;
         loop {
             attempt += 1;
             let mut conn = pool.acquire().await?;
-            match settle(&mut conn, v, root, &tenant, &id, &mut report).await {
-                Ok(()) => break,
-                Err(e) if attempt < ATTEMPTS => {
-                    report.retried += 1;
-                    tracing::warn!("upload reconciliation retry {attempt}: {e:#}");
-                }
-                Err(e) => {
-                    tracing::warn!("upload reconciliation failed: {e:#}");
-                    let state: String = sqlx::query_scalar(
-                        "SELECT state FROM v2_uploads
-                          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
-                    )
-                    .bind(v.server_instance_id.as_slice())
-                    .bind(&tenant)
-                    .bind(&id)
-                    .fetch_one(&mut *conn)
-                    .await?;
-                    quarantine(
-                        &mut conn,
-                        v,
-                        &tenant,
-                        &id,
-                        &state,
-                        "reconcile_failed",
-                        false,
-                    )
-                    .await?;
-                    report.quarantined += 1;
-                    break;
-                }
+            let Err(e) = settle(&mut conn, v, root, &tenant, &id, &mut report).await else {
+                break;
+            };
+            if attempt < ATTEMPTS {
+                report.retried += 1;
+                tracing::warn!("upload reconciliation retry {attempt}: {e:#}");
+                drop(conn);
+                tokio::time::sleep(Duration::from_millis(BACKOFF_MS * attempt as u64)).await;
+                continue;
             }
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM v2_uploads
+                  WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
+            )
+            .bind(v.server_instance_id.as_slice())
+            .bind(&tenant)
+            .bind(&id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if state == "COMMITTED" {
+                return Err(e.context("a COMMITTED upload keeps failing; v2 writes stay off"));
+            }
+            tracing::warn!("upload reconciliation failed: {e:#}");
+            quarantine(
+                &mut conn,
+                v,
+                &tenant,
+                &id,
+                &state,
+                "reconcile_failed",
+                false,
+            )
+            .await?;
+            report.quarantined += 1;
+            break;
         }
     }
     gc(pool, v, &mut report).await?;
     gate(pool, v).await?;
     Ok(report)
+}
+
+/// Fails the pass when a COMMITTED object is missing (L1210 `I = Ø`): that is
+/// more often a path out of reach than a lost object, and its quarantine
+/// could never be undone.
+async fn out_of_reach(pool: &SqlitePool, v: &Verified) -> anyhow::Result<()> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT immutable_path FROM v2_uploads u
+          WHERE server_instance_id = ? AND state = 'COMMITTED'
+            AND NOT EXISTS (SELECT 1 FROM v2_upload_quarantine q
+                             WHERE q.server_instance_id = u.server_instance_id
+                               AND q.tenant_id = u.tenant_id AND q.upload_id = u.upload_id)",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .fetch_all(pool)
+    .await?;
+    let missing = tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|p| Path::new(p).try_exists())
+            .filter(|e| !matches!(e, Ok(true)))
+            .count()
+    })
+    .await?;
+    if missing > 0 {
+        bail!("{missing} committed object(s) are missing or unreadable; is the blob root right?");
+    }
+    Ok(())
 }
 
 /// L1216: v2 writes stay off until no FINALIZING upload is left.
@@ -248,7 +299,7 @@ fn app(e: AppError) -> anyhow::Error {
 }
 
 /// Walks one upload through the table until an action keeps it or it
-/// quarantines, under its writer (L1216).
+/// quarantines, under its writer (L1216). File work runs off the runtime.
 async fn settle(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -276,8 +327,14 @@ async fn settle(
         };
         let staging = PathBuf::from(&u.staging_path);
         let (r, receipt) = receipt(conn, v, &row, &u).await?;
-        let i = immutable(&object, &u)?;
-        let s = staged(conn, v, id, &staging, &u).await?;
+        let chunks = chunks(conn, v, id, &u).await?;
+        fault(id, "io")?;
+        let (files, u) = blocking({
+            let (object, staging) = (object.clone(), staging.clone());
+            move || (files(&object, &staging, &u, chunks), u)
+        })
+        .await?;
+        let (i, s) = files?;
         match decide(&u.state, r, i, s) {
             Action::Keep => {
                 report.kept += 1;
@@ -289,18 +346,26 @@ async fn settle(
                 return Ok(());
             }
             Action::Promote => {
-                let state = u.state.clone();
-                if let Err(code) = promote(&staging, &object, &u)? {
-                    quarantine(conn, v, tenant, id, &state, code, false).await?;
+                let (promoted, u) = blocking({
+                    let (object, staging) = (object.clone(), staging.clone());
+                    move || (promote(&staging, &object, &u), u)
+                })
+                .await?;
+                if let Err(code) = promoted? {
+                    quarantine(conn, v, tenant, id, &u.state, code, false).await?;
                     report.quarantined += 1;
                     return Ok(());
                 }
-                cas(conn, v, tenant, id, "FINALIZING", "READY", None).await?;
+                fault(id, "cas")?;
+                let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+                ready(&mut tx, v, &u, &upload_id).await.map_err(app)?;
+                tx.commit().await?;
                 report.promoted += 1;
             }
             Action::Commit => {
                 let receipt = receipt.ok_or_else(|| anyhow!("a valid receipt has bytes"))?;
-                cas(conn, v, tenant, id, "READY", "COMMITTED", Some(&receipt)).await?;
+                fault(id, "cas")?;
+                commit(conn, v, tenant, id, &receipt).await?;
                 report.committed += 1;
             }
             Action::DropStaging => {
@@ -315,34 +380,30 @@ async fn settle(
     bail!("an upload did not settle in {STEPS} steps")
 }
 
-/// `from -> to`, only if the upload is still at `from`; `COMMITTED` also
-/// stores the exact receipt the ledger holds (L1206).
-async fn cas(
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
+    Ok(tokio::task::spawn_blocking(f).await?)
+}
+
+/// `READY -> COMMITTED`, storing the exact receipt the ledger holds (L1206).
+/// A CAS that misses is seen by the next re-read.
+async fn commit(
     conn: &mut SqliteConnection,
     v: &Verified,
     tenant: &[u8],
     id: &[u8],
-    from: &str,
-    to: &str,
-    receipt: Option<&[u8]>,
+    receipt: &[u8],
 ) -> anyhow::Result<()> {
-    fault(id, "cas")?;
-    // A CAS that misses is seen by the next re-read.
     sqlx::query(
         "UPDATE v2_uploads
-            SET state = ?,
-                exact_commit_receipt_binding_bytes = coalesce(?, exact_commit_receipt_binding_bytes),
-                commit_receipt_binding_bytes_sha256 =
-                    coalesce(?, commit_receipt_binding_bytes_sha256)
-          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ? AND state = ?",
+            SET state = 'COMMITTED', exact_commit_receipt_binding_bytes = ?,
+                commit_receipt_binding_bytes_sha256 = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ? AND state = 'READY'",
     )
-    .bind(to)
     .bind(receipt)
-    .bind(receipt.map(|r| sha256(r).to_vec()))
+    .bind(sha256(receipt).as_slice())
     .bind(v.server_instance_id.as_slice())
     .bind(tenant)
     .bind(id)
-    .bind(from)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -396,8 +457,9 @@ async fn quarantine(
 
 /// `R` (L1184): `V` only when the ledger holds the exact receipt, any stored
 /// copy is the same bytes and hash, it binds the exact request, and the one
-/// snapshot of this upload has its version, head and manifest at or below
-/// the profile's version. Returns the receipt bytes when `V`.
+/// snapshot of this upload has its version, head, manifest, object path and
+/// ciphertext hash, at or below the profile's version. Returns the receipt
+/// bytes when `V`.
 async fn receipt(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -406,7 +468,9 @@ async fn receipt(
 ) -> anyhow::Result<(C, Option<Vec<u8>>)> {
     let id: Vec<u8> = row.get("upload_id");
     let snapshots = sqlx::query(
-        "SELECT version, head_hash, signed_manifest_container_bytes FROM v2_snapshots
+        "SELECT version, head_hash, signed_manifest_container_bytes, immutable_blob_path,
+                ciphertext_sha256
+           FROM v2_snapshots
           WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?",
     )
     .bind(v.server_instance_id.as_slice())
@@ -414,16 +478,22 @@ async fn receipt(
     .bind(&id)
     .fetch_all(&mut *conn)
     .await?;
-    let ledger: Option<Vec<u8>> = match &u.commit_request {
+    let request = u
+        .commit_request
+        .as_deref()
+        .and_then(|r| CommitRequestV2::parse(r).ok());
+    // By the commit's key (0027's index), then its exact bytes.
+    let ledger: Option<Vec<u8>> = match &request {
         Some(request) => sqlx::query_scalar(
             "SELECT exact_response_bytes FROM v2_idempotency
               WHERE server_instance_id = ? AND tenant_id = ? AND operation_scope = ?
-                AND exact_request_bytes = ?",
+                AND idempotency_key = ? AND exact_request_bytes = ?",
         )
         .bind(v.server_instance_id.as_slice())
         .bind(u.p.tenant_id.as_slice())
         .bind(OPERATION_SCOPE_COMMIT)
-        .bind(request)
+        .bind(request.idempotency_key().as_slice())
+        .bind(request.exact_bytes())
         .fetch_optional(&mut *conn)
         .await?
         .flatten(),
@@ -452,17 +522,20 @@ async fn receipt(
             }
         }
         let bound = CommitReceiptBindingV2::parse(&receipt).ok()?;
-        let request = CommitRequestV2::parse(u.commit_request.as_deref()?).ok()?;
-        bound.check_binds(&request).ok()?;
+        bound.check_binds(request.as_ref()?).ok()?;
         let [snapshot] = snapshots.as_slice() else {
             return None;
         };
         let version: i64 = snapshot.get("version");
         let head: Vec<u8> = snapshot.get("head_hash");
         let bytes: Vec<u8> = snapshot.get("signed_manifest_container_bytes");
+        let path: String = snapshot.get("immutable_blob_path");
+        let ciphertext: Vec<u8> = snapshot.get("ciphertext_sha256");
         let linked = stored_uint(version).ok()? == bound.resulting_version
             && head == bound.resulting_head_hash
             && manifest.as_deref() == Some(&bytes[..])
+            && u.immutable_path.as_deref() == Some(path.as_str())
+            && ciphertext == u.sha256
             && current? >= version;
         linked.then_some(receipt)
     };
@@ -470,6 +543,38 @@ async fn receipt(
         Some(receipt) => (Valid, Some(receipt)),
         None => (Invalid, None),
     })
+}
+
+/// An OPEN upload's chunk receipts, by offset; none for another state.
+async fn chunks(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    id: &[u8],
+    u: &Upload,
+) -> anyhow::Result<Vec<(i64, i64, Vec<u8>)>> {
+    if u.state != "OPEN" {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_as(
+        "SELECT chunk_offset, chunk_length, chunk_sha256 FROM v2_upload_chunks
+          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?
+          ORDER BY chunk_offset",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(u.p.tenant_id.as_slice())
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+/// `I` and `S` of one upload, by blocking file I/O.
+fn files(
+    object: &Path,
+    staging: &Path,
+    u: &Upload,
+    chunks: Vec<(i64, i64, Vec<u8>)>,
+) -> anyhow::Result<(C, C)> {
+    Ok((immutable(object, u)?, staged(staging, u, chunks)?))
 }
 
 /// `I` (L1183): the object at its path keyed by `snapshot_id` (ADR 0002
@@ -507,26 +612,10 @@ fn whole(path: &Path, u: &Upload) -> anyhow::Result<C> {
 /// `S` (L1182). For OPEN, a tail past the committed offset is cut and flushed
 /// first (L1167), and `V` is a prefix whose chunk receipts tile it exactly;
 /// a missing file is `Ø` only at offset 0. Otherwise `S` is [`whole`].
-async fn staged(
-    conn: &mut SqliteConnection,
-    v: &Verified,
-    id: &[u8],
-    staging: &Path,
-    u: &Upload,
-) -> anyhow::Result<C> {
+fn staged(staging: &Path, u: &Upload, chunks: Vec<(i64, i64, Vec<u8>)>) -> anyhow::Result<C> {
     if u.state != "OPEN" {
         return whole(staging, u);
     }
-    let chunks: Vec<(i64, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT chunk_offset, chunk_length, chunk_sha256 FROM v2_upload_chunks
-          WHERE server_instance_id = ? AND tenant_id = ? AND upload_id = ?
-          ORDER BY chunk_offset",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(u.p.tenant_id.as_slice())
-    .bind(id)
-    .fetch_all(&mut *conn)
-    .await?;
     let opened = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -601,7 +690,9 @@ mod tests {
     use shared::envelope::{build_dek_slot, IntentIds, IntentNumbers, SlotIds};
     use shared::envelope_v2::{build_intent_v2, seal, MAX_OBJECT_SIZE, MIN_FRAME_PLAINTEXT_SIZE};
     use shared::keys::signing_key_id;
+    use shared::mutation::{IdempotentMutationRequestV2, OperationKind};
     use shared::signing::Ed25519SigningKey;
+    use shared::snapshot_v2::FinalizeUploadV2;
     use shared::snapshot_v2::{LeaseReleaseOutcome, SignedSnapshotManifestV2, SnapshotManifestV2};
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -611,6 +702,8 @@ mod tests {
     const LEASE: [u8; 16] = [0x1e; 16];
     const FKEK: [u8; 32] = [0xe0; 32];
     const DEK: [u8; 32] = [0x2d; 32];
+    /// The account and device a finalize ran as.
+    const ACTOR: [u8; 16] = [0x5a; 16];
     /// An OPEN upload's committed prefix, one chunk.
     const PREFIX: usize = 500;
 
@@ -666,6 +759,8 @@ mod tests {
         request: CommitRequestV2,
         receipt: Vec<u8>,
         bound: CommitReceiptBindingV2,
+        /// The exact FINALIZE_UPLOAD request a FINALIZING upload stores.
+        finalize: Vec<u8>,
     }
 
     fn fixture(tag: u8) -> Fixture {
@@ -756,6 +851,15 @@ mod tests {
             2,
             [tag; 16],
         );
+        let finalize = IdempotentMutationRequestV2 {
+            operation_kind: OperationKind::FinalizeUpload,
+            idempotency_key: [tag; 16],
+            canonical_payload_bytes: FinalizeUploadV2::new(request.clone()).encode(),
+            client_request_nonce: [tag; 16],
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        }
+        .encode();
         Fixture {
             tag,
             object,
@@ -763,6 +867,7 @@ mod tests {
             request,
             receipt: bound.encode(),
             bound,
+            finalize,
         }
     }
 
@@ -786,6 +891,7 @@ mod tests {
         let m = &f.manifest;
         let open = state == "OPEN";
         let committed = state == "COMMITTED";
+        let ready = committed || state == "READY";
         let c = f.request.manifest();
         sqlx::query(
             "INSERT INTO v2_uploads
@@ -798,9 +904,11 @@ mod tests {
                   signed_manifest_container_hash, signed_manifest_container_bytes_sha256,
                   exact_commit_request_bytes, exact_commit_request_bytes_sha256,
                   exact_finalize_response_bytes, exact_commit_receipt_binding_bytes,
-                  commit_receipt_binding_bytes_sha256, expires_at_ms, created_at_ms)
+                  commit_receipt_binding_bytes_sha256, expires_at_ms, created_at_ms,
+                  exact_finalize_request_bytes, finalize_actor_account_id,
+                  finalize_actor_device_id)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0, 'profile.create-upload.v2', ?, ?, ?, ?, ?,
-                     ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                     ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
         )
         .bind(INSTANCE.as_slice())
         .bind(TENANT.as_slice())
@@ -827,10 +935,13 @@ mod tests {
         .bind((!open).then(|| c.exact_bytes_sha256().to_vec()))
         .bind((!open).then(|| f.request.exact_bytes().to_vec()))
         .bind((!open).then(|| f.request.exact_bytes_sha256().to_vec()))
-        .bind((!open).then(|| b"finalized".to_vec()))
+        .bind(ready.then(|| b"finalized".to_vec()))
         .bind(committed.then(|| f.receipt.clone()))
         .bind(committed.then(|| sha256(&f.receipt).to_vec()))
         .bind(i64::MAX)
+        .bind((!open).then(|| f.finalize.clone()))
+        .bind((!open).then(|| ACTOR.to_vec()))
+        .bind((!open).then(|| ACTOR.to_vec()))
         .execute(pool)
         .await
         .unwrap();
@@ -1244,14 +1355,6 @@ mod tests {
             (false, true),
         ),
         row(
-            1210,
-            "COMMITTED",
-            (Valid, Absent, Valid),
-            "COMMITTED",
-            Some(("object_invalid", true)),
-            (true, false),
-        ),
-        row(
             1211,
             "COMMITTED",
             (Valid, Valid, Invalid),
@@ -1323,6 +1426,30 @@ mod tests {
             .unwrap();
             assert_eq!(stored, f.receipt);
         }
+
+        // L1150: each finalize the pass finished stored its exact READY
+        // response once, with its ledger and audit rows, as its own actor.
+        let finished: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT i.exact_response_bytes, u.exact_finalize_response_bytes
+               FROM v2_idempotency i JOIN v2_uploads u
+                 ON i.exact_request_bytes = u.exact_finalize_request_bytes
+              WHERE i.operation_kind = 'FINALIZE_UPLOAD' AND i.actor_device_id = ?",
+        )
+        .bind(ACTOR.as_slice())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(finished.len(), first.promoted);
+        assert!(finished.iter().all(|(ledger, stored)| ledger == stored));
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM v2_audit_events
+              WHERE action = 'profile.finalize_upload' AND actor_account_id = ?",
+        )
+        .bind(ACTOR.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audited as usize, first.promoted);
 
         let second = run(&pool, &v, &root.to_string_lossy()).await.unwrap();
         let kept = after
@@ -1435,7 +1562,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let f: Vec<Fixture> = (0x70..0x78).map(fixture).collect();
+        let f: Vec<Fixture> = (0x70..0x7a).map(fixture).collect();
         for f in &f {
             setup(&pool, root, f, "COMMITTED", Valid, Valid, Absent).await;
         }
@@ -1449,7 +1576,7 @@ mod tests {
             ..f[5].bound.clone()
         }
         .encode();
-        let tampers: [(&str, Vec<u8>); 8] = [
+        let tampers: [(&str, Vec<u8>); 10] = [
             // The ledger holds other bytes than the upload.
             ("UPDATE v2_idempotency SET exact_response_bytes = ? WHERE exact_request_bytes = (SELECT exact_commit_request_bytes FROM v2_uploads WHERE upload_id = x'70707070707070707070707070707070')", other),
             ("UPDATE v2_uploads SET commit_receipt_binding_bytes_sha256 = ? WHERE upload_id = x'71717171717171717171717171717171'", vec![0; 32]),
@@ -1460,7 +1587,10 @@ mod tests {
             ("UPDATE v2_idempotency SET exact_response_bytes = ?1 WHERE exact_request_bytes = (SELECT exact_commit_request_bytes FROM v2_uploads WHERE upload_id = x'75757575757575757575757575757575')", unbound.clone()),
             ("DELETE FROM v2_idempotency WHERE length(?) = 1 AND exact_request_bytes = (SELECT exact_commit_request_bytes FROM v2_uploads WHERE upload_id = x'76767676767676767676767676767676')", vec![1]),
             // A second snapshot names the upload, every link matching.
-            ("INSERT INTO v2_snapshots SELECT server_instance_id, tenant_id, fleet_id, ?1, version, ?1, ?1, upload_id, fkek_key_id, key_generation, envelope_version, intent_hash, preamble_sha256, dek_slot_sha256, immutable_blob_path, ciphertext_sha256, ciphertext_size, signed_manifest_container_bytes, signed_manifest_container_hash, signed_manifest_container_bytes_sha256, previous_head_hash, head_hash, signing_key_id, signature_suite_id, signature_version, signature_bytes, restore_epoch, created_by_device, created_at_ms FROM v2_snapshots WHERE upload_id = x'77777777777777777777777777777777'", vec![0x78; 16]),
+            ("INSERT INTO v2_snapshots SELECT server_instance_id, tenant_id, fleet_id, ?1, version, ?1, ?1, upload_id, fkek_key_id, key_generation, envelope_version, intent_hash, preamble_sha256, dek_slot_sha256, immutable_blob_path, ciphertext_sha256, ciphertext_size, signed_manifest_container_bytes, signed_manifest_container_hash, signed_manifest_container_bytes_sha256, previous_head_hash, head_hash, signing_key_id, signature_suite_id, signature_version, signature_bytes, restore_epoch, created_by_device, created_at_ms FROM v2_snapshots WHERE upload_id = x'77777777777777777777777777777777'", vec![0x99; 16]),
+            // The snapshot names another object or ciphertext than the upload.
+            ("UPDATE v2_snapshots SET immutable_blob_path = CAST(? AS TEXT) WHERE upload_id = x'78787878787878787878787878787878'", b"elsewhere.bin".to_vec()),
+            ("UPDATE v2_snapshots SET ciphertext_sha256 = ? WHERE upload_id = x'79797979797979797979797979797979'", vec![0; 32]),
         ];
         for (sql, bytes) in &tampers {
             sqlx::query(sql).bind(bytes).execute(&pool).await.unwrap();
@@ -1671,5 +1801,122 @@ mod tests {
         assert!(gate(&pool, &v).await.is_err());
         run(&pool, &v, &root.to_string_lossy()).await.unwrap();
         gate(&pool, &v).await.unwrap();
+    }
+
+    /// Every input of the four states the table covers has its own arm: the
+    /// fail-closed fallback is never reached.
+    #[test]
+    fn the_table_covers_every_input() {
+        let all = [Absent, Valid, Invalid];
+        for state in ["OPEN", "FINALIZING", "READY", "COMMITTED"] {
+            for r in all {
+                for i in all {
+                    for s in all {
+                        assert_ne!(
+                            decide(state, r, i, s),
+                            Action::Quarantine("unclassified", true),
+                            "{state} {r:?} {i:?} {s:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            decide("ABORTED", Absent, Absent, Absent),
+            Action::Quarantine("unclassified", true)
+        );
+    }
+
+    /// The quarantine rows and states of every upload, to prove a failed pass
+    /// wrote nothing.
+    async fn snapshot_of(pool: &SqlitePool) -> (i64, Vec<String>) {
+        let marks = sqlx::query_scalar("SELECT count(*) FROM v2_upload_quarantine")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let states = sqlx::query_scalar("SELECT state FROM v2_uploads ORDER BY upload_id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        (marks, states)
+    }
+
+    /// A blob root that is not there (a volume not mounted yet, another
+    /// spelling of the data directory) fails the pass and quarantines nothing;
+    /// with no upload to reconcile there is nothing to fail.
+    #[tokio::test]
+    async fn a_missing_blob_root_fails_the_pass_without_a_quarantine() {
+        let pool = pool().await;
+        let d = dir("root");
+        let root = d.0.as_path();
+        let gone = root.join("unmounted");
+        let v = identity();
+        run(&pool, &v, &gone.to_string_lossy()).await.unwrap();
+        let (open, done) = (fixture(0xc0), fixture(0xc1));
+        setup(&pool, &gone, &open, "OPEN", Absent, Absent, Absent).await;
+        insert(&pool, &gone, &done, "COMMITTED", 0).await;
+        commit_rows(&pool, &gone, &done, 1).await;
+        let before = snapshot_of(&pool).await;
+        let e = run(&pool, &v, &gone.to_string_lossy()).await.unwrap_err();
+        assert!(e.to_string().contains("is missing; mount it"), "{e:#}");
+        assert_eq!(snapshot_of(&pool).await, before);
+    }
+
+    /// L1210 with `I = Ø`: a missing COMMITTED object fails the whole pass
+    /// before any upload is touched, so not even another upload's quarantine
+    /// is written.
+    #[tokio::test]
+    async fn a_missing_committed_object_fails_the_pass_without_a_quarantine() {
+        let pool = pool().await;
+        let d = dir("missing");
+        let root = d.0.as_path();
+        let (bad, gone) = (fixture(0xc2), fixture(0xc3));
+        setup(&pool, root, &bad, "OPEN", Absent, Absent, Invalid).await;
+        setup(&pool, root, &gone, "COMMITTED", Valid, Absent, Absent).await;
+        let before = snapshot_of(&pool).await;
+        let e = run(&pool, &identity(), &root.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("committed object"), "{e:#}");
+        assert_eq!(snapshot_of(&pool).await, before);
+        // Put back, the object is reconciled like any other.
+        write(&gone.object_file(root), &gone.object);
+        run(&pool, &identity(), &root.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome(&pool, root, &gone).await,
+            ("COMMITTED".into(), None, false, true)
+        );
+    }
+
+    /// A COMMITTED upload whose reads fail for a moment is kept after the
+    /// backoff; one that keeps failing fails the pass, never quarantined.
+    #[tokio::test]
+    async fn a_committed_upload_that_keeps_failing_fails_the_pass() {
+        let pool = pool().await;
+        let d = dir("committed-io");
+        let root = d.0.as_path();
+        let (eased, stuck) = (fixture(0xc4), fixture(0xc5));
+        setup(&pool, root, &eased, "COMMITTED", Valid, Valid, Absent).await;
+        FAULTS
+            .lock()
+            .unwrap()
+            .push((eased.id().to_vec(), "io", ATTEMPTS as u32 - 1));
+        let report = run(&pool, &identity(), &root.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!((report.kept, report.retried), (1, ATTEMPTS - 1));
+        setup(&pool, root, &stuck, "COMMITTED", Valid, Valid, Absent).await;
+        FAULTS
+            .lock()
+            .unwrap()
+            .push((stuck.id().to_vec(), "io", ATTEMPTS as u32));
+        let before = snapshot_of(&pool).await;
+        let e = run(&pool, &identity(), &root.to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("keeps failing"), "{e:#}");
+        assert_eq!(snapshot_of(&pool).await, before);
     }
 }

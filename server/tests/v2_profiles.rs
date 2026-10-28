@@ -2533,14 +2533,29 @@ async fn an_upload_commits_once_and_the_next_checkout_starts_at_its_head() {
     );
     assert_eq!(
         server.abort(&id2, &access).await,
-        (409, "UPLOAD_OFFSET_MISMATCH".to_string())
+        (409, "UPLOAD_STATE_CONFLICT".to_string())
     );
+    // Only the finalize that stored it resumes it, and only under a live
+    // lease.
+    expect(
+        &server,
+        &fin2_path,
+        &access,
+        &finalize_req(0x0b, &c2),
+        (409, "UPLOAD_OFFSET_MISMATCH"),
+    )
+    .await;
+    let lease =
+        |at: u64| format!("UPDATE v2_profile_leases SET expires_at_ms = {at} WHERE profile_id = ?");
+    server.sql(&lease(1), &[&P1]).await;
+    expect(&server, &fin2_path, &access, &fin2, (409, "LEASE_EXPIRED")).await;
+    server.sql(&lease(now_ms() + 300_000), &[&P1]).await;
     expect(
         &server,
         &upload_path(&id2, "commit"),
         &access,
         c2.exact_bytes(),
-        (409, "UPLOAD_OFFSET_MISMATCH"),
+        (409, "UPLOAD_STATE_CONFLICT"),
     )
     .await;
     std::fs::remove_dir(&object2).unwrap();
@@ -3300,7 +3315,7 @@ async fn a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot() {
     );
     assert_eq!(
         server.abort(&id, &access).await,
-        (409, "UPLOAD_OFFSET_MISMATCH".to_string())
+        (409, "UPLOAD_STATE_CONFLICT".to_string())
     );
     assert_eq!(
         server.abort(&[0x66; 16], &access).await,
@@ -3354,17 +3369,36 @@ async fn a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot() {
         &upload_path(&id3, "commit"),
         &access,
         c3.exact_bytes(),
-        (409, "UPLOAD_OFFSET_MISMATCH"),
+        (409, "UPLOAD_STATE_CONFLICT"),
     )
     .await;
     let object3 = server.object_file(P1, &s3.terms.snapshot_id);
     assert!(object3.exists());
 
-    // L1210: a committed object gone is a security incident, and its
-    // snapshot is no longer served. The aborted object is not GC's.
-    std::fs::remove_file(&object).unwrap();
+    // L1210: a corrupt committed object is a security incident: its snapshot
+    // is no longer served nor its receipt replayed. The aborted object is
+    // not GC's.
+    let mut corrupt = std::fs::read(&object).unwrap();
+    corrupt[0] ^= 1;
+    std::fs::write(&object, corrupt).unwrap();
     server.restart().await;
     expect_get(&server, &snapshot_path(P1, 1), &access).await;
+    expect(
+        &server,
+        &upload_path(&id, "commit"),
+        &access,
+        c1.exact_bytes(),
+        (422, "UPLOAD_QUARANTINED"),
+    )
+    .await;
+    expect(
+        &server,
+        &fin_path,
+        &access,
+        &fin,
+        (422, "UPLOAD_QUARANTINED"),
+    )
+    .await;
     assert_eq!(
         server
             .count(
