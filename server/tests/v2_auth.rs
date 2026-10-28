@@ -5054,6 +5054,21 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     ] {
         assert_eq!(server.count(query).await, want, "{query}");
     }
+
+    // The trust evidence serves every fleet grant, revoked ones included,
+    // and reports the revoked ones.
+    let pages = evidence(&server, &access, &[]).await;
+    let served = containers(&pages);
+    for filed in [&device0, &recovery0, &device1, &recovery1, &rotation1] {
+        assert!(served.contains(filed));
+    }
+    let reported: Vec<[u8; 16]> = pages
+        .iter()
+        .flat_map(|p| &p.revocations)
+        .filter(|r| r.payload_domain == shared::authz_record::DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE)
+        .map(|r| r.replay_id)
+        .collect();
+    assert_eq!(reported.len(), 3, "{reported:?}");
 }
 
 // ------------------------------------------------------- ROOT_GRANT_REVOKE ---
