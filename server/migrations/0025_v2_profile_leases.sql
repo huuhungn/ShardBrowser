@@ -37,11 +37,11 @@ CREATE TABLE v2_profile_leases (
     FOREIGN KEY (tenant_id, profile_id) REFERENCES v2_profiles(tenant_id, id) ON DELETE CASCADE
 );
 
--- L1098: the fence is monotonic, and a lease is granted under the fence its
--- own transaction just took.
+-- L1098: the fence strictly increases, and a lease is granted under the
+-- fence its own transaction just took, so no two leases share a fence.
 CREATE TRIGGER v2_profiles_fence_moves_forward
 BEFORE UPDATE OF last_fencing_token ON v2_profiles
-WHEN NEW.last_fencing_token < OLD.last_fencing_token
+WHEN NEW.last_fencing_token <= OLD.last_fencing_token
 BEGIN
     SELECT RAISE(ABORT, 'a profile fence never moves back');
 END;
@@ -52,6 +52,27 @@ WHEN NEW.fencing_token IS NOT (SELECT last_fencing_token FROM v2_profiles
                                 WHERE tenant_id = NEW.tenant_id AND id = NEW.profile_id)
 BEGIN
     SELECT RAISE(ABORT, 'a lease holds its profile''s newest fence');
+END;
+
+-- A published profile is synced only through the v2_profile_leases routes;
+-- the legacy JSON fleet routes would take a second fence from v2_leases. The
+-- routes refuse first with PROFILE_PUBLISHED; these hold under any race.
+CREATE TRIGGER v2_leases_not_for_published_profiles
+BEFORE INSERT ON v2_leases
+WHEN EXISTS (SELECT 1 FROM v2_profiles
+              WHERE tenant_id = NEW.tenant_id AND id = NEW.profile_id
+                AND label_ciphertext IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'a published profile takes no legacy lease');
+END;
+
+CREATE TRIGGER v2_upload_sessions_not_for_published_profiles
+BEFORE INSERT ON v2_upload_sessions
+WHEN EXISTS (SELECT 1 FROM v2_profiles
+              WHERE tenant_id = NEW.tenant_id AND id = NEW.profile_id
+                AND label_ciphertext IS NOT NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'a published profile takes no legacy upload');
 END;
 
 -- Renew moves only the expiry.

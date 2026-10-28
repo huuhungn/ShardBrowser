@@ -89,6 +89,10 @@ fn session_of(who: Principal) -> Result<Session, AppError> {
 /// (ADR 0002 D-2 scope table). These are server RBAC, not issuer rules, so no
 /// custody is needed and an account-scoped grant of the session's account
 /// counts (D-2). Every candidate row must match its own container.
+///
+/// The device itself must be approved for the tenant or this fleet: a
+/// fleet-scoped approval admits a device to that fleet only (plan L459-L460,
+/// ADR 0002 Q-22). The session's own liveness already checked the epoch.
 async fn may(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -98,6 +102,27 @@ async fn may(
     capability: Capability,
     now: i64,
 ) -> Result<bool, AppError> {
+    let admitted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_device_approvals
+                         WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
+                           AND subject_hpke_key_id = ? AND server_instance_id = ?
+                           AND revoked_at IS NULL AND not_before_ms <= ? AND not_after_ms > ?
+                           AND (approval_scope_kind = 'tenant'
+                                OR (approval_scope_kind = 'fleet' AND approval_scope_id = ?)))",
+    )
+    .bind(s.tenant_id.as_slice())
+    .bind(s.device_id.as_slice())
+    .bind(s.signing_key_id.as_slice())
+    .bind(s.hpke_key_id.as_slice())
+    .bind(v.server_instance_id.as_slice())
+    .bind(now)
+    .bind(now)
+    .bind(fleet.as_slice())
+    .fetch_one(&mut *conn)
+    .await?;
+    if !admitted {
+        return Ok(false);
+    }
     let replays: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT replay_id FROM v2_capability_grants
           WHERE server_instance_id = ? AND tenant_id = ? AND capability = ?
@@ -408,11 +433,16 @@ pub async fn publish_profile(
     {
         return Err(no_active_key());
     }
+    // The row's `name` is the hex ID, which a legacy profile may already use.
+    let name = crate::identity::hex(&p.profile_id);
     let taken: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_profiles WHERE tenant_id = ? AND id = ?)",
+        "SELECT EXISTS (SELECT 1 FROM v2_profiles
+                         WHERE tenant_id = ? AND (id = ? OR (fleet_id = ? AND name = ?)))",
     )
     .bind(p.tenant_id.as_slice())
     .bind(p.profile_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(&name)
     .fetch_one(&mut *tx)
     .await?;
     if taken {
@@ -432,7 +462,7 @@ pub async fn publish_profile(
     .bind(p.profile_id.as_slice())
     .bind(p.tenant_id.as_slice())
     .bind(fleet.as_slice())
-    .bind(crate::identity::hex(&p.profile_id))
+    .bind(&name)
     .bind(&stamp)
     .bind(&stamp)
     .bind(req.label_ciphertext.as_slice())
@@ -632,6 +662,8 @@ pub async fn release_lease(
         return Ok(cbor(StatusCode::OK, response));
     }
 
+    // Only the holder releases: giving a lease up needs no capability, and
+    // anyone else ends it through force-expire under `lease.force_expire`.
     let held = current_lease(&mut tx, &p)
         .await?
         .filter(|l| l.lease.lease_id == lease_id)
@@ -720,6 +752,8 @@ pub async fn renew_lease(
     {
         return Err(AppError::Forbidden);
     }
+    // The profile and its fleet are still active.
+    published(&mut tx, &p).await?.ok_or_else(not_found)?;
     let held = current_lease(&mut tx, &p)
         .await?
         .filter(|l| l.lease.lease_id == lease_id)

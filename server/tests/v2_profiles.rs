@@ -535,10 +535,28 @@ async fn custodian(server: &mut Server, seed: u8) -> (Device, String) {
 /// A second device of the owner under a copy of `from`'s tenant approval,
 /// and its access token.
 async fn peer(server: &Server, from: &Device, seed: u8) -> (Device, String) {
+    peer_in(
+        server,
+        from,
+        seed,
+        ("approval_scope_kind", "approval_scope_id"),
+    )
+    .await
+}
+
+/// [`peer`] under an approval scope, given as SQL: column names to keep the
+/// copy's, or literals such as `'fleet'` and `x'..'`.
+async fn peer_in(
+    server: &Server,
+    from: &Device,
+    seed: u8,
+    scope: (&str, &str),
+) -> (Device, String) {
     let to = device(server, seed, "active").await;
     server
         .sql(
-            "INSERT INTO v2_device_approvals (
+            &format!(
+                "INSERT INTO v2_device_approvals (
                  tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
                  subject_device_id, subject_signing_key_id, subject_hpke_key_id,
                  approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
@@ -547,12 +565,14 @@ async fn peer(server: &Server, from: &Device, seed: u8) -> (Device, String) {
                  signature_bytes, issuer_signing_key_id, signed_container_hash,
                  exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
              SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
-                    ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                    ?, ?, ?, {}, {}, approved_use, issued_at_ms,
                     not_before_ms, not_after_ms, server_instance_id, restore_epoch,
                     canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
                     signature_bytes, issuer_signing_key_id, signed_container_hash,
                     exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
                FROM v2_device_approvals WHERE subject_device_id = ?",
+                scope.0, scope.1
+            ),
             &[
                 &[seed; 16],
                 &to.id,
@@ -625,6 +645,50 @@ async fn fleets(server: &Server) {
             )
             .await;
     }
+}
+
+/// A v1 token for the legacy JSON fleet routes, whose account maps to the
+/// owner through `legacy_user_id`.
+async fn legacy_token(server: &Server) -> String {
+    server
+        .sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin')
+              WHERE id = ?",
+            &[&OWNER],
+        )
+        .await;
+    let (status, body) = server
+        .post(
+            "/auth/login",
+            None,
+            json!({ "username": "admin", "password": "secret" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    body["token"].as_str().unwrap().to_string()
+}
+
+/// The exact `DEVICE_REVOKE` request of `subject`, signed by `issuer`.
+fn revoke_request(issuer: &Device, subject: &Device, key: u8) -> Vec<u8> {
+    use shared::authz_record::{
+        DeviceRevocationReason, DeviceRevocationV2, DOMAIN_DEVICE_REVOCATION,
+    };
+    let r = DeviceRevocationV2 {
+        common: common([key; 16], 30),
+        subject_account_id: OWNER,
+        subject_device_id: subject.id,
+        subject_signing_key_id: subject.signing_key_id,
+        subject_hpke_key_id: subject.hpke_key_id,
+        reason_code: DeviceRevocationReason::Compromised,
+    };
+    let container = build_record(&issuer.sk, DOMAIN_DEVICE_REVOCATION, &r.encode());
+    let request = shared::mutation::DeviceRevokeRequestV2 {
+        signed_container_hash: *AuthorizationRecord::parse(&container)
+            .unwrap()
+            .signed_container_hash(),
+        exact_signed_revocation_container_bytes: container,
+    };
+    outer(OperationKind::DeviceRevoke, key, request.encode())
 }
 
 fn pref(profile: [u8; 16]) -> ProfileRef {
@@ -1018,6 +1082,34 @@ async fn one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes
     .await;
     let missing = lease_path(P5, &third.lease.lease_id, "force-expire");
     expect(&server, &missing, &access, b"", (404, "RESOURCE_NOT_FOUND")).await;
+
+    // Revoking a device ends its current lease in the same transaction (C-1).
+    let (status, body) = server
+        .call(&held, &other_access, &checkout(0x0a, p, 0))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    grant(
+        &server,
+        c,
+        Some(&dev),
+        0xa8,
+        Capability::DeviceRevoke,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    let revoke = format!("/v2/devices/{}/revoke", hex(&other.id));
+    let (status, body) = server
+        .call(&revoke, &access, &revoke_request(&dev, &other, 0x90))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.count("SELECT count(*) FROM v2_profile_leases").await,
+        0
+    );
+    assert_eq!(
+        server.call(&held, &access, &checkout(0x0b, p, 0)).await.0,
+        201
+    );
 }
 
 #[tokio::test]
@@ -1165,6 +1257,74 @@ async fn every_refusal_has_its_status_and_code() {
         (403, ""),
     )
     .await;
+    // The legacy JSON routes refuse a published profile (PROFILE_PUBLISHED),
+    // and the schema refuses their rows under any race.
+    let v1 = legacy_token(&server).await;
+    let (t, pr) = (hex(&TENANT), hex(&P1));
+    for (path, body) in [
+        (
+            "/v2/fleet/leases",
+            json!({
+                "tenant_id": t, "profile_id": pr, "lease_id": hex(&[0x61; 16]),
+                "account_id": hex(&OWNER), "device_id": hex(&dev.id), "ttl_seconds": 60,
+            }),
+        ),
+        (
+            "/v2/fleet/uploads",
+            json!({
+                "tenant_id": t, "profile_id": pr, "session_id": hex(&[0x62; 16]),
+                "lease_id": hex(&[0x61; 16]), "fencing_token": 1, "target_version": 1,
+                "intent_hash": hex(&[0x63; 32]), "declared_size": 4,
+            }),
+        ),
+        (
+            "/v2/fleet/uploads/commit",
+            json!({
+                "tenant_id": t, "profile_id": pr, "session_id": hex(&[0x62; 16]),
+                "manifest_hex": "00", "snapshot_id": hex(&[0x64; 16]), "fleet_id": hex(&FLEET),
+                "base_version": 0, "key_generation": 0, "container_sha256": hex(&[0x65; 32]),
+                "author_account_id": hex(&OWNER), "author_device_id": hex(&dev.id),
+            }),
+        ),
+    ] {
+        let (status, got) = server.post(path, Some(&v1), body).await;
+        assert_eq!(
+            (status, got["code"].as_str()),
+            (409, Some("PROFILE_PUBLISHED")),
+            "{path}: {got}"
+        );
+    }
+    assert!(
+        !server
+            .try_sql(
+                "INSERT INTO v2_leases
+                     (id, tenant_id, profile_id, holder_account_id, holder_device_id, fencing_token,
+                      base_version, server_instance_id, restore_epoch, acquired_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, 9, 0, ?, 0, 't', 't')",
+                &[&[0x61; 16], &TENANT, &P1, &OWNER, &dev.id, &INSTANCE],
+            )
+            .await
+    );
+    assert!(
+        !server
+            .try_sql(
+                "INSERT INTO v2_upload_sessions
+                     (id, tenant_id, profile_id, lease_id, server_instance_id, restore_epoch,
+                      fencing_token, target_version, intent_hash, declared_size, received_size,
+                      staging_path, status, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, 0, 1, 1, ?, 4, 0, 's', 'open', 't', 't')",
+                &[
+                    &[0x62; 16],
+                    &TENANT,
+                    &P1,
+                    &[0x61; 16],
+                    &INSTANCE,
+                    &[0x63; 32]
+                ],
+            )
+            .await
+    );
+
     let gone = lease_path(P1, &other_lease.lease_id, "release");
     expect(
         &server,
@@ -1360,6 +1520,86 @@ async fn every_refusal_has_its_status_and_code() {
         )
         .await;
 
+    // A fleet-scoped approval admits a device to that fleet only (Q-22).
+    let elsewhere = format!("x'{}'", hex(&other_fleet));
+    let (_, fleet_b) = peer_in(&server, &dev, 0x7e, ("'fleet'", &elsewhere)).await;
+    expect(
+        &server,
+        &pub_path,
+        &fleet_b,
+        &publish(0x20, pref([0xc7; 16])),
+        (403, ""),
+    )
+    .await;
+    // Nor do approvals of it for this fleet that are revoked or outside
+    // their window.
+    let here = format!("x'{}'", hex(&FLEET));
+    for (replay, window, revoked) in [
+        (0xe1u8, "issued_at_ms, not_before_ms, not_after_ms", "'t'"),
+        (0xe2, "0, 0, 1", "NULL"),
+        (0xe3, "issued_at_ms, not_after_ms, not_after_ms + 1", "NULL"),
+    ] {
+        server
+            .sql(
+                &format!(
+                    "INSERT INTO v2_device_approvals (
+                         tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
+                         subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+                         approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                         not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                         canonical_payload_bytes, payload_sha256, signature_suite_id,
+                         signature_version, signature_bytes, issuer_signing_key_id,
+                         signed_container_hash, exact_signed_container_bytes,
+                         exact_signed_container_bytes_sha256, created_at, revoked_at)
+                     SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
+                            subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+                            'fleet', {here}, approved_use, {window},
+                            server_instance_id, restore_epoch, canonical_payload_bytes,
+                            payload_sha256, signature_suite_id, signature_version,
+                            signature_bytes, issuer_signing_key_id, signed_container_hash,
+                            exact_signed_container_bytes, exact_signed_container_bytes_sha256,
+                            created_at, {revoked}
+                       FROM v2_device_approvals WHERE replay_id = ?"
+                ),
+                &[&[replay; 16], &[0x7e; 16]],
+            )
+            .await;
+    }
+    expect(
+        &server,
+        &pub_path,
+        &fleet_b,
+        &publish(0x20, pref([0xc7; 16])),
+        (403, ""),
+    )
+    .await;
+    let (_, fleet_a) = peer_in(&server, &dev, 0x7f, ("'fleet'", &here)).await;
+    let (status, body) = server
+        .call(&pub_path, &fleet_a, &publish(0x21, pref([0xc8; 16])))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+    // Its row's name is the hex ID, which a legacy profile may hold already.
+    let p6 = [0xc6; 16];
+    server
+        .sql(
+            &format!(
+                "INSERT INTO v2_profiles (id, tenant_id, fleet_id, name, status, created_at, updated_at)
+                 VALUES (?, ?, ?, '{}', 'active', 't', 't')",
+                hex(&p6)
+            ),
+            &[&[0xd6; 16], &TENANT, &FLEET],
+        )
+        .await;
+    expect(
+        &server,
+        &pub_path,
+        &access,
+        &publish(0x22, pref(p6)),
+        (409, "PROFILE_EXISTS"),
+    )
+    .await;
+
     // A revoked or expired grant counts for nothing: renew needs the live
     // checkout capability.
     let (status, body) = server
@@ -1368,6 +1608,26 @@ async fn every_refusal_has_its_status_and_code() {
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
     let held = granted(LeaseOrigin::PublishCreate, &body).lease;
     let ren4 = lease_path(P4, &held.lease_id, "renew");
+    server
+        .sql(
+            "UPDATE v2_profiles SET status = 'archived' WHERE id = ?",
+            &[&P4],
+        )
+        .await;
+    expect(
+        &server,
+        &ren4,
+        &access,
+        &renew(pref(P4), held, 60),
+        (404, "RESOURCE_NOT_FOUND"),
+    )
+    .await;
+    server
+        .sql(
+            "UPDATE v2_profiles SET status = 'active' WHERE id = ?",
+            &[&P4],
+        )
+        .await;
     assert_eq!(
         server
             .call(&ren4, &access, &renew(pref(P4), held, 60))
@@ -1446,6 +1706,14 @@ async fn every_refusal_has_its_status_and_code() {
             .try_sql(
                 "UPDATE v2_profiles SET last_fencing_token = 1 WHERE id = ?",
                 &[&P1]
+            )
+            .await
+    );
+    assert!(
+        !server
+            .try_sql(
+                "UPDATE v2_profiles SET last_fencing_token = last_fencing_token WHERE id = ?",
+                &[&P4]
             )
             .await
     );
