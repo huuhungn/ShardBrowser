@@ -34,8 +34,7 @@ pub const DOMAIN_COMMIT_REQUEST: &str = "shardx.sync.commit-request.v2";
 pub const DOMAIN_COMMIT_RECEIPT_BINDING: &str = "shardx.sync.commit-receipt-binding.v2";
 /// Plan L547: the only `operation_scope` a commit request may carry.
 pub const OPERATION_SCOPE_COMMIT: &str = "profile.commit.v2";
-/// `head_hash` label (plan L535-L537).
-pub const L_SNAPSHOT_HEAD: &str = "SHARDX-SNAPSHOT-HEAD-V2\0";
+pub use crate::canonical::L_SNAPSHOT_HEAD;
 /// Every version field of the four records (plan L512, L532, L542, L571).
 pub const VERSION: u16 = 2;
 
@@ -174,8 +173,9 @@ impl SnapshotManifestV2 {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("SnapshotManifestV2", bytes)?;
         f.exact_text("domain", DOMAIN_MANIFEST_PAYLOAD)?;
-        if f.u16("version")? != VERSION {
-            return Err(bad("version"));
+        let version = f.u16("version")?;
+        if version != VERSION {
+            return Err(unsupported("version", version));
         }
         let m = Self {
             snapshot_id: f.fixed("snapshot_id")?,
@@ -745,6 +745,8 @@ impl CommitReceiptBindingV2 {
 
     /// Requires every binding field to match the stored exact request and its
     /// manifest (plan L572-L579, L584-L587); any difference is `RECEIPT_MISMATCH`.
+    /// `request` must be the request the caller stored or verified itself,
+    /// never one parsed from the same reply as the receipt.
     pub fn check_binds(&self, request: &CommitRequestV2) -> Result<()> {
         let p = &request.manifest.payload;
         let bindings = [
@@ -1077,7 +1079,10 @@ mod tests {
             parse(&with("domain", c::t(DOMAIN_COMMIT_REQUEST))),
             bad_value("domain")
         );
-        assert_eq!(parse(&with("version", c::u(3))), bad_value("version"));
+        assert_eq!(
+            code_of(parse(&with("version", c::u(3)))),
+            "SCHEMA_UNSUPPORTED"
+        );
         // target_version = base_version + 1, nothing else.
         for target in [4, 6] {
             assert_eq!(
