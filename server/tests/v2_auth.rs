@@ -6683,42 +6683,6 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
 const TRANSITIONS: &str = "/v2/recovery/restore-epoch-transitions";
 const TENANT2: [u8; 16] = [0x42; 16];
 
-/// Moves the authority and its mirror to `epoch`, as a finished D-1 restore
-/// leaves them.
-/// shortcut: sessions and approvals stay bound to the epoch they were made
-/// in, so no device could sign in after a restore; the fixture moves them.
-async fn restored_to(server: &mut Server, epoch: u64) {
-    let record = IdentityRecordV2 {
-        server_instance_id: INSTANCE,
-        restore_epoch: epoch,
-        restore_txn_id: [0x99; 16],
-        restored_db_sha256: [0x98; 32],
-        transition_set_sha256: [0x97; 32],
-        written_at_ms: 1_790_985_600_000,
-    }
-    .encode()
-    .unwrap();
-    let identity = server.data.with_extension("identity");
-    std::fs::write(identity.join("identity-record-v2.bin"), record).unwrap();
-    server
-        .sql(
-            &format!(
-                "UPDATE v2_server_state SET restore_epoch = {epoch}, external_record_sha256 = ?"
-            ),
-            &[&external_record_sha256(&record)],
-        )
-        .await;
-    for statement in [
-        "DROP TRIGGER IF EXISTS v2_sessions_binding_is_fixed".to_string(),
-        "DROP TRIGGER IF EXISTS v2_device_approvals_record_is_fixed".to_string(),
-        format!("UPDATE v2_sessions SET restore_epoch = {epoch}"),
-        format!("UPDATE v2_device_approvals SET restore_epoch = {epoch}"),
-    ] {
-        server.sql(&statement, &[]).await;
-    }
-    server.restart().await;
-}
-
 type Leaf = shared::restore_epoch::RestoreEpochLeafV2;
 type Transition = shared::restore_epoch::RestoreEpochTransitionV2;
 
@@ -6972,6 +6936,15 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     // After the restore to `E+1`, any session of the tenant reads the exact
     // bytes back, and a lost response is still answered.
     restored_to(&mut server, 1).await;
+    // The restore ended every session; the devices' approvals still hold.
+    let access = session_at(&server, &dev, 1).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_access = session_at(&server, &peer, 1).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
     assert_eq!((status, &out), (201, &signed));
     assert_eq!(
@@ -7035,6 +7008,15 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     });
     // Once the epoch passed it, a step can no longer be staged.
     restored_to(&mut server, 2).await;
+    // The restore ended every session; the devices' approvals still hold.
+    let access = session_at(&server, &dev, 2).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_access = session_at(&server, &peer, 2).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         server.file(&access, &next).await,
         (409, "STALE_CONTEXT".into())
