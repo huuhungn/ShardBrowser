@@ -1189,9 +1189,6 @@ pub async fn ack_fleet_grant(
     if g.server_instance_id != v.server_instance_id {
         return Err(AppError::Forbidden);
     }
-    if g.restore_epoch != v.restore_epoch {
-        return Err(stale());
-    }
 
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;
     let now = now_ms();
@@ -1691,9 +1688,6 @@ pub async fn revoke_fleet_grant(
     }
     if g.server_instance_id != v.server_instance_id {
         return Err(AppError::Forbidden);
-    }
-    if g.restore_epoch != v.restore_epoch {
-        return Err(stale());
     }
 
     let mut tx = app.db.begin_with("BEGIN IMMEDIATE").await?;

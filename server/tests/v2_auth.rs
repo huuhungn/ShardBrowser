@@ -416,11 +416,16 @@ async fn device(server: &Server, account: [u8; 16], seed: u8, status: &str) -> D
 
 /// The client half of a challenge: check the binding, open the secret, sign.
 fn answer(ticket: &Value, challenge: &Value, dev: &Device) -> Value {
+    answer_at(ticket, challenge, dev, 0)
+}
+
+/// [`answer`] to a server at `epoch`.
+fn answer_at(ticket: &Value, challenge: &Value, dev: &Device, epoch: u64) -> Value {
     let binding = unhex(challenge["binding"].as_str().unwrap());
     let parsed = DeviceSessionBindingV2::parse(&binding).unwrap();
     assert_eq!(parsed.device_id, dev.id);
     assert_eq!(parsed.fields.server_instance_id, INSTANCE);
-    assert_eq!(parsed.fields.restore_epoch, 0);
+    assert_eq!(parsed.fields.restore_epoch, epoch);
     assert_eq!(
         hex(&parsed.fields.pre_device_session_id),
         ticket["ticket_id"].as_str().unwrap()
@@ -451,6 +456,11 @@ async fn challenge(server: &Server, ticket: &Value, dev: &Device) -> (u16, Value
 
 /// Login, challenge and proof; returns the proof response.
 async fn session(server: &Server, dev: &Device) -> Value {
+    session_at(server, dev, 0).await
+}
+
+/// [`session`] on a server at `epoch`.
+async fn session_at(server: &Server, dev: &Device, epoch: u64) -> Value {
     let ticket = server.login("owner").await;
     let (status, ch) = challenge(server, &ticket, dev).await;
     assert_eq!(status, 201, "{ch}");
@@ -458,7 +468,7 @@ async fn session(server: &Server, dev: &Device) -> Value {
         .post(
             "/v2/auth/device-session-proofs",
             ticket["ticket"].as_str(),
-            answer(&ticket, &ch, dev),
+            answer_at(&ticket, &ch, dev, epoch),
         )
         .await;
     assert_eq!(status, 201, "{s}");
@@ -2996,9 +3006,10 @@ async fn readback_ack_and_activate_refuse_anything_but_the_exact_stored_grant() 
             (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
         ),
         (
+            // A ref carries its grant's issuance epoch, not the server's (Q-1).
             "another epoch",
             |r: &mut RootGrantRef| r.restore_epoch = 1,
-            (409, "STALE_CONTEXT"),
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
         ),
     ] {
         let mut r = honest.clone();
@@ -6672,42 +6683,6 @@ async fn a_custodian_rotates_the_root_to_a_new_custodian_set() {
 const TRANSITIONS: &str = "/v2/recovery/restore-epoch-transitions";
 const TENANT2: [u8; 16] = [0x42; 16];
 
-/// Moves the authority and its mirror to `epoch`, as a finished D-1 restore
-/// leaves them.
-/// shortcut: sessions and approvals stay bound to the epoch they were made
-/// in, so no device could sign in after a restore; the fixture moves them.
-async fn restored_to(server: &mut Server, epoch: u64) {
-    let record = IdentityRecordV2 {
-        server_instance_id: INSTANCE,
-        restore_epoch: epoch,
-        restore_txn_id: [0x99; 16],
-        restored_db_sha256: [0x98; 32],
-        transition_set_sha256: [0x97; 32],
-        written_at_ms: 1_790_985_600_000,
-    }
-    .encode()
-    .unwrap();
-    let identity = server.data.with_extension("identity");
-    std::fs::write(identity.join("identity-record-v2.bin"), record).unwrap();
-    server
-        .sql(
-            &format!(
-                "UPDATE v2_server_state SET restore_epoch = {epoch}, external_record_sha256 = ?"
-            ),
-            &[&external_record_sha256(&record)],
-        )
-        .await;
-    for statement in [
-        "DROP TRIGGER IF EXISTS v2_sessions_binding_is_fixed".to_string(),
-        "DROP TRIGGER IF EXISTS v2_device_approvals_record_is_fixed".to_string(),
-        format!("UPDATE v2_sessions SET restore_epoch = {epoch}"),
-        format!("UPDATE v2_device_approvals SET restore_epoch = {epoch}"),
-    ] {
-        server.sql(&statement, &[]).await;
-    }
-    server.restart().await;
-}
-
 type Leaf = shared::restore_epoch::RestoreEpochLeafV2;
 type Transition = shared::restore_epoch::RestoreEpochTransitionV2;
 
@@ -6961,6 +6936,15 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     // After the restore to `E+1`, any session of the tenant reads the exact
     // bytes back, and a lost response is still answered.
     restored_to(&mut server, 1).await;
+    // The restore ended every session; the devices' approvals still hold.
+    let access = session_at(&server, &dev, 1).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_access = session_at(&server, &peer, 1).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (status, out) = server.call(TRANSITIONS, &access, Some(&body)).await;
     assert_eq!((status, &out), (201, &signed));
     assert_eq!(
@@ -7024,6 +7008,15 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     });
     // Once the epoch passed it, a step can no longer be staged.
     restored_to(&mut server, 2).await;
+    // The restore ended every session; the devices' approvals still hold.
+    let access = session_at(&server, &dev, 2).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let peer_access = session_at(&server, &peer, 2).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
         server.file(&access, &next).await,
         (409, "STALE_CONTEXT".into())
@@ -7438,5 +7431,266 @@ async fn a_root_rotation_rewraps_every_retained_fleet_key_before_it_activates() 
     assert_eq!(
         file!(&access, 0xfa, 0, fkek0, V::Recovery, 0xfb, &late),
         403
+    );
+}
+
+/// Moves the identity record and its mirror to `epoch` and restarts, as a
+/// finished D-1 restore leaves them. Sessions and challenges are bound to the
+/// epoch they were made in, so the move ends them.
+async fn restored_to(server: &mut Server, epoch: u64) {
+    let record = IdentityRecordV2 {
+        server_instance_id: INSTANCE,
+        restore_epoch: epoch,
+        restore_txn_id: [0x99; 16],
+        restored_db_sha256: [0x98; 32],
+        transition_set_sha256: [0x97; 32],
+        written_at_ms: 1_790_985_600_000,
+    }
+    .encode()
+    .unwrap();
+    let identity = server.data.with_extension("identity");
+    std::fs::write(identity.join("identity-record-v2.bin"), record).unwrap();
+    server
+        .sql(
+            &format!(
+                "UPDATE v2_server_state SET restore_epoch = {epoch}, external_record_sha256 = ?"
+            ),
+            &[&external_record_sha256(&record)],
+        )
+        .await;
+    server.restart().await;
+}
+
+/// `request` as a client sends it to a server at `epoch`.
+fn at_epoch(request: &[u8], epoch: u64) -> Vec<u8> {
+    let mut outer = IdempotentMutationRequestV2::parse(request).unwrap();
+    outer.restore_epoch = epoch;
+    outer.encode()
+}
+
+#[tokio::test]
+async fn approvals_and_root_grants_from_before_a_restore_still_work_after_it() {
+    use shared::mutation::RootGrantRevokeReason as R;
+
+    let mut server = start("q1-approvals", 28231).await;
+    let (dev, old_access, _) = custodian(&mut server, 0x6d).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xc2; 16];
+    });
+    assert_eq!(server.call(GRANTS, &old_access, Some(&duty)).await.0, 201);
+    let joiner = device(&server, OWNER, 0x5b, "pending").await;
+    let rec = approval(&joiner, &dev.sk, 0x5c, 0, 30);
+    assert_eq!(server.approve(&joiner.id, &old_access, &rec).await.0, 201);
+    let existing = existing_root_grant(&dev, &joiner, 0x5c, 0x91);
+    let request = root_grant_create_request(0xc4, &dev, &existing);
+    assert_eq!(
+        server
+            .call(&root_grants_path(), &old_access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let gone = device(&server, OWNER, 0x5d, "pending").await;
+    let rec = approval(&gone, &dev.sk, 0x5e, 0, 30);
+    assert_eq!(server.approve(&gone.id, &old_access, &rec).await.0, 201);
+    server
+        .sql(
+            "UPDATE v2_device_approvals SET revoked_at = 'now' WHERE subject_device_id = ?",
+            &[&gone.id],
+        )
+        .await;
+
+    restored_to(&mut server, 1).await;
+    assert_eq!(server.me(&old_access).await.0, 401);
+    // The epoch-0 D1 approval still opens a setup session, which approves a
+    // device under its epoch-0 capability grant (Q-1).
+    let s = session_at(&server, &dev, 1).await;
+    assert_eq!(s["class"], "root_setup");
+    let access = s["access_token"].as_str().unwrap().to_string();
+    let late = device(&server, OWNER, 0x5f, "pending").await;
+    let rec = approval(&late, &dev.sk, 0x60, 1, 30);
+    let (status, _, body) = server.approve(&late.id, &access, &rec).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // The epoch-0 ordinary approval still opens an ordinary session.
+    let s = session_at(&server, &joiner, 1).await;
+    assert_eq!(s["class"], "ordinary");
+    let joiner_access = s["access_token"].as_str().unwrap().to_string();
+    assert_eq!(server.me(&joiner_access).await.0, 200);
+    // A root grant filed at epoch 0 is acknowledged and revoked at epoch 1.
+    let ack = at_epoch(&ack_request(0xd8, grant_ref(&dev, &existing)), 1);
+    let ack_path = format!("{}/ack", grant_path("0", &[0x91; 16]));
+    let (status, body) = server.call(&ack_path, &joiner_access, Some(&ack)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let revoke = at_epoch(
+        &root_revoke_request(0xc5, grant_ref(&dev, &existing), R::CustodyRemoved),
+        1,
+    );
+    let revoke_path = format!("{}/revoke", grant_path("0", &[0x91; 16]));
+    let (status, body) = server.call(&revoke_path, &access, Some(&revoke)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // A revoked epoch-0 approval stays revoked.
+    let ticket = server.login("owner").await;
+    assert_eq!(challenge(&server, &ticket, &gone).await.0, 409);
+}
+
+#[tokio::test]
+async fn fleet_grants_from_before_a_restore_are_acknowledged_and_revoked_after_it() {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantRevocation, FleetGrantRevokeReason,
+        FleetGrantRevokeV2, FleetGrantVariant as V, FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let mut server = start("q1-fleet", 28232).await;
+    let (dev, old_access, _) = custodian(&mut server, 0x6d).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    let manage = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa7; 16];
+        g.capability = Capability::FleetManage;
+    });
+    assert_eq!(server.call(GRANTS, &old_access, Some(&manage)).await.0, 201);
+    let fkek = [0xe0; 32];
+    let device0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &DeviceHpkeGrantV2 {
+            common: fleet_common(0xd0, 365),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation: 0,
+            subject_account_id: OWNER,
+            subject_device_id: dev.id,
+            subject_signing_key_id: dev.signing_key_id,
+            recipient_hpke_key_id: dev.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        }
+        .encode(),
+    );
+    let recovery0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+        &RecoveryGrantV2 {
+            common: fleet_common(0xd1, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation: 0,
+            recipient_root_key_id: shared::keys::root_key_id(&TRK),
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        }
+        .encode(),
+    );
+    let generation = FleetGenerationRef {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        fleet_id: FLEET,
+        generation: 0,
+        fkek_key_id: fkek,
+    };
+    let create = FleetKeyGenerationCreateV2 {
+        terms: FleetGenerationTerms {
+            generation,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(
+                &device0,
+            )])
+            .unwrap(),
+            recovery_grant_signed_container_hash: container_hash(&recovery0),
+            rotation: None,
+        },
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create.encode());
+    let path = fleet_generation_path();
+    assert_eq!(server.call(&path, &old_access, Some(&request)).await.0, 201);
+    for (key, variant, replay, container) in [
+        (0xb1, V::DeviceHpke, 0xd0, &device0),
+        (0xb2, V::Recovery, 0xd1, &recovery0),
+    ] {
+        let request = fleet_grant_request(key, 0, fkek, variant, replay, container);
+        let grants = fleet_grants_path(0);
+        assert_eq!(
+            server.call(&grants, &old_access, Some(&request)).await.0,
+            201
+        );
+    }
+
+    restored_to(&mut server, 1).await;
+    let access = session_at(&server, &dev, 1).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let grant = fleet_grant_ref(0, fkek, V::DeviceHpke, 0xd0, &device0);
+    let ack = lifecycle_request(
+        OperationKind::FleetGrantAck,
+        0xb4,
+        FleetKeyGrantAckV2 { grant }.encode(),
+    );
+    let (status, body) = server
+        .call(&format!("{path}/0/ack"), &access, Some(&at_epoch(&ack, 1)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let revoke = FleetGrantRevokeV2 {
+        revocation: FleetGrantRevocation {
+            generation,
+            grant_variant: V::Recovery,
+            replay_id: [0xd1; 16],
+            signed_container_hash: container_hash(&recovery0),
+            reason_code: FleetGrantRevokeReason::Superseded,
+        },
+    };
+    let request = lifecycle_request(OperationKind::FleetGrantRevoke, 0xbf, revoke.encode());
+    let revoke_path = format!("{path}/0/grants/{}/revoke", hex(&[0xd1; 16]));
+    let (status, body) = server
+        .call(&revoke_path, &access, Some(&at_epoch(&request, 1)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+}
+
+#[tokio::test]
+async fn a_first_device_confirmed_before_a_restore_is_approved_or_cancelled_after_it() {
+    let mut server = start("q1-confirm", 28233).await;
+    let dev = device(&server, OWNER, 0x6d, "pending").await;
+    server.confirm(&dev).await;
+    restored_to(&mut server, 1).await;
+    let s = session_at(&server, &dev, 1).await;
+    assert_eq!(s["class"], "pending_setup");
+    let rec = approval(&dev, &dev.sk, APPROVAL_REPLAY, 1, 30);
+    let access = s["access_token"].as_str().unwrap();
+    let (status, _, body) = server.approve(&dev.id, access, &rec).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(session_at(&server, &dev, 1).await["class"], "root_setup");
+    drop(server);
+
+    let mut server = start("q1-cancel", 28234).await;
+    let dev = device(&server, OWNER, 0x6d, "pending").await;
+    server.confirm(&dev).await;
+    restored_to(&mut server, 1).await;
+    let out = server
+        .offline(&["tenant", "cancel-first-device", "--tenant", "acme"], "")
+        .await;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_first_device_confirmations WHERE state = 'cancelled'")
+            .await,
+        1
     );
 }

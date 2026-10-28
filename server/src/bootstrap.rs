@@ -297,8 +297,8 @@ pub async fn cancel(cfg: &Config, slug: &str) -> Result<()> {
         }
         None => bail!("refusing: this tenant has no bootstrap guard for this server instance"),
     }
-    let (device_id, epoch, device_status): (Vec<u8>, i64, Option<String>) = sqlx::query_as(
-        "SELECT c.device_id, c.restore_epoch, d.status
+    let (device_id, device_status): (Vec<u8>, Option<String>) = sqlx::query_as(
+        "SELECT c.device_id, d.status
            FROM v2_first_device_confirmations c
            LEFT JOIN v2_devices d ON d.tenant_id = c.tenant_id AND d.id = c.device_id
           WHERE c.server_instance_id = ? AND c.tenant_id = ? AND c.state = 'pending'",
@@ -311,9 +311,8 @@ pub async fn cancel(cfg: &Config, slug: &str) -> Result<()> {
     // A cancel records an operator decision. A confirmation that is already
     // inconsistent belongs to the startup integrity pass (R1), not to a cancel.
     ensure!(
-        device_status.as_deref() == Some("pending")
-            && u64::try_from(epoch).ok() == Some(verified.restore_epoch),
-        "refusing: the confirmation no longer matches its device or this restore epoch; \
+        device_status.as_deref() == Some("pending"),
+        "refusing: the confirmation no longer matches its device; \
          restart the server so the integrity pass moves it to recovery"
     );
     let cancelled = sqlx::query(
