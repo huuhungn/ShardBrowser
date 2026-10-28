@@ -210,6 +210,12 @@ async fn revoke_everything(
             .execute(&mut *conn)
             .await?;
     }
+    // Its current profile leases end too (C-1); history stays in the audit.
+    sqlx::query("DELETE FROM v2_profile_leases WHERE tenant_id = ? AND owner_device_id = ?")
+        .bind(tenant.as_slice())
+        .bind(device.as_slice())
+        .execute(&mut *conn)
+        .await?;
     let sessions: Vec<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT id, absolute_expires_at_ms FROM v2_sessions
           WHERE tenant_id = ? AND device_id = ? AND revoked_at_ms IS NULL",

@@ -281,6 +281,33 @@ async fn account_id_for(
 // Fleet sync transfer
 // ---------------------------------------------------------------------------
 
+/// A profile published through `POST /v2/fleets/{id}/profiles` is synced only
+/// through its own lease routes (`v2_profiles`); a lease, upload or commit
+/// here would take a second fence and move its version. Migration 0025 holds
+/// the lease and upload inserts to the same rule under any race.
+async fn refuse_published(
+    app: &AppState,
+    tenant_id: &[u8; 16],
+    profile_id: &[u8; 16],
+) -> Result<(), AppError> {
+    let published: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_profiles
+                         WHERE tenant_id = ? AND id = ? AND label_ciphertext IS NOT NULL)",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(profile_id.as_slice())
+    .fetch_one(&app.db)
+    .await?;
+    if published {
+        return Err(AppError::Coded(
+            StatusCode::CONFLICT,
+            "PROFILE_PUBLISHED",
+            "this profile syncs through /v2/profiles, not the legacy fleet routes".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct AcquireLeaseReq {
     tenant_id: String,
@@ -314,6 +341,7 @@ pub async fn acquire_profile_lease(
     if caller_account_id != account_id {
         return Err(AppError::Forbidden);
     }
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     if !(MIN_LEASE_TTL_SECONDS..=MAX_LEASE_TTL_SECONDS).contains(&req.ttl_seconds) {
         return Err(AppError::BadRequest(format!(
@@ -416,6 +444,7 @@ pub async fn open_snapshot_upload(
     let lease_id = parse_id16(&req.lease_id, "lease_id")?;
 
     require_tenant_member(&app, tenant_id, &user).await?;
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     let intent_hash: [u8; 32] = decode_hex(&req.intent_hash)
         .ok_or_else(|| AppError::BadRequest("intent_hash: not hex".into()))?
@@ -532,6 +561,7 @@ pub async fn commit_snapshot_upload(
     if caller_account_id != author_account_id {
         return Err(AppError::Forbidden);
     }
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     let container_sha256: [u8; 32] = decode_hex(&req.container_sha256)
         .ok_or_else(|| AppError::BadRequest("container_sha256: not hex".into()))?
