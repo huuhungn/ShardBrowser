@@ -17,14 +17,17 @@
 //! the exact bytes of counted revocations, and the exact grant behind each
 //! collected fleet key with its evidence (G2-35), never a key (L2048).
 //! Version 3 adds the plan's `profile_bindings`, `operations` and
-//! `upload_sessions` for published-profile sync (`team::sync`).
+//! `upload_sessions` for published-profile sync (`team::sync`), and version
+//! 4 the rest of the plan's tables: the kept authorization records and root
+//! grants (`team::records`), and the schema of the tables later packages
+//! fill.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -353,6 +356,439 @@ UPDATE schema_meta SET schema_version = 3, min_reader_version = 3,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 3 to 4: the rest of the plan's reference DDL (L1460-L1771,
+/// L1931-L2029), as written there. The one change: version 3's
+/// `profile_bindings` has no `server_id` yet, so a binding proof names its
+/// binding by the instance-keyed UNIQUE the plan also declares (L1797). A
+/// version 3 reader would skip the kept records `team::records` checks
+/// before key use, so 4 is the minimum.
+// shortcut: the version 3 sync tables still lack `server_id` and their
+// server_origins, accounts and fleet_key_state foreign keys; add them when
+// publish-create files a binding's account and fleet key rows.
+const MIGRATE_V4: &str = r#"
+CREATE TABLE server_origins (
+  server_id                 TEXT PRIMARY KEY,
+  scheme                    TEXT NOT NULL CHECK (scheme IN ('https','http')),
+  host                      TEXT NOT NULL CHECK (
+                              length(host) BETWEEN 1 AND 253 AND
+                              host = lower(trim(host)) AND
+                              instr(host, '/') = 0 AND instr(host, '?') = 0 AND
+                              instr(host, '#') = 0 AND instr(host, '@') = 0 AND
+                              instr(host, ' ') = 0
+                            ),
+  port                      INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+  origin                    TEXT GENERATED ALWAYS AS
+                              (scheme || '://' || host || ':' || CAST(port AS TEXT)) STORED,
+  tls_policy                TEXT NOT NULL CHECK (tls_policy IN ('SYSTEM','PINNED')),
+  server_instance_id        TEXT NOT NULL,
+  last_restore_epoch        INTEGER NOT NULL CHECK (last_restore_epoch BETWEEN 0 AND 9223372036854775807),
+  status                    TEXT NOT NULL CHECK (status IN ('ACTIVE','QUARANTINED','DISABLED')),
+  UNIQUE(origin),
+  UNIQUE(server_id, server_instance_id),
+  CHECK (scheme = 'https' OR host IN ('127.0.0.1','localhost','[::1]'))
+) STRICT;
+
+CREATE TABLE accounts (
+  server_id       TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  tenant_id       TEXT NOT NULL,
+  account_id      TEXT NOT NULL,
+  device_id       TEXT NOT NULL,
+  role            TEXT NOT NULL CHECK (role IN ('owner','admin','member')),
+  status          TEXT NOT NULL CHECK (status IN ('ACTIVE','REVOKED','AUTH_REQUIRED')),
+  PRIMARY KEY(server_id, tenant_id, account_id, device_id),
+  UNIQUE(server_id, tenant_id, device_id)
+) STRICT;
+
+CREATE TABLE device_state (
+  server_id              TEXT NOT NULL,
+  tenant_id              TEXT NOT NULL,
+  account_id             TEXT NOT NULL,
+  device_id              TEXT NOT NULL,
+  signing_key_id         TEXT NOT NULL,
+  hpke_key_id            TEXT NOT NULL,
+  signing_credential_ref TEXT NOT NULL UNIQUE,
+  hpke_credential_ref    TEXT NOT NULL UNIQUE,
+  recovery_ready         INTEGER NOT NULL CHECK (recovery_ready IN (0,1)),
+  PRIMARY KEY(server_id, tenant_id, device_id),
+  FOREIGN KEY(server_id, tenant_id, account_id, device_id)
+    REFERENCES accounts(server_id, tenant_id, account_id, device_id) ON DELETE CASCADE,
+  CHECK (signing_key_id <> hpke_key_id),
+  CHECK (signing_credential_ref <> hpke_credential_ref)
+) STRICT;
+
+CREATE TABLE signed_authorization_records (
+  record_id                           TEXT PRIMARY KEY,
+  server_id                           TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  tenant_id                           TEXT NOT NULL,
+  record_kind                         TEXT NOT NULL CHECK (record_kind IN (
+                                        'DeviceApprovalV2','TenantCapabilityGrantV2',
+                                        'FleetKeyGrantV2::DeviceHpkeGrant',
+                                        'FleetKeyGrantV2::RecoveryGrant',
+                                        'FleetKeyGrantV2::RotationGrant'
+                                      )),
+  container_domain                    TEXT NOT NULL CHECK (container_domain = 'shardx.authorization.signed-container.v2'),
+  container_version                   INTEGER NOT NULL CHECK (container_version = 2),
+  payload_domain                      TEXT NOT NULL,
+  payload_version                     INTEGER NOT NULL CHECK (payload_version = 2),
+  replay_id                           BLOB NOT NULL CHECK (length(replay_id) = 16),
+  subject_kind                        TEXT CHECK (subject_kind IN ('account','device')),
+  subject_account_id                  TEXT,
+  subject_device_id                   TEXT,
+  subject_signing_key_id              TEXT,
+  subject_hpke_key_id                 TEXT,
+  approval_scope_kind                 TEXT CHECK (approval_scope_kind IN ('tenant','fleet')),
+  approval_scope_id                   TEXT,
+  approved_use                        TEXT CHECK (approved_use IS NULL OR approved_use = 'team.device'),
+  scope_kind                          TEXT CHECK (scope_kind IN ('tenant','fleet','profile')),
+  scope_id                            TEXT,
+  capability                          TEXT,
+  grant_variant                       TEXT CHECK (grant_variant IN ('DeviceHpkeGrant','RecoveryGrant','RotationGrant')),
+  fleet_id                            TEXT,
+  fkek_key_id                         TEXT,
+  generation                          INTEGER CHECK (generation IS NULL OR generation BETWEEN 0 AND 9223372036854775807),
+  grant_capability                    TEXT,
+  recipient_hpke_key_id               TEXT,
+  hpke_suite_id                       INTEGER CHECK (hpke_suite_id IS NULL OR hpke_suite_id BETWEEN 0 AND 65535),
+  hpke_info_bytes                     BLOB,
+  hpke_encapped_key_bytes             BLOB,
+  hpke_wrapped_fleet_key_bytes        BLOB,
+  recipient_root_key_id               TEXT,
+  recipient_root_generation           INTEGER CHECK (recipient_root_generation IS NULL OR recipient_root_generation BETWEEN 0 AND 9223372036854775807),
+  root_wrap_suite_id                  INTEGER CHECK (root_wrap_suite_id IS NULL OR root_wrap_suite_id BETWEEN 0 AND 65535),
+  root_wrap_nonce_bytes               BLOB,
+  root_wrap_context_bytes             BLOB,
+  wrapped_fleet_key_bytes             BLOB,
+  previous_fkek_key_id                TEXT,
+  previous_generation                 INTEGER CHECK (previous_generation IS NULL OR previous_generation BETWEEN 0 AND 9223372036854775807),
+  required_device_grant_count         INTEGER CHECK (required_device_grant_count IS NULL OR required_device_grant_count BETWEEN 0 AND 4294967295),
+  required_device_grant_set_hash      BLOB CHECK (required_device_grant_set_hash IS NULL OR length(required_device_grant_set_hash) = 32),
+  recovery_grant_signed_container_hash BLOB CHECK (recovery_grant_signed_container_hash IS NULL OR length(recovery_grant_signed_container_hash) = 32),
+  activation_not_before_ms            INTEGER CHECK (activation_not_before_ms IS NULL OR activation_not_before_ms BETWEEN 0 AND 9223372036854775807),
+  issued_at_ms                        INTEGER NOT NULL CHECK (issued_at_ms BETWEEN 0 AND 9223372036854775807),
+  not_before_ms                       INTEGER NOT NULL CHECK (not_before_ms BETWEEN 0 AND 9223372036854775807),
+  not_after_ms                        INTEGER NOT NULL CHECK (
+                                         not_after_ms BETWEEN 0 AND 9223372036854775807 AND
+                                         not_after_ms > not_before_ms
+                                       ),
+  server_instance_id                  TEXT NOT NULL,
+  restore_epoch                       INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  canonical_payload_bytes             BLOB NOT NULL CHECK (length(canonical_payload_bytes) > 0),
+  payload_sha256                      BLOB NOT NULL CHECK (length(payload_sha256) = 32),
+  signature_suite_id                  INTEGER NOT NULL CHECK (signature_suite_id BETWEEN 0 AND 65535),
+  signature_version                   INTEGER NOT NULL CHECK (signature_version = 1),
+  issuer_signing_key_id               TEXT NOT NULL,
+  signature_bytes                     BLOB NOT NULL CHECK (length(signature_bytes) > 0),
+  signed_container_hash               BLOB NOT NULL CHECK (length(signed_container_hash) = 32),
+  exact_signed_container_bytes        BLOB NOT NULL CHECK (length(exact_signed_container_bytes) > 0),
+  exact_signed_container_bytes_sha256 BLOB NOT NULL CHECK (length(exact_signed_container_bytes_sha256) = 32),
+  verified_at_ms                      INTEGER NOT NULL CHECK (verified_at_ms BETWEEN 0 AND 9223372036854775807),
+  revoked_at_ms                       INTEGER CHECK (
+                                         revoked_at_ms IS NULL OR
+                                         (revoked_at_ms BETWEEN 0 AND 9223372036854775807 AND revoked_at_ms >= issued_at_ms)
+                                       ),
+  UNIQUE(server_id, tenant_id, payload_domain, replay_id),
+  CHECK (issued_at_ms <= not_before_ms),
+  CHECK (
+    (record_kind = 'DeviceApprovalV2' AND
+      payload_domain = 'shardx.auth.device-approval.v2' AND
+      subject_account_id IS NOT NULL AND subject_device_id IS NOT NULL AND
+      subject_signing_key_id IS NOT NULL AND subject_hpke_key_id IS NOT NULL AND
+      approval_scope_kind IS NOT NULL AND approval_scope_id IS NOT NULL AND approved_use = 'team.device' AND
+      subject_kind IS NULL AND scope_kind IS NULL AND scope_id IS NULL AND capability IS NULL AND
+      grant_variant IS NULL AND fleet_id IS NULL AND fkek_key_id IS NULL AND generation IS NULL AND grant_capability IS NULL AND
+      recipient_hpke_key_id IS NULL AND hpke_suite_id IS NULL AND hpke_info_bytes IS NULL AND
+      hpke_encapped_key_bytes IS NULL AND hpke_wrapped_fleet_key_bytes IS NULL AND
+      recipient_root_key_id IS NULL AND recipient_root_generation IS NULL AND root_wrap_suite_id IS NULL AND
+      root_wrap_nonce_bytes IS NULL AND root_wrap_context_bytes IS NULL AND wrapped_fleet_key_bytes IS NULL AND
+      previous_fkek_key_id IS NULL AND previous_generation IS NULL AND required_device_grant_count IS NULL AND
+      required_device_grant_set_hash IS NULL AND recovery_grant_signed_container_hash IS NULL AND activation_not_before_ms IS NULL) OR
+    (record_kind = 'TenantCapabilityGrantV2' AND
+      payload_domain = 'shardx.auth.tenant-capability-grant.v2' AND
+      subject_kind IS NOT NULL AND subject_account_id IS NOT NULL AND
+      scope_kind IS NOT NULL AND scope_id IS NOT NULL AND capability IS NOT NULL AND
+      approval_scope_kind IS NULL AND approval_scope_id IS NULL AND approved_use IS NULL AND
+      grant_variant IS NULL AND fleet_id IS NULL AND fkek_key_id IS NULL AND generation IS NULL AND grant_capability IS NULL AND
+      recipient_hpke_key_id IS NULL AND hpke_suite_id IS NULL AND hpke_info_bytes IS NULL AND
+      hpke_encapped_key_bytes IS NULL AND hpke_wrapped_fleet_key_bytes IS NULL AND
+      recipient_root_key_id IS NULL AND recipient_root_generation IS NULL AND root_wrap_suite_id IS NULL AND
+      root_wrap_nonce_bytes IS NULL AND root_wrap_context_bytes IS NULL AND wrapped_fleet_key_bytes IS NULL AND
+      previous_fkek_key_id IS NULL AND previous_generation IS NULL AND required_device_grant_count IS NULL AND
+      required_device_grant_set_hash IS NULL AND recovery_grant_signed_container_hash IS NULL AND activation_not_before_ms IS NULL AND
+      ((subject_kind = 'account' AND subject_device_id IS NULL AND subject_signing_key_id IS NULL AND subject_hpke_key_id IS NULL) OR
+       (subject_kind = 'device' AND subject_device_id IS NOT NULL AND subject_signing_key_id IS NOT NULL AND subject_hpke_key_id IS NOT NULL))) OR
+    (record_kind = 'FleetKeyGrantV2::DeviceHpkeGrant' AND
+      payload_domain = 'shardx.keys.fleet-key-grant.device-hpke.v2' AND grant_variant = 'DeviceHpkeGrant' AND
+      fleet_id IS NOT NULL AND fkek_key_id IS NOT NULL AND generation IS NOT NULL AND
+      grant_capability = 'fleet.key.receive' AND subject_account_id IS NOT NULL AND subject_device_id IS NOT NULL AND
+      subject_signing_key_id IS NOT NULL AND recipient_hpke_key_id IS NOT NULL AND
+      hpke_suite_id IS NOT NULL AND hpke_info_bytes IS NOT NULL AND hpke_encapped_key_bytes IS NOT NULL AND
+      hpke_wrapped_fleet_key_bytes IS NOT NULL AND length(hpke_info_bytes) BETWEEN 1 AND 1024 AND
+      length(hpke_encapped_key_bytes) BETWEEN 1 AND 2048 AND length(hpke_wrapped_fleet_key_bytes) BETWEEN 1 AND 4096 AND
+      subject_kind IS NULL AND subject_hpke_key_id IS NULL AND approval_scope_kind IS NULL AND approval_scope_id IS NULL AND
+      approved_use IS NULL AND scope_kind IS NULL AND scope_id IS NULL AND capability IS NULL AND
+      recipient_root_key_id IS NULL AND recipient_root_generation IS NULL AND root_wrap_suite_id IS NULL AND
+      root_wrap_nonce_bytes IS NULL AND root_wrap_context_bytes IS NULL AND wrapped_fleet_key_bytes IS NULL AND
+      previous_fkek_key_id IS NULL AND previous_generation IS NULL AND required_device_grant_count IS NULL AND
+      required_device_grant_set_hash IS NULL AND recovery_grant_signed_container_hash IS NULL AND activation_not_before_ms IS NULL) OR
+    (record_kind = 'FleetKeyGrantV2::RecoveryGrant' AND
+      payload_domain = 'shardx.keys.fleet-key-grant.recovery.v2' AND grant_variant = 'RecoveryGrant' AND
+      fleet_id IS NOT NULL AND fkek_key_id IS NOT NULL AND generation IS NOT NULL AND
+      grant_capability = 'fleet.key.recover' AND recipient_root_key_id IS NOT NULL AND
+      recipient_root_generation IS NOT NULL AND root_wrap_suite_id IS NOT NULL AND
+      root_wrap_nonce_bytes IS NOT NULL AND root_wrap_context_bytes IS NOT NULL AND wrapped_fleet_key_bytes IS NOT NULL AND
+      length(root_wrap_nonce_bytes) BETWEEN 1 AND 64 AND length(root_wrap_context_bytes) BETWEEN 1 AND 1024 AND
+      length(wrapped_fleet_key_bytes) BETWEEN 1 AND 4096 AND
+      subject_kind IS NULL AND subject_account_id IS NULL AND subject_device_id IS NULL AND subject_signing_key_id IS NULL AND
+      subject_hpke_key_id IS NULL AND approval_scope_kind IS NULL AND approval_scope_id IS NULL AND approved_use IS NULL AND
+      scope_kind IS NULL AND scope_id IS NULL AND capability IS NULL AND recipient_hpke_key_id IS NULL AND
+      hpke_suite_id IS NULL AND hpke_info_bytes IS NULL AND hpke_encapped_key_bytes IS NULL AND hpke_wrapped_fleet_key_bytes IS NULL AND
+      previous_fkek_key_id IS NULL AND previous_generation IS NULL AND required_device_grant_count IS NULL AND
+      required_device_grant_set_hash IS NULL AND recovery_grant_signed_container_hash IS NULL AND activation_not_before_ms IS NULL) OR
+    (record_kind = 'FleetKeyGrantV2::RotationGrant' AND
+      payload_domain = 'shardx.keys.fleet-key-grant.rotation.v2' AND grant_variant = 'RotationGrant' AND
+      fleet_id IS NOT NULL AND fkek_key_id IS NOT NULL AND generation IS NOT NULL AND
+      grant_capability = 'key.rotate' AND previous_fkek_key_id IS NOT NULL AND previous_generation IS NOT NULL AND
+      generation = previous_generation + 1 AND fkek_key_id <> previous_fkek_key_id AND
+      required_device_grant_count IS NOT NULL AND required_device_grant_set_hash IS NOT NULL AND
+      recovery_grant_signed_container_hash IS NOT NULL AND activation_not_before_ms IS NOT NULL AND
+      length(required_device_grant_set_hash) = 32 AND length(recovery_grant_signed_container_hash) = 32 AND
+      activation_not_before_ms BETWEEN not_before_ms AND not_after_ms - 1 AND
+      subject_kind IS NULL AND subject_account_id IS NULL AND subject_device_id IS NULL AND subject_signing_key_id IS NULL AND
+      subject_hpke_key_id IS NULL AND approval_scope_kind IS NULL AND approval_scope_id IS NULL AND approved_use IS NULL AND
+      scope_kind IS NULL AND scope_id IS NULL AND capability IS NULL AND recipient_hpke_key_id IS NULL AND
+      hpke_suite_id IS NULL AND hpke_info_bytes IS NULL AND hpke_encapped_key_bytes IS NULL AND hpke_wrapped_fleet_key_bytes IS NULL AND
+      recipient_root_key_id IS NULL AND recipient_root_generation IS NULL AND root_wrap_suite_id IS NULL AND
+      root_wrap_nonce_bytes IS NULL AND root_wrap_context_bytes IS NULL AND wrapped_fleet_key_bytes IS NULL)
+  )
+) STRICT;
+
+CREATE TABLE tenant_root_key_generations (
+  server_id                       TEXT NOT NULL,
+  server_instance_id              TEXT NOT NULL,
+  tenant_id                       TEXT NOT NULL,
+  root_generation                 INTEGER NOT NULL CHECK (root_generation BETWEEN 0 AND 9223372036854775807),
+  root_key_id                     TEXT NOT NULL,
+  state                           TEXT NOT NULL CHECK (state IN ('PREPARING','ACTIVE','RETIRED')),
+  recovery_bundle_sha256          BLOB CHECK (recovery_bundle_sha256 IS NULL OR length(recovery_bundle_sha256) = 32),
+  required_custodian_grant_count  INTEGER NOT NULL CHECK (required_custodian_grant_count BETWEEN 1 AND 4294967295),
+  required_custodian_grant_set_hash BLOB NOT NULL CHECK (length(required_custodian_grant_set_hash) = 32),
+  created_at                      TEXT NOT NULL,
+  activated_at                   TEXT,
+  retired_at                     TEXT,
+  PRIMARY KEY(server_id, server_instance_id, tenant_id, root_generation),
+  UNIQUE(server_id, server_instance_id, tenant_id, root_key_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, root_generation, root_key_id),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX tenant_root_key_one_active_generation
+ON tenant_root_key_generations(server_id, server_instance_id, tenant_id)
+WHERE state = 'ACTIVE';
+
+CREATE TABLE tenant_root_key_grants (
+  server_id                           TEXT NOT NULL,
+  server_instance_id                  TEXT NOT NULL,
+  tenant_id                           TEXT NOT NULL,
+  replay_id                           BLOB NOT NULL CHECK (length(replay_id) = 16),
+  container_domain                    TEXT NOT NULL CHECK (container_domain = 'shardx.authorization.signed-container.v2'),
+  container_version                   INTEGER NOT NULL CHECK (container_version = 2),
+  payload_domain                      TEXT NOT NULL CHECK (payload_domain = 'shardx.keys.tenant-root-key-grant.v2'),
+  payload_version                     INTEGER NOT NULL CHECK (payload_version = 2),
+  grant_variant                       TEXT NOT NULL CHECK (grant_variant IN ('FirstRootSelfGrant','ExistingRootGrant','RotationGrant')),
+  root_key_id                         TEXT NOT NULL,
+  root_generation                     INTEGER NOT NULL CHECK (root_generation BETWEEN 0 AND 9223372036854775807),
+  grant_capability                    TEXT NOT NULL CHECK (grant_capability = 'root.custody'),
+  subject_account_id                  TEXT NOT NULL,
+  subject_device_id                   TEXT NOT NULL,
+  subject_signing_key_id              TEXT NOT NULL,
+  subject_device_approval_replay_id   BLOB NOT NULL CHECK (length(subject_device_approval_replay_id) = 16),
+  recipient_hpke_key_id               TEXT NOT NULL,
+  hpke_suite_id                       INTEGER NOT NULL CHECK (hpke_suite_id = 1),
+  hpke_mode_id                        INTEGER NOT NULL CHECK (hpke_mode_id = 0),
+  hpke_kem_id                         INTEGER NOT NULL CHECK (hpke_kem_id = 32),
+  hpke_kdf_id                         INTEGER NOT NULL CHECK (hpke_kdf_id = 1),
+  hpke_aead_id                        INTEGER NOT NULL CHECK (hpke_aead_id = 3),
+  hpke_info_bytes                     BLOB NOT NULL CHECK (length(hpke_info_bytes) BETWEEN 1 AND 1024),
+  hpke_encapped_key_bytes             BLOB NOT NULL CHECK (length(hpke_encapped_key_bytes) = 32),
+  hpke_wrapped_trk_bytes              BLOB NOT NULL CHECK (length(hpke_wrapped_trk_bytes) = 48),
+  previous_root_key_id                TEXT,
+  previous_root_generation            INTEGER CHECK (previous_root_generation IS NULL OR previous_root_generation BETWEEN 0 AND 9223372036854775807),
+  issued_at_ms                        INTEGER NOT NULL CHECK (issued_at_ms BETWEEN 0 AND 9223372036854775807),
+  not_before_ms                       INTEGER NOT NULL CHECK (not_before_ms BETWEEN 0 AND 9223372036854775807),
+  not_after_ms                        INTEGER NOT NULL CHECK (not_after_ms BETWEEN 0 AND 9223372036854775807 AND not_after_ms > not_before_ms),
+  restore_epoch                       INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  canonical_payload_bytes             BLOB NOT NULL CHECK (length(canonical_payload_bytes) BETWEEN 1 AND 65536),
+  payload_sha256                      BLOB NOT NULL CHECK (length(payload_sha256) = 32),
+  signature_suite_id                  INTEGER NOT NULL CHECK (signature_suite_id BETWEEN 0 AND 65535),
+  signature_version                   INTEGER NOT NULL CHECK (signature_version = 1),
+  issuer_signing_key_id               TEXT NOT NULL,
+  signature_bytes                     BLOB NOT NULL CHECK (length(signature_bytes) BETWEEN 1 AND 4096),
+  signed_container_hash               BLOB NOT NULL CHECK (length(signed_container_hash) = 32),
+  exact_signed_container_bytes        BLOB NOT NULL CHECK (length(exact_signed_container_bytes) BETWEEN 1 AND 131072),
+  exact_signed_container_bytes_sha256 BLOB NOT NULL CHECK (length(exact_signed_container_bytes_sha256) = 32),
+  trk_credential_ref                  TEXT,
+  acknowledged_at_ms                 INTEGER CHECK (acknowledged_at_ms IS NULL OR acknowledged_at_ms BETWEEN 0 AND 9223372036854775807),
+  revoked_at_ms                       INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms BETWEEN 0 AND 9223372036854775807),
+  PRIMARY KEY(server_id, server_instance_id, tenant_id, replay_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, payload_domain, replay_id),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, server_instance_id, tenant_id, root_generation, root_key_id)
+    REFERENCES tenant_root_key_generations(server_id, server_instance_id, tenant_id, root_generation, root_key_id) ON DELETE RESTRICT,
+  CHECK (subject_signing_key_id <> recipient_hpke_key_id),
+  CHECK (issued_at_ms <= not_before_ms),
+  CHECK (grant_variant <> 'FirstRootSelfGrant' OR root_generation = 0),
+  CHECK (
+    (grant_variant = 'RotationGrant' AND previous_root_key_id IS NOT NULL AND
+      previous_root_generation IS NOT NULL AND root_generation = previous_root_generation + 1 AND
+      root_key_id <> previous_root_key_id) OR
+    (grant_variant IN ('FirstRootSelfGrant','ExistingRootGrant') AND
+      previous_root_key_id IS NULL AND previous_root_generation IS NULL)
+  )
+) STRICT;
+
+CREATE UNIQUE INDEX tenant_root_one_first_self_grant
+ON tenant_root_key_grants(server_id, server_instance_id, tenant_id)
+WHERE grant_variant = 'FirstRootSelfGrant';
+
+-- shortcut: schema only; the launcher learns no account role, so accounts,
+-- device_state and fleet_key_state are filled with publish-create, which
+-- files the account a binding belongs to.
+CREATE TABLE fleet_key_state (
+  server_id                  TEXT NOT NULL,
+  server_instance_id         TEXT NOT NULL,
+  tenant_id                  TEXT NOT NULL,
+  fleet_id                   TEXT NOT NULL,
+  generation                 INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  fkek_key_id                TEXT NOT NULL,
+  device_id                  TEXT NOT NULL,
+  device_hpke_grant_record_id TEXT NOT NULL UNIQUE REFERENCES signed_authorization_records(record_id) ON DELETE RESTRICT,
+  fkek_credential_ref        TEXT NOT NULL UNIQUE,
+  state                      TEXT NOT NULL CHECK (state IN ('PREPARING','ACTIVE','RETIRED')),
+  acknowledged_at            TEXT,
+  created_at                 TEXT NOT NULL,
+  PRIMARY KEY(server_id, server_instance_id, tenant_id, fleet_id, generation),
+  UNIQUE(server_id, server_instance_id, tenant_id, fleet_id, fkek_key_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, fleet_id, generation, fkek_key_id),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, tenant_id, device_id)
+    REFERENCES device_state(server_id, tenant_id, device_id) ON DELETE RESTRICT,
+  CHECK (length(device_hpke_grant_record_id) > 0)
+) STRICT;
+
+CREATE UNIQUE INDEX fleet_key_one_active_generation
+ON fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id)
+WHERE state = 'ACTIVE';
+
+-- shortcut: schema only; the recovery and downgrade journals are written by
+-- WP-5 (probe 9, L2044).
+CREATE TABLE restore_journals (
+  local_profile_id   TEXT PRIMARY KEY REFERENCES profile_bindings(local_profile_id) ON DELETE RESTRICT,
+  journal_id         TEXT NOT NULL UNIQUE,
+  phase              TEXT NOT NULL CHECK (phase IN (
+                       'CREATED','DOWNLOADING','VERIFIED','EXTRACTING','VALIDATED','RESEALED',
+                       'SWAP_STARTED','SWAPPED','SMOKE_PASSED','ROLLBACK_REQUIRED','ROLLED_BACK','COMPLETED'
+                     )),
+  staged_path        TEXT NOT NULL,
+  backup_path        TEXT NOT NULL,
+  old_binding_json   TEXT NOT NULL,
+  target_version     INTEGER NOT NULL CHECK (target_version BETWEEN 0 AND 9223372036854775807),
+  target_head_hash   BLOB NOT NULL CHECK (length(target_head_hash) = 32),
+  created_at         TEXT NOT NULL,
+  updated_at         TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE downgrade_journals (
+  journal_id                    TEXT PRIMARY KEY,
+  mode                          TEXT NOT NULL CHECK (mode IN ('CLONE','PRE_V2_RESTORE')),
+  original_local_profile_id     TEXT NOT NULL,
+  new_local_profile_id          TEXT,
+  phase                         TEXT NOT NULL CHECK (phase IN (
+                                  'CREATED','CLAIMED','ORIGINAL_METADATA_MOVED','ORIGINAL_USER_DATA_MOVED',
+                                  'DISCOVERY_SCAN_PASSED','CLONE_WRITTEN','PRE_V2_SET_RESTORED',
+                                  'TEAM_ARTIFACTS_RETIRED','READBACK_PASSED','COMPLETED',
+                                  'ROLLBACK_REQUIRED','ROLLED_BACK'
+                                )),
+  original_metadata_archive_path TEXT,
+  original_user_data_archive_path TEXT,
+  pre_v2_manifest_sha256        BLOB CHECK (pre_v2_manifest_sha256 IS NULL OR length(pre_v2_manifest_sha256) = 32),
+  discovery_readback_sha256     BLOB CHECK (discovery_readback_sha256 IS NULL OR length(discovery_readback_sha256) = 32),
+  created_at                    TEXT NOT NULL,
+  updated_at                    TEXT NOT NULL,
+  CHECK (new_local_profile_id IS NULL OR new_local_profile_id <> original_local_profile_id)
+) STRICT;
+
+-- shortcut: schema only; WP-4 verifies and files transitions and their
+-- binding proofs (probe 7, L2042).
+CREATE TABLE restore_epoch_transitions (
+  server_id                  TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  tenant_id                  TEXT NOT NULL,
+  server_instance_id         TEXT NOT NULL,
+  transition_replay_id       BLOB NOT NULL CHECK (length(transition_replay_id) = 16),
+  previous_epoch             INTEGER NOT NULL CHECK (previous_epoch BETWEEN 0 AND 9223372036854775807),
+  new_epoch                  INTEGER NOT NULL CHECK (
+                               new_epoch BETWEEN 0 AND 9223372036854775807 AND
+                               new_epoch > previous_epoch
+                             ),
+  mapping_codec              TEXT NOT NULL CHECK (mapping_codec = 'PROFILE_HEAD_SET_MERKLE_V2'),
+  mapping_count              INTEGER NOT NULL CHECK (mapping_count BETWEEN 1 AND 1000000),
+  profile_head_mapping_root  BLOB NOT NULL CHECK (length(profile_head_mapping_root) = 32),
+  reason_code                TEXT NOT NULL CHECK (reason_code IN ('operator_restore','disaster_recovery','verified_backup_rollback')),
+  approver_account_id        TEXT NOT NULL,
+  approver_device_id         TEXT NOT NULL,
+  approver_signing_key_id    TEXT NOT NULL,
+  issued_at_ms               INTEGER NOT NULL CHECK (issued_at_ms BETWEEN 0 AND 9223372036854775807),
+  nonce                      BLOB NOT NULL CHECK (length(nonce) = 16),
+  canonical_transition_payload_bytes BLOB NOT NULL CHECK (length(canonical_transition_payload_bytes) BETWEEN 1 AND 131072),
+  transition_payload_sha256  BLOB NOT NULL CHECK (length(transition_payload_sha256) = 32),
+  signature_suite_id         INTEGER NOT NULL CHECK (signature_suite_id BETWEEN 0 AND 65535),
+  signature_version          INTEGER NOT NULL CHECK (signature_version = 1),
+  signature_bytes            BLOB NOT NULL CHECK (length(signature_bytes) BETWEEN 1 AND 4096),
+  signed_transition_container_hash BLOB NOT NULL CHECK (length(signed_transition_container_hash) = 32),
+  exact_signed_transition_bytes BLOB NOT NULL CHECK (length(exact_signed_transition_bytes) BETWEEN 1 AND 262144),
+  exact_signed_transition_bytes_sha256 BLOB NOT NULL CHECK (length(exact_signed_transition_bytes_sha256) = 32),
+  verified_at                TEXT NOT NULL,
+  PRIMARY KEY(server_id, tenant_id, server_instance_id, previous_epoch, new_epoch),
+  UNIQUE(server_id, server_instance_id, tenant_id, transition_replay_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, nonce),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE restore_epoch_binding_proofs (
+  server_id                  TEXT NOT NULL,
+  tenant_id                  TEXT NOT NULL,
+  server_instance_id         TEXT NOT NULL,
+  previous_epoch             INTEGER NOT NULL CHECK (previous_epoch BETWEEN 0 AND 9223372036854775807),
+  new_epoch                  INTEGER NOT NULL CHECK (
+                               new_epoch BETWEEN 0 AND 9223372036854775807 AND
+                               new_epoch > previous_epoch
+                             ),
+  remote_profile_id          TEXT NOT NULL,
+  previous_signed_head_hash  BLOB NOT NULL CHECK (length(previous_signed_head_hash) = 32),
+  new_signed_head_hash       BLOB NOT NULL CHECK (length(new_signed_head_hash) = 32),
+  leaf_index                 INTEGER NOT NULL CHECK (leaf_index BETWEEN 0 AND 999999),
+  leaf_count                 INTEGER NOT NULL CHECK (leaf_count BETWEEN 1 AND 1000000 AND leaf_index < leaf_count),
+  canonical_leaf_bytes       BLOB NOT NULL CHECK (length(canonical_leaf_bytes) BETWEEN 1 AND 1024),
+  leaf_hash                  BLOB NOT NULL CHECK (length(leaf_hash) = 32),
+  expected_root              BLOB NOT NULL CHECK (length(expected_root) = 32),
+  canonical_inclusion_proof_bytes BLOB NOT NULL CHECK (length(canonical_inclusion_proof_bytes) BETWEEN 1 AND 65536),
+  proof_sha256               BLOB NOT NULL CHECK (length(proof_sha256) = 32),
+  verified_at                TEXT NOT NULL,
+  PRIMARY KEY(server_id, tenant_id, server_instance_id, previous_epoch, new_epoch, remote_profile_id),
+  FOREIGN KEY(server_id, tenant_id, server_instance_id, previous_epoch, new_epoch)
+    REFERENCES restore_epoch_transitions(
+      server_id, tenant_id, server_instance_id, previous_epoch, new_epoch
+    ) ON DELETE RESTRICT,
+  FOREIGN KEY(server_instance_id, tenant_id, remote_profile_id)
+    REFERENCES profile_bindings(server_instance_id, tenant_id, remote_profile_id) ON DELETE RESTRICT
+) STRICT;
+UPDATE schema_meta SET schema_version = 4, min_reader_version = 4,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -407,6 +843,9 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(2, 2, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V3).with_context(unreadable)?;
         }
+        if matches!(meta(&tx).as_deref(), Ok([(3, 3, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V4).with_context(unreadable)?;
+        }
         tx.commit().with_context(unreadable)?;
         if !compatible(&conn) {
             bail!(crate::errcode::code("team.trustLedgerUnsupported"));
@@ -457,7 +896,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (3, 3, "CLEAN".into()));
+        assert_eq!(meta, (4, 4, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -477,8 +916,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 4",
-            "UPDATE schema_meta SET min_reader_version = 4",
+            "UPDATE schema_meta SET schema_version = 5",
+            "UPDATE schema_meta SET min_reader_version = 5",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -511,10 +950,10 @@ mod tests {
         );
     }
 
-    /// A version 1 file, as #188 wrote it, moves to version 3 in one
-    /// transaction and keeps its rows; it then reopens as version 3.
+    /// A version 1 file, as #188 wrote it, moves to version 4 in one
+    /// transaction and keeps its rows; it then reopens as version 4.
     #[test]
-    fn a_version_1_file_migrates_to_version_3_and_reopens() {
+    fn a_version_1_file_migrates_to_version_4_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("team-sync.db");
         let pin = format!(
@@ -530,7 +969,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(3, 3, "CLEAN".to_string())]);
+            assert_eq!(rows, [(4, 4, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -544,7 +983,7 @@ mod tests {
     /// A clean version 2 file gains the sync tables and keeps its ledger; one
     /// that already holds a sync table, or is not clean, is refused as it was.
     #[test]
-    fn a_version_2_file_migrates_to_version_3_or_is_left_as_it_was() {
+    fn a_version_2_file_migrates_to_version_4_or_is_left_as_it_was() {
         let v2 = |path: &Path| {
             let c = Connection::open(path).unwrap();
             c.execute_batch(SCHEMA_V1).unwrap();
@@ -563,7 +1002,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(3, 3, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(4, 4, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -593,6 +1032,194 @@ mod tests {
             assert!(crate::errcode::has_code(&err, code), "{sql}: {err}");
             assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
         }
+    }
+
+    /// A clean version 3 file gains the rest of the plan's tables and keeps
+    /// its bindings; one that already holds a version 4 table, or is not
+    /// clean, is refused as it was.
+    #[test]
+    fn a_version_3_file_migrates_to_version_4_or_is_left_as_it_was() {
+        let v3 = |path: &Path| {
+            let c = Connection::open(path).unwrap();
+            for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch(&format!(
+                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
+                 VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');",
+                i = "11".repeat(16)
+            ))
+            .unwrap();
+            c
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        drop(v3(&path));
+        for _ in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(meta(&db.conn).unwrap(), [(4, 4, "CLEAN".to_string())]);
+            for (table, rows) in [
+                ("profile_bindings", 1),
+                ("server_origins", 0),
+                ("accounts", 0),
+                ("device_state", 0),
+                ("signed_authorization_records", 0),
+                ("tenant_root_key_generations", 0),
+                ("tenant_root_key_grants", 0),
+                ("fleet_key_state", 0),
+                ("restore_journals", 0),
+                ("downgrade_journals", 0),
+                ("restore_epoch_transitions", 0),
+                ("restore_epoch_binding_proofs", 0),
+            ] {
+                let sql = format!("SELECT count(*) FROM {table}");
+                let n: i64 = db.conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+                assert_eq!(n, rows, "{table}");
+            }
+        }
+        for (sql, code) in [
+            (
+                "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
+                "team.trustLedgerUnsupported",
+            ),
+            (
+                "CREATE TABLE server_origins (x INTEGER)",
+                "team.trustLedgerUnreadable",
+            ),
+            (
+                "CREATE TABLE restore_epoch_binding_proofs (x INTEGER)",
+                "team.trustLedgerUnreadable",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            v3(&path).execute_batch(sql).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let err = Db::open_at(&path).err().expect(sql).to_string();
+                assert!(crate::errcode::has_code(&err, code), "{sql}: {err}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
+        }
+    }
+
+    /// The schema half of probes 7 and 9 (L2042, L2044): journal phases and
+    /// modes are closed sets, a clone never reuses the original's ID, and a
+    /// binding with a restore journal or an epoch proof cannot be deleted; a
+    /// proof names a binding and a transition that exist, inside its leaf
+    /// count. Rows survive a reopen exactly.
+    #[test]
+    fn journals_and_epoch_proofs_keep_their_constraints_across_a_reopen() {
+        let (_dir, path) = fresh();
+        let i = "11".repeat(16);
+        let h = format!("x'{}'", "22".repeat(32));
+        let n = format!("x'{}'", "33".repeat(16));
+        let row = |table: &str, values: &str| format!("INSERT INTO {table} VALUES ({values});");
+        let binding = format!(
+            "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+               fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
+             VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');"
+        );
+        let origin = format!(
+            "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+               server_instance_id, last_restore_epoch, status)
+             VALUES ('s', 'https', 'fleet.test', 443, 'SYSTEM', '{i}', 0, 'ACTIVE');"
+        );
+        let journal = row(
+            "restore_journals",
+            &format!(
+                "'p', 'j', 'SWAP_STARTED', 'st', 'bk', '{{}}', 9223372036854775807, {h}, 't', 't'"
+            ),
+        );
+        let downgrade = row(
+            "downgrade_journals",
+            &format!("'d', 'CLONE', 'p', 'q', 'CLONE_WRITTEN', NULL, NULL, {h}, NULL, 't', 't'"),
+        );
+        let transition = row(
+            "restore_epoch_transitions",
+            &format!(
+                "'s', '{i}', '{i}', {n}, 0, 1, 'PROFILE_HEAD_SET_MERKLE_V2', 1, {h},
+                 'operator_restore', 'a', 'd', 'k', 0, {n}, x'01', {h}, 1, 1, x'01', {h}, x'01', {h}, 't'"
+            ),
+        );
+        let proof = |profile: &str, index: u32, count: u32| {
+            row(
+                "restore_epoch_binding_proofs",
+                &format!(
+                    "'s', '{i}', '{i}', 0, 1, '{profile}', {h}, {h}, {index}, {count},
+                     x'01', {h}, {h}, x'01', {h}, 't'"
+                ),
+            )
+        };
+        let db = Db::open_at(&path).unwrap();
+        db.conn
+            .execute_batch(&format!(
+                "{binding}{origin}{transition}{journal}{downgrade}{}",
+                proof(&i, 0, 1)
+            ))
+            .unwrap();
+        let other = "44".repeat(16);
+        for sql in [
+            "DELETE FROM restore_journals".to_string(),
+            "DELETE FROM restore_epoch_binding_proofs".to_string(),
+        ] {
+            // Either child alone keeps the binding.
+            let sql = format!("SAVEPOINT p; {sql}; DELETE FROM profile_bindings;");
+            assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
+            db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        }
+        for sql in [
+            "DELETE FROM restore_epoch_transitions".to_string(),
+            "DELETE FROM server_origins".to_string(),
+            "UPDATE restore_journals SET phase = 'SWAPPING'".to_string(),
+            "UPDATE restore_journals SET target_version = -1".to_string(),
+            "UPDATE downgrade_journals SET phase = 'MOVED'".to_string(),
+            "UPDATE downgrade_journals SET mode = 'RESTORE'".to_string(),
+            "UPDATE downgrade_journals SET new_local_profile_id = 'p'".to_string(),
+            format!(
+                "DELETE FROM restore_epoch_binding_proofs; {}",
+                proof(&other, 0, 1)
+            ),
+            format!(
+                "DELETE FROM restore_epoch_binding_proofs; {}",
+                proof(&i, 1, 1)
+            ),
+            "UPDATE restore_epoch_binding_proofs SET new_epoch = 2".to_string(),
+            "UPDATE restore_epoch_transitions SET new_epoch = 0".to_string(),
+        ] {
+            let sql = format!("SAVEPOINT p; {sql};");
+            assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
+            db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        }
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let kept: (String, i64, String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT r.phase, r.target_version, d.phase, d.new_local_profile_id
+                 FROM restore_journals r, downgrade_journals d",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kept,
+            (
+                "SWAP_STARTED".into(),
+                i64::MAX,
+                "CLONE_WRITTEN".into(),
+                Some("q".into())
+            )
+        );
+        // The journal and the proof go first, then the binding can (L2044).
+        db.conn
+            .execute_batch(
+                "UPDATE restore_journals SET phase = 'COMPLETED';
+                 DELETE FROM restore_journals; DELETE FROM restore_epoch_binding_proofs;
+                 DELETE FROM profile_bindings;",
+            )
+            .unwrap();
     }
 
     /// A version 1 file that is not clean, or already holds a table the
