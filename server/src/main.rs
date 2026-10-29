@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
     // bootstrap, blob GC, v1 or v2 write) changes it until `restore commit`
     // or `restore abort`; the server never resumes a restore itself.
     let class = restore::startup_gate(&cfg).await?;
+    audit::init_read_only_count(&cfg.data_dir, class.read_only())?;
     let (pool, mut authority) = if class.read_only() {
         let pool = identity::open_read_only(&cfg).await?.with_context(|| {
             format!("a restore is in progress ({class:?}) and no database is at the DB path")
