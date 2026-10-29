@@ -720,8 +720,8 @@ CREATE TABLE downgrade_journals (
   CHECK (new_local_profile_id IS NULL OR new_local_profile_id <> original_local_profile_id)
 ) STRICT;
 
--- shortcut: schema only; WP-4 verifies and files transitions and their
--- binding proofs (probe 7, L2042).
+-- `sync::accept_transitions` files the transitions a binding verified, with
+-- its binding proofs (probe 7, L2042).
 CREATE TABLE restore_epoch_transitions (
   server_id                  TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
   tenant_id                  TEXT NOT NULL,

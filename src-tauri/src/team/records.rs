@@ -151,8 +151,8 @@ fn row(
 /// The `server_origins` row of `server_url`, from the URL parser (L2032),
 /// filed on first use for `instance` at `epoch`. An origin filed for another
 /// instance is refused: what was kept under the old one never moves.
-// shortcut: `last_restore_epoch` is the epoch of the first record kept here;
-// WP-4 moves it with accepted restore epoch transitions.
+/// Its `last_restore_epoch` starts at the epoch of the first record kept
+/// here and moves with each accepted restore epoch transition.
 pub(crate) fn origin(
     conn: &Connection,
     server_url: &str,
