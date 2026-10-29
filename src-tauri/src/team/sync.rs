@@ -1252,7 +1252,12 @@ fn store_transitions(
     (epoch, version, head): (u64, u64, Option<[u8; 32]>),
     record: impl FnOnce(&rusqlite::Connection) -> Result<()>,
 ) -> Result<bool> {
-    let tx = db.conn.transaction()?;
+    // Immediate: this one reads before it writes, and a deferred transaction
+    // that must upgrade while another handle commits is refused at once
+    // ("database is locked") instead of waiting out the busy timeout.
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (instance, tenant, profile) = (hex(&b.instance), hex(&b.tenant), hex(&b.profile));
     let server = super::records::origin(&tx, server_url, &instance, wire(b.epoch)?)?;
     for s in steps {
@@ -5988,6 +5993,94 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// Runs `job` on its own thread, with its own runtime and client for the
+    /// fake server at `base`, and waits for it: a call that never returns
+    /// fails the test instead of hanging it.
+    fn within<T: Send + 'static>(
+        what: &str,
+        base: &str,
+        job: impl FnOnce(&tokio::runtime::Runtime, &FleetClient, &Device) -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = base.to_string();
+        std::thread::Builder::new()
+            .name(what.into())
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let client = FleetClient::new(&base, "").unwrap();
+                tx.send(job(&rt, &client, &device(&me()))).ok();
+            })
+            .unwrap();
+        rx
+    }
+
+    fn finished<T>(what: &str, rx: &std::sync::mpsc::Receiver<T>) -> T {
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what} did not finish: a deadlock"))
+    }
+
+    /// Q-36 follow-up: a publish right after a restore epoch's acceptance, and
+    /// one running while another handle on the same database accepts it, both
+    /// finish. No lock is held across an `.await` and no second handle is
+    /// opened inside a transaction: the only locks are SQLite's file locks
+    /// (taken by single statements or by transactions that make no network
+    /// call, and bounded by the 5 s busy timeout) and the profile claims,
+    /// which refuse instead of waiting. A new profile starts at the epoch the
+    /// server lists, whichever of the two ran first. The acceptance's own
+    /// transaction reads before it writes, so it begins immediate: a deferred
+    /// one that had to upgrade under a committing publish was refused with
+    /// "database is locked" (3 runs in 40 before the fix).
+    #[test]
+    fn a_publish_at_a_restore_epoch_never_waits_on_its_acceptance() {
+        // The racing case is repeated: the window it closes is a few statements wide.
+        for concurrent in [false, true, true, true, true, true] {
+            let w = world();
+            let (h1, h2) = restored(&w);
+            let leaves = [
+                leaf(PROFILE, h2, h1),
+                leaf([0xc4; 16], [7; 32], [8; 32]),
+                leaf([0xc5; 16], [9; 32], [10; 32]),
+            ];
+            let t = transition(&w.me, 0, &leaves);
+            w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+            let base = w.client.base_url().to_string();
+            // A second handle, open and idle for the whole test.
+            let _idle = Db::open().unwrap();
+            let out = w.udd.with_file_name("out");
+            let accept = {
+                let out = out.clone();
+                move |rt: &tokio::runtime::Runtime, c: &FleetClient, d: &Device| {
+                    rt.block_on(pull(c, "t", d, LOCAL, &out, NOW))
+                }
+            };
+            let publish_new = |rt: &tokio::runtime::Runtime, c: &FleetClient, d: &Device| {
+                rt.block_on(publish(
+                    c,
+                    "t",
+                    d,
+                    "local-new",
+                    "Second",
+                    FLEET,
+                    PROFILE2,
+                    NOW,
+                ))
+            };
+            let (accepted, published) = if concurrent {
+                let a = within("accept", &base, accept);
+                let p = within("publish", &base, publish_new);
+                (finished("accept", &a), finished("publish", &p))
+            } else {
+                let accepted = finished("accept", &within("accept", &base, accept));
+                let p = within("publish", &base, publish_new);
+                (accepted, finished("publish", &p))
+            };
+            assert!(accepted.unwrap() > 0, "{concurrent}");
+            published.unwrap();
+            assert_eq!(w.state(LOCAL).2, 1, "{concurrent}");
+            assert_eq!(w.state("local-new").2, 1, "{concurrent}");
+        }
     }
 
     /// Probe 7, G2-39: a transition or proof that does not verify keeps the
