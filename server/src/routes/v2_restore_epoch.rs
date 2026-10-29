@@ -317,11 +317,9 @@ fn epoch_path(epoch: &str) -> Result<i64, AppError> {
 /// The exact stored bytes the path names: the transition, or with `profile`
 /// that profile's proof. Another tenant's are not found (L1131, L1226), and
 /// so is one staged for an epoch the server has not reached: a restore that
-/// never happened never becomes visible.
-/// shortcut: the restore tool (D-1 step 5) does not yet bind the served set
-/// to the external record's `transition_set_sha256`, so a staged transition
-/// becomes visible after any restore to its epoch; bind it when the restore
-/// tool lands (G2-52..60).
+/// never happened never becomes visible. `restore commit` (D-1 step 5) only
+/// reaches `E+1` once the staged `E -> E+1` rows are exactly the transition
+/// set the record's `transition_set_sha256` binds, so that is the set served.
 async fn read_back(
     app: &AppState,
     who: Principal,

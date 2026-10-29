@@ -9,7 +9,7 @@ use anyhow::Context;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
-use crate::{audit, auth, bootstrap, db, identity, util};
+use crate::{audit, auth, bootstrap, db, identity, restore, util};
 
 pub const USAGE: &str = "usage:
   shardx-team-server
@@ -18,6 +18,19 @@ pub const USAGE: &str = "usage:
       create the epoch-0 identity record (server stopped)
   shardx-team-server identity show
       verify the identity record against the database mirror
+  shardx-team-server restore status
+      print the restore class (ADR 0002 D-1 K1-K12) and its plan row
+  shardx-team-server restore export-heads --backup <db> --out <dir>
+      write one transition request per tenant a restore of <db> must cover
+  shardx-team-server restore prepare --backup <db> --txn <hex>
+      build the candidate, its transition artifacts and the manifest
+  shardx-team-server restore commit [--retire]
+      finish a prepared restore from its current class
+  shardx-team-server restore abort [--orphans [--delete-archives]]
+      drop a restore whose authority is still the previous epoch; --orphans
+      keeps the pre-restore archives unless --delete-archives is given
+  shardx-team-server restore withdraw-transitions --tenant <id>
+      remove a tenant's staged transition for the next restore epoch
   shardx-team-server tenant create --slug <slug> --owner-username <name> [--password-stdin]
       create a tenant and its owner account; the password is prompted for,
       or read from stdin with --password-stdin, never taken from argv or env
@@ -35,6 +48,25 @@ pub enum Command {
     Serve,
     IdentityInit,
     IdentityShow,
+    RestoreStatus,
+    RestoreExportHeads {
+        backup: String,
+        out: String,
+    },
+    RestorePrepare {
+        backup: String,
+        txn: [u8; 16],
+    },
+    RestoreCommit {
+        retire: bool,
+    },
+    RestoreAbort {
+        orphans: bool,
+        delete_archives: bool,
+    },
+    RestoreWithdrawTransitions {
+        tenant: [u8; 16],
+    },
     TenantCreate {
         slug: String,
         owner_username: String,
@@ -60,6 +92,37 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         [] => Ok(Command::Serve),
         ["identity", "init"] => Ok(Command::IdentityInit),
         ["identity", "show"] => Ok(Command::IdentityShow),
+        ["restore", "status"] => Ok(Command::RestoreStatus),
+        ["restore", "export-heads", "--backup", backup, "--out", out] => {
+            Ok(Command::RestoreExportHeads {
+                backup: backup.to_string(),
+                out: out.to_string(),
+            })
+        }
+        ["restore", "prepare", "--backup", backup, "--txn", txn] => Ok(Command::RestorePrepare {
+            backup: backup.to_string(),
+            txn: bootstrap::parse_device_id(txn).ok_or("--txn must be 32 hex digits")?,
+        }),
+        ["restore", "commit"] => Ok(Command::RestoreCommit { retire: false }),
+        ["restore", "commit", "--retire"] => Ok(Command::RestoreCommit { retire: true }),
+        ["restore", "abort"] => Ok(Command::RestoreAbort {
+            orphans: false,
+            delete_archives: false,
+        }),
+        ["restore", "abort", "--orphans"] => Ok(Command::RestoreAbort {
+            orphans: true,
+            delete_archives: false,
+        }),
+        ["restore", "abort", "--orphans", "--delete-archives"] => Ok(Command::RestoreAbort {
+            orphans: true,
+            delete_archives: true,
+        }),
+        ["restore", "withdraw-transitions", "--tenant", tenant] => {
+            Ok(Command::RestoreWithdrawTransitions {
+                tenant: bootstrap::parse_device_id(tenant)
+                    .ok_or("--tenant must be 32 hex digits")?,
+            })
+        }
         ["tenant", "create", rest @ ..] => parse_tenant_create(rest),
         ["tenant", "confirm-first-device", "--tenant", slug, "--device", device] => {
             Ok(Command::ConfirmFirstDevice {
@@ -136,6 +199,21 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::IdentityShow => {
             anyhow::ensure!(identity::show(&cfg).await?, "the identity does not verify");
             Ok(())
+        }
+        Command::RestoreStatus => restore::status(&cfg).await,
+        Command::RestoreExportHeads { backup, out } => {
+            restore::export_heads(&cfg, Path::new(&backup), Path::new(&out)).await
+        }
+        Command::RestorePrepare { backup, txn } => {
+            restore::prepare(&cfg, Path::new(&backup), txn).await
+        }
+        Command::RestoreCommit { retire } => restore::commit(&cfg, retire).await,
+        Command::RestoreAbort {
+            orphans,
+            delete_archives,
+        } => restore::abort(&cfg, orphans, delete_archives).await,
+        Command::RestoreWithdrawTransitions { tenant } => {
+            restore::withdraw_transitions(&cfg, tenant).await
         }
         Command::TenantCreate {
             slug,
@@ -440,6 +518,49 @@ mod tests {
                 device_id: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             })
         );
+        assert_eq!(parse(&args("restore status")), Ok(Command::RestoreStatus));
+        assert_eq!(
+            parse(&args("restore export-heads --backup b.db --out o")),
+            Ok(Command::RestoreExportHeads {
+                backup: "b.db".into(),
+                out: "o".into(),
+            })
+        );
+        assert_eq!(
+            parse(&args(
+                "restore prepare --backup b.db --txn 000102030405060708090a0b0c0d0e0f"
+            )),
+            Ok(Command::RestorePrepare {
+                backup: "b.db".into(),
+                txn: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            })
+        );
+        assert_eq!(
+            parse(&args("restore commit --retire")),
+            Ok(Command::RestoreCommit { retire: true })
+        );
+        assert_eq!(
+            parse(&args("restore abort --orphans")),
+            Ok(Command::RestoreAbort {
+                orphans: true,
+                delete_archives: false
+            })
+        );
+        assert_eq!(
+            parse(&args("restore abort --orphans --delete-archives")),
+            Ok(Command::RestoreAbort {
+                orphans: true,
+                delete_archives: true
+            })
+        );
+        assert_eq!(
+            parse(&args(
+                "restore withdraw-transitions --tenant 000102030405060708090a0b0c0d0e0f"
+            )),
+            Ok(Command::RestoreWithdrawTransitions {
+                tenant: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            })
+        );
         assert_eq!(
             parse(&args("tenant first-device-status --tenant acme")),
             Ok(Command::FirstDeviceStatus {
@@ -453,6 +574,11 @@ mod tests {
             "identity",
             "identity init extra",
             "identity repair",
+            "restore",
+            "restore prepare --backup b.db",
+            "restore prepare --backup b.db --txn 00",
+            "restore commit --force",
+            "restore abort now",
             "serve",
             "--help",
             "tenant create --slug acme",

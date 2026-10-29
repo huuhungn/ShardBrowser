@@ -826,7 +826,7 @@ pub(super) fn same_request(
 }
 
 /// The stored response a ledger row holds, if it is the exact map of `kind`
-/// for this request on this instance and epoch, with its record type and
+/// for this request on this instance and at its epoch, with its record type and
 /// hash; `None` for anything else.
 pub(super) fn stored_payload(
     row: &sqlx::sqlite::SqliteRow,
@@ -841,7 +841,7 @@ pub(super) fn stored_payload(
         && stored.exact_request_hash == outer.canonical_request_hash()
         && stored.response_record_type == record_type
         && stored.server_instance_id == v.server_instance_id
-        && stored.restore_epoch == v.restore_epoch
+        && stored.restore_epoch == outer.restore_epoch
         && row
             .get::<Option<String>, _>("response_record_type")
             .as_deref()

@@ -18,12 +18,15 @@ mod integrity;
 mod models;
 mod quarantine;
 mod ratelimit;
+mod restore;
 mod routes;
 mod state;
 mod util;
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+
+use anyhow::Context;
 
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -67,13 +70,41 @@ async fn main() -> anyhow::Result<()> {
              server can take it over; set a real password before exposing it"
         );
     }
-    let pool = db::init_pool(&cfg).await?;
-    db::bootstrap_admin(&pool, &cfg).await?;
-    blob::gc_orphans(&cfg, &pool).await;
-
-    // The server only reads the record; it never creates or repairs it.
-    let mirror = identity::read_mirror(&pool).await?;
-    let mut authority = identity::authority(&cfg, mirror.as_ref());
+    // ADR 0002 D-1: classify before any write. While a restore is in
+    // progress the DB is opened read-only, so nothing (no migration, admin
+    // bootstrap, blob GC, v1 or v2 write) changes it until `restore commit`
+    // or `restore abort`; the server never resumes a restore itself.
+    let class = restore::startup_gate(&cfg).await?;
+    let (pool, mut authority) = if class.read_only() {
+        let pool = identity::open_read_only(&cfg).await?.with_context(|| {
+            format!("a restore is in progress ({class:?}) and no database is at the DB path")
+        })?;
+        let refusal = identity::Refusal {
+            code: identity::ReasonCode::ReconciliationRequired,
+            detail: format!(
+                "a restore is in progress ({class:?}, plan {}); the database is read-only; \
+                 run `restore status`",
+                class.row()
+            ),
+        };
+        // K2 keeps the incident's own reason code (L2264, C-3).
+        let authority = match class {
+            restore::Class::K2 => {
+                let mirror = identity::read_mirror(&pool).await?;
+                identity::authority(&cfg, mirror.as_ref()).and(Err(refusal))
+            }
+            _ => Err(refusal),
+        };
+        (pool, authority)
+    } else {
+        let pool = db::init_pool(&cfg).await?;
+        db::bootstrap_admin(&pool, &cfg).await?;
+        blob::gc_orphans(&cfg, &pool).await;
+        // The server only reads the record; it never creates or repairs it.
+        let mirror = identity::read_mirror(&pool).await?;
+        let authority = identity::authority(&cfg, mirror.as_ref());
+        (pool, authority)
+    };
     // ADR 0001 R1/R4: reconcile the control plane before any request runs.
     if let Ok(verified) = &authority {
         // A failed pass turns v2 writes off; it never stops v1.

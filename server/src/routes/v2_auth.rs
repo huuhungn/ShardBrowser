@@ -211,6 +211,31 @@ pub struct Session {
     access_token_hash: [u8; 32],
 }
 
+impl Session {
+    /// A device's identity alone, so an offline command can apply a session
+    /// predicate such as `is_active_custodian`; it authenticates nothing.
+    pub(crate) fn of_device(
+        tenant_id: [u8; 16],
+        account_id: [u8; 16],
+        device_id: [u8; 16],
+        signing_key_id: [u8; 32],
+        hpke_key_id: [u8; 32],
+    ) -> Self {
+        Session {
+            id: [0; 16],
+            tenant_id,
+            account_id,
+            device_id,
+            class: "device".into(),
+            signing_key_id,
+            hpke_key_id,
+            access_expires_at_ms: 0,
+            absolute_expires_at_ms: 0,
+            access_token_hash: [0; 32],
+        }
+    }
+}
+
 const SESSION_COLUMNS: &str = "id, tenant_id, account_id, device_id, class, signing_key_id, \
      access_token_hash, \
      hpke_key_id, account_token_version, access_expires_at_ms, refresh_expires_at_ms, \

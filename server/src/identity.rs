@@ -12,6 +12,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use shardx_team_server::identity_record::{self, IdentityRecordV2, RECORD_LEN};
+use shardx_team_server::restore_manifest::MANIFEST_FILE;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 
@@ -183,7 +184,7 @@ pub(crate) fn is_network_path(_path: &Path) -> bool {
 /// same as any other entry that is not a valid record: it could point back
 /// into the data directory's rollback scope, which preflight keeps the
 /// directory out of (S1).
-fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Refusal> {
+pub(crate) fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Refusal> {
     let path = dir.join(RECORD_FILE);
     let unreadable = |e: std::io::Error| {
         refuse(
@@ -256,8 +257,8 @@ fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
 }
 
 /// Compare a parsed record with the mirror, following the plan's startup
-/// crash table (L2256-L2265). Restore preparation is not supported yet, so a
-/// record ahead of the mirror can only be resolved by the operator.
+/// crash table (L2256-L2265). A record ahead of the mirror is resolved only
+/// by `restore commit` from an exact preparation (`restore.rs`).
 pub fn reconcile(
     record: &IdentityRecordV2,
     record_sha256: [u8; 32],
@@ -318,7 +319,20 @@ pub fn authority(cfg: &Config, mirror: Option<&Mirror>) -> Authority {
     };
     let dir = preflight(dir, &cfg.data_dir).map_err(|e| refuse(ReasonCode::Missing, e))?;
     let (record, sha256) = read_record(&dir)?;
-    reconcile(&record, sha256, mirror)
+    let verified = reconcile(&record, sha256, mirror)?;
+    // K3 needs no preparation manifest at all (ADR 0002 D-1): while one
+    // exists, even a terminal one, a restore is still in progress.
+    if exists_or_unknown(&dir.join(MANIFEST_FILE)) {
+        return Err(refuse(
+            ReasonCode::ReconciliationRequired,
+            "a restore preparation manifest exists; run `restore status`",
+        ));
+    }
+    Ok(verified)
+}
+
+fn exists_or_unknown(path: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 async fn table_exists(pool: &SqlitePool, table: &str) -> Result<bool, sqlx::Error> {

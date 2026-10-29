@@ -2624,7 +2624,8 @@ async fn two_bootstraps_under_different_keys_commit_once_and_a_custodian_closes_
              SELECT server_instance_id, tenant_id, actor_device_id, operation_scope, ?,
                     operation_kind, ?, ?, ?, 'in_flight', response_record_type,
                     exact_response_bytes, exact_response_bytes_sha256, retained_until,
-                    approval_payload_domain, restore_epoch, actor_account_id, subject_device_id
+                    approval_payload_domain, restore_epoch, actor_account_id, subject_device_id,
+                    superseded_by_restore_epoch
                FROM v2_idempotency WHERE operation_kind = 'ROOT_GENERATION_CREATE'",
             &[&[0xe3; 16], &hash, &third, &sha256(&third)],
         )
@@ -2886,7 +2887,7 @@ async fn the_first_device_reads_back_acknowledges_and_activates_generation_zero(
                         x'{}', operation_kind, canonical_request_hash, exact_request_bytes,
                         exact_request_bytes_sha256, 'in_flight', NULL, NULL, NULL,
                         retained_until, approval_payload_domain, restore_epoch,
-                        actor_account_id, subject_device_id
+                        actor_account_id, subject_device_id, superseded_by_restore_epoch
                    FROM v2_idempotency WHERE operation_kind = '{kind}'",
                 "ee".repeat(16)
             ),
