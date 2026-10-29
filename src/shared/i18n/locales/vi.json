@@ -1287,6 +1287,7 @@
   "sync.noVerifiedFleetKey": "Không có khóa nhóm nào đã được thiết bị này xác minh để mở hồ sơ nhóm này. Hãy nhận khóa nhóm trong Cài đặt; không thể dùng mật khẩu bảo vệ cho hồ sơ này.",
   "sync.passphraseRequired": "Hãy nhập mật khẩu của nhóm để đẩy lên. Khoá đội máy từ máy chủ nhóm chưa được dùng cho đến khi có cơ chế phân phối khoá đã xác minh.",
   "sync.profileNotListed": "Máy chủ nhóm không liệt kê hồ sơ đã xuất bản này.",
+  "sync.publishChanged": "Lần xuất bản này đã bị hủy hoặc thay đổi bởi một tiến trình khác. Chưa có gì được gắn; hãy xuất bản lại.",
   "sync.publishPendingElsewhere": "Lần xuất bản trước của hồ sơ này lên một nhóm thiết bị khác chưa xong. Hãy hoàn tất lần đó trước.",
   "sync.publishProfileTaken": "Máy chủ nhóm đã có một hồ sơ trùng mã được chọn cho hồ sơ này. Hãy thử xuất bản lại.",
   "sync.pullPassphraseRequired": "Hãy nhập mật khẩu bảo vệ đã dùng khi đẩy bản chụp này lên.",

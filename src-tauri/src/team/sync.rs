@@ -782,9 +782,9 @@ fn stored_response(op: &Op, record_type: &str, body: &[u8]) -> Result<Vec<u8>> {
 
 /// Marks `op` COMPLETED with its exact response, which is also its receipt
 /// for a commit or release.
-fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]) -> Result<()> {
+fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]) -> Result<usize> {
     let receipt = matches!(op.kind.as_str(), "COMMIT" | "RELEASE");
-    conn.execute(
+    Ok(conn.execute(
         "UPDATE operations SET state = 'COMPLETED', response_record_type = ?2,
            exact_response_bytes = ?3, exact_response_bytes_sha256 = ?4,
            exact_receipt_bytes = CASE WHEN ?5 THEN ?3 END,
@@ -792,8 +792,7 @@ fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE op_id = ?1 AND state = 'PENDING'",
         params![op.op_id, record_type, body, sha256(body).to_vec(), receipt],
-    )?;
-    Ok(())
+    )?)
 }
 
 /// An `upload_sessions` row.
@@ -1780,7 +1779,11 @@ async fn send_publish(
     let lease = hex(&g.lease.lease_id);
     {
         let tx = db.conn.transaction()?;
-        complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
+        // Another process may have cancelled the publish since it was read:
+        // the binding is filed only with the completion of this very operation.
+        if complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)? != 1 {
+            bail!(code("sync.publishChanged"));
+        }
         tx.execute(
         "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
            account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
@@ -1875,14 +1878,28 @@ async fn refuse_publish(
     err
 }
 
+/// How long an unbound release is worth sending: the lease it names, asked for
+/// one TTL, cannot be live after that and the skew allowance.
+const UNBOUND_RELEASE_SECONDS: u64 = LEASE_TTL_SECONDS as u64 + LEASE_SKEW_MS / 1000;
+
+/// SQL for an unbound release that is past it, which is given up unsent and no
+/// longer counts as work in flight (the downgrade readiness uses it too).
+pub(crate) fn given_up_unbound_release() -> String {
+    format!(
+        "(kind = 'RELEASE' AND local_profile_id IS NULL
+          AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{UNBOUND_RELEASE_SECONDS} seconds'))"
+    )
+}
+
 /// Ends the unbound releases too old to matter and returns the rest.
 fn due_unbound_releases(db: &Db) -> Result<Vec<Op>> {
-    let ttl = u64::from(LEASE_TTL_SECONDS) + LEASE_SKEW_MS / 1000;
     db.conn.execute(
-        "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE kind = 'RELEASE' AND state = 'PENDING' AND local_profile_id IS NULL
-           AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ?1 || ' seconds')",
-        [ttl],
+        &format!(
+            "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE state = 'PENDING' AND {}",
+            given_up_unbound_release()
+        ),
+        [],
     )?;
     let mut stmt = db.conn.prepare(&format!(
         "SELECT {OP_COLUMNS} FROM operations
@@ -5076,6 +5093,30 @@ mod tests {
             assert_eq!(w.sent("POST", "/release").len(), before + 1, "{pull}");
             assert_eq!(unbound_pending(&w), 0, "{pull}");
         }
+    }
+
+    /// NEW-5: a publish whose operation another process ended (a cancel) between
+    /// the read and the send binds nothing: the completion must update exactly
+    /// the one pending row, in the transaction that files the binding.
+    #[test]
+    fn a_publish_whose_operation_was_cancelled_meanwhile_binds_nothing() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        let mut db = w.db();
+        let op = pending_publish(&db, LOCAL).unwrap().unwrap();
+        cancel_publish(LOCAL).unwrap();
+        let err =
+            w.rt.block_on(send_publish(
+                &w.client, "t", &mut db, &w.dev, LOCAL, FLEET, &op, NOW,
+            ))
+            .unwrap_err();
+        assert!(has(&err, "sync.publishChanged"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"),
+            1
+        );
     }
 
     /// NEW-3: a publish M-1 keeps unsent blocks a downgrade by a name that

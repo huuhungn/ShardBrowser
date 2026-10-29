@@ -1287,6 +1287,7 @@
   "sync.noVerifiedFleetKey": "No fleet key this device verified opens this team profile. Collect the fleet key in Settings; a passphrase cannot be used for it.",
   "sync.passphraseRequired": "Enter the team passphrase to push. Fleet keys from the team server are not used until verified key distribution ships.",
   "sync.profileNotListed": "The team server does not list this published profile.",
+  "sync.publishChanged": "This publish was cancelled or changed by another process. Nothing was bound; publish again.",
   "sync.publishPendingElsewhere": "An earlier publish of this profile to another fleet has not finished. Finish it first.",
   "sync.publishProfileTaken": "The team server already has a profile with the ID chosen for this one. Try publishing again.",
   "sync.pullPassphraseRequired": "Enter the passphrase this snapshot was pushed with.",

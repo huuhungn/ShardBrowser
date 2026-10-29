@@ -1295,12 +1295,14 @@ pub(crate) fn readiness() -> Result<Readiness> {
         );
         block(
             "downgrade.blockOperation",
-            count(
+            count(&format!(
                 "SELECT (SELECT count(*) FROM operations
-                          WHERE state IN ('PENDING', 'RUNNING', 'AWAITING_RETRY'))
+                          WHERE state IN ('PENDING', 'RUNNING', 'AWAITING_RETRY')
+                            AND NOT {})
                       + (SELECT count(*) FROM upload_sessions
                           WHERE state IN ('OPEN', 'FINALIZING', 'READY'))",
-            )?,
+                super::sync::given_up_unbound_release()
+            ))?,
         );
         // The way out of a publish that cannot be sent is the cancel command.
         block(
@@ -3152,6 +3154,41 @@ mod tests {
         assert!(ready_codes().contains(&"downgrade.blockLease"));
         let e = start_clone(LOCAL).unwrap_err();
         assert!(has(&e, "downgrade.leaseHeld"), "{e:#}");
+    }
+
+    /// An unbound release (a cancelled publish's) counts as work in flight
+    /// only until `retry_unbound_releases` would give it up unsent: the same
+    /// age, and only an unbound RELEASE.
+    #[test]
+    fn an_unbound_release_past_its_give_up_age_no_longer_blocks_the_downgrade() {
+        let (_e, _) = seeded();
+        start_clone(LOCAL).unwrap();
+        let db = Db::open().unwrap();
+        let blocked = || ready_codes().contains(&"downgrade.blockOperation");
+        let set = |sql: &str| db.conn.execute(sql, []).unwrap();
+        insert_op(&db, "rel", "RELEASE", "PENDING");
+        set("UPDATE operations SET local_profile_id = NULL");
+        assert!(blocked(), "recent");
+        let age = |at: &str| {
+            set(&format!("UPDATE operations SET created_at = '{at}'"));
+        };
+        age("2020-01-01T00:00:00.000Z");
+        assert!(!blocked(), "old and unbound");
+        // Not for a release a binding owns, nor for any other kind.
+        set(&format!(
+            "UPDATE operations SET local_profile_id = '{LOCAL}'"
+        ));
+        assert!(blocked(), "old but bound");
+        set("UPDATE operations SET local_profile_id = NULL, kind = 'PUBLISH'");
+        assert!(blocked(), "old but a publish");
+        // Just inside the age it still counts.
+        set("UPDATE operations SET kind = 'RELEASE'");
+        let inside = crate::team::sync::given_up_unbound_release();
+        assert!(inside.contains("360 seconds"), "{inside}");
+        set("UPDATE operations SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds')");
+        assert!(blocked(), "inside the age");
+        set("UPDATE operations SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-400 seconds')");
+        assert!(!blocked(), "past the age");
     }
 
     #[test]
