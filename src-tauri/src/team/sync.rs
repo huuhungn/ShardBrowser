@@ -171,6 +171,10 @@ fn spool(name: &str) -> Result<std::path::PathBuf> {
 }
 
 /// Whether `local` is a published profile. No team database means none is.
+// shortcut: a missing team database reads as unpublished, so the legacy path
+// runs and the server refuses its writes (PROFILE_PUBLISHED); opening the
+// database needs write access to the config root. Restore bindings from the
+// server once the Team profile UI records them.
 pub(crate) fn is_published(local: &str) -> Result<bool> {
     if !Db::path()?.exists() {
         return Ok(false);
@@ -614,15 +618,15 @@ fn stored<'a>(db: &Db, b: &Bound, op: &'a Op) -> Result<&'a [u8]> {
     Ok(&op.exact)
 }
 
-/// A reply to a stored request: the body on success. A refusal (4xx) fails
-/// the operation, so it is never resent; anything else leaves it PENDING for
-/// the next attempt to resend.
+/// A reply to a stored request: the body on success. A refusal fails the
+/// operation, so it is never resent; anything else (a lost reply, 401, 408,
+/// 429, 5xx) leaves it PENDING for the next attempt to resend as it is.
 fn settle(db: &Db, op: &Op, reply: Exact) -> Result<std::result::Result<Vec<u8>, anyhow::Error>> {
     if (200..300).contains(&reply.status) {
         return Ok(Ok(reply.body));
     }
     let err = refused(&reply);
-    if (400..500).contains(&reply.status) {
+    if terminal(reply.status) {
         db.conn.execute(
             "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE op_id = ?1",
@@ -633,7 +637,16 @@ fn settle(db: &Db, op: &Op, reply: Exact) -> Result<std::result::Result<Vec<u8>,
     Err(err)
 }
 
+/// A 4xx the request itself caused. A 401 only ends the session, and 408/429
+/// ask to resend later (plan 8.2 L1224, L1244).
+fn terminal(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 401 | 408 | 429)
+}
+
 fn refused(reply: &Exact) -> anyhow::Error {
+    if reply.status == 401 {
+        return anyhow!(code("sync.authRequired"));
+    }
     let detail: String = String::from_utf8_lossy(&reply.body)
         .chars()
         .take(300)
@@ -916,16 +929,27 @@ async fn checkout(client: &FleetClient, access: &str, db: &mut Db, b: &Bound) ->
         .map_err(|_| bad("ProfileLeaseV2"))?;
     let checks = [
         ("profile", g.profile == b.pref()),
-        ("base_version", g.lease.base_version == b.version),
-        (
-            "current_signed_head_hash",
-            g.current_signed_head_hash == b.head,
-        ),
         ("server_instance_id", g.server_instance_id == b.instance),
         ("restore_epoch", g.restore_epoch == b.epoch),
     ];
     if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
         return Err(bad(field));
+    }
+    // A replayed checkout from before the binding moved on holds a lease on an
+    // old head: it is released as stored, and the next one starts afresh.
+    if (g.lease.base_version, g.current_signed_head_hash) != (b.version, b.head) {
+        let release = {
+            let tx = db.conn.transaction()?;
+            tx.execute(
+                "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE op_id = ?1",
+                [&op.op_id],
+            )?;
+            let release = release_op(&tx, b, g.lease)?;
+            tx.commit()?;
+            get_op(db, &release)?
+        };
+        return release_reply(client, access, db, b, &release).await;
     }
     let tx = db.conn.transaction()?;
     complete(&tx, &op, RECORD_TYPE_CHECKED_OUT, &body)?;
@@ -1288,7 +1312,7 @@ async fn transfer(
     let mut renewed = std::time::Instant::now();
     for _ in 0..3 {
         let reply = client.upload_head(access, &upload).await?;
-        if (400..500).contains(&reply.status) {
+        if terminal(reply.status) {
             let e = refused(&reply);
             return Err(fail_upload(client, access, db, b, lease, commit_op, e).await);
         }
@@ -1482,9 +1506,12 @@ async fn finish(
     if object.headers.get("etag").and_then(|h| h.to_str().ok()) != Some(etag.as_str()) {
         return Err(mismatch("etag"));
     }
+    // The readback above is of `version` itself, so a head another device
+    // committed on top since then does not undo it.
     let head = listed(client, access, db, b).await?;
-    if (head.current_version, head.current_signed_head_hash)
-        != (version, Some(receipt.resulting_head_hash))
+    if head.current_version < version
+        || (head.current_version == version
+            && head.current_signed_head_hash != Some(receipt.resulting_head_hash))
     {
         return Err(mismatch("head"));
     }
@@ -1518,28 +1545,7 @@ async fn abandon(
     err: anyhow::Error,
 ) -> anyhow::Error {
     let released = async {
-        let kind = OperationKind::ReleaseLease;
-        let payload = ReleaseLeaseV2 {
-            profile: b.pref(),
-            lease,
-            reason_code: ReleaseReason::UserRelease,
-        }
-        .encode();
-        let (key, exact, canonical) = mutation(kind, payload, b)?;
-        let op_id = hex(&random::<16>()?);
-        let scope = format!(
-            "{} /v2/profiles/{}/leases/{}/release",
-            kind.scope(),
-            hex(&b.profile),
-            hex(&lease.lease_id)
-        );
-        let columns = Columns {
-            lease: Some(lease),
-            ..Default::default()
-        };
-        insert_op(
-            &db.conn, b, &op_id, "RELEASE", &scope, &key, &canonical, &exact, &columns,
-        )?;
+        let op_id = release_op(&db.conn, b, lease)?;
         let op = get_op(db, &op_id)?;
         release_reply(client, access, db, b, &op).await
     };
@@ -1549,9 +1555,37 @@ async fn abandon(
     err
 }
 
+/// Stores a `RELEASE_LEASE` of `lease` and returns its operation ID.
+fn release_op(conn: &rusqlite::Connection, b: &Bound, lease: LeaseRef) -> Result<String> {
+    let kind = OperationKind::ReleaseLease;
+    let payload = ReleaseLeaseV2 {
+        profile: b.pref(),
+        lease,
+        reason_code: ReleaseReason::UserRelease,
+    }
+    .encode();
+    let (key, exact, canonical) = mutation(kind, payload, b)?;
+    let op_id = hex(&random::<16>()?);
+    let scope = format!(
+        "{} /v2/profiles/{}/leases/{}/release",
+        kind.scope(),
+        hex(&b.profile),
+        hex(&lease.lease_id)
+    );
+    let columns = Columns {
+        lease: Some(lease),
+        ..Default::default()
+    };
+    insert_op(
+        conn, b, &op_id, "RELEASE", &scope, &key, &canonical, &exact, &columns,
+    )?;
+    Ok(op_id)
+}
+
 /// Sends the stored `RELEASE_LEASE`. Released, or refused because the lease
 /// is no longer this device's, the binding drops it and every operation still
-/// pending under it.
+/// pending under it. A 2xx that does not parse is a protocol error: it is
+/// reported, and the release stays PENDING to be replayed as stored.
 async fn release_reply(
     client: &FleetClient,
     access: &str,
@@ -1619,6 +1653,15 @@ pub(crate) async fn pull(
     let mut db = Db::open()?;
     let b = bound(&db, local)?;
     refuse_quarantined(&b)?;
+    // A push in flight would seal what this pull wrote over the user's data.
+    let pending: bool = db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM operations WHERE local_profile_id = ?1 AND state = 'PENDING')",
+        [local],
+        |r| r.get(0),
+    )?;
+    if b.lease.is_some() || pending {
+        bail!(code("sync.pushPending"));
+    }
     let head = listed(client, access, &mut db, &b).await?;
     if head.current_version == 0 {
         bail!(code("profile.theTeamServerHasNoSnapshotForThisProfi"));
@@ -1979,8 +2022,8 @@ mod tests {
         /// The active key a checkout names, when not `GEN` and `FKEK`.
         generation: Option<u64>,
         fkek_key_id: Option<[u8; 32]>,
-        /// Routes whose next request is refused unprocessed.
-        refuse: Vec<&'static str>,
+        /// Routes whose next request is refused unprocessed, with a status.
+        refuse: Vec<(&'static str, u16)>,
         fence: u64,
         lease: Option<LeaseRef>,
         stored: HashMap<[u8; 16], (Vec<u8>, u16, Vec<u8>)>,
@@ -1996,7 +2039,8 @@ mod tests {
         skip: Vec<&'static str>,
         /// PATCHes accepted before one is dropped.
         patch_budget: Option<usize>,
-        /// Replies altered on the way out: "receipt" or "manifest".
+        /// Replies altered on the way out: "receipt", "manifest", "checkout",
+        /// "release" (unreadable) or "huge" (an oversized list).
         tamper: Option<&'static str>,
         commits: usize,
     }
@@ -2073,6 +2117,9 @@ mod tests {
                     .map(str::to_string)
             };
             match (method.as_str(), parts) {
+                ("GET", ["v2", "fleets", _, "profiles"]) if self.tamper == Some("huge") => {
+                    reply(200, &[], vec![0; 9 << 20])
+                }
                 ("GET", ["v2", "fleets", _, "profiles"]) => {
                     let (version, head) = self.listed.unwrap_or((self.version, self.head));
                     let page = FleetProfilePageV2 {
@@ -2145,6 +2192,9 @@ mod tests {
                         }
                         .encode())
                     });
+                    if self.tamper == Some("release") && st == 200 {
+                        return reply(200, &[], b"not a stored response".to_vec());
+                    }
                     reply(st, &[], out)
                 }
                 ("POST", ["v2", "profiles", _, "leases", _, "renew"]) => {
@@ -2307,6 +2357,7 @@ mod tests {
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let tag = match (method.as_str(), parts.last().copied()) {
             ("PATCH", _) => "patch",
+            ("HEAD", _) => "head",
             (_, Some(last)) => last,
             _ => "",
         };
@@ -2327,8 +2378,9 @@ mod tests {
         if take(&mut f.skip, tag) {
             return reply(503, &[], Vec::new());
         }
-        if take(&mut f.refuse, tag) {
-            return reply(409, &[], b"refused".to_vec());
+        if let Some(i) = f.refuse.iter().position(|(t, _)| *t == tag) {
+            let (_, status) = f.refuse.remove(i);
+            return reply(status, &[("retry-after", "0".into())], b"refused".to_vec());
         }
         let r = f.route(&method, &parts, &headers, &body);
         if take(&mut f.lose, tag) {
@@ -3017,7 +3069,7 @@ mod tests {
     #[test]
     fn a_refused_or_mismatched_reply_is_never_kept() {
         let w = world();
-        w.fake().refuse.push("checkout");
+        w.fake().refuse.push(("checkout", 409));
         let err = w.push().unwrap_err();
         assert!(has(&err, "fleet.refusedSync"), "{err:#}");
         assert_eq!(
@@ -3040,5 +3092,190 @@ mod tests {
         assert_eq!(sent.len(), 3);
         assert_ne!(sent[0], sent[1], "the refused request is not resent");
         assert_eq!(sent[1], sent[2], "the unkept one is");
+    }
+
+    /// A head another device committed on top of this push, after its
+    /// receipt was kept, does not strand it: the readback of its own version
+    /// is pinned and the lease the commit released is dropped. A listed head
+    /// behind the receipt still fails.
+    #[test]
+    fn a_head_committed_on_top_does_not_strand_the_push() {
+        let w = world();
+        w.fake().tamper = Some("manifest");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.readbackMismatch"), "{err:#}");
+        {
+            let mut f = w.fake();
+            f.tamper = None;
+            f.listed = Some((0, None));
+        }
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.readbackMismatch"), "{err:#}");
+        w.fake().listed = Some((2, Some([9; 32])));
+        assert_eq!(w.push().unwrap().version, 1);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM profile_bindings WHERE remote_version = 1
+                   AND lease_id IS NULL AND sync_state = 'AVAILABLE'"
+            ),
+            1
+        );
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.remoteAhead"), "{err:#}");
+        assert_eq!(w.fake().commits, 1);
+    }
+
+    /// Plan 8.2: a 401 only ends the session and 408/429 ask to resend, so
+    /// none of them fails the stored request or drops the lease. 408/429 are
+    /// resent as they were; after a 401 the next push sends the same commit,
+    /// or release, byte for byte.
+    #[test]
+    fn a_lost_session_or_rate_limit_keeps_the_stored_request() {
+        let w = world();
+        w.fake().refuse.extend([
+            ("checkout", 429),
+            ("checkout", 408),
+            ("head", 401),
+            ("commit", 401),
+        ]);
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.authRequired"), "{err:#}");
+        let checkouts = w.sent("POST", "/checkout");
+        assert_eq!(checkouts.len(), 3);
+        assert!(checkouts.windows(2).all(|p| p[0] == p[1]));
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'OPEN'"),
+            1
+        );
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.authRequired"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'PENDING'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            1
+        );
+        assert_eq!(w.push().unwrap().version, 1);
+        let commits = w.sent("POST", "/commit");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0], commits[1]);
+        assert_eq!(w.fake().commits, 1);
+        drop(w);
+
+        let w = world();
+        {
+            let mut f = w.fake();
+            f.generation = Some(2);
+            f.refuse.push(("release", 401));
+        }
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'PENDING'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            1
+        );
+        w.push().unwrap_err();
+        let sent = w.sent("POST", "/release");
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0], sent[1]);
+        assert!(w.fake().lease.is_none());
+    }
+
+    /// A checkout replayed after the binding moved on to a newer head holds a
+    /// lease on the old one: it is released as stored, the checkout is
+    /// failed, and the push takes a fresh lease at the new head.
+    #[test]
+    fn a_replayed_checkout_on_an_old_head_is_released_and_taken_again() {
+        let w = world();
+        w.fake().lose.push("checkout");
+        w.push().unwrap_err();
+        let head = [9u8; 32];
+        {
+            let mut f = w.fake();
+            f.version = 1;
+            f.head = Some(head);
+        }
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET remote_version = 1, last_observed_head_hash = ?1",
+                [head.to_vec()],
+            )
+            .unwrap();
+        assert_eq!(w.push().unwrap().version, 2);
+        let checkouts = w.sent("POST", "/checkout");
+        assert_eq!(checkouts.len(), 3);
+        assert_eq!(checkouts[0], checkouts[1]);
+        assert_ne!(checkouts[1], checkouts[2]);
+        assert_eq!(w.sent("POST", "/release").len(), 1);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
+            1
+        );
+    }
+
+    /// A pull never writes over a profile whose push is in flight: one with
+    /// a stored request pending, or a lease still held.
+    #[test]
+    fn a_pull_waits_for_a_push_in_flight() {
+        for lose in [true, false] {
+            let w = world();
+            if lose {
+                w.fake().lose.push("checkout");
+            } else {
+                w.fake().tamper = Some("manifest");
+            }
+            w.push().unwrap_err();
+            let out = w.udd.with_file_name("out");
+            let err = w.pull(&out).unwrap_err();
+            assert!(has(&err, "sync.pushPending"), "{lose}: {err:#}");
+            assert!(!out.exists());
+        }
+    }
+
+    /// A 2xx release reply that does not parse is a protocol error: each
+    /// push reports it and the release stays stored, replayed as it was
+    /// until a readable reply completes it.
+    #[test]
+    fn an_unreadable_release_reply_is_reported_and_replayed() {
+        let w = world();
+        {
+            let mut f = w.fake();
+            f.generation = Some(2);
+            f.tamper = Some("release");
+        }
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.badReplySync"), "{err:#}");
+        w.fake().tamper = None;
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        let sent = w.sent("POST", "/release");
+        assert_eq!(sent.len(), 4);
+        assert!(sent[0] == sent[1] && sent[1] == sent[2]);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'COMPLETED'"
+            ),
+            2
+        );
+    }
+
+    /// A reply larger than any the client asks for is not held.
+    #[test]
+    fn a_reply_too_large_to_hold_is_refused() {
+        let w = world();
+        w.fake().tamper = Some("huge");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.badReplySync"), "{err:#}");
+        assert!(format!("{err:#}").contains("body-size"), "{err:#}");
+        assert!(w.sent("POST", "/checkout").is_empty());
     }
 }

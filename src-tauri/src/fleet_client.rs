@@ -101,6 +101,14 @@ pub struct DeviceSession {
     pub absolute_expires_at_ms: i64,
 }
 
+impl Drop for DeviceSession {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
 impl std::fmt::Debug for DeviceSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceSession")
@@ -874,14 +882,45 @@ impl FleetClient {
     }
 
     /// Sends `req` under a device session and returns the reply as received.
-    /// Only a reply that never arrived is an error: the caller decides what a
-    /// status means, and replays the same stored bytes after a lost one.
+    /// Only a reply that never arrived, or one too large to hold, is an
+    /// error: the caller decides what a status means, and replays the same
+    /// stored bytes after a lost one. 408 and 429 are resent as they were
+    /// after `Retry-After`, a bounded number of times (plan 8.2 L1244).
     async fn exact(&self, req: reqwest::RequestBuilder, access_token: &str) -> Result<Exact> {
         let lost = || crate::errcode::code("fleet.unreachableSync");
-        let res = req.bearer_auth(access_token).send().await.context(lost())?;
+        let req = req.bearer_auth(access_token);
+        let mut retries = 0;
+        let mut res = loop {
+            let res = req
+                .try_clone()
+                .ok_or_else(|| anyhow!(lost()))?
+                .send()
+                .await
+                .context(lost())?;
+            if !matches!(res.status().as_u16(), 408 | 429) || retries == EXACT_RETRIES {
+                break res;
+            }
+            retries += 1;
+            let wait = res
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()?.parse::<u64>().ok())
+                .unwrap_or(1)
+                .min(EXACT_RETRY_AFTER_MAX_SECS);
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        };
         let status = res.status().as_u16();
         let headers = res.headers().clone();
-        let body = res.bytes().await.context(lost())?.to_vec();
+        let mut body = Vec::new();
+        while let Some(chunk) = res.chunk().await.context(lost())? {
+            if body.len() + chunk.len() > MAX_EXACT_BYTES {
+                bail!(crate::errcode::code_with(
+                    "sync.badReplySync",
+                    &[("field", "body-size")]
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(Exact {
             status,
             headers,
@@ -1325,6 +1364,15 @@ struct RootKeyGrantsResponse {
 struct ActiveFleetGeneration {
     generation: u64,
 }
+
+/// The largest v2 reply held: a Range reply is at most the server's 8 MiB
+/// chunk cap (the client asks for 4 MiB), every other reply is far smaller.
+// shortcut: the plan names no response bound, so this is the chunk cap plus a
+// manifest's 128 KiB; take the plan's figure once it sets one.
+const MAX_EXACT_BYTES: usize = 8 * 1024 * 1024 + 128 * 1024;
+/// 408/429 resends, and the longest `Retry-After` waited for, per reply.
+const EXACT_RETRIES: u32 = 2;
+const EXACT_RETRY_AFTER_MAX_SECS: u64 = 30;
 
 /// A v2 reply exactly as received.
 pub struct Exact {
