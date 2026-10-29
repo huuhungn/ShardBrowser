@@ -19,6 +19,7 @@ pub mod fallback_key_file;
 pub mod fleet_grants;
 pub mod fleet_lifecycle;
 pub mod fleet_manifest;
+pub mod fleet_profiles;
 pub mod grants;
 pub mod keys;
 pub mod logins;

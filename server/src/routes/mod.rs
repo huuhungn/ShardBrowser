@@ -138,7 +138,8 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v2/fleets/:fleet_id/profiles",
             post(v2_profiles::publish_profile)
-                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY)),
+                .layer(DefaultBodyLimit::max(v2_root::MAX_ROOT_REQUEST_BODY))
+                .get(v2_profiles::list_profiles),
         )
         .route(
             "/v2/profiles/:profile_id/checkout",

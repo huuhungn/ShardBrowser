@@ -3418,3 +3418,436 @@ async fn expect_get(server: &Server, path: &str, bearer: &str) {
     let (status, _, body) = server.get(path, bearer, None).await;
     assert_eq!((status, code(&body).as_str()), (422, "UPLOAD_QUARANTINED"));
 }
+
+// ------------------------------------------------------------ fleet list ---
+
+use shared::fleet_profiles::{FleetProfileHeadV2, FleetProfilePageV2, MAX_FLEET_PROFILE_PAGE};
+
+fn list_path(fleet: [u8; 16], query: &str) -> String {
+    format!("/v2/fleets/{}/profiles{query}", hex(&fleet))
+}
+
+/// One page of `fleet`'s list, which must be served.
+async fn page(server: &Server, bearer: &str, fleet: [u8; 16], query: &str) -> FleetProfilePageV2 {
+    let (status, headers, body) = server.get(&list_path(fleet, query), bearer, None).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(headers["content-type"], "application/cbor");
+    FleetProfilePageV2::parse(&body).unwrap()
+}
+
+async fn list_refused(server: &Server, bearer: &str, fleet: [u8; 16], want: (u16, &str)) {
+    let (status, _, body) = server.get(&list_path(fleet, ""), bearer, None).await;
+    assert_eq!((status, code(&body).as_str()), want, "{}", hex(&fleet));
+}
+
+/// The ID `[tag, i >> 8, i, 0..]`.
+fn row_id(tag: u8, i: u16) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[..3].copy_from_slice(&[tag, (i >> 8) as u8, i as u8]);
+    id
+}
+
+/// Inserts `n` published, active version-0 profiles of `fleet` in `tenant`,
+/// with the IDs [`row_id`] of `tag`.
+async fn published_rows(server: &Server, tenant: [u8; 16], fleet: [u8; 16], tag: u8, n: u16) {
+    let rows = (0..n)
+        .map(|i| {
+            let id = hex(&row_id(tag, i));
+            format!(
+                "(x'{id}', x'{}', x'{}', '{id}', 0, 'active', 't', 't', x'5a', 0, 0)",
+                hex(&tenant),
+                hex(&fleet)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    server
+        .sql(
+            &format!(
+                "INSERT INTO v2_profiles
+                     (id, tenant_id, fleet_id, name, current_version, status, created_at,
+                      updated_at, label_ciphertext, last_fencing_token, current_key_generation)
+                 VALUES {rows}"
+            ),
+            &[],
+        )
+        .await;
+}
+
+fn ids(p: &FleetProfilePageV2) -> Vec<[u8; 16]> {
+    p.profiles.iter().map(|h| h.profile_id).collect()
+}
+
+/// Another tenant, `foreign`, with an active fleet `fleet`.
+async fn foreign_fleet(server: &Server, foreign: [u8; 16], fleet: [u8; 16]) {
+    server
+        .sql(
+            "INSERT INTO v2_tenants VALUES (?, 'other', 'active', NULL, 't')",
+            &[&foreign],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 't')",
+            &[&fleet, &foreign],
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn the_fleet_list_shows_each_published_head_in_bounded_pages_without_a_lease() {
+    let mut server = start("list", 28281).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (K::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (K::Fleet, FLEET)),
+        (0xa3, Capability::ProfileCommit, (K::Fleet, FLEET)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+
+    // An empty fleet is one empty last page naming this instance and fleet.
+    assert_eq!(
+        page(&server, &access, FLEET, "").await,
+        FleetProfilePageV2 {
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            tenant_id: TENANT,
+            fleet_id: FLEET,
+            profiles: vec![],
+            next_after: None,
+        }
+    );
+
+    // Two published profiles at version 0, in ID order whatever the publish
+    // order, each with its exact label ciphertext and no head.
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x02, pref(P2)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x01, pref(P1)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+    let at_zero = |id| FleetProfileHeadV2 {
+        profile_id: id,
+        current_version: 0,
+        current_signed_head_hash: None,
+        key_generation: 0,
+        label_ciphertext: vec![0x33; 24],
+    };
+    assert_eq!(
+        page(&server, &access, FLEET, "").await.profiles,
+        vec![at_zero(P1), at_zero(P2)]
+    );
+
+    // Not listed: a legacy profile, an archived one, one of another fleet,
+    // and one of another tenant's fleet under the same fleet ID.
+    server
+        .sql(
+            "INSERT INTO v2_profiles (id, tenant_id, fleet_id, name, status, created_at, updated_at)
+             VALUES (?, ?, ?, 'legacy', 'active', 't', 't')",
+            &[&P3, &TENANT, &FLEET],
+        )
+        .await;
+    published_rows(&server, TENANT, FLEET, 0xc4, 1).await;
+    server
+        .sql(
+            "UPDATE v2_profiles SET status = 'archived' WHERE id = ?",
+            &[&row_id(0xc4, 0)],
+        )
+        .await;
+    let other_fleet = [0xf7; 16];
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'o', 'active', 't')",
+            &[&other_fleet, &TENANT],
+        )
+        .await;
+    published_rows(&server, TENANT, other_fleet, 0xc5, 1).await;
+    let foreign = [0x42; 16];
+    foreign_fleet(&server, foreign, FLEET).await;
+    published_rows(&server, foreign, FLEET, 0xc6, 1).await;
+    assert_eq!(ids(&page(&server, &access, FLEET, "").await), vec![P1, P2]);
+    assert_eq!(ids(&page(&server, &access, FLEET, "?").await), vec![P1, P2]);
+
+    // Listing took no lease, fence, stored response or audit row.
+    let state = "SELECT (SELECT count(*) FROM v2_profile_leases) * 1000000
+                      + (SELECT sum(last_fencing_token) FROM v2_profiles) * 10000
+                      + (SELECT count(*) FROM v2_idempotency) * 100
+                      + (SELECT count(*) FROM v2_audit_events)";
+    let before = server.count(state).await;
+    page(&server, &access, FLEET, "").await;
+    assert_eq!(server.count(state).await, before);
+
+    // After a commit, P1 shows version 1 and the head that commit stored,
+    // under the profile's key generation.
+    let s1 = snap(pref(P1), first.lease, &dev, 0x11, None);
+    let id = server.uploaded(&access, 0x03, &s1).await;
+    let c1 = commit_request(&s1.manifest, &dev, id, 0x31, 0x41);
+    let (status, body) = server
+        .call(
+            &upload_path(&id, "finalize"),
+            &access,
+            &finalize_req(0x04, &c1),
+        )
+        .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = server
+        .call(&upload_path(&id, "commit"), &access, c1.exact_bytes())
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    server
+        .sql(
+            "UPDATE v2_profiles SET current_key_generation = 7 WHERE id = ?",
+            &[&P1],
+        )
+        .await;
+    // A head of the same profile ID and version under another tenant or
+    // another instance is not P1's (profile IDs are per tenant).
+    server
+        .sql(
+            &format!(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TEMP TABLE stray AS SELECT * FROM v2_snapshots WHERE profile_id = x'{p1}';
+                 UPDATE stray SET tenant_id = x'{foreign}', head_hash = randomblob(32);
+                 INSERT INTO v2_snapshots SELECT * FROM stray;
+                 UPDATE stray SET tenant_id = x'{tenant}', server_instance_id = x'{instance}',
+                                  head_hash = randomblob(32);
+                 INSERT INTO v2_snapshots SELECT * FROM stray;",
+                p1 = hex(&P1),
+                foreign = hex(&foreign),
+                tenant = hex(&TENANT),
+                instance = hex(&[0x09; 16]),
+            ),
+            &[],
+        )
+        .await;
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_snapshots WHERE profile_id = x'{}'",
+                hex(&P1)
+            ))
+            .await,
+        3
+    );
+    let head1 = FleetProfileHeadV2 {
+        profile_id: P1,
+        current_version: 1,
+        current_signed_head_hash: Some(c1.manifest().head_hash()),
+        key_generation: 7,
+        label_ciphertext: vec![0x33; 24],
+    };
+    assert_eq!(
+        page(&server, &access, FLEET, "").await.profiles,
+        vec![head1.clone(), at_zero(P2)]
+    );
+    // That head is the one a checkout must observe.
+    let (status, body) = server
+        .call(
+            &checkout_path(P1),
+            &access,
+            &checkout_at(0x05, pref(P1), 1, head1.current_signed_head_hash),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // A version without its stored head fails closed rather than list it
+    // without one.
+    server
+        .sql(
+            "UPDATE v2_profiles SET current_version = 2 WHERE id = ?",
+            &[&P1],
+        )
+        .await;
+    list_refused(&server, &access, FLEET, (422, "AUTH_CLAIM_COLUMN_MISMATCH")).await;
+    server
+        .sql(
+            "UPDATE v2_profiles SET current_version = 1 WHERE id = ?",
+            &[&P1],
+        )
+        .await;
+
+    // `after` starts past that ID.
+    let after_p1 = format!("?after={}", hex(&P1));
+    assert_eq!(
+        ids(&page(&server, &access, FLEET, &after_p1).await),
+        vec![P2]
+    );
+    let after_p2 = format!("?after={}", hex(&P2));
+    assert_eq!(
+        page(&server, &access, FLEET, &after_p2).await.profiles,
+        vec![]
+    );
+
+    // A full last page names no next page; one more profile moves the last
+    // to a second page, and the pages together are every ID in order.
+    published_rows(
+        &server,
+        TENANT,
+        FLEET,
+        0xd0,
+        MAX_FLEET_PROFILE_PAGE as u16 - 2,
+    )
+    .await;
+    let full = page(&server, &access, FLEET, "").await;
+    assert_eq!(
+        (full.profiles.len(), full.next_after),
+        (MAX_FLEET_PROFILE_PAGE, None)
+    );
+    published_rows(&server, TENANT, FLEET, 0xd1, 1).await;
+    let one = page(&server, &access, FLEET, "").await;
+    let last = one.profiles.last().unwrap().profile_id;
+    assert_eq!(one.next_after, Some(last));
+    assert_eq!(ids(&one), ids(&full));
+    let two = page(&server, &access, FLEET, &format!("?after={}", hex(&last))).await;
+    assert_eq!((ids(&two), two.next_after), (vec![row_id(0xd1, 0)], None));
+
+    // The query takes one `after` ID and nothing else.
+    for q in [
+        "?after=zz".to_string(),
+        format!("?after={}0", hex(&P1)),
+        format!("?after={}&after={}", hex(&P1), hex(&P2)),
+        format!("?cursor={}", hex(&P1)),
+        "?after=".to_string(),
+    ] {
+        let (status, _, _) = server.get(&list_path(FLEET, &q), &access, None).await;
+        assert_eq!(status, 400, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn the_fleet_list_needs_fleet_wide_checkout_and_hides_other_fleets() {
+    let mut server = start("list-refusals", 28282).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as K;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (K::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (K::Tenant, TENANT)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x01, pref(P1)))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(ids(&page(&server, &access, FLEET, "").await), vec![P1]);
+
+    // An unknown, an archived and another tenant's fleet are the same
+    // not-found, even to a tenant-wide holder.
+    let foreign = [0xf8; 16];
+    foreign_fleet(&server, [0x42; 16], foreign).await;
+    published_rows(&server, [0x42; 16], foreign, 0xc6, 1).await;
+    published_rows(&server, TENANT, ARCHIVED, 0xc7, 1).await;
+    for fleet in [[0x99; 16], ARCHIVED, foreign] {
+        list_refused(&server, &access, fleet, (404, "RESOURCE_NOT_FOUND")).await;
+    }
+    let (status, _, _) = server.get("/v2/fleets/zz/profiles", &access, None).await;
+    assert_eq!(status, 400);
+
+    // No session, or only a password ticket.
+    let r = client()
+        .get(format!(
+            "http://127.0.0.1:{}{}",
+            server.port,
+            list_path(FLEET, "")
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let ticket = server.login().await;
+    let (status, _, _) = server
+        .get(
+            &list_path(FLEET, ""),
+            ticket["ticket"].as_str().unwrap(),
+            None,
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    // A device without a fleet-wide checkout grant, whatever else it holds.
+    let (bare, bare_access) = peer(&server, &dev, 0x7d).await;
+    list_refused(&server, &bare_access, FLEET, (403, "")).await;
+    let other_fleet = [0xf7; 16];
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'o', 'active', 't')",
+            &[&other_fleet, &TENANT],
+        )
+        .await;
+    for (replay, capability, scope) in [
+        (0xb1, Capability::ProfileCheckout, (K::Profile, P1)),
+        (0xb2, Capability::ProfilePublish, (K::Fleet, FLEET)),
+        (0xb3, Capability::ProfileCommit, (K::Fleet, FLEET)),
+        (0xb4, Capability::ProfileCheckout, (K::Fleet, other_fleet)),
+    ] {
+        grant(&server, c, Some(&bare), replay, capability, scope).await;
+        list_refused(&server, &bare_access, FLEET, (403, "")).await;
+    }
+    grant(
+        &server,
+        c,
+        Some(&bare),
+        0xb5,
+        Capability::ProfileCheckout,
+        (K::Fleet, FLEET),
+    )
+    .await;
+    assert_eq!(ids(&page(&server, &bare_access, FLEET, "").await), vec![P1]);
+
+    // A fleet-scoped approval lists that fleet only (Q-22).
+    let elsewhere = format!("x'{}'", hex(&other_fleet));
+    let (fleet_b, fleet_b_access) = peer_in(&server, &dev, 0x7e, ("'fleet'", &elsewhere)).await;
+    grant(
+        &server,
+        c,
+        Some(&fleet_b),
+        0xb6,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    list_refused(&server, &fleet_b_access, FLEET, (403, "")).await;
+    let here = format!("x'{}'", hex(&FLEET));
+    let (fleet_a, fleet_a_access) = peer_in(&server, &dev, 0x7f, ("'fleet'", &here)).await;
+    grant(
+        &server,
+        c,
+        Some(&fleet_a),
+        0xb7,
+        Capability::ProfileCheckout,
+        (K::Tenant, TENANT),
+    )
+    .await;
+    assert_eq!(
+        ids(&page(&server, &fleet_a_access, FLEET, "").await),
+        vec![P1]
+    );
+
+    // An account-scoped grant is server RBAC and counts (D-2).
+    let (_, plain_access) = peer(&server, &dev, 0x80).await;
+    list_refused(&server, &plain_access, FLEET, (403, "")).await;
+    grant(
+        &server,
+        c,
+        None,
+        0xb8,
+        Capability::ProfileCheckout,
+        (K::Fleet, FLEET),
+    )
+    .await;
+    assert_eq!(
+        ids(&page(&server, &plain_access, FLEET, "").await),
+        vec![P1]
+    );
+}

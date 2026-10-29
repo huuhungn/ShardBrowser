@@ -1,5 +1,5 @@
-//! Profile publish, checkout and lease routes (plan 8.1 L1137-L1143; G2-21,
-//! G2-22, G2-25).
+//! Profile list, publish, checkout and lease routes (plan 8.1 L1136-L1143;
+//! G2-21, G2-22, G2-25).
 //!
 //! Publish, checkout and release take exact `IdempotentMutationRequestV2`
 //! bodies (5.6.5, L948/L949/L952). One `BEGIN IMMEDIATE` reloads the session,
@@ -19,13 +19,14 @@
 //! (`v2_uploads`).
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use sqlx::{Row, SqliteConnection};
 
 use shared::approval_receipt::AUTHORIZATION_REPLAY_RETENTION_MS;
 use shared::authz_record::Capability;
+use shared::fleet_profiles::{FleetProfileHeadV2, FleetProfilePageV2, MAX_FLEET_PROFILE_PAGE};
 use shared::mutation::{IdempotentMutationRequestV2, OperationKind};
 use shared::profile_lease::{
     LeaseOrigin, LeaseRef, LeaseReleasedV2, LeaseRenewV2, LeaseRenewedV2, ProfileCheckoutV2,
@@ -411,6 +412,115 @@ pub(super) fn replay(
         return Err(mismatch());
     }
     stored_payload(row, outer, record_type, v).ok_or_else(response_mismatch)
+}
+
+// ------------------------------------------------------------------- list ---
+
+/// `GET /v2/fleets/{fleet_id}/profiles` (L1136): the heads of the fleet's
+/// published profiles, without a lease, at most [`MAX_FLEET_PROFILE_PAGE`] a
+/// page in ascending ID order from `?after=<id>`. It shows what a checkout
+/// observes (L949), so it needs `profile.checkout` over the whole fleet or
+/// tenant (a profile-scoped grant lists nothing) and a tenant or fleet approval.
+pub async fn list_profiles(
+    State(app): State<AppState>,
+    who: Principal,
+    Path(fleet): Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, AppError> {
+    let v = verified(&app)?;
+    let presented = session_of(who)?;
+    let fleet = id_path(&fleet)?;
+    let after = match raw.as_deref() {
+        None | Some("") => None,
+        Some(q) => Some(
+            q.strip_prefix("after=")
+                .and_then(unhex::<16>)
+                .ok_or_else(|| AppError::BadRequest("the query takes one after=<id>".into()))?,
+        ),
+    };
+
+    let mut tx = app.db.begin().await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if !may(
+        &mut tx,
+        v,
+        &s,
+        &fleet,
+        None,
+        Capability::ProfileCheckout,
+        false,
+        now,
+    )
+    .await?
+    {
+        return Err(AppError::Forbidden);
+    }
+    let fleet_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_fleets
+                         WHERE tenant_id = ? AND id = ? AND status = 'active')",
+    )
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .fetch_one(&mut *tx)
+    .await?;
+    if !fleet_active {
+        return Err(not_found());
+    }
+    let rows = sqlx::query(
+        "SELECT p.id, p.current_version, p.current_key_generation, p.label_ciphertext,
+                s.head_hash
+           FROM v2_profiles p
+           LEFT JOIN v2_snapshots s
+             ON s.server_instance_id = ?1 AND s.tenant_id = p.tenant_id
+            AND s.profile_id = p.id AND s.version = p.current_version
+          WHERE p.tenant_id = ?2 AND p.fleet_id = ?3 AND p.status = 'active'
+            AND p.label_ciphertext IS NOT NULL AND (?4 IS NULL OR p.id > ?4)
+          ORDER BY p.id LIMIT ?5",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(s.tenant_id.as_slice())
+    .bind(fleet.as_slice())
+    .bind(after.as_ref().map(|a| a.as_slice()))
+    .bind(MAX_FLEET_PROFILE_PAGE as i64 + 1)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let mut profiles = Vec::with_capacity(rows.len());
+    for row in rows.iter().take(MAX_FLEET_PROFILE_PAGE) {
+        let current_version = stored_uint(row.get("current_version"))?;
+        let head: Option<Vec<u8>> = row.get("head_hash");
+        let current_signed_head_hash = match head {
+            Some(h) => Some(
+                h.try_into()
+                    .map_err(|_| column_mismatch("a stored head hash is not 32 bytes"))?,
+            ),
+            None if current_version == 0 => None,
+            None => return Err(column_mismatch("a published version has no stored head")),
+        };
+        profiles.push(FleetProfileHeadV2 {
+            profile_id: blob::<16>(row, "id")?,
+            current_version,
+            current_signed_head_hash,
+            key_generation: stored_uint(row.try_get("current_key_generation")?)?,
+            label_ciphertext: row.get("label_ciphertext"),
+        });
+    }
+    let next_after = (rows.len() > MAX_FLEET_PROFILE_PAGE)
+        .then(|| profiles.last().map(|p| p.profile_id))
+        .flatten();
+    let page = FleetProfilePageV2 {
+        server_instance_id: v.server_instance_id,
+        restore_epoch: v.restore_epoch,
+        tenant_id: s.tenant_id,
+        fleet_id: fleet,
+        profiles,
+        next_after,
+    };
+    Ok(cbor(StatusCode::OK, page.encode()))
 }
 
 // ------------------------------------------------- PROFILE_PUBLISH_CREATE ---
