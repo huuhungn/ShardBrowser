@@ -16,13 +16,15 @@
 //! the plan's DDL leaves to W6. The ledger keeps hashes, key IDs and times,
 //! the exact bytes of counted revocations, and the exact grant behind each
 //! collected fleet key with its evidence (G2-35), never a key (L2048).
+//! Version 3 adds the plan's `profile_bindings`, `operations` and
+//! `upload_sessions` for published-profile sync (`team::sync`).
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -212,6 +214,145 @@ UPDATE schema_meta SET schema_version = 2, min_reader_version = 2,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 2 to 3: the sync tables of the plan's reference DDL, with the
+/// columns the published-profile push and pull use (`team::sync`). The plan's
+/// `server_origins`, `accounts` and `fleet_key_state` do not exist yet, so
+/// the `server_id`, `account_id`/`device_id` and FKEK foreign keys are left
+/// out with their columns; every PK, UNIQUE and CHECK on a kept column stays.
+/// A version 2 reader would skip pending operations, so 3 is the minimum.
+const MIGRATE_V3: &str = r#"
+-- Plan L1773-L1808. `accepted_restore_epoch` is the epoch the binding has
+-- accepted (ADR 0002 rule 6, Q-1); `remote_version` with
+-- `last_observed_head_hash` is the pinned head.
+CREATE TABLE profile_bindings (
+  local_profile_id        TEXT PRIMARY KEY,
+  server_instance_id      TEXT NOT NULL CHECK (length(server_instance_id) = 32 AND server_instance_id NOT GLOB '*[^0-9a-f]*'),
+  tenant_id               TEXT NOT NULL CHECK (length(tenant_id) = 32 AND tenant_id NOT GLOB '*[^0-9a-f]*'),
+  fleet_id                TEXT NOT NULL CHECK (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*'),
+  remote_profile_id       TEXT NOT NULL CHECK (length(remote_profile_id) = 32 AND remote_profile_id NOT GLOB '*[^0-9a-f]*'),
+  remote_version          INTEGER NOT NULL CHECK (remote_version BETWEEN 0 AND 9223372036854775807),
+  last_observed_head_hash BLOB CHECK (last_observed_head_hash IS NULL OR length(last_observed_head_hash) = 32),
+  accepted_restore_epoch  INTEGER NOT NULL CHECK (accepted_restore_epoch BETWEEN 0 AND 9223372036854775807),
+  fencing_token           INTEGER CHECK (fencing_token IS NULL OR fencing_token BETWEEN 0 AND 9223372036854775807),
+  lease_id                TEXT,
+  sync_state              TEXT NOT NULL CHECK (sync_state IN (
+                            'LOCAL','AVAILABLE','CHECKED_OUT','LEASE_AT_RISK','OFFLINE_FORK',
+                            'UPLOADING','RESTORE_REQUIRED','CONFLICT','QUARANTINED'
+                          )),
+  last_error_code         TEXT,
+  UNIQUE(server_instance_id, tenant_id, remote_profile_id),
+  CHECK ((lease_id IS NULL) = (fencing_token IS NULL)),
+  CHECK ((remote_version = 0) = (last_observed_head_hash IS NULL))
+) STRICT;
+
+-- Plan L1810-L1870.
+CREATE TABLE operations (
+  op_id             TEXT PRIMARY KEY,
+  local_profile_id  TEXT REFERENCES profile_bindings(local_profile_id) ON DELETE SET NULL,
+  local_profile_id_at_request TEXT NOT NULL,
+  server_instance_id TEXT NOT NULL,
+  restore_epoch     INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  tenant_id         TEXT NOT NULL,
+  fleet_id          TEXT,
+  remote_profile_id TEXT,
+  snapshot_id       BLOB CHECK (snapshot_id IS NULL OR length(snapshot_id) = 16),
+  manifest_replay_id BLOB CHECK (manifest_replay_id IS NULL OR length(manifest_replay_id) = 16),
+  operation_scope   TEXT NOT NULL,
+  kind              TEXT NOT NULL CHECK (kind IN ('PUBLISH','CHECKOUT','UPLOAD','FINALIZE','COMMIT','RELEASE','UNBIND','RECOVERY_EXPORT')),
+  idempotency_key   TEXT NOT NULL,
+  canonical_request_hash BLOB NOT NULL CHECK (length(canonical_request_hash) = 32),
+  exact_request_bytes BLOB NOT NULL CHECK (length(exact_request_bytes) > 0),
+  exact_request_bytes_sha256 BLOB NOT NULL CHECK (length(exact_request_bytes_sha256) = 32),
+  remote_upload_id  TEXT,
+  lease_id          TEXT,
+  fencing_token     INTEGER CHECK (fencing_token IS NULL OR fencing_token BETWEEN 0 AND 9223372036854775807),
+  base_version      INTEGER CHECK (base_version IS NULL OR base_version BETWEEN 0 AND 9223372036854775807),
+  intent_hash       BLOB CHECK (intent_hash IS NULL OR length(intent_hash) = 32),
+  ciphertext_sha256 BLOB CHECK (ciphertext_sha256 IS NULL OR length(ciphertext_sha256) = 32),
+  signed_manifest_container_bytes BLOB,
+  signed_manifest_container_hash BLOB CHECK (
+    signed_manifest_container_hash IS NULL OR length(signed_manifest_container_hash) = 32
+  ),
+  signed_manifest_container_bytes_sha256 BLOB CHECK (
+    signed_manifest_container_bytes_sha256 IS NULL OR length(signed_manifest_container_bytes_sha256) = 32
+  ),
+  state             TEXT NOT NULL CHECK (state IN ('PENDING','RUNNING','AWAITING_RETRY','COMPLETED','FAILED','QUARANTINED')),
+  response_record_type TEXT,
+  exact_response_bytes BLOB,
+  exact_response_bytes_sha256 BLOB CHECK (
+    exact_response_bytes_sha256 IS NULL OR length(exact_response_bytes_sha256) = 32
+  ),
+  exact_receipt_bytes BLOB,
+  receipt_sha256   BLOB CHECK (receipt_sha256 IS NULL OR length(receipt_sha256) = 32),
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  UNIQUE(operation_scope, idempotency_key),
+  UNIQUE(op_id, server_instance_id, restore_epoch),
+  CHECK ((exact_response_bytes IS NULL) = (exact_response_bytes_sha256 IS NULL)),
+  CHECK ((exact_response_bytes IS NULL) = (response_record_type IS NULL)),
+  CHECK ((exact_receipt_bytes IS NULL) = (receipt_sha256 IS NULL)),
+  CHECK ((signed_manifest_container_bytes IS NULL) = (signed_manifest_container_hash IS NULL)),
+  CHECK ((signed_manifest_container_bytes IS NULL) = (signed_manifest_container_bytes_sha256 IS NULL)),
+  CHECK (state <> 'COMPLETED' OR exact_response_bytes IS NOT NULL),
+  CHECK (state <> 'COMPLETED' OR kind NOT IN ('COMMIT','RELEASE','UNBIND') OR exact_receipt_bytes IS NOT NULL),
+  CHECK (kind <> 'COMMIT' OR (
+    remote_upload_id IS NOT NULL AND lease_id IS NOT NULL AND fencing_token IS NOT NULL AND
+    base_version IS NOT NULL AND snapshot_id IS NOT NULL AND manifest_replay_id IS NOT NULL AND
+    intent_hash IS NOT NULL AND ciphertext_sha256 IS NOT NULL AND
+    signed_manifest_container_bytes IS NOT NULL
+  ))
+) STRICT;
+
+-- Plan L1872-L1929; `spool_ref` names `team-sync/spool/<it>.part`.
+CREATE TABLE upload_sessions (
+  upload_local_id             TEXT PRIMARY KEY,
+  local_profile_id            TEXT REFERENCES profile_bindings(local_profile_id) ON DELETE SET NULL,
+  local_profile_id_at_request TEXT NOT NULL,
+  commit_op_id                TEXT NOT NULL UNIQUE REFERENCES operations(op_id) ON DELETE RESTRICT,
+  server_instance_id          TEXT NOT NULL,
+  restore_epoch               INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  tenant_id                   TEXT NOT NULL,
+  fleet_id                    TEXT NOT NULL,
+  remote_profile_id           TEXT NOT NULL,
+  remote_upload_id            TEXT NOT NULL,
+  snapshot_id                 BLOB NOT NULL CHECK (length(snapshot_id) = 16),
+  manifest_replay_id          BLOB NOT NULL CHECK (length(manifest_replay_id) = 16),
+  intent_hash                 BLOB NOT NULL CHECK (length(intent_hash) = 32),
+  preamble_sha256             BLOB NOT NULL CHECK (length(preamble_sha256) = 32),
+  dek_slot_sha256             BLOB NOT NULL CHECK (length(dek_slot_sha256) = 32),
+  fkek_key_id                 TEXT NOT NULL,
+  key_generation              INTEGER NOT NULL CHECK (key_generation BETWEEN 0 AND 9223372036854775807),
+  committed_offset            INTEGER NOT NULL DEFAULT 0 CHECK (committed_offset BETWEEN 0 AND 9223372036854775807),
+  expected_ciphertext_sha256  BLOB NOT NULL CHECK (length(expected_ciphertext_sha256) = 32),
+  expected_ciphertext_size    INTEGER NOT NULL CHECK (expected_ciphertext_size BETWEEN 0 AND 9223372036854775807),
+  spool_ref                   TEXT NOT NULL CHECK (
+                                length(spool_ref) > 0 AND
+                                instr(spool_ref, '/') = 0 AND instr(spool_ref, char(92)) = 0
+                              ),
+  state                       TEXT NOT NULL CHECK (state IN ('OPEN','FINALIZING','READY','COMMITTED','ABORTED','QUARANTINED')),
+  exact_finalize_response_bytes BLOB,
+  finalize_response_sha256    BLOB CHECK (finalize_response_sha256 IS NULL OR length(finalize_response_sha256) = 32),
+  exact_commit_receipt_binding_bytes BLOB,
+  commit_receipt_binding_bytes_sha256 BLOB CHECK (
+    commit_receipt_binding_bytes_sha256 IS NULL OR length(commit_receipt_binding_bytes_sha256) = 32
+  ),
+  created_at                  TEXT NOT NULL,
+  updated_at                  TEXT NOT NULL,
+  UNIQUE(server_instance_id, tenant_id, remote_upload_id),
+  UNIQUE(server_instance_id, tenant_id, remote_profile_id, snapshot_id),
+  UNIQUE(server_instance_id, tenant_id, remote_profile_id, manifest_replay_id),
+  FOREIGN KEY(commit_op_id, server_instance_id, restore_epoch)
+    REFERENCES operations(op_id, server_instance_id, restore_epoch) ON DELETE RESTRICT,
+  CHECK (committed_offset <= expected_ciphertext_size),
+  CHECK ((exact_finalize_response_bytes IS NULL) = (finalize_response_sha256 IS NULL)),
+  CHECK ((exact_commit_receipt_binding_bytes IS NULL) = (commit_receipt_binding_bytes_sha256 IS NULL)),
+  CHECK (state NOT IN ('READY','COMMITTED') OR exact_finalize_response_bytes IS NOT NULL),
+  CHECK (state <> 'COMMITTED' OR exact_commit_receipt_binding_bytes IS NOT NULL)
+) STRICT;
+UPDATE schema_meta SET schema_version = 3, min_reader_version = 3,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -220,9 +361,17 @@ pub struct Db {
 impl Db {
     /// `<config_root>/team-sync/team-sync.db` (plan L1440).
     pub fn open() -> Result<Self> {
-        let dir = crate::store::config_root()?.join("team-sync");
-        std::fs::create_dir_all(&dir)?;
-        Self::open_at(&dir.join("team-sync.db"))
+        let path = Self::path()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        Self::open_at(&path)
+    }
+
+    pub fn path() -> Result<std::path::PathBuf> {
+        Ok(crate::store::config_root()?
+            .join("team-sync")
+            .join("team-sync.db"))
     }
 
     /// Opens `path`, creating the schema only when the file holds nothing, and
@@ -254,6 +403,9 @@ impl Db {
         // whole migration back.
         if matches!(meta(&tx).as_deref(), Ok([(1, 1, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V2).with_context(unreadable)?;
+        }
+        if matches!(meta(&tx).as_deref(), Ok([(2, 2, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V3).with_context(unreadable)?;
         }
         tx.commit().with_context(unreadable)?;
         if !compatible(&conn) {
@@ -305,7 +457,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (2, 2, "CLEAN".into()));
+        assert_eq!(meta, (3, 3, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -325,8 +477,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 3",
-            "UPDATE schema_meta SET min_reader_version = 3",
+            "UPDATE schema_meta SET schema_version = 4",
+            "UPDATE schema_meta SET min_reader_version = 4",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -359,10 +511,10 @@ mod tests {
         );
     }
 
-    /// A version 1 file, as #188 wrote it, moves to version 2 in one
-    /// transaction and keeps its rows; it then reopens as version 2.
+    /// A version 1 file, as #188 wrote it, moves to version 3 in one
+    /// transaction and keeps its rows; it then reopens as version 3.
     #[test]
-    fn a_version_1_file_migrates_to_version_2_and_reopens() {
+    fn a_version_1_file_migrates_to_version_3_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("team-sync.db");
         let pin = format!(
@@ -378,7 +530,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(2, 2, "CLEAN".to_string())]);
+            assert_eq!(rows, [(3, 3, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -386,6 +538,60 @@ mod tests {
             assert_eq!(count("trust_anchors"), 1, "kept");
             assert_eq!(count("trust_custodian_keys"), 0);
             assert_eq!(count("trust_fleet_key_grants"), 0);
+        }
+    }
+
+    /// A clean version 2 file gains the sync tables and keeps its ledger; one
+    /// that already holds a sync table, or is not clean, is refused as it was.
+    #[test]
+    fn a_version_2_file_migrates_to_version_3_or_is_left_as_it_was() {
+        let v2 = |path: &Path| {
+            let c = Connection::open(path).unwrap();
+            c.execute_batch(SCHEMA_V1).unwrap();
+            c.execute_batch(MIGRATE_V2).unwrap();
+            c.execute_batch(&format!(
+                "INSERT INTO trust_anchors VALUES ('{}', '{}', '{}', 'BOOTSTRAP', 0);",
+                "11".repeat(16),
+                "22".repeat(16),
+                "33".repeat(32)
+            ))
+            .unwrap();
+            c
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        drop(v2(&path));
+        for _ in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(meta(&db.conn).unwrap(), [(3, 3, "CLEAN".to_string())]);
+            for (table, rows) in [
+                ("trust_anchors", 1),
+                ("profile_bindings", 0),
+                ("operations", 0),
+                ("upload_sessions", 0),
+            ] {
+                let sql = format!("SELECT count(*) FROM {table}");
+                let n: i64 = db.conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+                assert_eq!(n, rows, "{table}");
+            }
+        }
+        for (sql, code) in [
+            (
+                "UPDATE schema_meta SET migration_state = 'MIGRATING'",
+                "team.trustLedgerUnsupported",
+            ),
+            (
+                "CREATE TABLE operations (x INTEGER)",
+                "team.trustLedgerUnreadable",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            v2(&path).execute_batch(sql).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let err = Db::open_at(&path).err().expect(sql).to_string();
+            assert!(crate::errcode::has_code(&err, code), "{sql}: {err}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
         }
     }
 

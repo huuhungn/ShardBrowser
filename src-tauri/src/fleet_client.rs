@@ -873,6 +873,194 @@ impl FleetClient {
         Ok(Some(body.to_vec()))
     }
 
+    /// Sends `req` under a device session and returns the reply as received.
+    /// Only a reply that never arrived is an error: the caller decides what a
+    /// status means, and replays the same stored bytes after a lost one.
+    async fn exact(&self, req: reqwest::RequestBuilder, access_token: &str) -> Result<Exact> {
+        let lost = || crate::errcode::code("fleet.unreachableSync");
+        let res = req.bearer_auth(access_token).send().await.context(lost())?;
+        let status = res.status().as_u16();
+        let headers = res.headers().clone();
+        let body = res.bytes().await.context(lost())?.to_vec();
+        Ok(Exact {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    /// POSTs exact CBOR request bytes (plan 8.1 L1137-L1152).
+    async fn post_exact(&self, path: &str, access_token: &str, body: &[u8]) -> Result<Exact> {
+        let req = self
+            .http
+            .post(self.url(path))
+            .header("content-type", "application/cbor")
+            .body(body.to_vec());
+        self.exact(req, access_token).await
+    }
+
+    /// `GET /v2/fleets/{fleet_id}/profiles`, one `FleetProfilePageV2`.
+    pub async fn list_fleet_profiles(
+        &self,
+        access_token: &str,
+        fleet_id: &[u8; 16],
+        after: Option<&[u8; 16]>,
+    ) -> Result<Exact> {
+        let mut url = self.url(&format!("/v2/fleets/{}/profiles", hex(fleet_id)));
+        if let Some(a) = after {
+            url = format!("{url}?after={}", hex(a));
+        }
+        self.exact(self.http.get(url), access_token).await
+    }
+
+    /// `PROFILE_PUBLISH_CREATE` (L1137).
+    // shortcut: nothing calls publish yet; the Team profile UI that lets a
+    // user publish a local profile (and records its binding) triggers it.
+    pub async fn publish_profile(
+        &self,
+        access_token: &str,
+        fleet_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/fleets/{}/profiles", hex(fleet_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `PROFILE_CHECKOUT` (L1138).
+    pub async fn checkout_profile(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/profiles/{}/checkout", hex(profile_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `LeaseRenewV2` (L1139).
+    pub async fn renew_lease_v2(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        lease_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!(
+            "/v2/profiles/{}/leases/{}/renew",
+            hex(profile_id),
+            hex(lease_id)
+        );
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `RELEASE_LEASE` (L1140).
+    pub async fn release_lease_v2(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        lease_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!(
+            "/v2/profiles/{}/leases/{}/release",
+            hex(profile_id),
+            hex(lease_id)
+        );
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `CREATE_UPLOAD` (L1147).
+    pub async fn create_upload(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/profiles/{}/uploads", hex(profile_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `HEAD /v2/uploads/{upload_id}`: the committed offset and state (L1148).
+    pub async fn upload_head(&self, access_token: &str, upload_id: &[u8; 16]) -> Result<Exact> {
+        let url = self.url(&format!("/v2/uploads/{}", hex(upload_id)));
+        self.exact(self.http.head(url), access_token).await
+    }
+
+    /// `PATCH /v2/uploads/{upload_id}`: one chunk at `offset` (L1149).
+    pub async fn upload_patch(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<Exact> {
+        let req = self
+            .http
+            .patch(self.url(&format!("/v2/uploads/{}", hex(upload_id))))
+            .header("upload-offset", offset.to_string())
+            .header(
+                "upload-chunk-sha256",
+                hex(&shardx_core::canonical::sha256(chunk)),
+            )
+            .body(chunk.to_vec());
+        self.exact(req, access_token).await
+    }
+
+    /// `FINALIZE_UPLOAD` (L1150).
+    pub async fn finalize_upload(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/uploads/{}/finalize", hex(upload_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// The exact `CommitRequestV2` (L1151).
+    pub async fn commit_upload(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/uploads/{}/commit", hex(upload_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// The exact signed manifest of a committed version (L1153).
+    pub async fn snapshot_manifest(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        version: u64,
+    ) -> Result<Exact> {
+        let url = self.url(&format!(
+            "/v2/profiles/{}/snapshots/{version}/manifest",
+            hex(profile_id)
+        ));
+        self.exact(self.http.get(url), access_token).await
+    }
+
+    /// Bytes `start..=end` of a committed version's ciphertext (L1153).
+    pub async fn snapshot_range(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        version: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Exact> {
+        let req = self
+            .http
+            .get(self.url(&format!(
+                "/v2/profiles/{}/snapshots/{version}",
+                hex(profile_id)
+            )))
+            .header("range", format!("bytes={start}-{end}"));
+        self.exact(req, access_token).await
+    }
+
     /// Lease, stage, and publish a sealed container. Returns the new version.
     ///
     /// The lease is released on every path, including failure: an upload that
@@ -1136,6 +1324,13 @@ struct RootKeyGrantsResponse {
 #[derive(Debug, serde::Deserialize)]
 struct ActiveFleetGeneration {
     generation: u64,
+}
+
+/// A v2 reply exactly as received.
+pub struct Exact {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: Vec<u8>,
 }
 
 pub fn random_id_hex() -> String {
