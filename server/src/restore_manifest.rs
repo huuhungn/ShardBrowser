@@ -495,6 +495,16 @@ mod tests {
         trailing.push(0);
         assert_eq!(TransitionSetIndexV2::parse(&trailing), None);
         assert_eq!(TransitionSetIndexV2::parse(b"junk"), None);
+        // A decodable map with a field the index does not have: the values
+        // parse, but the bytes are not the index's one encoding.
+        let Ok(Value::Map(mut fields)) = c::decode(&two) else {
+            panic!("an index is a map");
+        };
+        fields.push(("extra".into(), c::u(1)));
+        assert_eq!(
+            TransitionSetIndexV2::parse(&c::encode(&Value::Map(fields))),
+            None
+        );
     }
 
     #[test]
