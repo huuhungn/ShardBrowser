@@ -150,7 +150,8 @@ fn bad(field: &str) -> anyhow::Error {
 
 fn random<const N: usize>() -> Result<[u8; N]> {
     let mut b = [0u8; N];
-    getrandom::getrandom(&mut b).map_err(|e| anyhow!("{e}"))?;
+    // `getrandom` is Windows-only in this crate; shared has it everywhere.
+    shardx_core::keys::fill_random(&mut b).map_err(|e| anyhow!("{e}"))?;
     Ok(b)
 }
 
