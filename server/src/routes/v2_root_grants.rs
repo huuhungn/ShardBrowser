@@ -30,7 +30,9 @@ use shared::mutation::{
     RECORD_TYPE_ROOT_GRANT_CREATED, RECORD_TYPE_ROOT_GRANT_REVOKED,
 };
 
-use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body, int, sole_owner};
+use super::v2_approval::{
+    approvals_among, cbor, coded, column_mismatch, exact_cbor_body, int, sole_owner,
+};
 use super::v2_auth::{
     audit, blob, reload_session, revoke_session, unhex, verified, Principal, Session,
 };
@@ -1216,19 +1218,19 @@ pub async fn file_root_grant(
 
     // The subject: an active account and device under exactly these keys,
     // linked to its live, tenant-scoped approval (plan 5.6.4, Q-22).
-    let eligible: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_accounts
+    let candidates = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_device_approvals
+          WHERE EXISTS (SELECT 1 FROM v2_accounts
                          WHERE tenant_id = ? AND id = ? AND status = 'active')
             AND EXISTS (SELECT 1 FROM v2_devices
                          WHERE tenant_id = ? AND id = ? AND account_id = ? AND status = 'active'
                            AND signing_key_id = ? AND hpke_key_id = ?)
-            AND EXISTS (SELECT 1 FROM v2_device_approvals
-                         WHERE server_instance_id = ? AND tenant_id = ? AND payload_domain = ?
-                           AND replay_id = ? AND subject_account_id = ?
-                           AND subject_device_id = ? AND subject_signing_key_id = ?
-                           AND subject_hpke_key_id = ? AND approval_scope_kind = 'tenant'
-                           AND revoked_at IS NULL
-                           AND not_before_ms <= ? AND ? < not_after_ms)",
+            AND server_instance_id = ? AND tenant_id = ? AND payload_domain = ?
+            AND replay_id = ? AND subject_account_id = ?
+            AND subject_device_id = ? AND subject_signing_key_id = ?
+            AND subject_hpke_key_id = ? AND approval_scope_kind = 'tenant'
+            AND revoked_at IS NULL
+            AND not_before_ms <= ? AND ? < not_after_ms",
     )
     .bind(tenant.as_slice())
     .bind(g.subject_account_id.as_slice())
@@ -1247,9 +1249,12 @@ pub async fn file_root_grant(
     .bind(g.recipient_hpke_key_id.as_slice())
     .bind(now)
     .bind(now)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    if !eligible {
+    if approvals_among(&mut tx, v, &tenant, candidates)
+        .await?
+        .is_empty()
+    {
         return Err(coded(
             StatusCode::CONFLICT,
             "SUBJECT_NOT_ELIGIBLE",

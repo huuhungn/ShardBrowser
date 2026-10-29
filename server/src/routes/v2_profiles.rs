@@ -33,7 +33,7 @@ use shared::profile_lease::{
     ProfileLeaseV2, ProfilePublishCreateV2, ProfileRef, ReleaseLeaseV2, RECORD_TYPE_LEASE_RELEASED,
 };
 
-use super::v2_approval::{cbor, coded, column_mismatch, exact_cbor_body};
+use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, exact_cbor_body};
 use super::v2_auth::{audit, blob, random, reload_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
@@ -106,13 +106,13 @@ pub(super) async fn may(
     device_only: bool,
     now: i64,
 ) -> Result<bool, AppError> {
-    let admitted: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_device_approvals
-                         WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
-                           AND subject_hpke_key_id = ? AND server_instance_id = ?
-                           AND revoked_at IS NULL AND not_before_ms <= ? AND not_after_ms > ?
-                           AND (approval_scope_kind = 'tenant'
-                                OR (approval_scope_kind = 'fleet' AND approval_scope_id = ?)))",
+    let candidates = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_device_approvals
+          WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
+            AND subject_hpke_key_id = ? AND server_instance_id = ?
+            AND revoked_at IS NULL AND not_before_ms <= ? AND not_after_ms > ?
+            AND (approval_scope_kind = 'tenant'
+                 OR (approval_scope_kind = 'fleet' AND approval_scope_id = ?))",
     )
     .bind(s.tenant_id.as_slice())
     .bind(s.device_id.as_slice())
@@ -122,9 +122,12 @@ pub(super) async fn may(
     .bind(now)
     .bind(now)
     .bind(fleet.as_slice())
-    .fetch_one(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
-    if !admitted {
+    if approvals_among(conn, v, &s.tenant_id, candidates)
+        .await?
+        .is_empty()
+    {
         return Ok(false);
     }
     let replays: Vec<Vec<u8>> = sqlx::query_scalar(

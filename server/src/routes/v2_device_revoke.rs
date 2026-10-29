@@ -26,7 +26,7 @@ use shared::mutation::{
     DeviceRevokeRequestV2, DeviceRevokedV2, OperationKind, RECORD_TYPE_DEVICE_REVOKED,
 };
 
-use super::v2_approval::{cbor, coded, column_mismatch, int};
+use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, reload_session, revoke_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
@@ -102,14 +102,26 @@ async fn may_revoke(
     .bind(now)
     .fetch_all(&mut *conn)
     .await?;
-    let scopes: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT approval_scope_kind, approval_scope_id FROM v2_device_approvals
-          WHERE tenant_id = ? AND subject_device_id = ?",
+    let candidates = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_device_approvals
+          WHERE server_instance_id = ? AND tenant_id = ? AND subject_device_id = ?",
     )
+    .bind(v.server_instance_id.as_slice())
     .bind(s.tenant_id.as_slice())
     .bind(subject.as_slice())
     .fetch_all(&mut *conn)
     .await?;
+    let scopes: Vec<(String, Vec<u8>)> = approvals_among(conn, v, &s.tenant_id, candidates)
+        .await?
+        .into_iter()
+        .map(|a| {
+            let a = a.approval;
+            (
+                a.approval_scope_kind.as_str().into(),
+                a.approval_scope_id.to_vec(),
+            )
+        })
+        .collect();
     let mut covered = false;
     for (replay, kind, id) in &grants {
         let replay: [u8; 16] = replay

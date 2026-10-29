@@ -19,7 +19,7 @@ use sqlx::{Row, SqlitePool};
 use crate::error::AppError;
 use crate::identity::{ReasonCode, Refusal, Verified};
 use crate::quarantine::{self, Kind, Mark};
-use crate::routes::{v2_capability, v2_fleet, v2_root_grants};
+use crate::routes::{v2_approval, v2_capability, v2_fleet, v2_root_grants};
 use crate::util;
 
 /// Why a device's stored keys cannot be trusted.
@@ -199,9 +199,10 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
     Ok(quarantined)
 }
 
-/// Quarantines every root, capability and fleet key grant of this instance
-/// whose row disagrees with its signed container, through the same checks
-/// every request path uses. Returns how many it newly quarantined.
+/// Quarantines every root, capability and fleet key grant and every device
+/// approval of this instance whose row disagrees with its signed container,
+/// through the same checks every request path uses. Returns how many it newly
+/// quarantined.
 async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
     let instance = v.server_instance_id;
     let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
@@ -280,6 +281,25 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
                 }
                 Err(e) => anyhow::bail!("checking a fleet grant failed: {e:?}"),
             }
+        }
+    }
+    let approvals = sqlx::query(
+        "SELECT tenant_id, replay_id FROM v2_device_approvals WHERE server_instance_id = ?",
+    )
+    .bind(instance.as_slice())
+    .fetch_all(pool)
+    .await?;
+    for row in approvals {
+        let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
+        let mut conn = pool.acquire().await?;
+        let checked = v2_approval::load_approval(&mut conn, v, &tenant, &replay).await;
+        drop(conn);
+        match checked {
+            Ok(_) => {}
+            Err(AppError::Quarantine(mark)) => {
+                quarantined += usize::from(quarantine::record(pool, &mark).await?)
+            }
+            Err(e) => anyhow::bail!("checking a device approval failed: {e:?}"),
         }
     }
     Ok(quarantined)

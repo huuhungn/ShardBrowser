@@ -40,7 +40,7 @@ pub const MAX_SIGNERS: usize = 64;
 /// other table is served whole.
 const KINDS: [(&str, Option<&str>, bool); 7] = [
     ("v2_tenant_root_key_grants", Some("root_grant"), false),
-    ("v2_device_approvals", None, true),
+    ("v2_device_approvals", Some("device_approval"), true),
     ("v2_capability_grants", Some("capability_grant"), true),
     (REVOCATIONS, None, false),
     (

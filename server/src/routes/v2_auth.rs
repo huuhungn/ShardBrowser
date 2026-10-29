@@ -30,6 +30,7 @@ use shared::canonical::sha256;
 use shared::keys::fill_random;
 use shared::session_binding::{self as sb, BindingFields, DeviceSessionBindingV2};
 
+use super::v2_approval::approvals_among;
 use crate::auth::{client_ip, verify_slot};
 use crate::error::AppError;
 use crate::extract::AppJson;
@@ -269,12 +270,12 @@ pub(super) async fn approval_is_live(
     v: &Verified,
     now: i64,
 ) -> Result<bool, AppError> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_device_approvals
-                         WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
-                           AND subject_hpke_key_id = ? AND server_instance_id = ?
-                           AND revoked_at IS NULL
-                           AND not_before_ms <= ? AND not_after_ms > ?)",
+    let candidates = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_device_approvals
+          WHERE tenant_id = ? AND subject_device_id = ? AND subject_signing_key_id = ?
+            AND subject_hpke_key_id = ? AND server_instance_id = ?
+            AND revoked_at IS NULL
+            AND not_before_ms <= ? AND not_after_ms > ?",
     )
     .bind(tenant_id.as_slice())
     .bind(device_id.as_slice())
@@ -283,8 +284,11 @@ pub(super) async fn approval_is_live(
     .bind(v.server_instance_id.as_slice())
     .bind(now)
     .bind(now)
-    .fetch_one(&mut *conn)
-    .await?)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(!approvals_among(conn, v, tenant_id, candidates)
+        .await?
+        .is_empty())
 }
 
 /// The replay ID of that live D1 approval, which the first root self-grant
@@ -298,7 +302,7 @@ pub(super) async fn d1_approval_replay_id(
     v: &Verified,
     now: i64,
 ) -> Result<Option<[u8; 16]>, AppError> {
-    let id: Option<Vec<u8>> = sqlx::query_scalar(
+    let candidates = sqlx::query_scalar(
         "SELECT a.replay_id FROM v2_device_approvals a
            JOIN v2_first_device_confirmations c
              ON c.server_instance_id = a.server_instance_id AND c.tenant_id = a.tenant_id
@@ -319,9 +323,12 @@ pub(super) async fn d1_approval_replay_id(
     .bind(v.server_instance_id.as_slice())
     .bind(now)
     .bind(now)
-    .fetch_optional(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
-    Ok(id.and_then(|id| id.try_into().ok()))
+    Ok(approvals_among(conn, v, tenant_id, candidates)
+        .await?
+        .first()
+        .map(|a| a.approval.common.replay_id))
 }
 
 /// The predicates R2 rechecks on every use and refresh: this instance and

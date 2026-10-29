@@ -277,6 +277,18 @@ fn guard(version: i64) -> (String, String, &'static str) {
             "DELETE FROM v2_grant_quarantine".into(),
             "a grant quarantine is never removed",
         ),
+        // The rebuilt quarantine takes device approvals and is still kept.
+        29 => (
+            quarantined("device_approval"),
+            "DELETE FROM v2_grant_quarantine".into(),
+            "a grant quarantine is never removed",
+        ),
+        // An integer column of an upgraded table refuses an in-range REAL.
+        30 => (
+            none,
+            "UPDATE v2_profiles SET last_fencing_token = 1.5".into(),
+            "an integer column holds only integers",
+        ),
         _ => unreachable!("no guard for {version}"),
     }
 }
@@ -412,6 +424,33 @@ async fn m0028_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_fleet_grant
     }
     let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
     assert!(e.contains("a grant is quarantined once"), "{e}");
+}
+
+#[tokio::test]
+async fn m0029_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_device_approvals() {
+    let pool = upgrade(29).await;
+    for kind in ["fleet_rotation_grant", "unknown_kind"] {
+        let e = exec(&pool, &quarantined(kind)).await;
+        assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
+    }
+    let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
+    assert!(e.contains("a grant is quarantined once"), "{e}");
+}
+
+#[tokio::test]
+async fn m0030_upgraded_integer_columns_refuse_values_that_are_no_integers() {
+    let pool = upgrade(30).await;
+    for statement in [
+        "UPDATE v2_accounts SET token_version = '0.5'",
+        "UPDATE v2_uploads SET expires_at_ms = 9.5",
+    ] {
+        let e = exec(&pool, statement).await.unwrap_err();
+        assert!(e.contains("an integer column holds only integers"), "{e}");
+    }
+    // An integer, also as text that INTEGER affinity makes one, is stored.
+    exec(&pool, "UPDATE v2_profiles SET last_fencing_token = '4'")
+        .await
+        .unwrap();
 }
 
 // ------------------------------------------------- the v0.1.28 database ---
