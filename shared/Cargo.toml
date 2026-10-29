@@ -2,6 +2,7 @@
 name = "shardx-core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Shared ShardX logic: Chromium os_crypt cookie/secret encryption and portable user-data-dir snapshots (Mac/Win/Linux)."
 
 [dependencies]

@@ -322,3 +322,34 @@ jobs:
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # G2-62: shared, server and src-tauri each build on the `rust-version` their
+  # Cargo.toml declares, read from the manifest so the two cannot drift. A
+  # separate job, so it can change apart from the jobs above.
+  custody-msrv:
+    runs-on: ubuntu-22.04
+    name: Launcher, server and shared MSRV
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Check each crate on its declared rust-version
+        run: |
+          for crate in shared server src-tauri; do
+            msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$crate/Cargo.toml")
+            test -n "$msrv" || { echo "$crate declares no rust-version"; exit 1; }
+            rustup toolchain install "$msrv" --profile minimal
+            cargo "+$msrv" check --locked --all-targets --manifest-path "$crate/Cargo.toml"
+          done
