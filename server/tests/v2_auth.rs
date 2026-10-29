@@ -4040,6 +4040,7 @@ async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
     server
         .sql(
             "INSERT INTO v2_grant_quarantine
+                     (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
                  SELECT 'capability_grant', server_instance_id, tenant_id, replay_id,
                         'container_mismatch', 't'
                    FROM v2_capability_grants WHERE replay_id = ?",
@@ -9840,6 +9841,151 @@ async fn a_quarantined_revocation_that_verifies_again_is_served_again_after_a_re
     assert!(all.contains(&container) && reported);
     assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
     pool.close().await;
+}
+
+/// R1: a marked row is served again only when it holds the very container that
+/// was quarantined. Another genuine revocation filed under the same replay ID
+/// verifies and matches its own columns, but is not it: v2 stays off, on a
+/// running server and after a restart, until the original container is back.
+#[tokio::test]
+async fn a_marked_row_swapped_for_another_genuine_revocation_is_not_served_again() {
+    let mut server = start("r1-marked-row-swapped", 28394).await;
+    let (dev, access, _) = custodian(&mut server, 0x72).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (ours, other) = (
+        device(&server, OWNER, 0x7b, "pending").await,
+        device(&server, OWNER, 0x7c, "pending").await,
+    );
+    // The other device's revocation is filed first and set aside, so that ours
+    // can be filed under the same replay ID.
+    let theirs = revocation(&dev.sk, &other, 0x90, 28);
+    let status = server
+        .call(
+            &device_revoke_path(&other.id),
+            &access,
+            Some(&revoke_request(0xa7, &theirs)),
+        )
+        .await
+        .0;
+    assert_eq!(status, 201);
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    for statement in [
+        "CREATE TABLE set_aside AS SELECT * FROM v2_device_revocations",
+        "DELETE FROM v2_device_revocations",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    let mine = revocation(&dev.sk, &ours, 0x90, 29);
+    let request = revoke_request(0xa6, &mine);
+    let path = device_revoke_path(&ours.id);
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let cols = column_names(&pool, "v2_device_revocations").await;
+    let whole = row_literals(&pool, "v2_device_revocations", &cols, 0x90).await;
+    let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let calls = [
+        (evidence_path.clone(), None),
+        (GRANTS.to_string(), Some(duty.clone())),
+    ];
+
+    // Tampered and marked by the startup pass, with the hash of its container.
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'lost'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation' AND length(container_sha256) = 32")
+            .await,
+        1
+    );
+    assert_all_untrusted(&server, &access, &calls).await;
+
+    // The other genuine revocation takes the row, under the same key.
+    for statement in [
+        "DELETE FROM v2_device_revocations",
+        "INSERT INTO v2_device_revocations SELECT * FROM set_aside",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    // A running server refuses the page that would pass it off as ours...
+    let (status, body) = server.call(&evidence_path, &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
+    // ...and so does the next start, though the row verifies on its own.
+    server.restart().await;
+    assert_all_untrusted(&server, &access, &calls).await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        1
+    );
+
+    // Only the container that was quarantined, put back, is served again.
+    sqlx::query("DELETE FROM v2_device_revocations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let values: Vec<&str> = whole.iter().map(String::as_str).collect();
+    sqlx::query(&format!(
+        "INSERT INTO v2_device_revocations ({}) VALUES ({})",
+        cols.join(", "),
+        values.join(", ")
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    server.restart().await;
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (all, ours_reported, other_reported) =
+        served_revocations(&server, &access, ours.id, other.id).await;
+    assert!(all.contains(&mine) && !all.contains(&theirs));
+    assert!(ours_reported && !other_reported);
+    pool.close().await;
+}
+
+/// R1: a mark that holds no container hash (one written before 0033, or for a
+/// row that was already gone) cannot say what was quarantined, so its row is
+/// never served again, however intact it is.
+#[tokio::test]
+async fn a_mark_without_a_container_hash_is_never_served_again() {
+    let mut server = start("r1-mark-without-hash", 28395).await;
+    let (dev, access, _) = custodian(&mut server, 0x73).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let request = revoke_request(0xa6, &revocation(&dev.sk, &subject, 0x90, 29));
+    assert_eq!(
+        server
+            .call(&device_revoke_path(&subject.id), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    sqlx::query(
+        "INSERT INTO v2_grant_quarantine
+             (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+         SELECT 'device_revocation', server_instance_id, tenant_id, replay_id,
+                'container_mismatch', 't' FROM v2_device_revocations",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    server.restart().await;
+    let calls = [(GRANTS.to_string(), Some(duty))];
+    assert_all_untrusted(&server, &access, &calls).await;
 }
 
 #[tokio::test]

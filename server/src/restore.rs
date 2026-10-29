@@ -539,6 +539,9 @@ fn print_audit_failures(cfg: &Config, episode: Option<&str>) {
     for kept in crate::audit::kept_failures(&cfg.data_dir, episode) {
         println!("audit_write_failures_kept={kept}");
     }
+    for file in crate::audit::corrupt_files(&cfg.data_dir) {
+        println!("audit_write_failures_corrupt={}", file.display());
+    }
 }
 
 /// A restore ends: print its episode's failed audit writes and those kept for
