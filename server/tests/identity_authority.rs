@@ -212,6 +212,11 @@ fn a_symlinked_record_is_refused() {
     let linked = std::os::windows::fs::symlink_file(&target, &record);
     if let Err(e) = linked {
         // Windows needs Developer Mode or a privilege to create symlinks.
+        // Under CI a skip would hide a check that must run.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set and a symlink cannot be created here: {e}"
+        );
         eprintln!("skipping: cannot create a symlink here: {e}");
         return;
     }

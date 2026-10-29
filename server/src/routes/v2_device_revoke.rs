@@ -12,6 +12,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use sha2::{Digest, Sha256};
 use sqlx::SqliteConnection;
 
 use shared::approval_receipt::AUTHORIZATION_REPLAY_RETENTION_MS;
@@ -33,7 +34,7 @@ use super::v2_root::{
 use super::v2_root_grants::{at, custodian_besides, is_active_custodian, outer_request};
 use crate::error::AppError;
 use crate::identity::{hex, Verified};
-use crate::quarantine::{Kind, Mark};
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::now_ms;
 
@@ -64,7 +65,9 @@ pub(crate) struct StoredRevocation {
 /// issuer's key and required to hold exactly the columns its container
 /// determines. A row that disagrees refuses the request (422) and is
 /// quarantined (plan L507), again if it was marked before. A row that was
-/// marked but verifies now is served again: the mark stays as history.
+/// marked is served again only if it verifies and holds the very container
+/// that was quarantined (another genuine one under the same replay ID is not
+/// it); the mark stays as history.
 pub(crate) async fn load_revocation(
     conn: &mut SqliteConnection,
     instance: &[u8; 16],
@@ -99,6 +102,11 @@ pub(crate) async fn load_revocation(
     .await?;
     let issuer: [u8; 32] = issuer.and_then(|k| k.try_into().ok()).ok_or_else(broken)?;
     let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
+    if let Some(recorded) = quarantine::recorded_container_sha256(conn, &mark).await? {
+        if recorded.as_deref() != Some(Sha256::digest(&exact).as_slice()) {
+            return Err(broken());
+        }
+    }
     let Payload::DeviceRevocation(revocation) = record.payload().clone() else {
         return Err(broken());
     };
@@ -140,7 +148,9 @@ impl Unserved {
     pub(crate) fn describe(&self) -> String {
         let why = match self.why {
             Why::OtherInstance => "belongs to another server instance",
-            Why::Mismatch => "does not match its signed container",
+            Why::Mismatch => {
+                "does not match its signed container, or is not the container that was quarantined"
+            }
             Why::MarkedRowMissing => "is quarantined and its row is missing",
         };
         format!(

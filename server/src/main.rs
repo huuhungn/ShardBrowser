@@ -80,7 +80,12 @@ async fn main() -> anyhow::Result<()> {
         // written into the data directory, so only after it.
         db::refuse_network_storage(&cfg)?;
     }
-    audit::init_read_only_count(&cfg.data_dir, episode.as_deref())?;
+    if let Some(aside) = audit::init_read_only_count(&cfg.data_dir, episode.as_deref())? {
+        tracing::warn!(
+            file = %aside.display(),
+            "the audit failure count file was not understood; set aside, its valid lines kept"
+        );
+    }
     if let Some(episode) = &episode {
         // The incident output (ADR 0002 D-1): the failed audit writes of this episode.
         tracing::warn!(

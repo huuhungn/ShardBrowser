@@ -2411,16 +2411,43 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
     )
     .await;
 
-    // A row that was marked but verifies intact is served again, so the
-    // mark alone does not stop a restore.
-    exec(
-        &d,
-        "INSERT INTO v2_grant_quarantine
-           (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+    // A mark that holds no container hash cannot say what was quarantined,
+    // so its row is not served again, however intact.
+    let mark = "INSERT INTO v2_grant_quarantine
+           (kind, server_instance_id, tenant_id, replay_id, reason, created_at,
+            container_sha256)
          SELECT 'device_revocation', server_instance_id, tenant_id, replay_id,
-                'container_mismatch', 't' FROM v2_device_revocations",
-    )
-    .await;
+                'container_mismatch', 't', ";
+    exec(&d, &format!("{mark}NULL FROM v2_device_revocations")).await;
+    assert_refused_cleanly(&d, txn, "not the container that was quarantined").await;
+    // A row marked with the hash of the container it holds is served again,
+    // so the mark alone does not stop a restore.
+    // The same restore with the mark holding the hash of the container the
+    // row holds is served again, so the mark alone does not stop it.
+    reset(&d);
+    let third = peer(&d, &w.dev, 0x77, w.instance).await;
+    revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
+    let held: Vec<u8> = {
+        let p = pool(&d).await;
+        let v = sqlx::query_scalar(&format!(
+            "SELECT exact_signed_container_bytes FROM v2_device_revocations {row}"
+        ))
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        p.close().await;
+        v
+    };
+    {
+        use sha2::{Digest, Sha256};
+        let p = pool(&d).await;
+        sqlx::query(&format!("{mark}? FROM v2_device_revocations"))
+            .bind(Sha256::digest(&held).to_vec())
+            .execute(&p)
+            .await
+            .unwrap();
+        p.close().await;
+    }
     ok(prepare(&d, None, txn));
     ok(cli(&d, &["restore", "commit"]));
     assert_restored(&d, txn).await;
@@ -2802,7 +2829,9 @@ async fn an_empty_identity_directory_setting_refuses_to_start() {
 }
 
 /// Makes `link` a symbolic link to `target`, or says why it cannot (Windows
-/// needs Developer Mode or an administrator, as the GitHub runner is).
+/// needs Developer Mode or an administrator, as the GitHub runner is). Under
+/// `CI` a link that cannot be made fails the test: a skip there would hide a
+/// check that must run.
 fn symlink_file(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     let made = std::os::unix::fs::symlink(target, link);
@@ -2811,6 +2840,10 @@ fn symlink_file(target: &Path, link: &Path) -> bool {
     match made {
         Ok(()) => true,
         Err(e) => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set and a symlink cannot be created here: {e}"
+            );
             eprintln!("SKIPPED: cannot create a symlink here: {e}");
             false
         }
@@ -2840,5 +2873,71 @@ async fn a_symlink_to_a_valid_manifest_is_not_the_manifest() {
     std::fs::remove_file(&manifest).unwrap();
     std::fs::rename(&moved, &manifest).unwrap();
     assert_class(&d, "K7", "L2260");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// R2: a count file with one line that is not understood keeps its valid
+/// lines. `restore status` lists the kept count and the corrupt file's path and
+/// never what the bad line held; a read-only start sets the file aside, logs
+/// its path and carries the valid lines on.
+#[tokio::test]
+async fn g2_55_a_count_file_with_a_bad_line_is_set_aside_and_its_valid_lines_kept() {
+    let d = dirs("wi-audit-corrupt");
+    initialised(&d);
+    assert_server_normal(&d, 28441).await;
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    let file = d.data.join("audit-ro-failures");
+    std::fs::write(&file, "record-aa 9\nHOSTILE-LINE-TEXT 1\n").unwrap();
+    let status = ok(cli(&d, &["restore", "status"]));
+    let said = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert_eq!(field(&status, "audit_write_failures_kept"), "record-aa 9");
+    assert_eq!(
+        field(&status, "audit_write_failures_corrupt"),
+        file.display().to_string()
+    );
+    assert_eq!(field(&status, "audit_write_failures"), "unreadable");
+    assert!(!said.contains("HOSTILE"), "{said}");
+
+    // A read-only start sets it aside and says where.
+    let log = d.base.join("server.log");
+    {
+        let mut c = bin(&d);
+        let _s = Server(
+            c.env("SHARDX_BIND", "127.0.0.1:28441")
+                .env("SHARDX_TOKEN_SECRET", "restore-epoch-harness")
+                .env("SHARDX_ADMIN_USER", "admin")
+                .env("SHARDX_ADMIN_PASS", "secret")
+                .stdout(std::fs::File::create(&log).unwrap())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        ready(&http(), 28441).await;
+    }
+    let logged = plain(&String::from_utf8_lossy(&std::fs::read(&log).unwrap()));
+    assert!(logged.contains("was not understood"), "{logged}");
+    assert!(logged.contains("audit-ro-failures.corrupt-"), "{logged}");
+    assert!(!logged.contains("HOSTILE"), "{logged}");
+    let aside: Vec<_> = std::fs::read_dir(&d.data)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("audit-ro-failures.corrupt-")
+        })
+        .collect();
+    assert_eq!(aside.len(), 1);
+    assert!(std::fs::read_to_string(aside[0].path())
+        .unwrap()
+        .contains("HOSTILE"));
+    let status = ok(cli(&d, &["restore", "status"]));
+    assert_eq!(field(&status, "audit_write_failures_kept"), "record-aa 9");
+    assert_eq!(
+        field(&status, "audit_write_failures_corrupt"),
+        aside[0].path().display().to_string()
+    );
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("HOSTILE"));
     let _ = std::fs::remove_dir_all(&d.base);
 }
