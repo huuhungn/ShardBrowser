@@ -8749,6 +8749,71 @@ async fn each_column_is_compared<Fut: std::future::Future<Output = (u16, String)
     (compared, pinned)
 }
 
+/// The row `replay` of `table` is found by its key, so a change to a key
+/// column moves it out of the request's sight. For each of the three key
+/// columns: `ask` must give the answer in `answers` (the row is never served
+/// as itself) and the row is put back by its rowid, with any row the request
+/// filed instead removed and the quarantine released. Returns the key
+/// columns the schema refuses to change.
+async fn each_key_column_moves_the_row<Fut: std::future::Future<Output = (u16, String)>>(
+    pool: &SqlitePool,
+    table: &str,
+    replay: u8,
+    answers: &[(&str, u16, &str)],
+    ask: impl Fn() -> Fut,
+) -> Vec<String> {
+    let mut pinned = Vec::new();
+    assert_eq!(
+        answers.iter().map(|a| a.0).collect::<Vec<_>>(),
+        ["server_instance_id", "tenant_id", "replay_id"],
+        "{table}: the three key columns"
+    );
+    let cols = column_names(pool, table).await;
+    let rowids: Vec<i64> = sqlx::query_scalar(&format!("SELECT rowid FROM {table}"))
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    let rowid: i64 = sqlx::query_scalar(&format!("SELECT rowid FROM {table} WHERE replay_id = ?"))
+        .bind([replay; 16].as_slice())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let before = row_literals(pool, table, &cols, replay).await;
+    for (col, status, code) in answers {
+        if change_column(pool, table, col, replay, &[]).await.is_err() {
+            pinned.push(col.to_string());
+            continue;
+        }
+        assert_eq!(ask().await, (*status, code.to_string()), "{table}.{col}");
+        let known = rowids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::query(&format!("DELETE FROM {table} WHERE rowid NOT IN ({known})"))
+            .execute(pool)
+            .await
+            .unwrap();
+        let set: Vec<String> = cols
+            .iter()
+            .zip(&before)
+            .map(|(c, l)| format!("{c} = {l}"))
+            .collect();
+        sqlx::query(&format!(
+            "UPDATE {table} SET {} WHERE rowid = {rowid}",
+            set.join(", ")
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM v2_grant_quarantine")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    pinned
+}
+
 /// The startup pass of a restarted server quarantines the `table` row
 /// `replay` as `kind` for a change to any column but `skip`, and leaves it
 /// alone once the row is whole. Columns are changed as in
@@ -8925,6 +8990,23 @@ async fn every_root_grant_column_is_compared_with_its_container_on_each_request_
         ],
     );
 
+    // The key columns: a row under another key is not this grant.
+    each_key_column_moves_the_row(
+        &pool,
+        TABLE,
+        SELF_GRANT_REPLAY[0],
+        &[
+            ("server_instance_id", 404, KEY_ROOT),
+            ("tenant_id", 404, KEY_ROOT),
+            ("replay_id", 404, KEY_ROOT),
+        ],
+        || async {
+            let (status, body) = server.call(&path, &access, None).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
+
     // The RotationGrant row: its previous root is compared too. A change of
     // the previous generation moves the generation with it (the schema ties
     // the two), so the request asks for the row under its new generation.
@@ -9059,6 +9141,9 @@ async fn every_root_grant_column_is_compared_with_its_container_on_each_request_
     pool.close().await;
 }
 
+/// The code of a read of a grant that is not there.
+const KEY_ROOT: &str = "RESOURCE_NOT_FOUND";
+
 /// The columns the schema pins on a RotationGrant row.
 const ROTATION_PINNED: &[&str] = &[
     "container_domain",
@@ -9165,6 +9250,26 @@ async fn every_capability_grant_column_is_compared_with_its_container_on_each_re
             "signature_version",
         ],
     );
+    // The instance is part of the row, so another one is a mismatch; a grant
+    // under another replay ID is no answer to this one's retry, which files
+    // the grant afresh.
+    let pinned = each_key_column_moves_the_row(
+        &pool,
+        TABLE,
+        0xa1,
+        &[
+            ("server_instance_id", 422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+            ("tenant_id", 0, ""),
+            ("replay_id", 201, ""),
+        ],
+        || async {
+            let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
+    // A tenant-wide grant's scope is its tenant, which the schema ties.
+    assert_eq!(pinned, ["tenant_id"]);
     let at_startup = each_column_is_quarantined_at_startup(
         &mut server,
         &pool,
@@ -9258,6 +9363,21 @@ async fn every_device_revocation_column_is_compared_with_its_container_on_each_r
         1
     );
     let pool = matrix_pool(&server, TABLE).await;
+    each_key_column_moves_the_row(
+        &pool,
+        TABLE,
+        0x90,
+        &[
+            ("server_instance_id", 422, "MUTATION_RESPONSE_MISMATCH"),
+            ("tenant_id", 422, "MUTATION_RESPONSE_MISMATCH"),
+            ("replay_id", 422, "MUTATION_RESPONSE_MISMATCH"),
+        ],
+        || async {
+            let (status, body) = server.call(&path, &access, Some(&request)).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
     let columns = each_column_is_compared(
         &server,
         &pool,
@@ -9312,6 +9432,97 @@ async fn every_device_revocation_column_is_compared_with_its_container_on_each_r
             "signature_version",
         ],
     );
+    // The startup pass compares the same columns, and an untrusted
+    // revocation turns v2 off, so the restarts below end in a 423.
+    let at_startup = each_column_is_quarantined_at_startup(
+        &mut server,
+        &pool,
+        TABLE,
+        "device_revocation",
+        0x90,
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "filed_at_ms",
+        ],
+        &[
+            ("reason_code", "reason_code = 'lost'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
+        ],
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        at_startup,
+        &[
+            "subject_account_id",
+            "subject_device_id",
+            "subject_signing_key_id",
+            "subject_hpke_key_id",
+            "reason_code",
+            "issuer_signing_key_id",
+            "issued_at_ms",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ],
+        &[
+            "payload_domain",
+            "payload_version",
+            "signature_suite_id",
+            "signature_version",
+        ],
+    );
+    // Moved under another key, the row is a mismatch of the new key (the
+    // quarantine cannot name a tenant that does not exist, so that pass fails
+    // instead), or an untrusted revocation of another instance. Either way v2
+    // is off.
+    for (col, quarantined) in [
+        ("tenant_id", 0),
+        ("replay_id", 1),
+        ("server_instance_id", 0),
+    ] {
+        change_column(&pool, TABLE, col, 0x90, &[]).await.unwrap();
+        server.restart().await;
+        assert_eq!(
+            server
+                .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+                .await,
+            quarantined,
+            "{col}"
+        );
+        let (status, body) = server.call(&path, &access, Some(&request)).await;
+        assert_eq!(
+            (status, code_of(&body).as_str()),
+            (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED"),
+            "{col}"
+        );
+        sqlx::query(&format!("UPDATE {TABLE} SET {col} = ?"))
+            .bind(
+                match col {
+                    "tenant_id" => TENANT,
+                    "replay_id" => [0x90; 16],
+                    _ => INSTANCE,
+                }
+                .as_slice(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM v2_grant_quarantine")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    server.restart().await;
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
     pool.close().await;
 }
 
@@ -9389,31 +9600,25 @@ async fn the_startup_pass_quarantines_device_revocations_that_left_their_contain
             "{replay:#x}"
         );
     }
-    // The intact revocation is still served and reported; the quarantined
-    // one is neither, even once its row is put back.
-    let (all, drifted_reported, intact_reported) =
-        served_revocations(&server, &access, drifted.id, intact.id).await;
-    assert!(all.contains(&intact_container));
-    assert!(!all.contains(&drifted_container));
-    assert!(intact_reported && !drifted_reported);
+    // Hiding a revocation is unsafe, so v2 is off while one is quarantined:
+    // no evidence page, no retry, whatever the row says, even once it is put
+    // back (a quarantine is never lifted by the row).
+    let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let calls = [
+        (evidence_path, None),
+        (device_revoke_path(&intact.id), Some(intact_request.clone())),
+        (
+            device_revoke_path(&drifted.id),
+            Some(drifted_request.clone()),
+        ),
+    ];
+    assert_all_untrusted(&server, &access, &calls).await;
     server
         .sql(
             "UPDATE v2_device_revocations SET subject_hpke_key_id = ? WHERE replay_id = ?",
             &[&drifted.hpke_key_id, &[0x90; 16]],
         )
         .await;
-    let (all, drifted_reported, _) =
-        served_revocations(&server, &access, drifted.id, intact.id).await;
-    assert!(!all.contains(&drifted_container) && !drifted_reported);
-    // A retry of either filing finds its row: the intact one answers as
-    // before, the quarantined one is no revocation.
-    let retry = |device: &Device, request: Vec<u8>| {
-        let (server, access, path) = (&server, access.clone(), device_revoke_path(&device.id));
-        async move { server.call(&path, &access, Some(&request)).await.0 }
-    };
-    assert_eq!(retry(&intact, intact_request).await, 201);
-    assert_eq!(retry(&drifted, drifted_request).await, 422);
-    // A second pass finds nothing new.
     server.restart().await;
     assert_eq!(
         server
@@ -9421,6 +9626,131 @@ async fn the_startup_pass_quarantines_device_revocations_that_left_their_contain
             .await,
         2
     );
+    assert_all_untrusted(&server, &access, &calls).await;
+}
+
+/// Every call is refused because the control plane is untrusted.
+async fn assert_all_untrusted(server: &Server, access: &str, calls: &[(String, Option<Vec<u8>>)]) {
+    for (path, request) in calls {
+        let (status, body) = server.call(path, access, request.as_deref()).await;
+        assert_eq!(
+            (status, code_of(&body).as_str()),
+            (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED"),
+            "{path}"
+        );
+    }
+}
+
+/// A revocation moved to another server instance drops out of every check,
+/// so the startup pass refuses v2 for it, names no quarantine (the row is
+/// intact) and clears once the row is put back.
+#[tokio::test]
+async fn a_revocation_of_another_instance_turns_v2_off_until_it_is_put_back() {
+    let mut server = start("g2-30-revocation-instance", 28391).await;
+    let (dev, access, _) = custodian(&mut server, 0x74).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&subject.id),
+            &access,
+            Some(&revoke_request(0xa6, &container)),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    sqlx::query("UPDATE v2_device_revocations SET server_instance_id = zeroblob(16)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A running server refuses the evidence page that would leave it out.
+    let path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let (status, body) = server.call(&path, &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
+    server.restart().await;
+    let (status, body) = server.call(GRANTS, &access, Some(&duty)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        0
+    );
+
+    sqlx::query("UPDATE v2_device_revocations SET server_instance_id = ?")
+        .bind(INSTANCE.as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    server.restart().await;
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+}
+
+/// A revocation quarantined while the server runs is not dropped from the
+/// evidence either: the page is refused, as the next start would refuse v2.
+#[tokio::test]
+async fn a_revocation_quarantined_at_runtime_refuses_the_trust_evidence() {
+    let mut server = start("g2-30-revocation-runtime", 28392).await;
+    let (dev, access, _) = custodian(&mut server, 0x75).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let request = revoke_request(0xa6, &revocation(&dev.sk, &subject, 0x90, 29));
+    let path = device_revoke_path(&subject.id);
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'lost'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The retry finds the row drifted and quarantines it.
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 422);
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        1
+    );
+    let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let (status, body) = server.call(&evidence_path, &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
+    // Putting the row back lifts nothing: a quarantined revocation is no
+    // revocation, so its retry is not answered as the filing, and the
+    // evidence stays refused.
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'compromised'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+    let (status, _) = server.call(&evidence_path, &access, None).await;
+    assert_eq!(status, 423);
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -9465,10 +9795,13 @@ async fn the_trust_evidence_reports_a_revoked_device_from_its_record_not_its_col
             .await,
         1
     );
-    // Afterwards the page answers without the quarantined revocation.
-    let pages = evidence(&server, &access, &[]).await;
-    assert!(!containers(&pages).contains(&container));
-    assert!(pages.iter().all(|p| p.device_revocations.is_empty()));
+    // Afterwards the page is refused, not served without the quarantined
+    // revocation: a revoked device must not pass as live.
+    let (status, body) = server.call(&page, &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
 }
 
 /// A retry is answered only while the row still holds the container that was

@@ -1383,4 +1383,41 @@ async fn m0032_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_device_revo
     }
     let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
     assert!(e.contains("a grant is quarantined once"), "{e}");
+
+    // The rebuild keeps the rows and all three triggers: a quarantine is
+    // never changed or removed afterwards.
+    let before = world_before(32).await;
+    exec(&before, &quarantined("device_approval"))
+        .await
+        .unwrap();
+    let triggers = |pool: SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'trigger' AND tbl_name = 'v2_grant_quarantine' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let kept = triggers(before.clone()).await;
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM v2_grant_quarantine")
+            .fetch_one(&before)
+            .await
+            .unwrap()
+    };
+    let rows = count().await;
+    assert!(rows >= 1);
+    migrate_to(&before, 32).await;
+    assert_eq!(triggers(before.clone()).await, kept);
+    assert_eq!(count().await, rows);
+    let e = exec(&before, "UPDATE v2_grant_quarantine SET created_at = 'u'")
+        .await
+        .unwrap_err();
+    assert!(e.contains("a grant quarantine never changes"), "{e}");
+    let e = exec(&before, "DELETE FROM v2_grant_quarantine")
+        .await
+        .unwrap_err();
+    assert!(e.contains("a grant quarantine is never removed"), "{e}");
 }

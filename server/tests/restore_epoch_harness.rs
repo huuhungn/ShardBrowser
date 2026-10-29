@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use serde_json::{json, Value};
+use shardx_team_server::identity_record::IdentityRecordV2;
 use shardx_team_server::restore_manifest::{self as rm, MANIFEST_FILE};
 use shared::authz_record::{
     build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
@@ -1503,7 +1504,29 @@ async fn g2_55_a_failed_read_only_audit_write_is_counted_in_restore_status() {
         "2"
     );
 
-    std::fs::remove_file(d.identity.join(MANIFEST_FILE)).unwrap();
+    // A restart in the same restore keeps counting, and so does a normal
+    // start of the server, which leaves the count for the restore to report.
+    {
+        let _s = spawn(&d, 28431);
+        let c = http();
+        ready(&c, 28431).await;
+        let r = c
+            .post("http://127.0.0.1:28431/auth/login")
+            .json(&json!({ "username": "admin", "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "3"
+    );
+
+    // `restore abort` ends the restore: it prints the final count and clears it.
+    let aborted = ok(cli(&d, &["restore", "abort"]));
+    assert_eq!(field(&aborted, "audit_write_failures"), "3");
+    assert!(!d.data.join("audit-ro-failures").exists());
     assert_server_normal(&d, 28431).await;
     assert!(!d.data.join("audit-ro-failures").exists());
     assert!(
@@ -1511,6 +1534,96 @@ async fn g2_55_a_failed_read_only_audit_write_is_counted_in_restore_status() {
             .contains("audit_write_failures")
     );
     let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// ADR 0002 D-1, K2's incident output: `identity show` and `restore status`
+/// print the class and the failed audit writes, and a count that is not a
+/// number is reported as unreadable instead of failing either command.
+#[tokio::test]
+async fn g2_55_the_k2_incident_output_prints_the_audit_failure_count() {
+    let d = dirs("wi-audit-k2");
+    initialised(&d);
+    assert_server_normal(&d, 28433).await;
+    // A record of another instance than the mirror's is the L2264 incident.
+    let other = IdentityRecordV2::genesis([0x99; 16], 1);
+    std::fs::write(d.identity.join(RECORD), other.encode().unwrap()).unwrap();
+    assert_class(&d, "K2", "L2264");
+    {
+        let _s = spawn(&d, 28433);
+        let c = http();
+        ready(&c, 28433).await;
+        for _ in 0..2 {
+            let r = c
+                .post("http://127.0.0.1:28433/auth/login")
+                .json(&json!({ "username": "admin", "password": "wrong" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 401);
+        }
+    }
+    let show = cli(&d, &["identity", "show"]);
+    assert_eq!(field(&show, "class"), "K2");
+    assert_eq!(field(&show, "audit_write_failures"), "2");
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "2"
+    );
+    std::fs::write(d.data.join("audit-ro-failures"), "torn").unwrap();
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "unreadable"
+    );
+    assert_eq!(
+        field(&cli(&d, &["identity", "show"]), "audit_write_failures"),
+        "unreadable"
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// A directory squatting the count's name stops a read-only start by name,
+/// and a normal start does not touch it.
+#[tokio::test]
+async fn g2_55_a_directory_at_the_count_path_stops_a_read_only_start_by_name() {
+    let d = dirs("wi-audit-squat");
+    initialised(&d);
+    assert_server_normal(&d, 28434).await;
+    std::fs::create_dir(d.data.join("audit-ro-failures")).unwrap();
+    assert_server_normal(&d, 28434).await;
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    let said = refused_start(&d, 28434);
+    assert!(said.contains("not a regular file"), "{said}");
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "unreadable"
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// The text a server start prints when it refuses to run; a server that does
+/// start is killed and fails the test.
+fn refused_start(d: &Dirs, port: u16) -> String {
+    let mut c = bin(d);
+    let mut child = c
+        .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
+        .env("SHARDX_TOKEN_SECRET", "restore-epoch-harness")
+        .env("SHARDX_ADMIN_USER", "admin")
+        .env("SHARDX_ADMIN_PASS", "secret")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            let o = child.wait_with_output().unwrap();
+            assert!(!o.status.success(), "{}", text(&o));
+            return text(&o);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    panic!("the server started instead of refusing");
 }
 
 // ------------------------------------------------------------------ G2-54 ---
@@ -2268,5 +2381,284 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
     ok(prepare(&d, None, txn));
     ok(cli(&d, &["restore", "commit"]));
     assert_restored(&d, txn).await;
+
+    // A restore does not read around a revocation either: one of another
+    // server instance, or one that is quarantined, refuses it.
+    reset(&d);
+    let third = peer(&d, &w.dev, 0x77, w.instance).await;
+    revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
+    exec(&d, "DROP TRIGGER v2_device_revocations_no_update").await;
+    on_backup(&d, "DROP TRIGGER v2_device_revocations_no_update").await;
+    exec(
+        &d,
+        &format!("UPDATE v2_device_revocations SET server_instance_id = zeroblob(16) {row}"),
+    )
+    .await;
+    assert_refused_cleanly(&d, txn, "quarantined or of another server instance").await;
+    exec(
+        &d,
+        &format!(
+            "UPDATE v2_device_revocations SET server_instance_id = x'{}' {row}",
+            hex(&w.instance)
+        ),
+    )
+    .await;
+    exec(
+        &d,
+        "INSERT INTO v2_grant_quarantine
+           (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+         SELECT 'device_revocation', server_instance_id, tenant_id, replay_id,
+                'container_mismatch', 't' FROM v2_device_revocations",
+    )
+    .await;
+    assert_refused_cleanly(&d, txn, "quarantined or of another server instance").await;
     done(&d);
+}
+
+/// The same identity directory through the loopback administrative share, or
+/// None when this machine offers none.
+#[cfg(windows)]
+fn through_the_loopback_share(d: &Dirs) -> Option<Dirs> {
+    loopback_of(&d.identity).map(|unc| Dirs {
+        base: d.base.clone(),
+        data: d.data.clone(),
+        identity: unc,
+        backup: d.backup.clone(),
+    })
+}
+
+/// A configured identity directory that fails its preflight (here a network
+/// share) is an error, never "no record": the server must not classify as K1
+/// and open the DB writable in the middle of a restore, and the restore
+/// commands name the preflight error instead of asking for the variable.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_identity_directory_the_preflight_refuses_never_falls_to_k1() {
+    let d = dirs("preflight-k1");
+    initialised(&d);
+    assert_server_normal(&d, 28471).await;
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    let Some(u) = through_the_loopback_share(&d) else {
+        eprintln!("no loopback administrative share on this machine; not checked");
+        return;
+    };
+    let before = scalar(&d, "SELECT count(*) FROM audit_log").await;
+    let said = refused_start(&u, 28472);
+    assert!(
+        said.contains("SHARDX_IDENTITY_DIR") && said.contains("network share"),
+        "{said}"
+    );
+    assert_eq!(
+        scalar(&d, "SELECT count(*) FROM audit_log").await,
+        before,
+        "a refused start wrote"
+    );
+    for args in [
+        &["restore", "status"][..],
+        &["restore", "commit"],
+        &["restore", "abort"],
+        &[
+            "restore",
+            "withdraw-transitions",
+            "--tenant",
+            &"00".repeat(16),
+        ],
+    ] {
+        let said = text(&cli(&u, args));
+        assert!(said.contains("network share"), "{args:?}: {said}");
+        assert!(!said.contains("must be set"), "{args:?}: {said}");
+    }
+    // `identity show` names an untrusted directory as such, not as missing.
+    let show = cli(&u, &["identity", "show"]);
+    assert_eq!(field(&show, "status"), "EPOCH_AUTHORITY_CORRUPT");
+    // Nothing changed at the local path.
+    assert_class(&d, "K5a", "L2260");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// A restore reads its artifacts only through plain entries: a junction in
+/// place of the `restore-<txn>` directory refuses `restore commit`, and the
+/// junction's target is left alone.
+#[cfg(windows)]
+#[tokio::test]
+async fn restore_commit_refuses_artifacts_behind_a_junction() {
+    let d = dirs("junction");
+    let txn = empty(&d);
+    ok(prepare(&d, None, &txn));
+    assert_class(&d, "K7", "L2260");
+    let dir = d.identity.join(format!("restore-{txn}"));
+    let moved = d.base.join("moved-artifacts");
+    std::fs::rename(&dir, &moved).unwrap();
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&dir)
+        .arg(&moved)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{}", text(&made));
+    refused(cli(&d, &["restore", "commit"]), "link or reparse point");
+    assert!(moved.is_dir() && std::fs::read_dir(&moved).unwrap().count() > 0);
+    // Without the junction the same restore goes through.
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::rename(&moved, &dir).unwrap();
+    ok(cli(&d, &["restore", "commit"]));
+    assert_class(&d, "K3", "L2259");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// A configured identity directory that is not there is a missing authority
+/// (not an untrusted one), and the server does not start on it either.
+#[tokio::test]
+async fn an_identity_directory_that_is_not_there_is_missing_and_stops_the_server() {
+    let d = dirs("preflight-missing");
+    initialised(&d);
+    let u = Dirs {
+        base: d.base.clone(),
+        data: d.data.clone(),
+        identity: d.base.join("not-there"),
+        backup: d.backup.clone(),
+    };
+    let show = cli(&u, &["identity", "show"]);
+    assert_eq!(field(&show, "status"), "EPOCH_AUTHORITY_MISSING");
+    for args in [&["restore", "status"][..], &["restore", "commit"]] {
+        let said = text(&cli(&u, args));
+        assert!(said.contains("not-there"), "{args:?}: {said}");
+        assert!(!said.contains("must be set"), "{args:?}: {said}");
+    }
+    let said = refused_start(&u, 28473);
+    assert!(said.contains("SHARDX_IDENTITY_DIR"), "{said}");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// The failed logins a read-only server counts: two, in one server run.
+async fn two_failed_logins(d: &Dirs, port: u16) {
+    let _s = spawn(d, port);
+    let c = http();
+    ready(&c, port).await;
+    for _ in 0..2 {
+        let r = c
+            .post(format!("http://127.0.0.1:{port}/auth/login"))
+            .json(&json!({ "username": "admin", "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+}
+
+/// `restore commit` ends the restore like `abort` does: it prints the final
+/// count of failed audit writes, then clears it.
+#[tokio::test]
+async fn g2_55_restore_commit_prints_the_final_audit_failure_count_and_clears_it() {
+    let d = dirs("wi-audit-commit");
+    initialised(&d);
+    assert_server_normal(&d, 28435).await;
+    std::fs::copy(d.db(), &d.backup).unwrap();
+    let txn = exported(&d).0;
+    ok(prepare(&d, None, &txn));
+    assert_class(&d, "K7", "L2260");
+    two_failed_logins(&d, 28435).await;
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "2"
+    );
+    let committed = ok(cli(&d, &["restore", "commit"]));
+    assert_eq!(field(&committed, "audit_write_failures"), "2");
+    assert!(!d.data.join("audit-ro-failures").exists());
+    assert_class(&d, "K3", "L2259");
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// The text of `log` without its terminal colour codes.
+fn plain(log: &str) -> String {
+    let mut out = String::new();
+    let mut chars = log.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// ADR 0002 D-1: the read-only start's own log line carries the failed audit
+/// writes counted so far in this restore.
+#[tokio::test]
+async fn g2_55_a_read_only_start_logs_the_failed_audit_writes_counted_so_far() {
+    let d = dirs("wi-audit-log");
+    initialised(&d);
+    assert_server_normal(&d, 28436).await;
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    two_failed_logins(&d, 28436).await;
+    let log = d.base.join("server.log");
+    {
+        let mut c = bin(&d);
+        let _s = Server(
+            c.env("SHARDX_BIND", "127.0.0.1:28436")
+                .env("SHARDX_TOKEN_SECRET", "restore-epoch-harness")
+                .env("SHARDX_ADMIN_USER", "admin")
+                .env("SHARDX_ADMIN_PASS", "secret")
+                .stdout(std::fs::File::create(&log).unwrap())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        ready(&http(), 28436).await;
+    }
+    let logged = plain(&String::from_utf8_lossy(&std::fs::read(&log).unwrap()));
+    let line = logged
+        .lines()
+        .find(|l| l.contains("the database is opened read-only"))
+        .unwrap_or_else(|| panic!("no read-only line in {logged}"));
+    assert!(
+        line.contains("audit_write_failures=\"2\"") || line.contains("audit_write_failures=2"),
+        "{line}"
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// `path` through the loopback administrative share, or None when this
+/// machine offers none.
+#[cfg(windows)]
+fn loopback_of(path: &Path) -> Option<PathBuf> {
+    let local = std::fs::canonicalize(path)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let (drive, tail) = local.trim_start_matches(r"\\?\").split_once(":\\").unwrap();
+    let unc = PathBuf::from(format!(r"\\localhost\{drive}$\{tail}"));
+    unc.exists().then_some(unc)
+}
+
+/// The count lives in the data directory, so a read-only start checks that
+/// directory's volume first: on a network share it refuses and writes nothing.
+#[cfg(windows)]
+#[tokio::test]
+async fn g2_55_a_read_only_start_on_a_network_data_directory_writes_no_count() {
+    let d = dirs("wi-audit-network");
+    initialised(&d);
+    assert_server_normal(&d, 28437).await;
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    let Some(unc) = loopback_of(&d.data) else {
+        eprintln!("no loopback administrative share on this machine; not checked");
+        return;
+    };
+    let u = Dirs {
+        base: d.base.clone(),
+        data: unc,
+        identity: d.identity.clone(),
+        backup: d.backup.clone(),
+    };
+    let said = refused_start(&u, 28437);
+    assert!(said.contains("network share"), "{said}");
+    assert!(!d.data.join("audit-ro-failures").exists());
 }

@@ -74,8 +74,21 @@ async fn main() -> anyhow::Result<()> {
     // progress the DB is opened read-only, so nothing (no migration, admin
     // bootstrap, blob GC, v1 or v2 write) changes it until `restore commit`
     // or `restore abort`; the server never resumes a restore itself.
-    let class = restore::startup_gate(&cfg).await?;
-    audit::init_read_only_count(&cfg.data_dir, class.read_only())?;
+    let (class, episode) = restore::startup_gate(&cfg).await?;
+    if class.read_only() {
+        // init_pool makes this check on a writable start; the count file is
+        // written into the data directory, so only after it.
+        db::refuse_network_storage(&cfg)?;
+    }
+    audit::init_read_only_count(&cfg.data_dir, episode.as_deref())?;
+    if let Some(episode) = &episode {
+        // The incident output (ADR 0002 D-1): the failed audit writes of this episode.
+        tracing::warn!(
+            ?class,
+            audit_write_failures = audit::read_only_failures(&cfg.data_dir, episode),
+            "the database is opened read-only"
+        );
+    }
     let (pool, mut authority) = if class.read_only() {
         let pool = identity::open_read_only(&cfg).await?.with_context(|| {
             format!("a restore is in progress ({class:?}) and no database is at the DB path")
