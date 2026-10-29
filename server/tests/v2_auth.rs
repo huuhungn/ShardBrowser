@@ -9951,12 +9951,13 @@ async fn a_marked_row_swapped_for_another_genuine_revocation_is_not_served_again
     pool.close().await;
 }
 
-/// R1: a mark that holds no container hash (one written before 0033, or for a
-/// row that was already gone) cannot say what was quarantined, so its row is
-/// never served again, however intact it is.
+/// V2: a mark holds no container hash when the container bytes were corrupt at
+/// marking (they are no container to hold the row to), or when the mark is
+/// older than the hash. Such a mark is served again once the row verifies, so
+/// a flipped bit is not an outage for good.
 #[tokio::test]
-async fn a_mark_without_a_container_hash_is_never_served_again() {
-    let mut server = start("r1-mark-without-hash", 28395).await;
+async fn a_mark_without_a_container_hash_is_served_again_once_the_row_verifies() {
+    let mut server = start("v2-mark-without-hash", 28395).await;
     let (dev, access, _) = custodian(&mut server, 0x73).await;
     let duty = capability_grant(&dev, &dev.sk, |g| {
         g.common.replay_id = [0xa8; 16];
@@ -9964,7 +9965,8 @@ async fn a_mark_without_a_container_hash_is_never_served_again() {
     });
     assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
     let subject = device(&server, OWNER, 0x7b, "pending").await;
-    let request = revoke_request(0xa6, &revocation(&dev.sk, &subject, 0x90, 29));
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let request = revoke_request(0xa6, &container);
     assert_eq!(
         server
             .call(&device_revoke_path(&subject.id), &access, Some(&request))
@@ -9982,10 +9984,68 @@ async fn a_mark_without_a_container_hash_is_never_served_again() {
     .execute(&pool)
     .await
     .unwrap();
-    pool.close().await;
     server.restart().await;
-    let calls = [(GRANTS.to_string(), Some(duty))];
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+    pool.close().await;
+}
+
+/// V2: a flipped bit in the container is marked without a hash; putting the
+/// original bytes back, and restarting, turns v2 on again with the revocation
+/// served. A different genuine container under the same replay ID is still
+/// refused when the mark does hold a hash (see the swap test).
+#[tokio::test]
+async fn a_corrupt_container_is_marked_without_a_hash_and_served_again_once_restored() {
+    let mut server = start("v2-corrupt-container", 28396).await;
+    let (dev, access, _) = custodian(&mut server, 0x74).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let request = revoke_request(0xa6, &container);
+    assert_eq!(
+        server
+            .call(&device_revoke_path(&subject.id), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let calls = [
+        (evidence_path.clone(), None),
+        (GRANTS.to_string(), Some(duty.clone())),
+    ];
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    let mut bad = container.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    sqlx::query("UPDATE v2_device_revocations SET exact_signed_container_bytes = ?")
+        .bind(&bad)
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation' AND container_sha256 IS NULL")
+            .await,
+        1
+    );
     assert_all_untrusted(&server, &access, &calls).await;
+
+    sqlx::query("UPDATE v2_device_revocations SET exact_signed_container_bytes = ?")
+        .bind(&container)
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+    pool.close().await;
 }
 
 #[tokio::test]

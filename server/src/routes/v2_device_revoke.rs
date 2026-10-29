@@ -65,9 +65,11 @@ pub(crate) struct StoredRevocation {
 /// issuer's key and required to hold exactly the columns its container
 /// determines. A row that disagrees refuses the request (422) and is
 /// quarantined (plan L507), again if it was marked before. A row that was
-/// marked is served again only if it verifies and holds the very container
-/// that was quarantined (another genuine one under the same replay ID is not
-/// it); the mark stays as history.
+/// marked is served again once it verifies; if the mark holds the hash of the
+/// container that was quarantined, the row must hold that very container
+/// (another genuine one under the same replay ID is not it). A mark has no
+/// hash when the container itself was corrupt then (see
+/// [`quarantine::record`]). The mark stays as history.
 pub(crate) async fn load_revocation(
     conn: &mut SqliteConnection,
     instance: &[u8; 16],
@@ -91,25 +93,14 @@ pub(crate) async fn load_revocation(
         replay_id: *replay,
     };
     let broken = || AppError::Quarantine(Box::new(mark.clone()));
-    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
-    // The issuer's device row outlives its own revocation, so its key stays.
-    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
-    )
-    .bind(tenant.as_slice())
-    .bind(parsed.issuer_signing_key_id().as_slice())
-    .fetch_optional(&mut *conn)
-    .await?;
-    let issuer: [u8; 32] = issuer.and_then(|k| k.try_into().ok()).ok_or_else(broken)?;
-    let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
-    if let Some(recorded) = quarantine::recorded_container_sha256(conn, &mark).await? {
-        if recorded.as_deref() != Some(Sha256::digest(&exact).as_slice()) {
+    let Some((record, revocation)) = verified_container(conn, tenant, &exact).await? else {
+        return Err(broken());
+    };
+    if let Some(Some(recorded)) = quarantine::recorded_container_sha256(conn, &mark).await? {
+        if recorded.as_slice() != Sha256::digest(&exact).as_slice() {
             return Err(broken());
         }
     }
-    let Payload::DeviceRevocation(revocation) = record.payload().clone() else {
-        return Err(broken());
-    };
     let c = &revocation.common;
     if (&c.server_instance_id, &c.tenant_id, &c.replay_id) != (instance, tenant, replay) {
         return Err(broken());
@@ -125,13 +116,47 @@ pub(crate) async fn load_revocation(
     }))
 }
 
+/// The container bytes alone: parsed, signed under the key of one of the
+/// tenant's devices and a `DeviceRevocationV2`. `None` if they are not. The
+/// issuer's device row outlives its own revocation, so its key stays.
+pub(crate) async fn verified_container(
+    conn: &mut SqliteConnection,
+    tenant: &[u8; 16],
+    exact: &[u8],
+) -> sqlx::Result<Option<(VerifiedRecord, DeviceRevocationV2)>> {
+    let Ok(parsed) = AuthorizationRecord::parse(exact) else {
+        return Ok(None);
+    };
+    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
+    )
+    .bind(tenant.as_slice())
+    .bind(parsed.issuer_signing_key_id().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(issuer) = issuer.and_then(|k| <[u8; 32]>::try_from(k).ok()) else {
+        return Ok(None);
+    };
+    let Ok(record) = parsed.verify_signature(&issuer) else {
+        return Ok(None);
+    };
+    let Payload::DeviceRevocation(revocation) = record.payload().clone() else {
+        return Ok(None);
+    };
+    Ok(Some((record, revocation)))
+}
+
 /// Why a revocation is not being served correctly right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Why {
     /// The row names another server instance, so no check of this one sees it.
     OtherInstance,
-    /// The row disagrees with its signed container.
+    /// The row disagrees with its signed container, or its container does
+    /// not verify.
     Mismatch,
+    /// The row is intact, but holds another container than the one that was
+    /// quarantined.
+    OtherContainer,
     /// A quarantine mark names a row that is not there.
     MarkedRowMissing,
 }
@@ -146,16 +171,26 @@ pub(crate) struct Unserved {
 impl Unserved {
     /// Which revocation, why, and what clears it, for a log or a refusal.
     pub(crate) fn describe(&self) -> String {
-        let why = match self.why {
-            Why::OtherInstance => "belongs to another server instance",
-            Why::Mismatch => {
-                "does not match its signed container, or is not the container that was quarantined"
-            }
-            Why::MarkedRowMissing => "is quarantined and its row is missing",
+        let (why, clears) = match self.why {
+            Why::OtherInstance => (
+                "belongs to another server instance",
+                "restoring the row and restarting",
+            ),
+            Why::Mismatch => (
+                "does not match its signed container",
+                "restoring the row and restarting",
+            ),
+            Why::OtherContainer => (
+                "holds another container than the one that was quarantined",
+                "restoring the quarantined container and restarting",
+            ),
+            Why::MarkedRowMissing => (
+                "is quarantined and its row is missing",
+                "restoring the row and restarting",
+            ),
         };
         format!(
-            "device revocation {} of tenant {} {why}; restoring the row and restarting \
-             clears it",
+            "device revocation {} of tenant {} {why}; {clears} clears it",
             hex(&self.mark.replay_id),
             hex(&self.mark.tenant_id)
         )
@@ -240,14 +275,43 @@ pub(crate) async fn look_at_revocations(
                 mark,
                 why: Why::MarkedRowMissing,
             }),
-            Err(AppError::Quarantine(mark)) => found.unserved.push(Unserved {
-                mark: *mark,
-                why: Why::Mismatch,
-            }),
+            Err(AppError::Quarantine(mark)) => {
+                let why = why_broken(conn, &mark).await?;
+                found.unserved.push(Unserved { mark: *mark, why });
+            }
             Err(e) => return Err(e),
         }
     }
     Ok(found)
+}
+
+/// A row that failed [`load_revocation`]: a row whose container is intact but
+/// is not the one the mark recorded is [`Why::OtherContainer`], any other
+/// failure [`Why::Mismatch`].
+async fn why_broken(conn: &mut SqliteConnection, mark: &Mark) -> Result<Why, AppError> {
+    let Some(Some(recorded)) = quarantine::recorded_container_sha256(conn, mark).await? else {
+        return Ok(Why::Mismatch);
+    };
+    let exact: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+        "SELECT exact_signed_container_bytes FROM {TABLE}
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?"
+    ))
+    .bind(mark.server_instance_id.as_slice())
+    .bind(mark.tenant_id.as_slice())
+    .bind(mark.replay_id.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(match exact {
+        Some(exact)
+            if recorded.as_slice() != Sha256::digest(&exact).as_slice()
+                && verified_container(conn, &mark.tenant_id, &exact)
+                    .await?
+                    .is_some() =>
+        {
+            Why::OtherContainer
+        }
+        _ => Why::Mismatch,
+    })
 }
 
 fn malformed() -> AppError {
@@ -688,22 +752,30 @@ mod tests {
 
     #[test]
     fn each_finding_names_the_tenant_and_replay_and_what_clears_it() {
-        for (why, said) in [
-            (Why::OtherInstance, "belongs to another server instance"),
-            (Why::Mismatch, "does not match its signed container"),
+        let row = "restoring the row and restarting clears it";
+        for (why, said, clears) in [
+            (
+                Why::OtherInstance,
+                "belongs to another server instance",
+                row,
+            ),
+            (Why::Mismatch, "does not match its signed container", row),
+            (
+                Why::OtherContainer,
+                "holds another container than the one that was quarantined",
+                "restoring the quarantined container and restarting clears it",
+            ),
             (
                 Why::MarkedRowMissing,
                 "is quarantined and its row is missing",
+                row,
             ),
         ] {
             let text = unserved(why);
             assert!(text.contains(&"03".repeat(16)), "{text}");
             assert!(text.contains(&"02".repeat(16)), "{text}");
             assert!(text.contains(said), "{text}");
-            assert!(
-                text.contains("restoring the row and restarting clears it"),
-                "{text}"
-            );
+            assert!(text.contains(clears), "{text}");
         }
     }
 }
