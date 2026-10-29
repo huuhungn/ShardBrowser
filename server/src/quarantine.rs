@@ -7,8 +7,10 @@
 //! records the rows it finds the same way. A quarantined grant is refused for
 //! good, even if its row is later put back.
 
+use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 
+use crate::routes::v2_device_revoke::verified_container;
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +21,7 @@ pub enum Kind {
     FleetRecovery,
     FleetRotation,
     DeviceApproval,
+    DeviceRevocation,
 }
 
 impl Kind {
@@ -30,6 +33,7 @@ impl Kind {
             Self::FleetRecovery => "fleet_recovery_grant",
             Self::FleetRotation => "fleet_rotation_grant",
             Self::DeviceApproval => "device_approval",
+            Self::DeviceRevocation => "device_revocation",
         }
     }
 }
@@ -43,12 +47,40 @@ pub struct Mark {
     pub replay_id: [u8; 16],
 }
 
-/// Records `mark`; `true` if the grant was not quarantined before.
+/// Records `mark`; `true` if the grant was not quarantined before. A device
+/// revocation's mark also records the SHA-256 of the container bytes its row
+/// holds now, so that only that container can be served again, but only when
+/// those bytes verify as a revocation on their own. Corrupt bytes (or a row
+/// that is gone) leave no hash: they are no container to hold the row to, and
+/// the row is served again once it verifies.
 pub async fn record(pool: &SqlitePool, mark: &Mark) -> sqlx::Result<bool> {
+    let container_sha256 = if mark.kind == Kind::DeviceRevocation {
+        let exact = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT exact_signed_container_bytes FROM v2_device_revocations
+              WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?",
+        )
+        .bind(mark.server_instance_id.as_slice())
+        .bind(mark.tenant_id.as_slice())
+        .bind(mark.replay_id.as_slice())
+        .fetch_optional(pool)
+        .await?;
+        match exact {
+            Some(exact) => {
+                let mut conn = pool.acquire().await?;
+                verified_container(&mut conn, &mark.tenant_id, &exact)
+                    .await?
+                    .map(|_| Sha256::digest(&exact).to_vec())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let done = sqlx::query(
         "INSERT INTO v2_grant_quarantine
-             (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
-         SELECT ?1, ?2, ?3, ?4, 'container_mismatch', ?5
+             (kind, server_instance_id, tenant_id, replay_id, reason, created_at,
+              container_sha256)
+         SELECT ?1, ?2, ?3, ?4, 'container_mismatch', ?5, ?6
           WHERE NOT EXISTS (SELECT 1 FROM v2_grant_quarantine
                              WHERE kind = ?1 AND server_instance_id = ?2
                                AND tenant_id = ?3 AND replay_id = ?4)",
@@ -58,6 +90,7 @@ pub async fn record(pool: &SqlitePool, mark: &Mark) -> sqlx::Result<bool> {
     .bind(mark.tenant_id.as_slice())
     .bind(mark.replay_id.as_slice())
     .bind(util::now_rfc3339())
+    .bind(container_sha256)
     .execute(pool)
     .await?;
     let new = done.rows_affected() == 1;
@@ -82,5 +115,23 @@ pub async fn holds(conn: &mut SqliteConnection, mark: &Mark) -> sqlx::Result<boo
     .bind(mark.tenant_id.as_slice())
     .bind(mark.replay_id.as_slice())
     .fetch_one(conn)
+    .await
+}
+
+/// The container hash recorded with `mark`'s quarantine: `None` if it is not
+/// quarantined, `Some(None)` if no hash was recorded.
+pub async fn recorded_container_sha256(
+    conn: &mut SqliteConnection,
+    mark: &Mark,
+) -> sqlx::Result<Option<Option<Vec<u8>>>> {
+    sqlx::query_scalar(
+        "SELECT container_sha256 FROM v2_grant_quarantine
+          WHERE kind = ? AND server_instance_id = ? AND tenant_id = ? AND replay_id = ?",
+    )
+    .bind(mark.kind.as_str())
+    .bind(mark.server_instance_id.as_slice())
+    .bind(mark.tenant_id.as_slice())
+    .bind(mark.replay_id.as_slice())
+    .fetch_optional(conn)
     .await
 }

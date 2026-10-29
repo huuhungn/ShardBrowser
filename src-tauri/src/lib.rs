@@ -4762,7 +4762,7 @@ pub fn run() {
             }
 
             // Before the first write: state lives on local NTFS only (ADR 0002
-            // Q-29, plan L2335).
+            // Q-30, plan L2335).
             if let Err(refusal) = store::require_local_ntfs_roots() {
                 refuse_to_start(&refusal.to_string());
             }

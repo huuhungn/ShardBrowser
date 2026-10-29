@@ -50,9 +50,9 @@ pub async fn open_pool(cfg: &Config) -> anyhow::Result<SqlitePool> {
 
 /// The database and blobs must be on a local disk: SQLite locking is not
 /// reliable on network filesystems, and the plan rejects them (L1110, L2061,
-/// L2335). On Windows only local NTFS passes (ADR 0002 Q-29); elsewhere the
+/// L2335). On Windows only local NTFS passes (ADR 0002 Q-30); elsewhere the
 /// mount allowlist in `identity::is_network_path` is the whole check.
-fn refuse_network_storage(cfg: &Config) -> anyhow::Result<()> {
+pub(crate) fn refuse_network_storage(cfg: &Config) -> anyhow::Result<()> {
     let db_dir = std::path::Path::new(&cfg.db_path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

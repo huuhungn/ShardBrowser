@@ -94,7 +94,7 @@ jobs:
             sdks/rust/target
           key: windows-rust-${{ hashFiles('shared/Cargo.lock', 'server/Cargo.lock', 'src-tauri/Cargo.lock', 'sdks/rust/Cargo.lock') }}
 
-      # The supported-filesystem gate (ADR 0002 Q-29) must refuse an SMB
+      # The supported-filesystem gate (ADR 0002 Q-30) must refuse an SMB
       # share. The runner is elevated, so it shares an empty directory; the
       # volume tests of all three crates read SHARDX_TEST_SMB_DIR and only
       # query the share, never write to it.

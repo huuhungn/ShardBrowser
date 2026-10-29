@@ -82,6 +82,12 @@ pub fn hex(bytes: &[u8]) -> String {
 /// data directory nor inside or around it, because the data directory is in
 /// the DB backup and rollback scope the record must stay out of.
 pub fn preflight(identity_dir: &str, data_dir: &str) -> Result<PathBuf, String> {
+    if identity_dir.is_empty() {
+        return Err(
+            "SHARDX_IDENTITY_DIR is set but empty; set it to the identity directory or remove it"
+                .into(),
+        );
+    }
     let identity = std::fs::canonicalize(identity_dir)
         .map_err(|e| format!("SHARDX_IDENTITY_DIR {identity_dir:?}: {e}"))?;
     if !identity.is_dir() {
@@ -95,6 +101,14 @@ pub fn preflight(identity_dir: &str, data_dir: &str) -> Result<PathBuf, String> 
         return Err(
             "SHARDX_IDENTITY_DIR must not equal, contain or sit inside SHARDX_DATA_DIR".into(),
         );
+    }
+    // The record holds the external epoch authority, so its directory meets the
+    // data directory's filesystem rule (ADR 0002 Q-30). Off Windows this
+    // accepts every path and the mount allowlist below is the whole check.
+    if let Err(refusal) = shared::volume::require_local_ntfs(&identity) {
+        return Err(format!(
+            "SHARDX_IDENTITY_DIR {identity_dir:?} {refusal}, which is not supported"
+        ));
     }
     if is_network_path(&identity) {
         return Err("SHARDX_IDENTITY_DIR is on a network share, which is not supported".into());
@@ -184,6 +198,37 @@ pub(crate) fn is_network_path(_path: &Path) -> bool {
 /// same as any other entry that is not a valid record: it could point back
 /// into the data directory's rollback scope, which preflight keeps the
 /// directory out of (S1).
+/// Whether the entry is a symbolic link or, on Windows, any reparse point
+/// (junction, mount point, ...).
+pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// `path` is a regular file (a directory when `dir`), is not a link or reparse
+/// point, and is on local NTFS (ADR 0002 Q-30): the identity directory's own
+/// gate covers the directory, not the entries a link could point elsewhere.
+pub(crate) fn require_plain(path: &Path, dir: bool) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if is_link(&meta) {
+        return Err(format!("{} is a link or reparse point", path.display()));
+    }
+    if !(if dir { meta.is_dir() } else { meta.is_file() }) {
+        let want = if dir { "directory" } else { "regular file" };
+        return Err(format!("{} is not a {want}", path.display()));
+    }
+    shared::volume::require_local_ntfs(path)
+        .map_err(|refusal| format!("{} {refusal}, which is not supported", path.display()))
+}
+
 pub(crate) fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Refusal> {
     let path = dir.join(RECORD_FILE);
     let unreadable = |e: std::io::Error| {
@@ -208,9 +253,9 @@ pub(crate) fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Re
         }
         Err(e) => return Err(unreadable(e)),
     };
-    if !entry.file_type().is_file() {
-        return Err(not_regular());
-    }
+    // The one gate for a link, a reparse point, another kind of entry and
+    // another volume; the handle is compared with this entry below.
+    require_plain(&path, false).map_err(|e| refuse(ReasonCode::Corrupt, e))?;
     let file = open_no_follow(&path).map_err(unreadable)?;
     // Checked again on the open handle, so a swap after the first check fails.
     let opened = file.metadata().map_err(unreadable)?;
@@ -317,7 +362,17 @@ pub fn authority(cfg: &Config, mirror: Option<&Mirror>) -> Authority {
             "SHARDX_IDENTITY_DIR is not set",
         ));
     };
-    let dir = preflight(dir, &cfg.data_dir).map_err(|e| refuse(ReasonCode::Missing, e))?;
+    // A directory that is not there is a missing authority; one that is there
+    // but fails its preflight (wrong volume, overlapping the data directory)
+    // is not trusted, which is not the same as missing.
+    let dir = preflight(dir, &cfg.data_dir).map_err(|e| {
+        let code = if Path::new(dir).exists() {
+            ReasonCode::Corrupt
+        } else {
+            ReasonCode::Missing
+        };
+        refuse(code, e)
+    })?;
     let (record, sha256) = read_record(&dir)?;
     let verified = reconcile(&record, sha256, mirror)?;
     // K3 needs no preparation manifest at all (ADR 0002 D-1): while one
@@ -530,20 +585,24 @@ pub async fn read_mirror_read_only(cfg: &Config) -> anyhow::Result<Option<Mirror
 /// Read-only; returns whether it verified.
 pub async fn show(cfg: &Config) -> anyhow::Result<bool> {
     let mirror = read_mirror_read_only(cfg).await?;
-    match authority(cfg, mirror.as_ref()) {
+    let verified = match authority(cfg, mirror.as_ref()) {
         Ok(v) => {
             println!("status=OK");
             println!("server_instance_id={}", hex(&v.server_instance_id));
             println!("restore_epoch={}", v.restore_epoch);
             println!("external_record_sha256={}", hex(&v.external_record_sha256));
-            Ok(true)
+            true
         }
         Err(r) => {
             println!("status={}", r.code.as_str());
             println!("reason={}", r.detail);
-            Ok(false)
+            false
         }
-    }
+    };
+    // The K2 incident output (ADR 0002 D-1): the class and the failed audit
+    // writes of a read-only server. A class that cannot be read is not shown.
+    crate::restore::print_incident(cfg).await;
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -629,6 +688,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// G2-49: an identity directory on an SMB share fails closed before the
+    /// record is read. CI names a share it created in `SHARDX_TEST_SMB_DIR`;
+    /// elsewhere the loopback administrative share of the temporary directory
+    /// is tried, as in the data-directory test in `db.rs`.
+    #[cfg(windows)]
+    #[test]
+    fn preflight_refuses_an_identity_directory_on_an_smb_share() {
+        let share = match std::env::var_os("SHARDX_TEST_SMB_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => {
+                let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+                let local = temp.to_string_lossy().into_owned();
+                let (drive, tail) = local.trim_start_matches(r"\\?\").split_once(":\\").unwrap();
+                std::path::PathBuf::from(format!(r"\\localhost\{drive}$\{tail}"))
+            }
+        };
+        if !share.exists() {
+            assert!(
+                std::env::var_os("SHARDX_TEST_SMB_DIR").is_none(),
+                "SHARDX_TEST_SMB_DIR {share:?} is not reachable"
+            );
+            eprintln!("SKIPPED preflight_refuses_an_identity_directory_on_an_smb_share: no reachable SMB share");
+            return;
+        }
+        let data =
+            std::env::temp_dir().join(format!("shardx-preflight-smb-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let share = share.to_string_lossy().into_owned();
+        let err = preflight(&share, &data.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_dir_all(&data);
+        // The volume gate names the directory; the mount check alone does not.
+        assert!(
+            err.contains("network share") && err.contains("SHARDX_IDENTITY_DIR \""),
+            "{err}"
+        );
+    }
+
     #[test]
     fn mount_fields_are_unescaped() {
         assert_eq!(unescape_mount(r"/mnt/a\040b"), "/mnt/a b");
@@ -689,6 +785,54 @@ grpcfuse /host fakeowner rw 0 0
         write_record(&dir, b"ours").unwrap();
         assert_eq!(std::fs::read(dir.join(RECORD_FILE)).unwrap(), b"ours");
         assert!(!dir.join(TMP_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L5: an entry of the identity directory must be a plain file or
+    /// directory of the kind asked for, never a link or reparse point.
+    #[test]
+    fn only_plain_entries_of_the_identity_directory_are_read() {
+        let dir = std::env::temp_dir().join(format!("shardx-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        assert_eq!(require_plain(&dir.join("file"), false), Ok(()));
+        assert_eq!(require_plain(&dir.join("sub"), true), Ok(()));
+        assert!(require_plain(&dir.join("file"), true)
+            .unwrap_err()
+            .contains("not a directory"));
+        assert!(require_plain(&dir.join("sub"), false)
+            .unwrap_err()
+            .contains("not a regular file"));
+        assert!(require_plain(&dir.join("absent"), false).is_err());
+
+        // A junction (Windows) or symbolic link (elsewhere) to a directory.
+        let link = dir.join("link");
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(dir.join("sub"))
+            .output()
+            .unwrap()
+            .status
+            .success();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(dir.join("sub"), &link).is_ok();
+        assert!(made, "the test could not make a link");
+        assert!(require_plain(&link, true)
+            .unwrap_err()
+            .contains("link or reparse point"));
+        assert!(is_link(&std::fs::symlink_metadata(&link).unwrap()));
+        assert!(!is_link(
+            &std::fs::symlink_metadata(dir.join("sub")).unwrap()
+        ));
+        // The link, not its target, goes.
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+        assert!(dir.join("sub").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

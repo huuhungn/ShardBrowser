@@ -17,9 +17,9 @@ use shared::signing::{Ed25519VerifyingKey, SIGNATURE_SUITE_ID_ED25519 as SIGNING
 use sqlx::{Row, SqlitePool};
 
 use crate::error::AppError;
-use crate::identity::{ReasonCode, Refusal, Verified};
+use crate::identity::{hex, ReasonCode, Refusal, Verified};
 use crate::quarantine::{self, Kind, Mark};
-use crate::routes::{v2_approval, v2_capability, v2_fleet, v2_root_grants};
+use crate::routes::{v2_approval, v2_capability, v2_device_revoke, v2_fleet, v2_root_grants};
 use crate::util;
 
 /// Why a device's stored keys cannot be trusted.
@@ -71,18 +71,37 @@ pub struct Report {
     pub guards_created: usize,
     pub guards_to_recovery: usize,
     pub quarantined_grants: usize,
+    /// Device revocations that are not served correctly right now: rows of
+    /// another server instance, rows that fail their signed container, and
+    /// quarantine marks whose row is gone, each described with its tenant and
+    /// replay ID. A revocation left out of the checks would let a revoked
+    /// device pass as live, so any of them turns v2 off until the row is put
+    /// back and the server restarted.
+    pub untrusted_revocations: Vec<String>,
+    /// Marked before, intact now: served again, the mark kept as history.
+    pub revocations_served_again: usize,
     pub foreign_key_violations: usize,
 }
 
 impl Report {
     /// The refusal that turns v2 writes off, if the pass found one.
     pub fn refusal(&self) -> Option<Refusal> {
-        (self.foreign_key_violations > 0).then(|| Refusal {
-            code: ReasonCode::ControlPlaneIntegrityUntrusted,
-            detail: format!(
+        let detail = if let Some(first) = self.untrusted_revocations.first() {
+            format!(
+                "{first} ({} untrusted device revocation(s) in all)",
+                self.untrusted_revocations.len()
+            )
+        } else if self.foreign_key_violations > 0 {
+            format!(
                 "{} foreign-key violation(s) in the control plane",
                 self.foreign_key_violations
-            ),
+            )
+        } else {
+            return None;
+        };
+        Some(Refusal {
+            code: ReasonCode::ControlPlaneIntegrityUntrusted,
+            detail,
         })
     }
 }
@@ -94,7 +113,11 @@ pub async fn run(pool: &SqlitePool, identity: &Verified) -> Result<Report> {
     };
     report.guards_created = create_missing_guards(pool, &identity.server_instance_id).await?;
     report.guards_to_recovery = reconcile_guards(pool).await?;
-    report.quarantined_grants = quarantine_bad_grants(pool, identity).await?;
+    (
+        report.quarantined_grants,
+        report.untrusted_revocations,
+        report.revocations_served_again,
+    ) = quarantine_bad_grants(pool, identity).await?;
     report.foreign_key_violations = sqlx::query("SELECT 1 FROM pragma_foreign_key_check")
         .fetch_all(pool)
         .await?
@@ -200,10 +223,14 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
 }
 
 /// Quarantines every root, capability and fleet key grant and every device
-/// approval of this instance whose row disagrees with its signed container,
-/// through the same checks every request path uses. Returns how many it newly
-/// quarantined.
-async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
+/// approval and revocation of this instance whose row disagrees with its
+/// signed container, through the same checks every request path uses. Returns
+/// how many it newly quarantined, which device revocations are not served
+/// correctly now, and how many marked ones verify again.
+async fn quarantine_bad_grants(
+    pool: &SqlitePool,
+    v: &Verified,
+) -> Result<(usize, Vec<String>, usize)> {
     let instance = v.server_instance_id;
     let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
         row.get::<Vec<u8>, _>(col)
@@ -302,7 +329,35 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
             Err(e) => anyhow::bail!("checking a device approval failed: {e:?}"),
         }
     }
-    Ok(quarantined)
+    // Every row, whatever its instance: a revocation moved to another
+    // instance would otherwise drop out of every check.
+    let mut conn = pool.acquire().await?;
+    let found = v2_device_revoke::look_at_revocations(&mut conn, &instance, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("checking the device revocations failed: {e:?}"))?;
+    drop(conn);
+    for u in &found.unserved {
+        if u.why == v2_device_revoke::Why::Mismatch {
+            // The revocation is untrusted either way; a mark that cannot be
+            // written (its tenant may be gone) must not hide which one.
+            match quarantine::record(pool, &u.mark).await {
+                Ok(new) => quarantined += usize::from(new),
+                Err(e) => tracing::warn!("a device revocation mark could not be recorded: {e}"),
+            }
+        }
+    }
+    for mark in &found.served_again {
+        tracing::warn!(
+            tenant = hex(&mark.tenant_id),
+            replay = hex(&mark.replay_id),
+            "a quarantined device revocation verifies again and is served; its mark stays"
+        );
+    }
+    Ok((
+        quarantined,
+        found.unserved.iter().map(|u| u.describe()).collect(),
+        found.served_again.len(),
+    ))
 }
 
 /// Gives every tenant of this instance a guard. A missing guard is not proof
@@ -718,5 +773,32 @@ mod tests {
             report.refusal().map(|r| r.code.as_str()),
             Some("CONTROL_PLANE_INTEGRITY_UNTRUSTED")
         );
+    }
+
+    /// N1: the refusal names which revocation, why, and what clears it.
+    #[test]
+    fn the_revocation_refusal_names_the_row_and_what_clears_it() {
+        let report = Report {
+            untrusted_revocations: vec![
+                "device revocation 90 of tenant 41 does not match its signed container; restoring the row and restarting clears it"
+                    .into(),
+                "device revocation 91 of tenant 41 belongs to another server instance; restoring the row and restarting clears it"
+                    .into(),
+            ],
+            ..Report::default()
+        };
+        let refusal = report.refusal().unwrap();
+        assert_eq!(refusal.code.as_str(), "CONTROL_PLANE_INTEGRITY_UNTRUSTED");
+        assert!(refusal.detail.contains("device revocation 90 of tenant 41"));
+        assert!(refusal
+            .detail
+            .contains("restoring the row and restarting clears it"));
+        assert!(refusal.detail.contains("2 untrusted device revocation(s)"));
+        // Marks that verify again are history, not a refusal.
+        let again = Report {
+            revocations_served_again: 3,
+            ..Report::default()
+        };
+        assert!(again.refusal().is_none());
     }
 }

@@ -197,7 +197,10 @@ fn ledger(kind: &str, status: &str) -> String {
 /// The root self-grant's quarantine, recorded as `kind`.
 fn quarantined(kind: &str) -> String {
     format!(
-        "INSERT INTO v2_grant_quarantine VALUES ('{kind}', {I}, {T},          x'61616161616161616161616161616161', 'container_mismatch', 't')"
+        "INSERT INTO v2_grant_quarantine \
+         (kind, server_instance_id, tenant_id, replay_id, reason, created_at) \
+         VALUES ('{kind}', {I}, {T}, x'61616161616161616161616161616161', \
+                 'container_mismatch', 't')"
     )
 }
 
@@ -321,6 +324,18 @@ fn guard(version: i64) -> (String, String, &'static str) {
               WHERE operation_kind = 'LOCAL_UNBIND'"
                 .into(),
             "a ledger row is superseded once, by the next restore epoch",
+        ),
+        // The rebuilt quarantine takes device revocations and is still kept.
+        32 => (
+            quarantined("device_revocation"),
+            "DELETE FROM v2_grant_quarantine".into(),
+            "a grant quarantine is never removed",
+        ),
+        // A column is added in place: the quarantine is still kept.
+        33 => (
+            quarantined("device_revocation"),
+            "UPDATE v2_grant_quarantine SET created_at = 'u'".into(),
+            "a grant quarantine never changes",
         ),
         _ => unreachable!("no guard for {version}"),
     }
@@ -1366,4 +1381,123 @@ async fn fixtures_1_to_4_hold_on_a_populated_0016_file_after_its_upgrade() {
     let pool = reopen(pool, &dir.db()).await;
     run_migrations(&pool).await.unwrap();
     fixtures_on(pool, &dir.db(), "0016 world upgraded").await;
+}
+
+#[tokio::test]
+async fn m0032_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_device_revocations() {
+    let pool = upgrade(32).await;
+    for kind in ["device_approval", "unknown_kind"] {
+        let e = exec(&pool, &quarantined(kind)).await;
+        assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
+    }
+    let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
+    assert!(e.contains("a grant is quarantined once"), "{e}");
+
+    // The rebuild keeps the rows and all three triggers: a quarantine is
+    // never changed or removed afterwards.
+    let before = world_before(32).await;
+    exec(&before, &quarantined("device_approval"))
+        .await
+        .unwrap();
+    let triggers = |pool: SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'trigger' AND tbl_name = 'v2_grant_quarantine' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let kept = triggers(before.clone()).await;
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM v2_grant_quarantine")
+            .fetch_one(&before)
+            .await
+            .unwrap()
+    };
+    let rows = count().await;
+    assert!(rows >= 1);
+    migrate_to(&before, 32).await;
+    assert_eq!(triggers(before.clone()).await, kept);
+    assert_eq!(count().await, rows);
+    let e = exec(&before, "UPDATE v2_grant_quarantine SET created_at = 'u'")
+        .await
+        .unwrap_err();
+    assert!(e.contains("a grant quarantine never changes"), "{e}");
+    let e = exec(&before, "DELETE FROM v2_grant_quarantine")
+        .await
+        .unwrap_err();
+    assert!(e.contains("a grant quarantine is never removed"), "{e}");
+}
+
+/// 0033 adds the container hash to the quarantine in place: rows and all three
+/// triggers stay, old rows have no hash (never served again), the hash is 32
+/// bytes or none, and a mark still never changes or goes.
+#[tokio::test]
+async fn m0033_the_quarantine_gains_a_container_hash_and_stays_append_only() {
+    let pool = upgrade(33).await;
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('v2_grant_quarantine')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(columns.last().map(String::as_str), Some("container_sha256"));
+
+    let before = world_before(33).await;
+    exec(&before, &quarantined("device_revocation"))
+        .await
+        .unwrap();
+    let triggers = |pool: SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'trigger' AND tbl_name = 'v2_grant_quarantine' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let kept = triggers(before.clone()).await;
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM v2_grant_quarantine")
+        .fetch_one(&before)
+        .await
+        .unwrap();
+    migrate_to(&before, 33).await;
+    assert_eq!(triggers(before.clone()).await, kept);
+    let old: Vec<Option<Vec<u8>>> =
+        sqlx::query_scalar("SELECT container_sha256 FROM v2_grant_quarantine")
+            .fetch_all(&before)
+            .await
+            .unwrap();
+    assert_eq!(old.len() as i64, rows);
+    assert!(old.iter().all(Option::is_none), "{old:?}");
+
+    // A hash is 32 bytes.
+    let with = |hash: &str| {
+        format!(
+            "INSERT INTO v2_grant_quarantine
+                 (kind, server_instance_id, tenant_id, replay_id, reason, created_at,
+                  container_sha256)
+             VALUES ('device_revocation', {I}, {T}, x'62626262626262626262626262626262',
+                     'container_mismatch', 't', {hash})"
+        )
+    };
+    let e = exec(&before, &with("x'00'")).await.unwrap_err();
+    assert!(e.contains("CHECK constraint failed"), "{e}");
+    exec(&before, &with(&format!("x'{}'", "ab".repeat(32))))
+        .await
+        .unwrap();
+    // And it never changes or goes with its mark.
+    let e = exec(
+        &before,
+        "UPDATE v2_grant_quarantine SET container_sha256 = NULL",
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("a grant quarantine never changes"), "{e}");
+    let e = exec(&before, "DELETE FROM v2_grant_quarantine")
+        .await
+        .unwrap_err();
+    assert!(e.contains("a grant quarantine is never removed"), "{e}");
 }

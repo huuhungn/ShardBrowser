@@ -611,7 +611,7 @@ pub(super) enum Col {
 
 type Query<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 
-fn bind<'q>(q: Query<'q>, col: &'q Col) -> Query<'q> {
+pub(super) fn bind<'q>(q: Query<'q>, col: &'q Col) -> Query<'q> {
     match col {
         Col::Blob(b) => q.bind(b.as_slice()),
         Col::Int(n) => q.bind(*n),
