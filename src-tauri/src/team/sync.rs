@@ -1413,7 +1413,8 @@ fn verified_key(
 // ---------------------------------------------------------------- push ----
 
 /// Pushes the published profile `local` from `udd`, resuming whatever
-/// operation an earlier attempt left (plan L1137-L1215).
+/// operation an earlier attempt left (plan L1137-L1215). `clock` is the time
+/// since the push began, which decides when the lease is renewed.
 pub(crate) async fn push(
     client: &FleetClient,
     access: &str,
@@ -1421,6 +1422,7 @@ pub(crate) async fn push(
     local: &str,
     udd: &Path,
     now: u64,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
     loop {
@@ -1461,7 +1463,7 @@ pub(crate) async fn push(
         match s.state.as_str() {
             "OPEN" => {
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
-                    transfer(client, access, &mut db, &b, lease, &commit_op, &s).await?;
+                    transfer(client, access, &mut db, &b, lease, &commit_op, &s, clock).await?;
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
@@ -2191,7 +2193,9 @@ async fn fail_upload(
 }
 
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
-/// a guessed one; an offset conflict asks `HEAD` again.
+/// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
+/// once a third of its TTL has passed on `clock`.
+#[allow(clippy::too_many_arguments)]
 async fn transfer(
     client: &FleetClient,
     access: &str,
@@ -2200,11 +2204,12 @@ async fn transfer(
     lease: LeaseRef,
     commit_op: &Op,
     s: &Session,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<()> {
     stored(db, b, commit_op)?;
     let object = std::fs::read(spool(&s.spool)?)?;
     let upload = decode_hex16(&s.upload, "upload_id")?;
-    let mut renewed = std::time::Instant::now();
+    let mut renewed = clock();
     for _ in 0..3 {
         let reply = client.upload_head(access, &upload).await?;
         if terminal(reply.status) {
@@ -2226,10 +2231,10 @@ async fn transfer(
             if at == s.size {
                 return Ok(());
             }
-            if renewed.elapsed().as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
+            if clock().saturating_sub(renewed).as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
                 let expires = renew(client, access, b, lease).await?;
                 keep_expiry(&db.conn, &b.local, &lease, expires)?;
-                renewed = std::time::Instant::now();
+                renewed = clock();
             }
             let end = (at + CHUNK as u64).min(s.size);
             let chunk = &object[at as usize..end as usize];
@@ -3198,6 +3203,8 @@ mod tests {
         commits: usize,
         /// The `expires_at_ms` a checkout grants, when not `NOW` + TTL.
         expires: Option<u64>,
+        /// The `expires_at_ms` a renewal grants, when not `T0`.
+        renewed: Option<u64>,
         /// Other profiles the list reports after `PROFILE`.
         others: Vec<FleetProfileHeadV2>,
         /// Restore-epoch transitions and proofs, by path after
@@ -3483,7 +3490,7 @@ mod tests {
                     let out = LeaseRenewedV2 {
                         profile: r.profile,
                         lease: r.lease,
-                        expires_at_ms: T0,
+                        expires_at_ms: self.renewed.unwrap_or(T0),
                     };
                     reply(200, &[], out.encode())
                 }
@@ -3852,8 +3859,15 @@ mod tests {
         }
 
         fn push(&self) -> Result<Pushed> {
-            self.rt
-                .block_on(push(&self.client, "t", &self.dev, LOCAL, &self.udd, NOW))
+            self.rt.block_on(push(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                &self.udd,
+                NOW,
+                &|| std::time::Duration::ZERO,
+            ))
         }
 
         /// Publishes `LOCAL` as `PROFILE`, labelled "Work profile".
@@ -4590,6 +4604,57 @@ mod tests {
         let err = w.publish_by(&w.dev, [8; 16], PROFILE, "Work").unwrap_err();
         assert!(has(&err, "sync.publishPendingElsewhere"), "{err:#}");
         assert_eq!(w.sent("POST", "/profiles").len(), 1);
+    }
+
+    /// WP-12: a lease renewed mid-upload keeps the expiry the server granted.
+    /// The clock jumps past a third of the TTL at every look, so each chunk
+    /// renews; the binding's `lease_expires_at` is read each time the clock
+    /// is, and moves from the checkout's grant to the renewal's.
+    #[test]
+    fn a_renewed_lease_moves_the_bindings_expiry_forward() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let w = world();
+        let (granted, renewed) = (NOW + 300_000, NOW + 900_000);
+        w.fake().renewed = Some(renewed);
+        let at = |ms: u64| -> String {
+            w.db()
+                .conn
+                .query_row(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')",
+                    [ms as i64],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let looks = AtomicU64::new(0);
+        let seen = Mutex::new(Vec::new());
+        let clock = || {
+            let n = looks.fetch_add(1, Ordering::SeqCst);
+            let held: Option<String> = w
+                .db()
+                .conn
+                .query_row(
+                    "SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = ?1",
+                    [LOCAL],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            seen.lock().unwrap().push(held);
+            std::time::Duration::from_secs(n * 1000)
+        };
+        w.rt.block_on(push(&w.client, "t", &w.dev, LOCAL, &w.udd, NOW, &clock))
+            .unwrap();
+        assert!(w.sent("POST", "/renew").len() >= 2);
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen[0], Some(at(granted)), "before any renewal");
+        assert!(
+            seen.contains(&Some(at(renewed))),
+            "a renewal moved the expiry forward: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&Some(at(T0))),
+            "never to the stale one: {seen:?}"
+        );
     }
 
     /// WP-11: a server epoch ahead of the accepted one is where a new profile

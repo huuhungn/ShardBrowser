@@ -129,6 +129,7 @@ pub async fn profile_sync_push(
     }
     if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
         let (client, session, dev) = published_session(&c, username, password).await?;
+        let started = std::time::Instant::now();
         let pushed = team::sync::push(
             &client,
             &session.access_token,
@@ -136,6 +137,7 @@ pub async fn profile_sync_push(
             &profile_id,
             &udd,
             now_ms(),
+            &|| started.elapsed(),
         )
         .await;
         client.end_session(&session.access_token).await;
