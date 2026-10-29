@@ -151,8 +151,8 @@ fn row(
 /// The `server_origins` row of `server_url`, from the URL parser (L2032),
 /// filed on first use for `instance` at `epoch`. An origin filed for another
 /// instance is refused: what was kept under the old one never moves.
-// shortcut: `last_restore_epoch` is the epoch of the first record kept here;
-// WP-4 moves it with accepted restore epoch transitions.
+/// Its `last_restore_epoch` starts at the epoch of the first record kept
+/// here and moves with each accepted restore epoch transition.
 pub(crate) fn origin(
     conn: &Connection,
     server_url: &str,
@@ -700,6 +700,14 @@ mod tests {
                  INSERT INTO restore_epoch_binding_proofs VALUES ('{server}', '{i}', '{i}', 0, 1,
                    '{i}', {h}, {h}, 0, 1000000, x'01', {h}, {h}, x'01', {h}, 't');"
             ))
+            .unwrap();
+        // The ranges are probed by rewriting rows that are write-once in use;
+        // `db` tests those triggers.
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER restore_epoch_transitions_fixed;
+                 DROP TRIGGER restore_epoch_binding_proofs_fixed;",
+            )
             .unwrap();
         let max = i64::MAX;
         let u32_max = i64::from(u32::MAX);

@@ -1072,6 +1072,27 @@ impl FleetClient {
         self.post_exact(&path, access_token, request).await
     }
 
+    /// The exact signed `previous -> new` restore-epoch transition of
+    /// `tenant_id` or, with `profile_id`, that profile's exact inclusion
+    /// proof under it (L1131).
+    pub async fn restore_epoch_transition(
+        &self,
+        access_token: &str,
+        tenant_id: &[u8; 16],
+        (previous, new): (u64, u64),
+        profile_id: Option<&[u8; 16]>,
+    ) -> Result<Exact> {
+        let mut path = format!(
+            "/v2/recovery/restore-epoch-transitions/{}/{previous}/{new}",
+            hex(tenant_id)
+        );
+        if let Some(p) = profile_id {
+            path = format!("{path}/proofs/{}", hex(p));
+        }
+        self.exact(self.http.get(self.url(&path)), access_token)
+            .await
+    }
+
     /// The exact signed manifest of a committed version (L1153).
     pub async fn snapshot_manifest(
         &self,
