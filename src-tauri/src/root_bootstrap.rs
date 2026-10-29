@@ -60,7 +60,7 @@ const _: () = assert!(VALIDITY_MS <= shardx_core::approval_receipt::MAX_DEVICE_A
 // (owner-only on Unix) and in plain `String`s that are not zeroized. It is
 // cleared once the generation is active: the device reopens its self-grant
 // with its HPKE key, and the recovery bundle holds it. Keeping it in the OS
-// store instead waits for the fallback key file (G2-48).
+// store instead (or the key file, once open; G2-48) is not done yet.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct BootstrapState {
     #[serde(default)]

@@ -1,4 +1,4 @@
-//! The supported-filesystem gate (ADR 0002 Q-29, plan L1110, L2335): state
+//! The supported-filesystem gate (ADR 0002 Q-30, plan L1110, L2335): state
 //! lives only on a local NTFS volume. A UNC path, a mapped or substituted
 //! network drive, and a FAT32, exFAT, ReFS or any other volume are refused,
 //! because the durability and SQLite locking evidence (G2-49, G2-50) holds

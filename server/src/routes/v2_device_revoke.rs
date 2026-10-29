@@ -7,9 +7,6 @@
 //!
 //! shortcut: the optional activations C-1 lets a revocation carry are
 //! refused by the request codec; accept them when the client sends any.
-//! shortcut: the trust evidence does not serve the filed revocations yet, so
-//! other clients learn of one only from the server's device state; add them to
-//! `v2_trust` with the client's sticky-revocation rule (W6).
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
