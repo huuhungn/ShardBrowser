@@ -1,7 +1,8 @@
 //! Plan 5.6.5 profile lease maps: the `PROFILE_PUBLISH_CREATE` (L948),
 //! `PROFILE_CHECKOUT` (L949), `CREATE_UPLOAD` (L950) and `RELEASE_LEASE`
 //! (L952) payloads, their stored response payloads and the `FINALIZE_UPLOAD`
-//! response (L951), and the lease renew map of L1139/L1143. The
+//! response (L951), the `LOCAL_UNBIND` maps (L953) with their ADR 0002 D-7
+//! tombstone, and the lease renew map of L1139/L1143. The
 //! `FINALIZE_UPLOAD` request wraps a commit request, so it is
 //! [`crate::snapshot_v2::FinalizeUploadV2`].
 //!
@@ -574,6 +575,195 @@ impl LeaseReleasedV2 {
     }
 }
 
+// ----------------------------------------------------------- LOCAL_UNBIND ---
+
+pub const DOMAIN_LOCAL_UNBIND_REQUEST: &str = "shardx.local.unbind-request.v2";
+pub const DOMAIN_LOCAL_UNBIND_RESPONSE: &str = "shardx.local.unbind-response.v2";
+/// Chosen here, like the lease record types above.
+pub const RECORD_TYPE_LOCAL_UNBOUND: &str = "LocalUnbindResponseV2";
+/// ADR 0002 D-7.
+pub const DOMAIN_LOCAL_BINDING_TOMBSTONE: &str = "shardx.local.binding-tombstone.v2";
+const L_LOCAL_BINDING_TOMBSTONE: &str = "SHARDX-LOCAL-BINDING-TOMBSTONE-V2\0";
+const UNBIND_OUTCOME_UNBOUND: &str = "unbound";
+/// L953 `server_id:Text(1,512)` and `local_profile_id:Text(1,255)`, in bytes.
+pub const MAX_SERVER_ID: usize = 512;
+pub const MAX_LOCAL_PROFILE_ID: usize = 255;
+
+fn take_text(f: &mut Fields, field: &'static str, max: usize) -> Result<String> {
+    let s = f.text(field)?;
+    if !(1..=max).contains(&s.len()) {
+        return Err(f.bad(field));
+    }
+    Ok(s)
+}
+
+/// The binding a local unbind names (L953): the same in its request, its
+/// response and its D-7 tombstone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnboundBinding {
+    pub server_id: String,
+    pub server_instance_id: [u8; 16],
+    pub restore_epoch: u64,
+    pub tenant_id: [u8; 16],
+    pub fleet_id: [u8; 16],
+    pub remote_profile_id: [u8; 16],
+    pub local_profile_id: String,
+    pub remote_version: u64,
+    /// Omitted iff `remote_version` is 0.
+    pub expected_signed_head_hash: Option<[u8; 32]>,
+}
+
+impl UnboundBinding {
+    fn take(f: &mut Fields) -> Result<Self> {
+        let b = Self {
+            server_id: take_text(f, "server_id", MAX_SERVER_ID)?,
+            server_instance_id: f.fixed("server_instance_id")?,
+            restore_epoch: f.uint("restore_epoch")?,
+            tenant_id: f.fixed("tenant_id")?,
+            fleet_id: f.fixed("fleet_id")?,
+            remote_profile_id: f.fixed("remote_profile_id")?,
+            local_profile_id: take_text(f, "local_profile_id", MAX_LOCAL_PROFILE_ID)?,
+            remote_version: f.uint("remote_version")?,
+            expected_signed_head_hash: f.opt_fixed("expected_signed_head_hash")?,
+        };
+        if b.expected_signed_head_hash.is_some() != (b.remote_version != 0) {
+            return Err(RecordError::BadValue("expected_signed_head_hash"));
+        }
+        Ok(b)
+    }
+
+    fn map(&self, domain: &'static str) -> Vec<(&'static str, Value)> {
+        let mut map = vec![
+            ("domain", c::t(domain)),
+            ("version", c::u(VERSION)),
+            ("server_id", c::t(&self.server_id)),
+            ("server_instance_id", c::b(&self.server_instance_id)),
+            ("restore_epoch", c::u(self.restore_epoch)),
+            ("tenant_id", c::b(&self.tenant_id)),
+            ("fleet_id", c::b(&self.fleet_id)),
+            ("remote_profile_id", c::b(&self.remote_profile_id)),
+            ("local_profile_id", c::t(&self.local_profile_id)),
+            ("remote_version", c::u(self.remote_version)),
+        ];
+        if let Some(h) = &self.expected_signed_head_hash {
+            map.push(("expected_signed_head_hash", c::b(h)));
+        }
+        map
+    }
+}
+
+/// The L953 request: delete the binding only with no lease and no pending
+/// operation, both required `true`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUnbindV2 {
+    pub binding: UnboundBinding,
+}
+
+impl LocalUnbindV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("LocalUnbindV2", payload)?;
+        exact_version(&mut f, DOMAIN_LOCAL_UNBIND_REQUEST)?;
+        let binding = UnboundBinding::take(&mut f)?;
+        for flag in ["require_no_lease", "require_no_pending_operation"] {
+            if f.req(flag)? != Value::Bool(true) {
+                return Err(RecordError::BadValue(flag));
+            }
+        }
+        f.finish()?;
+        Ok(Self { binding })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut map = self.binding.map(DOMAIN_LOCAL_UNBIND_REQUEST);
+        map.push(("require_no_lease", Value::Bool(true)));
+        map.push(("require_no_pending_operation", Value::Bool(true)));
+        c::encode(&c::m(map))
+    }
+}
+
+/// The L953 response, stored and replayed after the binding row is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalUnboundV2 {
+    pub binding: UnboundBinding,
+    pub binding_tombstone_sha256: [u8; 32],
+    pub completed_at_ms: u64,
+}
+
+impl LocalUnboundV2 {
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("LocalUnboundV2", payload)?;
+        exact_version(&mut f, DOMAIN_LOCAL_UNBIND_RESPONSE)?;
+        let binding = UnboundBinding::take(&mut f)?;
+        f.exact_text("unbind_outcome", UNBIND_OUTCOME_UNBOUND)?;
+        let binding_tombstone_sha256 = f.fixed("binding_tombstone_sha256")?;
+        let completed_at_ms = f.uint("completed_at_ms")?;
+        f.finish()?;
+        Ok(Self {
+            binding,
+            binding_tombstone_sha256,
+            completed_at_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut map = self.binding.map(DOMAIN_LOCAL_UNBIND_RESPONSE);
+        map.push(("unbind_outcome", c::t(UNBIND_OUTCOME_UNBOUND)));
+        map.push((
+            "binding_tombstone_sha256",
+            c::b(&self.binding_tombstone_sha256),
+        ));
+        map.push(("completed_at_ms", c::u(self.completed_at_ms)));
+        c::encode(&c::m(map))
+    }
+}
+
+/// ADR 0002 D-7 `LocalBindingTombstoneV2`, the `UNBIND` receipt: built from
+/// the request and response fields alone, so it is recomputed after the
+/// binding row is deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBindingTombstoneV2 {
+    pub binding: UnboundBinding,
+    pub unbind_idempotency_key: [u8; 16],
+    pub completed_at_ms: u64,
+}
+
+impl LocalBindingTombstoneV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut f = Fields::decode("LocalBindingTombstoneV2", bytes)?;
+        exact_version(&mut f, DOMAIN_LOCAL_BINDING_TOMBSTONE)?;
+        let binding = UnboundBinding::take(&mut f)?;
+        let unbind_idempotency_key = f.fixed("unbind_idempotency_key")?;
+        let completed_at_ms = f.uint("completed_at_ms")?;
+        f.finish()?;
+        Ok(Self {
+            binding,
+            unbind_idempotency_key,
+            completed_at_ms,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut map = self.binding.map(DOMAIN_LOCAL_BINDING_TOMBSTONE);
+        map.push(("unbind_idempotency_key", c::b(&self.unbind_idempotency_key)));
+        map.push(("completed_at_ms", c::u(self.completed_at_ms)));
+        c::encode(&c::m(map))
+    }
+
+    /// D-7 `binding_tombstone_sha256`.
+    pub fn hash(&self) -> [u8; 32] {
+        c::domain_hash(L_LOCAL_BINDING_TOMBSTONE, &self.encode())
+    }
+
+    /// The response this tombstone completes.
+    pub fn response(&self) -> LocalUnboundV2 {
+        LocalUnboundV2 {
+            binding: self.binding.clone(),
+            binding_tombstone_sha256: self.hash(),
+            completed_at_ms: self.completed_at_ms,
+        }
+    }
+}
+
 // ------------------------------------------------------------------ renew ---
 
 /// The renew request body (L1139): the held lease and a new TTL from now.
@@ -856,5 +1046,151 @@ mod tests {
         .encode();
         let bad = edit(&release, |e| set(e, "reason_code", c::t("expired")));
         assert!(ReleaseLeaseV2::parse(&bad).is_err());
+    }
+
+    fn unbound(remote_version: u64, head: Option<[u8; 32]>) -> UnboundBinding {
+        UnboundBinding {
+            server_id: "a1".repeat(16),
+            server_instance_id: [6; 16],
+            restore_epoch: 1,
+            tenant_id: P.tenant_id,
+            fleet_id: P.fleet_id,
+            remote_profile_id: P.profile_id,
+            local_profile_id: "local-profile".into(),
+            remote_version,
+            expected_signed_head_hash: head,
+        }
+    }
+
+    fn tombstone(remote_version: u64, head: Option<[u8; 32]>) -> LocalBindingTombstoneV2 {
+        LocalBindingTombstoneV2 {
+            binding: unbound(remote_version, head),
+            unbind_idempotency_key: [18; 16],
+            completed_at_ms: 1_800_000_000_000,
+        }
+    }
+
+    /// ADR 0002 D-7 vectors at `remote_version` 0 (head omitted) and 7, and
+    /// the tombstone hash as the length-prefixed domain hash of its bytes.
+    #[test]
+    fn the_unbind_maps_round_trip_and_pin_the_tombstone() {
+        let mut pinned = Vec::new();
+        for (version, head) in [(0, None), (7, Some([8; 32]))] {
+            let t = tombstone(version, head);
+            let bytes = t.encode();
+            assert_eq!(LocalBindingTombstoneV2::parse(&bytes).unwrap(), t);
+            let mut pre = L_LOCAL_BINDING_TOMBSTONE.as_bytes().to_vec();
+            pre.extend((bytes.len() as u32).to_be_bytes());
+            pre.extend(&bytes);
+            assert_eq!(t.hash(), c::sha256(&pre));
+            let r = LocalUnbindV2 {
+                binding: t.binding.clone(),
+            };
+            assert_eq!(LocalUnbindV2::parse(&r.encode()).unwrap(), r);
+            let resp = t.response();
+            assert_eq!(resp.binding_tombstone_sha256, t.hash());
+            assert_eq!(LocalUnboundV2::parse(&resp.encode()).unwrap(), resp);
+            pinned.push(hex(&c::sha256(&bytes)));
+            pinned.push(hex(&t.hash()));
+            pinned.push(hex(&c::sha256(&r.encode())));
+            pinned.push(hex(&c::sha256(&resp.encode())));
+        }
+        // Regression vectors pinned at this commit: per version, SHA-256 of
+        // the tombstone, its D-7 hash, SHA-256 of the request and response.
+        assert_eq!(
+            pinned,
+            [
+                "774ce58878b464ddb29e9f5f19b021d57dacc136e664d8c2531b36dd9f42116d",
+                "97ad1c4f2ebe14de0dfd925d3c5a034ee5a1f94cba3ebf3b9e0babdaa8f3eccf",
+                "117cd4389450afb4586b626f6f348f4937a1446a41c2e7287f5035af0fe58b09",
+                "9207be88e317e744c1db5d1c59b0327404100e3c33363f7fc8c381ad678f56ed",
+                "879440b49881303deb78f9c8f6942724dec17cb3dbc98c3132a699f33fd60bca",
+                "65af66e2f3560b5e2d631162783ed282c1aa4285329111659039f41f8afb1f44",
+                "cb67fc13ffbeae8c7342dd1d50c7071d789d324706268ae83d6d6077676a83b9",
+                "60f425b9ffae2a00d7d01679df6c4e584a6a453c77573804a27e0fe4a2df6c50",
+            ]
+        );
+        // The three maps are told apart by their domains.
+        let t = tombstone(0, None).encode();
+        assert!(LocalUnboundV2::parse(&t).is_err());
+        assert!(LocalUnbindV2::parse(&t).is_err());
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// D-7 negatives: a head at 0 or none at 7, a 256-byte local ID, an
+    /// empty server ID; and every closed-map refusal of the three maps.
+    #[test]
+    fn the_unbind_maps_refuse_what_l953_does_not_allow() {
+        let base = [
+            tombstone(7, Some([8; 32])).encode(),
+            LocalUnbindV2 {
+                binding: unbound(7, Some([8; 32])),
+            }
+            .encode(),
+            tombstone(7, Some([8; 32])).response().encode(),
+        ];
+        let parse = |i: usize, b: &[u8]| match i {
+            0 => LocalBindingTombstoneV2::parse(b).is_ok(),
+            1 => LocalUnbindV2::parse(b).is_ok(),
+            _ => LocalUnboundV2::parse(b).is_ok(),
+        };
+        for (i, bytes) in base.iter().enumerate() {
+            assert!(parse(i, bytes), "{i}");
+            for (field, v) in [
+                ("server_id", c::t("")),
+                ("server_id", c::t(&"s".repeat(MAX_SERVER_ID + 1))),
+                ("local_profile_id", c::t("")),
+                (
+                    "local_profile_id",
+                    c::t(&"l".repeat(MAX_LOCAL_PROFILE_ID + 1)),
+                ),
+                ("remote_version", c::u(0)),
+                ("version", c::u(3)),
+                ("server_instance_id", c::b(&[6; 15])),
+                ("remote_profile_id", c::t("profile")),
+                ("extra", c::u(1)),
+            ] {
+                let bad = edit(bytes, |e| set(e, field, v));
+                assert!(!parse(i, &bad), "{i} {field}");
+            }
+            for (field, max) in [
+                ("server_id", MAX_SERVER_ID),
+                ("local_profile_id", MAX_LOCAL_PROFILE_ID),
+            ] {
+                let ok = edit(bytes, |e| set(e, field, c::t(&"x".repeat(max))));
+                assert!(parse(i, &ok), "{i} {field} at its bound");
+            }
+            let timed = if i == 1 {
+                None
+            } else {
+                Some("completed_at_ms")
+            };
+            for field in ["expected_signed_head_hash", "tenant_id"]
+                .into_iter()
+                .chain(timed)
+            {
+                let gone = edit(bytes, |e| e.retain(|(k, _)| k != field));
+                assert!(!parse(i, &gone), "{i} without {field}");
+            }
+        }
+        let at_zero = edit(&tombstone(0, None).encode(), |e| {
+            set(e, "expected_signed_head_hash", c::b(&[8; 32]))
+        });
+        assert!(LocalBindingTombstoneV2::parse(&at_zero).is_err());
+        for (field, v) in [
+            ("require_no_lease", Value::Bool(false)),
+            ("require_no_pending_operation", Value::Bool(false)),
+            ("require_no_lease", c::u(1)),
+        ] {
+            let bad = edit(&base[1], |e| set(e, field, v));
+            assert!(LocalUnbindV2::parse(&bad).is_err(), "{field}");
+        }
+        let gone = edit(&base[1], |e| e.retain(|(k, _)| k != "require_no_lease"));
+        assert!(LocalUnbindV2::parse(&gone).is_err());
+        let bad = edit(&base[2], |e| set(e, "unbind_outcome", c::t("released")));
+        assert!(LocalUnboundV2::parse(&bad).is_err());
     }
 }

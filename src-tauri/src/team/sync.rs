@@ -42,8 +42,9 @@ use shardx_core::mutation::{
 };
 use shardx_core::profile_lease::{
     CreateUploadV2, LeaseOrigin, LeaseRef, LeaseReleasedV2, LeaseRenewV2, LeaseRenewedV2,
-    ProfileCheckoutV2, ProfileLeaseV2, ProfileRef, ReleaseLeaseV2, ReleaseReason, UploadCreatedV2,
-    UploadFinalizedV2, RECORD_TYPE_CHECKED_OUT, RECORD_TYPE_LEASE_RELEASED,
+    LocalBindingTombstoneV2, LocalUnbindV2, LocalUnboundV2, ProfileCheckoutV2, ProfileLeaseV2,
+    ProfileRef, ReleaseLeaseV2, ReleaseReason, UnboundBinding, UploadCreatedV2, UploadFinalizedV2,
+    RECORD_TYPE_CHECKED_OUT, RECORD_TYPE_LEASE_RELEASED, RECORD_TYPE_LOCAL_UNBOUND,
     RECORD_TYPE_UPLOAD_CREATED, RECORD_TYPE_UPLOAD_FINALIZED,
 };
 use shardx_core::signing::Ed25519SigningKey;
@@ -414,6 +415,7 @@ fn kind_of(kind: &str) -> Option<OperationKind> {
         "UPLOAD" => OperationKind::CreateUpload,
         "FINALIZE" => OperationKind::FinalizeUpload,
         "RELEASE" => OperationKind::ReleaseLease,
+        "UNBIND" => OperationKind::LocalUnbind,
         _ => return None,
     })
 }
@@ -509,6 +511,11 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
             OperationKind::ReleaseLease => {
                 let ok = ReleaseLeaseV2::parse(p).is_ok_and(|r| lease_is(&r.lease));
                 checks.push(("lease_id", ok));
+            }
+            OperationKind::LocalUnbind => {
+                let ok = LocalUnbindV2::parse(p)
+                    .is_ok_and(|u| text(&op.remote_profile, &u.binding.remote_profile_id));
+                checks.push(("remote_profile_id", ok));
             }
             _ => {}
         }
@@ -1642,6 +1649,187 @@ async fn release_reply(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+// -------------------------------------------------------------- unbind ----
+
+/// `LOCAL_UNBIND` of `local` at `now` (L953, L1143, L2239; ADR 0002 D-7),
+/// in the Launcher DB alone: no server is called (L934-L936). One
+/// transaction reads back that the binding holds no lease and has no pending
+/// operation, stores the completed `UNBIND` with its exact stored response
+/// and its tombstone receipt, and deletes the binding; its operations keep
+/// their bytes with `local_profile_id` set NULL (probe 1, L2036). Once the
+/// binding is gone, a retry returns the stored response again, after its
+/// tombstone recomputes from the stored request and response (L969-L970).
+/// `server_url` names the `server_id` the tombstone carries.
+// shortcut: no command calls this yet, as no product path files a binding;
+// the downgrade flow (L2232-L2239) adds the command with its UI.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>> {
+    let db = Db::open()?;
+    let tx =
+        rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?;
+    let is_bound: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
+        [local],
+        |r| r.get(0),
+    )?;
+    if !is_bound {
+        return unbound_reply(&db, local);
+    }
+    let b = bound(&db, local)?;
+    if b.lease.is_some() {
+        bail!(code("sync.unbindLeaseHeld"));
+    }
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM operations WHERE local_profile_id = ?1
+           AND state IN ('PENDING', 'RUNNING', 'AWAITING_RETRY'))",
+        [local],
+        |r| r.get(0),
+    )?;
+    if pending {
+        bail!(code("sync.unbindPending"));
+    }
+    let binding = UnboundBinding {
+        server_id: super::records::origin(&tx, server_url, &hex(&b.instance), wire(b.epoch)?)?,
+        server_instance_id: b.instance,
+        restore_epoch: b.epoch,
+        tenant_id: b.tenant,
+        fleet_id: b.fleet,
+        remote_profile_id: b.profile,
+        local_profile_id: b.local.clone(),
+        remote_version: b.version,
+        expected_signed_head_hash: b.head,
+    };
+    let kind = OperationKind::LocalUnbind;
+    let payload = LocalUnbindV2 {
+        binding: binding.clone(),
+    }
+    .encode();
+    let (key, exact, canonical) = mutation(kind, payload, &b)?;
+    let op_id = hex(&random::<16>()?);
+    insert_op(
+        &tx,
+        &b,
+        &op_id,
+        "UNBIND",
+        kind.scope(),
+        &key,
+        &canonical,
+        &exact,
+        &Columns::default(),
+    )?;
+    let tombstone = LocalBindingTombstoneV2 {
+        binding,
+        unbind_idempotency_key: key,
+        completed_at_ms: now,
+    };
+    let response = IdempotentStoredResponseV2 {
+        operation_kind: kind,
+        idempotency_key: key,
+        exact_request_hash: canonical,
+        response_record_type: RECORD_TYPE_LOCAL_UNBOUND.into(),
+        canonical_response_payload_bytes: tombstone.response().encode(),
+        server_instance_id: b.instance,
+        restore_epoch: b.epoch,
+        committed_at_ms: now,
+        receipt_id: random()?,
+    }
+    .encode();
+    let receipt = tombstone.encode();
+    tx.execute(
+        "UPDATE operations SET state = 'COMPLETED', response_record_type = ?2,
+           exact_response_bytes = ?3, exact_response_bytes_sha256 = ?4,
+           exact_receipt_bytes = ?5, receipt_sha256 = ?6,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE op_id = ?1 AND state = 'PENDING'",
+        params![
+            op_id,
+            RECORD_TYPE_LOCAL_UNBOUND,
+            response,
+            sha256(&response).to_vec(),
+            receipt,
+            sha256(&receipt).to_vec()
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM profile_bindings WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    // The readback: what a retry would return, from the stored bytes alone.
+    let reply = unbound_reply(&db, local)?;
+    tx.commit()?;
+    Ok(reply)
+}
+
+/// The exact stored response of the newest completed unbind of `local`, once
+/// its columns match its request and its tombstone recomputes from the
+/// stored request and response (ADR 0002 D-7); otherwise nothing is trusted.
+fn unbound_reply(db: &Db, local: &str) -> Result<Vec<u8>> {
+    let (op, response, response_sha, receipt_sha) = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT {OP_COLUMNS}, exact_response_bytes, exact_response_bytes_sha256,
+                   receipt_sha256
+                 FROM operations WHERE kind = 'UNBIND' AND state = 'COMPLETED'
+                   AND local_profile_id IS NULL AND local_profile_id_at_request = ?1
+                 ORDER BY rowid DESC LIMIT 1"
+            ),
+            [local],
+            |r| {
+                Ok((
+                    op_row(r)?,
+                    r.get::<_, Vec<u8>>(22)?,
+                    r.get::<_, Vec<u8>>(23)?,
+                    r.get::<_, Vec<u8>>(24)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!(code("sync.unbindNotBound")))?;
+    let mismatch = |field: &str| {
+        anyhow!(code_with(
+            "sync.unbindTombstoneMismatch",
+            &[("field", field)]
+        ))
+    };
+    if let Some(field) = first_drift(db, &op)? {
+        return Err(mismatch(field));
+    }
+    let req = IdempotentMutationRequestV2::parse(&op.exact)
+        .map_err(|_| mismatch("exact_request_bytes"))?;
+    let asked = LocalUnbindV2::parse(&req.canonical_payload_bytes)
+        .map_err(|_| mismatch("canonical_payload_bytes"))?;
+    let payload = stored_response(&op, RECORD_TYPE_LOCAL_UNBOUND, &response)
+        .map_err(|_| mismatch("exact_response_bytes"))?;
+    let done = LocalUnboundV2::parse(&payload).map_err(|_| mismatch("LocalUnboundV2"))?;
+    let tombstone = LocalBindingTombstoneV2 {
+        binding: asked.binding,
+        unbind_idempotency_key: req.idempotency_key,
+        completed_at_ms: done.completed_at_ms,
+    };
+    let receipt = tombstone.encode();
+    let checks = [
+        (
+            "exact_response_bytes_sha256",
+            response_sha == sha256(&response),
+        ),
+        (
+            "local_profile_id",
+            tombstone.binding.local_profile_id == local,
+        ),
+        ("binding_tombstone_sha256", tombstone.response() == done),
+        (
+            "exact_receipt_bytes",
+            op.receipt.as_deref() == Some(&receipt[..]),
+        ),
+        ("receipt_sha256", receipt_sha == sha256(&receipt)),
+    ];
+    if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
+        return Err(mismatch(field));
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------- pull ----
@@ -3305,5 +3493,343 @@ mod tests {
         assert!(has(&err, "sync.badReplySync"), "{err:#}");
         assert!(format!("{err:#}").contains("body-size"), "{err:#}");
         assert!(w.sent("POST", "/checkout").is_empty());
+    }
+
+    /// The origin `enroll` filed the fleet key's records under.
+    const SERVER: &str = "https://fleet.test";
+
+    /// The local ID at request and now, request hash, exact request, receipt
+    /// and receipt hash of the stored unbind.
+    type UnbindRow = (String, Option<String>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+    fn unbind_op(w: &World) -> UnbindRow {
+        w.db()
+            .conn
+            .query_row(
+                "SELECT local_profile_id_at_request, local_profile_id, canonical_request_hash,
+                   exact_request_bytes, exact_receipt_bytes, receipt_sha256
+                 FROM operations WHERE kind = 'UNBIND' AND state = 'COMPLETED'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    /// Probe 1 (L2036), G2-26, G2-33: the unbind stores the completed
+    /// `UNBIND` with its exact response and D-7 tombstone and deletes the
+    /// binding, with no server call. Its context, request hash and receipt
+    /// outlive the binding across reopen; a retry returns the same bytes, and
+    /// no push, pull or listing brings the binding back.
+    #[test]
+    fn an_unbind_tombstone_outlives_its_binding_and_replays_exactly() {
+        let w = world();
+        w.push().unwrap();
+        let sent = w.fake().log.len();
+        let reply = unbind(LOCAL, SERVER, NOW).unwrap();
+        assert_eq!(w.fake().log.len(), sent, "no server call");
+
+        let stored = IdempotentStoredResponseV2::parse(&reply).unwrap();
+        assert_eq!(stored.operation_kind, OperationKind::LocalUnbind);
+        assert_eq!(stored.response_record_type, RECORD_TYPE_LOCAL_UNBOUND);
+        let done = LocalUnboundV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+        let server_id: String = w
+            .db()
+            .conn
+            .query_row(
+                "SELECT server_id FROM server_origins WHERE origin = 'https://fleet.test:443'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected = UnboundBinding {
+            server_id,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            tenant_id: TENANT,
+            fleet_id: FLEET,
+            remote_profile_id: PROFILE,
+            local_profile_id: LOCAL.into(),
+            remote_version: 1,
+            expected_signed_head_hash: w.fake().head,
+        };
+        assert_eq!(done.binding, expected);
+        assert_eq!(done.completed_at_ms, NOW);
+
+        let (at_request, local, canonical, request, receipt, receipt_sha) = unbind_op(&w);
+        assert_eq!((at_request.as_str(), local), (LOCAL, None));
+        let req = IdempotentMutationRequestV2::parse(&request).unwrap();
+        assert_eq!(canonical, req.canonical_request_hash());
+        assert_eq!(stored.exact_request_hash, req.canonical_request_hash());
+        assert_eq!(
+            LocalUnbindV2::parse(&req.canonical_payload_bytes)
+                .unwrap()
+                .binding,
+            expected
+        );
+        let tombstone = LocalBindingTombstoneV2::parse(&receipt).unwrap();
+        assert_eq!(tombstone.binding, expected);
+        assert_eq!(tombstone.unbind_idempotency_key, req.idempotency_key);
+        assert_eq!(tombstone.hash(), done.binding_tombstone_sha256);
+        assert_eq!(receipt_sha, sha256(&receipt));
+        for (sql, n) in [
+            ("SELECT count(*) FROM profile_bindings", 0),
+            (
+                "SELECT count(*) FROM operations WHERE local_profile_id IS NOT NULL",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM operations WHERE kind = 'UNBIND' AND remote_profile_id =
+                   'c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1' AND exact_response_bytes_sha256 IS NOT NULL",
+                1,
+            ),
+        ] {
+            assert_eq!(w.count(sql), n, "{sql}");
+        }
+
+        // Every call below reopens the database file.
+        assert_eq!(unbind(LOCAL, SERVER, NOW + DAY).unwrap(), reply);
+        assert_eq!(unbind(LOCAL, SERVER, NOW + DAY).unwrap(), reply);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'UNBIND'"),
+            1
+        );
+        assert!(!is_published(LOCAL).unwrap());
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.profileNotListed"), "{err:#}");
+        let err = w.pull(&w._dir.path().join("pulled")).unwrap_err();
+        assert!(has(&err, "sync.profileNotListed"), "{err:#}");
+        assert_eq!(w.fake().log.len(), sent, "nothing was sent or listed");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(unbind_op(&w).4, receipt);
+    }
+
+    /// A version 0 binding names no head, and its tombstone omits it.
+    #[test]
+    fn an_unbind_at_version_zero_omits_the_head() {
+        let _w = world();
+        let reply = unbind(LOCAL, SERVER, NOW).unwrap();
+        let stored = IdempotentStoredResponseV2::parse(&reply).unwrap();
+        let done = LocalUnboundV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+        assert_eq!(
+            (
+                done.binding.remote_version,
+                done.binding.expected_signed_head_hash
+            ),
+            (0, None)
+        );
+    }
+
+    /// Probe 1 crash points: a failure at each write of the unbind, or at
+    /// its readback, rolls the whole transaction back. After reopen the
+    /// binding is whole, no `UNBIND` is stored, and the unbind then runs once.
+    #[test]
+    fn an_unbind_cut_off_at_any_write_leaves_the_binding_whole() {
+        for trigger in [
+            "BEFORE INSERT ON operations BEGIN SELECT RAISE(ABORT, 'crash'); END",
+            "BEFORE UPDATE ON operations BEGIN SELECT RAISE(ABORT, 'crash'); END",
+            "BEFORE DELETE ON profile_bindings BEGIN SELECT RAISE(ABORT, 'crash'); END",
+            // The readback fails after every write is made.
+            "AFTER UPDATE OF state ON operations BEGIN
+               UPDATE operations SET receipt_sha256 = zeroblob(32) WHERE op_id = NEW.op_id; END",
+        ] {
+            let w = world();
+            let origins = w.count("SELECT count(*) FROM server_origins");
+            w.db()
+                .conn
+                .execute_batch(&format!("CREATE TRIGGER crash {trigger}"))
+                .unwrap();
+            unbind(LOCAL, SERVER, NOW).unwrap_err();
+            w.db().conn.execute_batch("DROP TRIGGER crash").unwrap();
+            for (sql, n) in [
+                (
+                    "SELECT count(*) FROM profile_bindings WHERE local_profile_id = 'local-profile'",
+                    1,
+                ),
+                ("SELECT count(*) FROM operations", 0),
+                ("SELECT count(*) FROM server_origins", origins),
+            ] {
+                assert_eq!(w.count(sql), n, "{trigger}: {sql}");
+            }
+            let reply = unbind(LOCAL, SERVER, NOW).unwrap();
+            assert_eq!(unbind(LOCAL, SERVER, NOW).unwrap(), reply, "{trigger}");
+            assert_eq!(w.count("SELECT count(*) FROM operations"), 1, "{trigger}");
+        }
+    }
+
+    /// L953 `require_no_lease`/`require_no_pending_operation`, and probe 9's
+    /// journal: each refuses the unbind, and nothing is stored or deleted.
+    #[test]
+    fn an_unbind_is_refused_while_a_lease_request_or_journal_is_open() {
+        let w = world();
+        let err = unbind("never-bound", SERVER, NOW).unwrap_err();
+        assert!(has(&err, "sync.unbindNotBound"), "{err:#}");
+        w.fake().skip.push("finalize");
+        w.push().unwrap_err();
+        let unchanged = |w: &World| {
+            assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'UNBIND'"),
+                0
+            );
+        };
+        let err = unbind(LOCAL, SERVER, NOW).unwrap_err();
+        assert!(has(&err, "sync.unbindLeaseHeld"), "{err:#}");
+        unchanged(&w);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                [],
+            )
+            .unwrap();
+        let err = unbind(LOCAL, SERVER, NOW).unwrap_err();
+        assert!(has(&err, "sync.unbindPending"), "{err:#}");
+        unchanged(&w);
+        for state in ["RUNNING", "AWAITING_RETRY"] {
+            w.db()
+                .conn
+                .execute(
+                    "UPDATE operations SET state = ?1 WHERE state NOT IN ('COMPLETED', 'FAILED')",
+                    [state],
+                )
+                .unwrap();
+            let err = unbind(LOCAL, SERVER, NOW).unwrap_err();
+            assert!(has(&err, "sync.unbindPending"), "{state}: {err:#}");
+        }
+        w.db()
+            .conn
+            .execute(
+                "UPDATE operations SET state = 'FAILED' WHERE state <> 'COMPLETED'",
+                [],
+            )
+            .unwrap();
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO restore_journals(local_profile_id, journal_id, phase, staged_path,
+                   backup_path, old_binding_json, target_version, target_head_hash,
+                   created_at, updated_at)
+                 VALUES ('local-profile', 'j', 'CREATED', 's', 'b', '{}', 1, zeroblob(32), 'now',
+                   'now')",
+                [],
+            )
+            .unwrap();
+        unbind(LOCAL, SERVER, NOW).unwrap_err();
+        unchanged(&w);
+        w.db()
+            .conn
+            .execute("DELETE FROM restore_journals", [])
+            .unwrap();
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    /// ADR 0002 D-7: after delete and reopen, a stored unbind whose columns,
+    /// response or receipt no longer recompute from its request is never
+    /// returned, even with foreign keys bypassed.
+    #[test]
+    fn a_tombstone_that_no_longer_recomputes_is_never_returned() {
+        let other = format!("'{}'", "99".repeat(16));
+        let later = |w: &World| {
+            let (.., receipt, _) = unbind_op(w);
+            let mut t = LocalBindingTombstoneV2::parse(&receipt).unwrap();
+            t.completed_at_ms += 1;
+            (t.encode(), sha256(&t.encode()).to_vec())
+        };
+        for (field, sql) in [
+            (
+                "exact_receipt_bytes",
+                "UPDATE operations SET exact_receipt_bytes = ?1, receipt_sha256 = ?2".to_string(),
+            ),
+            (
+                "exact_receipt_bytes",
+                "UPDATE operations SET exact_receipt_bytes = CAST(x'00' || exact_receipt_bytes AS BLOB)"
+                    .into(),
+            ),
+            (
+                "receipt_sha256",
+                "UPDATE operations SET receipt_sha256 = zeroblob(32)".into(),
+            ),
+            (
+                "exact_response_bytes",
+                "UPDATE operations SET exact_response_bytes = CAST(x'00' || exact_response_bytes AS BLOB)"
+                    .into(),
+            ),
+            (
+                "exact_response_bytes_sha256",
+                "UPDATE operations SET exact_response_bytes_sha256 = zeroblob(32)".into(),
+            ),
+            (
+                "remote_profile_id",
+                format!("UPDATE operations SET remote_profile_id = {other}"),
+            ),
+            (
+                "server_instance_id",
+                format!("UPDATE operations SET server_instance_id = {other}"),
+            ),
+            ("restore_epoch", "UPDATE operations SET restore_epoch = 1".into()),
+            (
+                "exact_request_bytes",
+                "UPDATE operations SET exact_request_bytes = CAST(x'00' || exact_request_bytes AS BLOB)"
+                    .into(),
+            ),
+        ] {
+            let w = world();
+            unbind(LOCAL, SERVER, NOW).unwrap();
+            let (receipt, sha) = later(&w);
+            let raw = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+            raw.pragma_update(None, "foreign_keys", false).unwrap();
+            let n = if sql.contains("?1") {
+                raw.execute(&sql, params![receipt, sha])
+            } else {
+                raw.execute(&sql, [])
+            };
+            assert_eq!(n.unwrap(), 1, "{sql}");
+            drop(raw);
+            let err = unbind(LOCAL, SERVER, NOW).unwrap_err();
+            assert!(has(&err, "sync.unbindTombstoneMismatch"), "{sql}: {err:#}");
+            let named = format!("field={field}]]");
+            assert!(format!("{err:#}").contains(&named), "{field}: {err:#}");
+        }
+
+        // A response naming another tombstone hash, every hash over it
+        // consistent; then the request filed under another local ID.
+        let w = world();
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        let response: Vec<u8> = w
+            .db()
+            .conn
+            .query_row("SELECT exact_response_bytes FROM operations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut stored = IdempotentStoredResponseV2::parse(&response).unwrap();
+        let mut done = LocalUnboundV2::parse(&stored.canonical_response_payload_bytes).unwrap();
+        done.binding_tombstone_sha256 = [0; 32];
+        stored.canonical_response_payload_bytes = done.encode();
+        let forged = stored.encode();
+        let set = "UPDATE operations SET exact_response_bytes = ?1,
+                     exact_response_bytes_sha256 = ?2, local_profile_id_at_request = ?3";
+        for (bytes, local, field) in [
+            (&forged, LOCAL, "binding_tombstone_sha256"),
+            (&response, "other", "local_profile_id"),
+        ] {
+            w.db()
+                .conn
+                .execute(set, params![bytes, sha256(bytes).to_vec(), local])
+                .unwrap();
+            let err = unbind(local, SERVER, NOW).unwrap_err();
+            let named = format!("field={field}]]");
+            assert!(format!("{err:#}").contains(&named), "{field}: {err:#}");
+        }
     }
 }

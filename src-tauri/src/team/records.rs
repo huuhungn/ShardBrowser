@@ -153,7 +153,12 @@ fn row(
 /// instance is refused: what was kept under the old one never moves.
 // shortcut: `last_restore_epoch` is the epoch of the first record kept here;
 // WP-4 moves it with accepted restore epoch transitions.
-fn origin(conn: &Connection, server_url: &str, instance: &str, epoch: i64) -> Result<String> {
+pub(crate) fn origin(
+    conn: &Connection,
+    server_url: &str,
+    instance: &str,
+    epoch: i64,
+) -> Result<String> {
     let url = url::Url::parse(server_url).map_err(|_| unreadable())?;
     let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
         return Err(unreadable());
