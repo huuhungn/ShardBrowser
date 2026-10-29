@@ -63,8 +63,13 @@ const MARKER_KEYS: [&str; 11] = [
 ];
 
 #[cfg(test)]
+type Hook = (String, Box<dyn Fn()>);
+
+#[cfg(test)]
 thread_local! {
     static CRASH_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// Runs at the named point, as another process would between two steps.
+    static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A place the tests cut the flow off: by an injected error, or, under the
@@ -73,6 +78,13 @@ thread_local! {
 #[cfg(test)]
 fn point(name: &str) -> Result<()> {
     crate::crash_harness::pause_if(name);
+    HOOK.with(|h| {
+        if let Some((at, run)) = &*h.borrow() {
+            if at == name {
+                run();
+            }
+        }
+    });
     if CRASH_AT.with(|c| c.borrow().as_deref() == Some(name)) {
         bail!("injected crash at {name}");
     }
@@ -86,51 +98,99 @@ fn point(_name: &str) -> Result<()> {
 
 // ----------------------------------------------------------- discovery ----
 
-/// What the v0.1.28 launcher can find of a profile ID. It is a superset of
-/// `profile::list_all`: every `*.json` under `profiles/` (an unreadable one
-/// counts for any ID its text contains), every `user-data/` directory and
-/// every `trash/` entry. A profile counts as listed only when its record is
-/// `profiles/<id>.json` with the same ID inside, as `profile::load_raw`
-/// needs.
+/// What the v0.1.28 launcher can find of a profile ID. v0.1.28 reads only
+/// `<config_root>/profiles` and `<config_root>/user-data` (its `store.rs`),
+/// so those are scanned always; this launcher's data root is scanned as well
+/// when it is somewhere else. The scan is a superset of `profile::list_all`:
+/// every `*.json` (an unreadable one counts for any ID its text contains),
+/// every `user-data/` directory and every `trash/` entry. A profile counts as
+/// listed only when v0.1.28 would load it: `<config_root>/profiles/<id>.json`
+/// with the same ID inside (`profile::load_raw`).
 #[derive(Default)]
 pub(crate) struct Discovery {
-    records: BTreeSet<(String, String)>,
-    data: BTreeSet<String>,
-    trash: BTreeSet<String>,
+    /// `(file stem, ID inside)` of the records under the config root.
+    listed: BTreeSet<(String, String)>,
+    /// Directory names under the config root's `user-data`.
+    listed_data: BTreeSet<String>,
+    /// Every stem, inner ID, data directory and trash entry, in every root.
+    seen: BTreeSet<String>,
     unparsed: Vec<String>,
+}
+
+/// The `(profiles, user-data, trash)` directories a scan reads: the config
+/// root's, which v0.1.28 reads, then the data root's if it is another folder.
+fn scan_roots() -> Result<Vec<(PathBuf, PathBuf, PathBuf)>> {
+    let config = store::config_root()?;
+    let mut roots = vec![(
+        config.join("profiles"),
+        config.join("user-data"),
+        config.join("trash"),
+    )];
+    if !same_dir(&store::data_root()?, &config) {
+        roots.push((
+            store::profiles_dir()?,
+            store::user_data_root()?,
+            store::trash_dir()?,
+        ));
+    }
+    Ok(roots)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Entries of `dir`; a folder that is not there lists nothing.
+fn entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => Ok(rd.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub(crate) fn discover() -> Result<Discovery> {
     let mut found = Discovery::default();
-    for entry in std::fs::read_dir(store::profiles_dir()?)? {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let body = std::fs::read_to_string(&path)?;
-        match serde_json::from_str::<profile::StoredProfile>(&body) {
-            Ok(stored) => {
-                found.records.insert((stem, stored.meta.id));
+    for (at, (profiles, data, trash)) in scan_roots()?.into_iter().enumerate() {
+        let legacy = at == 0;
+        for path in entries(&profiles)? {
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
             }
-            Err(_) => found.unparsed.push(body),
-        }
-    }
-    for entry in std::fs::read_dir(store::user_data_root()?)? {
-        found.data.insert(name_of(&entry?.path()));
-    }
-    for entry in std::fs::read_dir(store::trash_dir()?)? {
-        let path = entry?.path();
-        found.trash.insert(
-            path.file_stem()
+            let stem = path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
-                .to_string(),
-        );
+                .to_string();
+            let body = std::fs::read_to_string(&path)?;
+            match serde_json::from_str::<profile::StoredProfile>(&body) {
+                Ok(stored) => {
+                    found.seen.insert(stem.clone());
+                    found.seen.insert(stored.meta.id.clone());
+                    if legacy {
+                        found.listed.insert((stem, stored.meta.id));
+                    }
+                }
+                Err(_) => found.unparsed.push(body),
+            }
+        }
+        for path in entries(&data)? {
+            found.seen.insert(name_of(&path));
+            if legacy {
+                found.listed_data.insert(name_of(&path));
+            }
+        }
+        for path in entries(&trash)? {
+            found.seen.insert(
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
     }
     Ok(found)
 }
@@ -143,34 +203,48 @@ fn name_of(path: &Path) -> String {
 }
 
 impl Discovery {
-    /// Whether v0.1.28 would show `id` anywhere.
+    /// Whether v0.1.28 (or this launcher) would show `id` anywhere.
     pub(crate) fn mentions(&self, id: &str) -> bool {
-        self.records
-            .iter()
-            .any(|(stem, inner)| stem == id || inner == id)
-            || self.data.contains(id)
-            || self.trash.contains(id)
-            || self.unparsed.iter().any(|body| body.contains(id))
+        self.seen.contains(id) || self.unparsed.iter().any(|body| body.contains(id))
     }
 
     /// Whether `id` is a profile v0.1.28 can load.
     pub(crate) fn lists(&self, id: &str) -> bool {
-        self.records.contains(&(id.to_string(), id.to_string()))
+        self.listed.contains(&(id.to_string(), id.to_string()))
+    }
+
+    /// Whether v0.1.28 finds a user-data directory for `id`.
+    pub(crate) fn has_data(&self, id: &str) -> bool {
+        self.listed_data.contains(id)
     }
 }
 
-/// `path` lies under none of the directories v0.1.28 reads profiles from.
+/// `path` lies under none of the directories v0.1.28 or this launcher reads
+/// profiles from.
 fn outside_discovery(path: &Path) -> Result<()> {
     let inside = std::fs::canonicalize(path)?;
-    for root in [
-        store::profiles_dir()?,
-        store::user_data_root()?,
-        store::trash_dir()?,
-        store::extensions_dir()?,
-    ] {
-        if inside.starts_with(std::fs::canonicalize(root)?) {
+    let mut roots = vec![store::extensions_dir()?];
+    for (profiles, data, trash) in scan_roots()? {
+        roots.extend([profiles, data, trash]);
+    }
+    for root in roots {
+        // A folder that is not there holds nothing.
+        let Ok(root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        if inside.starts_with(root) {
             bail!(code("downgrade.archiveDiscoverable"));
         }
+    }
+    Ok(())
+}
+
+/// v0.1.28 reads the config root only, so a clone written to a moved data
+/// root would be invisible to it: the flow runs only with the data root where
+/// v0.1.28 looks.
+fn require_legacy_layout() -> Result<()> {
+    if !same_dir(&store::data_root()?, &store::config_root()?) {
+        bail!(code("downgrade.dataRootMoved"));
     }
     Ok(())
 }
@@ -181,14 +255,26 @@ fn archive_root() -> Result<PathBuf> {
     Ok(store::data_root()?.join(ARCHIVE_DIR))
 }
 
+/// A profile ID is a UUID as `profile::save_raw` mints it (the only generator,
+/// in v0.1.28 as now). Anything else, `Z:` and `..` included, is not a name
+/// to build a path from.
 fn valid_id(id: &str) -> Result<()> {
-    if id.is_empty() || id.contains(['/', '\\', '.']) {
+    let canonical = uuid::Uuid::parse_str(id).is_ok_and(|u| u.hyphenated().to_string() == id);
+    if !canonical {
         bail!(code("profile.invalidId"));
     }
     Ok(())
 }
 
-/// Every path the flow touches, from the journal alone.
+/// A journal ID is 16 random bytes in lower-case hex.
+fn valid_journal_id(id: &str) -> Result<()> {
+    if id.len() != 32 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        bail!(code("downgrade.archiveOutside"));
+    }
+    Ok(())
+}
+
+/// Every path the flow touches.
 struct Places {
     dir: PathBuf,
     metadata_src: PathBuf,
@@ -200,6 +286,10 @@ struct Places {
     clone_staging: PathBuf,
 }
 
+/// The paths of journal `j`, recomputed from its IDs. The paths the journal
+/// stores must equal them exactly: a stored path is never followed, so a
+/// journal cannot aim a move or a delete at the staging directory, at the
+/// profiles folder or anywhere else.
 fn places(j: &DowngradeJournal) -> Result<Places> {
     let (Some(metadata), Some(data), Some(new)) = (
         &j.original_metadata_archive_path,
@@ -211,24 +301,21 @@ fn places(j: &DowngradeJournal) -> Result<Places> {
             &[("phase", j.phase.as_str())]
         ));
     };
-    valid_id(&j.original_local_profile_id)?;
+    let original = &j.original_local_profile_id;
+    valid_id(original)?;
     valid_id(new)?;
-    let root = archive_root()?;
-    let dir = root.join(&j.journal_id);
-    let (metadata_dst, data_dst) = (PathBuf::from(metadata), PathBuf::from(data));
-    // A journal whose paths lead anywhere but its own archive directory is
-    // not ours to follow.
-    let tidy = |p: &Path| p.starts_with(&dir) && !p.components().any(|c| c.as_os_str() == "..");
-    if j.journal_id.is_empty()
-        || j.journal_id.contains(['/', '\\', '.'])
-        || !tidy(&metadata_dst)
-        || !tidy(&data_dst)
-    {
+    valid_journal_id(&j.journal_id)?;
+    let dir = archive_root()?.join(&j.journal_id);
+    let (metadata_dst, data_dst) = (
+        dir.join(format!("{original}.json.archived")),
+        dir.join("user-data"),
+    );
+    if *metadata != metadata_dst.display().to_string() || *data != data_dst.display().to_string() {
         bail!(code("downgrade.archiveOutside"));
     }
     Ok(Places {
-        metadata_src: store::profiles_dir()?.join(format!("{}.json", j.original_local_profile_id)),
-        data_src: store::user_data_root()?.join(&j.original_local_profile_id),
+        metadata_src: store::profiles_dir()?.join(format!("{original}.json")),
+        data_src: store::user_data_root()?.join(original),
         clone_metadata: store::profiles_dir()?.join(format!("{new}.json")),
         clone_data: store::user_data_root()?.join(new),
         clone_staging: dir.join("clone-user-data.partial"),
@@ -257,23 +344,28 @@ fn make_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One same-volume rename, flushed at both ends. A repeat after the rename
-/// finds the destination and nothing at the source and does nothing.
+/// A same-volume rename that never replaces, flushed at both ends.
+fn move_new(src: &Path, dst: &Path) -> Result<()> {
+    durable::move_new(src, dst).with_context(|| {
+        code_with(
+            "downgrade.moveFailed",
+            &[("path", &src.display().to_string())],
+        )
+    })?;
+    durable::sync_parent(src)?;
+    durable::sync_parent(dst)?;
+    Ok(())
+}
+
+/// One move into a place that is empty. A repeat after the move finds the
+/// destination and nothing at the source and does nothing.
 fn move_path(src: &Path, dst: &Path, missing: &str) -> Result<()> {
     match (exists(src), exists(dst)) {
         (true, false) => {
             if let Some(parent) = dst.parent() {
                 make_dir(parent)?;
             }
-            durable::replace_file(src, dst).with_context(|| {
-                code_with(
-                    "downgrade.moveFailed",
-                    &[("path", &src.display().to_string())],
-                )
-            })?;
-            durable::sync_parent(src)?;
-            durable::sync_parent(dst)?;
-            Ok(())
+            move_new(src, dst)
         }
         (false, true) => Ok(()),
         (true, true) => bail!(code("downgrade.archiveConflict")),
@@ -350,11 +442,60 @@ fn pending_work(db: &Db, local: &str) -> Result<u64> {
     Ok(count as u64)
 }
 
+/// One flow runs at a time in this process: the downgrade commands, the
+/// startup resume and the fingerprint migration of `runtime` (which rewrites
+/// profile files) take turns, so none of them sees another half done.
+pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FLOW.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The claim on the profiles a flow touches: the original and the clone. A
+/// running browser on either, or any other change of them, refuses it.
+fn claim(original: &str, new: Option<&str>) -> Result<profile::ProfileClaimGuard> {
+    let ids: Vec<&str> = std::iter::once(original).chain(new).collect();
+    profile::begin_user_mutation(ids, &code("downgrade.actionDowngrade"))
+}
+
+/// Reads journal `id`, takes the claim on its profiles and reads it again: the
+/// flow acts on what was stored once the profiles were its own. A settled
+/// journal needs no claim.
+fn claimed(id: &str) -> Result<(Option<profile::ProfileClaimGuard>, Db, DowngradeJournal)> {
+    let db = Db::open()?;
+    let find =
+        |db: &Db| journal::downgrade_get(db, id)?.ok_or_else(|| anyhow!(code("journal.notFound")));
+    let peek = find(&db)?;
+    if peek.mode != Mode::Clone {
+        bail!(code("downgrade.notClone"));
+    }
+    if peek.phase.resume() == Next::Settled {
+        return Ok((None, db, peek));
+    }
+    let guard = claim(
+        &peek.original_local_profile_id,
+        peek.new_local_profile_id.as_deref(),
+    )?;
+    point("claimed:reread")?;
+    let j = find(&db)?;
+    if j.original_local_profile_id != peek.original_local_profile_id
+        || j.new_local_profile_id != peek.new_local_profile_id
+    {
+        bail!(code_with(
+            "journal.readbackMismatch",
+            &[("field", "profiles")]
+        ));
+    }
+    Ok((Some(guard), db, j))
+}
+
 /// Starts the downgrade clone of the bound, stopped profile `local` and runs
-/// it to the end.
+/// it to the end, under one claim.
 pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
     valid_id(local)?;
-    let _claim = profile::begin_user_mutation([local], &code("downgrade.actionDowngrade"))?;
+    let _flow = exclusive();
+    require_legacy_layout()?;
+    let new = random_id()?;
+    let _claim = claim(local, Some(&new))?;
     let db = Db::open()?;
     binding_facts(&db, local)?;
     if pending_work(&db, local)? > 0 {
@@ -363,11 +504,18 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
     if !profile::load_raw(local).is_ok_and(|p| p.meta.id == local && !p.meta.temporary) {
         bail!(code("downgrade.originalUnreadable"));
     }
+    // What would leave the profile half moved is refused before a journal or
+    // a move exists: a link in its data, a browser holding it, another disk.
+    let data = store::user_data_root()?.join(local);
+    if exists(&data) {
+        listing(&data, false)?;
+        prove_idle(&data)?;
+    }
     let archive = archive_root()?;
     make_dir(&archive)?;
     store::require_local_ntfs(&archive)?;
     outside_discovery(&archive)?;
-    let new = random_id()?;
+    same_volume(&data, &archive)?;
     if discover()?.mentions(&new) {
         bail!(code("downgrade.archiveConflict"));
     }
@@ -376,7 +524,7 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
     let journal_id = hex(&id);
     let dir = archive.join(&journal_id);
     let journal = DowngradeJournal {
-        journal_id: journal_id.clone(),
+        journal_id,
         mode: Mode::Clone,
         original_local_profile_id: local.to_string(),
         new_local_profile_id: Some(new),
@@ -391,29 +539,25 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
         discovery_readback_sha256: None,
     };
     journal::downgrade_create(&db, &journal)?;
-    drop(db);
     point("created")?;
-    drop(_claim);
-    run_clone(&journal_id)
+    drive(db, journal)
 }
 
 /// Runs the clone journal `journal_id` from the phase it is at to the end (or
 /// to its rollback), as a start after a crash does.
 pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {
-    let mut db = Db::open()?;
-    let mut j = journal::downgrade_get(&db, journal_id)?
-        .ok_or_else(|| anyhow!(code("journal.notFound")))?;
-    if j.mode != Mode::Clone {
-        bail!(code("downgrade.notClone"));
-    }
+    let _flow = exclusive();
+    let (_claim, db, j) = claimed(journal_id)?;
+    drive(db, j)
+}
+
+/// Runs `j` to the end. The caller holds the claim and the flow lock.
+fn drive(mut db: Db, mut j: DowngradeJournal) -> Result<CloneDone> {
     if j.phase.resume() == Next::Settled {
         return Ok(done(&j));
     }
-    let _claim = profile::begin_user_mutation(
-        [&j.original_local_profile_id],
-        &code("downgrade.actionDowngrade"),
-    )?;
     let w = places(&j)?;
+    point("claim_held")?;
     loop {
         let step: Result<DowngradeJournal> = (|| {
             Ok(match j.phase {
@@ -425,10 +569,13 @@ pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {
                     make_dir(&w.dir)?;
                     store::require_local_ntfs(&w.dir)?;
                     outside_discovery(&w.dir)?;
+                    prove_idle(&w.data_src)?;
+                    same_volume(&w.data_src, &w.dir)?;
                     move_path(&w.metadata_src, &w.metadata_dst, "downgrade.originalGone")?;
                     advance(&db, &j, Phase::OriginalMetadataMoved, Patch::default())?
                 }
                 Phase::OriginalMetadataMoved => {
+                    prove_idle(&w.data_src)?;
                     move_data(&w)?;
                     advance(&db, &j, Phase::OriginalUserDataMoved, Patch::default())?
                 }
@@ -469,7 +616,7 @@ pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {
             Ok(next) => j = next,
             // A state nothing here can explain: put the original back rather
             // than guess.
-            Err(e) if CONFLICTS.iter().any(|key| has_code(&format!("{e:#}"), key)) => {
+            Err(e) if forces_rollback(j.phase, &format!("{e:#}")) => {
                 let _ = journal::downgrade_advance(
                     &db,
                     &j.journal_id,
@@ -487,20 +634,101 @@ pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {
 }
 
 /// Failures after which the disk cannot be trusted to continue forward.
-const CONFLICTS: [&str; 6] = [
+const CONFLICTS: [&str; 7] = [
     "downgrade.archiveConflict",
     "downgrade.originalGone",
     "downgrade.stillDiscoverable",
     "downgrade.cloneTeamMarker",
     "downgrade.cloneMismatch",
     "downgrade.userDataLink",
+    "downgrade.readbackFailed",
 ];
+
+/// Whether the error `text` at `phase` sends the journal to its rollback. A
+/// missing archive is not one once the clone is written: the clone may then
+/// be the only copy, so only a person decides.
+fn forces_rollback(phase: Phase, text: &str) -> bool {
+    let clone_exists = matches!(phase, Phase::CloneWritten | Phase::ReadbackPassed);
+    CONFLICTS
+        .iter()
+        .any(|key| has_code(text, key) && !(clone_exists && *key == "downgrade.originalGone"))
+}
 
 fn advance(db: &Db, j: &DowngradeJournal, to: Phase, patch: Patch) -> Result<DowngradeJournal> {
     point(&format!("before:{}", to.as_str()))?;
     let next = journal::downgrade_advance(db, &j.journal_id, to, patch)?;
     point(&format!("after:{}", to.as_str()))?;
     Ok(next)
+}
+
+/// Proves no browser holds the profile's data before anything moves. Chromium
+/// keeps `lockfile` open on Windows and a `SingletonLock` elsewhere; a lock
+/// that cannot be opened exclusively counts as held.
+fn prove_idle(data: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = data.join("lockfile");
+        let free = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&lock);
+        if exists(&lock) && free.is_err() {
+            bail!(code("downgrade.dataInUse"));
+        }
+    }
+    #[cfg(not(windows))]
+    if exists(&data.join("SingletonLock")) {
+        bail!(code("downgrade.dataInUse"));
+    }
+    Ok(())
+}
+
+/// The serial number of the volume holding `path`.
+#[cfg(windows)]
+fn volume_serial(path: &Path) -> Result<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(u64::from(info.dwVolumeSerialNumber))
+}
+
+#[cfg(not(windows))]
+fn volume_serial(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+fn one_volume(serials: &[u64]) -> Result<()> {
+    if !serials.windows(2).all(|pair| pair[0] == pair[1]) {
+        bail!(code("downgrade.volumeMismatch"));
+    }
+    Ok(())
+}
+
+/// The profile records, the profile's data (or the folder it will live in)
+/// and the archive are on one volume, so each move is one rename.
+fn same_volume(data: &Path, archive: &Path) -> Result<()> {
+    let data = if exists(data) {
+        data.to_path_buf()
+    } else {
+        store::user_data_root()?
+    };
+    let serials = [store::profiles_dir()?, data, archive.to_path_buf()]
+        .iter()
+        .map(|p| volume_serial(p))
+        .collect::<Result<Vec<_>>>()?;
+    one_volume(&serials)
 }
 
 fn move_data(w: &Places) -> Result<()> {
@@ -668,9 +896,7 @@ fn write_clone(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<()> {
         if listing(&w.clone_staging, false)? != archived {
             bail!(code("downgrade.cloneMismatch"));
         }
-        durable::replace_file(&w.clone_staging, &w.clone_data)?;
-        durable::sync_parent(&w.clone_staging)?;
-        durable::sync_parent(&w.clone_data)?;
+        move_new(&w.clone_staging, &w.clone_data)?;
     } else if listing(&w.clone_data, false)? != archived {
         bail!(code("downgrade.cloneMismatch"));
     }
@@ -693,10 +919,7 @@ fn write_clone(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<()> {
 fn read_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<[u8; 32]> {
     let new = j.new_local_profile_id.as_deref().unwrap_or_default();
     let found = discover()?;
-    if !found.lists(new)
-        || !found.data.contains(new)
-        || found.mentions(&j.original_local_profile_id)
-    {
+    if !found.lists(new) || !found.has_data(new) || found.mentions(&j.original_local_profile_id) {
         bail!(code("downgrade.readbackFailed"));
     }
     let listed = profile::list_all()?;
@@ -730,22 +953,55 @@ fn readback_digest(j: &DowngradeJournal) -> [u8; 32] {
     sha256(&input)
 }
 
-/// Puts the original back and removes what the clone wrote. Both moves back
-/// refuse to overwrite anything, so a state with the original in two places
-/// stays `ROLLBACK_REQUIRED` for a person.
+/// Whether the original can be put back, decided before anything is deleted.
+/// The clone may hold the only copy of a profile's data, so it is removed
+/// only when the original is in the archive (or already back in place), in
+/// one place only, and the clone holds nothing the archive does not.
+fn check_restorable(j: &DowngradeJournal, w: &Places) -> Result<()> {
+    let conflict = || anyhow!(code("downgrade.rollbackConflict"));
+    let clone_present = exists(&w.clone_metadata) || exists(&w.clone_data);
+    for (src, dst) in [
+        (&w.data_src, &w.data_dst),
+        (&w.metadata_src, &w.metadata_dst),
+    ] {
+        let (in_place, archived) = (exists(src), exists(dst));
+        if (in_place && archived) || (clone_present && !in_place && !archived) {
+            return Err(conflict());
+        }
+    }
+    if exists(&w.clone_metadata) {
+        let body = std::fs::read(&w.clone_metadata)?;
+        let ours = serde_json::from_slice::<profile::StoredProfile>(&body)
+            .is_ok_and(|p| Some(p.meta.id) == j.new_local_profile_id);
+        if !ours {
+            return Err(conflict());
+        }
+    }
+    if exists(&w.clone_data) {
+        let original = if exists(&w.data_dst) {
+            &w.data_dst
+        } else {
+            &w.data_src
+        };
+        if listing(&w.clone_data, false)? != listing(original, true)? {
+            return Err(conflict());
+        }
+    }
+    Ok(())
+}
+
+/// Puts the original back and removes what the clone wrote. Nothing is
+/// deleted unless [`check_restorable`] passes, and the moves back never
+/// replace, so a state with the original in two places stays
+/// `ROLLBACK_REQUIRED` for a person.
 fn roll_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<DowngradeJournal> {
     let j = if j.phase == Phase::RollbackRequired {
         j.clone()
     } else {
         journal::downgrade_advance(db, &j.journal_id, Phase::RollbackRequired, Patch::default())?
     };
+    check_restorable(&j, w)?;
     if exists(&w.clone_metadata) {
-        let body = std::fs::read(&w.clone_metadata)?;
-        let ours = serde_json::from_slice::<profile::StoredProfile>(&body)
-            .is_ok_and(|p| Some(p.meta.id) == j.new_local_profile_id);
-        if !ours {
-            bail!(code("downgrade.rollbackConflict"));
-        }
         std::fs::remove_file(&w.clone_metadata)?;
         durable::sync_parent(&w.clone_metadata)?;
     }
@@ -764,9 +1020,7 @@ fn roll_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<DowngradeJourn
             if exists(src) {
                 bail!(code("downgrade.rollbackConflict"));
             }
-            durable::replace_file(dst, src)?;
-            durable::sync_parent(dst)?;
-            durable::sync_parent(src)?;
+            move_new(dst, src)?;
         }
     }
     point("rollback:restored")?;
@@ -778,20 +1032,30 @@ fn roll_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<DowngradeJourn
 
 /// Rolls the journal `journal_id` back on request.
 pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {
-    let db = Db::open()?;
-    let j = journal::downgrade_get(&db, journal_id)?
-        .ok_or_else(|| anyhow!(code("journal.notFound")))?;
-    if j.mode != Mode::Clone || j.phase == Phase::Completed {
+    let _flow = exclusive();
+    let (_claim, db, j) = claimed(journal_id)?;
+    if j.phase == Phase::Completed {
         bail!(code_with(
             "journal.badTransition",
             &[("from", j.phase.as_str()), ("to", "ROLLED_BACK")]
         ));
     }
-    let _claim = profile::begin_user_mutation(
-        [&j.original_local_profile_id],
-        &code("downgrade.actionDowngrade"),
-    )?;
     Ok(done(&roll_back(&db, &j, &places(&j)?)?))
+}
+
+/// Whether a downgrade or restore journal is recorded that a move of the data
+/// root would strand: its saved paths point into the current folder.
+pub(crate) fn journals_exist() -> Result<bool> {
+    if !Db::path()?.exists() {
+        return Ok(false);
+    }
+    let count: i64 = Db::open()?.conn.query_row(
+        "SELECT (SELECT count(*) FROM downgrade_journals WHERE phase <> 'ROLLED_BACK')
+              + (SELECT count(*) FROM restore_journals)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// What a resume found for one open journal.
@@ -1003,6 +1267,7 @@ mod tests {
     impl Drop for Env {
         fn drop(&mut self) {
             CRASH_AT.with(|c| *c.borrow_mut() = None);
+            HOOK.with(|h| *h.borrow_mut() = None);
             crate::process::Tracker::shared().set_running_for_test("another-profile", false);
             store::set_config_root(None);
             store::set_data_root(None);
@@ -1015,8 +1280,9 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let lifecycle = profile::lifecycle_test_guard();
         let dir = tempfile::tempdir().unwrap();
+        // The data root is the config root, where v0.1.28 looks.
         store::set_config_root(Some(dir.path().join("config")));
-        store::set_data_root(Some(dir.path().join("data")));
+        store::set_data_root(None);
         Env {
             _config: config,
             _lifecycle: lifecycle,
@@ -1133,6 +1399,10 @@ mod tests {
         CRASH_AT.with(|c| *c.borrow_mut() = Some(point.to_string()));
     }
 
+    fn set_hook(point: &str, run: impl Fn() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some((point.to_string(), Box::new(run))));
+    }
+
     fn no_crash() {
         CRASH_AT.with(|c| *c.borrow_mut() = None);
     }
@@ -1161,7 +1431,7 @@ mod tests {
         outside_discovery(&w.dir).unwrap();
         let found = discover().unwrap();
         assert!(!found.mentions(LOCAL));
-        assert!(found.lists(&new) && found.data.contains(&new));
+        assert!(found.lists(&new) && found.has_data(&new));
         let listed = profile::list_all().unwrap();
         assert!(listed.iter().any(|p| p.id == new));
         assert!(listed.iter().all(|p| p.id != LOCAL));
@@ -1201,7 +1471,7 @@ mod tests {
         let _e = env();
         seed(LOCAL, true);
         let found = discover().unwrap();
-        assert!(found.lists(LOCAL) && found.mentions(LOCAL) && found.data.contains(LOCAL));
+        assert!(found.lists(LOCAL) && found.mentions(LOCAL) && found.has_data(LOCAL));
         assert!(!found.mentions(OTHER));
         // A record under another file name, a trash entry and an unreadable
         // record each still mention the ID.
@@ -1424,7 +1694,6 @@ mod tests {
         };
         let root = std::path::PathBuf::from(root);
         store::set_config_root(Some(root.join("config")));
-        store::set_data_root(Some(root.join("data")));
         let _ = start_clone(LOCAL);
     }
 
@@ -1607,88 +1876,439 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_journal_that_points_outside_its_archive_is_not_followed() {
-        let (_e, before) = seeded();
-        let profiles = store::profiles_dir().unwrap();
-        let archive = archive_root().unwrap().join("evil");
-        let evil = DowngradeJournal {
-            journal_id: "evil".into(),
+    /// Runs the clone flow until `point` cuts it off.
+    fn at(point: &str) -> (DowngradeJournal, Places) {
+        crash_at(point);
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        (j, w)
+    }
+
+    const JOURNAL: &str = "0123456789abcdef0123456789abcdef";
+
+    fn journal_at(metadata: &Path, data: &Path) -> DowngradeJournal {
+        DowngradeJournal {
+            journal_id: JOURNAL.into(),
             mode: Mode::Clone,
             original_local_profile_id: LOCAL.into(),
             new_local_profile_id: Some(OTHER.into()),
             phase: P::Created,
-            original_metadata_archive_path: Some(
-                profiles.join("x.json.archived").display().to_string(),
-            ),
-            original_user_data_archive_path: Some(archive.join("user-data").display().to_string()),
+            original_metadata_archive_path: Some(metadata.display().to_string()),
+            original_user_data_archive_path: Some(data.display().to_string()),
             pre_v2_manifest_sha256: None,
             discovery_readback_sha256: None,
-        };
-        journal::downgrade_create(&Db::open().unwrap(), &evil).unwrap();
-        let e = run_clone("evil").unwrap_err();
-        assert!(has(&e, "downgrade.archiveOutside"), "{e:#}");
-        let dotted = DowngradeJournal {
-            original_metadata_archive_path: Some(
-                archive.join("..").join("x").display().to_string(),
-            ),
-            ..evil.clone()
-        };
-        assert!(places(&dotted).is_err());
-        assert_eq!(
-            std::fs::read(profiles.join(format!("{LOCAL}.json"))).unwrap(),
-            before.metadata
-        );
-        // An ID that is a path, with paths that agree with it, is not followed
-        // either, nor are IDs of the profiles that are paths.
-        let nested = archive_root().unwrap().join("a").join("b");
-        let traversal = DowngradeJournal {
-            journal_id: "a/b".into(),
-            original_metadata_archive_path: Some(nested.join("m").display().to_string()),
-            original_user_data_archive_path: Some(nested.join("d").display().to_string()),
-            ..evil.clone()
-        };
-        assert!(has(
-            &places(&traversal).err().unwrap(),
-            "downgrade.archiveOutside"
-        ));
-        let tidy = DowngradeJournal {
-            journal_id: "tidy".into(),
-            original_metadata_archive_path: Some(
-                archive_root()
-                    .unwrap()
-                    .join("tidy")
-                    .join("m")
-                    .display()
-                    .to_string(),
-            ),
-            original_user_data_archive_path: Some(
-                archive_root()
-                    .unwrap()
-                    .join("tidy")
-                    .join("d")
-                    .display()
-                    .to_string(),
-            ),
-            ..evil
-        };
-        assert!(places(&tidy).is_ok());
-        for (original, new) in [
-            ("a/b", OTHER),
-            (LOCAL, "a/b"),
-            ("..", OTHER),
-            (LOCAL, "x.y"),
+        }
+    }
+
+    /// M1: the paths a journal stores are not followed; they must equal the
+    /// ones recomputed from its IDs.
+    #[test]
+    fn a_journal_cannot_aim_a_path_anywhere_but_its_own_archive() {
+        let (_e, before) = seeded();
+        let profiles = store::profiles_dir().unwrap();
+        let dir = archive_root().unwrap().join(JOURNAL);
+        let own_metadata = dir.join(format!("{LOCAL}.json.archived"));
+        let own_data = dir.join("user-data");
+        let staging = dir.join("clone-user-data.partial");
+        assert!(places(&journal_at(&own_metadata, &own_data)).is_ok());
+        for (metadata, data) in [
+            (profiles.join("x.json.archived"), own_data.clone()),
+            (own_metadata.clone(), staging.clone()),
+            (staging.clone(), own_data.clone()),
+            (dir.join("..").join("x"), own_data.clone()),
+            (dir.join("other.json"), own_data.clone()),
+            (own_metadata.clone(), dir.join("user-data2")),
+            (own_metadata.clone(), profiles.clone()),
         ] {
-            let bad = DowngradeJournal {
-                original_local_profile_id: original.into(),
-                new_local_profile_id: Some(new.into()),
-                ..tidy.clone()
+            let e = places(&journal_at(&metadata, &data)).err().unwrap();
+            assert!(has(&e, "downgrade.archiveOutside"), "{metadata:?} {data:?}");
+        }
+        // A journal ID is 32 lower-case hex digits and nothing else.
+        for id in ["evil", "../x", "a/b", "", &"A".repeat(32), &"a".repeat(31)] {
+            let j = DowngradeJournal {
+                journal_id: id.into(),
+                ..journal_at(&own_metadata, &own_data)
             };
+            let e = places(&j).err().unwrap();
+            assert!(has(&e, "downgrade.archiveOutside"), "{id}");
+        }
+        // Stored paths equal to the staging path never reach the clone step:
+        // the original survives a resume.
+        crash_at("after:CLAIMED");
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        Db::open()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE downgrade_journals SET original_user_data_archive_path = ?2
+                 WHERE journal_id = ?1",
+                params![j.journal_id, w.clone_staging.display().to_string()],
+            )
+            .unwrap();
+        let e = run_clone(&j.journal_id).unwrap_err();
+        assert!(has(&e, "downgrade.archiveOutside"), "{e:#}");
+        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+        assert_eq!(tree_digest(&w.data_src), before.data);
+    }
+
+    /// M2: only a canonical UUID names a profile.
+    #[test]
+    fn a_drive_relative_or_path_like_id_is_not_a_profile_id() {
+        let _e = env();
+        valid_id(LOCAL).unwrap();
+        for bad in [
+            "Z:",
+            "Z:x",
+            "..",
+            "a/b",
+            "a\\b",
+            "x.y",
+            "",
+            "11111111-1111-4111-8111-11111111111",
+            "11111111111141118111111111111111",
+            "AAAAAAAA-1111-4111-8111-111111111111",
+            "{11111111-1111-4111-8111-111111111111}",
+        ] {
             assert!(
-                has(&places(&bad).err().unwrap(), "profile.invalidId"),
-                "{original} {new}"
+                has(&valid_id(bad).unwrap_err(), "profile.invalidId"),
+                "{bad}"
             );
         }
+        let dir = archive_root().unwrap().join(JOURNAL);
+        let j = DowngradeJournal {
+            original_local_profile_id: "Y:".into(),
+            new_local_profile_id: Some("Z:".into()),
+            ..journal_at(&dir.join("m"), &dir.join("d"))
+        };
+        assert!(has(&places(&j).err().unwrap(), "profile.invalidId"));
+        for bad in ["Z:", ".."] {
+            let e = start_clone(bad).unwrap_err();
+            assert!(has(&e, "profile.invalidId"), "{bad}");
+        }
+    }
+
+    /// H2: a rollback never deletes a clone before it knows the original can
+    /// be put back.
+    #[test]
+    fn a_rollback_never_deletes_a_clone_whose_original_cannot_be_restored() {
+        let (_e, _) = seeded();
+        let (j, w) = at("after:CLONE_WRITTEN");
+        let new = j.new_local_profile_id.clone().unwrap();
+        let work = w.clone_data.join("Default").join("work.txt");
+        std::fs::write(&work, b"weeks of work").unwrap();
+        std::fs::remove_dir_all(&w.data_dst).unwrap();
+        // The archive is gone while the clone is written: that is not an
+        // automatic rollback, and no rollback deletes the clone.
+        let e = run_clone(&j.journal_id).unwrap_err();
+        assert!(has(&e, "downgrade.originalGone"), "{e:#}");
+        assert_eq!(the_journal().phase, P::CloneWritten);
+        for _ in 0..2 {
+            let e = roll_back_clone(&j.journal_id).unwrap_err();
+            assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
+            let e = run_clone(&j.journal_id).unwrap_err();
+            assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
+        }
+        assert_eq!(the_journal().phase, P::RollbackRequired);
+        assert_eq!(std::fs::read(&work).unwrap(), b"weeks of work");
+        assert!(exists(&w.clone_metadata) && !exists(&w.data_src));
+        // The clone's ID is claimed while a flow runs on it.
+        crate::process::Tracker::shared().set_running_for_test(&new, true);
+        for result in [run_clone(&j.journal_id), roll_back_clone(&j.journal_id)] {
+            let e = result.unwrap_err();
+            assert!(has(&e, "profile.stopRunningBrowser"), "{e:#}");
+        }
+        crate::process::Tracker::shared().set_running_for_test(&new, false);
+        assert_eq!(std::fs::read(&work).unwrap(), b"weeks of work");
+    }
+
+    /// H2: a rollback that ends in rollbackConflict has deleted nothing, and a
+    /// clone that holds more than the archive is kept.
+    #[test]
+    fn a_rollback_that_conflicts_keeps_the_clone() {
+        // The original recreated in place.
+        let (_e, before) = seeded();
+        let (j, w) = at("after:CLONE_WRITTEN");
+        std::fs::write(&w.metadata_src, &before.metadata).unwrap();
+        let e = roll_back_clone(&j.journal_id).unwrap_err();
+        assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
+        assert!(exists(&w.clone_data) && exists(&w.clone_metadata));
+        assert!(exists(&w.metadata_dst) && exists(&w.data_dst));
+        drop(_e);
+        // Work done in the clone since it was written.
+        let (_e, _) = seeded();
+        let (j, w) = at("after:CLONE_WRITTEN");
+        std::fs::write(w.clone_data.join("Default").join("work.txt"), b"work").unwrap();
+        let e = roll_back_clone(&j.journal_id).unwrap_err();
+        assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
+        assert!(exists(&w.clone_data) && exists(&w.clone_metadata));
+        assert!(!exists(&w.data_src) && exists(&w.data_dst));
+        // Taking the work out lets the rollback through.
+        std::fs::remove_file(w.clone_data.join("Default").join("work.txt")).unwrap();
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
+    }
+
+    /// LOW 3: nothing here replaces: a move into an occupied place fails and
+    /// leaves both sides as they were.
+    #[test]
+    fn a_move_into_an_occupied_place_replaces_nothing() {
+        let e = env();
+        let (a, b) = (e.dir.path().join("a"), e.dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("f"), b"a").unwrap();
+        std::fs::write(b.join("f"), b"b").unwrap();
+        assert!(move_new(&a, &b).is_err());
+        assert_eq!(std::fs::read(a.join("f")).unwrap(), b"a");
+        assert_eq!(std::fs::read(b.join("f")).unwrap(), b"b");
+    }
+
+    fn make_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// A link (a symlink, or a junction on Windows) inside the user data is
+    /// refused before anything is journaled or moved.
+    #[test]
+    fn a_link_in_the_user_data_is_refused_before_anything_moves() {
+        let (e, before) = seeded();
+        let outside = e.dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        let data = store::user_data_root().unwrap().join(LOCAL);
+        make_link(&data.join("Default").join("jn"), &outside);
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.userDataLink"), "{err:#}");
+        let db = Db::open().unwrap();
+        assert!(journal::downgrade_for(&db, LOCAL).unwrap().is_empty());
+        let metadata = store::profiles_dir().unwrap().join(format!("{LOCAL}.json"));
+        assert_eq!(std::fs::read(metadata).unwrap(), before.metadata);
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"outside"
+        );
+        assert!(data.join("Default").join("Cookies").exists());
+    }
+
+    /// H1: v0.1.28 reads the config root only, so a moved data root refuses
+    /// the clone, and the scan reads the config root whatever the data root.
+    #[test]
+    fn a_moved_data_root_refuses_the_clone_and_discovery_reads_the_config_root() {
+        let (e, _) = seeded();
+        let moved = e.dir.path().join("data2");
+        store::set_data_root(Some(moved.clone()));
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.dataRootMoved"), "{err:#}");
+        let db = Db::open().unwrap();
+        assert!(journal::downgrade_for(&db, LOCAL).unwrap().is_empty());
+        assert!(!moved.join(ARCHIVE_DIR).exists());
+        // The original in the config root is found although the data root's
+        // folders are empty: that is where v0.1.28 lists it.
+        let found = discover().unwrap();
+        assert!(found.lists(LOCAL) && found.mentions(LOCAL) && found.has_data(LOCAL));
+        // A record in the moved data root is seen, but v0.1.28 does not list it.
+        std::fs::write(
+            moved.join("profiles").join(format!("{OTHER}.json")),
+            serde_json::to_vec(&record(OTHER)).unwrap(),
+        )
+        .unwrap();
+        let found = discover().unwrap();
+        assert!(found.mentions(OTHER) && !found.lists(OTHER) && !found.has_data(OTHER));
+        // An archive inside either root's folders is discoverable.
+        let config = store::config_root().unwrap();
+        for inside in [
+            config.join("profiles"),
+            config.join("user-data").join(LOCAL),
+            moved.join("profiles"),
+            moved.join("user-data"),
+        ] {
+            let e = outside_discovery(&inside).unwrap_err();
+            assert!(has(&e, "downgrade.archiveDiscoverable"), "{inside:?}");
+        }
+    }
+
+    /// H1: a clone finished under the config root stops being evidence once
+    /// the data root is somewhere else.
+    #[test]
+    fn a_finished_clone_is_not_evidence_after_the_data_root_moves() {
+        let (e, _) = seeded();
+        start_clone(LOCAL).unwrap();
+        assert!(ready_codes().is_empty());
+        store::set_data_root(Some(e.dir.path().join("data2")));
+        assert!(ready_codes().contains(&"downgrade.blockCloneEvidence"));
+    }
+
+    /// M3: the data root does not move while a journal is recorded.
+    #[test]
+    fn a_data_root_move_is_refused_while_a_journal_is_recorded() {
+        let _e = env();
+        assert!(!journals_exist().unwrap());
+        crate::migrate::refuse_while_journals().unwrap();
+        seed(LOCAL, true);
+        bind(LOCAL);
+        assert!(!journals_exist().unwrap());
+        crash_at("after:ORIGINAL_USER_DATA_MOVED");
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        assert!(journals_exist().unwrap());
+        let e = crate::migrate::refuse_while_journals().unwrap_err();
+        assert!(has(&e, "migrate.downgradeJournal"), "{e:#}");
+        // A rolled-back journal strands nothing; a finished one does.
+        roll_back_clone(&the_journal().journal_id).unwrap();
+        assert!(!journals_exist().unwrap());
+        start_clone(LOCAL).unwrap();
+        assert!(journals_exist().unwrap());
+        let db = Db::open().unwrap();
+        db.conn
+            .execute("DELETE FROM downgrade_journals", [])
+            .unwrap();
+        assert!(!journals_exist().unwrap());
+        seed(OTHER, false);
+        bind(OTHER);
+        journal::restore_create(&db, &restore_journal(OTHER)).unwrap();
+        assert!(journals_exist().unwrap());
+    }
+
+    /// LOW 1: the journal is read again once the claim is held, and one claim
+    /// covers the original and the clone from the start to the end.
+    #[test]
+    fn a_resume_reads_the_journal_again_after_it_holds_the_claim() {
+        let (_e, _) = seeded();
+        crash_at("created");
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        let id = the_journal().journal_id;
+        // Another process moves the journal on between the claim and the read.
+        let other = id.clone();
+        set_hook("claimed:reread", move || {
+            let db = Db::open().unwrap();
+            journal::downgrade_advance(&db, &other, P::Claimed, Patch::default()).unwrap();
+        });
+        assert_eq!(run_clone(&id).unwrap().phase, "COMPLETED");
+    }
+
+    #[test]
+    fn a_start_holds_one_claim_on_the_original_and_the_clone_until_it_ends() {
+        let (_e, _) = seeded();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(0u8));
+        let counted = seen.clone();
+        set_hook("claim_held", move || {
+            let j = the_journal();
+            let new = j.new_local_profile_id.clone().unwrap();
+            for id in [LOCAL, new.as_str()] {
+                assert!(profile::begin_user_mutation([id], "test").is_err(), "{id}");
+            }
+            counted.set(counted.get() + 1);
+        });
+        start_clone(LOCAL).unwrap();
+        assert_eq!(seen.get(), 1);
+        // Released at the end.
+        let new = the_journal().new_local_profile_id.unwrap();
+        assert!(profile::begin_user_mutation([LOCAL, new.as_str()], "test").is_ok());
+    }
+
+    /// A browser holding the data is detected before anything moves.
+    struct Held(Option<std::fs::File>, std::path::PathBuf);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            drop(self.0.take());
+            let _ = std::fs::remove_file(&self.1);
+        }
+    }
+
+    fn hold(data: &Path) -> Held {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let lock = data.join("lockfile");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .share_mode(1)
+                .open(&lock)
+                .unwrap();
+            Held(Some(file), lock)
+        }
+        #[cfg(not(windows))]
+        {
+            let lock = data.join("SingletonLock");
+            std::fs::write(&lock, b"").unwrap();
+            Held(None, lock)
+        }
+    }
+
+    #[test]
+    fn data_held_by_a_browser_is_refused_before_a_journal_or_a_move() {
+        let (_e, before) = seeded();
+        let data = store::user_data_root().unwrap().join(LOCAL);
+        let held = hold(&data);
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.dataInUse"), "{err:#}");
+        assert!(journal::downgrade_for(&Db::open().unwrap(), LOCAL)
+            .unwrap()
+            .is_empty());
+        drop(held);
+        start_clone(LOCAL).unwrap();
+        assert_cloned(&before);
+    }
+
+    #[test]
+    fn a_resume_waits_while_a_browser_holds_the_data_and_moves_nothing() {
+        let (_e, before) = seeded();
+        crash_at("after:CLAIMED");
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        let held = hold(&w.data_src);
+        let err = run_clone(&j.journal_id).unwrap_err();
+        assert!(has(&err, "downgrade.dataInUse"), "{err:#}");
+        assert_eq!(the_journal().phase, P::Claimed);
+        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+        assert!(!exists(&w.metadata_dst));
+        drop(held);
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+    }
+
+    #[test]
+    fn the_sources_and_the_archive_must_be_on_one_volume() {
+        let _e = env();
+        let profiles = store::profiles_dir().unwrap();
+        let data = store::user_data_root().unwrap();
+        assert_eq!(
+            volume_serial(&profiles).unwrap(),
+            volume_serial(&data).unwrap()
+        );
+        assert!(volume_serial(&profiles.join("missing")).is_err());
+        one_volume(&[]).unwrap();
+        one_volume(&[7]).unwrap();
+        one_volume(&[1, 1, 1]).unwrap();
+        for serials in [[1, 1, 2], [2, 1, 1], [1, 2, 1]] {
+            let e = one_volume(&serials).unwrap_err();
+            assert!(has(&e, "downgrade.volumeMismatch"), "{serials:?}");
+        }
+        let archive = archive_root().unwrap();
+        make_dir(&archive).unwrap();
+        same_volume(&data.join("none"), &archive).unwrap();
+        same_volume(&data, &archive).unwrap();
+        assert!(same_volume(&data, &archive.join("missing")).is_err());
     }
 
     fn insert_op(db: &Db, op: &str, kind: &str, state: &str) {
@@ -1877,19 +2497,6 @@ mod tests {
         assert_eq!(the_journal().phase, P::RollbackRequired);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_link_in_the_user_data_is_not_followed() {
-        let (_e, _) = seeded();
-        let data = store::user_data_root().unwrap().join(LOCAL);
-        std::os::unix::fs::symlink("/", data.join("link")).unwrap();
-        let e = start_clone(LOCAL).unwrap_err();
-        assert!(has(&e, "downgrade.userDataLink"), "{e:#}");
-        let j = the_journal();
-        run_clone(&j.journal_id).unwrap();
-        assert!(places(&j).unwrap().metadata_src.exists());
-    }
-
     #[test]
     fn a_readback_that_v0_1_28_would_not_agree_with_fails_the_flow() {
         for trace in [
@@ -1922,10 +2529,15 @@ mod tests {
             }
             let e = run_clone(&j.journal_id).unwrap_err();
             assert!(has(&e, "downgrade.readbackFailed"), "{trace}: {e:#}");
-            assert_eq!(the_journal().phase, P::CloneWritten, "{trace}");
+            // A journal never waits at CLONE_WRITTEN for a readback that
+            // cannot pass: it goes to its rollback.
+            assert_eq!(the_journal().phase, P::RollbackRequired, "{trace}");
             assert!(ready_codes().contains(&"downgrade.blockDowngradeJournal"));
             // The original is still whole in the archive for recovery.
             assert_eq!(std::fs::read(&w.metadata_dst).unwrap(), before.metadata);
+            assert_eq!(run_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
+            assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+            assert_eq!(tree_digest(&w.data_src), before.data);
         }
     }
 

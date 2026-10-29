@@ -466,6 +466,9 @@ fn migrate_all_to(
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
 ) -> usize {
+    // Profile files are rewritten here without a claim; a downgrade in flight
+    // is moving them, so the two take turns.
+    let _flow = crate::team::downgrade::exclusive();
     let mut n = 0;
     if let Ok(d) = crate::store::profiles_dir() {
         n += migrate_dir_to(&d, chromium_version, grease_brand, grease_version, tls).unwrap_or(0);
@@ -1150,6 +1153,30 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The migration rewrites profile files without a claim, so it waits for a
+    /// downgrade that is moving them.
+    #[test]
+    fn the_profile_migration_waits_for_a_downgrade_in_flight() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().join("config")));
+        let flow = crate::team::downgrade::exclusive();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = finished.clone();
+        let worker = std::thread::spawn(move || {
+            migrate_all_to("1.0.0", None, None, None);
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        drop(flow);
+        worker.join().unwrap();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        crate::store::set_config_root(None);
+    }
 
     /// #114: a network that accepts the connection and never answers used to
     /// hold the first-run gate, and with it the whole window, indefinitely.

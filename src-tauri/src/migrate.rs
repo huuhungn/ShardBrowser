@@ -56,7 +56,18 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     out
 }
 
+/// A saved downgrade or restore names paths inside the current data root, and
+/// a rollback or resume that finds them elsewhere would leave a profile
+/// stranded: the root does not move while one is recorded.
+pub(crate) fn refuse_while_journals() -> Result<()> {
+    if crate::team::downgrade::journals_exist()? {
+        anyhow::bail!(crate::errcode::code("migrate.downgradeJournal"));
+    }
+    Ok(())
+}
+
 fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
+    refuse_while_journals()?;
     let src = store::data_root()?;
     let dst = dst.to_path_buf();
     if dst == src {

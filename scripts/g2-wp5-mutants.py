@@ -104,14 +104,26 @@ MUTANTS = [
      "if discover()?.mentions(&j.original_local_profile_id) {\n        bail!(code(\"downgrade.stillDiscoverable\"));",
      "if false && discover()?.mentions(&j.original_local_profile_id) {\n        bail!(code(\"downgrade.stillDiscoverable\"));"),
     ("D04-archive-outside-discovery", D,
-     "if inside.starts_with(std::fs::canonicalize(root)?) {",
-     "if false && inside.starts_with(std::fs::canonicalize(root)?) {"),
-    ("D05-archive-prefix", D, "let tidy = |p: &Path| p.starts_with(&dir) &&", "let tidy = |p: &Path| true &&"),
-    ("D06-archive-dotdot", D,
-     "!p.components().any(|c| c.as_os_str() == \"..\")", "true"),
-    ("D07-journal-id-path", D, "|| j.journal_id.contains(['/', '\\\\', '.'])", "|| false"),
-    ("D08-original-id-path", D, "valid_id(&j.original_local_profile_id)?;\n    valid_id(new)?;", "valid_id(new)?;"),
-    ("D09-new-id-path", D, "valid_id(&j.original_local_profile_id)?;\n    valid_id(new)?;", "valid_id(&j.original_local_profile_id)?;"),
+     "if inside.starts_with(root) {",
+     "if false && inside.starts_with(root) {"),
+    ("D04b-archive-outside-data-roots", D,
+     "roots.extend([profiles, data, trash]);", "roots.extend([profiles]);"),
+    ("D05-archive-paths-metadata", D,
+     "if *metadata != metadata_dst.display().to_string() || *data != data_dst.display().to_string() {",
+     "if *data != data_dst.display().to_string() {"),
+    ("D06-archive-paths-data", D,
+     "if *metadata != metadata_dst.display().to_string() || *data != data_dst.display().to_string() {",
+     "if *metadata != metadata_dst.display().to_string() {"),
+    ("D06b-archive-paths-any", D,
+     "if *metadata != metadata_dst.display().to_string() || *data != data_dst.display().to_string() {",
+     "if false {"),
+    ("D07-journal-id-length", D, "if id.len() != 32 ||", "if false ||"),
+    ("D07b-journal-id-hex", D,
+     "|| !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {", "|| false {"),
+    ("D08-original-id-path", D, "valid_id(original)?;\n    valid_id(new)?;", "valid_id(new)?;"),
+    ("D09-new-id-path", D, "valid_id(original)?;\n    valid_id(new)?;", "valid_id(original)?;"),
+    ("D09b-id-canonical", D,
+     ".is_ok_and(|u| u.hyphenated().to_string() == id)", ".is_ok()"),
     ("D10-empty-user-data", D, "return make_dir(&w.data_dst);", "return Ok(());"),
     # --- downgrade: start ----------------------------------------------------
     ("D11-start-binding", D,
@@ -136,11 +148,11 @@ MUTANTS = [
     ("D22-existing-copy-compared", D, "} else if listing(&w.clone_data, false)? != archived {", "} else if false {"),
     ("D23-existing-record-id", D,
      "if require_clean(&body, &forbidden)?.meta.id != new {", "if false {"),
-    ("D24-readback-lists", D, "if !found.lists(new)\n        ||", "if false\n        ||"),
-    ("D25-readback-user-data", D, "|| !found.data.contains(new)", "|| false"),
+    ("D24-readback-lists", D, "if !found.lists(new) ||", "if false ||"),
+    ("D25-readback-user-data", D, "|| !found.has_data(new)", "|| false"),
     ("D26-readback-old-id", D,
-     "|| found.mentions(&j.original_local_profile_id)\n    {\n        bail!(code(\"downgrade.readbackFailed\"));",
-     "|| false\n    {\n        bail!(code(\"downgrade.readbackFailed\"));"),
+     "|| found.mentions(&j.original_local_profile_id) {",
+     "|| false {"),
     ("D27-readback-listing", D, "if !listed.iter().any(|p| p.id == new)", "if false"),
     # --- downgrade: rollback and resume -------------------------------------
     ("D28-rollback-overwrite", D,
@@ -155,11 +167,11 @@ MUTANTS = [
      "let _ = journal::downgrade_advance(\n                    &db,\n                    &j.journal_id,\n                    Phase::RollbackRequired,\n                    Patch::default(),\n                );",
      ""),
     ("D32-rollback-completed", D,
-     "if j.mode != Mode::Clone || j.phase == Phase::Completed {", "if j.mode != Mode::Clone {"),
+     "    if j.phase == Phase::Completed {\n        bail!(code_with(", "    if false {\n        bail!(code_with("),
     ("D33-pre-v2-as-clone", D,
      "Mode::PreV2Restore => Err(anyhow!(code(\"downgrade.preV2Unsupported\"))),",
      "Mode::PreV2Restore => run_clone(&j.journal_id),"),
-    ("D34-clone-mode", D, "if j.mode != Mode::Clone {\n        bail!(code(\"downgrade.notClone\"));", "if false {\n        bail!(code(\"downgrade.notClone\"));"),
+    ("D34-clone-mode", D, "if peek.mode != Mode::Clone {\n        bail!(code(\"downgrade.notClone\"));", "if false {\n        bail!(code(\"downgrade.notClone\"));"),
     ("D35-unbind-flow", D,
      "if Db::path()?.exists() && journal::flow_taken(&Db::open()?, local)? {", "if false {"),
     # --- downgrade: readiness -----------------------------------------------
@@ -192,6 +204,54 @@ MUTANTS = [
     ("D50-evidence-clone-listed", D, "        && found.lists(new)\n        && !found", "        && true\n        && !found"),
     ("D51-evidence-old-id", D,
      "&& !found.mentions(&j.original_local_profile_id)\n}", "&& true\n}"),
+    # --- review fixes: layout, claims, rollback, guards --------------------------
+    ("D52-legacy-roots", D,
+     "config.join(\"profiles\"),\n        config.join(\"user-data\"),",
+     "store::profiles_dir()?,\n        store::user_data_root()?,"),
+    ("D53-data-root-scan", D,
+     "if !same_dir(&store::data_root()?, &config) {", "if false {"),
+    ("D54-data-root-moved", D,
+     "if !same_dir(&store::data_root()?, &store::config_root()?) {", "if false {"),
+    ("D55-start-layout", D, "    require_legacy_layout()?;\n    let new = random_id()?;", "    let new = random_id()?;"),
+    ("D56-restorable-two-places", D,
+     "if (in_place && archived) || (clone_present && !in_place && !archived) {",
+     "if clone_present && !in_place && !archived {"),
+    ("D57-restorable-nowhere", D,
+     "if (in_place && archived) || (clone_present && !in_place && !archived) {",
+     "if in_place && archived {"),
+    ("D58-restorable-clone-record", D, "        if !ours {\n            return Err(conflict());", "        if false {\n            return Err(conflict());"),
+    ("D59-restorable-listing", D,
+     "if listing(&w.clone_data, false)? != listing(original, true)? {", "if false {"),
+    ("D60-rollback-unchecked", D, "    check_restorable(&j, w)?;\n", ""),
+    ("D61-original-gone-after-clone", D,
+     "&& !(clone_exists && *key == \"downgrade.originalGone\"))", ")"),
+    ("D62-clone-exists-phase", D,
+     "let clone_exists = matches!(phase, Phase::CloneWritten | Phase::ReadbackPassed);",
+     "let clone_exists = false;"),
+    ("D62b-clone-exists-readback", D,
+     "matches!(phase, Phase::CloneWritten | Phase::ReadbackPassed)", "matches!(phase, Phase::CloneWritten)"),
+    ("D63-reread-after-claim", D,
+     "    let j = find(&db)?;\n    if j.original_local_profile_id", "    let j = peek.clone();\n    if j.original_local_profile_id"),
+    ("D64-claim-covers-clone", D,
+     "let _claim = claim(local, Some(&new))?;", "let _claim = claim(local, None)?;"),
+    ("D65-resume-claims-clone", D,
+     "peek.new_local_profile_id.as_deref(),\n    )?;", "None,\n    )?;"),
+    ("D66-start-idle", D, "        listing(&data, false)?;\n        prove_idle(&data)?;", "        listing(&data, false)?;"),
+    ("D67-start-links", D, "        listing(&data, false)?;\n        prove_idle(&data)?;", "        prove_idle(&data)?;"),
+    ("D68-start-volume", D, "    same_volume(&data, &archive)?;\n", ""),
+    ("D69-claimed-idle", D, "                    prove_idle(&w.data_src)?;\n                    same_volume", "                    same_volume"),
+    ("D70-metadata-moved-idle", D,
+     "                    prove_idle(&w.data_src)?;\n                    move_data(&w)?;", "                    move_data(&w)?;"),
+    ("D71-claimed-volume", D, "                    same_volume(&w.data_src, &w.dir)?;\n", ""),
+    ("D72-one-volume", D, "if !serials.windows(2).all(|pair| pair[0] == pair[1]) {", "if false {"),
+    ("D73-idle-lock", D, "if exists(&lock) && free.is_err() {", "if false {"),
+    ("D74-move-replaces", D,
+     "durable::move_new(src, dst).with_context(", "durable::replace_file(src, dst).with_context("),
+    ("D75-journals-exist-restore", D,
+     "              + (SELECT count(*) FROM restore_journals)\",", "              + 0\","),
+    ("D76-journals-exist-rolled-back", D,
+     "WHERE phase <> 'ROLLED_BACK')", "WHERE phase <> 'COMPLETED')"),
+    ("D77-journals-exist-none", D, "    Ok(count > 0)\n}\n\n/// What a resume", "    Ok(false)\n}\n\n/// What a resume"),
 ]
 
 
@@ -222,6 +282,7 @@ def main(argv):
         return 0
     only = argv[argv.index("--only") + 1:] if "--only" in argv else None
     chosen = [m for m in MUTANTS if only is None or m[0] in only]
+    bad = 0
     originals = {f: (SRC / f).read_bytes() for f in (J, D)}
     digests = {f: hashlib.sha256(b).hexdigest() for f, b in originals.items()}
     for mid, f, old, new in chosen:
@@ -230,7 +291,9 @@ def main(argv):
         o, n = old.replace("\n", nl), new.replace("\n", nl)
         if text.count(o) != 1:
             print(f"BAD-PATTERN {mid}: {text.count(o)} matches")
-            return 2
+            bad += 1
+    if bad:
+        return 2
     if "--dry-run" in argv:
         print(f"{len(chosen)} patterns match exactly once")
         return 0
