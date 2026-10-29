@@ -858,14 +858,17 @@ async fn listed(
 
 const TRANSITION_REQUIRED: &str = "RESTORE_EPOCH_TRANSITION_REQUIRED";
 
-/// Whether `b` is quarantined for a restore epoch (plan 8.2 L1237), which
-/// only verified transitions and proofs of its tenant clear.
+/// Whether `b` waits for a restore epoch transition that was not served yet
+/// (plan 8.2 L1237). A transition or proof that was served and refused
+/// (invalid, another tenant's, no proof for `b`) stays quarantined until an
+/// operator acts.
 fn awaits_transition(b: &Bound) -> bool {
-    b.state == "QUARANTINED"
-        && b.error
-            .as_deref()
-            .is_some_and(|e| e.starts_with("RESTORE_EPOCH_"))
+    b.state == "QUARANTINED" && b.error.as_deref() == Some(TRANSITION_REQUIRED)
 }
+
+/// How many versions below the listed one the leaf's new head is looked
+/// for; past it the server is not believed (fails closed).
+const LEAF_SEARCH: u64 = 64;
 
 /// One verified `E -> E+1` step of a binding: the signed transition and its
 /// inclusion proof, as exact bytes.
@@ -892,11 +895,13 @@ fn refusal(reason: &'static str, field: &str) -> (&'static str, anyhow::Error) {
 
 /// Rule 6, L2243, L2057: moves `b` from its accepted epoch to the server's
 /// through its tenant's signed `E -> E+1` transitions, each signed by a key
-/// that was a root custodian when it signed (rule 1) and is not withdrawn,
-/// and its own inclusion proof in each, whose leaf starts at the head `b`
-/// pinned (or at the head it ends at, as when the restore rolled back only
-/// a commit `b` never pinned). The exact transition and proof bytes are
-/// stored and read back, and the binding accepts the new epoch and pins
+/// trusted as a revocation's issuer is ([`verify_transition`]), and its own
+/// inclusion proof in each, whose leaf starts at the head `b` pinned (or at
+/// the head it ends at, as when the restore rolled back only a commit `b`
+/// never pinned). A new head the last leaf ends at is accepted as rule 6
+/// accepts one ([`verify_leaf_head`]). A lease from before the restore is
+/// released first. The exact transition and proof bytes are stored and read
+/// back, and the binding, as it was read, accepts the new epoch and pins
 /// the leaf's new head, in one transaction. Anything else keeps it
 /// quarantined under a named reason; a lost reply changes nothing.
 // shortcut: a binding pinned behind both heads of its leaf (it missed
@@ -910,6 +915,23 @@ async fn accept_transitions(
     b: &Bound,
     now: u64,
 ) -> Result<()> {
+    // The restore released every lease (D-1): one held from before it is
+    // released as any other, and the binding keeps waiting.
+    let released;
+    let b = match b.lease {
+        Some(lease) => {
+            let op = get_op(db, &release_op(&db.conn, b, lease)?)?;
+            release_reply(client, access, db, b, &op).await?;
+            db.conn.execute(
+                "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = ?2
+                 WHERE local_profile_id = ?1",
+                params![b.local, TRANSITION_REQUIRED],
+            )?;
+            released = bound(db, &b.local)?;
+            &released
+        }
+        None => b,
+    };
     let (epoch, listed) = listing(client, access, b).await?;
     if epoch <= b.epoch {
         return Err(quarantine(
@@ -937,7 +959,7 @@ async fn accept_transitions(
             404 => Err(refusal(TRANSITION_REQUIRED, "")),
             _ => {
                 let body = ok(reply)?.body;
-                verify_transition(db, dev, b, chain.as_ref(), &keys, epochs, &body)
+                verify_transition(db, dev, b, chain.as_ref(), &keys, epochs, &body, now)
             }
         };
         let checked = match checked {
@@ -964,21 +986,42 @@ async fn accept_transitions(
             proof_bytes,
         });
     }
-    // The leaf's new head is a committed manifest whose exact bytes hash to
-    // it; its version is the one its signed payload names.
-    let mut version = None;
-    for v in (1..=listed.current_version).rev() {
-        let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
-        let m = SignedSnapshotManifestV2::parse(&reply.body)
-            .map_err(|_| bad("SignedSnapshotManifestV2"))?;
-        if Some(m.head_hash()) == head {
-            let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
-                .map_err(|_| bad("manifest"))?;
-            version = Some(p.target_version);
-            break;
+    // An unchanged pin keeps its version. Otherwise the leaf's new head is a
+    // committed manifest whose exact bytes hash to it, within `LEAF_SEARCH`
+    // versions of the listed one, accepted as a new head is (rule 6) except
+    // for its earlier epoch.
+    let version = if head == b.head {
+        b.version
+    } else {
+        let low = listed
+            .current_version
+            .saturating_sub(LEAF_SEARCH - 1)
+            .max(1);
+        let mut found = None;
+        for v in (low..=listed.current_version).rev() {
+            let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
+            let m = SignedSnapshotManifestV2::parse(&reply.body)
+                .map_err(|_| bad("SignedSnapshotManifestV2"))?;
+            if Some(m.head_hash()) == head {
+                found = Some((v, m));
+                break;
+            }
         }
-    }
-    let version = version.ok_or_else(|| bad("current_signed_head_hash"))?;
+        let checked = match found {
+            Some((v, m)) => {
+                let c = chain.as_ref();
+                verify_leaf_head(db, dev, b, c, &keys, m, (v, epoch), now).map(|()| v)
+            }
+            None => Err(refusal(
+                "RESTORE_EPOCH_TRANSITION_INVALID",
+                "new_signed_head_hash",
+            )),
+        };
+        match checked {
+            Ok(v) => v,
+            Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
+        }
+    };
     match store_transitions(db, client.base_url(), b, &steps, epoch, version, head) {
         Ok(true) => Ok(()),
         Ok(false) => {
@@ -993,8 +1036,12 @@ type Refused = (&'static str, anyhow::Error);
 
 /// The served `epochs` transition of `b`'s tenant, once its exact bytes
 /// parse, its signature verifies under the key it names, it names `b`'s
-/// tenant, instance and exactly `epochs`, and its signer was a root
-/// custodian at its `issued_at_ms` and is not withdrawn now.
+/// tenant, instance and exactly `epochs`, and its signer is trusted as a
+/// revocation's issuer is (rule 6): a root custodian at its `issued_at_ms`,
+/// still one now, when this device first sees it, and neither held lapsed
+/// (Q-25: the signer chooses `issued_at_ms`, so a lapse this device saw is
+/// not backdated past) nor withdrawn.
+#[allow(clippy::too_many_arguments)]
 fn verify_transition(
     db: &Db,
     dev: &Device,
@@ -1003,6 +1050,7 @@ fn verify_transition(
     keys: &std::collections::BTreeMap<[u8; 32], [u8; 32]>,
     epochs: (u64, u64),
     body: &[u8],
+    now: u64,
 ) -> std::result::Result<shardx_core::restore_epoch::VerifiedTransition, Refused> {
     let invalid = |field| refusal("RESTORE_EPOCH_TRANSITION_INVALID", field);
     let parsed = SignedRestoreEpochTransitionV2::parse(body)
@@ -1025,10 +1073,65 @@ fn verify_transition(
         return Err(invalid("previous_epoch"));
     }
     let withdrawn = ledger::withdrawn(db, &dev.pin.0, &signer).unwrap_or(true);
-    if !chain.is_some_and(|c| c.custodian_at(&signer, p.issued_at_ms)) || withdrawn {
+    let lapsed = ledger::lapsed(db, &dev.pin.0, &signer).unwrap_or(true);
+    let custodian = chain
+        .is_some_and(|c| c.custodian_at(&signer, p.issued_at_ms) && c.custodian_now(&signer, now));
+    if !custodian || lapsed || withdrawn {
         return Err(invalid("approver_signing_key_id"));
     }
     Ok(t)
+}
+
+/// Rule 6, first acceptance, for the manifest a transition's leaf ends at,
+/// found at `version` under the new `epoch`: its signature verifies under a
+/// key the evidence holds, it names `b`'s tenant, fleet, profile and
+/// instance at `version` and an epoch before `epoch` (the leaf's own
+/// exception, L2243), and its signer holds now an approval covering the
+/// fleet and a device-scoped `profile.commit` covering the profile or its
+/// fleet, and is not withdrawn.
+#[allow(clippy::too_many_arguments)]
+fn verify_leaf_head(
+    db: &Db,
+    dev: &Device,
+    b: &Bound,
+    chain: Option<&shardx_core::trust_chain::TrustChain>,
+    keys: &std::collections::BTreeMap<[u8; 32], [u8; 32]>,
+    m: SignedSnapshotManifestV2,
+    (version, epoch): (u64, u64),
+    now: u64,
+) -> std::result::Result<(), Refused> {
+    let invalid = |field| refusal("RESTORE_EPOCH_TRANSITION_INVALID", field);
+    let signer = *m.signer_signing_key_id();
+    let pk = keys
+        .get(&signer)
+        .ok_or_else(|| invalid("signer_signing_key_id"))?;
+    let p = m
+        .verify_signature(pk)
+        .map_err(|_| invalid("signature_bytes"))?
+        .payload()
+        .clone();
+    let checks = [
+        ("tenant_id", p.tenant_id == b.tenant),
+        ("fleet_id", p.fleet_id == b.fleet),
+        ("profile_id", p.profile_id == b.profile),
+        ("server_instance_id", p.server_instance_id == b.instance),
+        ("target_version", p.target_version == version),
+        ("restore_epoch", p.restore_epoch < epoch),
+    ];
+    if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
+        return Err(invalid(field));
+    }
+    let Some(chain) = chain else {
+        return Err(invalid("signer_signing_key_id"));
+    };
+    let commits = |scope| chain.capability_at(&signer, Capability::ProfileCommit, scope, now);
+    if !chain.approval_valid_at(&signer, Scope::Fleet(b.fleet), now)
+        || !(commits(Scope::Profile(b.profile)) || commits(Scope::Fleet(b.fleet)))
+        || ledger::withdrawn(db, &dev.pin.0, &signer).unwrap_or(true)
+    {
+        return Err(invalid("signer_signing_key_id"));
+    }
+    Ok(())
 }
 
 /// `b`'s served proof under `t`, once it proves `b`'s own leaf against the
@@ -1160,16 +1263,19 @@ fn store_transitions(
     )?;
     let moved = tx.execute(
         "UPDATE profile_bindings SET accepted_restore_epoch = ?2, remote_version = ?3,
-           last_observed_head_hash = ?4, last_error_code = NULL,
-           sync_state = CASE WHEN lease_id IS NULL THEN 'AVAILABLE' ELSE 'CHECKED_OUT' END
+           last_observed_head_hash = ?4, last_error_code = NULL, sync_state = 'AVAILABLE'
          WHERE local_profile_id = ?1 AND accepted_restore_epoch = ?5
-           AND sync_state = 'QUARANTINED'",
+           AND sync_state = 'QUARANTINED' AND last_error_code IS ?6 AND remote_version = ?7
+           AND last_observed_head_hash IS ?8 AND lease_id IS NULL",
         params![
             b.local,
             wire(epoch)?,
             wire(version)?,
             head.map(|h| h.to_vec()),
-            wire(b.epoch)?
+            wire(b.epoch)?,
+            b.error,
+            wire(b.version)?,
+            b.head.map(|h| h.to_vec()),
         ],
     )?;
     if moved != 1 {
@@ -1287,7 +1393,11 @@ async fn checkout(
     let replay = find(db, &b.local, "CHECKOUT", None, Some("PENDING"))?;
     let replayed = replay.is_some();
     let op = match replay {
-        Some(op) => op,
+        Some(op) => {
+            // A restore since it was stored quarantines here, first.
+            listed(client, access, db, b).await?;
+            op
+        }
         None => {
             let head = listed(client, access, db, b).await?;
             if head.current_version > b.version {
@@ -2268,6 +2378,7 @@ pub(crate) async fn pull(
     let head = match listed(client, access, &mut db, &b).await {
         // A listing that shows a restore quarantines; it is accepted at once.
         Err(_) if awaits_transition(&bound(&db, local)?) => {
+            b = bound(&db, local)?;
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             b = bound(&db, local)?;
             listed(client, access, &mut db, &b).await?
@@ -2293,15 +2404,25 @@ pub(crate) async fn pull(
         let m = SignedSnapshotManifestV2::parse(&reply.body)
             .map_err(|_| bad("SignedSnapshotManifestV2"))?;
         if v == b.version {
-            // The pinned head: its bytes were accepted before (rule 6,
-            // "Pinning"), so neither its signer nor its epoch is re-checked.
+            // The pinned head: its bytes were verified when they were
+            // pinned (rule 6, "Pinning"), so neither its signer nor its epoch
+            // is re-checked; it must still be this binding's at `v`.
             if Some(m.head_hash()) != b.head {
                 return Err(bad("current_signed_head_hash"));
             }
-            last = Some(
-                SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
-                    .map_err(|_| bad("manifest"))?,
-            );
+            let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
+                .map_err(|_| bad("manifest"))?;
+            let checks = [
+                ("tenant_id", p.tenant_id == b.tenant),
+                ("fleet_id", p.fleet_id == b.fleet),
+                ("profile_id", p.profile_id == b.profile),
+                ("server_instance_id", p.server_instance_id == b.instance),
+                ("target_version", p.target_version == v),
+            ];
+            if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
+                return Err(bad(field));
+            }
+            last = Some(p);
             continue;
         }
         let signer = *m.signer_signing_key_id();
@@ -2673,6 +2794,9 @@ mod tests {
         /// commits, by the version they made.
         upload_keys: Vec<([u8; 16], [u8; 16])>,
         commit_keys: Vec<([u8; 16], u64)>,
+        /// SQL another writer runs on the launcher's database when the next
+        /// proof is served.
+        on_proof: Option<String>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -3015,13 +3139,21 @@ mod tests {
                     reply(201, &[], receipt)
                 }
                 ("GET", ["v2", "recovery", "restore-epoch-transitions", rest @ ..]) => {
+                    if rest.contains(&"proofs") {
+                        if let Some(sql) = self.on_proof.take() {
+                            let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                            assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
+                        }
+                    }
                     match self.epoch_files.get(&rest.join("/")) {
                         Some(b) => reply(200, &[], b.clone()),
                         None => reply(404, &[], br#"{"code":"RESOURCE_NOT_FOUND"}"#.to_vec()),
                     }
                 }
                 ("GET", ["v2", "profiles", _, "snapshots", v, "manifest"]) => {
-                    let mut m = self.manifests[&v.parse().unwrap()].clone();
+                    let Some(mut m) = self.manifests.get(&v.parse().unwrap()).cloned() else {
+                        return reply(404, &[], br#"{"code":"RESOURCE_NOT_FOUND"}"#.to_vec());
+                    };
                     if self.tamper == Some("manifest") {
                         *m.last_mut().unwrap() ^= 1;
                     }
@@ -4598,8 +4730,8 @@ mod tests {
     }
 
     /// Probe 7, G2-39: a transition or proof that does not verify keeps the
-    /// binding quarantined under its named reason and files nothing: none
-    /// served, no proof, tampered bytes, a signer the evidence lacks, one
+    /// binding quarantined under its named reason and files nothing, and
+    /// only a transition not served yet is asked for again: none served, no proof, tampered bytes, a signer the evidence lacks, one
     /// not a custodian when it signed, one distrusted since, another
     /// instance, another epoch step, another tenant's transition or proof,
     /// another profile's proof, a wrong sibling, and a leaf that neither
@@ -4763,9 +4895,16 @@ mod tests {
             setup(&w, h1, h2);
             let out = w.udd.with_file_name("out");
             let checkouts = w.sent("POST", "/checkout").len();
-            for err in [w.pull(&out).unwrap_err(), w.push().unwrap_err()] {
-                assert!(has(&err, key), "{i}: {err:#}");
-            }
+            let err = w.pull(&out).unwrap_err();
+            assert!(has(&err, key), "{i}: {err:#}");
+            // Only a transition not served yet is asked for again.
+            let again = if reason == TRANSITION_REQUIRED {
+                key
+            } else {
+                "sync.bindingQuarantined"
+            };
+            let err = w.push().unwrap_err();
+            assert!(has(&err, again), "{i}: {err:#}");
             let (state, error, epoch, version, _) = w.state(LOCAL);
             assert_eq!(
                 (state.as_str(), error.as_deref(), epoch, version),
@@ -4803,8 +4942,7 @@ mod tests {
     /// the whole acceptance back and leaves the binding quarantined;
     /// reopened, the next push accepts and commits at the new epoch. A
     /// transition filed already is never replaced: another binding served
-    /// other bytes for the same epochs stays quarantined, and is accepted
-    /// against the filed row once the same bytes are served.
+    /// other bytes for the same epochs stays quarantined.
     #[test]
     fn a_cut_off_acceptance_leaves_the_binding_quarantined_until_reopen() {
         let w = world();
@@ -4873,13 +5011,16 @@ mod tests {
             w.state("local-3").1.as_deref(),
             Some("RESTORE_EPOCH_TRANSITION_INVALID")
         );
+        // Refused once, it waits for an operator even when the filed bytes
+        // are served again.
         w.fake().epoch_files.insert(epoch_path(0), original.clone());
-        assert!(w.pull_of("local-3", &out3).unwrap() > 0);
-        assert_eq!(w.state("local-3").2, 1);
+        let err = w.pull_of("local-3", &out3).unwrap_err();
+        assert!(has(&err, "sync.bindingQuarantined"), "{err:#}");
+        assert_eq!(w.state("local-3").2, 0);
         assert_eq!(w.count("SELECT count(*) FROM restore_epoch_transitions"), 1);
         assert_eq!(
             w.count("SELECT count(*) FROM restore_epoch_binding_proofs"),
-            2
+            1
         );
     }
 
@@ -4949,9 +5090,10 @@ mod tests {
 
     /// Probe 11 (L2046): a checkout replayed after its stored expiry returns
     /// the original expired lease; it is released, and the new lease is
-    /// taken under a new key. A checkout stored before a restore whose
-    /// transition the binding accepted is released the same way. A fresh
-    /// lease is used whatever its expiry says.
+    /// taken under a new key. A checkout stored before a restore is replayed
+    /// only after the listing showed the restore and its transition was
+    /// accepted, and is released the same way. A fresh lease is used
+    /// whatever its expiry says.
     #[test]
     fn a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key() {
         let w = world();
@@ -4983,13 +5125,6 @@ mod tests {
             &[PROFILE],
             0,
         );
-        w.db()
-            .conn
-            .execute(
-                "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = ?1",
-                [TRANSITION_REQUIRED],
-            )
-            .unwrap();
         assert_eq!(w.push().unwrap().version, 2);
         let checkouts = w.sent("POST", "/checkout");
         assert_eq!(checkouts.len(), 4);
@@ -4999,5 +5134,362 @@ mod tests {
             w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
             1
         );
+    }
+
+    /// A manifest signed by `sk` over version 1's payload as `edit` changes
+    /// it, served as version 1.
+    fn forge(
+        w: &World,
+        sk: &Ed25519SigningKey,
+        edit: impl FnOnce(&mut SnapshotManifestV2),
+    ) -> [u8; 32] {
+        let mut f = w.fake();
+        let m = SignedSnapshotManifestV2::parse(&f.manifests[&1]).unwrap();
+        let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        p.signer_signing_key_id = shardx_core::keys::signing_key_id(sk.verifying_key().as_bytes());
+        edit(&mut p);
+        let forged = SignedSnapshotManifestV2::sign(sk, &p).unwrap();
+        f.manifests.insert(1, forged.exact_bytes().to_vec());
+        forged.head_hash()
+    }
+
+    impl World {
+        fn pull_at(&self, udd: &Path, now: u64) -> Result<u64> {
+            self.rt
+                .block_on(pull(&self.client, "t", &self.dev, LOCAL, udd, now))
+        }
+    }
+
+    /// Rule 6 for the head a transition's leaf ends at, the one new head it
+    /// lets in (review probe): it is pinned only once its signature verifies
+    /// under a key the evidence holds, it names the binding's tenant, fleet,
+    /// profile and instance at the version it was found at and an epoch
+    /// before the new one, and its signer may commit now. Otherwise the
+    /// binding stays quarantined and nothing is filed or pulled.
+    #[test]
+    fn a_leaf_head_is_accepted_only_as_a_new_head_is() {
+        type Edit = Box<dyn Fn(&mut SnapshotManifestV2)>;
+        let stranger = Ed25519SigningKey::from_bytes(&[0x33; 32]);
+        let cases: Vec<(&str, bool, Edit)> = vec![
+            (
+                "signer_signing_key_id",
+                true,
+                Box::new(|p| {
+                    p.server_instance_id = [0x44; 16];
+                    p.restore_epoch = 99;
+                }),
+            ),
+            ("tenant_id", false, Box::new(|p| p.tenant_id = OTHER_TENANT)),
+            ("fleet_id", false, Box::new(|p| p.fleet_id = [0x45; 16])),
+            ("profile_id", false, Box::new(|p| p.profile_id = PROFILE3)),
+            (
+                "server_instance_id",
+                false,
+                Box::new(|p| p.server_instance_id = [0x44; 16]),
+            ),
+            (
+                "target_version",
+                false,
+                Box::new(|p| {
+                    p.base_version = 4;
+                    p.target_version = 5;
+                    p.previous_signed_head_hash = Some([0x46; 32]);
+                }),
+            ),
+            ("restore_epoch", false, Box::new(|p| p.restore_epoch = 1)),
+            ("signer_signing_key_id", false, Box::new(|_| {})),
+        ];
+        for (i, (field, by_stranger, edit)) in cases.into_iter().enumerate() {
+            let w = world();
+            let (_, h2) = restored(&w);
+            let sk = if by_stranger { &stranger } else { &w.me.sk };
+            let new = forge(&w, sk, edit);
+            if i == 7 {
+                // Its own manifest, but the signer holds no `profile.commit`.
+                let ev = Ev {
+                    commit: None,
+                    ..Ev::default()
+                };
+                w.fake().pages = pages(&w.me, &w.grant, &ev)[0].encode();
+            }
+            let leaves = [leaf(PROFILE, h2, new)];
+            w.file(
+                &w.me.sk,
+                &transition(&w.me, 0, &leaves),
+                &leaves,
+                &[PROFILE],
+                0,
+            );
+            let out = w.udd.with_file_name("out");
+            let err = w.pull(&out).unwrap_err();
+            assert!(has(&err, "sync.epochTransitionInvalid"), "{i}: {err:#}");
+            assert!(
+                format!("{err:#}").contains(&format!("field={field}]]")),
+                "{i}: {err:#}"
+            );
+            let (state, reason, epoch, version, head) = w.state(LOCAL);
+            assert_eq!(
+                (state.as_str(), reason.as_deref(), epoch, version, head),
+                (
+                    "QUARANTINED",
+                    Some("RESTORE_EPOCH_TRANSITION_INVALID"),
+                    0,
+                    2,
+                    Some(h2.to_vec())
+                ),
+                "{i}"
+            );
+            assert_eq!(w.filed(), 0, "{i}");
+            assert!(!out.exists(), "{i}");
+        }
+    }
+
+    /// A pinned head is read back without its signer or epoch checked again,
+    /// but only as the binding's own: one naming another instance is not
+    /// restored.
+    #[test]
+    fn a_pinned_head_is_read_back_only_as_the_bindings_own() {
+        let w = world();
+        w.push().unwrap();
+        let me = Ed25519SigningKey::from_bytes(&[1; 32]);
+        let forged = forge(&w, &me, |p| p.server_instance_id = [0x44; 16]);
+        w.fake().head = Some(forged);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET last_observed_head_hash = ?1",
+                [forged.to_vec()],
+            )
+            .unwrap();
+        let out = w.udd.with_file_name("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("field=server_instance_id"),
+            "{err:#}"
+        );
+        assert!(!out.exists());
+    }
+
+    /// Rule 6's issuer test for the transition signer (review probe, Q-25):
+    /// a custodian key this device holds as lapsed signs nothing it accepts,
+    /// whatever date it puts on it, and one that is no longer a custodian
+    /// when this device first sees the transition does not either, though
+    /// it was one when it signed.
+    #[test]
+    fn a_lapsed_or_former_custodian_signs_no_transition() {
+        let w = world();
+        let (h1, h2) = restored(&w);
+        let held = w
+            .db()
+            .conn
+            .execute(
+                "UPDATE trust_custodian_keys
+                 SET lapsed_evaluation = (SELECT max(evaluation_id) FROM trust_evaluations),
+                     observed_lapsed_at_ms = ?2
+                 WHERE signing_key_id = ?1",
+                params![hex(&w.me.to.signing_key_id), NOW as i64],
+            )
+            .unwrap();
+        assert_eq!(held, 1);
+        let leaves = [leaf(PROFILE, h2, h1)];
+        let t = RestoreEpochTransitionV2 {
+            issued_at_ms: NOW - 1_000,
+            ..transition(&w.me, 0, &leaves)
+        };
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        let err = w.pull(&w.udd.with_file_name("out")).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionInvalid"), "{err:#}");
+        assert_eq!(w.state(LOCAL).2, 0);
+        assert_eq!(w.filed(), 0);
+        drop(w);
+
+        // The custody window ended before now; the leaf keeps the pinned
+        // head, so only the signer decides.
+        let w = world();
+        let (_, h2) = restored(&w);
+        let leaves = [leaf(PROFILE, h2, h2)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        let later = T0 + 301 * DAY;
+        let err = w.pull_at(&w.udd.with_file_name("out"), later).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionInvalid"), "{err:#}");
+        assert_eq!(w.state(LOCAL).2, 0);
+        assert_eq!(w.filed(), 0);
+    }
+
+    /// L1422, L2239 (review probe): once a transition was accepted, the
+    /// unbind still succeeds and its retry replays the same reply; the
+    /// transition and the proof outlive the binding with every key intact,
+    /// and no proof can be filed for a binding that does not exist.
+    #[test]
+    fn an_unbind_after_an_accepted_transition_keeps_its_evidence() {
+        let w = world();
+        let (h1, h2) = restored(&w);
+        let leaves = [leaf(PROFILE, h2, h1)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        assert!(w.pull(&w.udd.with_file_name("out")).unwrap() > 0);
+        assert_eq!(w.filed(), 2);
+        let server = w.client.base_url().to_string();
+        let reply = unbind(LOCAL, &server, NOW).unwrap();
+        assert_eq!(unbind(LOCAL, &server, NOW).unwrap(), reply, "retry replays");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'UNBIND' AND state = 'COMPLETED'"
+            ),
+            1
+        );
+        assert_eq!(w.filed(), 2, "transition and proof outlive the binding");
+        assert_eq!(w.count("SELECT count(*) FROM pragma_foreign_key_check"), 0);
+        let orphan = w.db().conn.execute(
+            "INSERT INTO restore_epoch_binding_proofs
+             SELECT server_id, tenant_id, server_instance_id, previous_epoch, new_epoch,
+               'ffffffffffffffffffffffffffffffff', previous_signed_head_hash,
+               new_signed_head_hash, leaf_index, leaf_count, canonical_leaf_bytes, leaf_hash,
+               expected_root, canonical_inclusion_proof_bytes, proof_sha256, verified_at
+             FROM restore_epoch_binding_proofs",
+            [],
+        );
+        assert!(orphan.is_err());
+    }
+
+    /// The binding moves only as it was read: another writer that changes
+    /// its reason, version, head or lease while the transition is being
+    /// verified leaves it where that writer put it, and nothing is filed.
+    #[test]
+    fn a_binding_changed_during_acceptance_is_not_moved() {
+        for sql in [
+            "UPDATE profile_bindings SET last_error_code = 'HEAD_ROLLBACK_DETECTED'",
+            "UPDATE profile_bindings SET remote_version = 1",
+            "UPDATE profile_bindings SET last_observed_head_hash = randomblob(32)",
+            "UPDATE profile_bindings SET lease_id = 'x', fencing_token = 1",
+        ] {
+            let w = world();
+            let (h1, h2) = restored(&w);
+            let leaves = [leaf(PROFILE, h2, h1)];
+            w.file(
+                &w.me.sk,
+                &transition(&w.me, 0, &leaves),
+                &leaves,
+                &[PROFILE],
+                0,
+            );
+            w.fake().on_proof = Some(sql.into());
+            let err = w.pull(&w.udd.with_file_name("out")).unwrap_err();
+            assert!(has(&err, "sync.bindingChanged"), "{sql}: {err:#}");
+            assert_eq!(w.state(LOCAL).2, 0, "{sql}");
+            assert_eq!(w.filed(), 0, "{sql}");
+            assert!(w.fake().on_proof.is_none(), "{sql}: it ran");
+        }
+    }
+
+    /// The leaf's new head is looked for within `LEAF_SEARCH` versions of
+    /// the listed one and never past it; a pin the leaf keeps is not looked
+    /// for at all.
+    #[test]
+    fn the_leaf_head_search_is_bounded_and_skipped_for_an_unchanged_pin() {
+        let w = world();
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        let decoy = w.fake().manifests[&2].clone();
+        {
+            let mut f = w.fake();
+            f.restore(1);
+            for v in 2..=LEAF_SEARCH + 1 {
+                f.manifests.insert(v, decoy.clone());
+            }
+            f.listed = Some((LEAF_SEARCH + 1, Some(h2)));
+        }
+        let leaves = [leaf(PROFILE, h2, h1)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        let err = w.pull(&w.udd.with_file_name("out")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("field=new_signed_head_hash"),
+            "{err:#}"
+        );
+        assert_eq!(w.state(LOCAL).2, 0);
+        drop(w);
+
+        let w = world();
+        let (_, h2) = restored(&w);
+        {
+            let mut f = w.fake();
+            f.manifests.clear();
+            f.listed = Some((2, Some(h2)));
+        }
+        let leaves = [leaf(PROFILE, h2, h2)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        // The pull then reads the pinned head back, which this fake lost.
+        let _ = w.pull(&w.udd.with_file_name("out"));
+        let (state, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), epoch, version, head),
+            ("AVAILABLE", 1, 2, Some(h2.to_vec()))
+        );
+    }
+
+    /// A lease the binding still holds from before the restore (D-1 released
+    /// them all) is released through the stored release, with what is
+    /// pending under it, before the binding moves; the push then starts
+    /// afresh at the new epoch.
+    #[test]
+    fn a_lease_from_before_the_restore_is_released_before_the_binding_moves() {
+        let w = world();
+        w.push().unwrap();
+        let h1 = w.head_of(1);
+        w.fake().lose.push("upload");
+        w.push().unwrap_err();
+        w.fake().restore(1);
+        let leaves = [leaf(PROFILE, h1, h1)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = ?1",
+                [TRANSITION_REQUIRED],
+            )
+            .unwrap();
+        assert_eq!(w.push().unwrap().version, 2);
+        assert_eq!(w.sent("POST", "/release").len(), 1);
+        assert_eq!(w.sent("POST", "/uploads").len(), 3, "never replayed");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'UPLOAD' AND state = 'FAILED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE state = 'PENDING'"),
+            0
+        );
+        assert_eq!(w.state(LOCAL).2, 1);
     }
 }

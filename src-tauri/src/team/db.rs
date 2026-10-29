@@ -20,14 +20,14 @@
 //! `upload_sessions` for published-profile sync (`team::sync`), and version
 //! 4 the rest of the plan's tables: the kept authorization records and root
 //! grants (`team::records`), and the schema of the tables later packages
-//! fill.
+//! fill. Version 5 lets a restore epoch binding proof outlive its binding.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -789,6 +789,53 @@ UPDATE schema_meta SET schema_version = 4, min_reader_version = 4,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 4 to 5: a binding proof outlives its binding (L1422, L2239: an
+/// unbind keeps its evidence, like its receipt and tombstone), so the
+/// reference DDL's `ON DELETE RESTRICT` key to `profile_bindings` (L2027),
+/// which would refuse every unbind once a proof is filed, becomes a check
+/// at filing: a proof is still refused unless its binding exists. The key
+/// to its transition stays. Rows are kept exactly.
+const MIGRATE_V5: &str = r#"
+CREATE TABLE restore_epoch_binding_proofs_v5 (
+  server_id                  TEXT NOT NULL,
+  tenant_id                  TEXT NOT NULL,
+  server_instance_id         TEXT NOT NULL,
+  previous_epoch             INTEGER NOT NULL CHECK (previous_epoch BETWEEN 0 AND 9223372036854775807),
+  new_epoch                  INTEGER NOT NULL CHECK (
+                               new_epoch BETWEEN 0 AND 9223372036854775807 AND
+                               new_epoch > previous_epoch
+                             ),
+  remote_profile_id          TEXT NOT NULL,
+  previous_signed_head_hash  BLOB NOT NULL CHECK (length(previous_signed_head_hash) = 32),
+  new_signed_head_hash       BLOB NOT NULL CHECK (length(new_signed_head_hash) = 32),
+  leaf_index                 INTEGER NOT NULL CHECK (leaf_index BETWEEN 0 AND 999999),
+  leaf_count                 INTEGER NOT NULL CHECK (leaf_count BETWEEN 1 AND 1000000 AND leaf_index < leaf_count),
+  canonical_leaf_bytes       BLOB NOT NULL CHECK (length(canonical_leaf_bytes) BETWEEN 1 AND 1024),
+  leaf_hash                  BLOB NOT NULL CHECK (length(leaf_hash) = 32),
+  expected_root              BLOB NOT NULL CHECK (length(expected_root) = 32),
+  canonical_inclusion_proof_bytes BLOB NOT NULL CHECK (length(canonical_inclusion_proof_bytes) BETWEEN 1 AND 65536),
+  proof_sha256               BLOB NOT NULL CHECK (length(proof_sha256) = 32),
+  verified_at                TEXT NOT NULL,
+  PRIMARY KEY(server_id, tenant_id, server_instance_id, previous_epoch, new_epoch, remote_profile_id),
+  FOREIGN KEY(server_id, tenant_id, server_instance_id, previous_epoch, new_epoch)
+    REFERENCES restore_epoch_transitions(
+      server_id, tenant_id, server_instance_id, previous_epoch, new_epoch
+    ) ON DELETE RESTRICT
+) STRICT;
+INSERT INTO restore_epoch_binding_proofs_v5 SELECT * FROM restore_epoch_binding_proofs;
+DROP TABLE restore_epoch_binding_proofs;
+ALTER TABLE restore_epoch_binding_proofs_v5 RENAME TO restore_epoch_binding_proofs;
+CREATE TRIGGER restore_epoch_binding_proofs_need_binding
+BEFORE INSERT ON restore_epoch_binding_proofs
+WHEN NOT EXISTS (SELECT 1 FROM profile_bindings
+                 WHERE server_instance_id = NEW.server_instance_id
+                   AND tenant_id = NEW.tenant_id
+                   AND remote_profile_id = NEW.remote_profile_id)
+BEGIN SELECT RAISE(ABORT, 'restore_epoch_binding_proofs: no binding'); END;
+UPDATE schema_meta SET schema_version = 5, min_reader_version = 5,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -846,6 +893,9 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(3, 3, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V4).with_context(unreadable)?;
         }
+        if matches!(meta(&tx).as_deref(), Ok([(4, 4, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V5).with_context(unreadable)?;
+        }
         tx.commit().with_context(unreadable)?;
         if !compatible(&conn) {
             bail!(crate::errcode::code("team.trustLedgerUnsupported"));
@@ -896,7 +946,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (4, 4, "CLEAN".into()));
+        assert_eq!(meta, (5, 5, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -916,8 +966,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 5",
-            "UPDATE schema_meta SET min_reader_version = 5",
+            "UPDATE schema_meta SET schema_version = 6",
+            "UPDATE schema_meta SET min_reader_version = 6",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -950,10 +1000,10 @@ mod tests {
         );
     }
 
-    /// A version 1 file, as #188 wrote it, moves to version 4 in one
-    /// transaction and keeps its rows; it then reopens as version 4.
+    /// A version 1 file, as #188 wrote it, moves to version 5 in one
+    /// transaction and keeps its rows; it then reopens as version 5.
     #[test]
-    fn a_version_1_file_migrates_to_version_4_and_reopens() {
+    fn a_version_1_file_migrates_to_version_5_and_reopens() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("team-sync.db");
         let pin = format!(
@@ -969,7 +1019,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(4, 4, "CLEAN".to_string())]);
+            assert_eq!(rows, [(5, 5, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -983,7 +1033,7 @@ mod tests {
     /// A clean version 2 file gains the sync tables and keeps its ledger; one
     /// that already holds a sync table, or is not clean, is refused as it was.
     #[test]
-    fn a_version_2_file_migrates_to_version_4_or_is_left_as_it_was() {
+    fn a_version_2_file_migrates_to_version_5_or_is_left_as_it_was() {
         let v2 = |path: &Path| {
             let c = Connection::open(path).unwrap();
             c.execute_batch(SCHEMA_V1).unwrap();
@@ -1002,7 +1052,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(4, 4, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -1038,7 +1088,7 @@ mod tests {
     /// its bindings; one that already holds a version 4 table, or is not
     /// clean, is refused as it was.
     #[test]
-    fn a_version_3_file_migrates_to_version_4_or_is_left_as_it_was() {
+    fn a_version_3_file_migrates_to_version_5_or_is_left_as_it_was() {
         let v3 = |path: &Path| {
             let c = Connection::open(path).unwrap();
             for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3] {
@@ -1058,7 +1108,7 @@ mod tests {
         drop(v3(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(4, 4, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("profile_bindings", 1),
                 ("server_origins", 0),
@@ -1106,9 +1156,10 @@ mod tests {
 
     /// The schema half of probes 7 and 9 (L2042, L2044): journal phases and
     /// modes are closed sets, a clone never reuses the original's ID, and a
-    /// binding with a restore journal or an epoch proof cannot be deleted; a
-    /// proof names a binding and a transition that exist, inside its leaf
-    /// count. Rows survive a reopen exactly.
+    /// binding with a restore journal cannot be deleted; a proof is filed
+    /// only for a binding and a transition that exist, inside its leaf
+    /// count, and outlives its binding (L1422, L2239). Rows survive a
+    /// reopen exactly.
     #[test]
     fn journals_and_epoch_proofs_keep_their_constraints_across_a_reopen() {
         let (_dir, path) = fresh();
@@ -1160,15 +1211,11 @@ mod tests {
             ))
             .unwrap();
         let other = "44".repeat(16);
-        for sql in [
-            "DELETE FROM restore_journals".to_string(),
-            "DELETE FROM restore_epoch_binding_proofs".to_string(),
-        ] {
-            // Either child alone keeps the binding.
-            let sql = format!("SAVEPOINT p; {sql}; DELETE FROM profile_bindings;");
-            assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
-            db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
-        }
+        // The journal alone keeps the binding; the proof does not.
+        let sql = "SAVEPOINT p; DELETE FROM restore_epoch_binding_proofs;
+                   DELETE FROM profile_bindings;";
+        assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
+        db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
         for sql in [
             "DELETE FROM restore_epoch_transitions".to_string(),
             "DELETE FROM server_origins".to_string(),
@@ -1212,14 +1259,125 @@ mod tests {
                 Some("q".into())
             )
         );
-        // The journal and the proof go first, then the binding can (L2044).
+        // The journal goes first, then the binding can (L2044); its proof
+        // stays, and no proof is filed for it any more.
         db.conn
             .execute_batch(
                 "UPDATE restore_journals SET phase = 'COMPLETED';
-                 DELETE FROM restore_journals; DELETE FROM restore_epoch_binding_proofs;
-                 DELETE FROM profile_bindings;",
+                 DELETE FROM restore_journals; DELETE FROM profile_bindings;",
             )
             .unwrap();
+        let proofs: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM restore_epoch_binding_proofs",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(proofs, 1);
+        let refiled = format!(
+            "DELETE FROM restore_epoch_binding_proofs; {}",
+            proof(&i, 0, 1)
+        );
+        assert!(db.conn.execute_batch(&refiled).is_err());
+    }
+
+    /// A clean version 4 file with a filed proof moves to version 5 with the
+    /// proof's bytes exactly, the key to its transition and the check at
+    /// filing; its binding can then be deleted, as an unbind does, and the
+    /// proof stays. One that already holds the rebuilt table, or is not
+    /// clean, is refused as it was.
+    #[test]
+    fn a_version_4_file_keeps_its_proofs_and_lets_them_outlive_the_binding() {
+        let i = "11".repeat(16);
+        let h = format!("x'{}'", "22".repeat(32));
+        let n = format!("x'{}'", "33".repeat(16));
+        let v4 = |path: &Path| {
+            let c = Connection::open(path).unwrap();
+            for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3, MIGRATE_V4] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch(&format!(
+                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
+                 VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');
+                 INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                   server_instance_id, last_restore_epoch, status)
+                 VALUES ('s', 'https', 'fleet.test', 443, 'SYSTEM', '{i}', 0, 'ACTIVE');
+                 INSERT INTO restore_epoch_transitions VALUES ('s', '{i}', '{i}', {n}, 0, 1,
+                   'PROFILE_HEAD_SET_MERKLE_V2', 1, {h}, 'operator_restore', 'a', 'd', 'k', 0,
+                   {n}, x'01', {h}, 1, 1, x'01', {h}, x'01', {h}, 't');
+                 INSERT INTO restore_epoch_binding_proofs VALUES ('s', '{i}', '{i}', 0, 1,
+                   '{i}', {h}, {h}, 0, 1, x'01', {h}, {h}, x'0102', {h}, 't');"
+            ))
+            .unwrap();
+            c
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        let before: Vec<Vec<u8>> = v4(&path)
+            .prepare("SELECT canonical_inclusion_proof_bytes FROM restore_epoch_binding_proofs")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for _ in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
+            let kept: Vec<u8> = db
+                .conn
+                .query_row(
+                    "SELECT canonical_inclusion_proof_bytes FROM restore_epoch_binding_proofs",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, [kept]);
+        }
+        let db = Db::open_at(&path).unwrap();
+        let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert!(db
+            .conn
+            .execute_batch("DELETE FROM restore_epoch_transitions")
+            .is_err());
+        db.conn
+            .execute_batch("DELETE FROM profile_bindings")
+            .unwrap();
+        assert_eq!(
+            count("SELECT count(*) FROM restore_epoch_binding_proofs"),
+            1
+        );
+        assert_eq!(count("SELECT count(*) FROM pragma_foreign_key_check"), 0);
+        let orphan = "INSERT INTO restore_epoch_binding_proofs
+            SELECT server_id, tenant_id, server_instance_id, previous_epoch, new_epoch,
+              'ffffffffffffffffffffffffffffffff', previous_signed_head_hash,
+              new_signed_head_hash, leaf_index, leaf_count, canonical_leaf_bytes, leaf_hash,
+              expected_root, canonical_inclusion_proof_bytes, proof_sha256, verified_at
+            FROM restore_epoch_binding_proofs";
+        assert!(db.conn.execute_batch(orphan).is_err());
+        drop(db);
+        for (sql, code) in [
+            (
+                "UPDATE schema_meta SET migration_state = 'MIGRATING'",
+                "team.trustLedgerUnsupported",
+            ),
+            (
+                "CREATE TABLE restore_epoch_binding_proofs_v5 (x INTEGER)",
+                "team.trustLedgerUnreadable",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            v4(&path).execute_batch(sql).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let err = Db::open_at(&path).err().expect(sql).to_string();
+                assert!(crate::errcode::has_code(&err, code), "{sql}: {err}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
+        }
     }
 
     /// A version 1 file that is not clean, or already holds a table the

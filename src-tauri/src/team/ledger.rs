@@ -230,6 +230,20 @@ pub fn withdrawn(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
     )?)
 }
 
+/// Q-25: whether this device holds `key` as lapsed, so that anything it
+/// first sees from `key` from now on meets that lapse, whatever date it
+/// carries.
+pub fn lapsed(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
+    let (instance, tenant) = ids(binding);
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM trust_custodian_keys
+         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+           AND lapsed_evaluation IS NOT NULL)",
+        params![instance, tenant, hex(key)],
+        |r| r.get(0),
+    )?)
+}
+
 /// `pages` as this device's history lets it see them: containers signed by a
 /// proven-revoked or distrusted key and not seen by the evaluation that
 /// counted it are dropped, so are those sticky lapse refuses
