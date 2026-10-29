@@ -466,16 +466,28 @@ fn sibling(udd: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(udd.with_file_name(format!("{name}.{suffix}")))
 }
 
-/// Windows reserved device name (case-insensitive, ignoring any extension):
-/// `NUL`, `CON`, `COM1`, … — these don't behave as literal files on Windows.
+/// Windows reserved device name (case-insensitive, ignoring any extension and
+/// the spaces before it): `NUL`, `CON`, `COM1`, `COM¹`, … — these don't
+/// behave as literal files on Windows (`NUL .txt` is the device too).
 fn is_windows_reserved(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let stem = name.split('.').next().unwrap_or(name);
+    let stem = stem.trim_end_matches(' ').to_ascii_uppercase();
     matches!(
         stem.as_str(),
         "CON"
             | "PRN"
             | "AUX"
             | "NUL"
+            | "CONIN$"
+            | "CONOUT$"
+            | "COM0"
+            | "COM\u{b9}"
+            | "COM\u{b2}"
+            | "COM\u{b3}"
+            | "LPT0"
+            | "LPT\u{b9}"
+            | "LPT\u{b2}"
+            | "LPT\u{b3}"
             | "COM1"
             | "COM2"
             | "COM3"
@@ -1071,7 +1083,6 @@ mod tests {
         assert!(!backup.exists(), "backup consumed by recovery");
     }
 
-    #[cfg(unix)]
     #[test]
     fn unpack_rejects_symlink_entries() {
         use std::io::Write;
@@ -1184,6 +1195,236 @@ mod tests {
         let entries = [("Default/Cookies-x", false), ("default/COOKIES-X", false)];
         let err = unpack_fresh("case", &crafted(&entries)).unwrap_err();
         assert!(format!("{err:#}").contains("two entries"), "{err:#}");
+    }
+
+    // ---- G2-51: the Windows path corpus (plan L1367) against `normalize_rel`
+    // and the unpack that uses it. The `cfg(windows)` halves run on the
+    // Windows CI job, on NTFS.
+
+    /// Names that never reach the disk: ADS/colon, reserved devices in every
+    /// spelling Windows documents, trailing dots and spaces, traversal and
+    /// drive/root prefixes.
+    const REFUSED_NAMES: &[&str] = &[
+        "a:b",
+        "a::$DATA",
+        "a:$DATA",
+        "Cookies:Zone.Identifier",
+        ":",
+        "CON",
+        "con",
+        "Con.txt",
+        "PRN",
+        "AUX",
+        "NUL",
+        "nul.tar.gz",
+        "NUL .txt",
+        "NUL ",
+        "CONIN$",
+        "conout$",
+        "COM0",
+        "COM1",
+        "com9.log",
+        "COM\u{b9}",
+        "COM\u{b2}",
+        "COM\u{b3}",
+        "LPT0",
+        "LPT1",
+        "lpt9",
+        "LPT\u{b9}",
+        "LPT\u{b3}.txt",
+        "a.",
+        "a..",
+        "a ",
+        "a. ",
+        "a .",
+        "...",
+        " ",
+        "..",
+        "C:",
+        "C:evil",
+    ];
+
+    /// Names close to the refused ones that are plain files on every
+    /// Windows: they keep unpacking.
+    const KEPT_NAMES: &[&str] = &[
+        "CONSOLE",
+        "COM10",
+        "LPT10",
+        "NULL",
+        "AUXILIARY.txt",
+        "a.b",
+        ".hidden",
+        " leading",
+        "a\u{3000}",
+        "\u{e9}t\u{e9}",
+        "Local Storage",
+        "000003.log",
+    ];
+
+    #[test]
+    fn the_windows_path_corpus_is_refused_in_every_position() {
+        for name in REFUSED_NAMES {
+            for rel in [
+                name.to_string(),
+                format!("Default/{name}"),
+                format!("{name}/Default"),
+                format!("Default/{name}/x"),
+            ] {
+                assert!(normalize_rel(&rel).is_err(), "{rel:?} was accepted");
+            }
+        }
+        for name in KEPT_NAMES {
+            let rel = format!("Default/{name}");
+            assert_eq!(normalize_rel(&rel).unwrap(), rel);
+        }
+    }
+
+    /// Cross-check against Windows itself: every corpus name the Win32 path
+    /// layer does not keep literally (`GetFullPathNameW` rewrites it) is one
+    /// the check refuses, and every kept name stays literal.
+    #[cfg(windows)]
+    #[test]
+    fn every_name_windows_rewrites_is_refused() {
+        let base = std::env::temp_dir().join("shardx-corpus-oracle");
+        for name in REFUSED_NAMES.iter().chain(KEPT_NAMES) {
+            let path = base.join(name);
+            let literal = std::path::absolute(&path).is_ok_and(|a| a == path);
+            if !literal {
+                assert!(normalize_rel(name).is_err(), "Windows rewrites {name:?}");
+            }
+        }
+        for name in KEPT_NAMES {
+            let path = base.join(name);
+            assert_eq!(std::path::absolute(&path).unwrap(), path, "{name:?}");
+        }
+    }
+
+    /// Case-fold collisions as NTFS folds them: the second spelling is
+    /// refused as a second entry, while names NTFS keeps apart (Unicode
+    /// normalization forms, fullwidth, dotless i, sharp s, Kelvin sign, final
+    /// sigma) both unpack as their own files.
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_case_fold_collisions_are_refused_and_distinct_names_kept() {
+        crate::volume::require_local_ntfs(&std::env::temp_dir()).unwrap();
+        for (i, (a, b)) in [
+            ("Preferences", "PREFERENCES"),
+            ("\u{c9}t\u{e9}", "\u{e9}T\u{c9}"),
+            ("\u{3a3}", "\u{3c3}"),
+            ("\u{416}", "\u{436}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (pa, pb) = (format!("Default/{a}"), format!("Default/{b}"));
+            let err = unpack_fresh(&format!("fold{i}"), &crafted(&[(&pa, false), (&pb, false)]))
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("two entries"),
+                "{a:?}/{b:?}: {err:#}"
+            );
+        }
+        for (i, (a, b)) in [
+            ("\u{e9}", "e\u{301}"),
+            ("\u{ff21}", "A"),
+            ("\u{131}", "I"),
+            ("\u{df}", "SS"),
+            ("\u{212a}", "k"),
+            ("\u{3c2}", "\u{3c3}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base =
+                std::env::temp_dir().join(format!("shardx-corpus-keep{i}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let dst = base.join("dst");
+            let (pa, pb) = (format!("Default/{a}"), format!("Default/{b}"));
+            unpack(&crafted(&[(&pa, false), (&pb, false)]), &dst).unwrap();
+            let names: Vec<String> = std::fs::read_dir(dst.join("Default"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert!(
+                names.contains(&a.to_string()) && names.contains(&b.to_string()),
+                "{names:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// Paths past `MAX_PATH` (260) unpack and read back through the
+    /// long-path form; one past the archive's own cap is refused.
+    #[test]
+    fn long_paths_unpack_and_an_overlong_one_is_refused() {
+        let segment = "s".repeat(100);
+        let long = format!("Default/{}/leaf.bin", [segment.as_str(); 4].join("/"));
+        let base = std::env::temp_dir().join(format!("shardx-corpus-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dst = base.join("dst");
+        unpack(&crafted(&[(&long, false)]), &dst).unwrap();
+        assert!(dst.join(&long).as_os_str().len() > 260);
+        assert_eq!(std::fs::read(dst.join(&long)).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let overlong = format!("Default/{}", [segment.as_str(); 41].join("/"));
+        assert!(overlong.len() > MAX_PATH_BYTES);
+        let err = unpack_fresh("overlong", &crafted(&[(&overlong, false)])).unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds"), "{err:#}");
+    }
+
+    /// `mklink /J`: a directory junction, which needs no privilege.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    /// Reparse points: pack does not follow a junction out of the profile,
+    /// and the swap that replaces a profile holding one removes the link,
+    /// never what it points at.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_neither_packed_through_nor_followed_on_replace() {
+        let base =
+            std::env::temp_dir().join(format!("shardx-corpus-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"OUTSIDE-BYTES").unwrap();
+        let udd = base.join("udd");
+        std::fs::create_dir_all(udd.join("Default")).unwrap();
+        std::fs::write(udd.join("Default/keep.txt"), b"inside").unwrap();
+        junction(&udd.join("Default").join("link"), &outside);
+        assert!(udd.join("Default/link/secret.txt").exists());
+
+        let bytes = pack(&udd).unwrap();
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let paths: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("keep.txt")), "{paths:?}");
+        assert!(!paths.iter().any(|p| p.contains("link")), "{paths:?}");
+
+        unpack(&bytes, &udd).unwrap();
+        assert_eq!(
+            std::fs::read(outside.join("secret.txt")).unwrap(),
+            b"OUTSIDE-BYTES"
+        );
+        assert!(std::fs::symlink_metadata(udd.join("Default/link")).is_err());
+        assert_eq!(
+            std::fs::read(udd.join("Default/keep.txt")).unwrap(),
+            b"inside"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

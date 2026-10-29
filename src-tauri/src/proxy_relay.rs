@@ -36,6 +36,8 @@ const CLIENT_IDLE: Duration = Duration::from_secs(120);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
 /// The upstream answers a SOCKS CONNECT only after reaching the target.
 const UPSTREAM_REPLY: Duration = Duration::from_secs(60);
+/// How long a closing connection waits for the client to finish sending.
+const DRAIN_LIMIT: Duration = Duration::from_secs(2);
 
 /// Bytes the engine carries inline unchanged. They are also exactly the bytes
 /// `form_urlencoded` leaves alone, so for credentials made only of these the
@@ -141,11 +143,14 @@ async fn accept_loop(listener: TcpListener, relay: Arc<Relay>) {
                     let relay = relay.clone();
                     connections.spawn(async move {
                         let _ = stream.set_nodelay(true);
-                        let client = BufReader::new(stream);
+                        let mut client = BufReader::new(stream);
                         let _ = match relay.upstream.kind {
-                            ProxyKind::Socks5 => relay.serve_socks(client).await,
-                            ProxyKind::Http | ProxyKind::Https => relay.serve_http(client).await,
+                            ProxyKind::Socks5 => relay.serve_socks(&mut client).await,
+                            ProxyKind::Http | ProxyKind::Https => {
+                                relay.serve_http(&mut client).await
+                            }
                         };
+                        close_gracefully(client).await;
                     });
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
@@ -153,6 +158,20 @@ async fn accept_loop(listener: TcpListener, relay: Arc<Relay>) {
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
+}
+
+/// Ends a client connection so the last reply survives. Closing a socket
+/// while client bytes sit unread in its receive buffer makes the OS send RST
+/// instead of FIN, and the client then loses the 502/407 or SOCKS refusal it
+/// has not read yet (Windows error 10054). So: half-close, read what is left
+/// until the client closes too or `DRAIN_LIMIT` passes, then close.
+async fn close_gracefully(mut client: BufReader<TcpStream>) {
+    let _ = client.get_mut().shutdown().await;
+    let mut sink = [0u8; 4096];
+    let _ = timeout(DRAIN_LIMIT, async {
+        while matches!(client.get_mut().read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
 }
 
 fn tls_connector() -> Result<tokio_rustls::TlsConnector> {
@@ -239,8 +258,8 @@ impl Relay {
         format!("Basic {}", STANDARD.encode(pair))
     }
 
-    async fn serve_http(&self, mut client: BufReader<TcpStream>) -> Result<()> {
-        let lines = timeout(CLIENT_IDLE, read_head(&mut client)).await??;
+    async fn serve_http(&self, client: &mut BufReader<TcpStream>) -> Result<()> {
+        let lines = timeout(CLIENT_IDLE, read_head(client)).await??;
         let (request_line, headers) = lines.split_first().context("empty request head")?;
         let expected = format!(
             "Basic {}",
@@ -294,7 +313,7 @@ impl Relay {
             }
         };
         upstream.write_all(&head).await?;
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        tokio::io::copy_bidirectional(client, &mut upstream).await?;
         Ok(())
     }
 
@@ -321,7 +340,7 @@ impl Relay {
         Ok((upstream, peer))
     }
 
-    async fn serve_socks(&self, mut client: BufReader<TcpStream>) -> Result<()> {
+    async fn serve_socks(&self, client: &mut BufReader<TcpStream>) -> Result<()> {
         let mut greeting = [0u8; 2];
         timeout(CLIENT_IDLE, client.read_exact(&mut greeting)).await??;
         anyhow::ensure!(greeting[0] == 0x05, "not SOCKS5");
@@ -350,7 +369,7 @@ impl Relay {
         let mut request = [0u8; 3];
         timeout(CLIENT_IDLE, client.read_exact(&mut request)).await??;
         anyhow::ensure!(request[0] == 0x05, "not SOCKS5");
-        let target = read_socks_addr(&mut client).await?;
+        let target = read_socks_addr(client).await?;
         let (mut upstream, peer) = match self.socks_upstream().await {
             Ok(upstream) => upstream,
             Err(_) => {
@@ -379,7 +398,7 @@ impl Relay {
         if reply[1] != 0x00 {
             return Ok(());
         }
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        tokio::io::copy_bidirectional(client, &mut upstream).await?;
         Ok(())
     }
 }
@@ -740,6 +759,26 @@ mod tests {
         let (_c, status) = socks_client(&relay, &user, &pass, dst).await;
         assert_eq!(status, 1);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A refusal survives client bytes the relay never reads: closing with
+    /// them unread used to send RST, which threw the 502 away (10054).
+    #[tokio::test]
+    async fn a_refusal_reaches_a_client_that_is_still_sending() {
+        let relay = start(entry(ProxyKind::Http, closed_port().await))
+            .await
+            .unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", relay.port)).await.unwrap();
+        let request = format!(
+            "POST http://127.0.0.1:9/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: {}\r\nContent-Length: 64\r\n\r\n",
+            token_basic(&relay)
+        );
+        c.write_all(request.as_bytes()).await.unwrap();
+        // The relay has read the head and is dialling the upstream; the body
+        // lands in its receive buffer and is never read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        c.write_all(&[b'x'; 64]).await.unwrap();
+        assert!(read_all(&mut c).await.starts_with(b"HTTP/1.1 502"));
     }
 
     #[tokio::test]

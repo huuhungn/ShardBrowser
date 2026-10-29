@@ -188,4 +188,176 @@ mod tests {
             "a short secret is no key: {err}"
         );
     }
+
+    // ---- G2-48 in a fresh process. The child is this test binary running an
+    // ignored test (see `crate::crash_harness`); restart, a locked session and
+    // a store made unavailable on the real machine are the manual check in
+    // `scripts/g2-48-credential-check.ps1`.
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    /// The real Windows Credential Manager entry, built as `entry` builds it
+    /// outside tests: service `shardx-launcher`, `persistence = Local`.
+    #[cfg(windows)]
+    fn real_entry(credential_ref: &str) -> keyring_core::Entry {
+        use keyring_core::api::CredentialStoreApi;
+        windows_native_keyring_store::Store::new()
+            .unwrap()
+            .build(
+                SERVICE,
+                credential_ref,
+                Some(&std::collections::HashMap::from([("persistence", "Local")])),
+            )
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child process of the G2-48 check"]
+    fn child_reads_and_deletes_the_real_credential() {
+        let (Some(credential_ref), Some(digest)) =
+            (env("SHARDX_G2_48_REF"), env("SHARDX_G2_48_SHA256"))
+        else {
+            return;
+        };
+        let entry = real_entry(&credential_ref);
+        let secret = Zeroizing::new(entry.get_secret().unwrap());
+        assert_eq!(sha256_hex(&secret), digest);
+        assert_eq!(entry.get_attributes().unwrap()["persistence"], "Local");
+        entry.delete_credential().unwrap();
+        println!("G2-48-CHILD-OK");
+    }
+
+    /// A key stored in the real OS store by one process is read back exactly
+    /// by a new process, filed as local (never roaming), and is gone for both
+    /// once that process deletes it.
+    #[cfg(windows)]
+    #[test]
+    fn a_real_os_store_key_survives_into_a_fresh_process() {
+        let credential_ref = format!("g2-48-test-{}", uuid::Uuid::new_v4().simple());
+        let mut key = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(&mut key[..]).unwrap();
+        let entry = real_entry(&credential_ref);
+        entry.set_secret(&key[..]).unwrap();
+        let digest = sha256_hex(&key[..]);
+        let child = crate::crash_harness::spawn(
+            "credential::tests::child_reads_and_deletes_the_real_credential",
+            "-",
+            &[
+                ("SHARDX_G2_48_REF", std::path::Path::new(&credential_ref)),
+                ("SHARDX_G2_48_SHA256", std::path::Path::new(&digest)),
+            ],
+        );
+        let read_back = crate::crash_harness::kill_after(child, "G2-48-CHILD-OK");
+        let gone = matches!(entry.get_secret(), Err(keyring_core::Error::NoEntry));
+        if !gone {
+            let _ = entry.delete_credential();
+        }
+        assert!(read_back, "the fresh process did not read the key back");
+        assert!(gone, "the fresh process did not delete the key");
+    }
+
+    #[test]
+    #[ignore = "child process of the G2-48 check"]
+    fn child_with_no_store_fails_closed() {
+        let Some(root) = env("SHARDX_G2_48_ROOT") else {
+            return;
+        };
+        crate::store::set_config_root(Some(root.into()));
+        OS_STORE_DOWN.with(|d| d.set(true));
+        let err = store("device-hpke.g2-48", &[5; 32]).unwrap_err();
+        assert!(err.to_string().contains("credential.unavailable"), "{err}");
+        let err = load("device-hpke.g2-48").unwrap_err();
+        assert!(err.to_string().contains("credential.unavailable"), "{err}");
+        println!("G2-48-CHILD-OK");
+    }
+
+    /// With no OS store and no key file a fresh process refuses to store or
+    /// load a key, and writes nothing to disk: no insecure fallback.
+    #[test]
+    fn an_unavailable_store_fails_closed_in_a_fresh_process() {
+        let root = tempfile::tempdir().unwrap();
+        let child = crate::crash_harness::spawn(
+            "credential::tests::child_with_no_store_fails_closed",
+            "-",
+            &[("SHARDX_G2_48_ROOT", root.path())],
+        );
+        assert!(crate::crash_harness::kill_after(child, "G2-48-CHILD-OK"));
+        fn files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir).map_or(0, |entries| {
+                entries
+                    .map(|e| e.unwrap().path())
+                    .map(|p| if p.is_dir() { files(&p) } else { 1 })
+                    .sum()
+            })
+        }
+        assert_eq!(files(root.path()), 0, "something was written");
+    }
+
+    #[test]
+    #[ignore = "child process of the G2-48 check"]
+    fn child_unlocks_the_key_file() {
+        let (Some(root), Some(digest)) = (env("SHARDX_G2_48_ROOT"), env("SHARDX_G2_48_SHA256"))
+        else {
+            return;
+        };
+        crate::store::set_config_root(Some(root.into()));
+        OS_STORE_DOWN.with(|d| d.set(true));
+        let err = load("device-hpke.g2-48").unwrap_err();
+        assert!(err.to_string().contains("credential.locked"), "{err}");
+        crate::key_file::unlock("g2-48 test passphrase").unwrap();
+        assert_eq!(sha256_hex(&load("device-hpke.g2-48").unwrap()[..]), digest);
+        println!("G2-48-CHILD-OK");
+    }
+
+    #[test]
+    #[ignore = "child process of the G2-48 check"]
+    fn child_files_a_key_in_the_key_file() {
+        let Some(root) = env("SHARDX_G2_48_ROOT") else {
+            return;
+        };
+        crate::store::set_config_root(Some(root.into()));
+        OS_STORE_DOWN.with(|d| d.set(true));
+        crate::key_file::create("g2-48 test passphrase").unwrap();
+        store("device-hpke.g2-48", &[0x48; 32]).unwrap();
+        println!("G2-48-CHILD-OK");
+    }
+
+    /// A key that went to the key file because the OS store was unavailable
+    /// is there for a fresh process, locked until the passphrase opens it.
+    /// Both runs are child processes: the config root and the open key file
+    /// are process-global, and a locked file under the root would fail the
+    /// other credential tests running beside this one.
+    #[test]
+    fn a_key_file_key_is_locked_then_served_in_a_fresh_process() {
+        let root = tempfile::tempdir().unwrap();
+        let child = crate::crash_harness::spawn(
+            "credential::tests::child_files_a_key_in_the_key_file",
+            "-",
+            &[("SHARDX_G2_48_ROOT", root.path())],
+        );
+        assert!(crate::crash_harness::kill_after(child, "G2-48-CHILD-OK"));
+        let child = crate::crash_harness::spawn(
+            "credential::tests::child_unlocks_the_key_file",
+            "-",
+            &[
+                ("SHARDX_G2_48_ROOT", root.path()),
+                (
+                    "SHARDX_G2_48_SHA256",
+                    std::path::Path::new(&sha256_hex(&[0x48; 32])),
+                ),
+            ],
+        );
+        assert!(crate::crash_harness::kill_after(child, "G2-48-CHILD-OK"));
+    }
 }
