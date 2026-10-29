@@ -2202,4 +2202,520 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), before, "{what}");
         }
     }
+
+    use rusqlite::types::Value as Sql;
+
+    /// A `COMMIT` operation of server `s`, instance `i` and epoch `epoch`.
+    fn commit_op_sql(op: &str, s: &str, i: &str, epoch: i64, scope: &str, key: &str) -> String {
+        format!(
+            "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
+               server_id, server_instance_id, restore_epoch, tenant_id, fleet_id,
+               remote_profile_id, snapshot_id, manifest_replay_id, operation_scope, kind,
+               idempotency_key, canonical_request_hash, exact_request_bytes,
+               exact_request_bytes_sha256, remote_upload_id, lease_id, fencing_token,
+               base_version, intent_hash, ciphertext_sha256, signed_manifest_container_bytes,
+               signed_manifest_container_hash, signed_manifest_container_bytes_sha256, state,
+               created_at, updated_at)
+             VALUES ('{op}', 'p', 'p', '{s}', '{i}', {epoch}, '{i}', '{i}', '{i}', zeroblob(16),
+               zeroblob(16), '{scope}', 'COMMIT', '{key}', zeroblob(32), x'01', zeroblob(32),
+               'up-{op}', 'aa', 1, 0, zeroblob(32), zeroblob(32), x'01', zeroblob(32),
+               zeroblob(32), 'PENDING', 't', 't');"
+        )
+    }
+
+    /// The upload session of the `COMMIT` operation `op`, with the identity
+    /// and replay columns `snapshot`, `replay` and `upload`, under key
+    /// generation `generation` of fleet key `fkek`.
+    #[allow(clippy::too_many_arguments)]
+    fn session_sql(
+        id: &str,
+        op: &str,
+        s: &str,
+        i: &str,
+        epoch: i64,
+        ids: (&str, &str, &str),
+        scope_key: (&str, &str),
+        generation: i64,
+    ) -> String {
+        let (upload, snapshot, replay) = ids;
+        let (scope, key) = scope_key;
+        format!(
+            "INSERT INTO upload_sessions(upload_local_id, local_profile_id,
+               local_profile_id_at_request, commit_op_id, server_id, server_instance_id,
+               restore_epoch, tenant_id, fleet_id, remote_profile_id, remote_upload_id,
+               snapshot_id, manifest_replay_id, operation_scope, idempotency_key,
+               canonical_request_hash, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
+               key_generation, committed_offset, expected_ciphertext_sha256,
+               expected_ciphertext_size, spool_ref, state, retry_state, created_at, updated_at)
+             VALUES ('{id}', 'p', 'p', '{op}', '{s}', '{i}', {epoch}, '{i}', '{i}', '{i}',
+               '{upload}', x'{snapshot}', x'{replay}', '{scope}', '{key}', zeroblob(32),
+               x'{intent}', x'{preamble}', x'{slot}', '{fkek}', {generation}, 7,
+               x'{digest}', 100, '{id}.part', 'OPEN', 'NONE', 't', 't');",
+            intent = "31".repeat(32),
+            preamble = "32".repeat(32),
+            slot = "33".repeat(32),
+            digest = "34".repeat(32),
+            fkek = "cd".repeat(32),
+        )
+    }
+
+    /// Probe 4 (L2038, G2-36): an upload session keeps its identity, replay
+    /// and resume columns across a reopen. A second session cannot reuse the
+    /// upload, snapshot, replay or scope and key of the first, nor bind to a
+    /// commit operation of another instance, epoch or server, nor to a fleet
+    /// key of another instance. `READY` and `COMMITTED` need the finalize
+    /// response bytes, and `COMMITTED` the commit receipt binding bytes,
+    /// with their hashes.
+    #[test]
+    fn an_upload_session_refuses_a_second_identity_and_a_stranger_commit_or_key() {
+        let (_dir, path) = fresh();
+        let i = "11".repeat(16);
+        let other = "22".repeat(16);
+        let (snap1, snap2) = ("a1".repeat(16), "a2".repeat(16));
+        let (rep1, rep2) = ("b1".repeat(16), "b2".repeat(16));
+        {
+            let db = Db::open_at(&path).unwrap();
+            fixtures::seed_binding(&db.conn, "s", "p", &i, &i, &i, &i, 0);
+            db.conn
+                .execute_batch(&format!(
+                    "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                       server_instance_id, last_restore_epoch, status)
+                     VALUES ('s2', 'https', 'two.test', 443, 'SYSTEM', '{other}', 0, 'ACTIVE');
+                     {}{}{}{}",
+                    commit_op_sql("op1", "s", &i, 0, "scope1", "k1"),
+                    commit_op_sql("op2", "s", &i, 0, "scope2", "k2"),
+                    commit_op_sql("op3", "s", &i, 3, "scope3", "k3"),
+                    commit_op_sql("op4", "s2", &other, 0, "scope4", "k4"),
+                ))
+                .unwrap();
+            let first = session_sql(
+                "u1",
+                "op1",
+                "s",
+                &i,
+                0,
+                ("up1", &snap1, &rep1),
+                ("scope1", "k1"),
+                1,
+            );
+            db.conn.execute_batch(&first).unwrap();
+        }
+        // The session reopens exactly.
+        let db = Db::open_at(&path).unwrap();
+        let kept: (String, String, String, i64, i64, i64, String, String) = db
+            .conn
+            .query_row(
+                "SELECT remote_upload_id, hex(snapshot_id), hex(manifest_replay_id),
+                   committed_offset, expected_ciphertext_size, key_generation,
+                   hex(intent_hash) || hex(preamble_sha256) || hex(dek_slot_sha256),
+                   hex(expected_ciphertext_sha256)
+                 FROM upload_sessions",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            kept,
+            (
+                "up1".into(),
+                snap1.to_uppercase(),
+                rep1.to_uppercase(),
+                7,
+                100,
+                1,
+                format!("{}{}{}", "31".repeat(32), "32".repeat(32), "33".repeat(32)),
+                "34".repeat(32)
+            )
+        );
+        let ok = session_sql(
+            "u2",
+            "op2",
+            "s",
+            &i,
+            0,
+            ("up2", &snap2, &rep2),
+            ("scope2", "k2"),
+            1,
+        );
+        for (what, sql) in [
+            (
+                "the same upload",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s",
+                    &i,
+                    0,
+                    ("up1", &snap2, &rep2),
+                    ("scope2", "k2"),
+                    1,
+                ),
+            ),
+            (
+                "the same snapshot",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap1, &rep2),
+                    ("scope2", "k2"),
+                    1,
+                ),
+            ),
+            (
+                "the same replay",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep1),
+                    ("scope2", "k2"),
+                    1,
+                ),
+            ),
+            (
+                "the same scope and key",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope1", "k1"),
+                    1,
+                ),
+            ),
+            (
+                "the same commit operation",
+                session_sql(
+                    "u2",
+                    "op1",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope2", "k2"),
+                    1,
+                ),
+            ),
+            (
+                "a commit operation of another epoch",
+                session_sql(
+                    "u2",
+                    "op3",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope3", "k3"),
+                    1,
+                ),
+            ),
+            (
+                "a commit operation of another instance",
+                session_sql(
+                    "u2",
+                    "op4",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope4", "k4"),
+                    1,
+                ),
+            ),
+            (
+                "a commit operation of another server",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s2",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope2", "k2"),
+                    1,
+                ),
+            ),
+            (
+                "a fleet key of another instance",
+                session_sql(
+                    "u2",
+                    "op4",
+                    "s2",
+                    &other,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope4", "k4"),
+                    1,
+                ),
+            ),
+            (
+                "a generation that is not filed",
+                session_sql(
+                    "u2",
+                    "op2",
+                    "s",
+                    &i,
+                    0,
+                    ("up2", &snap2, &rep2),
+                    ("scope2", "k2"),
+                    2,
+                ),
+            ),
+        ] {
+            let sql = format!("SAVEPOINT p; {sql}");
+            assert!(db.conn.execute_batch(&sql).is_err(), "{what}");
+            db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        }
+        // Nothing but the first session was kept; a second, distinct one is.
+        let sessions = |db: &Db| -> i64 {
+            db.conn
+                .query_row("SELECT count(*) FROM upload_sessions", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(sessions(&db), 1);
+        db.conn.execute_batch(&ok).unwrap();
+        assert_eq!(sessions(&db), 2);
+
+        // READY and COMMITTED need the bytes they stand on, with their hashes.
+        let set = |sql: &str| db.conn.execute_batch(&format!("SAVEPOINT p; {sql}"));
+        let undo = || db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        for (what, sql) in [
+            (
+                "READY with no finalize response",
+                "UPDATE upload_sessions SET state = 'READY'",
+            ),
+            (
+                "COMMITTED with no finalize response",
+                "UPDATE upload_sessions SET state = 'COMMITTED'",
+            ),
+            (
+                "COMMITTED with no receipt binding",
+                "UPDATE upload_sessions SET state = 'COMMITTED',
+                   exact_finalize_response_bytes = x'01', finalize_response_sha256 = zeroblob(32)",
+            ),
+            (
+                "COMMITTED with a receipt binding but no finalize response",
+                "UPDATE upload_sessions SET state = 'COMMITTED',
+                   exact_commit_receipt_binding_bytes = x'02',
+                   commit_receipt_binding_bytes_sha256 = zeroblob(32)",
+            ),
+            (
+                "finalize bytes with no hash",
+                "UPDATE upload_sessions SET exact_finalize_response_bytes = x'01'",
+            ),
+            (
+                "a receipt binding with no hash",
+                "UPDATE upload_sessions SET exact_commit_receipt_binding_bytes = x'02'",
+            ),
+            (
+                "a receipt hash of the wrong length",
+                "UPDATE upload_sessions SET exact_commit_receipt_binding_bytes = x'02',
+                   commit_receipt_binding_bytes_sha256 = zeroblob(31)",
+            ),
+        ] {
+            assert!(
+                set(&format!("{sql} WHERE upload_local_id = 'u2'")).is_err(),
+                "{what}"
+            );
+            undo();
+        }
+        db.conn
+            .execute_batch(
+                "UPDATE upload_sessions SET state = 'READY',
+                   exact_finalize_response_bytes = x'01', finalize_response_sha256 = zeroblob(32)
+                 WHERE upload_local_id = 'u2';
+                 UPDATE upload_sessions SET state = 'COMMITTED',
+                   exact_commit_receipt_binding_bytes = x'02',
+                   commit_receipt_binding_bytes_sha256 = zeroblob(32)
+                 WHERE upload_local_id = 'u2'",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let (state, finalize, receipt): (String, Vec<u8>, Vec<u8>) = db
+            .conn
+            .query_row(
+                "SELECT state, exact_finalize_response_bytes, exact_commit_receipt_binding_bytes
+                 FROM upload_sessions WHERE upload_local_id = 'u2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (state.as_str(), finalize, receipt),
+            ("COMMITTED", vec![1], vec![2])
+        );
+        assert_eq!(sessions(&db), 2);
+    }
+
+    /// Probe 10 (L2045, G2-42) on the sync tables, the integer classes of
+    /// version 3: version (`remote_version`, `base_version`, the epochs),
+    /// fencing (`fencing_token`) and offset and size (`committed_offset`,
+    /// `expected_ciphertext_size`), with the retry counts. Both bounds are kept
+    /// exactly across a reopen; one past either bound, 2^63, 2^64 - 1, a
+    /// fraction, and text or bytes that name no integer are refused with the
+    /// value left as it was. STRICT converts text or a real naming an in-range
+    /// integer losslessly, so that is stored as the exact INTEGER.
+    #[test]
+    fn every_sync_integer_class_keeps_its_range_across_a_reopen() {
+        let (_dir, path) = fresh();
+        let i = "11".repeat(16);
+        let db = Db::open_at(&path).unwrap();
+        fixtures::seed_binding(&db.conn, "s", "p", &i, &i, &i, &i, 0);
+        db.conn
+            .execute_batch(&format!(
+                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1,
+                   lease_expires_at = 'x' WHERE local_profile_id = 'p';
+                 {}{}",
+                commit_op_sql("op1", "s", &i, 0, "scope1", "k1"),
+                session_sql(
+                    "u1",
+                    "op1",
+                    "s",
+                    &i,
+                    0,
+                    ("up1", &"a1".repeat(16), &"b1".repeat(16)),
+                    ("scope1", "k1"),
+                    1,
+                ),
+            ))
+            .unwrap();
+        // A release request no upload hangs on, whose epoch can move alone.
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
+                   server_id, server_instance_id, restore_epoch, tenant_id, fleet_id,
+                   remote_profile_id, operation_scope, kind, idempotency_key,
+                   canonical_request_hash, exact_request_bytes, exact_request_bytes_sha256, state,
+                   created_at, updated_at)
+                 VALUES ('rel', 'p', 'p', 's', '{i}', 0, '{i}', '{i}', '{i}', 'scope-rel',
+                   'RELEASE', 'k-rel', zeroblob(32), x'01', zeroblob(32), 'PENDING', 't', 't')"
+            ))
+            .unwrap();
+        let max = i64::MAX;
+        let bound = "local_profile_id = 'p'";
+        let rel = "op_id = 'rel'";
+        let up = "upload_local_id = 'u1'";
+        // (table, column, SET tail, row, lowest, highest). `remote_version`
+        // names a head exactly when it is not 0 (L1796).
+        let head = ", last_observed_head_hash = CASE WHEN ?1 = 0 THEN NULL ELSE zeroblob(32) END";
+        let probes = [
+            ("profile_bindings", "remote_version", head, bound, 0, max),
+            ("profile_bindings", "base_version", "", bound, 0, max),
+            (
+                "profile_bindings",
+                "accepted_restore_epoch",
+                "",
+                bound,
+                0,
+                max,
+            ),
+            ("profile_bindings", "fencing_token", "", bound, 0, max),
+            ("operations", "restore_epoch", "", rel, 0, max),
+            ("operations", "fencing_token", "", rel, 0, max),
+            ("operations", "base_version", "", rel, 0, max),
+            ("operations", "retry_count", "", rel, 0, max),
+            ("upload_sessions", "retry_count", "", up, 0, max),
+            // The size first, with the offset at 0; then the offset, with the
+            // size at its highest: the offset never passes the size.
+            (
+                "upload_sessions",
+                "expected_ciphertext_size",
+                ", committed_offset = 0",
+                up,
+                0,
+                max,
+            ),
+            ("upload_sessions", "committed_offset", "", up, 0, max),
+        ];
+        let set = |table: &str, col: &str, tail: &str, row: &str, v: Sql| {
+            db.conn.execute(
+                &format!("UPDATE {table} SET {col} = ?1{tail} WHERE {row}"),
+                [v],
+            )
+        };
+        let get = |db: &Db, table: &str, col: &str, row: &str| -> (Sql, String) {
+            db.conn
+                .query_row(
+                    &format!("SELECT {col}, typeof({col}) FROM {table} WHERE {row}"),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        for (table, col, tail, row, lo, hi) in &probes {
+            let at = format!("{table}.{col}");
+            for v in [*lo, *hi] {
+                assert_eq!(
+                    set(table, col, tail, row, Sql::Integer(v)).unwrap(),
+                    1,
+                    "{at} = {v}"
+                );
+            }
+            let bad = [
+                Sql::Integer(lo - 1),
+                Sql::Real(2f64.powi(63)),
+                Sql::Real(u64::MAX as f64),
+                Sql::Real(0.5),
+                Sql::Text("zero".into()),
+                Sql::Text("9223372036854775808".into()),
+                Sql::Text("-1".into()),
+                Sql::Blob(vec![1]),
+            ];
+            for v in bad {
+                assert!(
+                    set(table, col, tail, row, v.clone()).is_err(),
+                    "{at} = {v:?}"
+                );
+                assert_eq!(get(&db, table, col, row).0, Sql::Integer(*hi), "{at}");
+            }
+            // Lossless conversions land as the exact integer.
+            for v in [Sql::Text(hi.to_string()), Sql::Real(*lo as f64)] {
+                set(table, col, tail, row, v).unwrap();
+            }
+            assert_eq!(
+                get(&db, table, col, row),
+                (Sql::Integer(*lo), "integer".into()),
+                "{at}"
+            );
+            set(table, col, tail, row, Sql::Integer(*hi)).unwrap();
+        }
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        for (table, col, _, row, _, hi) in &probes {
+            assert_eq!(
+                get(&db, table, col, row),
+                (Sql::Integer(*hi), "integer".into()),
+                "{table}.{col}"
+            );
+        }
+        // The head stays what the version says.
+        let heads: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM profile_bindings WHERE last_observed_head_hash IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(heads, 1);
+    }
 }

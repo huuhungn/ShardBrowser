@@ -4928,6 +4928,43 @@ mod tests {
         }
     }
 
+    /// Probe 10 (L2045, G2-42), the wire side of the sync tables: the
+    /// conversion to a row refuses an integer past `i64::MAX` with
+    /// `WIRE_INTEGER_OUT_OF_RANGE`, and a lease whose expiry is one never
+    /// parses, so it reaches no row, whether it arrives in a checkout's or a
+    /// publish's reply.
+    #[test]
+    fn a_server_integer_past_the_signed_range_is_refused_before_any_row() {
+        assert_eq!(wire(i64::MAX as u64).unwrap(), i64::MAX);
+        for past in [1u64 << 63, u64::MAX] {
+            assert_eq!(
+                wire(past).unwrap_err().to_string(),
+                "WIRE_INTEGER_OUT_OF_RANGE"
+            );
+        }
+        for publish in [false, true] {
+            let w = if publish { world_unbound() } else { world() };
+            w.fake().expires = Some(u64::MAX);
+            let err = if publish {
+                w.publish().map(|_| ()).unwrap_err()
+            } else {
+                w.push().map(|_| ()).unwrap_err()
+            };
+            assert!(has(&err, "sync.badReplySync"), "publish {publish}: {err:#}");
+            let rows = |w: &World| {
+                w.count(
+                    "SELECT count(*) FROM profile_bindings
+                     WHERE lease_id IS NOT NULL OR lease_expires_at IS NOT NULL",
+                )
+            };
+            assert_eq!(rows(&w), 0, "publish {publish}");
+            if publish {
+                assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+                assert!(!is_published(LOCAL).unwrap());
+            }
+        }
+    }
+
     /// Rule 6, first acceptance: a new head is restored only while its
     /// signer holds, now, an approval and a device-scoped `profile.commit`
     /// covering the profile or its fleet.
