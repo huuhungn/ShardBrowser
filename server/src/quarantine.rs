@@ -10,6 +10,7 @@
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 
+use crate::routes::v2_device_revoke::verified_container;
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +49,13 @@ pub struct Mark {
 
 /// Records `mark`; `true` if the grant was not quarantined before. A device
 /// revocation's mark also records the SHA-256 of the container bytes its row
-/// holds now (none if the row is gone), so that only that container can be
-/// served again.
+/// holds now, so that only that container can be served again, but only when
+/// those bytes verify as a revocation on their own. Corrupt bytes (or a row
+/// that is gone) leave no hash: they are no container to hold the row to, and
+/// the row is served again once it verifies.
 pub async fn record(pool: &SqlitePool, mark: &Mark) -> sqlx::Result<bool> {
     let container_sha256 = if mark.kind == Kind::DeviceRevocation {
-        sqlx::query_scalar::<_, Vec<u8>>(
+        let exact = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT exact_signed_container_bytes FROM v2_device_revocations
               WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?",
         )
@@ -60,8 +63,16 @@ pub async fn record(pool: &SqlitePool, mark: &Mark) -> sqlx::Result<bool> {
         .bind(mark.tenant_id.as_slice())
         .bind(mark.replay_id.as_slice())
         .fetch_optional(pool)
-        .await?
-        .map(|bytes| Sha256::digest(bytes).to_vec())
+        .await?;
+        match exact {
+            Some(exact) => {
+                let mut conn = pool.acquire().await?;
+                verified_container(&mut conn, &mark.tenant_id, &exact)
+                    .await?
+                    .map(|_| Sha256::digest(&exact).to_vec())
+            }
+            None => None,
+        }
     } else {
         None
     };

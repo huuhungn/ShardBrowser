@@ -2411,17 +2411,42 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
     )
     .await;
 
-    // A mark that holds no container hash cannot say what was quarantined,
-    // so its row is not served again, however intact.
+    // A mark whose hash is not that of the container the row holds: the row
+    // is intact but is not what was quarantined, and the restore says what to
+    // put back.
     let mark = "INSERT INTO v2_grant_quarantine
            (kind, server_instance_id, tenant_id, replay_id, reason, created_at,
             container_sha256)
          SELECT 'device_revocation', server_instance_id, tenant_id, replay_id,
                 'container_mismatch', 't', ";
+    exec(
+        &d,
+        &format!("{mark}zeroblob(32) FROM v2_device_revocations"),
+    )
+    .await;
+    assert_refused_cleanly(
+        &d,
+        txn,
+        "another container than the one that was quarantined",
+    )
+    .await;
+    assert_refused_cleanly(
+        &d,
+        txn,
+        "restoring the quarantined container and restarting clears it",
+    )
+    .await;
+
+    // A mark with no hash (the container was corrupt when it was marked) is
+    // served again once the row verifies, so it does not stop a restore.
+    reset(&d);
+    let third = peer(&d, &w.dev, 0x77, w.instance).await;
+    revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
     exec(&d, &format!("{mark}NULL FROM v2_device_revocations")).await;
-    assert_refused_cleanly(&d, txn, "not the container that was quarantined").await;
-    // A row marked with the hash of the container it holds is served again,
-    // so the mark alone does not stop a restore.
+    ok(prepare(&d, None, txn));
+    ok(cli(&d, &["restore", "commit"]));
+    assert_restored(&d, txn).await;
+
     // The same restore with the mark holding the hash of the container the
     // row holds is served again, so the mark alone does not stop it.
     reset(&d);

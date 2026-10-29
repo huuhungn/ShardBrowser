@@ -207,25 +207,52 @@ fn write_counts(file: &Path, entries: &[(String, u64)]) -> anyhow::Result<()> {
 
 const CORRUPT_INFIX: &str = ".corrupt-";
 
-/// Renames a corrupt count file to `<name>.corrupt-<unix_ms>` (never over
+/// Sets a corrupt count file aside as `<name>.corrupt-<unix_ms>` (never over
 /// another) and puts a new file with the lines that were understood in its
-/// place; the new file is complete before the old one moves, so no valid line
-/// is only in the corrupt file. Returns the corrupt file's new path.
+/// place. The aside name is made with a hard link, which is atomic and fails
+/// if the name exists, so the count file is never absent: until the new file
+/// is renamed over it, a crash leaves the corrupt file in place (and the next
+/// start sets it aside again). On a filesystem without hard links the file is
+/// renamed instead, with a window between the two renames. Returns the aside
+/// path.
 fn set_aside(file: &Path, valid: &[(String, u64)]) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    let tmp = write_tmp(file, valid)?;
-    let mut ms = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    set_aside_then(file, valid, now, || Ok(()))
+}
+
+/// [`set_aside`] from the name stamped `start_ms` on (the next free one), and
+/// running `after_aside` once the aside name exists and the new file is not
+/// yet installed (the instant a crash would leave behind).
+fn set_aside_then(
+    file: &Path,
+    valid: &[(String, u64)],
+    start_ms: u128,
+    after_aside: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let tmp = write_tmp(file, valid)?;
+    let mut ms = start_ms;
+    let name = |ms: u128| file.with_file_name(format!("{FAILURES_FILE}{CORRUPT_INFIX}{ms}"));
     let aside = loop {
-        let name = format!("{FAILURES_FILE}{CORRUPT_INFIX}{ms}");
-        let candidate = file.with_file_name(name);
-        if std::fs::symlink_metadata(&candidate).is_err() {
-            break candidate;
+        let candidate = name(ms);
+        match std::fs::hard_link(file, &candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ms += 1,
+            Err(_) => {
+                // No hard links here: rename, to a name nothing holds.
+                while std::fs::symlink_metadata(name(ms)).is_ok() {
+                    ms += 1;
+                }
+                let candidate = name(ms);
+                std::fs::rename(file, &candidate)
+                    .with_context(|| format!("setting {} aside", file.display()))?;
+                break candidate;
+            }
         }
-        ms += 1;
     };
-    std::fs::rename(file, &aside).with_context(|| format!("setting {} aside", file.display()))?;
+    after_aside()?;
     std::fs::rename(&tmp, file).with_context(|| format!("installing {}", file.display()))?;
     sync_parent(file)?;
     Ok(aside)
@@ -672,6 +699,61 @@ mod tests {
         assert_eq!(clear_episode(&f.data_dir, "record-9").unwrap(), Some(9));
         assert_eq!(corrupt_files(&f.data_dir).len(), 3);
         assert!(aside.exists());
+    }
+
+    /// V3: setting a corrupt file aside never leaves the count file absent. At
+    /// the instant a crash would leave behind (the aside name made, the new
+    /// file not installed) the corrupt file is still where it was, and the next
+    /// start keeps the valid lines.
+    #[tokio::test]
+    async fn a_crash_while_setting_a_file_aside_never_loses_the_valid_lines() {
+        let f = Fixture::new("crash").await;
+        let file = f.dir.join(FAILURES_FILE);
+        std::fs::write(&file, "record-9 9\njunk\n").unwrap();
+        let valid = vec![("record-9".to_string(), 9)];
+        let crashed = set_aside_then(&file, &valid, 7, || {
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "record-9 9\njunk\n",
+                "the count file is not absent"
+            );
+            anyhow::bail!("crash")
+        });
+        assert!(crashed.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "record-9 9\njunk\n"
+        );
+        // The aside copy is there, with the same content.
+        let files = corrupt_files(&f.data_dir);
+        assert_eq!(files.len(), 2, "{files:?}");
+        let aside = files.iter().find(|p| **p != file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(aside).unwrap(),
+            "record-9 9\njunk\n"
+        );
+        // Names already taken are skipped, never overwritten: the next free one
+        // after the stamp is used.
+        let taken = f.dir.join("audit-ro-failures.corrupt-8");
+        std::fs::write(&taken, "other").unwrap();
+        let third = set_aside_then(&file, &valid, 7, || Ok(())).unwrap();
+        assert_eq!(third, f.dir.join("audit-ro-failures.corrupt-9"));
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "other");
+        std::fs::write(&file, "record-9 9\njunk\n").unwrap();
+        // The next start sets it aside again and keeps the valid line.
+        let again = init_read_only_count(&f.data_dir, Some("txn-b"))
+            .unwrap()
+            .expect("set aside again");
+        assert_ne!(&again, aside, "an earlier aside is never overwritten");
+        assert_eq!(kept_failures(&f.data_dir, Some("txn-b")), ["record-9 9"]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "record-9 9\ntxn-b 0\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(aside).unwrap(),
+            "record-9 9\njunk\n"
+        );
     }
 
     /// L2: the count is replaced atomically, and a file that is not a count
