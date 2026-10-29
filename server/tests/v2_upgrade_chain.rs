@@ -169,6 +169,13 @@ fn upload(upload: &str, snapshot: u8, generation: u8) -> String {
     )
 }
 
+/// The root self-grant's quarantine, recorded as `kind`.
+fn quarantined(kind: &str) -> String {
+    format!(
+        "INSERT INTO v2_grant_quarantine VALUES ('{kind}', {I}, {T},          x'61616161616161616161616161616161', 'container_mismatch', 't')"
+    )
+}
+
 /// The populated database just before `version`. Tables a migration
 /// creates get their rows right after it.
 async fn world_before(version: i64) -> SqlitePool {
@@ -177,6 +184,9 @@ async fn world_before(version: i64) -> SqlitePool {
     exec(&pool, WORLD_0016).await.unwrap();
     for v in 17..version {
         migrate_to(&pool, v).await;
+        if v == 19 {
+            exec(&pool, &quarantined("root_grant")).await.unwrap();
+        }
         if v == 26 {
             exec(&pool, &upload(UPLOAD, 0x82, 0)).await.unwrap();
         }
@@ -260,6 +270,12 @@ fn guard(version: i64) -> (String, String, &'static str) {
             ),
             "DELETE FROM v2_upload_quarantine".into(),
             "an upload quarantine is never removed",
+        ),
+        // The rebuilt quarantine takes fleet grants and is still kept.
+        28 => (
+            quarantined("fleet_rotation_grant"),
+            "DELETE FROM v2_grant_quarantine".into(),
+            "a grant quarantine is never removed",
         ),
         _ => unreachable!("no guard for {version}"),
     }
@@ -385,6 +401,17 @@ async fn m0027_upgraded_uploads_keep_their_terms_and_quarantines_are_kept() {
         .await,
         ["'OPEN'|NULL|NULL"]
     );
+}
+
+#[tokio::test]
+async fn m0028_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_fleet_grants() {
+    let pool = upgrade(28).await;
+    for kind in ["capability_grant", "unknown_kind"] {
+        let e = exec(&pool, &quarantined(kind)).await;
+        assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
+    }
+    let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
+    assert!(e.contains("a grant is quarantined once"), "{e}");
 }
 
 // ------------------------------------------------- the v0.1.28 database ---

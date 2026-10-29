@@ -10,6 +10,7 @@
 //! writes off.
 
 use anyhow::Result;
+use shared::fleet_lifecycle::FleetGrantVariant;
 use shared::grants::HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305 as HPKE_SUITE;
 use shared::keys::{hpke_key_id, signing_key_id};
 use shared::signing::{Ed25519VerifyingKey, SIGNATURE_SUITE_ID_ED25519 as SIGNING_SUITE};
@@ -18,7 +19,7 @@ use sqlx::{Row, SqlitePool};
 use crate::error::AppError;
 use crate::identity::{ReasonCode, Refusal, Verified};
 use crate::quarantine::{self, Kind, Mark};
-use crate::routes::{v2_capability, v2_root_grants};
+use crate::routes::{v2_capability, v2_fleet, v2_root_grants};
 use crate::util;
 
 /// Why a device's stored keys cannot be trusted.
@@ -198,9 +199,9 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
     Ok(quarantined)
 }
 
-/// Quarantines every root and capability grant of this instance whose row
-/// disagrees with its signed container, through the same checks every request
-/// path uses. Returns how many it newly quarantined.
+/// Quarantines every root, capability and fleet key grant of this instance
+/// whose row disagrees with its signed container, through the same checks
+/// every request path uses. Returns how many it newly quarantined.
 async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
     let instance = v.server_instance_id;
     let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
@@ -253,6 +254,32 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
                 replay_id: replay,
             };
             quarantined += usize::from(quarantine::record(pool, &mark).await?);
+        }
+    }
+    for variant in [
+        FleetGrantVariant::DeviceHpke,
+        FleetGrantVariant::Recovery,
+        FleetGrantVariant::Rotation,
+    ] {
+        let fleet = sqlx::query(&format!(
+            "SELECT tenant_id, replay_id FROM {} WHERE server_instance_id = ?",
+            v2_fleet::table_of(variant)
+        ))
+        .bind(instance.as_slice())
+        .fetch_all(pool)
+        .await?;
+        for row in fleet {
+            let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
+            let mut conn = pool.acquire().await?;
+            let checked = v2_fleet::load_fleet_grant(&mut conn, v, &tenant, variant, &replay).await;
+            drop(conn);
+            match checked {
+                Ok(_) => {}
+                Err(AppError::Quarantine(mark)) => {
+                    quarantined += usize::from(quarantine::record(pool, &mark).await?)
+                }
+                Err(e) => anyhow::bail!("checking a fleet grant failed: {e:?}"),
+            }
         }
     }
     Ok(quarantined)

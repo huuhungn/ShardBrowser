@@ -43,9 +43,21 @@ const KINDS: [(&str, Option<&str>, bool); 7] = [
     ("v2_device_approvals", None, true),
     ("v2_capability_grants", Some("capability_grant"), true),
     (REVOCATIONS, None, false),
-    ("v2_fleet_device_hpke_grants", None, false),
-    ("v2_fleet_recovery_grants", None, false),
-    ("v2_fleet_rotation_grants", None, false),
+    (
+        "v2_fleet_device_hpke_grants",
+        Some("fleet_device_hpke_grant"),
+        false,
+    ),
+    (
+        "v2_fleet_recovery_grants",
+        Some("fleet_recovery_grant"),
+        false,
+    ),
+    (
+        "v2_fleet_rotation_grants",
+        Some("fleet_rotation_grant"),
+        false,
+    ),
 ];
 const REVOCATIONS: &str = "v2_device_revocations";
 
