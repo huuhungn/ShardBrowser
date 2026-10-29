@@ -2,7 +2,8 @@
 //! lives in `0..=i64::MAX` (narrower where its class is bounded). Per class,
 //! the request decoder and the SQL CHECK accept the domain's ends and refuse
 //! -1, 2^63, u64::MAX, a float, text and an overlong form; and every INTEGER
-//! column of every v2 table carries such an upper-bound CHECK.
+//! column of every v2 table carries such an upper-bound CHECK and refuses any
+//! value that is not an integer (plan L2045: no REAL/TEXT coercion).
 use shardx_team_server::run_migrations;
 use shared::envelope_v2::MAX_OBJECT_SIZE;
 use shared::fleet_lifecycle::{
@@ -362,6 +363,8 @@ async fn refusal(pool: &SqlitePool, sql: &str) -> Option<String> {
 }
 
 const CHECK: Option<&str> = Some("275");
+/// `SQLITE_CONSTRAINT_TRIGGER`: an integer column's type trigger refused it.
+const NOT_INTEGER: Option<&str> = Some("1811");
 
 #[tokio::test]
 async fn every_class_column_stores_its_domain_ends_and_its_check_refuses_the_rest() {
@@ -392,7 +395,10 @@ async fn every_class_column_stores_its_domain_ends_and_its_check_refuses_the_res
             "9.3e18".into(),
             "-0.5".into(),
             "'9223372036854775808'".into(),
-            // Text and blobs sort above every number.
+            // In-range values that are not integers, as REAL and as the
+            // numeric TEXT that INTEGER affinity turns into a REAL.
+            format!("{}.5", c.lo),
+            format!("'{}.5'", c.lo),
             "'one'".into(),
             "x'01'".into(),
             (c.hi + 1).to_string(),
@@ -401,10 +407,33 @@ async fn every_class_column_stores_its_domain_ends_and_its_check_refuses_the_res
             refused.push((c.lo - 1).to_string());
         }
         for v in refused {
+            // A literal past i64 is a REAL to SQLite, so its type refuses it.
+            let want = if v.parse::<i64>().is_ok() {
+                CHECK
+            } else {
+                NOT_INTEGER
+            };
             assert_eq!(
                 refusal(&pool, &upload_row(c.row, &v)).await.as_deref(),
-                CHECK,
+                want,
                 "{} {} refuses {v}",
+                c.class,
+                c.column
+            );
+        }
+        // An update to a non-integer is refused as well, by the type trigger
+        // and not by another of the table's triggers.
+        for v in [format!("{}.5", c.lo), format!("'{}.5'", c.lo)] {
+            let e = sqlx::query(&format!(
+                "UPDATE {table} SET {column} = {v} WHERE rowid = (SELECT max(rowid) FROM {table})"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("an integer column holds only integers"),
+                "{} {} update refuses {v}: {e}",
                 c.class,
                 c.column
             );
@@ -491,6 +520,65 @@ async fn every_integer_column_of_every_v2_table_has_an_upper_bound_check() {
     }
     assert!(checked > 150, "only {checked} integer columns found");
     assert!(unbounded.is_empty(), "{unbounded:?}");
+}
+
+#[tokio::test]
+async fn every_integer_column_of_every_v2_table_refuses_a_value_that_is_no_integer() {
+    let pool = pool().await;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'v2\\_%' ESCAPE '\\'
+          ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut guarded = 0;
+    let mut unguarded = Vec::new();
+    for table in &tables {
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info(?) WHERE type = 'INTEGER' COLLATE NOCASE
+              ORDER BY cid",
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        if cols.is_empty() {
+            continue;
+        }
+        let trigger = |event: &'static str| {
+            let pool = &pool;
+            async move {
+                let sql: Option<String> = sqlx::query_scalar(
+                    "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ? AND tbl_name = ?",
+                )
+                .bind(format!("{table}_integers_on_{event}"))
+                .bind(table)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+                sql.unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        let (insert, update) = (trigger("insert").await, trigger("update").await);
+        let of = update
+            .split_once("BEFORE UPDATE OF ")
+            .and_then(|(_, rest)| rest.split_once(" ON "))
+            .map_or(Vec::new(), |(list, _)| list.split(", ").collect::<Vec<_>>());
+        for col in &cols {
+            let guard = format!("typeof(NEW.{col}) NOT IN ('integer', 'null')");
+            if insert.contains(&guard) && update.contains(&guard) && of.contains(&col.as_str()) {
+                guarded += 1;
+            } else {
+                unguarded.push(format!("{table}.{col}"));
+            }
+        }
+    }
+    assert!(unguarded.is_empty(), "{unguarded:?}");
+    assert_eq!(guarded, 180);
 }
 
 #[test]
