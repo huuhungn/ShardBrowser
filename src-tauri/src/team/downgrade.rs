@@ -1927,9 +1927,14 @@ mod tests {
         }
         // A journal ID is 32 lower-case hex digits and nothing else.
         for id in ["evil", "../x", "a/b", "", &"A".repeat(32), &"a".repeat(31)] {
+            // Its stored paths agree with it, so only the ID itself is wrong.
+            let own = archive_root().unwrap().join(id);
             let j = DowngradeJournal {
                 journal_id: id.into(),
-                ..journal_at(&own_metadata, &own_data)
+                ..journal_at(
+                    &own.join(format!("{LOCAL}.json.archived")),
+                    &own.join("user-data"),
+                )
             };
             let e = places(&j).err().unwrap();
             assert!(has(&e, "downgrade.archiveOutside"), "{id}");
@@ -1986,6 +1991,18 @@ mod tests {
             ..journal_at(&dir.join("m"), &dir.join("d"))
         };
         assert!(has(&places(&j).err().unwrap(), "profile.invalidId"));
+        // Either ID alone is enough to refuse.
+        for (original, new) in [("Y:", OTHER), (LOCAL, "Z:")] {
+            let j = DowngradeJournal {
+                original_local_profile_id: original.into(),
+                new_local_profile_id: Some(new.into()),
+                ..journal_at(&dir.join("m"), &dir.join("d"))
+            };
+            assert!(
+                has(&places(&j).err().unwrap(), "profile.invalidId"),
+                "{original} {new}"
+            );
+        }
         for bad in ["Z:", ".."] {
             let e = start_clone(bad).unwrap_err();
             assert!(has(&e, "profile.invalidId"), "{bad}");
@@ -2024,6 +2041,33 @@ mod tests {
         }
         crate::process::Tracker::shared().set_running_for_test(&new, false);
         assert_eq!(std::fs::read(&work).unwrap(), b"weeks of work");
+    }
+
+    /// H2: once a clone exists, a lost archive is left to a person, while any
+    /// other conflict still rolls back; before the clone it always rolls back.
+    #[test]
+    fn a_lost_archive_forces_a_rollback_only_before_the_clone_exists() {
+        let gone = code("downgrade.originalGone");
+        for phase in [P::CloneWritten, P::ReadbackPassed] {
+            assert!(!forces_rollback(phase, &gone), "{phase:?}");
+            assert!(forces_rollback(phase, &code("downgrade.cloneMismatch")));
+        }
+        for phase in [
+            P::Claimed,
+            P::OriginalMetadataMoved,
+            P::OriginalUserDataMoved,
+        ] {
+            assert!(forces_rollback(phase, &gone), "{phase:?}");
+        }
+        assert!(forces_rollback(P::DiscoveryScanPassed, &gone));
+        assert!(forces_rollback(
+            P::CloneWritten,
+            &code("downgrade.readbackFailed")
+        ));
+        assert!(!forces_rollback(
+            P::CloneWritten,
+            &code("downgrade.moveFailed")
+        ));
     }
 
     /// H2: a rollback that ends in rollbackConflict has deleted nothing, and a
@@ -2065,6 +2109,12 @@ mod tests {
         assert!(move_new(&a, &b).is_err());
         assert_eq!(std::fs::read(a.join("f")).unwrap(), b"a");
         assert_eq!(std::fs::read(b.join("f")).unwrap(), b"b");
+        let (f, g) = (e.dir.path().join("f.txt"), e.dir.path().join("g.txt"));
+        std::fs::write(&f, b"f").unwrap();
+        std::fs::write(&g, b"g").unwrap();
+        assert!(move_new(&f, &g).is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"f");
+        assert_eq!(std::fs::read(&g).unwrap(), b"g");
     }
 
     fn make_link(link: &Path, target: &Path) {
@@ -2211,7 +2261,7 @@ mod tests {
             let j = the_journal();
             let new = j.new_local_profile_id.clone().unwrap();
             for id in [LOCAL, new.as_str()] {
-                assert!(profile::begin_user_mutation([id], "test").is_err(), "{id}");
+                assert!(profile::begin_profile_launch(id).is_err(), "{id}");
             }
             counted.set(counted.get() + 1);
         });
@@ -2219,7 +2269,8 @@ mod tests {
         assert_eq!(seen.get(), 1);
         // Released at the end.
         let new = the_journal().new_local_profile_id.unwrap();
-        assert!(profile::begin_user_mutation([LOCAL, new.as_str()], "test").is_ok());
+        assert!(profile::begin_profile_launch(LOCAL).is_ok());
+        assert!(profile::begin_profile_launch(&new).is_ok());
     }
 
     /// A browser holding the data is detected before anything moves.
@@ -2271,20 +2322,19 @@ mod tests {
 
     #[test]
     fn a_resume_waits_while_a_browser_holds_the_data_and_moves_nothing() {
-        let (_e, before) = seeded();
-        crash_at("after:CLAIMED");
-        start_clone(LOCAL).unwrap_err();
-        no_crash();
-        let j = the_journal();
-        let w = places(&j).unwrap();
-        let held = hold(&w.data_src);
-        let err = run_clone(&j.journal_id).unwrap_err();
-        assert!(has(&err, "downgrade.dataInUse"), "{err:#}");
-        assert_eq!(the_journal().phase, P::Claimed);
-        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
-        assert!(!exists(&w.metadata_dst));
-        drop(held);
-        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+        for point in ["after:CLAIMED", "after:ORIGINAL_METADATA_MOVED"] {
+            let (_e, before) = seeded();
+            let (j, w) = at(point);
+            let phase = the_journal().phase;
+            let held = hold(&w.data_src);
+            let err = run_clone(&j.journal_id).unwrap_err();
+            assert!(has(&err, "downgrade.dataInUse"), "{point}: {err:#}");
+            assert_eq!(the_journal().phase, phase, "{point}");
+            assert!(exists(&w.data_src) && !exists(&w.data_dst), "{point}");
+            drop(held);
+            assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+            assert_cloned(&before);
+        }
     }
 
     #[test]

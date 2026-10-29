@@ -16,9 +16,11 @@ Not mutated, because no test can observe the difference:
 - the directory and file flushes (`durable::sync_parent`, `sync_all`): they only
   matter across a power cut, and the tests kill the process, not the machine;
 - `store::require_local_ntfs(archive)`: it passes on every local NTFS test dir;
-- the symlink guard in `move_data` (unix-only test).
+- `volume_serial` itself and the call to `refuse_while_journals` in
+  `migrate::do_run`: a test run has one volume and no `AppHandle`. The lock in
+  `runtime::migrate_all_to` is checked by hand against its own test.
 
-Two mutants survive by design; each removes a check that a second check
+Some mutants survive by design; each removes a check that a second check
 repeats, so no behaviour changes (EQUIVALENT below).
 """
 import hashlib
@@ -260,6 +262,13 @@ EQUIVALENT = {
     "D24-readback-lists",
     # `journal::downgrade_advance` refuses a rollback from COMPLETED anyway.
     "D32-rollback-completed",
+    # `check_restorable` refuses a state with the original in two places before
+    # the loop runs, and `move_new` refuses to replace it a step later.
+    "D28-rollback-overwrite",
+    # The volume check of the start repeats in `drive` (D71), and a test run
+    # has one volume: only `one_volume` and `same_volume` are observable.
+    "D68-start-volume",
+    "D71-claimed-volume",
 }
 
 
