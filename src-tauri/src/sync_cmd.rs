@@ -40,6 +40,17 @@ pub struct PushResult {
     pub sha256: String,
 }
 
+/// A profile the team server now holds at version 0.
+#[derive(Debug, Serialize)]
+pub struct PublishResult {
+    /// The new remote profile ID, hex.
+    pub profile_id: String,
+    /// The fence of the first lease this device holds on it.
+    pub fencing_token: u64,
+    /// When that lease ends, by the server's clock.
+    pub lease_expires_at_ms: u64,
+}
+
 /// What the team server knows about a profile, without downloading it.
 #[derive(Debug, Serialize)]
 pub struct RemoteSnapshot {
@@ -118,6 +129,7 @@ pub async fn profile_sync_push(
     }
     if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
         let (client, session, dev) = published_session(&c, username, password).await?;
+        let started = std::time::Instant::now();
         let pushed = team::sync::push(
             &client,
             &session.access_token,
@@ -125,6 +137,7 @@ pub async fn profile_sync_push(
             &profile_id,
             &udd,
             now_ms(),
+            &|| started.elapsed(),
         )
         .await;
         client.end_session(&session.access_token).await;
@@ -182,6 +195,68 @@ pub async fn profile_sync_push(
         container_bytes: sealed.info.file_bytes,
         sha256: sealed.info.sha256,
     })
+}
+
+/// Publish `profile_id` as a new profile of this device's fleet (`team::sync`),
+/// in a device session the account `username` and `password` open for this
+/// call only. The server holds the profile at version 0 with the first lease
+/// this device owns; the next push seals the data. `label` is the name the
+/// fleet lists it by, sealed under the verified fleet key; it defaults to the
+/// profile's name.
+#[tauri::command]
+pub async fn profile_sync_publish(
+    profile_id: String,
+    label: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<PublishResult, String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionPublishToTeam"),
+    )
+    .map_err(|error| error.to_string())?;
+    let c = ready_config()?;
+    let stored = profile::load_raw(&profile_id)
+        .map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
+    let label = label
+        .or_else(|| stored.config.get("name")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
+    let remote = fleet_client::decode_hex16(&fleet_client::random_id_hex(), "profile_id")
+        .map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let published = team::sync::publish(
+        &client,
+        &session.access_token,
+        &dev,
+        &profile_id,
+        &label,
+        fleet,
+        remote,
+        now_ms(),
+    )
+    .await;
+    client.end_session(&session.access_token).await;
+    let p = published.map_err(|e| format!("{e:#}"))?;
+    Ok(PublishResult {
+        profile_id: fleet_client::hex(&p.profile),
+        fencing_token: p.lease.fencing_token,
+        lease_expires_at_ms: p.expires_at_ms,
+    })
+}
+
+/// Cancels the unfinished publish of `profile_id` (`team::sync::cancel_publish`):
+/// the way out when the stored request cannot be sent any more, because the
+/// fleet key it was sealed under was withdrawn or a compromise was counted.
+/// Nothing is sent to the server.
+#[tauri::command]
+pub async fn profile_sync_cancel_publish(profile_id: String) -> Result<(), String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionCancelPublish"),
+    )
+    .map_err(|error| error.to_string())?;
+    team::sync::cancel_publish(&profile_id).map_err(|e| format!("{e:#}"))
 }
 
 /// Seal a profile for push: always under the passphrase, never a cached fleet
@@ -643,16 +718,17 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        team::db::Db::open()
-            .unwrap()
-            .conn
-            .execute(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES (?1, ?2, ?2, ?2, ?2, 0, 0, 'AVAILABLE')",
-                [id.clone(), "ee".repeat(16)],
-            )
-            .unwrap();
+        let ee = "ee".repeat(16);
+        team::db::fixtures::seed_binding(
+            &team::db::Db::open().unwrap().conn,
+            "s",
+            &id,
+            &ee,
+            &ee,
+            &ee,
+            &ee,
+            0,
+        );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let pushed = rt.block_on(profile_sync_push(

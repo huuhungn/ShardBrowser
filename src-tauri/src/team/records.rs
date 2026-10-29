@@ -682,16 +682,22 @@ mod tests {
             .query_row("SELECT server_id FROM server_origins", [], |r| r.get(0))
             .unwrap();
         let device = hex(&hash(&six[2]));
+        let second = hex(&hash(&six[3]));
         db.conn
             .execute_batch(&format!(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');
-                 INSERT INTO accounts VALUES ('{server}', 't', 'a', 'd', 'owner', 'ACTIVE');
-                 INSERT INTO device_state VALUES ('{server}', 't', 'a', 'd', 'sk', 'hk',
+                "INSERT INTO accounts VALUES ('{server}', '{i}', 'a', 'd', 'owner', 'ACTIVE');
+                 INSERT INTO device_state VALUES ('{server}', '{i}', 'a', 'd', 'sk', 'hk',
                    'cred:sign', 'cred:hpke', 0);
-                 INSERT INTO fleet_key_state VALUES ('{server}', '{i}', 't', 'f', 1, 'k', 'd',
+                 INSERT INTO fleet_key_state VALUES ('{server}', '{i}', '{i}', '{i}', 1, 'k', 'd',
                    '{device}', 'cred:fkek', 'ACTIVE', NULL, 't');
+                 INSERT INTO fleet_key_state VALUES ('{server}', '{i}', '{i}', '{i}', 2, 'k2', 'd',
+                   '{second}', 'cred:fkek2', 'RETIRED', NULL, 't');
+                 INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                   tenant_id, account_id, device_id, fleet_id, remote_profile_id, remote_version,
+                   base_version, accepted_restore_epoch, fkek_key_id, key_generation, sync_state,
+                   dirty)
+                 VALUES ('p', '{server}', '{i}', '{i}', 'a', 'd', '{i}', '{i}', 0, 0, 0, 'k', 1,
+                   'AVAILABLE', 0);
                  INSERT INTO restore_journals VALUES ('p', 'j', 'CREATED', 's', 'b', '{{}}', 0,
                    {h}, 't', 't');
                  INSERT INTO restore_epoch_transitions VALUES ('{server}', '{i}', '{i}', {n}, 0, 1,
@@ -764,7 +770,13 @@ mod tests {
             (ROOT_GRANTS, "acknowledged_at_ms", "1".into(), 0, max),
             (ROOT_GRANTS, "revoked_at_ms", "1".into(), 0, max),
             (ROOT_GRANTS, "restore_epoch", "1".into(), 0, max),
-            ("fleet_key_state", "generation", "1".into(), 0, max),
+            (
+                "fleet_key_state",
+                "generation",
+                "fkek_key_id = 'k2'".into(),
+                0,
+                max,
+            ),
             ("restore_journals", "target_version", "1".into(), 0, max),
             (
                 "restore_epoch_transitions",

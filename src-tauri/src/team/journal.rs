@@ -639,22 +639,16 @@ mod tests {
     }
 
     pub(crate) fn bind(db: &Db, local: &str) {
-        db.conn
-            .execute(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'AVAILABLE')",
-                params![
-                    local,
-                    "03".repeat(16),
-                    "02".repeat(16),
-                    "04".repeat(16),
-                    crate::fleet_client::hex(&shardx_core::canonical::sha256(local.as_bytes()))
-                        [..32]
-                        .to_string()
-                ],
-            )
-            .unwrap();
+        crate::team::db::fixtures::seed_binding(
+            &db.conn,
+            "s",
+            local,
+            &"03".repeat(16),
+            &"02".repeat(16),
+            &"04".repeat(16),
+            &crate::fleet_client::hex(&shardx_core::canonical::sha256(local.as_bytes()))[..32],
+            0,
+        );
     }
 
     fn restore() -> RestoreJournal {
