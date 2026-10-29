@@ -1051,7 +1051,13 @@ async fn accept_transitions(
         }
         Err(e) => e,
     };
-    record(&db.conn)?;
+    // In its own transaction, and never in place of the refusal: a record
+    // that fails leaves nothing behind, and the next evaluation records.
+    if let Some((seen, c)) = &evaluated {
+        if let Err(e) = ledger::record(db, &dev.pin.0, seen, c, None, now) {
+            eprintln!("[sync] trust ledger: {e:#}");
+        }
+    }
     Err(refused)
 }
 
@@ -5736,6 +5742,28 @@ mod tests {
             .unwrap();
         assert_eq!(w.state(LOCAL).2, 1);
         assert_eq!(evaluations(), before + 1);
+    }
+
+    /// A refused acceptance whose evaluation cannot be recorded leaves no
+    /// part of it behind, and still answers with its refusal.
+    #[test]
+    fn a_failed_record_leaves_no_evaluation_and_keeps_the_refusal() {
+        let w = world();
+        restored(&w);
+        w.db()
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER crash BEFORE INSERT ON trust_custodian_keys
+                 BEGIN SELECT RAISE(ABORT, 'crash'); END",
+            )
+            .unwrap();
+        let evaluations = || w.count("SELECT count(*) FROM trust_evaluations");
+        let before = evaluations();
+        let err = w.pull(&w.udd.with_file_name("out")).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionMissing"), "{err:#}");
+        assert_eq!(evaluations(), before);
+        let (_, reason, epoch, ..) = w.state(LOCAL);
+        assert_eq!((reason.as_deref(), epoch), (Some(TRANSITION_REQUIRED), 0));
     }
 
     /// A lapse observed only while accepting transitions is kept (no fleet
