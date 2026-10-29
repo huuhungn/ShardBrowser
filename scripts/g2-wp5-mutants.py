@@ -17,6 +17,9 @@ Not mutated, because no test can observe the difference:
   matter across a power cut, and the tests kill the process, not the machine;
 - `store::require_local_ntfs(archive)`: it passes on every local NTFS test dir;
 - the symlink guard in `move_data` (unix-only test).
+
+Two mutants survive by design; each removes a check that a second check
+repeats, so no behaviour changes (EQUIVALENT below).
 """
 import hashlib
 import os
@@ -42,7 +45,7 @@ MUTANTS = [
      "let tx = txn(db)?;\n    refuse_second_flow(&tx, &journal.local_profile_id)?;",
      "let tx = txn(db)?;"),
     ("J05-restore-integer-range", J,
-     "let version = i64::try_from(journal.target_version)\n        .map_err(|_| anyhow!(code_with(\"journal.outOfRange\", &[(\"field\", \"target_version\")])))?;",
+     "let version = i64::try_from(journal.target_version).map_err(|_| {\n        anyhow!(code_with(\n            \"journal.outOfRange\",\n            &[(\"field\", \"target_version\")]\n        ))\n    })?;",
      "let version = journal.target_version as i64;"),
     ("J06-restore-retire-open", J,
      "if !current.phase.is_terminal() {\n        bail!(code_with(\n            \"journal.notSettled\",",
@@ -55,8 +58,8 @@ MUTANTS = [
      "if &stored != journal {\n        bail!(mismatch(\"journal\"));\n    }\n    tx.commit()?;\n    Ok(())\n}\n\n/// Moves the journal of `local`",
      "tx.commit()?;\n    Ok(())\n}\n\n/// Moves the journal of `local`"),
     ("J10-restore-advance-readback", J,
-     "if stored.phase != to || stored != (RestoreJournal { phase: to, ..current }) {",
-     "if false {"),
+     "if stored.phase != to\n        || stored\n",
+     "if stored.phase != to\n        && false\n        && stored\n"),
     ("J11-restore-retire-readback", J,
      "if restore_in(&tx, local)?.is_some() {\n        bail!(mismatch(\"row\"));",
      "if false && restore_in(&tx, local)?.is_some() {\n        bail!(mismatch(\"row\"));"),
@@ -133,7 +136,7 @@ MUTANTS = [
     ("D22-existing-copy-compared", D, "} else if listing(&w.clone_data, false)? != archived {", "} else if false {"),
     ("D23-existing-record-id", D,
      "if require_clean(&body, &forbidden)?.meta.id != new {", "if false {"),
-    ("D24-readback-lists", D, "if !found.lists(new) ||", "if false ||"),
+    ("D24-readback-lists", D, "if !found.lists(new)\n        ||", "if false\n        ||"),
     ("D25-readback-user-data", D, "|| !found.data.contains(new)", "|| false"),
     ("D26-readback-old-id", D,
      "|| found.mentions(&j.original_local_profile_id)\n    {\n        bail!(code(\"downgrade.readbackFailed\"));",
@@ -190,6 +193,14 @@ MUTANTS = [
     ("D51-evidence-old-id", D,
      "&& !found.mentions(&j.original_local_profile_id)\n}", "&& true\n}"),
 ]
+
+
+EQUIVALENT = {
+    # `profile::list_all` (D27) refuses the same state a line later.
+    "D24-readback-lists",
+    # `journal::downgrade_advance` refuses a rollback from COMPLETED anyway.
+    "D32-rollback-completed",
+}
 
 
 def sha(path):
@@ -260,7 +271,8 @@ def main(argv):
             assert sha(SRC / f) == digests[f], f"{f} not restored"
     counted = killed + survived
     print(f"killed {killed}/{counted} (invalid, not counted: {invalid}); sha256 of both files restored")
-    return 0 if survived == 0 else 1
+    open_ones = [m for m, status in results if status == "SURVIVED" and m not in EQUIVALENT]
+    return 1 if open_ones else 0
 
 
 if __name__ == "__main__":
