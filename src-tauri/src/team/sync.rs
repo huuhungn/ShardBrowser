@@ -866,8 +866,8 @@ fn awaits_transition(b: &Bound) -> bool {
     b.state == "QUARANTINED" && b.error.as_deref() == Some(TRANSITION_REQUIRED)
 }
 
-/// How many versions below the listed one the leaf's new head is looked
-/// for; past it the server is not believed (fails closed).
+/// How many versions at or below the pinned one the leaf's new head is
+/// looked for; past it the server is not believed (fails closed).
 const LEAF_SEARCH: u64 = 64;
 
 /// One verified `E -> E+1` step of a binding: the signed transition and its
@@ -920,7 +920,10 @@ async fn accept_transitions(
     let released;
     let b = match b.lease {
         Some(lease) => {
-            let op = get_op(db, &release_op(&db.conn, b, lease)?)?;
+            let op = match find(db, &b.local, "RELEASE", Some(&lease), Some("PENDING"))? {
+                Some(op) => op,
+                None => get_op(db, &release_op(&db.conn, b, lease)?)?,
+            };
             release_reply(client, access, db, b, &op).await?;
             db.conn.execute(
                 "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = ?2
@@ -987,18 +990,16 @@ async fn accept_transitions(
         });
     }
     // An unchanged pin keeps its version. Otherwise the leaf's new head is a
-    // committed manifest whose exact bytes hash to it, within `LEAF_SEARCH`
-    // versions of the listed one, accepted as a new head is (rule 6) except
-    // for its earlier epoch.
+    // committed manifest whose exact bytes hash to it, at most `LEAF_SEARCH`
+    // versions at or below the pinned one (a restore only goes back), and
+    // accepted as a new head is (rule 6) except for its earlier epoch.
     let version = if head == b.head {
         b.version
     } else {
-        let low = listed
-            .current_version
-            .saturating_sub(LEAF_SEARCH - 1)
-            .max(1);
+        let top = b.version.min(listed.current_version);
+        let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
         let mut found = None;
-        for v in (low..=listed.current_version).rev() {
+        for v in (low..=top).rev() {
             let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
             let m = SignedSnapshotManifestV2::parse(&reply.body)
                 .map_err(|_| bad("SignedSnapshotManifestV2"))?;
@@ -1038,9 +1039,10 @@ type Refused = (&'static str, anyhow::Error);
 /// parse, its signature verifies under the key it names, it names `b`'s
 /// tenant, instance and exactly `epochs`, and its signer is trusted as a
 /// revocation's issuer is (rule 6): a root custodian at its `issued_at_ms`,
-/// still one now, when this device first sees it, and neither held lapsed
-/// (Q-25: the signer chooses `issued_at_ms`, so a lapse this device saw is
-/// not backdated past) nor withdrawn.
+/// still one now, when this device first sees it, not dated at or before
+/// a lapse this device observed (Q-25: the signer chooses `issued_at_ms`,
+/// so it is not backdated past one; a re-appointment after it signs again),
+/// and not withdrawn.
 #[allow(clippy::too_many_arguments)]
 fn verify_transition(
     db: &Db,
@@ -1073,7 +1075,9 @@ fn verify_transition(
         return Err(invalid("previous_epoch"));
     }
     let withdrawn = ledger::withdrawn(db, &dev.pin.0, &signer).unwrap_or(true);
-    let lapsed = ledger::lapsed(db, &dev.pin.0, &signer).unwrap_or(true);
+    let lapsed = ledger::lapsed_at(db, &dev.pin.0, &signer)
+        .map(|at| at.is_some_and(|at| p.issued_at_ms <= at))
+        .unwrap_or(true);
     let custodian = chain
         .is_some_and(|c| c.custodian_at(&signer, p.issued_at_ms) && c.custodian_now(&signer, now));
     if !custodian || lapsed || withdrawn {
@@ -5394,9 +5398,9 @@ mod tests {
         }
     }
 
-    /// The leaf's new head is looked for within `LEAF_SEARCH` versions of
-    /// the listed one and never past it; a pin the leaf keeps is not looked
-    /// for at all.
+    /// The leaf's new head is looked for within `LEAF_SEARCH` versions at or
+    /// below the pinned one and never past it, however many commits follow
+    /// the restore; a pin the leaf keeps is not looked for at all.
     #[test]
     fn the_leaf_head_search_is_bounded_and_skipped_for_an_unchanged_pin() {
         let w = world();
@@ -5412,6 +5416,13 @@ mod tests {
             }
             f.listed = Some((LEAF_SEARCH + 1, Some(h2)));
         }
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET remote_version = ?1",
+                [(LEAF_SEARCH + 1) as i64],
+            )
+            .unwrap();
         let leaves = [leaf(PROFILE, h2, h1)];
         w.file(
             &w.me.sk,
@@ -5426,6 +5437,39 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(w.state(LOCAL).2, 0);
+        drop(w);
+
+        // More than `LEAF_SEARCH` commits after the restore: the leaf's head,
+        // one below the pin, is still found.
+        let w = world();
+        let (h1, h2) = restored(&w);
+        {
+            let mut f = w.fake();
+            // Signed manifests that are not the leaf's head.
+            let m = SignedSnapshotManifestV2::parse(&f.manifests[&1]).unwrap();
+            let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+            p.manifest_replay_id = [0x48; 16];
+            let decoy = SignedSnapshotManifestV2::sign(&w.me.sk, &p)
+                .unwrap()
+                .exact_bytes()
+                .to_vec();
+            for v in 2..=LEAF_SEARCH + 6 {
+                f.manifests.insert(v, decoy.clone());
+            }
+            f.listed = Some((LEAF_SEARCH + 6, Some([0x47; 32])));
+        }
+        let leaves = [leaf(PROFILE, h2, h1)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        // The pull then walks the decoys, which do not chain.
+        let _ = w.pull(&w.udd.with_file_name("out"));
+        let (_, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!((epoch, version, head), (1, 1, Some(h1.to_vec())));
         drop(w);
 
         let w = world();
@@ -5489,6 +5533,225 @@ mod tests {
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE state = 'PENDING'"),
             0
+        );
+        assert_eq!(w.state(LOCAL).2, 1);
+    }
+
+    /// Adds custodian `seed` to the evidence the fake serves: approved by
+    /// this device under its `device.approve`, and appointed by it once per
+    /// `(issued, not_before, not_after)` in `grants`. Its key.
+    fn custodian(w: &World, seed: u8, grants: &[(u64, u64, u64)]) -> Ed25519SigningKey {
+        let k = Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
+        let approval = DeviceApprovalV2 {
+            common: common(seed),
+            subject_account_id: [seed; 16],
+            subject_device_id: [seed + 1; 16],
+            subject_signing_key_id: kid,
+            subject_hpke_key_id: [seed; 32],
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let approve = TenantCapabilityGrantV2 {
+            common: common(seed + 1),
+            subject: device_subject(&w.me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceApprove,
+        };
+        let mut extra = vec![
+            build_record(&w.me.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &approve.encode()),
+        ];
+        for (i, &(issued, nb, na)) in grants.iter().enumerate() {
+            let root = TenantRootKeyGrantV2 {
+                common: CommonFields {
+                    issued_at_ms: issued,
+                    not_before_ms: nb,
+                    not_after_ms: na,
+                    ..common(seed + 2 + i as u8)
+                },
+                variant: RootGrantVariant::ExistingRootGrant,
+                root_key_id: [8; 32],
+                root_generation: 0,
+                subject_account_id: [seed; 16],
+                subject_device_id: [seed + 1; 16],
+                subject_signing_key_id: kid,
+                recipient_hpke_key_id: [seed; 32],
+                subject_device_approval_replay_id: [seed; 16],
+                hpke_encapped_key_bytes: [3; 32],
+                hpke_wrapped_trk_bytes: [4; 48],
+            };
+            extra.push(build_record(
+                &w.me.sk,
+                DOMAIN_TENANT_ROOT_KEY_GRANT,
+                &root.encode(),
+            ));
+        }
+        let ev = Ev {
+            extra,
+            ..Ev::default()
+        };
+        let mut p = pages(&w.me, &w.grant, &ev);
+        p[0].signing_public_keys.push(k.verifying_key().to_bytes());
+        w.fake().pages = p[0].encode();
+        k
+    }
+
+    /// Files the `0 -> 1` transition custodian `seed` signs at `issued`, its
+    /// leaf rolling the pinned h2 back to h1.
+    fn file_by(
+        w: &World,
+        k: &Ed25519SigningKey,
+        seed: u8,
+        issued: u64,
+        (h1, h2): ([u8; 32], [u8; 32]),
+    ) {
+        let leaves = [leaf(PROFILE, h2, h1)];
+        let t = RestoreEpochTransitionV2 {
+            approver_account_id: [seed; 16],
+            approver_device_id: [seed + 1; 16],
+            approver_signing_key_id: shardx_core::keys::signing_key_id(
+                k.verifying_key().as_bytes(),
+            ),
+            issued_at_ms: issued,
+            ..transition(&w.me, 0, &leaves)
+        };
+        w.file(k, &t, &leaves, &[PROFILE], 0);
+    }
+
+    impl World {
+        /// Records, as collecting a fleet key does, an evaluation at `at` of
+        /// the evidence the fake serves.
+        fn observe(&self, at: u64) {
+            let page = TenantTrustEvidencePageV2::parse(&self.fake().pages).unwrap();
+            let mut db = self.db();
+            let (seen, chain) =
+                ledger::evaluate(&db, &self.dev.pin.0, &self.dev.pin.1, &[page], at)
+                    .unwrap()
+                    .unwrap();
+            ledger::record(&mut db, &self.dev.pin.0, &seen, &chain, None, at).unwrap();
+        }
+
+        /// Since when custodian `k` is held lapsed here, if it is.
+        fn lapse_of(&self, k: &Ed25519SigningKey) -> Option<i64> {
+            let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
+            self.db()
+                .conn
+                .query_row(
+                    "SELECT observed_lapsed_at_ms FROM trust_custodian_keys
+                     WHERE signing_key_id = ?1",
+                    [hex(&kid)],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+                .flatten()
+        }
+    }
+
+    /// Rule 2 for the transition signer: a second custodian whose custody
+    /// starts in ten days signs a transition dated inside it (+20 days);
+    /// it was a custodian "when it signed" but is not one now, and holds no
+    /// lapse, so only that check refuses it.
+    #[test]
+    fn a_custodian_not_yet_appointed_signs_no_transition() {
+        let w = world();
+        let heads = restored(&w);
+        let k = custodian(&w, 0x50, &[(T0, NOW + 10 * DAY, NOW + 100 * DAY)]);
+        file_by(&w, &k, 0x50, NOW + 20 * DAY, heads);
+        let err = w.pull(&w.udd.with_file_name("out")).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionInvalid"), "{err:#}");
+        assert_eq!(w.lapse_of(&k), None, "only custodian_now can refuse");
+        assert_eq!(w.state(LOCAL).2, 0);
+        assert_eq!(w.filed(), 0);
+    }
+
+    /// Q-26 for the transition signer: a second custodian, current and not
+    /// lapsed, signs a transition this device accepts, unless this device
+    /// distrusts it.
+    #[test]
+    fn a_custodian_distrusted_here_signs_no_transition() {
+        for distrust in [false, true] {
+            let w = world();
+            let heads = restored(&w);
+            let k = custodian(&w, 0x60, &[(T0, T0, T0 + 300 * DAY)]);
+            if distrust {
+                let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
+                ledger::distrust_key(&w.db(), &w.dev.pin.0, &kid, NOW).unwrap();
+            }
+            file_by(&w, &k, 0x60, NOW, heads);
+            let pulled = w.pull(&w.udd.with_file_name("out"));
+            assert_eq!(w.lapse_of(&k), None, "{distrust}");
+            assert_eq!(w.state(LOCAL).2, i64::from(!distrust), "{distrust}");
+            if distrust {
+                let err = pulled.unwrap_err();
+                assert!(has(&err, "sync.epochTransitionInvalid"), "{err:#}");
+            }
+        }
+    }
+
+    /// Q-25: a lapse refuses only what is dated at or before it. A custodian
+    /// whose custody ended is held lapsed, is re-appointed after the lapse,
+    /// and then signs a transition this device accepts.
+    #[test]
+    fn a_custodian_reappointed_after_its_lapse_signs_again() {
+        let w = world();
+        let heads = restored(&w);
+        let out = w.udd.with_file_name("out");
+        let first = (T0, T0, NOW + DAY);
+        let k = custodian(&w, 0x70, &[first]);
+        // Seen while a custodian, then held lapsed once its custody ended.
+        w.observe(NOW);
+        assert_eq!(w.lapse_of(&k), None);
+        let lapse = NOW + 2 * DAY;
+        w.observe(lapse);
+        assert_eq!(w.lapse_of(&k), Some(lapse as i64));
+        let again = NOW + 3 * DAY;
+        custodian(&w, 0x70, &[first, (again, again, NOW + 100 * DAY)]);
+        file_by(&w, &k, 0x70, NOW + 4 * DAY, heads);
+        w.pull_at(&out, NOW + 4 * DAY).unwrap();
+        assert_eq!(w.state(LOCAL).2, 1);
+    }
+
+    /// A lease release that fails before the server sees it is retried as
+    /// the one stored RELEASE, byte for byte, until it goes through.
+    #[test]
+    fn a_failed_release_of_an_old_lease_is_retried_as_stored() {
+        let w = world();
+        w.push().unwrap();
+        let h1 = w.head_of(1);
+        w.fake().lose.push("upload");
+        w.push().unwrap_err();
+        {
+            let mut f = w.fake();
+            f.restore(1);
+            f.skip.extend(["release", "release"]);
+        }
+        let leaves = [leaf(PROFILE, h1, h1)];
+        w.file(
+            &w.me.sk,
+            &transition(&w.me, 0, &leaves),
+            &leaves,
+            &[PROFILE],
+            0,
+        );
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = ?1",
+                [TRANSITION_REQUIRED],
+            )
+            .unwrap();
+        w.push().unwrap_err();
+        w.push().unwrap_err();
+        assert_eq!(w.push().unwrap().version, 2);
+        let sent = w.sent("POST", "/release");
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|s| *s == sent[0]), "the stored bytes");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE'"),
+            1
         );
         assert_eq!(w.state(LOCAL).2, 1);
     }

@@ -794,7 +794,8 @@ UPDATE schema_meta SET schema_version = 4, min_reader_version = 4,
 /// reference DDL's `ON DELETE RESTRICT` key to `profile_bindings` (L2027),
 /// which would refuse every unbind once a proof is filed, becomes a check
 /// at filing: a proof is still refused unless its binding exists. The key
-/// to its transition stays. Rows are kept exactly.
+/// to its transition stays. Rows are kept exactly. A filed transition or
+/// proof is evidence (L2042): it never changes and is never forgotten.
 const MIGRATE_V5: &str = r#"
 CREATE TABLE restore_epoch_binding_proofs_v5 (
   server_id                  TEXT NOT NULL,
@@ -832,6 +833,14 @@ WHEN NOT EXISTS (SELECT 1 FROM profile_bindings
                    AND tenant_id = NEW.tenant_id
                    AND remote_profile_id = NEW.remote_profile_id)
 BEGIN SELECT RAISE(ABORT, 'restore_epoch_binding_proofs: no binding'); END;
+CREATE TRIGGER restore_epoch_binding_proofs_fixed BEFORE UPDATE ON restore_epoch_binding_proofs
+BEGIN SELECT RAISE(ABORT, 'a filed binding proof never changes'); END;
+CREATE TRIGGER restore_epoch_binding_proofs_kept BEFORE DELETE ON restore_epoch_binding_proofs
+BEGIN SELECT RAISE(ABORT, 'a filed binding proof is never forgotten'); END;
+CREATE TRIGGER restore_epoch_transitions_fixed BEFORE UPDATE ON restore_epoch_transitions
+BEGIN SELECT RAISE(ABORT, 'a filed transition never changes'); END;
+CREATE TRIGGER restore_epoch_transitions_kept BEFORE DELETE ON restore_epoch_transitions
+BEGIN SELECT RAISE(ABORT, 'a filed transition is never forgotten'); END;
 UPDATE schema_meta SET schema_version = 5, min_reader_version = 5,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
@@ -1158,8 +1167,8 @@ mod tests {
     /// modes are closed sets, a clone never reuses the original's ID, and a
     /// binding with a restore journal cannot be deleted; a proof is filed
     /// only for a binding and a transition that exist, inside its leaf
-    /// count, and outlives its binding (L1422, L2239). Rows survive a
-    /// reopen exactly.
+    /// count, and outlives its binding (L1422, L2239); a filed transition
+    /// or proof is never changed or deleted. Rows survive a reopen exactly.
     #[test]
     fn journals_and_epoch_proofs_keep_their_constraints_across_a_reopen() {
         let (_dir, path) = fresh();
@@ -1187,34 +1196,45 @@ mod tests {
             "downgrade_journals",
             &format!("'d', 'CLONE', 'p', 'q', 'CLONE_WRITTEN', NULL, NULL, {h}, NULL, 't', 't'"),
         );
-        let transition = row(
-            "restore_epoch_transitions",
-            &format!(
-                "'s', '{i}', '{i}', {n}, 0, 1, 'PROFILE_HEAD_SET_MERKLE_V2', 1, {h},
-                 'operator_restore', 'a', 'd', 'k', 0, {n}, x'01', {h}, 1, 1, x'01', {h}, x'01', {h}, 't'"
-            ),
-        );
-        let proof = |profile: &str, index: u32, count: u32| {
+        // Epochs `e -> e + 1`, `n` its replay ID and nonce.
+        let transition = |e: u32, n: &str| {
+            row(
+                "restore_epoch_transitions",
+                &format!(
+                    "'s', '{i}', '{i}', {n}, {e}, {}, 'PROFILE_HEAD_SET_MERKLE_V2', 1, {h},
+                     'operator_restore', 'a', 'd', 'k', 0, {n}, x'01', {h}, 1, 1, x'01', {h}, x'01', {h}, 't'",
+                    e + 1
+                ),
+            )
+        };
+        let proof = |profile: &str, e: u32, index: u32, count: u32| {
             row(
                 "restore_epoch_binding_proofs",
                 &format!(
-                    "'s', '{i}', '{i}', 0, 1, '{profile}', {h}, {h}, {index}, {count},
-                     x'01', {h}, {h}, x'01', {h}, 't'"
+                    "'s', '{i}', '{i}', {e}, {}, '{profile}', {h}, {h}, {index}, {count},
+                     x'01', {h}, {h}, x'01', {h}, 't'",
+                    e + 1
                 ),
             )
         };
         let db = Db::open_at(&path).unwrap();
         db.conn
             .execute_batch(&format!(
-                "{binding}{origin}{transition}{journal}{downgrade}{}",
-                proof(&i, 0, 1)
+                "{binding}{origin}{}{}{journal}{downgrade}{}",
+                transition(0, &n),
+                transition(1, &format!("x'{}'", "34".repeat(16))),
+                proof(&i, 0, 0, 1)
             ))
             .unwrap();
         let other = "44".repeat(16);
-        // The journal alone keeps the binding; the proof does not.
-        let sql = "SAVEPOINT p; DELETE FROM restore_epoch_binding_proofs;
-                   DELETE FROM profile_bindings;";
+        // The journal keeps the binding; the proof does not.
+        let sql = "SAVEPOINT p; DELETE FROM profile_bindings;";
         assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
+        db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        // In range, for a binding and a transition that exist, a proof is
+        // filed: what is refused below is refused for its own reason.
+        let sql = format!("SAVEPOINT p; {}", proof(&i, 1, 0, 1));
+        db.conn.execute_batch(&sql).unwrap();
         db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
         for sql in [
             "DELETE FROM restore_epoch_transitions".to_string(),
@@ -1224,16 +1244,17 @@ mod tests {
             "UPDATE downgrade_journals SET phase = 'MOVED'".to_string(),
             "UPDATE downgrade_journals SET mode = 'RESTORE'".to_string(),
             "UPDATE downgrade_journals SET new_local_profile_id = 'p'".to_string(),
-            format!(
-                "DELETE FROM restore_epoch_binding_proofs; {}",
-                proof(&other, 0, 1)
-            ),
-            format!(
-                "DELETE FROM restore_epoch_binding_proofs; {}",
-                proof(&i, 1, 1)
-            ),
+            proof(&other, 1, 0, 1),
+            proof(&i, 1, 1, 1),
             "UPDATE restore_epoch_binding_proofs SET new_epoch = 2".to_string(),
+            format!("UPDATE restore_epoch_binding_proofs SET remote_profile_id = '{other}'"),
+            "UPDATE restore_epoch_binding_proofs SET canonical_inclusion_proof_bytes = x'00'"
+                .to_string(),
+            "DELETE FROM restore_epoch_binding_proofs".to_string(),
             "UPDATE restore_epoch_transitions SET new_epoch = 0".to_string(),
+            "UPDATE restore_epoch_transitions SET verified_at = 'u' WHERE previous_epoch = 1"
+                .to_string(),
+            "DELETE FROM restore_epoch_transitions WHERE previous_epoch = 1".to_string(),
         ] {
             let sql = format!("SAVEPOINT p; {sql};");
             assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
@@ -1276,11 +1297,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(proofs, 1);
-        let refiled = format!(
-            "DELETE FROM restore_epoch_binding_proofs; {}",
-            proof(&i, 0, 1)
-        );
-        assert!(db.conn.execute_batch(&refiled).is_err());
+        assert!(db.conn.execute_batch(&proof(&i, 1, 0, 1)).is_err());
     }
 
     /// A clean version 4 file with a filed proof moves to version 5 with the

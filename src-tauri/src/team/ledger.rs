@@ -230,18 +230,22 @@ pub fn withdrawn(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
     )?)
 }
 
-/// Q-25: whether this device holds `key` as lapsed, so that anything it
-/// first sees from `key` from now on meets that lapse, whatever date it
-/// carries.
-pub fn lapsed(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
+/// Q-25: when this device observed `key` lapse, if it did. Anything it first
+/// sees from `key` from now on and dated at or before then is refused, as
+/// [`lapse_allows`] refuses a container; a later date still needs custody
+/// after the lapse, which only a re-appointment gives.
+pub fn lapsed_at(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<Option<u64>> {
     let (instance, tenant) = ids(binding);
-    Ok(db.conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM trust_custodian_keys
-         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
-           AND lapsed_evaluation IS NOT NULL)",
-        params![instance, tenant, hex(key)],
-        |r| r.get(0),
-    )?)
+    let at: Option<Option<i64>> = db
+        .conn
+        .query_row(
+            "SELECT observed_lapsed_at_ms FROM trust_custodian_keys
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3",
+            params![instance, tenant, hex(key)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(at.flatten().map(|ms| ms as u64))
 }
 
 /// `pages` as this device's history lets it see them: containers signed by a

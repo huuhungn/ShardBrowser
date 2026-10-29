@@ -701,6 +701,14 @@ mod tests {
                    '{i}', {h}, {h}, 0, 1000000, x'01', {h}, {h}, x'01', {h}, 't');"
             ))
             .unwrap();
+        // The ranges are probed by rewriting rows that are write-once in use;
+        // `db` tests those triggers.
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER restore_epoch_transitions_fixed;
+                 DROP TRIGGER restore_epoch_binding_proofs_fixed;",
+            )
+            .unwrap();
         let max = i64::MAX;
         let u32_max = i64::from(u32::MAX);
         let kind = |k: &str| format!("record_kind = '{k}'");
