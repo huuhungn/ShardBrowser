@@ -68,6 +68,10 @@ use crate::fleet_client::{decode_hex16, hex, Exact, FleetClient};
 
 /// The pilot lease TTL (plan 10.1 L1398 proposes 90 s; uploads renew).
 const LEASE_TTL_SECONDS: u32 = 300;
+/// How far past `now` plus one TTL a lease expiry the server grants may lie.
+// shortcut: a fixed allowance for clock skew between this device and the
+// server; make it configurable when a fleet needs a different one.
+const LEASE_SKEW_MS: u64 = 60_000;
 /// PATCH chunk size; the server takes up to 8 MiB.
 #[cfg(not(test))]
 const CHUNK: usize = 4 << 20;
@@ -702,6 +706,13 @@ fn terminal(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 401 | 408 | 429)
 }
 
+/// Whether a lease expiry the server granted is plausible at `now`: still
+/// ahead, and no further than one TTL and the skew allowance.
+fn lease_expiry_ok(expires_at_ms: u64, now: u64) -> bool {
+    expires_at_ms > now
+        && expires_at_ms <= now + u64::from(LEASE_TTL_SECONDS) * 1000 + LEASE_SKEW_MS
+}
+
 fn refused(reply: &Exact) -> anyhow::Error {
     if reply.status == 401 {
         return anyhow!(code("sync.authRequired"));
@@ -977,7 +988,10 @@ async fn accept_transitions(
         Some(lease) => {
             let op = match find(db, &b.local, "RELEASE", Some(&lease), Some("PENDING"))? {
                 Some(op) => op,
-                None => get_op(db, &release_op(&db.conn, b, lease)?)?,
+                None => get_op(
+                    db,
+                    &release_op(&db.conn, b, lease, ReleaseReason::UserRelease)?,
+                )?,
             };
             release_reply(client, access, db, b, &op).await?;
             db.conn.execute(
@@ -1463,7 +1477,17 @@ pub(crate) async fn push(
         match s.state.as_str() {
             "OPEN" => {
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
-                    transfer(client, access, &mut db, &b, lease, &commit_op, &s, clock).await?;
+                    transfer(
+                        client,
+                        access,
+                        &mut db,
+                        &b,
+                        lease,
+                        &commit_op,
+                        &s,
+                        (now, clock),
+                    )
+                    .await?;
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
@@ -1543,7 +1567,7 @@ pub(crate) async fn publish(
             .await?
         }
     };
-    send_publish(client, access, &mut db, &dev.me, local, fleet, &op).await
+    send_publish(client, access, &mut db, dev, local, fleet, &op, now).await
 }
 
 fn is_bound(db: &Db, local: &str) -> Result<bool> {
@@ -1663,15 +1687,18 @@ async fn store_publish(
 
 /// Sends the stored `PUBLISH`, checks the stored response names exactly what
 /// was asked, and files the binding with the operation's completion.
+#[allow(clippy::too_many_arguments)]
 async fn send_publish(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
-    me: &Recipient,
+    dev: &Device,
     local: &str,
     fleet: [u8; 16],
     op: &Op,
+    now: u64,
 ) -> Result<Published> {
+    let me = &dev.me;
     let exact = stored_for(db, local, op)?;
     let asked = IdempotentMutationRequestV2::parse(exact)
         .ok()
@@ -1694,23 +1721,45 @@ async fn send_publish(
         state: "LOCAL".into(),
         error: None,
     };
+    // Every send, a replay included, needs the key still verified and not
+    // blocked: a compromise counted or a key withdrawn since it was stored
+    // keeps it unsent (cancel it with `cancel_publish`).
+    verified_key(
+        db,
+        dev,
+        &fleet,
+        asked.key_generation,
+        Some(&asked.fkek_key_id),
+        now,
+    )?;
+    if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &fleet, asked.key_generation)? {
+        bail!(code("sync.commitBlockedCompromised"));
+    }
     let reply = client.publish_profile(access, &fleet, exact).await?;
     let body = settle(db, op, reply)??;
-    let payload = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
-    let g = ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &payload)
-        .map_err(|_| bad("ProfileLeaseV2"))?;
-    let checks = [
-        ("profile", g.profile == b.pref()),
-        ("server_instance_id", g.server_instance_id == b.instance),
-        ("restore_epoch", g.restore_epoch == op.epoch),
-        ("fkek_key_id", g.fkek_key_id == asked.fkek_key_id),
-        ("key_generation", g.key_generation == asked.key_generation),
-        // The first fence of a new profile.
-        ("fencing_token", g.lease.fencing_token == 1),
-    ];
-    if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
-        return Err(bad(field));
-    }
+    let accepted = || -> Result<ProfileLeaseV2> {
+        let payload = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
+        let g = ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &payload)
+            .map_err(|_| bad("ProfileLeaseV2"))?;
+        let checks = [
+            ("profile", g.profile == b.pref()),
+            ("server_instance_id", g.server_instance_id == b.instance),
+            ("restore_epoch", g.restore_epoch == op.epoch),
+            ("fkek_key_id", g.fkek_key_id == asked.fkek_key_id),
+            ("key_generation", g.key_generation == asked.key_generation),
+            // The first fence of a new profile.
+            ("fencing_token", g.lease.fencing_token == 1),
+            ("expires_at_ms", lease_expiry_ok(g.expires_at_ms, now)),
+        ];
+        match checks.iter().find(|(_, ok)| !ok) {
+            Some((field, _)) => Err(bad(field)),
+            None => Ok(g),
+        }
+    };
+    let g = match accepted() {
+        Ok(g) => g,
+        Err(e) => return Err(refuse_publish(client, access, db, &b, op, &body, e).await),
+    };
     let lease = hex(&g.lease.lease_id);
     let tx = db.conn.transaction()?;
     complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
@@ -1755,6 +1804,62 @@ async fn send_publish(
         lease: g.lease,
         expires_at_ms: g.expires_at_ms,
     })
+}
+
+/// A 2xx reply to a stored publish that cannot be accepted ends it: the
+/// operation is QUARANTINED under `err`'s named reason and never replayed
+/// (the server would answer the same). If the reply still names a lease of this
+/// profile in a stored response that verifies, that lease is released with
+/// `cancel_publish`, once and best effort: it lapses at its TTL otherwise.
+async fn refuse_publish(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    b: &Bound,
+    op: &Op,
+    body: &[u8],
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let _ = db.conn.execute(
+        "UPDATE operations SET state = 'QUARANTINED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE op_id = ?1 AND state = 'PENDING'",
+        [&op.op_id],
+    );
+    let lease = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, body)
+        .ok()
+        .and_then(|p| ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &p).ok())
+        .filter(|g| g.profile == b.pref())
+        .map(|g| g.lease);
+    if let Some(lease) = lease {
+        let sent = async {
+            let release = release_op(&db.conn, b, lease, ReleaseReason::CancelPublish)?;
+            let release = get_op(db, &release)?;
+            release_reply(client, access, db, b, &release).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] cancel_publish release: {e:#}");
+        }
+    }
+    err
+}
+
+/// Ends the pending publish of `local` without sending it: the way out of a
+/// stored request that `publish` keeps refusing (a key withdrawn or a
+/// compromise counted since it was stored). Nothing is sent, so a request
+/// that had already reached the server leaves its first lease to lapse at its
+/// TTL and the empty profile listed; the next publish names a new profile.
+// shortcut: no command calls this yet, as push and pull have no cancel or
+// release command; add one with the Team profile UI.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cancel_publish(local: &str) -> Result<()> {
+    let db = Db::open()?;
+    let op = pending_publish(&db, local)?.ok_or_else(|| anyhow!(code("sync.noPublishPending")))?;
+    db.conn.execute(
+        "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE op_id = ?1 AND state = 'PENDING'",
+        [&op.op_id],
+    )?;
+    Ok(())
 }
 
 /// `PROFILE_CHECKOUT` at the pinned head, or the replay of a stored one.
@@ -1806,6 +1911,11 @@ async fn checkout(
         ("profile", g.profile == b.pref()),
         ("server_instance_id", g.server_instance_id == b.instance),
         ("restore_epoch", g.restore_epoch == op.epoch),
+        // A replay may return a lease that has ended since (released below).
+        (
+            "expires_at_ms",
+            lease_expiry_ok(g.expires_at_ms, now) || (replayed && g.expires_at_ms <= now),
+        ),
     ];
     if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
         return Err(bad(field));
@@ -1825,7 +1935,7 @@ async fn checkout(
                  WHERE op_id = ?1",
                 [&op.op_id],
             )?;
-            let release = release_op(&tx, b, g.lease)?;
+            let release = release_op(&tx, b, g.lease, ReleaseReason::UserRelease)?;
             tx.commit()?;
             get_op(db, &release)?
         };
@@ -2194,7 +2304,8 @@ async fn fail_upload(
 
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
 /// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
-/// once a third of its TTL has passed on `clock`.
+/// once a third of its TTL has passed on `clock`, which counts from `now`; the
+/// expiry the server then grants must be a plausible one.
 #[allow(clippy::too_many_arguments)]
 async fn transfer(
     client: &FleetClient,
@@ -2204,7 +2315,7 @@ async fn transfer(
     lease: LeaseRef,
     commit_op: &Op,
     s: &Session,
-    clock: &(dyn Fn() -> std::time::Duration + Sync),
+    (now, clock): (u64, &(dyn Fn() -> std::time::Duration + Sync)),
 ) -> Result<()> {
     stored(db, b, commit_op)?;
     let object = std::fs::read(spool(&s.spool)?)?;
@@ -2233,6 +2344,9 @@ async fn transfer(
             }
             if clock().saturating_sub(renewed).as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
                 let expires = renew(client, access, b, lease).await?;
+                if !lease_expiry_ok(expires, now + clock().as_millis() as u64) {
+                    return Err(bad("expires_at_ms"));
+                }
                 keep_expiry(&db.conn, &b.local, &lease, expires)?;
                 renewed = clock();
             }
@@ -2485,7 +2599,7 @@ async fn abandon(
     err: anyhow::Error,
 ) -> anyhow::Error {
     let released = async {
-        let op_id = release_op(&db.conn, b, lease)?;
+        let op_id = release_op(&db.conn, b, lease, ReleaseReason::UserRelease)?;
         let op = get_op(db, &op_id)?;
         release_reply(client, access, db, b, &op).await
     };
@@ -2496,12 +2610,17 @@ async fn abandon(
 }
 
 /// Stores a `RELEASE_LEASE` of `lease` and returns its operation ID.
-fn release_op(conn: &rusqlite::Connection, b: &Bound, lease: LeaseRef) -> Result<String> {
+fn release_op(
+    conn: &rusqlite::Connection,
+    b: &Bound,
+    lease: LeaseRef,
+    reason: ReleaseReason,
+) -> Result<String> {
     let kind = OperationKind::ReleaseLease;
     let payload = ReleaseLeaseV2 {
         profile: b.pref(),
         lease,
-        reason_code: ReleaseReason::UserRelease,
+        reason_code: reason,
     }
     .encode();
     let (key, exact, canonical) = mutation(kind, payload, b)?;
@@ -2512,8 +2631,10 @@ fn release_op(conn: &rusqlite::Connection, b: &Bound, lease: LeaseRef) -> Result
         hex(&b.profile),
         hex(&lease.lease_id)
     );
+    // A cancelled publish has no binding for the operation to name.
     let columns = Columns {
         lease: Some(lease),
+        unbound: reason == ReleaseReason::CancelPublish,
         ..Default::default()
     };
     insert_op(
@@ -3414,6 +3535,9 @@ mod tests {
                             .unwrap();
                             match t {
                                 "publish-profile" => g.profile.profile_id = [0xee; 16],
+                                "publish-tenant" => g.profile.tenant_id = [0xee; 16],
+                                "publish-fleet" => g.profile.fleet_id = [0xee; 16],
+                                "publish-expiry" => g.expires_at_ms = 1,
                                 "publish-key" => g.fkek_key_id = [0xee; 32],
                                 "publish-generation" => g.key_generation += 1,
                                 "publish-fence" => g.lease.fencing_token = 2,
@@ -3461,6 +3585,25 @@ mod tests {
                         let mut r = IdempotentStoredResponseV2::parse(&out).unwrap();
                         r.exact_request_hash = [0; 32];
                         return reply(st, &[], r.encode());
+                    }
+                    if let Some(t) = self.tamper.filter(|t| t.starts_with("checkout-")) {
+                        if st == 201 {
+                            let mut r = IdempotentStoredResponseV2::parse(&out).unwrap();
+                            let mut g = ProfileLeaseV2::parse(
+                                LeaseOrigin::Checkout,
+                                &r.canonical_response_payload_bytes,
+                            )
+                            .unwrap();
+                            match t {
+                                "checkout-tenant" => g.profile.tenant_id = [0xee; 16],
+                                "checkout-fleet" => g.profile.fleet_id = [0xee; 16],
+                                "checkout-late" => g.expires_at_ms = NOW + 3_600_000,
+                                "checkout-past" => g.expires_at_ms = 1,
+                                _ => unreachable!("{t}"),
+                            }
+                            r.canonical_response_payload_bytes = g.encode(LeaseOrigin::Checkout);
+                            return reply(st, &[], r.encode());
+                        }
                     }
                     reply(st, &[], out)
                 }
@@ -4475,18 +4618,25 @@ mod tests {
         assert_eq!(w.fake().published, [PROFILE]);
     }
 
-    /// WP-11: a reply that does not name exactly what was asked is never
-    /// kept: no binding, the operation still pending.
+    /// WP-11, L-4: a 2xx reply that does not name exactly what was asked
+    /// (L-5: the tenant and the fleet among it) is never kept: no binding, and
+    /// the operation is QUARANTINED under the named field instead of being
+    /// replayed for good. When the reply still names a lease of the profile
+    /// in a stored response that verifies, that lease is released with
+    /// `cancel_publish`; the next publish is a new request.
     #[test]
     fn a_publish_reply_that_does_not_name_the_request_is_never_kept() {
-        for (tamper, field) in [
-            ("publish-hash", "exact_request_hash"),
-            ("publish-profile", "profile"),
-            ("publish-instance", "server_instance_id"),
-            ("publish-epoch", "restore_epoch"),
-            ("publish-key", "fkek_key_id"),
-            ("publish-generation", "key_generation"),
-            ("publish-fence", "fencing_token"),
+        for (tamper, field, released) in [
+            ("publish-hash", "exact_request_hash", false),
+            ("publish-profile", "profile", false),
+            ("publish-tenant", "profile", false),
+            ("publish-fleet", "profile", false),
+            ("publish-instance", "server_instance_id", true),
+            ("publish-epoch", "restore_epoch", true),
+            ("publish-key", "fkek_key_id", true),
+            ("publish-generation", "key_generation", true),
+            ("publish-fence", "fencing_token", true),
+            ("publish-expiry", "expires_at_ms", true),
         ] {
             let w = world_unbound();
             w.fake().tamper = Some(tamper);
@@ -4500,8 +4650,205 @@ mod tests {
             );
             assert_eq!(
                 w.count(
-                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'QUARANTINED'
                        AND exact_response_bytes IS NULL"
+                ),
+                1,
+                "{tamper}"
+            );
+            let releases = w.sent("POST", "/release");
+            assert_eq!(releases.len(), usize::from(released), "{tamper}");
+            for sent in releases {
+                let request = IdempotentMutationRequestV2::parse(&sent).unwrap();
+                let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes).unwrap();
+                assert_eq!(
+                    release.reason_code,
+                    ReleaseReason::CancelPublish,
+                    "{tamper}"
+                );
+            }
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND local_profile_id IS NOT NULL"),
+                0,
+                "{tamper}: the release names no binding"
+            );
+            // Not replayed: the next publish is a new request.
+            w.fake().tamper = None;
+            w.publish_as(PROFILE2, "Work profile").unwrap();
+            let sent = w.sent("POST", "/profiles");
+            assert_eq!(sent.len(), 2, "{tamper}");
+            assert_ne!(sent[0], sent[1], "{tamper}: not a replay");
+        }
+    }
+
+    /// A compromised revocation of a key the fleet's devices hold, counted.
+    fn count_a_compromise(w: &World) {
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: [0x77; 32],
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+            )
+            .unwrap();
+    }
+
+    /// M-1: a stored publish is re-checked at every send, replays included. A
+    /// compromise counted, or the key withdrawn by local distrust, since it
+    /// was stored keeps it unsent under a named code, still PENDING; the
+    /// cancel path ends it, and what is left of the key stops a new request.
+    #[test]
+    fn a_stored_publish_is_not_sent_once_its_key_is_blocked_or_withdrawn() {
+        for (name, code) in [
+            ("compromise", "sync.commitBlockedCompromised"),
+            ("withdrawn", "sync.noVerifiedFleetKey"),
+        ] {
+            let w = world_unbound();
+            w.fake().skip.push("publish");
+            w.publish().unwrap_err();
+            assert_eq!(
+                w.sent("POST", "/profiles").len(),
+                1,
+                "{name}: stored and tried"
+            );
+            if name == "compromise" {
+                count_a_compromise(&w);
+            } else {
+                ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+            }
+            let err = w.publish().unwrap_err();
+            assert!(has(&err, code), "{name}: {err:#}");
+            assert_eq!(
+                w.sent("POST", "/profiles").len(),
+                1,
+                "{name}: not sent again"
+            );
+            assert!(w.fake().published.is_empty(), "{name}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'"
+                ),
+                1,
+                "{name}: kept, unsent"
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings"),
+                0,
+                "{name}"
+            );
+
+            cancel_publish(LOCAL).unwrap();
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"
+                ),
+                1,
+                "{name}"
+            );
+            let err = cancel_publish(LOCAL).unwrap_err();
+            assert!(has(&err, "sync.noPublishPending"), "{name}: {err:#}");
+            let err = w.publish_as(PROFILE2, "Work").unwrap_err();
+            assert!(
+                has(&err, code),
+                "{name}: a new request needs a good key: {err:#}"
+            );
+            assert_eq!(w.sent("POST", "/profiles").len(), 1, "{name}");
+        }
+    }
+
+    /// M-1: with the key good, the stored publish goes out as before.
+    #[test]
+    fn a_stored_publish_goes_out_while_its_key_holds() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        w.publish().unwrap();
+        assert_eq!(w.fake().published, [PROFILE]);
+        let sent = w.sent("POST", "/profiles");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1], "the stored request, replayed");
+    }
+
+    /// L-3: the expiry of a first lease is pinned only inside the window:
+    /// ahead of now and no further than one TTL and the skew allowance. A
+    /// reply outside it is refused by name, and the operation ends.
+    #[test]
+    fn a_publish_lease_expiry_outside_the_ttl_is_refused() {
+        for (ms, kept) in [
+            (NOW + 1, true),
+            (NOW + 300_000 + 60_000, true),
+            (NOW, false),
+            (NOW + 300_000 + 60_000 + 1, false),
+            (1, false),
+            (9_000_000_000_000, false),
+        ] {
+            let w = world_unbound();
+            w.fake().expires = Some(ms);
+            let result = w.publish();
+            if kept {
+                assert_eq!(result.unwrap().expires_at_ms, ms, "{ms}");
+                assert_eq!(
+                    w.count(&format!(
+                        "SELECT count(*) FROM profile_bindings
+                         WHERE lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', {ms} / 1000.0, 'unixepoch')"
+                    )),
+                    1,
+                    "{ms}"
+                );
+                continue;
+            }
+            let err = result.unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{ms}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("expires_at_ms"),
+                "{ms}: {err:#}"
+            );
+            assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0, "{ms}");
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'QUARANTINED'"),
+                1,
+                "{ms}"
+            );
+        }
+    }
+
+    /// L-5, L-3: a checkout reply that names another tenant or fleet, or a
+    /// lease that ends outside the window (a fresh one that has already
+    /// ended included), is never kept: refused by name, no lease on the
+    /// binding.
+    #[test]
+    fn a_checkout_reply_for_another_tenant_fleet_or_expiry_is_never_kept() {
+        for (tamper, field) in [
+            ("checkout-tenant", "profile"),
+            ("checkout-fleet", "profile"),
+            ("checkout-late", "expires_at_ms"),
+            ("checkout-past", "expires_at_ms"),
+        ] {
+            let w = world();
+            w.fake().tamper = Some(tamper);
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{tamper}: {err:#}");
+            assert!(format!("{err:#}").contains(field), "{tamper}: {err:#}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM profile_bindings
+                     WHERE lease_id IS NOT NULL OR lease_expires_at IS NOT NULL"
+                ),
+                0,
+                "{tamper}"
+            );
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'PENDING'"
                 ),
                 1,
                 "{tamper}"
@@ -4606,18 +4953,45 @@ mod tests {
         assert_eq!(w.sent("POST", "/profiles").len(), 1);
     }
 
-    /// WP-12: a lease renewed mid-upload keeps the expiry the server granted.
-    /// The clock jumps past a third of the TTL at every look, so each chunk
-    /// renews; the binding's `lease_expires_at` is read each time the clock
-    /// is, and moves from the checkout's grant to the renewal's.
-    #[test]
-    fn a_renewed_lease_moves_the_bindings_expiry_forward() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let w = world();
-        let (granted, renewed) = (NOW + 300_000, NOW + 900_000);
-        w.fake().renewed = Some(renewed);
-        let at = |ms: u64| -> String {
-            w.db()
+    /// The `NOW` a push sees `JUMP` seconds after its first look at the clock:
+    /// the first renewal is due and the clock then stands still.
+    const JUMP: u64 = 101;
+
+    fn jump() -> impl Fn() -> std::time::Duration + Sync {
+        let looks = std::sync::atomic::AtomicU64::new(0);
+        move || {
+            let n = looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::time::Duration::from_secs(if n == 0 { 0 } else { JUMP })
+        }
+    }
+
+    impl World {
+        fn push_at(&self, clock: &(dyn Fn() -> std::time::Duration + Sync)) -> Result<Pushed> {
+            self.rt.block_on(push(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                &self.udd,
+                NOW,
+                clock,
+            ))
+        }
+
+        fn expiry(&self) -> Option<String> {
+            self.db()
+                .conn
+                .query_row(
+                    "SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = ?1",
+                    [LOCAL],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// `lease_expires_at` as the binding stores `ms`.
+        fn stored_as(&self, ms: u64) -> String {
+            self.db()
                 .conn
                 .query_row(
                     "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')",
@@ -4625,36 +4999,67 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap()
-        };
-        let looks = AtomicU64::new(0);
+        }
+    }
+
+    /// WP-12: a lease renewed mid-upload keeps the expiry the server granted.
+    /// The clock jumps past a third of the TTL once, so the first chunk
+    /// renews; the binding's `lease_expires_at` is read each time the clock
+    /// is, and moves from the checkout's grant to the renewal's.
+    #[test]
+    fn a_renewed_lease_moves_the_bindings_expiry_forward() {
+        let w = world();
+        let (granted, renewed) = (NOW + 300_000, NOW + JUMP * 1000 + 300_000);
+        w.fake().renewed = Some(renewed);
         let seen = Mutex::new(Vec::new());
-        let clock = || {
-            let n = looks.fetch_add(1, Ordering::SeqCst);
-            let held: Option<String> = w
-                .db()
-                .conn
-                .query_row(
-                    "SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = ?1",
-                    [LOCAL],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            seen.lock().unwrap().push(held);
-            std::time::Duration::from_secs(n * 1000)
+        let clock = jump();
+        let watching = || {
+            seen.lock().unwrap().push(w.expiry());
+            clock()
         };
-        w.rt.block_on(push(&w.client, "t", &w.dev, LOCAL, &w.udd, NOW, &clock))
-            .unwrap();
-        assert!(w.sent("POST", "/renew").len() >= 2);
+        w.push_at(&watching).unwrap();
+        assert_eq!(w.sent("POST", "/renew").len(), 1);
         let seen = seen.into_inner().unwrap();
-        assert_eq!(seen[0], Some(at(granted)), "before any renewal");
+        assert_eq!(seen[0], Some(w.stored_as(granted)), "before any renewal");
         assert!(
-            seen.contains(&Some(at(renewed))),
+            seen.contains(&Some(w.stored_as(renewed))),
             "a renewal moved the expiry forward: {seen:?}"
         );
         assert!(
-            !seen.contains(&Some(at(T0))),
+            !seen.contains(&Some(w.stored_as(T0))),
             "never to the stale one: {seen:?}"
         );
+    }
+
+    /// L-3: an expiry the server grants is kept only when it lies ahead of
+    /// now and within one TTL and the skew allowance; at the edges it is kept,
+    /// one millisecond outside it is refused by name and the row is unchanged.
+    #[test]
+    fn a_lease_expiry_outside_the_ttl_is_refused_by_name() {
+        let now = NOW + JUMP * 1000;
+        let last = now + 300_000 + 60_000;
+        for (ms, kept) in [
+            (now + 1, true),
+            (last, true),
+            (now, false),
+            (last + 1, false),
+            (1, false),
+        ] {
+            let w = world();
+            w.fake().renewed = Some(ms);
+            let result = w.push_at(&jump());
+            if kept {
+                result.unwrap();
+                continue;
+            }
+            let err = result.unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{ms}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("expires_at_ms"),
+                "{ms}: {err:#}"
+            );
+            assert_eq!(w.expiry(), Some(w.stored_as(NOW + 300_000)), "{ms}");
+        }
     }
 
     /// WP-11: a server epoch ahead of the accepted one is where a new profile
@@ -6536,8 +6941,7 @@ mod tests {
     /// the original expired lease; it is released, and the new lease is
     /// taken under a new key. A checkout stored before a restore is replayed
     /// only after the listing showed the restore and its transition was
-    /// accepted, and is released the same way. A fresh lease is used
-    /// whatever its expiry says.
+    /// accepted, and is released the same way.
     #[test]
     fn a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key() {
         let w = world();
@@ -6547,6 +6951,8 @@ mod tests {
             f.lose.push("checkout");
         }
         w.push().unwrap_err();
+        // The lease the new key takes is an ordinary one.
+        w.fake().expires = None;
         assert_eq!(w.push().unwrap().version, 1);
         let checkouts = w.sent("POST", "/checkout");
         assert_eq!(checkouts.len(), 3);

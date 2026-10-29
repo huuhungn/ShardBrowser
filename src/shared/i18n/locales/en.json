@@ -1280,6 +1280,7 @@
   "sync.headRollback": "The team server offered an older state of this profile than this device already accepted. The profile is quarantined.",
   "sync.holdWorkInOneWindowAlone": "Hold — work in one window alone",
   "sync.noDataToPush": "This profile has no data to push yet.",
+  "sync.noPublishPending": "This profile has no unfinished publish to cancel.",
   "sync.noTeamServer": "No team server is configured. Set one in Settings.",
   "sync.noVerifiedFleetKey": "No fleet key this device verified opens this team profile. Collect the fleet key in Settings; a passphrase cannot be used for it.",
   "sync.passphraseRequired": "Enter the team passphrase to push. Fleet keys from the team server are not used until verified key distribution ships.",

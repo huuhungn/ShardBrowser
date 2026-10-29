@@ -1280,6 +1280,7 @@
   "sync.headRollback": "Máy chủ nhóm đưa ra một trạng thái cũ hơn trạng thái thiết bị này đã chấp nhận. Hồ sơ đã bị cách ly.",
   "sync.holdWorkInOneWindowAlone": "Tách riêng — làm việc trong một cửa sổ",
   "sync.noDataToPush": "Hồ sơ này chưa có dữ liệu nào để đẩy lên.",
+  "sync.noPublishPending": "Hồ sơ này không có lần xuất bản dang dở nào để hủy.",
   "sync.noTeamServer": "Chưa cấu hình máy chủ nhóm. Hãy đặt một máy chủ trong Cài đặt.",
   "sync.noVerifiedFleetKey": "Không có khóa nhóm nào đã được thiết bị này xác minh để mở hồ sơ nhóm này. Hãy nhận khóa nhóm trong Cài đặt; không thể dùng mật khẩu bảo vệ cho hồ sơ này.",
   "sync.passphraseRequired": "Hãy nhập mật khẩu của nhóm để đẩy lên. Khoá đội máy từ máy chủ nhóm chưa được dùng cho đến khi có cơ chế phân phối khoá đã xác minh.",
