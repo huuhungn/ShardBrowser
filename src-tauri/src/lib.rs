@@ -2015,7 +2015,7 @@ fn team_set_connection(
 
     let server_changed = url != c.server_url || tenant_id.trim() != c.tenant_id;
     c.server_url = url;
-    c.token = token.trim().to_string();
+    c.token = token.trim().to_string().into();
     c.tenant_id = tenant_id.trim().to_string();
     let mut stale_refs = Vec::new();
     if server_changed {
@@ -2122,12 +2122,20 @@ async fn team_enroll_device(
     // Fleet routes are account-scoped, and the server is the only source for
     // this id. Storing it here is what lets sync run without a second call.
     c.account_id = enrolled.account_id;
-    c.signing_key_seed = seed.iter().map(|b| format!("{b:02x}")).collect();
+    c.signing_key_seed = seed
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .into();
     // Without the HPKE seed the device can never open a root key grant sealed
     // to it: the public half is registered with the server, but the private
     // half only exists here. Discarding it would make enrollment permanently
     // unable to receive custody.
-    c.hpke_key_seed = hpke_seed.iter().map(|b| format!("{b:02x}")).collect();
+    c.hpke_key_seed = hpke_seed
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .into();
     let old_refs = [
         std::mem::take(&mut c.signing_credential_ref),
         std::mem::take(&mut c.hpke_credential_ref),
@@ -3256,7 +3264,7 @@ mod custody_tests {
             .get_mut(&fleet)
             .unwrap()
             .keys
-            .insert(3, "zz".into());
+            .insert(3, "zz".to_string().into());
         fleet_keys::save(&keys).unwrap();
         let unreadable = fleet_keys::collect(&fleet, 3, &[0x5c; 32]).unwrap();
         let kept = [
@@ -4232,8 +4240,8 @@ mod custody_tests {
             account_id: hex(&me.to.account_id),
             device_id: hex(&me.to.device_id),
             fleet_id: hex(&FLEET),
-            signing_key_seed: hex(&[1; 32]),
-            hpke_key_seed: hex(&[7; 32]),
+            signing_key_seed: hex(&[1; 32]).into(),
+            hpke_key_seed: hex(&[7; 32]).into(),
             ..Default::default()
         };
         let now = T0 + 2 * DAY;

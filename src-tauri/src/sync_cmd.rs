@@ -567,13 +567,13 @@ mod tests {
         let seed = "11".repeat(32);
         team_config::save(&team_config::TeamConfig {
             server_url: "http://127.0.0.1:9".into(),
-            token: "t".into(),
+            token: "t".to_string().into(),
             tenant_id: "aa".repeat(16),
             device_id: "bb".repeat(16),
             account_id: "cc".repeat(16),
             fleet_id: "dd".repeat(16),
-            signing_key_seed: seed.clone(),
-            hpke_key_seed: seed,
+            signing_key_seed: seed.clone().into(),
+            hpke_key_seed: seed.into(),
             ..Default::default()
         })
         .unwrap();
@@ -633,13 +633,13 @@ mod tests {
             // Nothing listens here, so a push that got past the key check
             // fails on the network instead of with the refusal.
             server_url: "http://127.0.0.1:9".into(),
-            token: "t".into(),
+            token: "t".to_string().into(),
             tenant_id: "aa".repeat(16),
             device_id: "bb".repeat(16),
             account_id: "cc".repeat(16),
             fleet_id: "dd".repeat(16),
-            signing_key_seed: seed.clone(),
-            hpke_key_seed: seed,
+            signing_key_seed: seed.clone().into(),
+            hpke_key_seed: seed.into(),
             ..Default::default()
         })
         .unwrap();

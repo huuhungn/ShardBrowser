@@ -67,14 +67,14 @@ fn now_chromium() -> i64 {
 
 /// Resolved OSCrypt key; cipher chosen per-OS at compile time.
 struct Crypt {
-    key: Vec<u8>,
+    key: zeroize::Zeroizing<Vec<u8>>,
 }
 
 impl Crypt {
     /// POSIX: fixed derivation; Windows: read/mint os_crypt.encrypted_key.
     fn open(udd: &Path) -> Result<Self> {
         Ok(Self {
-            key: os_crypt_key(udd)?,
+            key: os_crypt_key(udd)?.into(),
         })
     }
 

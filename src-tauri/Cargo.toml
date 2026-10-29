@@ -33,7 +33,7 @@ shardx-core = { path = "../shared" }
 # Device keys in the OS credential store (ADR 0004). The core crate has no
 # platform code; the Windows backend is below.
 keyring-core = "=1.0.0"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
