@@ -96,6 +96,14 @@ pub fn preflight(identity_dir: &str, data_dir: &str) -> Result<PathBuf, String> 
             "SHARDX_IDENTITY_DIR must not equal, contain or sit inside SHARDX_DATA_DIR".into(),
         );
     }
+    // The record holds the external epoch authority, so its directory meets the
+    // data directory's filesystem rule (ADR 0002 Q-30). Off Windows this
+    // accepts every path and the mount allowlist below is the whole check.
+    if let Err(refusal) = shared::volume::require_local_ntfs(&identity) {
+        return Err(format!(
+            "SHARDX_IDENTITY_DIR {identity_dir:?} {refusal}, which is not supported"
+        ));
+    }
     if is_network_path(&identity) {
         return Err("SHARDX_IDENTITY_DIR is on a network share, which is not supported".into());
     }
@@ -627,6 +635,43 @@ mod tests {
         assert!(preflight(&s(&base.join("absent")), &s(&data)).is_err());
         assert!(preflight(&s(&outside), &s(&data)).is_ok());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// G2-49: an identity directory on an SMB share fails closed before the
+    /// record is read. CI names a share it created in `SHARDX_TEST_SMB_DIR`;
+    /// elsewhere the loopback administrative share of the temporary directory
+    /// is tried, as in the data-directory test in `db.rs`.
+    #[cfg(windows)]
+    #[test]
+    fn preflight_refuses_an_identity_directory_on_an_smb_share() {
+        let share = match std::env::var_os("SHARDX_TEST_SMB_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => {
+                let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+                let local = temp.to_string_lossy().into_owned();
+                let (drive, tail) = local.trim_start_matches(r"\\?\").split_once(":\\").unwrap();
+                std::path::PathBuf::from(format!(r"\\localhost\{drive}$\{tail}"))
+            }
+        };
+        if !share.exists() {
+            assert!(
+                std::env::var_os("SHARDX_TEST_SMB_DIR").is_none(),
+                "SHARDX_TEST_SMB_DIR {share:?} is not reachable"
+            );
+            eprintln!("SKIPPED preflight_refuses_an_identity_directory_on_an_smb_share: no reachable SMB share");
+            return;
+        }
+        let data =
+            std::env::temp_dir().join(format!("shardx-preflight-smb-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let share = share.to_string_lossy().into_owned();
+        let err = preflight(&share, &data.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_dir_all(&data);
+        // The volume gate names the directory; the mount check alone does not.
+        assert!(
+            err.contains("network share") && err.contains("SHARDX_IDENTITY_DIR \""),
+            "{err}"
+        );
     }
 
     #[test]
