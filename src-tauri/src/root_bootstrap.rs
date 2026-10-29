@@ -718,8 +718,29 @@ pub async fn run(
         },
         passphrase,
     };
-    let result = bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await;
-    result.map(|()| BootstrapStatus::of(&state))
+    bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await?;
+    if state.activated {
+        keep_records(client.base_url(), &state)?;
+    }
+    Ok(BootstrapStatus::of(&state))
+}
+
+/// Files the activated generation 0, its self-grant and this device's
+/// approval in the team database (plan L1510-L1744). Each run after
+/// activation files what is missing and refuses a row that changed.
+fn keep_records(server_url: &str, state: &BootstrapState) -> Result<()> {
+    let mut db = crate::team::db::Db::open()?;
+    let tx = db.conn.transaction()?;
+    crate::team::records::keep_root_bootstrap(
+        &tx,
+        server_url,
+        &unhex_vec(&state.approval)?,
+        &unhex_vec(&state.self_grant)?,
+        &unhex(&state.recovery_bundle_sha256)?,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// How far the bootstrap got, for the UI: nothing of the state's secrets.

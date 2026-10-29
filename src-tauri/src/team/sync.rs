@@ -2494,6 +2494,7 @@ mod tests {
                 &self.me.hpke_sk,
                 NOW,
                 &mut db,
+                "https://fleet.test",
             )
             .unwrap()
             .expect("the grant verifies");
@@ -3055,6 +3056,7 @@ mod tests {
             &w.me.hpke_sk,
             NOW,
             &mut db,
+            "https://fleet.test",
         )
         .unwrap()
         .expect("generation 2 verifies");

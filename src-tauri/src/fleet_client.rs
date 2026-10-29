@@ -221,6 +221,10 @@ impl FleetClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
 
 /// True for `https://`, or `http://` to this machine.

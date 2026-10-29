@@ -66,6 +66,8 @@ fn keys_of(pages: &[TenantTrustEvidencePageV2]) -> Keys {
 
 /// A fleet key grant an evaluation accepted and opened (G2-35).
 pub struct Opened<'a> {
+    /// The team server the grant came from, for its `server_origins` row.
+    pub server_url: &'a str,
     pub fleet_id: &'a [u8; 16],
     pub generation: u64,
     pub fkek_key_id: [u8; 32],
@@ -487,7 +489,8 @@ pub fn commit_blocked(
 /// a new evaluation, the first sighting of every container, the reported
 /// revocations, every `DeviceRevocationV2` rule 6 counts, the custodian keys
 /// with their `first_not_before` and observed lapses, and, when a grant
-/// opened, its fleet's generation and the grant itself.
+/// opened, its fleet's generation and the grant itself, also as a kept
+/// signed authorization record (`team::records`).
 pub fn record(
     db: &mut Db,
     binding: &Binding,
@@ -618,6 +621,8 @@ pub fn record(
                 pages
             ],
         )?;
+        // Probe 3 (L2032): the exact grant with every column it decides.
+        super::records::keep(&tx, o.server_url, o.container, now)?;
     }
     tx.commit()?;
     Ok(())
