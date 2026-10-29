@@ -167,17 +167,26 @@ pub fn unwrap_dek(
 
 /// Domain label of the AAD a profile label is sealed under.
 pub const L_PROFILE_LABEL: &str = "SHARDX-PROFILE-LABEL-V2\0";
-/// Longest label `seal_label` takes, in bytes: the server stores at most 4096
-/// bytes of `label_ciphertext` (plan L948), which also holds the nonce and tag.
-pub const MAX_LABEL_LEN: usize = 1024;
+/// Domain label of the HKDF `info` the label subkey is derived under.
+pub const L_PROFILE_LABEL_KEY: &str = "SHARDX-PROFILE-LABEL-KEY-V2\0";
+/// The sizes a label is padded to: the plaintext is `u16be(len) || label ||
+/// zeros`, exactly one of these, so the server learns only the bucket.
+pub const LABEL_BUCKETS: [usize; 3] = [64, 256, 1024];
+/// Longest label `seal_label` takes, in bytes: the largest bucket less its
+/// two-byte length. The sealed form (nonce, bucket and tag) stays well under
+/// the 4096 bytes the server stores of `label_ciphertext` (plan L948).
+pub const MAX_LABEL_LEN: usize = 1024 - 2;
 
-fn label_aad(
+/// `domain` followed by the tenant, fleet, profile and `u64be(generation)`:
+/// the AAD of a sealed label, and the `info` of its subkey under another domain.
+fn label_context(
+    domain: &str,
     tenant_id: &[u8; 16],
     fleet_id: &[u8; 16],
     profile_id: &[u8; 16],
     generation: u64,
 ) -> Vec<u8> {
-    let mut aad = L_PROFILE_LABEL.as_bytes().to_vec();
+    let mut aad = domain.as_bytes().to_vec();
     aad.extend_from_slice(tenant_id);
     aad.extend_from_slice(fleet_id);
     aad.extend_from_slice(profile_id);
@@ -185,11 +194,38 @@ fn label_aad(
     aad
 }
 
+/// The key a profile's label is sealed under: HKDF-SHA256 (RFC 5869) of the
+/// fleet key, no salt, with `info` the domain label followed by the tenant,
+/// fleet, profile and `u64be(generation)`. The fleet key itself never seals
+/// a label, so a label ciphertext cannot be turned against its other uses.
+fn label_key(
+    fkek: &[u8; 32],
+    tenant_id: &[u8; 16],
+    fleet_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    generation: u64,
+) -> Zeroizing<[u8; 32]> {
+    let info = label_context(
+        L_PROFILE_LABEL_KEY,
+        tenant_id,
+        fleet_id,
+        profile_id,
+        generation,
+    );
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<sha2_11::Sha256>::new(None, fkek)
+        .expand(&info, &mut *key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    key
+}
+
 /// Seals the display `label` of a profile under the fleet key, as
 /// `nonce || ciphertext || tag`: the `label_ciphertext` of a publish-create
-/// request, which the server stores and never reads (plan L364). The AAD
-/// names the tenant, fleet, profile and key generation, so the ciphertext
-/// opens nowhere else. An empty or overlong label is refused.
+/// request, which the server stores and never reads (plan L364). The
+/// plaintext is padded to a bucket (`LABEL_BUCKETS`), the key is the label
+/// subkey of `label_key`, and the AAD names the tenant, fleet, profile and key
+/// generation, so the ciphertext opens nowhere else. An empty or overlong
+/// label is refused.
 pub fn seal_label(
     fkek: &[u8; 32],
     nonce: &[u8; WRAP_NONCE_LEN],
@@ -205,12 +241,20 @@ pub fn seal_label(
             got: label.len(),
         });
     }
-    let aad = label_aad(tenant_id, fleet_id, profile_id, generation);
-    let sealed = ChaCha20Poly1305::new(&(*fkek).into())
+    let bucket = bucket_of(label.len() + 2).ok_or(KeyError::BadLength {
+        field: "label",
+        got: label.len(),
+    })?;
+    let mut padded = Zeroizing::new(vec![0u8; bucket]);
+    padded[..2].copy_from_slice(&(label.len() as u16).to_be_bytes());
+    padded[2..2 + label.len()].copy_from_slice(label);
+    let key = label_key(fkek, tenant_id, fleet_id, profile_id, generation);
+    let aad = label_context(L_PROFILE_LABEL, tenant_id, fleet_id, profile_id, generation);
+    let sealed = ChaCha20Poly1305::new(&(*key).into())
         .encrypt(
             &(*nonce).into(),
             Payload {
-                msg: label,
+                msg: &padded,
                 aad: &aad,
             },
         )
@@ -218,8 +262,15 @@ pub fn seal_label(
     Ok([nonce.as_slice(), &sealed].concat())
 }
 
+/// The smallest bucket that holds `len` bytes.
+fn bucket_of(len: usize) -> Option<usize> {
+    LABEL_BUCKETS.into_iter().find(|b| len <= *b)
+}
+
 /// The label `seal_label` sealed, or `KeyError::Aead` for any other key, tenant,
-/// fleet, profile, generation or byte.
+/// fleet, profile, generation or byte. The plaintext must be exactly a bucket
+/// holding a non-empty label in the smallest bucket that fits, padded with
+/// zeros: anything else is refused even though it authenticated.
 pub fn open_label(
     fkek: &[u8; 32],
     tenant_id: &[u8; 16],
@@ -236,17 +287,29 @@ pub fn open_label(
     }
     let (nonce, body) = sealed.split_at(WRAP_NONCE_LEN);
     let nonce: [u8; WRAP_NONCE_LEN] = nonce.try_into().map_err(|_| KeyError::Aead)?;
-    let aad = label_aad(tenant_id, fleet_id, profile_id, generation);
-    ChaCha20Poly1305::new(&(*fkek).into())
-        .decrypt(
-            &nonce.into(),
-            Payload {
-                msg: body,
-                aad: &aad,
-            },
-        )
-        .map(Zeroizing::new)
-        .map_err(|_| KeyError::Aead)
+    let key = label_key(fkek, tenant_id, fleet_id, profile_id, generation);
+    let aad = label_context(L_PROFILE_LABEL, tenant_id, fleet_id, profile_id, generation);
+    let padded = Zeroizing::new(
+        ChaCha20Poly1305::new(&(*key).into())
+            .decrypt(
+                &nonce.into(),
+                Payload {
+                    msg: body,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| KeyError::Aead)?,
+    );
+    let len = padded
+        .get(..2)
+        .map(|l| usize::from(u16::from_be_bytes([l[0], l[1]])))
+        .filter(|l| *l > 0 && bucket_of(l + 2) == Some(padded.len()))
+        .filter(|l| padded[2 + l..].iter().all(|b| *b == 0))
+        .ok_or(KeyError::BadLength {
+            field: "label",
+            got: padded.len(),
+        })?;
+    Ok(Zeroizing::new(padded[2..2 + len].to_vec()))
 }
 
 /// Fill `out` with OS entropy.
@@ -374,7 +437,7 @@ mod tests {
             "Work".as_bytes(),
         )
         .expect("seal");
-        assert_eq!(sealed.len(), WRAP_NONCE_LEN + 4 + AEAD_TAG_LEN);
+        assert_eq!(sealed.len(), WRAP_NONCE_LEN + 64 + AEAD_TAG_LEN);
         assert!(!sealed.windows(4).any(|w| w == b"Work"));
         assert_eq!(
             *open_label(&fkek, &t, &f, &p, 7, &sealed).expect("open"),
@@ -410,6 +473,7 @@ mod tests {
         let seal = |l: &[u8]| seal_label(&fkek, &nonce, &ids, &ids, &ids, 1, l);
         assert!(matches!(seal(b""), Err(KeyError::BadLength { .. })));
         assert!(seal(&[b'x'; MAX_LABEL_LEN]).is_ok());
+        assert_eq!(MAX_LABEL_LEN + 2, LABEL_BUCKETS[2]);
         assert!(matches!(
             seal(&[b'x'; MAX_LABEL_LEN + 1]),
             Err(KeyError::BadLength { .. })
@@ -421,6 +485,126 @@ mod tests {
                 open_label(&fkek, &ids, &ids, &ids, 1, &sealed[..short]),
                 Err(KeyError::BadLength { .. })
             ));
+        }
+    }
+
+    /// A label is padded to a bucket, so its ciphertext shows only which of
+    /// 64, 256 or 1024 bytes it fell in; the edges fall where the two-byte
+    /// length puts them.
+    #[test]
+    fn a_profile_label_is_padded_to_a_bucket() {
+        let (fkek, ids) = ([0x5a; 32], [1; 16]);
+        let nonce = [9; WRAP_NONCE_LEN];
+        for (len, bucket) in [
+            (1, 64),
+            (62, 64),
+            (63, 256),
+            (254, 256),
+            (255, 1024),
+            (MAX_LABEL_LEN, 1024),
+        ] {
+            let label = vec![b'x'; len];
+            let sealed = seal_label(&fkek, &nonce, &ids, &ids, &ids, 1, &label).unwrap();
+            assert_eq!(
+                sealed.len(),
+                WRAP_NONCE_LEN + bucket + AEAD_TAG_LEN,
+                "{len}"
+            );
+            assert_eq!(
+                *open_label(&fkek, &ids, &ids, &ids, 1, &sealed).unwrap(),
+                label
+            );
+        }
+    }
+
+    /// What authenticates but is not a label this module sealed is refused: a
+    /// length past the bucket, an empty label, a bucket that is not the
+    /// smallest, padding that is not zero, a size that is no bucket.
+    #[test]
+    fn a_profile_label_that_is_not_canonical_is_refused() {
+        let (fkek, ids) = ([0x5a; 32], [1; 16]);
+        let nonce = [9; WRAP_NONCE_LEN];
+        let forge = |plain: &[u8]| {
+            let key = label_key(&fkek, &ids, &ids, &ids, 1);
+            let aad = label_context(L_PROFILE_LABEL, &ids, &ids, &ids, 1);
+            let sealed = ChaCha20Poly1305::new(&(*key).into())
+                .encrypt(
+                    &nonce.into(),
+                    Payload {
+                        msg: plain,
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            open_label(
+                &fkek,
+                &ids,
+                &ids,
+                &ids,
+                1,
+                &[nonce.as_slice(), &sealed].concat(),
+            )
+        };
+        let block = |size: usize, len: u16, pad: u8| {
+            let mut b = vec![0u8; size];
+            b[..2].copy_from_slice(&len.to_be_bytes());
+            b[2..2 + usize::from(len).min(size - 2)].fill(b'x');
+            *b.last_mut().unwrap() = pad;
+            b
+        };
+        assert!(forge(&block(64, 5, 0)).is_ok(), "the control opens");
+        for (name, plain) in [
+            ("longer than the bucket", block(64, 63, 0)),
+            ("empty", block(64, 0, 0)),
+            ("not the smallest bucket", block(256, 5, 0)),
+            ("padding not zero", block(64, 5, 1)),
+            ("no bucket", vec![0u8; 100]),
+            ("no length", vec![0u8; 1]),
+            ("nothing", Vec::new()),
+        ] {
+            assert!(
+                matches!(forge(&plain), Err(KeyError::BadLength { .. })),
+                "{name}"
+            );
+        }
+    }
+
+    /// The label subkey is HKDF-SHA256 of the fleet key under the pinned info,
+    /// never the fleet key itself, and differs per profile and generation.
+    /// Pinned vectors, cross-checked against Python's HMAC and
+    /// `cryptography`: the format is `nonce || ChaCha20-Poly1305(subkey,
+    /// nonce, u16be(len) || label || zeros to the bucket, AAD) || tag`.
+    #[test]
+    fn g2_golden_vector_profile_label() {
+        let fkek: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let (t, f, p) = ([0x11; 16], [0x22; 16], [0x33; 16]);
+        let key = label_key(&fkek, &t, &f, &p, 7);
+        assert_ne!(*key, fkek);
+        assert_eq!(
+            hex32(&key),
+            "1b9252810d436b045965d1105ea45a008a6e9735b98acaa6466d352747e505dd",
+            "label subkey diverged from the pinned vector"
+        );
+        assert_ne!(*key, *label_key(&fkek, &t, &f, &[0x34; 16], 7));
+        assert_ne!(*key, *label_key(&fkek, &t, &f, &p, 8));
+        let nonce: [u8; WRAP_NONCE_LEN] = core::array::from_fn(|i| 0xa0 + i as u8);
+        for (label, golden) in [
+            (
+                "Work".as_bytes().to_vec(),
+                "0b235c0f6a52d09980f3c86f0094d0c4f17479049c8dd43947621d3b78f13170",
+            ),
+            (
+                "w".repeat(100).into_bytes(),
+                "dbd16b99e01ab7e2c16a2323e7f9660d24a5a629fadf3d2497cfc7ea09d5a594",
+            ),
+        ] {
+            let sealed = seal_label(&fkek, &nonce, &t, &f, &p, 7, &label).unwrap();
+            assert_eq!(
+                hex32(&c::sha256(&sealed)),
+                golden,
+                "label ciphertext diverged from the pinned vector"
+            );
+            assert_eq!(*open_label(&fkek, &t, &f, &p, 7, &sealed).unwrap(), label);
         }
     }
 
