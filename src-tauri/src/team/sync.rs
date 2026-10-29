@@ -94,6 +94,8 @@ pub(crate) struct Pushed {
 /// A `profile_bindings` row.
 struct Bound {
     local: String,
+    /// The `server_origins` row of the instance.
+    server: String,
     instance: [u8; 16],
     tenant: [u8; 16],
     fleet: [u8; 16],
@@ -140,6 +142,8 @@ struct Op {
     manifest_hash: Option<Vec<u8>>,
     manifest_sha: Option<Vec<u8>>,
     receipt: Option<Vec<u8>>,
+    server: String,
+    scope: String,
 }
 
 /// What a new operation row carries besides its request.
@@ -210,7 +214,7 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
         .query_row(
             "SELECT server_instance_id, tenant_id, fleet_id, remote_profile_id, remote_version,
                     last_observed_head_hash, accepted_restore_epoch, lease_id, fencing_token,
-                    sync_state, last_error_code
+                    sync_state, last_error_code, server_id
              FROM profile_bindings WHERE local_profile_id = ?1",
             [local],
             |r| {
@@ -223,13 +227,23 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
                     r.get::<_, Option<i64>>(8)?,
                     r.get::<_, String>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
                 ))
             },
         )
         .optional()?
         .ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
-    let ([instance, tenant, fleet, profile], version, head, epoch, lease_id, fence, state, error) =
-        row;
+    let (
+        [instance, tenant, fleet, profile],
+        version,
+        head,
+        epoch,
+        lease_id,
+        fence,
+        state,
+        error,
+        server,
+    ) = row;
     let version = version as u64;
     let lease = match (lease_id, fence) {
         (Some(id), Some(f)) => Some(LeaseRef {
@@ -241,6 +255,7 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
     };
     Ok(Bound {
         local: local.to_string(),
+        server,
         instance: decode_hex16(&instance, "server_instance_id")?,
         tenant: decode_hex16(&tenant, "tenant_id")?,
         fleet: decode_hex16(&fleet, "fleet_id")?,
@@ -282,7 +297,7 @@ const OP_COLUMNS: &str = "op_id, kind, state, server_instance_id, restore_epoch,
     exact_request_bytes_sha256, remote_upload_id, lease_id, fencing_token, base_version,
     snapshot_id, manifest_replay_id, intent_hash, ciphertext_sha256,
     signed_manifest_container_bytes, signed_manifest_container_hash,
-    signed_manifest_container_bytes_sha256, exact_receipt_bytes";
+    signed_manifest_container_bytes_sha256, exact_receipt_bytes, server_id, operation_scope";
 
 fn op_row(r: &rusqlite::Row) -> rusqlite::Result<Op> {
     Ok(Op {
@@ -308,6 +323,8 @@ fn op_row(r: &rusqlite::Row) -> rusqlite::Result<Op> {
         manifest_hash: r.get(19)?,
         manifest_sha: r.get(20)?,
         receipt: r.get(21)?,
+        server: r.get(22)?,
+        scope: r.get(23)?,
     })
 }
 
@@ -359,14 +376,14 @@ fn insert_op(
 ) -> Result<()> {
     let m = c.manifest;
     conn.execute(
-        "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
+        "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request, server_id,
            server_instance_id, restore_epoch, tenant_id, fleet_id, remote_profile_id,
            snapshot_id, manifest_replay_id, operation_scope, kind, idempotency_key,
            canonical_request_hash, exact_request_bytes, exact_request_bytes_sha256,
            remote_upload_id, lease_id, fencing_token, base_version, intent_hash,
            ciphertext_sha256, signed_manifest_container_bytes, signed_manifest_container_hash,
            signed_manifest_container_bytes_sha256, state, created_at, updated_at)
-         VALUES (?1, ?25, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+         VALUES (?1, ?25, ?2, ?26, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'PENDING',
            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         params![
@@ -395,6 +412,7 @@ fn insert_op(
             m.map(|m| m.signed_container_hash().to_vec()),
             m.map(|m| m.exact_bytes_sha256().to_vec()),
             (!c.unbound).then_some(&b.local),
+            b.server,
         ],
     )?;
     Ok(())
@@ -607,6 +625,10 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
                 "upload.dek_slot_sha256",
                 s.dek_slot[..] == p.dek_slot_sha256,
             ),
+            ("upload.server_id", s.server == op.server),
+            ("upload.operation_scope", s.scope == op.scope),
+            ("upload.idempotency_key", s.key == op.key),
+            ("upload.canonical_request_hash", s.canonical == op.canonical),
             ("upload.fkek_key_id", s.fkek_key_id == hex(&p.fkek_key_id)),
             (
                 "upload.key_generation",
@@ -623,6 +645,12 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
             ("spool", sha256(&spooled) == p.ciphertext_sha256),
         ]);
     }
+    let filed: i64 = db.conn.query_row(
+        "SELECT count(*) FROM server_origins WHERE server_id = ?1 AND server_instance_id = ?2",
+        [&op.server, &op.instance],
+        |r| r.get(0),
+    )?;
+    checks.push(("server_id", filed == 1));
     Ok(checks.into_iter().find(|(_, ok)| !ok).map(|(f, _)| f))
 }
 
@@ -774,6 +802,10 @@ struct Session {
     size: u64,
     spool: String,
     state: String,
+    server: String,
+    scope: String,
+    key: String,
+    canonical: Vec<u8>,
 }
 
 fn session(db: &Db, commit_op: &str) -> Result<Session> {
@@ -781,7 +813,7 @@ fn session(db: &Db, commit_op: &str) -> Result<Session> {
         "SELECT upload_local_id, server_instance_id, restore_epoch, remote_upload_id, snapshot_id,
                 manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
                 key_generation, expected_ciphertext_sha256, expected_ciphertext_size, spool_ref,
-                state
+                state, server_id, operation_scope, idempotency_key, canonical_request_hash
          FROM upload_sessions WHERE commit_op_id = ?1",
         [commit_op],
         |r| {
@@ -801,6 +833,10 @@ fn session(db: &Db, commit_op: &str) -> Result<Session> {
                 size: r.get::<_, i64>(12)? as u64,
                 spool: r.get(13)?,
                 state: r.get(14)?,
+                server: r.get(15)?,
+                scope: r.get(16)?,
+                key: r.get(17)?,
+                canonical: r.get(18)?,
             })
         },
     )?)
@@ -1432,6 +1468,33 @@ pub(crate) async fn push(
 
 // ------------------------------------------------------------- publish ----
 
+/// The server a fleet key was filed under (G2-36): the one `fleet_key_state`
+/// row of `b`'s fleet that holds `generation` as `fkek_key_id`.
+fn key_server(db: &Db, b: &Bound, generation: u64, fkek_key_id: &[u8; 32]) -> Result<String> {
+    let rows = db
+        .conn
+        .prepare(
+            "SELECT server_id FROM fleet_key_state
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+               AND generation = ?4 AND fkek_key_id = ?5",
+        )?
+        .query_map(
+            params![
+                hex(&b.instance),
+                hex(&b.tenant),
+                hex(&b.fleet),
+                wire(generation)?,
+                hex(fkek_key_id)
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match <[String; 1]>::try_from(rows) {
+        Ok([server]) => Ok(server),
+        Err(_) => bail!(code("sync.fleetKeyRecollect")),
+    }
+}
+
 /// A finished publish: the version-0 profile and the first lease.
 #[derive(Debug)]
 pub(crate) struct Published {
@@ -1473,7 +1536,7 @@ pub(crate) async fn publish(
             .await?
         }
     };
-    send_publish(client, access, &mut db, local, fleet, &op).await
+    send_publish(client, access, &mut db, &dev.me, local, fleet, &op).await
 }
 
 fn is_bound(db: &Db, local: &str) -> Result<bool> {
@@ -1516,6 +1579,7 @@ async fn store_publish(
 ) -> Result<Op> {
     let mut b = Bound {
         local: local.to_string(),
+        server: String::new(),
         instance: dev.pin.0.server_instance_id,
         tenant: dev.pin.0.tenant_id,
         fleet,
@@ -1550,6 +1614,12 @@ async fn store_publish(
     let generation = ledger::highest_generation(db, &dev.pin.0, &fleet)?
         .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
     let fkek = verified_key(db, dev, &fleet, generation, None, now)?;
+    b.server = key_server(
+        db,
+        &b,
+        generation,
+        &shardx_core::fleet_grants::fkek_key_id(&fkek),
+    )?;
     if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &fleet, generation)? {
         bail!(code("sync.commitBlockedCompromised"));
     }
@@ -1590,6 +1660,7 @@ async fn send_publish(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
+    me: &Recipient,
     local: &str,
     fleet: [u8; 16],
     op: &Op,
@@ -1604,6 +1675,7 @@ async fn send_publish(
     }
     let b = Bound {
         local: local.to_string(),
+        server: op.server.clone(),
         instance: decode_hex16(&op.instance, "server_instance_id")?,
         tenant: asked.profile.tenant_id,
         fleet,
@@ -1636,19 +1708,27 @@ async fn send_publish(
     let tx = db.conn.transaction()?;
     complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
     tx.execute(
-        "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id, fleet_id,
-           remote_profile_id, remote_version, accepted_restore_epoch, fencing_token, lease_id,
-           sync_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, 'CHECKED_OUT')",
+        "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
+           account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+           accepted_restore_epoch, fencing_token, lease_id, lease_expires_at, fkek_key_id,
+           key_generation, sync_state, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ', ?12 / 1000.0, 'unixepoch'), ?13, ?14,
+           'CHECKED_OUT', 1)",
         params![
             b.local,
+            b.server,
             hex(&b.instance),
             hex(&b.tenant),
+            hex(&me.account_id),
+            hex(&me.device_id),
             hex(&b.fleet),
             hex(&b.profile),
             wire(op.epoch)?,
             wire(g.lease.fencing_token)?,
-            lease
+            lease,
+            wire(g.expires_at_ms)?,
+            hex(&g.fkek_key_id),
+            wire(g.key_generation)?
         ],
     )?;
     tx.execute(
@@ -1756,12 +1836,14 @@ async fn checkout(
         ],
     )?;
     tx.execute(
-        "UPDATE profile_bindings SET lease_id = ?2, fencing_token = ?3, sync_state = 'CHECKED_OUT'
+        "UPDATE profile_bindings SET lease_id = ?2, fencing_token = ?3, sync_state = 'CHECKED_OUT',
+           lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?4 / 1000.0, 'unixepoch')
          WHERE local_profile_id = ?1",
         params![
             b.local,
             hex(&g.lease.lease_id),
-            wire(g.lease.fencing_token)?
+            wire(g.lease.fencing_token)?,
+            wire(g.expires_at_ms)?
         ],
     )?;
     tx.commit()?;
@@ -2045,10 +2127,12 @@ fn prepare_commit(db: &mut Db, dev: &Device, b: &Bound, up: &Op) -> Result<()> {
            tenant_id, fleet_id, remote_profile_id, remote_upload_id, snapshot_id,
            manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
            key_generation, expected_ciphertext_sha256, expected_ciphertext_size, spool_ref,
+           server_id, operation_scope, idempotency_key, canonical_request_hash, retry_state,
            state, created_at, updated_at)
-         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-           ?18, ?19, 'OPEN', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+         SELECT ?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+           ?18, ?19, ?20, operation_scope, idempotency_key, canonical_request_hash, 'NONE', 'OPEN',
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         FROM operations WHERE op_id = ?3",
         params![
             hex(&random::<16>()?),
             b.local,
@@ -2069,6 +2153,7 @@ fn prepare_commit(db: &mut Db, dev: &Device, b: &Bound, up: &Op) -> Result<()> {
             terms.expected_ciphertext_sha256.to_vec(),
             wire(terms.expected_ciphertext_size)?,
             up.op_id,
+            b.server,
         ],
     )?;
     tx.commit()?;
@@ -2137,7 +2222,8 @@ async fn transfer(
                 return Ok(());
             }
             if renewed.elapsed().as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
-                renew(client, access, b, lease).await?;
+                let expires = renew(client, access, b, lease).await?;
+                keep_expiry(&db.conn, &b.local, &lease, expires)?;
                 renewed = std::time::Instant::now();
             }
             let end = (at + CHUNK as u64).min(s.size);
@@ -2160,8 +2246,9 @@ async fn transfer(
     Err(bad("upload-offset"))
 }
 
-/// `LeaseRenewV2` for the lease this push holds (L1139).
-async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -> Result<()> {
+/// `LeaseRenewV2` for the lease this push holds (L1139); returns the
+/// server's new expiry.
+async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -> Result<u64> {
     let body = LeaseRenewV2 {
         profile: b.pref(),
         lease,
@@ -2175,6 +2262,21 @@ async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -
     if (r.profile, r.lease) != (b.pref(), lease) {
         return Err(bad("lease_id"));
     }
+    Ok(r.expires_at_ms)
+}
+
+/// The server's expiry of `lease`, on the binding that holds it.
+fn keep_expiry(
+    conn: &rusqlite::Connection,
+    local: &str,
+    lease: &LeaseRef,
+    expires_at_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE profile_bindings SET lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?3 / 1000.0, 'unixepoch')
+         WHERE local_profile_id = ?1 AND lease_id = ?2",
+        params![local, hex(&lease.lease_id), wire(expires_at_ms)?],
+    )?;
     Ok(())
 }
 
@@ -2341,13 +2443,17 @@ async fn finish(
     }
     let s = session(db, &op.op_id)?;
     db.conn.execute(
-        "UPDATE profile_bindings SET remote_version = ?2, last_observed_head_hash = ?3,
-           lease_id = NULL, fencing_token = NULL, sync_state = 'AVAILABLE', last_error_code = NULL
+        "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
+           last_observed_head_hash = ?3, fkek_key_id = ?4, key_generation = ?5,
+           lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL, sync_state = 'AVAILABLE',
+           last_error_code = NULL
          WHERE local_profile_id = ?1",
         params![
             b.local,
             wire(version)?,
-            receipt.resulting_head_hash.to_vec()
+            receipt.resulting_head_hash.to_vec(),
+            s.fkek_key_id,
+            wire(s.key_generation)?
         ],
     )?;
     let _ = std::fs::remove_file(spool(&s.spool)?);
@@ -2453,7 +2559,8 @@ async fn release_reply(
         params![b.local, lease],
     )?;
     tx.execute(
-        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, sync_state = 'AVAILABLE'
+        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL,
+           sync_state = 'AVAILABLE'
          WHERE local_profile_id = ?1 AND lease_id = ?2",
         params![b.local, lease],
     )?;
@@ -2587,9 +2694,9 @@ fn unbound_reply(db: &Db, local: &str) -> Result<Vec<u8>> {
             |r| {
                 Ok((
                     op_row(r)?,
-                    r.get::<_, Vec<u8>>(22)?,
-                    r.get::<_, Vec<u8>>(23)?,
                     r.get::<_, Vec<u8>>(24)?,
+                    r.get::<_, Vec<u8>>(25)?,
+                    r.get::<_, Vec<u8>>(26)?,
                 ))
             },
         )
@@ -2826,13 +2933,16 @@ pub(crate) async fn pull(
         ))
     })??;
     db.conn.execute(
-        "UPDATE profile_bindings SET remote_version = ?2, last_observed_head_hash = ?3
+        "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
+           last_observed_head_hash = ?3, fkek_key_id = ?5, key_generation = ?6
          WHERE local_profile_id = ?1 AND remote_version = ?4",
         params![
             b.local,
             wire(head.current_version)?,
             head.current_signed_head_hash.map(|h| h.to_vec()),
-            wire(b.version)?
+            wire(b.version)?,
+            hex(&p.fkek_key_id),
+            wire(p.key_generation)?
         ],
     )?;
     Ok(restored)
@@ -3721,17 +3831,17 @@ mod tests {
             }
             db.conn
                 .execute(
-                    "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                       fleet_id, remote_profile_id, remote_version, accepted_restore_epoch,
-                       sync_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'AVAILABLE')",
-                    params![
-                        LOCAL,
-                        hex(&INSTANCE),
-                        hex(&TENANT),
-                        hex(&FLEET),
-                        hex(&PROFILE)
-                    ],
+                    "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                       tenant_id, account_id, device_id, fleet_id, remote_profile_id,
+                       remote_version, base_version, accepted_restore_epoch, fkek_key_id,
+                       key_generation, sync_state, dirty)
+                     SELECT ?1, k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+                       k.device_id, k.fleet_id, ?2, 0, 0, 0, k.fkek_key_id, k.generation,
+                       'AVAILABLE', 0
+                     FROM fleet_key_state k
+                     JOIN device_state d USING (server_id, tenant_id, device_id)
+                     WHERE k.state = 'ACTIVE'",
+                    params![LOCAL, hex(&PROFILE)],
                 )
                 .unwrap();
         }
@@ -3941,6 +4051,12 @@ mod tests {
             "UPDATE upload_sessions SET restore_epoch = 1".into(),
             "UPDATE upload_sessions SET snapshot_id = zeroblob(16)".into(),
             "UPDATE upload_sessions SET manifest_replay_id = zeroblob(16)".into(),
+            "UPDATE operations SET server_id = 'elsewhere' WHERE kind = 'COMMIT'".into(),
+            "UPDATE operations SET server_id = 'elsewhere' WHERE kind = 'FINALIZE'".into(),
+            "UPDATE upload_sessions SET server_id = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET operation_scope = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET idempotency_key = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET canonical_request_hash = zeroblob(32)".into(),
             "SPOOL".into(),
         ] {
             let w = world();
@@ -3976,7 +4092,7 @@ mod tests {
         let w = world();
         w.db()
             .conn
-            .execute("DELETE FROM signed_authorization_records", [])
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM signed_authorization_records")
             .unwrap();
         for _ in 0..2 {
             let err = w.push().unwrap_err();
@@ -4207,6 +4323,116 @@ mod tests {
                 "{point}"
             );
         }
+    }
+
+    /// WP-12 (G2-32, G2-35, G2-36): a binding, its operations and its upload
+    /// session name the `server_origins` row, the account and device, and the
+    /// `fleet_key_state` row of the key they were made under. The lease's
+    /// server expiry is kept with the lease and dropped with it, `dirty` is
+    /// set by a publish and cleared by a push or a pull, and the pinned base
+    /// version follows the head.
+    #[test]
+    fn a_binding_and_its_rows_name_the_servers_account_and_key() {
+        let expiry = |ms: u64| {
+            format!("lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', {ms} / 1000.0, 'unixepoch')")
+        };
+        let w = world_unbound();
+        w.publish().unwrap();
+        let named = "SELECT count(*) FROM profile_bindings b
+             JOIN server_origins o ON o.server_id = b.server_id
+              AND o.server_instance_id = b.server_instance_id
+             JOIN accounts a ON a.server_id = b.server_id AND a.tenant_id = b.tenant_id
+              AND a.account_id = b.account_id AND a.device_id = b.device_id
+              AND a.role = 'member' AND a.status = 'ACTIVE'
+             JOIN device_state d ON d.server_id = b.server_id AND d.tenant_id = b.tenant_id
+              AND d.device_id = b.device_id
+              AND d.signing_credential_ref = 'device-signing.' || b.device_id
+              AND d.hpke_credential_ref = 'device-hpke.' || b.device_id
+             JOIN fleet_key_state k ON k.server_id = b.server_id
+              AND k.server_instance_id = b.server_instance_id AND k.tenant_id = b.tenant_id
+              AND k.fleet_id = b.fleet_id AND k.generation = b.key_generation
+              AND k.fkek_key_id = b.fkek_key_id AND k.state = 'ACTIVE'
+              AND k.fkek_credential_ref = 'fleet-key.' || b.fleet_id || '.' || b.key_generation
+             WHERE b.account_id = ?1 AND b.device_id = ?2 AND b.fkek_key_id = ?3
+               AND b.key_generation = 1 AND b.local_profile_id = 'local-profile'";
+        let me = me();
+        let check = |w: &World, extra: &str| {
+            w.db()
+                .conn
+                .query_row(
+                    &format!("{named} AND {extra}"),
+                    params![
+                        hex(&me.to.account_id),
+                        hex(&me.to.device_id),
+                        hex(&shardx_core::fleet_grants::fkek_key_id(&FKEK))
+                    ],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let lease = expiry(NOW + 300_000);
+        // Published: the first lease, a dirty profile, base version 0.
+        assert_eq!(
+            check(
+                &w,
+                &format!("b.dirty = 1 AND b.base_version = 0 AND b.{lease}")
+            ),
+            1
+        );
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations o JOIN profile_bindings b
+                 ON b.local_profile_id = o.local_profile_id AND b.server_id = o.server_id"
+            ),
+            w.count("SELECT count(*) FROM operations"),
+        );
+        // Pushed: the head moves, the profile is clean, the lease is gone.
+        w.push().unwrap();
+        assert_eq!(
+            check(
+                &w,
+                "b.dirty = 0 AND b.base_version = 1 AND b.remote_version = 1
+                 AND b.lease_id IS NULL AND b.lease_expires_at IS NULL"
+            ),
+            1
+        );
+        let sessions = "SELECT count(*) FROM upload_sessions u
+             JOIN operations o ON o.op_id = u.commit_op_id
+             WHERE u.server_id = o.server_id AND u.operation_scope = o.operation_scope
+               AND u.idempotency_key = o.idempotency_key
+               AND u.canonical_request_hash = o.canonical_request_hash
+               AND u.retry_state = 'NONE' AND u.fkek_key_id = ?1 AND u.key_generation = 1";
+        let kept: i64 = w
+            .db()
+            .conn
+            .query_row(
+                sessions,
+                [hex(&shardx_core::fleet_grants::fkek_key_id(&FKEK))],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        // A pull of a profile edited since is clean again.
+        w.db()
+            .conn
+            .execute("UPDATE profile_bindings SET dirty = 1", [])
+            .unwrap();
+        w.pull(&w._dir.path().join("pulled")).unwrap();
+        assert_eq!(
+            check(&w, "b.dirty = 0 AND b.base_version = b.remote_version"),
+            1
+        );
+        // A checkout that is not finished keeps the lease with its expiry.
+        drop(w);
+        let w2 = world();
+        w2.fake().skip.push("finalize");
+        w2.push().unwrap_err();
+        assert_eq!(
+            w2.count(&format!(
+                "SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL AND {lease}"
+            )),
+            1
+        );
     }
 
     /// WP-11 probe 11: a publish the server refuses is failed and never
@@ -5227,7 +5453,8 @@ mod tests {
         w.db()
             .conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+                   lease_expires_at = NULL",
                 [],
             )
             .unwrap();
@@ -5475,19 +5702,17 @@ mod tests {
             self.db()
                 .conn
                 .execute(
-                    "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                       fleet_id, remote_profile_id, remote_version, last_observed_head_hash,
-                       accepted_restore_epoch, sync_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'AVAILABLE')",
-                    params![
-                        local,
-                        hex(&INSTANCE),
-                        hex(&TENANT),
-                        hex(&FLEET),
-                        hex(&profile),
-                        version as i64,
-                        head.to_vec()
-                    ],
+                    "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                       tenant_id, account_id, device_id, fleet_id, remote_profile_id,
+                       remote_version, base_version, last_observed_head_hash,
+                       accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+                     SELECT ?1, k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+                       k.device_id, k.fleet_id, ?2, ?3, ?3, ?4, 0, k.fkek_key_id, k.generation,
+                       'AVAILABLE', 0
+                     FROM fleet_key_state k
+                     JOIN device_state d USING (server_id, tenant_id, device_id)
+                     WHERE k.state = 'ACTIVE'",
+                    params![local, hex(&profile), version as i64, head.to_vec()],
                 )
                 .unwrap();
         }
@@ -6253,7 +6478,7 @@ mod tests {
             "UPDATE profile_bindings SET last_error_code = 'HEAD_ROLLBACK_DETECTED'",
             "UPDATE profile_bindings SET remote_version = 1",
             "UPDATE profile_bindings SET last_observed_head_hash = randomblob(32)",
-            "UPDATE profile_bindings SET lease_id = 'x', fencing_token = 1",
+            "UPDATE profile_bindings SET lease_id = 'x', fencing_token = 1, lease_expires_at = 'x'",
         ] {
             let w = world();
             let (h1, h2) = restored(&w);

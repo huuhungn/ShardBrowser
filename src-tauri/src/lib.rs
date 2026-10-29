@@ -4079,6 +4079,8 @@ mod custody_tests {
             .unwrap();
         let pin_now = (BINDING, me.to.signing_key_id);
         assert!(!fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1));
+        // A fixture bypassing the keys that hold the record.
+        db.conn.pragma_update(None, "foreign_keys", false).unwrap();
         for (sql, undo) in [
             (
                 "UPDATE signed_authorization_records SET generation = 2",

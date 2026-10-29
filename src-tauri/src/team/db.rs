@@ -21,13 +21,16 @@
 //! 4 the rest of the plan's tables: the kept authorization records and root
 //! grants (`team::records`), and the schema of the tables later packages
 //! fill. Version 5 lets a restore epoch binding proof outlive its binding.
+//! Version 6 brings the three sync tables to the plan's columns and foreign
+//! keys: each names its `server_origins` row, a binding its account and its
+//! fleet key.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -362,9 +365,6 @@ UPDATE schema_meta SET schema_version = 3, min_reader_version = 3,
 /// binding by the instance-keyed UNIQUE the plan also declares (L1797). A
 /// version 3 reader would skip the kept records `team::records` checks
 /// before key use, so 4 is the minimum.
-// shortcut: the version 3 sync tables still lack `server_id` and their
-// server_origins, accounts and fleet_key_state foreign keys; add them when
-// publish-create files a binding's account and fleet key rows.
 const MIGRATE_V4: &str = r#"
 CREATE TABLE server_origins (
   server_id                 TEXT PRIMARY KEY,
@@ -845,6 +845,314 @@ UPDATE schema_meta SET schema_version = 5, min_reader_version = 5,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 5 to 6: the plan's columns and foreign keys on the three sync
+/// tables (L1775-L1929). Each table is rebuilt, so the migration runs with
+/// foreign keys off (a `DROP TABLE` would otherwise fire their actions on the
+/// rows it keeps) and `open_at` checks every key before it commits. Rows are
+/// kept exactly; the new columns come from rows this device already holds,
+/// and a file that has bindings but no kept key evidence for them is refused
+/// whole rather than given a guess.
+const MIGRATE_V6: &str = r#"-- The proof's check names profile_bindings, which is rebuilt below.
+DROP TRIGGER restore_epoch_binding_proofs_need_binding;
+
+-- The account, device and fleet key rows the plan's foreign keys name (L1484,
+-- L1748), from the fleet key grants this device already verified and kept
+-- (G2-35): the grant's subject is the device, and the highest generation
+-- kept for a fleet is its ACTIVE one. The credential references are the names the
+-- seeds and the fleet key are, or will be, stored under; the account's role is
+-- the least privilege: authority comes from signed capability grants, never
+-- from this column.
+INSERT OR IGNORE INTO accounts(server_id, tenant_id, account_id, device_id, role, status)
+SELECT o.server_id, g.tenant_id, r.subject_account_id, r.subject_device_id, 'member', 'ACTIVE'
+FROM trust_fleet_key_grants g
+JOIN signed_authorization_records r ON r.exact_signed_container_bytes = g.exact_signed_container_bytes
+  AND r.record_kind = 'FleetKeyGrantV2::DeviceHpkeGrant'
+JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+      GROUP BY server_instance_id HAVING count(*) = 1) o
+  ON o.server_instance_id = g.server_instance_id;
+
+INSERT OR IGNORE INTO device_state(server_id, tenant_id, account_id, device_id, signing_key_id,
+  hpke_key_id, signing_credential_ref, hpke_credential_ref, recovery_ready)
+SELECT o.server_id, g.tenant_id, r.subject_account_id, r.subject_device_id,
+  r.subject_signing_key_id, r.recipient_hpke_key_id,
+  'device-signing.' || r.subject_device_id, 'device-hpke.' || r.subject_device_id, 0
+FROM trust_fleet_key_grants g
+JOIN signed_authorization_records r ON r.exact_signed_container_bytes = g.exact_signed_container_bytes
+  AND r.record_kind = 'FleetKeyGrantV2::DeviceHpkeGrant'
+JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+      GROUP BY server_instance_id HAVING count(*) = 1) o
+  ON o.server_instance_id = g.server_instance_id;
+
+INSERT OR IGNORE INTO fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id,
+  generation, fkek_key_id, device_id, device_hpke_grant_record_id, fkek_credential_ref, state,
+  acknowledged_at, created_at)
+SELECT o.server_id, g.server_instance_id, g.tenant_id, g.fleet_id, g.generation, g.fkek_key_id,
+  r.subject_device_id, r.record_id, 'fleet-key.' || g.fleet_id || '.' || g.generation,
+  CASE WHEN g.generation = (SELECT max(h.generation) FROM trust_fleet_key_grants h
+                            WHERE h.server_instance_id = g.server_instance_id
+                              AND h.tenant_id = g.tenant_id AND h.fleet_id = g.fleet_id)
+       THEN 'ACTIVE' ELSE 'RETIRED' END,
+  NULL, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+FROM trust_fleet_key_grants g
+JOIN signed_authorization_records r ON r.exact_signed_container_bytes = g.exact_signed_container_bytes
+  AND r.record_kind = 'FleetKeyGrantV2::DeviceHpkeGrant'
+JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+      GROUP BY server_instance_id HAVING count(*) = 1) o
+  ON o.server_instance_id = g.server_instance_id;
+
+-- Plan L1775-L1808. `accepted_restore_epoch` is the epoch the binding has
+-- accepted (ADR 0002 rule 6, Q-1), kept as version 3 had it; `remote_version`
+-- with `last_observed_head_hash` is the pinned head.
+CREATE TABLE profile_bindings_v6 (
+  local_profile_id       TEXT PRIMARY KEY,
+  server_id              TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  server_instance_id     TEXT NOT NULL CHECK (length(server_instance_id) = 32 AND server_instance_id NOT GLOB '*[^0-9a-f]*'),
+  tenant_id              TEXT NOT NULL CHECK (length(tenant_id) = 32 AND tenant_id NOT GLOB '*[^0-9a-f]*'),
+  account_id             TEXT NOT NULL,
+  device_id              TEXT NOT NULL,
+  fleet_id               TEXT NOT NULL CHECK (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*'),
+  remote_profile_id      TEXT NOT NULL CHECK (length(remote_profile_id) = 32 AND remote_profile_id NOT GLOB '*[^0-9a-f]*'),
+  remote_version         INTEGER NOT NULL CHECK (remote_version BETWEEN 0 AND 9223372036854775807),
+  base_version           INTEGER NOT NULL CHECK (base_version BETWEEN 0 AND 9223372036854775807),
+  accepted_restore_epoch INTEGER NOT NULL CHECK (accepted_restore_epoch BETWEEN 0 AND 9223372036854775807),
+  fencing_token          INTEGER CHECK (fencing_token IS NULL OR fencing_token BETWEEN 0 AND 9223372036854775807),
+  lease_id               TEXT,
+  lease_expires_at       TEXT,
+  fkek_key_id            TEXT NOT NULL,
+  key_generation         INTEGER NOT NULL CHECK (key_generation BETWEEN 0 AND 9223372036854775807),
+  last_observed_head_hash BLOB CHECK (last_observed_head_hash IS NULL OR length(last_observed_head_hash) = 32),
+  sync_state             TEXT NOT NULL CHECK (sync_state IN (
+                           'LOCAL','AVAILABLE','CHECKED_OUT','LEASE_AT_RISK','OFFLINE_FORK',
+                           'UPLOADING','RESTORE_REQUIRED','CONFLICT','QUARANTINED'
+                         )),
+  dirty                  INTEGER NOT NULL CHECK (dirty IN (0,1)),
+  last_error_code        TEXT,
+  UNIQUE(server_id, tenant_id, remote_profile_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, remote_profile_id),
+  UNIQUE(server_instance_id, tenant_id, remote_profile_id),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, tenant_id, account_id, device_id)
+    REFERENCES accounts(server_id, tenant_id, account_id, device_id) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, server_instance_id, tenant_id, fleet_id, key_generation, fkek_key_id)
+    REFERENCES fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id, generation, fkek_key_id) ON DELETE RESTRICT,
+  CHECK (
+    (lease_id IS NULL AND fencing_token IS NULL AND lease_expires_at IS NULL) OR
+    (lease_id IS NOT NULL AND fencing_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+  ),
+  CHECK ((remote_version = 0) = (last_observed_head_hash IS NULL))
+) STRICT;
+
+-- Each binding's server, account and fleet key come from the rows above; one
+-- that has none, or more than one, makes the NOT NULL column refuse, and the
+-- whole migration with it. A lease kept without its server expiry (version 3
+-- kept none) is recorded as already ended.
+INSERT INTO profile_bindings_v6(local_profile_id, server_id, server_instance_id, tenant_id,
+  account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+  accepted_restore_epoch, fencing_token, lease_id, lease_expires_at, fkek_key_id, key_generation,
+  last_observed_head_hash, sync_state, dirty, last_error_code)
+SELECT b.local_profile_id, so.server_id, b.server_instance_id, b.tenant_id, ac.account_id,
+  ac.device_id, b.fleet_id, b.remote_profile_id, b.remote_version, b.remote_version,
+  b.accepted_restore_epoch, b.fencing_token, b.lease_id,
+  CASE WHEN b.lease_id IS NULL THEN NULL ELSE '1970-01-01T00:00:00.000Z' END,
+  fk.fkek_key_id, fk.generation, b.last_observed_head_hash, b.sync_state, 0, b.last_error_code
+FROM profile_bindings b
+LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+           GROUP BY server_instance_id HAVING count(*) = 1) so
+  ON so.server_instance_id = b.server_instance_id
+LEFT JOIN (SELECT server_id, tenant_id, min(account_id) AS account_id, min(device_id) AS device_id
+           FROM accounts GROUP BY server_id, tenant_id HAVING count(*) = 1) ac
+  ON ac.server_id = so.server_id AND ac.tenant_id = b.tenant_id
+LEFT JOIN fleet_key_state fk
+  ON fk.server_id = so.server_id AND fk.server_instance_id = b.server_instance_id
+ AND fk.tenant_id = b.tenant_id AND fk.fleet_id = b.fleet_id AND fk.state = 'ACTIVE';
+
+-- Plan L1810-L1870.
+CREATE TABLE operations_v6 (
+  op_id             TEXT PRIMARY KEY,
+  local_profile_id  TEXT REFERENCES profile_bindings(local_profile_id) ON DELETE SET NULL,
+  local_profile_id_at_request TEXT NOT NULL,
+  server_id         TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  server_instance_id TEXT NOT NULL,
+  restore_epoch     INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  tenant_id         TEXT NOT NULL,
+  fleet_id          TEXT,
+  remote_profile_id TEXT,
+  snapshot_id       BLOB CHECK (snapshot_id IS NULL OR length(snapshot_id) = 16),
+  manifest_replay_id BLOB CHECK (manifest_replay_id IS NULL OR length(manifest_replay_id) = 16),
+  operation_scope   TEXT NOT NULL,
+  kind              TEXT NOT NULL CHECK (kind IN ('PUBLISH','CHECKOUT','UPLOAD','FINALIZE','COMMIT','RELEASE','UNBIND','RECOVERY_EXPORT')),
+  idempotency_key   TEXT NOT NULL,
+  canonical_request_hash BLOB NOT NULL CHECK (length(canonical_request_hash) = 32),
+  exact_request_bytes BLOB NOT NULL CHECK (length(exact_request_bytes) > 0),
+  exact_request_bytes_sha256 BLOB NOT NULL CHECK (length(exact_request_bytes_sha256) = 32),
+  remote_upload_id  TEXT,
+  lease_id          TEXT,
+  fencing_token     INTEGER CHECK (fencing_token IS NULL OR fencing_token BETWEEN 0 AND 9223372036854775807),
+  base_version      INTEGER CHECK (base_version IS NULL OR base_version BETWEEN 0 AND 9223372036854775807),
+  intent_hash       BLOB CHECK (intent_hash IS NULL OR length(intent_hash) = 32),
+  ciphertext_sha256 BLOB CHECK (ciphertext_sha256 IS NULL OR length(ciphertext_sha256) = 32),
+  signed_manifest_container_bytes BLOB,
+  signed_manifest_container_hash BLOB CHECK (
+    signed_manifest_container_hash IS NULL OR length(signed_manifest_container_hash) = 32
+  ),
+  signed_manifest_container_bytes_sha256 BLOB CHECK (
+    signed_manifest_container_bytes_sha256 IS NULL OR length(signed_manifest_container_bytes_sha256) = 32
+  ),
+  state             TEXT NOT NULL CHECK (state IN ('PENDING','RUNNING','AWAITING_RETRY','COMPLETED','FAILED','QUARANTINED')),
+  retry_count       INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 9223372036854775807),
+  next_retry_at     TEXT,
+  response_record_type TEXT,
+  exact_response_bytes BLOB,
+  exact_response_bytes_sha256 BLOB CHECK (
+    exact_response_bytes_sha256 IS NULL OR length(exact_response_bytes_sha256) = 32
+  ),
+  exact_receipt_bytes BLOB,
+  receipt_sha256   BLOB CHECK (receipt_sha256 IS NULL OR length(receipt_sha256) = 32),
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  UNIQUE(operation_scope, idempotency_key),
+  UNIQUE(op_id, server_id, server_instance_id, restore_epoch),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  CHECK ((exact_response_bytes IS NULL) = (exact_response_bytes_sha256 IS NULL)),
+  CHECK ((exact_response_bytes IS NULL) = (response_record_type IS NULL)),
+  CHECK ((exact_receipt_bytes IS NULL) = (receipt_sha256 IS NULL)),
+  CHECK ((signed_manifest_container_bytes IS NULL) = (signed_manifest_container_hash IS NULL)),
+  CHECK ((signed_manifest_container_bytes IS NULL) = (signed_manifest_container_bytes_sha256 IS NULL)),
+  CHECK (state <> 'COMPLETED' OR exact_response_bytes IS NOT NULL),
+  CHECK (state <> 'COMPLETED' OR kind NOT IN ('COMMIT','RELEASE','UNBIND') OR exact_receipt_bytes IS NOT NULL),
+  CHECK (kind <> 'COMMIT' OR (
+    remote_upload_id IS NOT NULL AND lease_id IS NOT NULL AND fencing_token IS NOT NULL AND
+    base_version IS NOT NULL AND snapshot_id IS NOT NULL AND manifest_replay_id IS NOT NULL AND
+    intent_hash IS NOT NULL AND ciphertext_sha256 IS NOT NULL AND
+    signed_manifest_container_bytes IS NOT NULL
+  ))
+) STRICT;
+
+INSERT INTO operations_v6(op_id, local_profile_id, local_profile_id_at_request, server_id,
+  server_instance_id, restore_epoch, tenant_id, fleet_id, remote_profile_id, snapshot_id,
+  manifest_replay_id, operation_scope, kind, idempotency_key, canonical_request_hash,
+  exact_request_bytes, exact_request_bytes_sha256, remote_upload_id, lease_id, fencing_token,
+  base_version, intent_hash, ciphertext_sha256, signed_manifest_container_bytes,
+  signed_manifest_container_hash, signed_manifest_container_bytes_sha256, state,
+  response_record_type, exact_response_bytes, exact_response_bytes_sha256, exact_receipt_bytes,
+  receipt_sha256, created_at, updated_at)
+SELECT p.op_id, p.local_profile_id, p.local_profile_id_at_request, so.server_id,
+  p.server_instance_id, p.restore_epoch, p.tenant_id, p.fleet_id, p.remote_profile_id,
+  p.snapshot_id, p.manifest_replay_id, p.operation_scope, p.kind, p.idempotency_key,
+  p.canonical_request_hash, p.exact_request_bytes, p.exact_request_bytes_sha256,
+  p.remote_upload_id, p.lease_id, p.fencing_token, p.base_version, p.intent_hash,
+  p.ciphertext_sha256, p.signed_manifest_container_bytes, p.signed_manifest_container_hash,
+  p.signed_manifest_container_bytes_sha256, p.state, p.response_record_type,
+  p.exact_response_bytes, p.exact_response_bytes_sha256, p.exact_receipt_bytes, p.receipt_sha256,
+  p.created_at, p.updated_at
+FROM operations p
+LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+           GROUP BY server_instance_id HAVING count(*) = 1) so
+  ON so.server_instance_id = p.server_instance_id;
+
+-- Plan L1872-L1929; `spool_ref` names `team-sync/spool/<it>.part`. The
+-- request's scope, key and hash mirror the COMMIT operation's.
+CREATE TABLE upload_sessions_v6 (
+  upload_local_id             TEXT PRIMARY KEY,
+  local_profile_id            TEXT REFERENCES profile_bindings(local_profile_id) ON DELETE SET NULL,
+  local_profile_id_at_request TEXT NOT NULL,
+  commit_op_id                TEXT NOT NULL UNIQUE REFERENCES operations(op_id) ON DELETE RESTRICT,
+  server_id                   TEXT NOT NULL REFERENCES server_origins(server_id) ON DELETE RESTRICT,
+  server_instance_id          TEXT NOT NULL,
+  restore_epoch               INTEGER NOT NULL CHECK (restore_epoch BETWEEN 0 AND 9223372036854775807),
+  tenant_id                   TEXT NOT NULL,
+  fleet_id                    TEXT NOT NULL,
+  remote_profile_id           TEXT NOT NULL,
+  remote_upload_id            TEXT NOT NULL,
+  snapshot_id                 BLOB NOT NULL CHECK (length(snapshot_id) = 16),
+  manifest_replay_id          BLOB NOT NULL CHECK (length(manifest_replay_id) = 16),
+  operation_scope             TEXT NOT NULL,
+  idempotency_key             TEXT NOT NULL,
+  canonical_request_hash      BLOB NOT NULL CHECK (length(canonical_request_hash) = 32),
+  intent_hash                 BLOB NOT NULL CHECK (length(intent_hash) = 32),
+  preamble_sha256             BLOB NOT NULL CHECK (length(preamble_sha256) = 32),
+  dek_slot_sha256             BLOB NOT NULL CHECK (length(dek_slot_sha256) = 32),
+  fkek_key_id                 TEXT NOT NULL,
+  key_generation              INTEGER NOT NULL CHECK (key_generation BETWEEN 0 AND 9223372036854775807),
+  committed_offset            INTEGER NOT NULL DEFAULT 0 CHECK (committed_offset BETWEEN 0 AND 9223372036854775807),
+  expected_ciphertext_sha256  BLOB NOT NULL CHECK (length(expected_ciphertext_sha256) = 32),
+  expected_ciphertext_size    INTEGER NOT NULL CHECK (expected_ciphertext_size BETWEEN 0 AND 9223372036854775807),
+  spool_ref                   TEXT NOT NULL CHECK (
+                                length(spool_ref) > 0 AND
+                                instr(spool_ref, '/') = 0 AND instr(spool_ref, char(92)) = 0
+                              ),
+  state                       TEXT NOT NULL CHECK (state IN ('OPEN','FINALIZING','READY','COMMITTED','ABORTED','QUARANTINED')),
+  retry_state                 TEXT NOT NULL CHECK (retry_state IN ('NONE','BACKOFF','MANUAL')),
+  retry_count                 INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 9223372036854775807),
+  next_retry_at               TEXT,
+  last_error_code             TEXT,
+  exact_finalize_response_bytes BLOB,
+  finalize_response_sha256    BLOB CHECK (finalize_response_sha256 IS NULL OR length(finalize_response_sha256) = 32),
+  exact_commit_receipt_binding_bytes BLOB,
+  commit_receipt_binding_bytes_sha256 BLOB CHECK (
+    commit_receipt_binding_bytes_sha256 IS NULL OR length(commit_receipt_binding_bytes_sha256) = 32
+  ),
+  created_at                  TEXT NOT NULL,
+  updated_at                  TEXT NOT NULL,
+  UNIQUE(server_id, server_instance_id, tenant_id, remote_upload_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, remote_profile_id, snapshot_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, remote_profile_id, manifest_replay_id),
+  UNIQUE(operation_scope, idempotency_key),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(commit_op_id, server_id, server_instance_id, restore_epoch)
+    REFERENCES operations(op_id, server_id, server_instance_id, restore_epoch) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, server_instance_id, tenant_id, fleet_id, key_generation, fkek_key_id)
+    REFERENCES fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id, generation, fkek_key_id) ON DELETE RESTRICT,
+  CHECK (committed_offset <= expected_ciphertext_size),
+  CHECK ((exact_finalize_response_bytes IS NULL) = (finalize_response_sha256 IS NULL)),
+  CHECK ((exact_commit_receipt_binding_bytes IS NULL) = (commit_receipt_binding_bytes_sha256 IS NULL)),
+  CHECK (state NOT IN ('READY','COMMITTED') OR exact_finalize_response_bytes IS NOT NULL),
+  CHECK (state <> 'COMMITTED' OR exact_commit_receipt_binding_bytes IS NOT NULL)
+) STRICT;
+
+INSERT INTO upload_sessions_v6(upload_local_id, local_profile_id, local_profile_id_at_request,
+  commit_op_id, server_id, server_instance_id, restore_epoch, tenant_id, fleet_id,
+  remote_profile_id, remote_upload_id, snapshot_id, manifest_replay_id, operation_scope,
+  idempotency_key, canonical_request_hash, intent_hash, preamble_sha256, dek_slot_sha256,
+  fkek_key_id, key_generation, committed_offset, expected_ciphertext_sha256,
+  expected_ciphertext_size, spool_ref, state, retry_state, exact_finalize_response_bytes,
+  finalize_response_sha256, exact_commit_receipt_binding_bytes,
+  commit_receipt_binding_bytes_sha256, created_at, updated_at)
+SELECT u.upload_local_id, u.local_profile_id, u.local_profile_id_at_request, u.commit_op_id,
+  so.server_id, u.server_instance_id, u.restore_epoch, u.tenant_id, u.fleet_id,
+  u.remote_profile_id, u.remote_upload_id, u.snapshot_id, u.manifest_replay_id,
+  c.operation_scope, c.idempotency_key, c.canonical_request_hash, u.intent_hash,
+  u.preamble_sha256, u.dek_slot_sha256, u.fkek_key_id, u.key_generation, u.committed_offset,
+  u.expected_ciphertext_sha256, u.expected_ciphertext_size, u.spool_ref, u.state, 'NONE',
+  u.exact_finalize_response_bytes, u.finalize_response_sha256,
+  u.exact_commit_receipt_binding_bytes, u.commit_receipt_binding_bytes_sha256, u.created_at,
+  u.updated_at
+FROM upload_sessions u
+JOIN operations c ON c.op_id = u.commit_op_id
+LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
+           GROUP BY server_instance_id HAVING count(*) = 1) so
+  ON so.server_instance_id = u.server_instance_id;
+
+DROP TABLE upload_sessions;
+DROP TABLE operations;
+DROP TABLE profile_bindings;
+ALTER TABLE profile_bindings_v6 RENAME TO profile_bindings;
+ALTER TABLE operations_v6 RENAME TO operations;
+ALTER TABLE upload_sessions_v6 RENAME TO upload_sessions;
+CREATE TRIGGER restore_epoch_binding_proofs_need_binding
+BEFORE INSERT ON restore_epoch_binding_proofs
+WHEN NOT EXISTS (SELECT 1 FROM profile_bindings
+                 WHERE server_instance_id = NEW.server_instance_id
+                   AND tenant_id = NEW.tenant_id
+                   AND remote_profile_id = NEW.remote_profile_id)
+BEGIN SELECT RAISE(ABORT, 'restore_epoch_binding_proofs: no binding'); END;
+UPDATE schema_meta SET schema_version = 6, min_reader_version = 6,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -873,7 +1181,9 @@ impl Db {
         let mut conn = Connection::open(path).with_context(unreadable)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .with_context(unreadable)?;
-        conn.pragma_update(None, "foreign_keys", true)
+        // Off until the migrations are checked: a table rebuild must not fire
+        // the actions of the keys that name it.
+        conn.pragma_update(None, "foreign_keys", false)
             .with_context(unreadable)?;
         // SQLite refuses to leave WAL while another connection reads, with an
         // error rather than another mode.
@@ -890,6 +1200,7 @@ impl Db {
         if objects == 0 {
             tx.execute_batch(SCHEMA_V1).with_context(unreadable)?;
         }
+        let from = meta(&tx).ok().and_then(|m| m.first().map(|r| r.0));
         // Only from exactly one clean version 1 row: anything else is left as
         // it is for `compatible` to refuse, and a step that fails rolls the
         // whole migration back.
@@ -905,7 +1216,22 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(4, 4, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V5).with_context(unreadable)?;
         }
+        if matches!(meta(&tx).as_deref(), Ok([(5, 5, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V6).with_context(unreadable)?;
+        }
+        if from.is_some_and(|v| v < SCHEMA_VERSION) {
+            let broken: i64 = tx
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })
+                .with_context(unreadable)?;
+            if broken != 0 {
+                bail!(unreadable());
+            }
+        }
         tx.commit().with_context(unreadable)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .with_context(unreadable)?;
         if !compatible(&conn) {
             bail!(crate::errcode::code("team.trustLedgerUnsupported"));
         }
@@ -928,6 +1254,105 @@ fn meta(conn: &Connection) -> rusqlite::Result<Vec<(i64, i64, String)>> {
     conn.prepare("SELECT schema_version, min_reader_version, migration_state FROM schema_meta")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect()
+}
+
+/// Test support: the rows version 6's keys name, so a fixture can bind a
+/// profile without a sync.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use rusqlite::Connection;
+
+    /// A device, a fleet key of generation 1 and the signed grant that
+    /// delivered it, for fleet `f` of tenant `t` on instance `i`, filed
+    /// under server `s`: what the version 5 sync files held for a binding.
+    pub(crate) fn evidence(c: &Connection, s: &str, i: &str, t: &str, f: &str) {
+        c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO trust_anchors VALUES ('{i}', '{t}', '{anchor}', 'BOOTSTRAP', 0);
+             INSERT OR IGNORE INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);
+             INSERT OR IGNORE INTO trust_fleet_generations VALUES ('{i}', '{t}', '{f}', 1);
+             INSERT OR IGNORE INTO trust_fleet_key_grants
+               VALUES ('{i}', '{t}', '{f}', 1, '{fkek}', 1, x'ab', x'00');
+             INSERT OR IGNORE INTO signed_authorization_records(record_id, server_id, tenant_id,
+               record_kind, container_domain, container_version, payload_domain, payload_version,
+               replay_id, subject_account_id, subject_device_id, subject_signing_key_id,
+               grant_variant, fleet_id, fkek_key_id, generation, grant_capability,
+               recipient_hpke_key_id, hpke_suite_id, hpke_info_bytes, hpke_encapped_key_bytes,
+               hpke_wrapped_fleet_key_bytes, issued_at_ms, not_before_ms, not_after_ms,
+               server_instance_id, restore_epoch, canonical_payload_bytes, payload_sha256,
+               signature_suite_id, signature_version, issuer_signing_key_id, signature_bytes,
+               signed_container_hash, exact_signed_container_bytes,
+               exact_signed_container_bytes_sha256, verified_at_ms)
+             VALUES ('rec-{f}', '{s}', '{t}', 'FleetKeyGrantV2::DeviceHpkeGrant',
+               'shardx.authorization.signed-container.v2', 2,
+               'shardx.keys.fleet-key-grant.device-hpke.v2', 2, x'{f}', '{account}', '{device}',
+               '{signing}', 'DeviceHpkeGrant', '{f}', '{fkek}', 1, 'fleet.key.receive', '{hpke}',
+               1, x'01', x'01', x'01', 1, 1, 2, '{i}', 0, x'01', zeroblob(32), 1, 1, '{anchor}',
+               x'01', zeroblob(32), x'ab', zeroblob(32), 1);",
+            anchor = "ef".repeat(32),
+            fkek = "cd".repeat(32),
+            account = "a1".repeat(16),
+            device = "d1".repeat(16),
+            signing = "51".repeat(32),
+            hpke = "b2".repeat(32),
+        ))
+        .unwrap();
+    }
+
+    /// Binds `local` to `remote`, with the origin, account, device and fleet
+    /// key it needs, under server `s`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seed_binding(
+        c: &Connection,
+        s: &str,
+        local: &str,
+        i: &str,
+        t: &str,
+        f: &str,
+        remote: &str,
+        epoch: i64,
+    ) {
+        c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO server_origins(server_id, scheme, host, port, tls_policy,
+               server_instance_id, last_restore_epoch, status)
+             VALUES ('{s}', 'https', 'h{}.test', 443, 'SYSTEM', '{i}', 0, 'ACTIVE');",
+            &i[..8]
+        ))
+        .unwrap();
+        evidence(c, s, i, t, f);
+        c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO accounts VALUES ('{s}', '{t}', '{a}', '{d}', 'member', 'ACTIVE');
+             INSERT OR IGNORE INTO device_state VALUES ('{s}', '{t}', '{a}', '{d}', '{sig}',
+               '{hpke}', 'device-signing.{d}', 'device-hpke.{d}', 0);
+             INSERT OR IGNORE INTO fleet_key_state VALUES ('{s}', '{i}', '{t}', '{f}', 1, '{fkek}',
+               '{d}', 'rec-{f}', 'fleet-key.{f}.1', 'ACTIVE', NULL, 't');",
+            a = "a1".repeat(16),
+            d = "d1".repeat(16),
+            sig = "51".repeat(32),
+            hpke = "b2".repeat(32),
+            fkek = "cd".repeat(32),
+        ))
+        .unwrap();
+        c.execute(
+            "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+               tenant_id, account_id, device_id, fleet_id, remote_profile_id, remote_version,
+               base_version, accepted_restore_epoch, fkek_key_id, key_generation, sync_state,
+               dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, 1, 'AVAILABLE', 0)",
+            rusqlite::params![
+                local,
+                s,
+                i,
+                t,
+                "a1".repeat(16),
+                "d1".repeat(16),
+                f,
+                remote,
+                epoch,
+                "cd".repeat(32)
+            ],
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -955,7 +1380,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (5, 5, "CLEAN".into()));
+        assert_eq!(meta, (6, 6, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -975,8 +1400,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 6",
-            "UPDATE schema_meta SET min_reader_version = 6",
+            "UPDATE schema_meta SET schema_version = 7",
+            "UPDATE schema_meta SET min_reader_version = 7",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -1028,7 +1453,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(5, 5, "CLEAN".to_string())]);
+            assert_eq!(rows, [(6, 6, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -1061,7 +1486,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -1093,23 +1518,17 @@ mod tests {
         }
     }
 
-    /// A clean version 3 file gains the rest of the plan's tables and keeps
-    /// its bindings; one that already holds a version 4 table, or is not
-    /// clean, is refused as it was.
+    /// A clean version 3 file gains the rest of the plan's tables; one that
+    /// already holds a version 4 table, or is not clean, is refused as it
+    /// was, and so is one with a binding: version 3 kept no evidence of the
+    /// key a binding was made under (version 6 needs it).
     #[test]
-    fn a_version_3_file_migrates_to_version_5_or_is_left_as_it_was() {
+    fn a_version_3_file_migrates_to_version_6_or_is_left_as_it_was() {
         let v3 = |path: &Path| {
             let c = Connection::open(path).unwrap();
             for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3] {
                 c.execute_batch(sql).unwrap();
             }
-            c.execute_batch(&format!(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');",
-                i = "11".repeat(16)
-            ))
-            .unwrap();
             c
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1117,9 +1536,9 @@ mod tests {
         drop(v3(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
             for (table, rows) in [
-                ("profile_bindings", 1),
+                ("profile_bindings", 0),
                 ("server_origins", 0),
                 ("accounts", 0),
                 ("device_state", 0),
@@ -1150,6 +1569,14 @@ mod tests {
                 "CREATE TABLE restore_epoch_binding_proofs (x INTEGER)",
                 "team.trustLedgerUnreadable",
             ),
+            (
+                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
+                 VALUES ('p', '11111111111111111111111111111111', '11111111111111111111111111111111',
+                   '11111111111111111111111111111111', '11111111111111111111111111111111', 0, 0,
+                   'AVAILABLE')",
+                "team.trustLedgerUnreadable",
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("team-sync.db");
@@ -1176,16 +1603,6 @@ mod tests {
         let h = format!("x'{}'", "22".repeat(32));
         let n = format!("x'{}'", "33".repeat(16));
         let row = |table: &str, values: &str| format!("INSERT INTO {table} VALUES ({values});");
-        let binding = format!(
-            "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-               fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-             VALUES ('p', '{i}', '{i}', '{i}', '{i}', 0, 0, 'AVAILABLE');"
-        );
-        let origin = format!(
-            "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
-               server_instance_id, last_restore_epoch, status)
-             VALUES ('s', 'https', 'fleet.test', 443, 'SYSTEM', '{i}', 0, 'ACTIVE');"
-        );
         let journal = row(
             "restore_journals",
             &format!(
@@ -1218,9 +1635,10 @@ mod tests {
             )
         };
         let db = Db::open_at(&path).unwrap();
+        fixtures::seed_binding(&db.conn, "s", "p", &i, &i, &i, &i, 0);
         db.conn
             .execute_batch(&format!(
-                "{binding}{origin}{}{}{journal}{downgrade}{}",
+                "{}{}{journal}{downgrade}{}",
                 transition(0, &n),
                 transition(1, &format!("x'{}'", "34".repeat(16))),
                 proof(&i, 0, 0, 1)
@@ -1300,7 +1718,7 @@ mod tests {
         assert!(db.conn.execute_batch(&proof(&i, 1, 0, 1)).is_err());
     }
 
-    /// A clean version 4 file with a filed proof moves to version 5 with the
+    /// A clean version 4 file with a filed proof moves on with the
     /// proof's bytes exactly, the key to its transition and the check at
     /// filing; its binding can then be deleted, as an unbind does, and the
     /// proof stays. One that already holds the rebuilt table, or is not
@@ -1329,6 +1747,7 @@ mod tests {
                    '{i}', {h}, {h}, 0, 1, x'01', {h}, {h}, x'0102', {h}, 't');"
             ))
             .unwrap();
+            fixtures::evidence(&c, "s", &i, &i, &i);
             c
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1342,7 +1761,7 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(5, 5, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
             let kept: Vec<u8> = db
                 .conn
                 .query_row(
@@ -1524,6 +1943,263 @@ mod tests {
             db.conn.execute_batch(&rows).unwrap();
             let sql = format!("DELETE FROM {table}");
             assert!(db.conn.execute_batch(&sql).is_err(), "{sql}");
+        }
+    }
+
+    /// G2-32, G2-35, G2-36: a clean version 5 file with data moves to
+    /// version 6 with every row it had, exactly: the three sync tables are
+    /// rebuilt without their foreign-key actions firing (an operation keeps
+    /// its binding), the new columns come from the rows the file already
+    /// holds, and the plan's keys are then enforced. A file that cannot be
+    /// given them, with no kept key evidence for a binding, two origins for
+    /// an instance or an operation of an instance with no origin, is refused
+    /// whole and left as it was.
+    #[test]
+    fn a_version_5_file_with_data_moves_to_version_6_keeping_every_row() {
+        let i = "11".repeat(16);
+        let (key, account, device) = ("cd".repeat(32), "a1".repeat(16), "d1".repeat(16));
+        let v5 = |path: &Path| {
+            let c = Connection::open(path).unwrap();
+            for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3, MIGRATE_V4, MIGRATE_V5] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch(&format!(
+                "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                   server_instance_id, last_restore_epoch, status)
+                 VALUES ('s', 'https', 'fleet.test', 443, 'SYSTEM', '{i}', 4, 'ACTIVE');
+                 INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+                   fleet_id, remote_profile_id, remote_version, last_observed_head_hash,
+                   accepted_restore_epoch, fencing_token, lease_id, sync_state)
+                 VALUES ('p', '{i}', '{i}', '{i}', '{i}', 3, zeroblob(32), 4, 2, '{lease}',
+                   'CHECKED_OUT'),
+                   ('q', '{i}', '{i}', '{i}', '{other}', 0, NULL, 4, NULL, NULL, 'AVAILABLE');
+                 INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
+                   server_instance_id, restore_epoch, tenant_id, fleet_id, remote_profile_id,
+                   snapshot_id, manifest_replay_id, operation_scope, kind, idempotency_key,
+                   canonical_request_hash, exact_request_bytes, exact_request_bytes_sha256,
+                   remote_upload_id, lease_id, fencing_token, base_version, intent_hash,
+                   ciphertext_sha256, signed_manifest_container_bytes,
+                   signed_manifest_container_hash, signed_manifest_container_bytes_sha256, state,
+                   created_at, updated_at)
+                 VALUES ('op1', 'p', 'p', '{i}', 4, '{i}', '{i}', '{i}', zeroblob(16),
+                   zeroblob(16), 'scope1', 'COMMIT', 'k1', x'{canonical}', x'0102', zeroblob(32),
+                   'up1', '{lease}', 2, 3, zeroblob(32), zeroblob(32), x'03', zeroblob(32),
+                   zeroblob(32), 'PENDING', 't1', 't2'),
+                   ('op2', 'q', 'q', '{i}', 4, '{i}', '{i}', '{other}', NULL, NULL, 'scope2',
+                   'PUBLISH', 'k2', zeroblob(32), x'01', zeroblob(32), NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL, 'PENDING', 't1', 't2'),
+                   ('op3', NULL, 'gone', '{i}', 4, '{i}', '{i}', '{i}', NULL, NULL, 'scope3',
+                   'UNBIND', 'k3', zeroblob(32), x'01', zeroblob(32), NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL, 'PENDING', 't1', 't2');
+                 INSERT INTO upload_sessions(upload_local_id, local_profile_id,
+                   local_profile_id_at_request, commit_op_id, server_instance_id, restore_epoch,
+                   tenant_id, fleet_id, remote_profile_id, remote_upload_id, snapshot_id,
+                   manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
+                   key_generation, committed_offset, expected_ciphertext_sha256,
+                   expected_ciphertext_size, spool_ref, state, created_at, updated_at)
+                 VALUES ('u1', 'p', 'p', 'op1', '{i}', 4, '{i}', '{i}', '{i}', 'up1',
+                   zeroblob(16), zeroblob(16), zeroblob(32), zeroblob(32), zeroblob(32), '{key}',
+                   1, 5, zeroblob(32), 10, 'op1.part', 'OPEN', 't1', 't2');
+                 INSERT INTO restore_journals VALUES ('p', 'j', 'CREATED', 's', 'b', '{{}}', 0,
+                   zeroblob(32), 't', 't');",
+                lease = "aa".repeat(16),
+                other = "22".repeat(16),
+                canonical = "0a".repeat(32),
+            ))
+            .unwrap();
+            fixtures::evidence(&c, "s", &i, &i, &i);
+            c
+        };
+        type Rows = Vec<Vec<rusqlite::types::Value>>;
+        let tables = ["profile_bindings", "operations", "upload_sessions"];
+        let dump = |c: &Connection, table: &str, cols: &[String]| -> Rows {
+            let cols: Vec<String> = cols.iter().map(|c| format!("\"{c}\"")).collect();
+            c.prepare(&format!(
+                "SELECT {} FROM {table} ORDER BY 1",
+                cols.join(", ")
+            ))
+            .unwrap()
+            .query_map([], |r| {
+                (0..cols.len())
+                    .map(|n| r.get::<_, rusqlite::types::Value>(n))
+                    .collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        let mut had = Vec::new();
+        {
+            let c = v5(&path);
+            for table in tables {
+                let cols: Vec<String> = c
+                    .prepare("SELECT name FROM pragma_table_info(?1)")
+                    .unwrap()
+                    .query_map([table], |r| r.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let rows = dump(&c, table, &cols);
+                had.push((table, cols, rows));
+            }
+        }
+        for round in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
+            for (table, cols, rows) in &had {
+                assert_eq!(&dump(&db.conn, table, cols), rows, "{table} round {round}");
+            }
+            let one = |sql: &str| -> String { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+            let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+            assert_eq!(
+                one(
+                    "SELECT server_id || account_id || device_id || fkek_key_id || key_generation
+                       || base_version || dirty FROM profile_bindings WHERE local_profile_id = 'p'"
+                ),
+                format!("s{account}{device}{key}130"),
+            );
+            assert_eq!(
+                one("SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = 'p'"),
+                "1970-01-01T00:00:00.000Z"
+            );
+            assert_eq!(
+                count("SELECT count(*) FROM profile_bindings WHERE lease_expires_at IS NULL"),
+                1
+            );
+            assert_eq!(
+                count("SELECT count(*) FROM operations WHERE server_id = 's'"),
+                3
+            );
+            // The rebuild did not fire the keys' actions: the operations keep
+            // their binding, and the unbound one stays unbound.
+            assert_eq!(
+                count("SELECT count(*) FROM operations WHERE local_profile_id IS NOT NULL"),
+                2
+            );
+            assert_eq!(
+                one(
+                    "SELECT server_id || retry_state || operation_scope || idempotency_key
+                       FROM upload_sessions"
+                ),
+                "sNONEscope1k1"
+            );
+            assert_eq!(
+                one("SELECT hex(canonical_request_hash) FROM upload_sessions"),
+                "0A".repeat(32)
+            );
+            assert_eq!(count("SELECT count(*) FROM restore_journals"), 1);
+            assert_eq!(
+                one(
+                    "SELECT role || status || signing_credential_ref || hpke_credential_ref
+                       FROM accounts JOIN device_state USING (server_id, tenant_id, device_id)"
+                ),
+                format!("memberACTIVEdevice-signing.{device}device-hpke.{device}"),
+            );
+            assert_eq!(
+                one(
+                    "SELECT state || fkek_credential_ref || device_hpke_grant_record_id
+                       FROM fleet_key_state"
+                ),
+                format!("ACTIVEfleet-key.{i}.1rec-{i}"),
+            );
+            assert_eq!(count("SELECT count(*) FROM pragma_foreign_key_check"), 0);
+            let pragma: i64 = db
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(pragma, 1);
+            // The plan's keys now hold.
+            for sql in [
+                "UPDATE profile_bindings SET server_id = 'nowhere' WHERE local_profile_id = 'q'",
+                "UPDATE profile_bindings SET key_generation = 9 WHERE local_profile_id = 'q'",
+                "UPDATE profile_bindings SET account_id = 'nobody' WHERE local_profile_id = 'q'",
+                "UPDATE operations SET server_id = 'nowhere' WHERE op_id = 'op2'",
+                "UPDATE upload_sessions SET server_id = 'nowhere'",
+                "UPDATE upload_sessions SET key_generation = 9",
+                "UPDATE profile_bindings SET lease_expires_at = NULL WHERE local_profile_id = 'p'",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL
+                   WHERE local_profile_id = 'p'",
+                "UPDATE profile_bindings SET dirty = 2 WHERE local_profile_id = 'q'",
+                "UPDATE upload_sessions SET retry_state = 'LATER'",
+                "UPDATE upload_sessions SET spool_ref = 'a/b'",
+                "UPDATE operations SET kind = 'COMMIT' WHERE op_id = 'op2'",
+                "DELETE FROM fleet_key_state",
+                "DELETE FROM accounts",
+                "DELETE FROM server_origins",
+            ] {
+                assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
+            }
+            // The binding alone holds the key: with the upload session gone,
+            // it cannot be deleted.
+            let sql = "SAVEPOINT p; DELETE FROM upload_sessions; DELETE FROM restore_journals;
+                       DELETE FROM fleet_key_state";
+            assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
+            db.conn.execute_batch("ROLLBACK TO p; RELEASE p;").unwrap();
+        }
+        for (sql, what) in [
+            ("DELETE FROM signed_authorization_records", "no kept grant"),
+            ("DELETE FROM trust_fleet_key_grants", "no verified grant"),
+            (
+                "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                   server_instance_id, last_restore_epoch, status)
+                 VALUES ('s2', 'https', 'other.test', 443, 'SYSTEM',
+                   '11111111111111111111111111111111', 0, 'ACTIVE')",
+                "two origins",
+            ),
+            (
+                "UPDATE operations SET server_instance_id = 'ffffffffffffffffffffffffffffffff'
+                 WHERE op_id = 'op2'",
+                "an operation of no origin",
+            ),
+            (
+                "INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                   server_instance_id, last_restore_epoch, status)
+                 VALUES ('s5', 'https', 'a5.test', 443, 'SYSTEM',
+                   'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 0, 'ACTIVE'),
+                   ('s6', 'https', 'a6.test', 443, 'SYSTEM',
+                   'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', 0, 'ACTIVE');
+                 UPDATE operations SET server_instance_id = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+                 WHERE op_id = 'op2'",
+                "an operation of two origins",
+            ),
+            (
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO restore_journals VALUES ('ghost', 'g', 'CREATED', 's', 'b', '{}', 0,
+                   zeroblob(32), 't', 't')",
+                "a key already broken",
+            ),
+            (
+                "CREATE TEMP TABLE copy AS SELECT * FROM signed_authorization_records;
+                 UPDATE copy SET record_id = 'rec2', replay_id = x'02020202020202020202020202020202',
+                   subject_device_id = 'd2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2',
+                   subject_account_id = 'a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2',
+                   fleet_id = '22222222222222222222222222222222',
+                   exact_signed_container_bytes = x'ac';
+                 INSERT INTO signed_authorization_records SELECT * FROM copy;
+                 INSERT INTO trust_fleet_generations
+                   VALUES ('11111111111111111111111111111111', '11111111111111111111111111111111',
+                     '22222222222222222222222222222222', 1);
+                 INSERT INTO trust_fleet_key_grants
+                   VALUES ('11111111111111111111111111111111', '11111111111111111111111111111111',
+                     '22222222222222222222222222222222', 1,
+                     'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd', 1, x'ac', x'00')",
+                "two devices of a tenant",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            v5(&path).execute_batch(sql).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let err = Db::open_at(&path).err().expect(what).to_string();
+                assert!(
+                    crate::errcode::has_code(&err, "team.trustLedgerUnreadable"),
+                    "{what}: {err}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{what}");
         }
     }
 }

@@ -702,16 +702,17 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        team::db::Db::open()
-            .unwrap()
-            .conn
-            .execute(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES (?1, ?2, ?2, ?2, ?2, 0, 0, 'AVAILABLE')",
-                [id.clone(), "ee".repeat(16)],
-            )
-            .unwrap();
+        let ee = "ee".repeat(16);
+        team::db::fixtures::seed_binding(
+            &team::db::Db::open().unwrap().conn,
+            "s",
+            &id,
+            &ee,
+            &ee,
+            &ee,
+            &ee,
+            0,
+        );
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let pushed = rt.block_on(profile_sync_push(

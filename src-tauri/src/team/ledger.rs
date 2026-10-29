@@ -656,7 +656,88 @@ pub fn record_in(
         )?;
         // Probe 3 (L2032): the exact grant with every column it decides.
         super::records::keep(tx, o.server_url, o.container, now)?;
+        keep_key_state(tx, &instance, &tenant, &o)?;
     }
+    Ok(())
+}
+
+/// G2-36 (plan L1484, L1748): the account, device and fleet key rows a
+/// binding's foreign keys name, filed with the grant that delivered the key.
+/// The grant's subject is this device. The newest generation filed for a
+/// fleet is its ACTIVE one and retires the one before; a renewed grant of the
+/// same key moves the row to the new record, and another key of a generation
+/// already filed leaves the row as filed (the grant above keeps the same rule). The account's role is the
+/// least privilege: authority comes from signed capability grants, never from
+/// this column. The cached key stays the one the ledger's grant verifies.
+fn keep_key_state(
+    tx: &rusqlite::Connection,
+    instance: &str,
+    tenant: &str,
+    o: &Opened,
+) -> Result<()> {
+    let server = super::records::origin(tx, o.server_url, instance, 0)?;
+    let (record, account, device, signing, hpke): (String, String, String, String, String) = tx
+        .query_row(
+            "SELECT record_id, subject_account_id, subject_device_id, subject_signing_key_id,
+               recipient_hpke_key_id
+             FROM signed_authorization_records WHERE exact_signed_container_bytes = ?1",
+            [o.container],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(|_| anyhow!(crate::errcode::code("team.trustLedgerUnreadable")))?;
+    let (fleet, generation) = (hex(o.fleet_id), wire(o.generation)?);
+    tx.execute(
+        "INSERT OR IGNORE INTO accounts VALUES (?1, ?2, ?3, ?4, 'member', 'ACTIVE')",
+        params![server, tenant, account, device],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO device_state VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+        params![
+            server,
+            tenant,
+            account,
+            device,
+            signing,
+            hpke,
+            format!("device-signing.{device}"),
+            format!("device-hpke.{device}")
+        ],
+    )?;
+    let newest: bool = tx.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM fleet_key_state
+           WHERE server_id = ?1 AND server_instance_id = ?2 AND tenant_id = ?3
+             AND fleet_id = ?4 AND generation > ?5)",
+        params![server, instance, tenant, fleet, generation],
+        |r| r.get(0),
+    )?;
+    if newest {
+        tx.execute(
+            "UPDATE fleet_key_state SET state = 'RETIRED'
+             WHERE server_id = ?1 AND server_instance_id = ?2 AND tenant_id = ?3
+               AND fleet_id = ?4 AND state = 'ACTIVE' AND generation < ?5",
+            params![server, instance, tenant, fleet, generation],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id,
+           generation, fkek_key_id, device_id, device_hpke_grant_record_id, fkek_credential_ref,
+           state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT DO UPDATE SET device_hpke_grant_record_id = excluded.device_hpke_grant_record_id
+         WHERE fkek_key_id = excluded.fkek_key_id",
+        params![
+            server,
+            instance,
+            tenant,
+            fleet,
+            generation,
+            hex(&o.fkek_key_id),
+            device,
+            record,
+            format!("fleet-key.{fleet}.{}", o.generation),
+            if newest { "ACTIVE" } else { "RETIRED" }
+        ],
+    )?;
     Ok(())
 }
 
@@ -823,5 +904,106 @@ mod tests {
         let unverifiable = signed_by(&d, 10, L - 1);
         let kept = prepare(&db, &B, &[page(&[&x], vec![unverifiable.clone()])]).unwrap();
         assert_eq!(kept[0].containers, [unverifiable]);
+    }
+
+    /// G2-36: a grant filed as opened files the account, device and fleet key
+    /// rows it names. The newest generation is ACTIVE and retires the one
+    /// before, an older one is filed RETIRED, a renewed grant of the same key
+    /// moves the row to the new record, and another key of a filed
+    /// generation leaves the row as filed.
+    #[test]
+    fn a_filed_grant_files_the_key_state_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let (i, t, f) = ("33".repeat(16), "44".repeat(16), "55".repeat(16));
+        super::super::db::fixtures::seed_binding(&db.conn, "s", "p", &i, &t, &f, &f, 0);
+        // The grants of generations 2 and 3, and a renewed one of 2, as
+        // copies of the filed grant.
+        for (record, replay, generation, key, container) in [
+            ("rec2", "02", 2, "e2", "ac"),
+            ("rec3", "03", 3, "e3", "ad"),
+            ("rec2b", "04", 2, "e2", "ae"),
+            ("rec2c", "05", 2, "e9", "af"),
+        ] {
+            db.conn
+                .execute_batch(&format!(
+                    "CREATE TEMP TABLE copy AS SELECT * FROM signed_authorization_records
+                       WHERE record_id = 'rec-{f}';
+                     UPDATE copy SET record_id = '{record}', generation = {generation},
+                       replay_id = x'{replay:0>32}',
+                       fkek_key_id = '{}', exact_signed_container_bytes = x'{container}';
+                     INSERT INTO signed_authorization_records SELECT * FROM copy;
+                     DROP TABLE copy;",
+                    key.repeat(32)
+                ))
+                .unwrap();
+        }
+        let file = |generation: u64, key: &str, container: u8| {
+            let fkek_key_id = decode_hex32(&key.repeat(32), "fkek_key_id").unwrap();
+            keep_key_state(
+                &db.conn,
+                &i,
+                &t,
+                &Opened {
+                    server_url: "https://h33333333.test",
+                    fleet_id: &decode_hex16(&f, "fleet").unwrap(),
+                    generation,
+                    fkek_key_id,
+                    container: &[container],
+                    pages: &[],
+                },
+            )
+            .unwrap();
+        };
+        let states = |db: &Db| -> Vec<(i64, String, String, String)> {
+            db.conn
+                .prepare(
+                    "SELECT generation, state, device_hpke_grant_record_id, substr(fkek_key_id, 1, 2)
+                     FROM fleet_key_state ORDER BY generation",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let row =
+            |g: i64, s: &str, r: &str, k: &str| (g, s.to_string(), r.to_string(), k.to_string());
+        let first = row(1, "ACTIVE", &format!("rec-{f}"), "cd");
+        assert_eq!(states(&db), [first]);
+        file(2, "e2", 0xac);
+        assert_eq!(
+            states(&db),
+            [
+                row(1, "RETIRED", &format!("rec-{f}"), "cd"),
+                row(2, "ACTIVE", "rec2", "e2")
+            ]
+        );
+        file(3, "e3", 0xad);
+        file(1, "cd", 0xab);
+        assert_eq!(
+            states(&db),
+            [
+                row(1, "RETIRED", &format!("rec-{f}"), "cd"),
+                row(2, "RETIRED", "rec2", "e2"),
+                row(3, "ACTIVE", "rec3", "e3")
+            ]
+        );
+        // A renewed grant of generation 2's key moves its row to the new
+        // record and keeps its state; another key of generation 2 changes
+        // nothing.
+        file(2, "e2", 0xae);
+        file(2, "e9", 0xaf);
+        assert_eq!(
+            states(&db),
+            [
+                row(1, "RETIRED", &format!("rec-{f}"), "cd"),
+                row(2, "RETIRED", "rec2b", "e2"),
+                row(3, "ACTIVE", "rec3", "e3")
+            ]
+        );
+        let n = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(n("SELECT count(*) FROM accounts"), 1);
+        assert_eq!(n("SELECT count(*) FROM device_state"), 1);
     }
 }
