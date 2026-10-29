@@ -2703,6 +2703,12 @@ fn recipient(c: &team_config::TeamConfig) -> anyhow::Result<shardx_core::trust_c
 /// issuer must not be proven revoked or distrusted now, even though the grant
 /// was first seen before (Q-26: the one exception to Q-19 (A), for key
 /// material only).
+///
+/// Only the delivering grant's direct issuer is checked, as the ADR words it:
+/// a custodian D' that a distrusted or revoked X appointed before that keeps
+/// its standing, so grants D' issues stay usable and D' can re-file the same
+/// FKEK. The D-6 (a) custodian change events, pending the Q-17 UX review, are
+/// what reveal D' to the user.
 fn fleet_key_verifies(
     ledger: &team::db::Db,
     (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
@@ -4023,6 +4029,36 @@ mod custody_tests {
         let reappointed = custody(&me, &[first, again], std::slice::from_ref(&after));
         let got = collect_at(&path, &reappointed, &after, 1, T0 + 44 * DAY);
         assert_eq!(got, Some(honest), "re-appointed by another custodian");
+    }
+
+    /// The documented D-6 no-history limit of Q-25: when the server withheld
+    /// D's root grant for all of D's window, this device never counted D, so
+    /// the root grant sent later with a grant backdated from D's stolen key
+    /// is accepted, D lapses only in that accepting evaluation, and the key
+    /// still reverifies for pull.
+    #[test]
+    fn limit_a_backdated_grant_from_a_never_counted_custodian_is_accepted() {
+        let me = me();
+        let stolen = [0x71; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&stolen);
+        let first = d_root(&me.sk, 21, T0, T0 + 30 * DAY);
+        let c = lasting(41, T0 + 10 * DAY, LONG);
+        let backdated = grant_at(&d_key(), &me, 1, c, kid, &stolen);
+        let late = custody(
+            &me,
+            std::slice::from_ref(&first),
+            std::slice::from_ref(&backdated),
+        );
+        let (_dir, path) = ledger_at();
+        let withheld = custody(&me, &[], &[]);
+        assert_eq!(collect_at(&path, &withheld, &[], 1, T0 + DAY), None);
+        let at = T0 + 41 * DAY;
+        assert_eq!(collect_at(&path, &late, &backdated, 1, at), Some(stolen));
+        assert_eq!(lapsed(&path), [(hex(&d_id()), at as i64)]);
+        let db = team::db::Db::open_at(&path).unwrap();
+        let pin = (BINDING, me.to.signing_key_id);
+        let used = fleet_key_verifies(&db, &pin, &me.to, &FLEET, 1, &stolen, at + DAY);
+        assert!(used.unwrap(), "pull would use it");
     }
 
     /// Q-25 at use: reverifying a kept key first records the lapse history

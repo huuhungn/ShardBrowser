@@ -166,9 +166,16 @@ pub fn evaluate(
 /// Q-25, before any new container is accepted: every custodian key whose
 /// known custody, from the root grants earlier evaluations counted, has
 /// ended at `now` is held as lapsed as of the latest evaluation, so whatever
-/// is first seen from here on meets that lapse. Nothing in the evidence being
-/// accepted can backdate past it or extend the key first, and a key the
-/// evidence leaves out is not lapsed while its known custody runs.
+/// is first seen from here on meets that lapse. For such a key nothing in the
+/// evidence being accepted can backdate past it or extend the key first, and
+/// a key the evidence leaves out is not lapsed while its known custody runs.
+///
+/// Only keys an earlier evaluation counted are covered (the D-6 no-history
+/// limit): a server that withheld D's root grant for all of D's window, or a
+/// device offline for it, finds nothing here, so when the root grant arrives
+/// later with a grant backdated into that window from D's stolen key, the
+/// lapse is recorded in that accepting evaluation and the grant keeps its
+/// standing.
 fn observe_lapses(db: &Db, binding: &Binding, now: u64) -> Result<()> {
     let (instance, tenant) = ids(binding);
     let latest: Option<i64> = db.conn.query_row(
