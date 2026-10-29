@@ -35,7 +35,13 @@ pub async fn log(
     .execute(db)
     .await;
     if let Err(e) = written {
-        if let Some(failures) = count_read_only_failure() {
+        // Off the async worker (an fsync); awaited, so the count is in the file
+        // before the caller goes on.
+        let counted = tokio::task::spawn_blocking(count_read_only_failure)
+            .await
+            .ok()
+            .flatten();
+        if let Some(failures) = counted {
             tracing::error!(
                 action,
                 actor = actor.unwrap_or("-"),
@@ -47,17 +53,31 @@ pub async fn log(
     }
 }
 
-/// The failed audit writes of one restore episode (a restore in progress, or
-/// K2's incident). `restore status` is a separate process, so the count is
-/// mirrored in this file in the data directory (outside the read-only DB) as
-/// `<episode> <count>`. A read-only restart in the same episode continues the
-/// count; `restore commit` and `restore abort` print it and remove the file.
+/// The failed audit writes of the restore episodes a read-only server has
+/// counted (a restore in progress, or K2's incident). `restore status` is a
+/// separate process, so the counts are mirrored in this file in the data
+/// directory (outside the read-only DB), one `<episode> <count>` per line. A
+/// read-only restart in the same episode continues its count. An episode's key
+/// can change while the restore runs (the manifest appears), and a non-zero
+/// count is never dropped for that: the old key's line stays until `restore
+/// clear-audit-count` acknowledges it. `restore commit` and `restore abort`
+/// print their own episode and clear only that line.
 const FAILURES_FILE: &str = "audit-ro-failures";
 
 struct ReadOnlyFailures {
     file: PathBuf,
     episode: String,
     count: u64,
+    /// The non-zero counts of other episodes, written back with every update.
+    kept: Vec<(String, u64)>,
+}
+
+impl ReadOnlyFailures {
+    fn entries(&self) -> Vec<(String, u64)> {
+        let mut all = self.kept.clone();
+        all.push((self.episode.clone(), self.count));
+        all
+    }
 }
 
 /// `None` outside read-only mode, where a failed write stays swallowed.
@@ -69,13 +89,21 @@ fn failures() -> MutexGuard<'static, Option<ReadOnlyFailures>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Whether a regular file is at `file`. A link, a reparse point or a directory
-/// there is refused by name: the count is never written through one.
-fn counter_exists(file: &Path) -> anyhow::Result<bool> {
+/// What the count file holds.
+enum Counts {
+    Absent,
+    /// Something that is not a list of `<episode> <count>` lines.
+    Unreadable,
+    Entries(Vec<(String, u64)>),
+}
+
+/// Reads the count file. A link, a reparse point or a directory at its name
+/// is refused by name: the count is never written through one.
+fn read_counts(file: &Path) -> anyhow::Result<Counts> {
     use anyhow::Context;
     match std::fs::symlink_metadata(file) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("checking {}", file.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Counts::Absent),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", file.display())),
         Ok(m) if crate::identity::is_link(&m) => anyhow::bail!(
             "{} is a link or reparse point; remove it, the audit failure count is never \
              written through one",
@@ -85,19 +113,29 @@ fn counter_exists(file: &Path) -> anyhow::Result<bool> {
             "{} is not a regular file; remove it, the audit failure count needs that name",
             file.display()
         ),
-        Ok(_) => Ok(true),
+        Ok(_) => {}
     }
+    Ok(std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| parse_counts(&text))
+        .map_or(Counts::Unreadable, Counts::Entries))
 }
 
-fn parse_count(text: &str) -> Option<(&str, u64)> {
-    let (episode, count) = text.trim().split_once(' ')?;
-    Some((episode, count.parse().ok()?))
+fn parse_counts(text: &str) -> Option<Vec<(String, u64)>> {
+    let entries = text
+        .lines()
+        .map(|line| {
+            let (episode, count) = line.split_once(' ')?;
+            Some((episode.to_string(), count.parse().ok()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!entries.is_empty()).then_some(entries)
 }
 
 /// Replaces the count file atomically: a temp file, fsync, rename, fsync of
-/// the directory, so a crash leaves the old count or the new one, never a torn
-/// file.
-fn write_count(file: &Path, episode: &str, count: u64) -> anyhow::Result<()> {
+/// the directory, so a crash leaves the old counts or the new ones, never a
+/// torn file.
+fn write_counts(file: &Path, entries: &[(String, u64)]) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::io::Write;
     let tmp = file.with_extension("tmp");
@@ -112,7 +150,9 @@ fn write_count(file: &Path, episode: &str, count: u64) -> anyhow::Result<()> {
         .create_new(true)
         .open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    f.write_all(format!("{episode} {count}\n").as_bytes())?;
+    for (episode, count) in entries {
+        writeln!(f, "{episode} {count}")?;
+    }
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, file).with_context(|| format!("installing {}", file.display()))?;
@@ -123,9 +163,10 @@ fn write_count(file: &Path, episode: &str, count: u64) -> anyhow::Result<()> {
 }
 
 /// Opens the count for `episode` when the server starts read-only, continuing
-/// the count of the same episode and starting another at zero. `None` is a
-/// normal start: no count is kept and an earlier one is left for `restore
-/// commit` or `restore abort` to report.
+/// the count of the same episode and starting another at zero, next to the
+/// non-zero counts of the episodes before it. `None` is a normal start: no
+/// count is kept and earlier ones are left for `restore status`, `restore
+/// commit`, `restore abort` or `restore clear-audit-count` to report.
 pub fn init_read_only_count(data_dir: &str, episode: Option<&str>) -> anyhow::Result<()> {
     let file = Path::new(data_dir).join(FAILURES_FILE);
     let mut state = failures();
@@ -133,24 +174,33 @@ pub fn init_read_only_count(data_dir: &str, episode: Option<&str>) -> anyhow::Re
         *state = None;
         return Ok(());
     };
-    let count = if counter_exists(&file)? {
-        std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|text| {
-                parse_count(&text)
-                    .filter(|(e, _)| *e == episode)
-                    .map(|(_, c)| c)
-            })
-            .unwrap_or(0)
-    } else {
-        0
+    let before = match read_counts(&file)? {
+        Counts::Entries(entries) => entries,
+        Counts::Absent => Vec::new(),
+        Counts::Unreadable => {
+            tracing::warn!(
+                "{} is not a count file; counting again from zero",
+                file.display()
+            );
+            Vec::new()
+        }
     };
-    write_count(&file, episode, count)?;
-    *state = Some(ReadOnlyFailures {
+    let count = before
+        .iter()
+        .find_map(|(e, c)| (e == episode).then_some(*c))
+        .unwrap_or(0);
+    let kept: Vec<_> = before
+        .into_iter()
+        .filter(|(e, c)| e != episode && *c > 0)
+        .collect();
+    let new = ReadOnlyFailures {
         file,
         episode: episode.to_string(),
         count,
-    });
+        kept,
+    };
+    write_counts(&new.file, &new.entries())?;
+    *state = Some(new);
     Ok(())
 }
 
@@ -159,7 +209,7 @@ fn count_read_only_failure() -> Option<u64> {
     let mut state = failures();
     let state = state.as_mut()?;
     state.count += 1;
-    if let Err(e) = write_count(&state.file, &state.episode, state.count) {
+    if let Err(e) = write_counts(&state.file, &state.entries()) {
         tracing::error!(error = %e, "cannot record the failed audit write count");
     }
     Some(state.count)
@@ -168,33 +218,60 @@ fn count_read_only_failure() -> Option<u64> {
 /// The count of `episode` as `restore status` prints it: the number, or
 /// `unreadable` when the file cannot be read, which never fails the command.
 pub fn read_only_failures(data_dir: &str, episode: &str) -> String {
-    let file = Path::new(data_dir).join(FAILURES_FILE);
-    match counter_exists(&file) {
-        Ok(false) => "0".into(),
-        Ok(true) => match std::fs::read_to_string(&file) {
-            Ok(text) => match parse_count(&text) {
-                Some((e, count)) if e == episode => count.to_string(),
-                Some(_) => "0".into(),
-                None => "unreadable".into(),
-            },
-            Err(_) => "unreadable".into(),
-        },
-        Err(_) => "unreadable".into(),
+    match read_counts(&Path::new(data_dir).join(FAILURES_FILE)) {
+        Ok(Counts::Absent) => "0".into(),
+        Ok(Counts::Entries(entries)) => entries
+            .iter()
+            .find_map(|(e, c)| (e == episode).then(|| c.to_string()))
+            .unwrap_or_else(|| "0".into()),
+        Ok(Counts::Unreadable) | Err(_) => "unreadable".into(),
     }
 }
 
-/// Removes the count when a restore ends. A name that is not a plain file is
-/// left alone and reported, since the restore itself has finished.
-pub fn clear_read_only_count(data_dir: &str) {
+/// The counts kept for episodes other than `except`, as `restore status`
+/// prints them, in every class: `<episode> <count>`. An unreadable file shows
+/// as `unreadable` unless `except` already reports it.
+pub fn kept_failures(data_dir: &str, except: Option<&str>) -> Vec<String> {
+    match read_counts(&Path::new(data_dir).join(FAILURES_FILE)) {
+        Ok(Counts::Entries(entries)) => entries
+            .into_iter()
+            .filter(|(e, c)| Some(e.as_str()) != except && *c > 0)
+            .map(|(e, c)| format!("{e} {c}"))
+            .collect(),
+        Ok(Counts::Unreadable) | Err(_) if except.is_none() => vec!["unreadable".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Removes `episode`'s line from the count file (the file itself when it was
+/// the last), returning its count. The other episodes' lines stay.
+pub fn clear_episode(data_dir: &str, episode: &str) -> anyhow::Result<Option<u64>> {
     let file = Path::new(data_dir).join(FAILURES_FILE);
-    match counter_exists(&file) {
-        Ok(true) => {
-            if let Err(e) = std::fs::remove_file(&file) {
-                eprintln!("warning: cannot remove {}: {e}", file.display());
-            }
+    let entries = match read_counts(&file)? {
+        Counts::Absent => return Ok(None),
+        Counts::Unreadable => {
+            anyhow::bail!("{} is not a count file; remove it by hand", file.display())
         }
-        Ok(false) => {}
-        Err(e) => eprintln!("warning: {e:#}"),
+        Counts::Entries(entries) => entries,
+    };
+    let cleared = entries
+        .iter()
+        .find_map(|(e, c)| (e == episode).then_some(*c));
+    let rest: Vec<_> = entries.into_iter().filter(|(e, _)| e != episode).collect();
+    if rest.is_empty() {
+        std::fs::remove_file(&file)
+            .map_err(|e| anyhow::anyhow!("cannot remove {}: {e}", file.display()))?;
+    } else if cleared.is_some() {
+        write_counts(&file, &rest)?;
+    }
+    Ok(cleared)
+}
+
+/// Clears `episode` when its restore ends. A name that is not a plain file is
+/// left alone and reported, since the restore itself has finished.
+pub fn clear_read_only_count(data_dir: &str, episode: &str) {
+    if let Err(e) = clear_episode(data_dir, episode) {
+        eprintln!("warning: {e:#}");
     }
 }
 
@@ -349,7 +426,7 @@ mod tests {
         // A normal start keeps the count for `restore commit` to report.
         init_read_only_count(&f.data_dir, None).unwrap();
         assert_eq!(read_only_failures(&f.data_dir, "e1"), "2");
-        clear_read_only_count(&f.data_dir);
+        clear_read_only_count(&f.data_dir, "e1");
         assert_eq!(read_only_failures(&f.data_dir, "e1"), "0");
         assert!(!f.dir.join(FAILURES_FILE).exists());
     }
@@ -375,6 +452,59 @@ mod tests {
         assert_eq!(read_only_failures(&f.data_dir, "record-b"), "0");
         f.fail(1).await;
         assert_eq!(read_only_failures(&f.data_dir, "record-b"), "1");
+    }
+
+    /// N2: when an episode's key changes mid-restore, the old key's non-zero
+    /// count is kept next to the new one, listed in every class, and cleared
+    /// only by name; a zero count is not worth keeping.
+    #[tokio::test]
+    async fn a_changed_episode_key_keeps_the_old_count_until_it_is_cleared_by_name() {
+        let f = Fixture::new("switch").await;
+        let file = f.dir.join(FAILURES_FILE);
+        init_read_only_count(&f.data_dir, Some("zero")).unwrap();
+        init_read_only_count(&f.data_dir, Some("record-a")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "record-a 0
+"
+        );
+        f.fail(2).await;
+        init_read_only_count(&f.data_dir, Some("txn-b")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "record-a 2
+txn-b 0
+"
+        );
+        f.fail(1).await;
+        assert_eq!(read_only_failures(&f.data_dir, "txn-b"), "1");
+        assert_eq!(read_only_failures(&f.data_dir, "record-a"), "2");
+        assert_eq!(kept_failures(&f.data_dir, Some("txn-b")), ["record-a 2"]);
+        // A class with no episode of its own (K3) lists both.
+        assert_eq!(kept_failures(&f.data_dir, None), ["record-a 2", "txn-b 1"]);
+        // A restart on the new key keeps the old line.
+        init_read_only_count(&f.data_dir, Some("txn-b")).unwrap();
+        f.fail(1).await;
+        assert_eq!(kept_failures(&f.data_dir, Some("txn-b")), ["record-a 2"]);
+        assert_eq!(read_only_failures(&f.data_dir, "txn-b"), "2");
+
+        // The restore's own end clears its own line only.
+        clear_read_only_count(&f.data_dir, "txn-b");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "record-a 2
+"
+        );
+        assert_eq!(clear_episode(&f.data_dir, "txn-b").unwrap(), None);
+        assert_eq!(clear_episode(&f.data_dir, "record-a").unwrap(), Some(2));
+        assert!(!file.exists());
+        assert_eq!(clear_episode(&f.data_dir, "record-a").unwrap(), None);
+
+        // An unreadable file is not guessed at.
+        std::fs::write(&file, "junk").unwrap();
+        assert!(clear_episode(&f.data_dir, "e1").is_err());
+        assert_eq!(kept_failures(&f.data_dir, None), ["unreadable"]);
+        assert!(kept_failures(&f.data_dir, Some("e1")).is_empty());
     }
 
     /// L2: the count is replaced atomically, and a file that is not a count
@@ -418,7 +548,7 @@ mod tests {
         init_read_only_count(&f.data_dir, None).unwrap();
         assert!(file.is_dir());
         // `restore commit` and `abort` leave it and go on.
-        clear_read_only_count(&f.data_dir);
+        clear_read_only_count(&f.data_dir, "e1");
         assert!(file.is_dir());
         std::fs::remove_dir(&file).unwrap();
 
@@ -442,7 +572,7 @@ mod tests {
         assert!(e.to_string().contains("link or reparse point"), "{e:#}");
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
         assert_eq!(read_only_failures(&f.data_dir, "e1"), "unreadable");
-        clear_read_only_count(&f.data_dir);
+        clear_read_only_count(&f.data_dir, "e1");
         assert!(std::fs::symlink_metadata(&file).is_ok());
     }
 }

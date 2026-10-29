@@ -32,8 +32,8 @@ use super::v2_root::{
 };
 use super::v2_root_grants::{at, custodian_besides, is_active_custodian, outer_request};
 use crate::error::AppError;
-use crate::identity::Verified;
-use crate::quarantine::{self, Kind, Mark};
+use crate::identity::{hex, Verified};
+use crate::quarantine::{Kind, Mark};
 use crate::state::AppState;
 use crate::util::now_ms;
 
@@ -63,7 +63,8 @@ pub(crate) struct StoredRevocation {
 /// The revocation `replay` of this instance, reparsed, verified under its
 /// issuer's key and required to hold exactly the columns its container
 /// determines. A row that disagrees refuses the request (422) and is
-/// quarantined (plan L507); one quarantined before is no revocation.
+/// quarantined (plan L507), again if it was marked before. A row that was
+/// marked but verifies now is served again: the mark stays as history.
 pub(crate) async fn load_revocation(
     conn: &mut SqliteConnection,
     instance: &[u8; 16],
@@ -86,9 +87,6 @@ pub(crate) async fn load_revocation(
         tenant_id: *tenant,
         replay_id: *replay,
     };
-    if quarantine::holds(conn, &mark).await? {
-        return Ok(None);
-    }
     let broken = || AppError::Quarantine(Box::new(mark.clone()));
     let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
     // The issuer's device row outlives its own revocation, so its key stays.
@@ -117,6 +115,133 @@ pub(crate) async fn load_revocation(
         revocation,
         signed_container_hash: *record.record().signed_container_hash(),
     }))
+}
+
+/// Why a revocation is not being served correctly right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// The row names another server instance, so no check of this one sees it.
+    OtherInstance,
+    /// The row disagrees with its signed container.
+    Mismatch,
+    /// A quarantine mark names a row that is not there.
+    MarkedRowMissing,
+}
+
+/// A revocation that is not served correctly right now.
+#[derive(Debug, Clone)]
+pub(crate) struct Unserved {
+    pub(crate) mark: Mark,
+    pub(crate) why: Why,
+}
+
+impl Unserved {
+    /// Which revocation, why, and what clears it, for a log or a refusal.
+    pub(crate) fn describe(&self) -> String {
+        let why = match self.why {
+            Why::OtherInstance => "belongs to another server instance",
+            Why::Mismatch => "does not match its signed container",
+            Why::MarkedRowMissing => "is quarantined and its row is missing",
+        };
+        format!(
+            "device revocation {} of tenant {} {why}; restoring the row and restarting \
+             clears it",
+            hex(&self.mark.replay_id),
+            hex(&self.mark.tenant_id)
+        )
+    }
+}
+
+/// What a look at the revocations found.
+#[derive(Debug, Default)]
+pub(crate) struct Findings {
+    pub(crate) unserved: Vec<Unserved>,
+    /// Marked before, and intact now: served again, the mark kept as history.
+    pub(crate) served_again: Vec<Mark>,
+}
+
+/// Looks at the revocations that decide whether v2 may run: every row of
+/// every instance when `every_row`, and in any case every row a quarantine
+/// mark names. A revocation left out of the checks would let a revoked device
+/// pass as live, so a row of another instance, one that fails
+/// [`load_revocation`] now, or a mark whose row is gone is `unserved`.
+pub(crate) async fn look_at_revocations(
+    conn: &mut SqliteConnection,
+    instance: &[u8; 16],
+    every_row: bool,
+) -> Result<Findings, AppError> {
+    let mut found = Findings::default();
+    let other: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(&format!(
+        "SELECT server_instance_id, tenant_id, replay_id FROM {TABLE}
+          WHERE server_instance_id <> ?"
+    ))
+    .bind(instance.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    for (other, tenant, replay) in other {
+        found.unserved.push(Unserved {
+            mark: Mark {
+                kind: Kind::DeviceRevocation,
+                server_instance_id: other.try_into().map_err(|_| malformed())?,
+                tenant_id: tenant.try_into().map_err(|_| malformed())?,
+                replay_id: replay.try_into().map_err(|_| malformed())?,
+            },
+            why: Why::OtherInstance,
+        });
+    }
+    let marked: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT tenant_id, replay_id FROM v2_grant_quarantine
+          WHERE kind = 'device_revocation' AND server_instance_id = ?",
+    )
+    .bind(instance.as_slice())
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut keys = if every_row {
+        sqlx::query_as(&format!(
+            "SELECT tenant_id, replay_id FROM {TABLE} WHERE server_instance_id = ?"
+        ))
+        .bind(instance.as_slice())
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        Vec::new()
+    };
+    for key in &marked {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    for (tenant, replay) in keys {
+        let (tenant, replay): ([u8; 16], [u8; 16]) = (
+            tenant.try_into().map_err(|_| malformed())?,
+            replay.try_into().map_err(|_| malformed())?,
+        );
+        let mark = Mark {
+            kind: Kind::DeviceRevocation,
+            server_instance_id: *instance,
+            tenant_id: tenant,
+            replay_id: replay,
+        };
+        let was_marked = marked.contains(&(tenant.to_vec(), replay.to_vec()));
+        match load_revocation(conn, instance, &tenant, &replay).await {
+            Ok(Some(_)) if was_marked => found.served_again.push(mark),
+            Ok(Some(_)) => {}
+            Ok(None) => found.unserved.push(Unserved {
+                mark,
+                why: Why::MarkedRowMissing,
+            }),
+            Err(AppError::Quarantine(mark)) => found.unserved.push(Unserved {
+                mark: *mark,
+                why: Why::Mismatch,
+            }),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(found)
+}
+
+fn malformed() -> AppError {
+    AppError::Internal("a device revocation row has a malformed key".into())
 }
 
 /// Whether the row `replay` holds exactly the filed container `hash`.
@@ -532,4 +657,43 @@ pub async fn revoke_device(
     .await?;
     tx.commit().await?;
     Ok(cbor(StatusCode::CREATED, response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unserved(why: Why) -> String {
+        Unserved {
+            mark: Mark {
+                kind: Kind::DeviceRevocation,
+                server_instance_id: [1; 16],
+                tenant_id: [2; 16],
+                replay_id: [3; 16],
+            },
+            why,
+        }
+        .describe()
+    }
+
+    #[test]
+    fn each_finding_names_the_tenant_and_replay_and_what_clears_it() {
+        for (why, said) in [
+            (Why::OtherInstance, "belongs to another server instance"),
+            (Why::Mismatch, "does not match its signed container"),
+            (
+                Why::MarkedRowMissing,
+                "is quarantined and its row is missing",
+            ),
+        ] {
+            let text = unserved(why);
+            assert!(text.contains(&"03".repeat(16)), "{text}");
+            assert!(text.contains(&"02".repeat(16)), "{text}");
+            assert!(text.contains(said), "{text}");
+            assert!(
+                text.contains("restoring the row and restarting clears it"),
+                "{text}"
+            );
+        }
+    }
 }

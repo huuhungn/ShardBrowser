@@ -218,7 +218,7 @@ fn a_symlinked_record_is_refused() {
     let out = cli(&d, &["identity", "show"]);
     assert_eq!(field(&out, "status"), "EPOCH_AUTHORITY_CORRUPT");
     assert!(
-        field(&out, "reason").contains("not a regular file"),
+        field(&out, "reason").contains("link or reparse point"),
         "{}",
         stdout(&out)
     );

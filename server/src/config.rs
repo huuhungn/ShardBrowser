@@ -73,9 +73,9 @@ impl Config {
         let snapshot_keep = parse_env("SHARDX_SNAPSHOT_KEEP", 5);
         let max_snapshot_bytes = parse_env::<usize>("SHARDX_MAX_SNAPSHOT_BYTES", 512 * 1024 * 1024);
         let trust_proxy = env_or("SHARDX_TRUST_PROXY", "0") == "1";
-        let identity_dir = std::env::var("SHARDX_IDENTITY_DIR")
-            .ok()
-            .filter(|v| !v.is_empty());
+        // An empty value is kept, not read as unset: the preflight refuses it,
+        // so a blanked variable cannot start the server without an authority.
+        let identity_dir = std::env::var("SHARDX_IDENTITY_DIR").ok();
 
         Arc::new(Config {
             bind,

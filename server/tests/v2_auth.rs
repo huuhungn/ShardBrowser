@@ -9600,9 +9600,8 @@ async fn the_startup_pass_quarantines_device_revocations_that_left_their_contain
             "{replay:#x}"
         );
     }
-    // Hiding a revocation is unsafe, so v2 is off while one is quarantined:
-    // no evidence page, no retry, whatever the row says, even once it is put
-    // back (a quarantine is never lifted by the row).
+    // Hiding a revocation is unsafe, so v2 is off while one is not served
+    // correctly: no evidence page, no retry.
     let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
     let calls = [
         (evidence_path, None),
@@ -9626,6 +9625,17 @@ async fn the_startup_pass_quarantines_device_revocations_that_left_their_contain
             .await,
         2
     );
+    // The first row verifies again, but the borrowed one still does not.
+    assert_all_untrusted(&server, &access, &calls).await;
+    // A mark whose row is gone is not served either: only the row itself,
+    // put back, clears it.
+    server
+        .sql(
+            "DELETE FROM v2_device_revocations WHERE replay_id = ?",
+            &[&[0xe8; 16]],
+        )
+        .await;
+    server.restart().await;
     assert_all_untrusted(&server, &access, &calls).await;
 }
 
@@ -9736,20 +9746,99 @@ async fn a_revocation_quarantined_at_runtime_refuses_the_trust_evidence() {
         (status, code_of(&body).as_str()),
         (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
     );
-    // Putting the row back lifts nothing: a quarantined revocation is no
-    // revocation, so its retry is not answered as the filing, and the
-    // evidence stays refused.
+    // While the row stays wrong, the retry is refused again and so is the
+    // evidence.
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    // Put back, the revocation is served again without a restart: the retry
+    // is answered as the filing, the page lists it, and the mark stays.
     sqlx::query("UPDATE v2_device_revocations SET reason_code = 'compromised'")
         .execute(&pool)
         .await
         .unwrap();
-    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let (_, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(reported);
     assert_eq!(
-        (status, code_of(&body).as_str()),
-        (422, "MUTATION_RESPONSE_MISMATCH")
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        1
     );
-    let (status, _) = server.call(&evidence_path, &access, None).await;
-    assert_eq!(status, 423);
+    pool.close().await;
+}
+
+/// N1: one quarantined revocation does not disable v2 for good. v2 is off only
+/// while a revocation is not served correctly right now; restoring the row and
+/// restarting brings it back, serving the revocation, and the mark stays as
+/// history. A mark whose row is missing keeps v2 off until the row is back.
+#[tokio::test]
+async fn a_quarantined_revocation_that_verifies_again_is_served_again_after_a_restart() {
+    let mut server = start("n1-revocation-served-again", 28393).await;
+    let (dev, access, _) = custodian(&mut server, 0x76).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let request = revoke_request(0xa6, &container);
+    let path = device_revoke_path(&subject.id);
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let evidence_path = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let marks = "SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'";
+    let calls = [
+        (evidence_path.clone(), None),
+        (GRANTS.to_string(), Some(duty.clone())),
+    ];
+
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    let cols = column_names(&pool, "v2_device_revocations").await;
+    let whole = row_literals(&pool, "v2_device_revocations", &cols, 0x90).await;
+
+    // Tampered, then marked by the startup pass: v2 is off.
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'lost'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(server.count(marks).await, 1);
+    assert_all_untrusted(&server, &access, &calls).await;
+
+    // Still wrong on the next start: still off, and still one mark.
+    server.restart().await;
+    assert_eq!(server.count(marks).await, 1);
+    assert_all_untrusted(&server, &access, &calls).await;
+
+    // Missing after the mark: off too.
+    sqlx::query("DELETE FROM v2_device_revocations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_all_untrusted(&server, &access, &calls).await;
+
+    // The row restored as it was: v2 is back on the next start, the
+    // revocation is served, and the mark stays as history.
+    let values: Vec<&str> = whole.iter().map(String::as_str).collect();
+    sqlx::query(&format!(
+        "INSERT INTO v2_device_revocations ({}) VALUES ({})",
+        cols.join(", "),
+        values.join(", ")
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    server.restart().await;
+    assert_eq!(server.count(marks).await, 1);
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
     pool.close().await;
 }
 
