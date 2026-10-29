@@ -27,7 +27,7 @@ use super::v2_approval::{cbor, coded};
 use super::v2_auth::{reload_session, unhex, verified, Principal};
 use super::v2_device_revoke::load_revocation;
 use crate::error::AppError;
-use crate::identity::Verified;
+use crate::identity::{ReasonCode, Verified};
 use crate::state::AppState;
 use crate::util::now_ms;
 use shared::canonical::sha256;
@@ -150,7 +150,7 @@ fn revoked_at_ms(revoked_at: &str) -> u64 {
 
 /// The rows of `kind` after `after`, at most `limit`, without their
 /// containers: a page loads only the containers it serves. Quarantined rows
-/// are left out.
+/// are left out, except that a quarantined revocation refuses the page.
 async fn rows(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -161,6 +161,23 @@ async fn rows(
     limit: i64,
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, AppError> {
     let (table, quarantine_kind, scoped) = KINDS[usize::from(kind)];
+    // A page that left a revocation out would let a revoked device pass as
+    // live, so one that cannot be trusted refuses the page, as the startup
+    // pass does. Rows of other instances count: moving one hides it.
+    if table == REVOCATIONS {
+        let untrusted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM v2_grant_quarantine WHERE kind = 'device_revocation')
+                 OR EXISTS (SELECT 1 FROM v2_device_revocations WHERE server_instance_id <> ?)",
+        )
+        .bind(v.server_instance_id.as_slice())
+        .fetch_one(&mut *conn)
+        .await?;
+        if untrusted {
+            return Err(AppError::EpochAuthority(
+                ReasonCode::ControlPlaneIntegrityUntrusted,
+            ));
+        }
+    }
     let quarantined = quarantine_kind.map_or(String::new(), |k| {
         format!(
             " AND NOT EXISTS (SELECT 1 FROM v2_grant_quarantine q

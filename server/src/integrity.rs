@@ -71,18 +71,32 @@ pub struct Report {
     pub guards_created: usize,
     pub guards_to_recovery: usize,
     pub quarantined_grants: usize,
+    /// Device revocations that cannot be trusted: rows of another server
+    /// instance and quarantined ones. A revocation left out of the checks
+    /// would let a revoked device pass as live, so any of them turns v2 off.
+    pub untrusted_revocations: usize,
     pub foreign_key_violations: usize,
 }
 
 impl Report {
     /// The refusal that turns v2 writes off, if the pass found one.
     pub fn refusal(&self) -> Option<Refusal> {
-        (self.foreign_key_violations > 0).then(|| Refusal {
-            code: ReasonCode::ControlPlaneIntegrityUntrusted,
-            detail: format!(
+        let detail = if self.untrusted_revocations > 0 {
+            format!(
+                "{} device revocation(s) are quarantined or of another server instance",
+                self.untrusted_revocations
+            )
+        } else if self.foreign_key_violations > 0 {
+            format!(
                 "{} foreign-key violation(s) in the control plane",
                 self.foreign_key_violations
-            ),
+            )
+        } else {
+            return None;
+        };
+        Some(Refusal {
+            code: ReasonCode::ControlPlaneIntegrityUntrusted,
+            detail,
         })
     }
 }
@@ -94,7 +108,8 @@ pub async fn run(pool: &SqlitePool, identity: &Verified) -> Result<Report> {
     };
     report.guards_created = create_missing_guards(pool, &identity.server_instance_id).await?;
     report.guards_to_recovery = reconcile_guards(pool).await?;
-    report.quarantined_grants = quarantine_bad_grants(pool, identity).await?;
+    (report.quarantined_grants, report.untrusted_revocations) =
+        quarantine_bad_grants(pool, identity).await?;
     report.foreign_key_violations = sqlx::query("SELECT 1 FROM pragma_foreign_key_check")
         .fetch_all(pool)
         .await?
@@ -202,8 +217,9 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
 /// Quarantines every root, capability and fleet key grant and every device
 /// approval and revocation of this instance whose row disagrees with its
 /// signed container, through the same checks every request path uses. Returns
-/// how many it newly quarantined.
-async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
+/// how many it newly quarantined, and how many device revocations cannot be
+/// trusted (those of another instance, and every quarantined one).
+async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<(usize, usize)> {
     let instance = v.server_instance_id;
     let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
         row.get::<Vec<u8>, _>(col)
@@ -302,13 +318,18 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
             Err(e) => anyhow::bail!("checking a device approval failed: {e:?}"),
         }
     }
-    let revocations = sqlx::query(
-        "SELECT tenant_id, replay_id FROM v2_device_revocations WHERE server_instance_id = ?",
-    )
-    .bind(instance.as_slice())
-    .fetch_all(pool)
-    .await?;
+    // Every row, whatever its instance: a revocation moved to another
+    // instance would otherwise drop out of every check.
+    let revocations =
+        sqlx::query("SELECT tenant_id, replay_id, server_instance_id FROM v2_device_revocations")
+            .fetch_all(pool)
+            .await?;
+    let mut untrusted = 0;
     for row in revocations {
+        if id(&row, "server_instance_id")? != instance {
+            untrusted += 1;
+            continue;
+        }
         let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
         let mut conn = pool.acquire().await?;
         let checked =
@@ -322,7 +343,15 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
             Err(e) => anyhow::bail!("checking a device revocation failed: {e:?}"),
         }
     }
-    Ok(quarantined)
+    // Quarantined once, untrusted for good: also a mark whose row is gone.
+    untrusted += usize::try_from(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'",
+        )
+        .fetch_one(pool)
+        .await?,
+    )?;
+    Ok((quarantined, untrusted))
 }
 
 /// Gives every tenant of this instance a guard. A missing guard is not proof
