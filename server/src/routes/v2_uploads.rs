@@ -55,8 +55,8 @@ use super::v2_profiles::{
     active_key, conflict, finish, head, held_lease, id_path, may, no_active_key, not_found,
     published, replay, response_mismatch, session_of,
 };
-use super::v2_root::{ledger_row, mismatch, record_error, stored_response};
-use super::v2_root_grants::outer_request;
+use super::v2_root::{ledger_row, mismatch, record_error, stale, stored_response};
+use super::v2_root_grants::outer_request_any_epoch;
 use crate::error::AppError;
 use crate::fleet;
 use crate::identity::Verified;
@@ -314,7 +314,7 @@ pub async fn create_upload(
     let v = verified(&app)?;
     let presented = session_of(who)?;
     let profile = id_path(&profile)?;
-    let outer = outer_request(v, &headers, &body, OperationKind::CreateUpload)?;
+    let outer = outer_request_any_epoch(v, &headers, &body, OperationKind::CreateUpload)?;
     let req = CreateUploadV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
     let p = req.profile;
     if p.profile_id != profile {
@@ -342,6 +342,9 @@ pub async fn create_upload(
             .ok_or_else(not_found)?;
         tx.commit().await?;
         return Ok(cbor(StatusCode::CREATED, response));
+    }
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
     }
 
     if !may(
@@ -879,7 +882,7 @@ pub async fn finalize_upload(
     let v = verified(&app)?;
     let presented = session_of(who)?;
     let upload_id = id_path(&upload)?;
-    let outer = outer_request(v, &headers, &body, OperationKind::FinalizeUpload)?;
+    let outer = outer_request_any_epoch(v, &headers, &body, OperationKind::FinalizeUpload)?;
     let req = FinalizeUploadV2::parse(&outer.canonical_payload_bytes).map_err(snapshot_error)?;
     if req.commit().upload_id() != &upload_id {
         return Err(column_mismatch(
@@ -911,6 +914,9 @@ pub async fn finalize_upload(
         }
         tx.commit().await?;
         return Ok(cbor(StatusCode::OK, response));
+    }
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
     }
 
     let u = load(&mut tx, v, &s.tenant_id, &upload_id)
@@ -1122,7 +1128,8 @@ pub async fn commit_upload(
         .await?
         .ok_or(AppError::Unauthorized)?;
     let stored = sqlx::query(
-        "SELECT canonical_request_hash, exact_response_bytes FROM v2_idempotency
+        "SELECT canonical_request_hash, exact_response_bytes, superseded_by_restore_epoch
+           FROM v2_idempotency
           WHERE server_instance_id = ? AND tenant_id = ? AND actor_device_id = ?
             AND operation_scope = ? AND idempotency_key = ?",
     )
@@ -1138,6 +1145,10 @@ pub async fn commit_upload(
         // request has one encoding.
         if blob::<32>(&row, "canonical_request_hash")? != *req.canonical_request_hash() {
             return Err(mismatch());
+        }
+        // ADR 0002 D-1 (L381): a superseded commit names its epoch.
+        if let Some(epoch) = row.get::<Option<i64>, _>("superseded_by_restore_epoch") {
+            return Err(AppError::Superseded(stored_uint(epoch)?));
         }
         let receipt: Vec<u8> = row.get("exact_response_bytes");
         let bound = CommitReceiptBindingV2::parse(&receipt).map_err(snapshot_error)?;

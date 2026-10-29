@@ -474,7 +474,7 @@ async fn a_stored_idempotent_response_of_any_kind_never_changes() {
             "INSERT INTO v2_idempotency VALUES ({I}, {T2}, {D2}, '{scope}', \
              x'0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d', 'ROOT_GENERATION_CREATE', randomblob(32), \
              x'bb', randomblob(32), '{status}', {record_type}, {response}, 9, NULL, NULL, \
-             NULL, NULL)"
+             NULL, NULL, NULL)"
         )
     };
     let scope = "tenant.root-generation-create.v2";

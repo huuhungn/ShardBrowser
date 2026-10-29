@@ -26,15 +26,23 @@ use shardx_team_server::restore_manifest::{
     self as rm, IndexEntry, PreparationManifestV2, State, TransitionSetIndexV2, MANIFEST_FILE,
 };
 use shared::canonical as c;
+use shared::mutation::IdempotentStoredResponseV2;
+use shared::profile_lease::{
+    LeaseOrigin, ProfileLeaseV2, UploadCreatedV2, UploadFinalizedV2, RECORD_TYPE_UPLOAD_CREATED,
+    RECORD_TYPE_UPLOAD_FINALIZED,
+};
 use shared::restore_epoch::{
     mapping_root, verify_inclusion, RestoreEpochInclusionProofV2, RestoreEpochLeafV2,
     SignedRestoreEpochTransitionV2,
 };
+use shared::snapshot_v2::{CommitReceiptBindingV2, CommitRequestV2};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
 
 use crate::config::Config;
-use crate::identity::{self, hex, Mirror, RECORD_FILE};
+use crate::identity::{self, hex, Mirror, Verified, RECORD_FILE};
+use crate::routes::v2_auth::Session;
+use crate::routes::v2_root_grants::is_active_custodian;
 use crate::util;
 
 /// Where each table of the candidate comes from (D-1 restore-scope table).
@@ -99,9 +107,9 @@ const SCOPE: &[(&str, Source)] = &[
     // Children before parents: these are deleted in this order.
     ("v2_profile_leases", Source::Cleared),
     ("v2_upload_chunks", Source::Cleared),
-    ("v2_device_session_challenges", Source::Cleared),
     ("v2_spent_refresh_tokens", Source::Cleared),
     ("v2_sessions", Source::Cleared),
+    ("v2_device_session_challenges", Source::Cleared),
     ("v2_enrollment_challenges", Source::Cleared),
     ("v2_pre_device_sessions", Source::Cleared),
 ];
@@ -139,10 +147,11 @@ impl Class {
         }
     }
 
-    /// A restore is in progress: the server opens the DB read-only, so no
-    /// write of any kind changes it before `restore commit` or `abort`.
+    /// A restore is in progress, or K2's security incident (C-3, ADR 0002
+    /// L520): the server opens the DB read-only, so no write of any kind
+    /// changes it before `restore commit` or `abort`.
     pub fn read_only(self) -> bool {
-        !matches!(self, Self::K1 | Self::K2 | Self::K3 | Self::K4)
+        !matches!(self, Self::K1 | Self::K3 | Self::K4)
     }
 }
 
@@ -201,6 +210,10 @@ pub fn classify(o: &Observed) -> Class {
     let m_is_x = row.is_some_and(|m| mirror_is(m, &x.server_instance_id, x.restore_epoch, xsha));
     let p = match &o.p {
         Prep::Absent if m_is_x => return Class::K3,
+        // K4 is every other no-manifest record: how to recover (operator
+        // only). `identity show` keeps ADR 0001's finer reason code, such as
+        // EPOCH_AUTHORITY_BEHIND_DB for the same epoch with other bytes,
+        // which says why v2 is off.
         Prep::Absent => return Class::K4,
         Prep::Unparsable => {
             return match (m_is_x, o.dx, o.c) {
@@ -301,6 +314,12 @@ const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
 /// Present unless the entry is certainly absent: an unreadable entry is never
 /// taken for a missing one.
+fn sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
 fn exists(path: &Path) -> bool {
     !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -404,11 +423,17 @@ fn is_candidate(name: &str) -> bool {
     name.starts_with("restore-candidate-")
 }
 
-/// Everything K3 lists as a stray: never evidence, removed by `--orphans`.
+fn is_archive(name: &str) -> bool {
+    name.starts_with("pre-restore-")
+}
+
+/// Everything K3 lists as a stray: never evidence, removed by `--orphans`
+/// except the `pre-restore-*` archives, the only copy of a pre-restore live
+/// DB, which only `--delete-archives` removes.
 fn orphans(site: &Site) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = names_in(&site.data)
         .into_iter()
-        .filter(|n| is_candidate(n) || n.starts_with("pre-restore-"))
+        .filter(|n| is_candidate(n) || is_archive(n))
         .map(|n| site.data.join(n))
         .collect();
     out.extend(
@@ -460,6 +485,22 @@ async fn observe(cfg: &Config) -> (Option<Site>, Observed) {
 /// The class the server starts in.
 pub async fn startup_class(cfg: &Config) -> Class {
     classify(&observe(cfg).await.1)
+}
+
+/// [`startup_class`], refusing a K1 or K4 start that would create an empty
+/// DB at the DB path while files of a restore are left (round-4 B7).
+pub async fn startup_gate(cfg: &Config) -> anyhow::Result<Class> {
+    let (site, o) = observe(cfg).await;
+    let class = classify(&o);
+    if let (Class::K1 | Class::K4, Mirrored::Absent, Some(site)) = (class, &o.m, &site) {
+        ensure!(
+            matches!(o.p, Prep::Absent) && orphans(site).is_empty(),
+            "refusing to start: no database is at the DB path and files of a restore are \
+             left ({class:?}, plan {}); run `restore status`",
+            class.row()
+        );
+    }
+    Ok(class)
 }
 
 /// `restore status`: read-only; prints the class and the plan row.
@@ -724,10 +765,12 @@ fn proof_sha(exact: &[u8]) -> [u8; 32] {
 }
 
 /// The staged `E -> E+1` transitions must be exactly one per covered tenant,
-/// each signed by a live unrevoked device of its tenant over exactly the
-/// computed leaves. Custody was checked when the route filed it.
+/// each signed over exactly the computed leaves by a live unrevoked device
+/// that is still an ACTIVE root custodian of its tenant at `E` (ADR 0002
+/// L561), by the route's own predicate.
 async fn staged(
     conn: &mut SqliteConnection,
+    v: &Verified,
     x: &IdentityRecordV2,
     tenants: &BTreeMap<[u8; 16], Vec<RestoreEpochLeafV2>>,
 ) -> anyhow::Result<Vec<Staged>> {
@@ -759,8 +802,8 @@ async fn staged(
         let exact: Vec<u8> = r.get(1);
         let device: Vec<u8> = r.get(2);
         let key: Vec<u8> = r.get(3);
-        let public: Vec<u8> = sqlx::query_scalar(
-            "SELECT d.signing_public_key FROM v2_devices d
+        let signer = sqlx::query(
+            "SELECT d.signing_public_key, d.account_id, d.hpke_key_id FROM v2_devices d
               WHERE d.tenant_id = ? AND d.id = ? AND d.signing_key_id = ? AND d.status = 'active'
                 AND NOT EXISTS (SELECT 1 FROM v2_device_revocations r
                                  WHERE r.tenant_id = d.tenant_id
@@ -778,7 +821,27 @@ async fn staged(
                 hex(tenant)
             )
         })?;
-        let public: [u8; 32] = public.try_into().map_err(|_| anyhow::anyhow!("bad key"))?;
+        let blob = |i: usize| signer.get::<Vec<u8>, _>(i);
+        let bad = || anyhow::anyhow!("bad key");
+        let public: [u8; 32] = blob(0).try_into().map_err(|_| bad())?;
+        let account: [u8; 16] = blob(1).try_into().map_err(|_| bad())?;
+        let as_device = Session::of_device(
+            *tenant,
+            account,
+            device.clone().try_into().map_err(|_| bad())?,
+            key.clone().try_into().map_err(|_| bad())?,
+            blob(2).try_into().map_err(|_| bad())?,
+        );
+        ensure!(
+            is_active_custodian(conn, v, &as_device, util::now_ms())
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "refusing: custody of tenant {}: {e:?}",
+                    hex(tenant)
+                ))?,
+            "refusing: tenant {}'s transition signer is not an ACTIVE root custodian at E",
+            hex(tenant)
+        );
         let verified = SignedRestoreEpochTransitionV2::parse(&exact)
             .and_then(|t| t.verify_signature(&public))
             .map_err(|e| anyhow::anyhow!("refusing: tenant {}'s transition: {e:?}", hex(tenant)))?;
@@ -844,6 +907,92 @@ async fn count(conn: &mut SqliteConnection, sql: &str) -> anyhow::Result<i64> {
 }
 
 /// Step 2a.3: the restore-scope merge, in one transaction on the live copy.
+/// D-1, replays after a restore (ADR 0002 L377-L389): the merge keeps every
+/// ledger row and marks those whose result it rolled back with `next`. Each
+/// kind uses the predicate its replay route uses; an unreadable result fails
+/// closed.
+async fn supersede(conn: &mut SqliteConnection, next: u64) -> anyhow::Result<()> {
+    let rows = sqlx::query(
+        "SELECT rowid, tenant_id, operation_kind, exact_request_bytes, exact_response_bytes
+           FROM v2_idempotency
+          WHERE status = 'succeeded' AND operation_kind IN
+                ('COMMIT', 'CREATE_UPLOAD', 'FINALIZE_UPLOAD', 'PROFILE_PUBLISH_CREATE')",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for r in rows {
+        let (rowid, tenant, kind): (i64, Vec<u8>, String) = (r.get(0), r.get(1), r.get(2));
+        let request: Vec<u8> = r.get(3);
+        let response: Vec<u8> = r.get::<Option<Vec<u8>>, _>(4).unwrap_or_default();
+        let bad =
+            || anyhow::anyhow!("refusing: the {kind} ledger row {rowid} has no readable result");
+        let payload = |record_type: &str| {
+            IdempotentStoredResponseV2::parse(&response)
+                .ok()
+                .filter(|s| s.response_record_type == record_type)
+                .map(|s| s.canonical_response_payload_bytes)
+                .ok_or_else(bad)
+        };
+        let kept: bool = match kind.as_str() {
+            // The commit's upload fixes its profile.
+            "COMMIT" => {
+                let req = CommitRequestV2::parse(&request).map_err(|_| bad())?;
+                let b = CommitReceiptBindingV2::parse(&response).map_err(|_| bad())?;
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM v2_snapshots WHERE tenant_id = ? AND upload_id = ?
+                                       AND version = ? AND snapshot_id = ?)",
+                )
+                .bind(&tenant)
+                .bind(req.upload_id().as_slice())
+                .bind(i64::try_from(b.resulting_version)?)
+                .bind(b.snapshot_id.as_slice())
+                .fetch_one(&mut *conn)
+                .await?
+            }
+            "PROFILE_PUBLISH_CREATE" => {
+                let origin = LeaseOrigin::PublishCreate;
+                let l = ProfileLeaseV2::parse(origin, &payload(origin.record_type())?)
+                    .map_err(|_| bad())?;
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM v2_profiles WHERE tenant_id = ? AND id = ?)",
+                )
+                .bind(&tenant)
+                .bind(l.profile.profile_id.as_slice())
+                .fetch_one(&mut *conn)
+                .await?
+            }
+            _ => {
+                let upload = if kind == "CREATE_UPLOAD" {
+                    UploadCreatedV2::parse(&payload(RECORD_TYPE_UPLOAD_CREATED)?)
+                        .map_err(|_| bad())?
+                        .upload_id
+                } else {
+                    UploadFinalizedV2::parse(&payload(RECORD_TYPE_UPLOAD_FINALIZED)?)
+                        .map_err(|_| bad())?
+                        .upload_id
+                };
+                sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM v2_uploads WHERE tenant_id = ? AND upload_id = ?)",
+                )
+                .bind(&tenant)
+                .bind(upload.as_slice())
+                .fetch_one(&mut *conn)
+                .await?
+            }
+        };
+        if !kept {
+            sqlx::query(
+                "UPDATE v2_idempotency SET superseded_by_restore_epoch = ? WHERE rowid = ?",
+            )
+            .bind(i64::try_from(next)?)
+            .bind(rowid)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn merge(conn: &mut SqliteConnection, x: &IdentityRecordV2) -> anyhow::Result<()> {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -896,6 +1045,7 @@ async fn merge(conn: &mut SqliteConnection, x: &IdentityRecordV2) -> anyhow::Res
                 .with_context(|| format!("clearing {table}"))?;
         }
     }
+    supersede(&mut tx, x.restore_epoch + 1).await?;
     tx.commit().await?;
 
     let instance = hex(&x.server_instance_id);
@@ -924,27 +1074,6 @@ async fn merge(conn: &mut SqliteConnection, x: &IdentityRecordV2) -> anyhow::Res
                                    WHERE r.tenant_id = d.tenant_id
                                      AND (r.subject_device_id = d.id
                                           OR r.subject_signing_key_id = d.signing_key_id)))"
-                .into(),
-        ),
-        // shortcut: D-1 marks these rows superseded_by_restore_epoch and
-        // answers their replays with an error; until that column and its
-        // replay paths exist, a restore that would roll back a ledgered
-        // result is refused instead.
-        (
-            "a ledgered upload or commit result the restore would roll back",
-            "SELECT count(*) FROM v2_idempotency i
-              WHERE (i.operation_kind = 'CREATE_UPLOAD' AND NOT EXISTS (
-                       SELECT 1 FROM v2_uploads u WHERE u.server_instance_id = i.server_instance_id
-                          AND u.tenant_id = i.tenant_id AND u.operation_scope = i.operation_scope
-                          AND u.idempotency_key = i.idempotency_key))
-                 OR (i.operation_kind = 'FINALIZE_UPLOAD' AND NOT EXISTS (
-                       SELECT 1 FROM v2_uploads u WHERE u.server_instance_id = i.server_instance_id
-                          AND u.tenant_id = i.tenant_id
-                          AND u.exact_finalize_request_bytes = i.exact_request_bytes))
-                 OR (i.operation_kind = 'COMMIT' AND NOT EXISTS (
-                       SELECT 1 FROM v2_uploads u WHERE u.server_instance_id = i.server_instance_id
-                          AND u.tenant_id = i.tenant_id
-                          AND u.exact_commit_request_bytes = i.exact_request_bytes))"
                 .into(),
         ),
     ] {
@@ -1002,7 +1131,12 @@ pub async fn prepare(cfg: &Config, backup: &Path, txn: [u8; 16]) -> anyhow::Resu
         let live_heads = heads(&mut conn, "main", &x.server_instance_id).await?;
         let backup_heads = heads(&mut conn, "bk", &x.server_instance_id).await?;
         let tenants = coverage(&live_heads, &backup_heads)?;
-        let staged = staged(&mut conn, &x, &tenants).await?;
+        let v = Verified {
+            server_instance_id: x.server_instance_id,
+            restore_epoch: x.restore_epoch,
+            external_record_sha256: xsha,
+        };
+        let staged = staged(&mut conn, &v, &x, &tenants).await?;
         merge(&mut conn, &x).await?;
         sqlx::query("DETACH DATABASE bk").execute(&mut conn).await?;
         anyhow::Ok(staged)
@@ -1010,27 +1144,33 @@ pub async fn prepare(cfg: &Config, backup: &Path, txn: [u8; 16]) -> anyhow::Resu
     .await;
     // Closed before any removal: Windows cannot delete an open file.
     let closed = conn.close().await;
-    let built = built.and_then(|s| closed.map(|()| s).map_err(Into::into));
-    let staged = match built {
+    let checked = built
+        .and_then(|s| closed.map(|()| s).map_err(Into::into))
+        .and_then(|s| {
+            ensure!(
+                sha256_file(backup)? == backup_sha,
+                "refusing: the backup changed while it was read"
+            );
+            for suffix in SIDECARS {
+                ensure!(
+                    !exists(&sidecar(&tmp, suffix)),
+                    "refusing: the candidate has a {suffix} sidecar"
+                );
+            }
+            sync_file(&tmp)?;
+            Ok(s)
+        });
+    // A refused prepare leaves nothing of its own for `--orphans` to clean.
+    let staged = match checked {
         Ok(s) => s,
         Err(e) => {
+            for suffix in SIDECARS {
+                let _ = std::fs::remove_file(sidecar(&tmp, suffix));
+            }
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
     };
-    ensure!(
-        sha256_file(backup)? == backup_sha,
-        "refusing: the backup changed while it was read"
-    );
-    for suffix in SIDECARS {
-        let mut s = tmp.clone().into_os_string();
-        s.push(suffix);
-        ensure!(
-            !exists(Path::new(&s)),
-            "refusing: the candidate has a {suffix} sidecar"
-        );
-    }
-    sync_file(&tmp)?;
     crash("prepare.2a.tmp");
     std::fs::rename(&tmp, &candidate)?;
     identity::sync_dir(&site.data)?;
@@ -1474,8 +1614,68 @@ pub async fn commit(cfg: &Config, retire_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `restore abort [--orphans]`: only while the authority is still `E`.
-pub async fn abort(cfg: &Config, orphans_only: bool) -> anyhow::Result<()> {
+/// `restore withdraw-transitions --tenant <id>` (offline, audited): removes
+/// the tenant's staged `E -> E+1` transition and its proofs, so a filing no
+/// restore can use (other leaves, or a tenant that needs none) never blocks
+/// every restore at `E`. Only in K3: a prepared restore has bound its set.
+pub async fn withdraw_transitions(cfg: &Config, tenant: [u8; 16]) -> anyhow::Result<()> {
+    let (site, o) = observe(cfg).await;
+    let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
+    let class = classify(&o);
+    ensure!(
+        class == Class::K3,
+        "refusing: withdraw-transitions is only for K3, not {class:?} ({})",
+        class.row()
+    );
+    let (x, _) = o.x.context("no identity record")?;
+    let epoch = i64::try_from(x.restore_epoch)?;
+    let mut conn = connect(&site.db, false).await?;
+    let mut tx = conn.begin().await?;
+    let mut removed = [0u64; 2];
+    for (n, table) in [
+        "v2_restore_epoch_transition_proofs",
+        "v2_restore_epoch_transitions",
+    ]
+    .iter()
+    .enumerate()
+    {
+        removed[n] = sqlx::query(&format!(
+            "DELETE FROM {table} WHERE server_instance_id = ? AND tenant_id = ?
+               AND previous_epoch = ? AND new_epoch = previous_epoch + 1"
+        ))
+        .bind(x.server_instance_id.as_slice())
+        .bind(tenant.as_slice())
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+    ensure!(
+        removed[1] == 1,
+        "refusing: tenant {} has no staged transition at E",
+        hex(&tenant)
+    );
+    sqlx::query(
+        "INSERT INTO audit_log (actor, action, env_id, detail, at) VALUES (NULL, ?, NULL, ?, ?)",
+    )
+    .bind("server.restore_withdraw_transitions")
+    .bind(format!(
+        "tenant_id={} previous_epoch={epoch} proofs={} reason_code=offline_operator_cli",
+        hex(&tenant),
+        removed[0]
+    ))
+    .bind(util::now_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    conn.close().await?;
+    println!("withdrawn={}", hex(&tenant));
+    Ok(())
+}
+
+/// `restore abort [--orphans [--delete-archives]]`: only while the authority
+/// is still `E`.
+pub async fn abort(cfg: &Config, orphans_only: bool, delete_archives: bool) -> anyhow::Result<()> {
     let (site, o) = observe(cfg).await;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let class = classify(&o);
@@ -1485,6 +1685,15 @@ pub async fn abort(cfg: &Config, orphans_only: bool) -> anyhow::Result<()> {
             "refusing: --orphans is only for K3, not {class:?}"
         );
         for path in orphans(&site) {
+            let archive = path.parent() == Some(site.data.as_path())
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_archive);
+            if archive && !delete_archives {
+                println!("kept={}", path.display());
+                continue;
+            }
             if path.is_dir() {
                 std::fs::remove_dir_all(&path)?;
             } else {
@@ -1731,9 +1940,10 @@ mod tests {
         for (i, (o, want)) in cases.iter().enumerate() {
             assert_eq!(classify(o), *want, "case {i}");
         }
-        assert!(!Class::K3.read_only() && !Class::K1.read_only() && !Class::K2.read_only());
+        assert!(!Class::K3.read_only() && !Class::K1.read_only());
         assert!(!Class::K4.read_only());
         for k in [
+            Class::K2,
             Class::K5a,
             Class::K5b,
             Class::K6,

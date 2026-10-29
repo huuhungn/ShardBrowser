@@ -52,7 +52,7 @@ fn approve_row(kind: &str, scope: &str, r3: &str) -> String {
     format!(
         "INSERT INTO v2_idempotency VALUES ({I}, {T}, {D}, '{scope}', {R}, '{kind}', \
          randomblob(32), x'bb', randomblob(32), 'succeeded', 'DeviceApprovalReceiptV2', x'cc', \
-         randomblob(32), 9, {r3})"
+         randomblob(32), 9, {r3}, NULL)"
     )
 }
 

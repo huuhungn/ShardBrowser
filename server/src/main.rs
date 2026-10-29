@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     // progress the DB is opened read-only, so nothing (no migration, admin
     // bootstrap, blob GC, v1 or v2 write) changes it until `restore commit`
     // or `restore abort`; the server never resumes a restore itself.
-    let class = restore::startup_class(&cfg).await;
+    let class = restore::startup_gate(&cfg).await?;
     let (pool, mut authority) = if class.read_only() {
         let pool = identity::open_read_only(&cfg).await?.with_context(|| {
             format!("a restore is in progress ({class:?}) and no database is at the DB path")
@@ -87,7 +87,15 @@ async fn main() -> anyhow::Result<()> {
                 class.row()
             ),
         };
-        (pool, Err(refusal))
+        // K2 keeps the incident's own reason code (L2264, C-3).
+        let authority = match class {
+            restore::Class::K2 => {
+                let mirror = identity::read_mirror(&pool).await?;
+                identity::authority(&cfg, mirror.as_ref()).and(Err(refusal))
+            }
+            _ => Err(refusal),
+        };
+        (pool, authority)
     } else {
         let pool = db::init_pool(&cfg).await?;
         db::bootstrap_admin(&pool, &cfg).await?;

@@ -255,6 +255,21 @@ pub(super) fn outer_request(
     body: &[u8],
     kind: OperationKind,
 ) -> Result<IdempotentMutationRequestV2, AppError> {
+    let outer = outer_request_any_epoch(v, headers, body, kind)?;
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
+    }
+    Ok(outer)
+}
+
+/// [`outer_request`] without its epoch check, for a route whose ledger
+/// answers a replay across a restore first (ADR 0002 D-1, L377-L389).
+pub(super) fn outer_request_any_epoch(
+    v: &Verified,
+    headers: &HeaderMap,
+    body: &[u8],
+    kind: OperationKind,
+) -> Result<IdempotentMutationRequestV2, AppError> {
     exact_cbor_body(headers, body, MAX_ROOT_REQUEST_BODY)?;
     let outer = IdempotentMutationRequestV2::parse(body).map_err(record_error)?;
     if outer.operation_kind != kind {
@@ -262,9 +277,6 @@ pub(super) fn outer_request(
     }
     if outer.server_instance_id != v.server_instance_id {
         return Err(AppError::Forbidden);
-    }
-    if outer.restore_epoch != v.restore_epoch {
-        return Err(stale());
     }
     Ok(outer)
 }
@@ -718,7 +730,7 @@ async fn confers_custody(
     .await?)
 }
 
-pub(super) async fn is_active_custodian(
+pub(crate) async fn is_active_custodian(
     conn: &mut SqliteConnection,
     v: &Verified,
     s: &Session,

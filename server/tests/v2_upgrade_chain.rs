@@ -169,6 +169,29 @@ fn upload(upload: &str, snapshot: u8, generation: u8) -> String {
     )
 }
 
+/// A ledger row of `kind` in `status`; a succeeded one with its response.
+fn ledger(kind: &str, status: &str) -> String {
+    let response = if status == "succeeded" {
+        "'CreateUploadResponseV2', x'01', zeroblob(32)"
+    } else {
+        "NULL, NULL, NULL"
+    };
+    format!(
+        "INSERT INTO v2_idempotency (server_instance_id, tenant_id, actor_device_id,
+           operation_scope, idempotency_key, operation_kind, canonical_request_hash,
+           exact_request_bytes, exact_request_bytes_sha256, status, response_record_type,
+           exact_response_bytes, exact_response_bytes_sha256, retained_until)
+         VALUES ({I}, {T}, {D2}, '{scope}', x'{key}', '{kind}', zeroblob(32), x'aa',
+           zeroblob(32), '{status}', {response}, 0)",
+        scope = if kind == "CREATE_UPLOAD" {
+            "profile.create-upload.v2"
+        } else {
+            "profile.local-unbind.v2"
+        },
+        key = format!("{:02x}", kind.len()).repeat(16),
+    )
+}
+
 /// The root self-grant's quarantine, recorded as `kind`.
 fn quarantined(kind: &str) -> String {
     format!(
@@ -288,6 +311,14 @@ fn guard(version: i64) -> (String, String, &'static str) {
             none,
             "UPDATE v2_profiles SET last_fencing_token = 1.5".into(),
             "an integer column holds only integers",
+        ),
+        // Only a commit, upload or publish row is ever superseded.
+        31 => (
+            ledger("LOCAL_UNBIND", "in_flight"),
+            "UPDATE v2_idempotency SET superseded_by_restore_epoch = 1
+              WHERE operation_kind = 'LOCAL_UNBIND'"
+                .into(),
+            "a ledger row is superseded once, by the next restore epoch",
         ),
         _ => unreachable!("no guard for {version}"),
     }
@@ -451,6 +482,53 @@ async fn m0030_upgraded_integer_columns_refuse_values_that_are_no_integers() {
     exec(&pool, "UPDATE v2_profiles SET last_fencing_token = '4'")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn m0031_upgraded_ledger_rows_are_superseded_once_and_only_by_the_next_epoch() {
+    let pool = upgrade(31).await;
+    assert_eq!(
+        rows(
+            &pool,
+            "v2_idempotency",
+            &["superseded_by_restore_epoch".into()]
+        )
+        .await,
+        ["NULL", "NULL"],
+        "the upgraded rows are not superseded"
+    );
+    exec(&pool, &ledger("CREATE_UPLOAD", "succeeded"))
+        .await
+        .unwrap();
+    let mark = |epoch: u8| {
+        format!(
+            "UPDATE v2_idempotency SET superseded_by_restore_epoch = {epoch}
+              WHERE operation_kind = 'CREATE_UPLOAD'"
+        )
+    };
+    let once = "a ledger row is superseded once, by the next restore epoch";
+    // The server is at epoch 0: only 1 is the next epoch.
+    assert!(exec(&pool, &mark(2)).await.unwrap_err().contains(once));
+    exec(&pool, &mark(1)).await.unwrap();
+    assert!(exec(&pool, &mark(1)).await.unwrap_err().contains(once));
+    let e = exec(
+        &pool,
+        "UPDATE v2_idempotency SET retained_until = 1 WHERE operation_kind = 'CREATE_UPLOAD'",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        e.contains("a stored idempotent response never changes"),
+        "{e}"
+    );
+    let e = exec(
+        &pool,
+        "UPDATE v2_idempotency SET superseded_by_restore_epoch = 1, retained_until = 1
+          WHERE operation_kind = 'CREATE_UPLOAD'",
+    )
+    .await
+    .unwrap_err();
+    assert!(e.contains("never changes") || e.contains(once), "{e}");
 }
 
 // ------------------------------------------------- the v0.1.28 database ---

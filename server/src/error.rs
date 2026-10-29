@@ -26,6 +26,9 @@ pub enum AppError {
     /// `AUTH_CLAIM_COLUMN_MISMATCH`, and quarantined once the request's own
     /// transaction has rolled back (plan 5.6.4).
     Quarantine(Box<crate::quarantine::Mark>),
+    /// The replay of a commit a restore rolled back (ADR 0002 D-1):
+    /// `BASE_VERSION_MISMATCH` with the allowlisted epoch that superseded it.
+    Superseded(u64),
 }
 
 impl AppError {
@@ -53,6 +56,10 @@ impl AppError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "the stored grant does not match its signed container".into(),
             ),
+            AppError::Superseded(_) => (
+                StatusCode::CONFLICT,
+                "a restore rolled this commit back".into(),
+            ),
         }
     }
 }
@@ -77,6 +84,11 @@ impl IntoResponse for AppError {
             AppError::Quarantine(_) => {
                 json!({ "error": client_msg, "code": "AUTH_CLAIM_COLUMN_MISMATCH" })
             }
+            AppError::Superseded(epoch) => json!({
+                "error": client_msg,
+                "code": "BASE_VERSION_MISMATCH",
+                "superseded_by_restore_epoch": epoch,
+            }),
             _ => json!({ "error": client_msg }),
         };
         let mut resp = (code, Json(body)).into_response();

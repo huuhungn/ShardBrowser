@@ -37,10 +37,10 @@ use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, exact_cb
 use super::v2_auth::{audit, blob, random, reload_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
-    ledger_row, mismatch, record_error, same_request, store_response, stored_payload,
+    ledger_row, mismatch, record_error, same_request, stale, store_response, stored_payload,
     stored_response, MAX_ROOT_REQUEST_BODY,
 };
-use super::v2_root_grants::outer_request;
+use super::v2_root_grants::outer_request_any_epoch;
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::state::AppState;
@@ -540,7 +540,7 @@ pub async fn publish_profile(
     let v = verified(&app)?;
     let presented = session_of(who)?;
     let fleet = id_path(&fleet)?;
-    let outer = outer_request(v, &headers, &body, OperationKind::ProfilePublishCreate)?;
+    let outer = outer_request_any_epoch(v, &headers, &body, OperationKind::ProfilePublishCreate)?;
     let req =
         ProfilePublishCreateV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
     let p = req.profile;
@@ -569,6 +569,9 @@ pub async fn publish_profile(
         }
         tx.commit().await?;
         return Ok(cbor(StatusCode::CREATED, response));
+    }
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
     }
 
     if !may(
@@ -686,7 +689,7 @@ pub async fn checkout_profile(
     let v = verified(&app)?;
     let presented = session_of(who)?;
     let profile = id_path(&profile)?;
-    let outer = outer_request(v, &headers, &body, OperationKind::ProfileCheckout)?;
+    let outer = outer_request_any_epoch(v, &headers, &body, OperationKind::ProfileCheckout)?;
     let req = ProfileCheckoutV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
     let p = req.profile;
     if p.profile_id != profile {
@@ -715,6 +718,9 @@ pub async fn checkout_profile(
         }
         tx.commit().await?;
         return Ok(cbor(StatusCode::CREATED, response));
+    }
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
     }
 
     if !may(
@@ -803,7 +809,7 @@ pub async fn release_lease(
     let v = verified(&app)?;
     let presented = session_of(who)?;
     let (profile, lease_id) = (id_path(&profile)?, id_path(&lease_id)?);
-    let outer = outer_request(v, &headers, &body, OperationKind::ReleaseLease)?;
+    let outer = outer_request_any_epoch(v, &headers, &body, OperationKind::ReleaseLease)?;
     let req = ReleaseLeaseV2::parse(&outer.canonical_payload_bytes).map_err(record_error)?;
     let p = req.profile;
     if p.profile_id != profile || req.lease.lease_id != lease_id {
@@ -830,6 +836,9 @@ pub async fn release_lease(
         }
         tx.commit().await?;
         return Ok(cbor(StatusCode::OK, response));
+    }
+    if outer.restore_epoch != v.restore_epoch {
+        return Err(stale());
     }
 
     // Only the holder releases: giving a lease up needs no capability, and

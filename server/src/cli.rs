@@ -26,8 +26,11 @@ pub const USAGE: &str = "usage:
       build the candidate, its transition artifacts and the manifest
   shardx-team-server restore commit [--retire]
       finish a prepared restore from its current class
-  shardx-team-server restore abort [--orphans]
-      drop a restore whose authority is still the previous epoch
+  shardx-team-server restore abort [--orphans [--delete-archives]]
+      drop a restore whose authority is still the previous epoch; --orphans
+      keeps the pre-restore archives unless --delete-archives is given
+  shardx-team-server restore withdraw-transitions --tenant <id>
+      remove a tenant's staged transition for the next restore epoch
   shardx-team-server tenant create --slug <slug> --owner-username <name> [--password-stdin]
       create a tenant and its owner account; the password is prompted for,
       or read from stdin with --password-stdin, never taken from argv or env
@@ -59,6 +62,10 @@ pub enum Command {
     },
     RestoreAbort {
         orphans: bool,
+        delete_archives: bool,
+    },
+    RestoreWithdrawTransitions {
+        tenant: [u8; 16],
     },
     TenantCreate {
         slug: String,
@@ -98,8 +105,24 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }),
         ["restore", "commit"] => Ok(Command::RestoreCommit { retire: false }),
         ["restore", "commit", "--retire"] => Ok(Command::RestoreCommit { retire: true }),
-        ["restore", "abort"] => Ok(Command::RestoreAbort { orphans: false }),
-        ["restore", "abort", "--orphans"] => Ok(Command::RestoreAbort { orphans: true }),
+        ["restore", "abort"] => Ok(Command::RestoreAbort {
+            orphans: false,
+            delete_archives: false,
+        }),
+        ["restore", "abort", "--orphans"] => Ok(Command::RestoreAbort {
+            orphans: true,
+            delete_archives: false,
+        }),
+        ["restore", "abort", "--orphans", "--delete-archives"] => Ok(Command::RestoreAbort {
+            orphans: true,
+            delete_archives: true,
+        }),
+        ["restore", "withdraw-transitions", "--tenant", tenant] => {
+            Ok(Command::RestoreWithdrawTransitions {
+                tenant: bootstrap::parse_device_id(tenant)
+                    .ok_or("--tenant must be 32 hex digits")?,
+            })
+        }
         ["tenant", "create", rest @ ..] => parse_tenant_create(rest),
         ["tenant", "confirm-first-device", "--tenant", slug, "--device", device] => {
             Ok(Command::ConfirmFirstDevice {
@@ -185,7 +208,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             restore::prepare(&cfg, Path::new(&backup), txn).await
         }
         Command::RestoreCommit { retire } => restore::commit(&cfg, retire).await,
-        Command::RestoreAbort { orphans } => restore::abort(&cfg, orphans).await,
+        Command::RestoreAbort {
+            orphans,
+            delete_archives,
+        } => restore::abort(&cfg, orphans, delete_archives).await,
+        Command::RestoreWithdrawTransitions { tenant } => {
+            restore::withdraw_transitions(&cfg, tenant).await
+        }
         Command::TenantCreate {
             slug,
             owner_username,
@@ -512,7 +541,25 @@ mod tests {
         );
         assert_eq!(
             parse(&args("restore abort --orphans")),
-            Ok(Command::RestoreAbort { orphans: true })
+            Ok(Command::RestoreAbort {
+                orphans: true,
+                delete_archives: false
+            })
+        );
+        assert_eq!(
+            parse(&args("restore abort --orphans --delete-archives")),
+            Ok(Command::RestoreAbort {
+                orphans: true,
+                delete_archives: true
+            })
+        );
+        assert_eq!(
+            parse(&args(
+                "restore withdraw-transitions --tenant 000102030405060708090a0b0c0d0e0f"
+            )),
+            Ok(Command::RestoreWithdrawTransitions {
+                tenant: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            })
         );
         assert_eq!(
             parse(&args("tenant first-device-status --tenant acme")),
