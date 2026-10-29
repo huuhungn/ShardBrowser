@@ -613,11 +613,24 @@ async fn bootstrap_root(port: u16, dev: &Device, access: &str, instance: [u8; 16
     .await;
 }
 
-/// A second device of the owner under a copy of `from`'s tenant approval.
-async fn peer(d: &Dirs, from: &Device, seed: u8) -> Device {
+/// A second device of the owner under a tenant approval `from` signs,
+/// stored the way the approval route stores it.
+async fn peer(d: &Dirs, from: &Device, seed: u8, instance: [u8; 16]) -> Device {
     let to = device(d, seed, "active").await;
+    let approval = DeviceApprovalV2 {
+        common: common([seed; 16], instance),
+        subject_account_id: ACCOUNT,
+        subject_device_id: to.id,
+        subject_signing_key_id: to.signing_key_id,
+        subject_hpke_key_id: to.hpke_key_id,
+        approval_scope_kind: ApprovalScopeKind::Tenant,
+        approval_scope_id: TENANT,
+    };
+    let c = &approval.common;
+    let exact = build_record(&from.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+    let r = AuthorizationRecord::parse(&exact).unwrap();
     let p = pool(d).await;
-    sqlx::query(
+    sqlx::query(&format!(
         "INSERT INTO v2_device_approvals (
            tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
            subject_device_id, subject_signing_key_id, subject_hpke_key_id,
@@ -626,19 +639,25 @@ async fn peer(d: &Dirs, from: &Device, seed: u8) -> Device {
            canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
            signature_bytes, issuer_signing_key_id, signed_container_hash,
            exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
-         SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
-           ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
-           not_before_ms, not_after_ms, server_instance_id, restore_epoch,
-           canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
-           signature_bytes, issuer_signing_key_id, signed_container_hash,
-           exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
-           FROM v2_device_approvals WHERE subject_device_id = ?",
-    )
+         VALUES (?, ?, '{DOMAIN_DEVICE_APPROVAL}', 2, ?, ?, ?, ?, 'tenant', ?, 'team.device',
+                 {}, {}, {}, ?, 0, ?, ?, 1, 1, ?, ?, ?, ?, ?, 't')",
+        c.issued_at_ms, c.not_before_ms, c.not_after_ms
+    ))
+    .bind(TENANT.as_slice())
     .bind([seed; 16].as_slice())
+    .bind(ACCOUNT.as_slice())
     .bind(to.id.as_slice())
     .bind(to.signing_key_id.as_slice())
     .bind(to.hpke_key_id.as_slice())
-    .bind(from.id.as_slice())
+    .bind(TENANT.as_slice())
+    .bind(instance.as_slice())
+    .bind(r.canonical_payload_bytes())
+    .bind(r.payload_sha256().as_slice())
+    .bind(r.signature_bytes())
+    .bind(r.issuer_signing_key_id().as_slice())
+    .bind(r.signed_container_hash().as_slice())
+    .bind(r.exact_signed_container_bytes())
+    .bind(r.exact_signed_container_bytes_sha256().as_slice())
     .execute(&p)
     .await
     .unwrap();
@@ -978,7 +997,7 @@ async fn world(d: &Dirs, port: u16, file: bool) -> World {
     let access = session(port, &dev).await;
     bootstrap_root(port, &dev, &access, instance).await;
     fleet(d, instance).await;
-    let other = peer(d, &dev, SIGNER2).await;
+    let other = peer(d, &dev, SIGNER2, instance).await;
     let other_access = session(port, &other).await;
     may_commit(port, (&dev, &access), &dev, 0xa1, instance).await;
     may_commit(port, (&dev, &access), &other, 0xa4, instance).await;

@@ -5,6 +5,27 @@
 ALTER TABLE v2_idempotency ADD COLUMN superseded_by_restore_epoch INTEGER
     CHECK (superseded_by_restore_epoch BETWEEN 1 AND 9223372036854775807);
 
+-- 0030's integer triggers of this table, with the new column.
+DROP TRIGGER v2_idempotency_integers_on_insert;
+CREATE TRIGGER v2_idempotency_integers_on_insert
+BEFORE INSERT ON v2_idempotency
+WHEN typeof(NEW.retained_until) NOT IN ('integer', 'null')
+   OR typeof(NEW.restore_epoch) NOT IN ('integer', 'null')
+   OR typeof(NEW.superseded_by_restore_epoch) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
+
+DROP TRIGGER v2_idempotency_integers_on_update;
+CREATE TRIGGER v2_idempotency_integers_on_update
+BEFORE UPDATE OF retained_until, restore_epoch, superseded_by_restore_epoch ON v2_idempotency
+WHEN typeof(NEW.retained_until) NOT IN ('integer', 'null')
+   OR typeof(NEW.restore_epoch) NOT IN ('integer', 'null')
+   OR typeof(NEW.superseded_by_restore_epoch) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
+
 -- 0020's trigger refused every update of a stored response; it now names
 -- every column but the mark.
 DROP TRIGGER v2_idempotency_succeeded_is_fixed;
