@@ -509,6 +509,13 @@ pub async fn status(cfg: &Config) -> anyhow::Result<()> {
     let class = classify(&o);
     println!("class={class:?}");
     println!("row={}", class.row());
+    if class.read_only() {
+        // WI-AUDIT-RO: v1 audit writes the read-only DB refused since it opened.
+        println!(
+            "audit_write_failures={}",
+            crate::audit::read_only_failures(&cfg.data_dir)?
+        );
+    }
     if let (Class::K3, Some(site)) = (class, &site) {
         for path in orphans(site) {
             println!("orphan={}", path.display());

@@ -1461,6 +1461,58 @@ async fn assert_server_normal(d: &Dirs, port: u16) {
     assert!(v1);
 }
 
+// ------------------------------------------------------------------ G2-55 ---
+
+/// WI-AUDIT-RO (ADR 0002 D-1): a v1 login that fails on the read-only DB
+/// cannot write its `audit_log` row. The server counts it, and `restore
+/// status` prints the count; a start outside read-only mode discards it.
+#[tokio::test]
+async fn g2_55_a_failed_read_only_audit_write_is_counted_in_restore_status() {
+    let d = dirs("wi-audit-ro");
+    initialised(&d);
+    // The first start creates the DB and the admin the logins below use.
+    assert_server_normal(&d, 28431).await;
+    // Outside read-only mode nothing is counted, so no count is kept.
+    assert!(!d.data.join("audit-ro-failures").exists());
+    assert!(
+        !String::from_utf8_lossy(&cli(&d, &["restore", "status"]).stdout)
+            .contains("audit_write_failures")
+    );
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "0"
+    );
+    {
+        let _s = spawn(&d, 28431);
+        let c = http();
+        ready(&c, 28431).await;
+        for _ in 0..2 {
+            let r = c
+                .post("http://127.0.0.1:28431/auth/login")
+                .json(&json!({ "username": "admin", "password": "wrong" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 401);
+        }
+    }
+    assert_eq!(
+        field(&cli(&d, &["restore", "status"]), "audit_write_failures"),
+        "2"
+    );
+
+    std::fs::remove_file(d.identity.join(MANIFEST_FILE)).unwrap();
+    assert_server_normal(&d, 28431).await;
+    assert!(!d.data.join("audit-ro-failures").exists());
+    assert!(
+        !String::from_utf8_lossy(&cli(&d, &["restore", "status"]).stdout)
+            .contains("audit_write_failures")
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
 // ------------------------------------------------------------------ G2-54 ---
 
 /// L2259: external record = mirror and no preparation manifest is normal
