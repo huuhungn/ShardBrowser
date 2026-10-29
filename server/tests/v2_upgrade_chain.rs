@@ -277,6 +277,12 @@ fn guard(version: i64) -> (String, String, &'static str) {
             "DELETE FROM v2_grant_quarantine".into(),
             "a grant quarantine is never removed",
         ),
+        // The rebuilt quarantine takes device approvals and is still kept.
+        29 => (
+            quarantined("device_approval"),
+            "DELETE FROM v2_grant_quarantine".into(),
+            "a grant quarantine is never removed",
+        ),
         _ => unreachable!("no guard for {version}"),
     }
 }
@@ -407,6 +413,17 @@ async fn m0027_upgraded_uploads_keep_their_terms_and_quarantines_are_kept() {
 async fn m0028_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_fleet_grants() {
     let pool = upgrade(28).await;
     for kind in ["capability_grant", "unknown_kind"] {
+        let e = exec(&pool, &quarantined(kind)).await;
+        assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
+    }
+    let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
+    assert!(e.contains("a grant is quarantined once"), "{e}");
+}
+
+#[tokio::test]
+async fn m0029_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_device_approvals() {
+    let pool = upgrade(29).await;
+    for kind in ["fleet_rotation_grant", "unknown_kind"] {
         let e = exec(&pool, &quarantined(kind)).await;
         assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
     }

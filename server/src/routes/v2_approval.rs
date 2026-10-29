@@ -36,9 +36,11 @@ use super::v2_auth::{
     DEVICE_SESSION_CHALLENGES,
 };
 use super::v2_fleet::holds_capability;
+use super::v2_root::{insert_row, row_holds, Col};
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::integrity::derive_device_key_ids;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339};
 
@@ -712,50 +714,142 @@ async fn first_approval(
 
 /// Files the approval row: every column from the verified record.
 async fn insert_approval(conn: &mut SqliteConnection, req: &Request) -> Result<(), AppError> {
-    let a = &req.approval;
-    let c = &a.common;
-    let record = &req.record;
-    let outer_sha = *record.exact_signed_container_bytes_sha256();
-    sqlx::query(
-        "INSERT INTO v2_device_approvals
-             (tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
-              subject_device_id, subject_signing_key_id, subject_hpke_key_id, approval_scope_kind,
-              approval_scope_id, approved_use, issued_at_ms, not_before_ms, not_after_ms,
-              server_instance_id, restore_epoch, canonical_payload_bytes, payload_sha256,
-              signature_suite_id, signature_version, signature_bytes, issuer_signing_key_id,
-              signed_container_hash, exact_signed_container_bytes,
-              exact_signed_container_bytes_sha256, revoked_at, created_at)
-         VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?, 'team.device', ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, NULL, ?)",
-    )
-    .bind(c.tenant_id.as_slice())
-    .bind(c.replay_id.as_slice())
-    .bind(DOMAIN_DEVICE_APPROVAL)
-    .bind(a.subject_account_id.as_slice())
-    .bind(a.subject_device_id.as_slice())
-    .bind(a.subject_signing_key_id.as_slice())
-    .bind(a.subject_hpke_key_id.as_slice())
-    .bind(a.approval_scope_kind.as_str())
-    .bind(a.approval_scope_id.as_slice())
-    .bind(int(c.issued_at_ms)?)
-    .bind(int(c.not_before_ms)?)
-    .bind(int(c.not_after_ms)?)
-    .bind(c.server_instance_id.as_slice())
-    .bind(int(c.restore_epoch)?)
-    .bind(record.canonical_payload_bytes())
-    .bind(record.payload_sha256().as_slice())
-    .bind(i64::from(record.signature_suite().0))
-    .bind(i64::from(record.signature_suite().1))
-    .bind(record.signature_bytes())
-    .bind(record.issuer_signing_key_id().as_slice())
-    .bind(record.signed_container_hash().as_slice())
-    .bind(record.exact_signed_container_bytes())
-    .bind(outer_sha.as_slice())
-    .bind(now_rfc3339())
-    .execute(&mut *conn)
-    .await?;
+    let cols = approval_columns(&req.approval, &req.record)?;
+    insert_row(conn, TABLE, &cols, &now_rfc3339()).await
+}
 
-    Ok(())
+// ---------------------------------------------------------- stored approvals ---
+
+const TABLE: &str = "v2_device_approvals";
+
+/// The columns a verified approval determines (plan 5.6.1 `DeviceApprovalV2`).
+fn approval_columns(
+    a: &DeviceApprovalV2,
+    record: &AuthorizationRecord,
+) -> Result<Vec<(&'static str, Col)>, AppError> {
+    let c = &a.common;
+    let b = |bytes: &[u8]| Col::Blob(bytes.to_vec());
+    let (suite, version) = record.signature_suite();
+    Ok(vec![
+        ("tenant_id", b(&c.tenant_id)),
+        ("replay_id", b(&c.replay_id)),
+        ("payload_domain", Col::Text(DOMAIN_DEVICE_APPROVAL)),
+        ("payload_version", Col::Int(2)),
+        ("subject_account_id", b(&a.subject_account_id)),
+        ("subject_device_id", b(&a.subject_device_id)),
+        ("subject_signing_key_id", b(&a.subject_signing_key_id)),
+        ("subject_hpke_key_id", b(&a.subject_hpke_key_id)),
+        (
+            "approval_scope_kind",
+            Col::Text(a.approval_scope_kind.as_str()),
+        ),
+        ("approval_scope_id", b(&a.approval_scope_id)),
+        ("approved_use", Col::Text("team.device")),
+        ("issued_at_ms", Col::Int(int(c.issued_at_ms)?)),
+        ("not_before_ms", Col::Int(int(c.not_before_ms)?)),
+        ("not_after_ms", Col::Int(int(c.not_after_ms)?)),
+        ("server_instance_id", b(&c.server_instance_id)),
+        ("restore_epoch", Col::Int(int(c.restore_epoch)?)),
+        (
+            "canonical_payload_bytes",
+            b(record.canonical_payload_bytes()),
+        ),
+        ("payload_sha256", b(record.payload_sha256())),
+        ("signature_suite_id", Col::Int(i64::from(suite))),
+        ("signature_version", Col::Int(i64::from(version))),
+        ("signature_bytes", b(record.signature_bytes())),
+        ("issuer_signing_key_id", b(record.issuer_signing_key_id())),
+        ("signed_container_hash", b(record.signed_container_hash())),
+        (
+            "exact_signed_container_bytes",
+            b(record.exact_signed_container_bytes()),
+        ),
+        (
+            "exact_signed_container_bytes_sha256",
+            b(record.exact_signed_container_bytes_sha256()),
+        ),
+    ])
+}
+
+/// A filed approval whose row matched its verified container.
+pub(crate) struct StoredApproval {
+    pub(crate) approval: DeviceApprovalV2,
+}
+
+/// The approval `replay` of this instance, reparsed, verified under its
+/// issuer's key and required to hold exactly the columns its container
+/// determines. A row that disagrees refuses the request (422) and is
+/// quarantined (plan L507); one quarantined before is no approval.
+pub(crate) async fn load_approval(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    replay: &[u8; 16],
+) -> Result<Option<StoredApproval>, AppError> {
+    let exact: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+        "SELECT exact_signed_container_bytes FROM {TABLE}
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?"
+    ))
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(replay.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(exact) = exact else { return Ok(None) };
+    let mark = Mark {
+        kind: Kind::DeviceApproval,
+        server_instance_id: v.server_instance_id,
+        tenant_id: *tenant,
+        replay_id: *replay,
+    };
+    if quarantine::holds(conn, &mark).await? {
+        return Ok(None);
+    }
+    let broken = || AppError::Quarantine(Box::new(mark.clone()));
+    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
+    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
+    )
+    .bind(tenant.as_slice())
+    .bind(parsed.issuer_signing_key_id().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let issuer: [u8; 32] = issuer.and_then(|k| k.try_into().ok()).ok_or_else(broken)?;
+    let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
+    let Payload::DeviceApproval(approval) = record.payload().clone() else {
+        return Err(broken());
+    };
+    let c = &approval.common;
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id)
+        != (&v.server_instance_id, tenant, replay)
+    {
+        return Err(broken());
+    }
+    let cols = approval_columns(&approval, record.record()).map_err(|_| broken())?;
+    // The key is among the columns, so this is a check of that one row.
+    if !row_holds(conn, TABLE, &cols).await? {
+        return Err(broken());
+    }
+    Ok(Some(StoredApproval { approval }))
+}
+
+/// The approvals among `candidates`, the replay IDs an indexed query found:
+/// that query only finds them, each one's authority is its loaded container
+/// ([`load_approval`]).
+pub(crate) async fn approvals_among(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    candidates: Vec<Vec<u8>>,
+) -> Result<Vec<StoredApproval>, AppError> {
+    let mut found = Vec::new();
+    for replay in candidates {
+        let replay: [u8; 16] = replay
+            .try_into()
+            .map_err(|_| column_mismatch("a stored replay id is not 16 bytes"))?;
+        found.extend(load_approval(conn, v, tenant, &replay).await?);
+    }
+    Ok(found)
 }
 
 /// Stores the exact receipt under the approval's replay ID.

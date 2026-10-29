@@ -532,27 +532,34 @@ async fn custodian(server: &mut Server, seed: u8) -> (Device, String) {
     (dev, access)
 }
 
-/// A second device of the owner under a copy of `from`'s tenant approval,
-/// and its access token.
+/// A second device of the owner approved tenant-wide by `from`, and its
+/// access token.
 async fn peer(server: &Server, from: &Device, seed: u8) -> (Device, String) {
-    peer_in(
-        server,
-        from,
-        seed,
-        ("approval_scope_kind", "approval_scope_id"),
-    )
-    .await
+    peer_in(server, from, seed, (ApprovalScopeKind::Tenant, TENANT)).await
 }
 
-/// [`peer`] under an approval scope, given as SQL: column names to keep the
-/// copy's, or literals such as `'fleet'` and `x'..'`.
+/// [`peer`] under the approval scope `(kind, id)`: a signed approval filed
+/// straight into the table.
 async fn peer_in(
     server: &Server,
     from: &Device,
     seed: u8,
-    scope: (&str, &str),
+    scope: (ApprovalScopeKind, [u8; 16]),
 ) -> (Device, String) {
     let to = device(server, seed, "active").await;
+    let replay = seed;
+    let approval = DeviceApprovalV2 {
+        common: common([replay; 16], 30),
+        subject_account_id: OWNER,
+        subject_device_id: to.id,
+        subject_signing_key_id: to.signing_key_id,
+        subject_hpke_key_id: to.hpke_key_id,
+        approval_scope_kind: scope.0,
+        approval_scope_id: scope.1,
+    };
+    let c = &approval.common;
+    let exact = build_record(&from.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+    let r = AuthorizationRecord::parse(&exact).unwrap();
     server
         .sql(
             &format!(
@@ -564,21 +571,29 @@ async fn peer_in(
                  canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
                  signature_bytes, issuer_signing_key_id, signed_container_hash,
                  exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
-             SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
-                    ?, ?, ?, {}, {}, approved_use, issued_at_ms,
-                    not_before_ms, not_after_ms, server_instance_id, restore_epoch,
-                    canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
-                    signature_bytes, issuer_signing_key_id, signed_container_hash,
-                    exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
-               FROM v2_device_approvals WHERE subject_device_id = ?",
-                scope.0, scope.1
+             VALUES (?, ?, '{DOMAIN_DEVICE_APPROVAL}', 2, ?, ?, ?, ?, '{}', ?, 'team.device',
+                     {}, {}, {}, ?, 0, ?, ?, 1, 1, ?, ?, ?, ?, ?, 't')",
+                scope.0.as_str(),
+                c.issued_at_ms,
+                c.not_before_ms,
+                c.not_after_ms
             ),
             &[
-                &[seed; 16],
+                &TENANT,
+                &[replay; 16],
+                &OWNER,
                 &to.id,
                 &to.signing_key_id,
                 &to.hpke_key_id,
-                &from.id,
+                &scope.1,
+                &INSTANCE,
+                r.canonical_payload_bytes(),
+                r.payload_sha256(),
+                r.signature_bytes(),
+                r.issuer_signing_key_id(),
+                r.signed_container_hash(),
+                r.exact_signed_container_bytes(),
+                r.exact_signed_container_bytes_sha256(),
             ],
         )
         .await;
@@ -1521,8 +1536,7 @@ async fn every_refusal_has_its_status_and_code() {
         .await;
 
     // A fleet-scoped approval admits a device to that fleet only (Q-22).
-    let elsewhere = format!("x'{}'", hex(&other_fleet));
-    let (_, fleet_b) = peer_in(&server, &dev, 0x7e, ("'fleet'", &elsewhere)).await;
+    let (_, fleet_b) = peer_in(&server, &dev, 0x7e, (ApprovalScopeKind::Fleet, other_fleet)).await;
     expect(
         &server,
         &pub_path,
@@ -1573,11 +1587,29 @@ async fn every_refusal_has_its_status_and_code() {
         (403, ""),
     )
     .await;
-    let (_, fleet_a) = peer_in(&server, &dev, 0x7f, ("'fleet'", &here)).await;
+    let (_, fleet_a) = peer_in(&server, &dev, 0x7f, (ApprovalScopeKind::Fleet, FLEET)).await;
     let (status, body) = server
         .call(&pub_path, &fleet_a, &publish(0x21, pref([0xc8; 16])))
         .await;
     assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // A candidate approval row that left its container refuses the request
+    // and is quarantined; from then on it is no approval.
+    for statement in [
+        "CREATE TABLE twin AS SELECT * FROM v2_device_approvals
+          WHERE replay_id = x'71717171717171717171717171717171'",
+        "UPDATE twin SET replay_id = x'eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea'",
+        "INSERT INTO v2_device_approvals SELECT * FROM twin",
+    ] {
+        server.sql(statement, &[]).await;
+    }
+    expect(
+        &server,
+        &pub_path,
+        &access,
+        &publish(0x23, pref([0xc9; 16])),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH"),
+    )
+    .await;
 
     // Its row's name is the hex ID, which a legacy profile may hold already.
     let p6 = [0xc6; 16];
@@ -3806,8 +3838,8 @@ async fn the_fleet_list_needs_fleet_wide_checkout_and_hides_other_fleets() {
     assert_eq!(ids(&page(&server, &bare_access, FLEET, "").await), vec![P1]);
 
     // A fleet-scoped approval lists that fleet only (Q-22).
-    let elsewhere = format!("x'{}'", hex(&other_fleet));
-    let (fleet_b, fleet_b_access) = peer_in(&server, &dev, 0x7e, ("'fleet'", &elsewhere)).await;
+    let (fleet_b, fleet_b_access) =
+        peer_in(&server, &dev, 0x7e, (ApprovalScopeKind::Fleet, other_fleet)).await;
     grant(
         &server,
         c,
@@ -3818,8 +3850,8 @@ async fn the_fleet_list_needs_fleet_wide_checkout_and_hides_other_fleets() {
     )
     .await;
     list_refused(&server, &fleet_b_access, FLEET, (403, "")).await;
-    let here = format!("x'{}'", hex(&FLEET));
-    let (fleet_a, fleet_a_access) = peer_in(&server, &dev, 0x7f, ("'fleet'", &here)).await;
+    let (fleet_a, fleet_a_access) =
+        peer_in(&server, &dev, 0x7f, (ApprovalScopeKind::Fleet, FLEET)).await;
     grant(
         &server,
         c,

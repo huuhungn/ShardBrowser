@@ -18,6 +18,7 @@ pub enum Kind {
     FleetDeviceHpke,
     FleetRecovery,
     FleetRotation,
+    DeviceApproval,
 }
 
 impl Kind {
@@ -28,6 +29,7 @@ impl Kind {
             Self::FleetDeviceHpke => "fleet_device_hpke_grant",
             Self::FleetRecovery => "fleet_recovery_grant",
             Self::FleetRotation => "fleet_rotation_grant",
+            Self::DeviceApproval => "device_approval",
         }
     }
 }

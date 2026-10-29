@@ -39,7 +39,7 @@ use shared::mutation::{
     OperationKind, RootGenerationState, RootGrantState,
 };
 
-use super::v2_approval::{cbor, coded, column_mismatch, int};
+use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, blob, reload_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
@@ -911,21 +911,18 @@ pub async fn file_fleet_grant(
             // of exactly these keys, tenant-wide or for this fleet.
             // shortcut: fleet membership is not checked, there is no member
             // table yet; add it with the L1126 membership routes.
-            let eligible: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM v2_accounts
-                                 WHERE tenant_id = ? AND id = ? AND status = 'active')
-                    AND EXISTS (SELECT 1 FROM v2_device_approvals
-                                 WHERE server_instance_id = ? AND tenant_id = ?
-                                   AND subject_account_id = ? AND subject_device_id = ?
-                                   AND subject_signing_key_id = ? AND subject_hpke_key_id = ?
-                                   AND revoked_at IS NULL
-                                   AND not_before_ms <= ? AND ? < not_after_ms
-                                   AND (approval_scope_kind = 'tenant'
-                                        OR (approval_scope_kind = 'fleet'
-                                            AND approval_scope_id = ?)))",
+            let candidates = sqlx::query_scalar(
+                "SELECT replay_id FROM v2_device_approvals
+                  WHERE server_instance_id = ? AND tenant_id = ?
+                    AND subject_account_id = ? AND subject_device_id = ?
+                    AND subject_signing_key_id = ? AND subject_hpke_key_id = ?
+                    AND revoked_at IS NULL
+                    AND not_before_ms <= ? AND ? < not_after_ms
+                    AND (approval_scope_kind = 'tenant'
+                         OR (approval_scope_kind = 'fleet' AND approval_scope_id = ?))
+                    AND EXISTS (SELECT 1 FROM v2_accounts
+                                 WHERE tenant_id = ? AND id = ? AND status = 'active')",
             )
-            .bind(s.tenant_id.as_slice())
-            .bind(p.subject_account_id.as_slice())
             .bind(v.server_instance_id.as_slice())
             .bind(s.tenant_id.as_slice())
             .bind(p.subject_account_id.as_slice())
@@ -935,9 +932,14 @@ pub async fn file_fleet_grant(
             .bind(now)
             .bind(now)
             .bind(fleet.as_slice())
-            .fetch_one(&mut *tx)
+            .bind(s.tenant_id.as_slice())
+            .bind(p.subject_account_id.as_slice())
+            .fetch_all(&mut *tx)
             .await?;
-            if !eligible {
+            if approvals_among(&mut tx, v, &s.tenant_id, candidates)
+                .await?
+                .is_empty()
+            {
                 return Err(conflict(
                     "SUBJECT_NOT_ELIGIBLE",
                     "the subject has no active account or live approval for this fleet",

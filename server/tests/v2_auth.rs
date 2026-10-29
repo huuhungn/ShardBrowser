@@ -4425,7 +4425,7 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
         .await;
     // An issuer that does not hold generation 0 hands it to nobody else (D-2).
     let peer = device(&server, OWNER, 0x7d, "active").await;
-    approve_by_copy(&server, &dev, &peer, 0x7d).await;
+    file_approval(&server, &dev, &peer, 0x7d).await;
     let to_peer = DeviceHpkeGrantV2 {
         common: fleet_common(0xdd, 30),
         fleet_id: FLEET,
@@ -4599,14 +4599,48 @@ async fn a_custodian_creates_fleet_generations_and_files_their_grants() {
 
 /// Gives `to` a live approval by copying `from`'s stored one with `to`'s keys.
 /// The copy's container no longer matches its columns; the fleet routes only
-/// ask whether a live approval of the subject's keys exists.
-async fn approve_by_copy(server: &Server, from: &Device, to: &Device, replay: u8) {
-    approve_by_copy_in(server, from, to, replay, "approval_scope_kind").await;
+/// `to` approved tenant-wide by `from`: a signed approval filed straight
+/// into the table.
+async fn file_approval(server: &Server, from: &Device, to: &Device, replay: u8) {
+    file_approval_in(
+        server,
+        from,
+        to,
+        replay,
+        (ApprovalScopeKind::Tenant, TENANT),
+    )
+    .await;
 }
 
-/// [`approve_by_copy`] with `scope` as the approval scope kind, a column name
-/// to keep the copy's or a quoted literal such as `'fleet'`.
-async fn approve_by_copy_in(server: &Server, from: &Device, to: &Device, replay: u8, scope: &str) {
+/// [`file_approval`] under the scope `(kind, id)`.
+async fn file_approval_in(
+    server: &Server,
+    from: &Device,
+    to: &Device,
+    replay: u8,
+    scope: (ApprovalScopeKind, [u8; 16]),
+) {
+    let start = now_ms() - 60_000;
+    let approval = DeviceApprovalV2 {
+        common: CommonFields {
+            replay_id: [replay; 16],
+            tenant_id: TENANT,
+            issued_at_ms: start,
+            not_before_ms: start,
+            not_after_ms: start + 30 * DAY_MS,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        },
+        subject_account_id: OWNER,
+        subject_device_id: to.id,
+        subject_signing_key_id: to.signing_key_id,
+        subject_hpke_key_id: to.hpke_key_id,
+        approval_scope_kind: scope.0,
+        approval_scope_id: scope.1,
+    };
+    let c = &approval.common;
+    let exact = build_record(&from.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+    let r = AuthorizationRecord::parse(&exact).unwrap();
     server
         .sql(
             &format!(
@@ -4618,23 +4652,75 @@ async fn approve_by_copy_in(server: &Server, from: &Device, to: &Device, replay:
                  canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
                  signature_bytes, issuer_signing_key_id, signed_container_hash,
                  exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
+             VALUES (?, ?, '{DOMAIN_DEVICE_APPROVAL}', 2, ?, ?, ?, ?, '{}', ?, 'team.device',
+                     {}, {}, {}, ?, 0, ?, ?, 1, 1, ?, ?, ?, ?, ?, 't')",
+                scope.0.as_str(),
+                c.issued_at_ms,
+                c.not_before_ms,
+                c.not_after_ms
+            ),
+            &[
+                &TENANT,
+                &[replay; 16],
+                &OWNER,
+                &to.id,
+                &to.signing_key_id,
+                &to.hpke_key_id,
+                &scope.1,
+                &INSTANCE,
+                r.canonical_payload_bytes(),
+                r.payload_sha256(),
+                r.signature_bytes(),
+                r.issuer_signing_key_id(),
+                r.signed_container_hash(),
+                r.exact_signed_container_bytes(),
+                r.exact_signed_container_bytes_sha256(),
+            ],
+        )
+        .await;
+}
+
+/// `to` under a copy of approval `from`'s row: a row that does not match
+/// its container, which every use refuses and quarantines.
+async fn copy_approval(server: &Server, from: u8, to: &Device, replay: u8) {
+    server
+        .sql(
+            "INSERT INTO v2_device_approvals (
+                 tenant_id, replay_id, payload_domain, payload_version, subject_account_id,
+                 subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+                 approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
+                 not_before_ms, not_after_ms, server_instance_id, restore_epoch,
+                 canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
+                 signature_bytes, issuer_signing_key_id, signed_container_hash,
+                 exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at)
              SELECT tenant_id, ?, payload_domain, payload_version, subject_account_id,
-                    ?, ?, ?, {scope}, approval_scope_id, approved_use, issued_at_ms,
+                    ?, ?, ?, approval_scope_kind, approval_scope_id, approved_use, issued_at_ms,
                     not_before_ms, not_after_ms, server_instance_id, restore_epoch,
                     canonical_payload_bytes, payload_sha256, signature_suite_id, signature_version,
                     signature_bytes, issuer_signing_key_id, signed_container_hash,
                     exact_signed_container_bytes, exact_signed_container_bytes_sha256, created_at
-               FROM v2_device_approvals WHERE subject_device_id = ?"
-            ),
+               FROM v2_device_approvals WHERE replay_id = ?",
             &[
                 &[replay; 16],
                 &to.id,
                 &to.signing_key_id,
                 &to.hpke_key_id,
-                &from.id,
+                &[from; 16],
             ],
         )
         .await;
+}
+
+/// Whether approval `replay` is quarantined.
+async fn approval_quarantined(server: &Server, replay: u8) -> bool {
+    server
+        .count(&format!(
+            "SELECT count(*) FROM v2_grant_quarantine
+              WHERE kind = 'device_approval' AND replay_id = x'{}'",
+            hex(&[replay; 16])
+        ))
+        .await
+        == 1
 }
 
 fn fleet_grant_ref(
@@ -4821,7 +4907,7 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
     );
     // Only the grant's subject acknowledges a device grant (D-9).
     let other = device(&server, OWNER, 0x7e, "active").await;
-    approve_by_copy(&server, &dev, &other, 0x7e).await;
+    file_approval(&server, &dev, &other, 0x7e).await;
     let to_other = DeviceHpkeGrantV2 {
         common: fleet_common(0xd9, 365),
         fleet_id: FLEET,
@@ -4840,6 +4926,36 @@ async fn a_custodian_acks_activates_rotates_and_revokes_fleet_grants() {
         &to_other.encode(),
     );
     file!(0xba, 0, fkek0, V::DeviceHpke, 0xd9, &to_other);
+    // A subject under an approval row that left its container is refused,
+    // and the row quarantined.
+    let copied = device(&server, OWNER, 0x58, "active").await;
+    copy_approval(&server, 0x7e, &copied, 0x58).await;
+    let to_copied = DeviceHpkeGrantV2 {
+        common: fleet_common(0xe6, 365),
+        fleet_id: FLEET,
+        fkek_key_id: fkek0,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: copied.id,
+        subject_signing_key_id: copied.signing_key_id,
+        recipient_hpke_key_id: copied.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let to_copied = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &to_copied.encode(),
+    );
+    let request = fleet_grant_request(0xe7, 0, fkek0, V::DeviceHpke, 0xe6, &to_copied);
+    let (status, body) = server
+        .call(&fleet_grants_path(0), &access, Some(&request))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    assert!(approval_quarantined(&server, 0x58).await);
     let foreign_ack = ack(0xbb, 0, fkek0, V::DeviceHpke, 0xd9, &to_other);
     assert_eq!(server.call(&ack0, &access, Some(&foreign_ack)).await.0, 403);
     let again = ack(0xb5, 0, fkek0, V::DeviceHpke, 0xd0, &device0);
@@ -5388,7 +5504,7 @@ async fn a_custodian_files_an_existing_root_grant_only_to_a_tenant_approved_devi
     let (dev, access, _) = custodian(&mut server, 0x6f).await;
     let path = root_grants_path();
     let peer = device(&server, OWNER, 0x7b, "active").await;
-    approve_by_copy(&server, &dev, &peer, 0x7b).await;
+    file_approval(&server, &dev, &peer, 0x7b).await;
 
     let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
     let request = root_grant_create_request(0xc0, &dev, &existing);
@@ -5416,7 +5532,14 @@ async fn a_custodian_files_an_existing_root_grant_only_to_a_tenant_approved_devi
 
     // Q-22: a fleet-scoped approval never carries root custody.
     let fleet_only = device(&server, OWNER, 0x7a, "active").await;
-    approve_by_copy_in(&server, &dev, &fleet_only, 0x7a, "'fleet'").await;
+    file_approval_in(
+        &server,
+        &dev,
+        &fleet_only,
+        0x7a,
+        (ApprovalScopeKind::Fleet, FLEET),
+    )
+    .await;
     let grant = existing_root_grant(&dev, &fleet_only, 0x7a, 0x92);
     let request = root_grant_create_request(0xc2, &dev, &grant);
     let (status, body) = server.call(&path, &access, Some(&request)).await;
@@ -5433,6 +5556,17 @@ async fn a_custodian_files_an_existing_root_grant_only_to_a_tenant_approved_devi
         (status, code_of(&body).as_str()),
         (409, "SUBJECT_NOT_ELIGIBLE")
     );
+    // An approval row that left its container is refused and quarantined.
+    let copied = device(&server, OWNER, 0x58, "active").await;
+    copy_approval(&server, 0x7b, &copied, 0x58).await;
+    let grant = existing_root_grant(&dev, &copied, 0x58, 0xe9);
+    let request = root_grant_create_request(0xea, &dev, &grant);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    assert!(approval_quarantined(&server, 0x58).await);
     // A grant signed by another key than the session's.
     let forged = existing_root_grant(&peer, &peer, 0x7b, 0x94);
     let request = root_grant_create_request(0xc4, &peer, &forged);
@@ -5802,7 +5936,7 @@ async fn a_revoked_device_cannot_sign_in_again() {
         .unwrap()
         .to_string();
     let approved = device(&server, OWNER, 0x7d, "active").await;
-    approve_by_copy(&server, &dev, &approved, 0x7d).await;
+    file_approval(&server, &dev, &approved, 0x7d).await;
     let path = device_revoke_path(&pending.id);
     let good = revocation(&dev.sk, &pending, 0x90, 30);
 
@@ -5839,6 +5973,23 @@ async fn a_revoked_device_cannot_sign_in_again() {
     ] {
         assert_eq!(server.call(p, &access, Some(&request)).await.0, 403);
     }
+    // A subject under an approval row that left its container is refused,
+    // and the row quarantined.
+    let copied = device(&server, OWNER, 0x58, "active").await;
+    copy_approval(&server, 0x7d, &copied, 0x58).await;
+    let copied_revoke = revocation(&dev.sk, &copied, 0xe6, 30);
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&copied.id),
+            &access,
+            Some(&revoke_request(0xe7, &copied_revoke)),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    assert!(approval_quarantined(&server, 0x58).await);
     let duty = capability_grant(&dev, &dev.sk, |g| {
         g.common.replay_id = [0xa8; 16];
         g.capability = Capability::DeviceRevoke;
@@ -6783,7 +6934,7 @@ async fn a_custodian_files_a_restore_epoch_transition_once_and_the_tenant_reads_
     let mut server = start("g2-restore-epoch", 28230).await;
     let (dev, access, _) = custodian(&mut server, 0x6c).await;
     let peer = device(&server, OWNER, 0x7c, "active").await;
-    approve_by_copy(&server, &dev, &peer, 0x7c).await;
+    file_approval(&server, &dev, &peer, 0x7c).await;
     let peer_access = session(&server, &peer).await["access_token"]
         .as_str()
         .unwrap()
@@ -8229,5 +8380,225 @@ async fn the_startup_pass_quarantines_fleet_grants_that_left_their_containers() 
             .count("SELECT count(*) FROM v2_grant_quarantine")
             .await,
         3
+    );
+}
+
+// ------------------------------------------------- stored device approvals ---
+
+/// The columns an approval row keeps beside its container: its marks; and
+/// its replay ID, under which a row is another approval (see the startup pass
+/// test).
+const APPROVAL_ROW_ONLY: [&str; 3] = ["revoked_at", "created_at", "replay_id"];
+/// The columns the request's candidate query selects on: a row changed there
+/// is out of the request's sight, and the startup pass finds it.
+const APPROVAL_LOOKUP: [&str; 5] = [
+    "server_instance_id",
+    "tenant_id",
+    "subject_device_id",
+    "subject_signing_key_id",
+    "subject_hpke_key_id",
+];
+
+#[tokio::test]
+async fn every_approval_column_is_compared_with_its_container_on_each_request() {
+    let mut server = start("g2-30-approval-columns", 28501).await;
+    // A D1 approval behind a root_setup session, and an ordinary one.
+    let (dev, setup) = approved(&mut server, 0x6a).await;
+    let peer = device(&server, OWNER, 0x6b, "active").await;
+    file_approval(&server, &dev, &peer, 0x72).await;
+    let ordinary = session(&server, &peer).await;
+    assert_eq!(ordinary["class"], "ordinary");
+    let ordinary = ordinary["access_token"].as_str().unwrap().to_string();
+    let pool = db(&server.data).await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop_triggers(&pool, "v2_grant_quarantine").await;
+    drop_triggers(&pool, "v2_device_approvals").await;
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('v2_device_approvals') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let me = |access: String| {
+        let server = &server;
+        async move {
+            let (status, body) = server.me(&access).await;
+            (
+                status,
+                body["code"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+    };
+    for (access, replay) in [(&setup, APPROVAL_REPLAY), (&ordinary, 0x72)] {
+        assert_eq!(me(access.clone()).await.0, 200);
+        let mut by_request = Vec::new();
+        for col in cols
+            .iter()
+            .filter(|c| !APPROVAL_ROW_ONLY.contains(&c.as_str()))
+        {
+            let before: (String,) = sqlx::query_as(&format!(
+                "SELECT quote({col}) FROM v2_device_approvals WHERE replay_id = ?"
+            ))
+            .bind([replay; 16].as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            // A value the schema refuses can never disagree with a filed
+            // container.
+            if mutate(&pool, "v2_device_approvals", col, replay)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let quarantined = format!(
+                "SELECT count(*) FROM v2_grant_quarantine
+                  WHERE kind = 'device_approval' AND replay_id = x'{}'",
+                hex(&[replay; 16])
+            );
+            if APPROVAL_LOOKUP.contains(&col.as_str()) {
+                assert_eq!(me(access.clone()).await.0, 401, "{col}");
+            } else {
+                assert_eq!(
+                    me(access.clone()).await,
+                    (422, "AUTH_CLAIM_COLUMN_MISMATCH".into()),
+                    "{col}"
+                );
+                assert_eq!(server.count(&quarantined).await, 1, "{col} is quarantined");
+                by_request.push(col.as_str());
+            }
+            // Put back and released, the approval answers as before.
+            sqlx::query(&format!(
+                "UPDATE v2_device_approvals SET {col} = {} WHERE replay_id = ?",
+                before.0
+            ))
+            .bind([replay; 16].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM v2_grant_quarantine")
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert_eq!(me(access.clone()).await.0, 200, "{col} restored");
+        }
+        for col in [
+            "subject_account_id",
+            "approval_scope_id",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "issuer_signing_key_id",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ] {
+            assert!(by_request.contains(&col), "{col}: {by_request:?}");
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn the_startup_pass_quarantines_approvals_that_left_their_containers() {
+    let mut server = start("g2-30-approval-startup", 28502).await;
+    let (dev, _) = approved(&mut server, 0x6c).await;
+    let (drifted, intact) = (
+        device(&server, OWNER, 0x6d, "active").await,
+        device(&server, OWNER, 0x6e, "active").await,
+    );
+    file_approval(&server, &dev, &drifted, 0x73).await;
+    file_approval(&server, &dev, &intact, 0x74).await;
+    let drifted_access = session(&server, &drifted).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let intact_access = session(&server, &intact).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let container = |replay: u8| {
+        format!(
+            "SELECT exact_signed_container_bytes FROM v2_device_approvals WHERE replay_id = x'{}'",
+            hex(&[replay; 16])
+        )
+    };
+    let pool = db(&server.data).await;
+    let (drifted_container, intact_container): (Vec<u8>, Vec<u8>) = (
+        sqlx::query_scalar(&container(0x73))
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        sqlx::query_scalar(&container(0x74))
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    );
+    // While the server is down one approval's HPKE key ID drifts, out of
+    // every request's sight, and a row under another replay ID takes the
+    // intact approval's exact container.
+    drop_triggers(&pool, "v2_device_approvals").await;
+    for statement in [
+        "UPDATE v2_device_approvals SET subject_hpke_key_id = zeroblob(32)
+          WHERE replay_id = x'73737373737373737373737373737373'",
+        "CREATE TABLE borrowed AS SELECT * FROM v2_device_approvals
+          WHERE replay_id = x'74747474747474747474747474747474'",
+        "UPDATE borrowed SET replay_id = x'e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8'",
+        "INSERT INTO v2_device_approvals SELECT * FROM borrowed",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    server.restart().await;
+    for replay in [0x73, 0xe8] {
+        assert_eq!(
+            server
+                .count(&format!(
+                    "SELECT count(*) FROM v2_grant_quarantine
+                      WHERE kind = 'device_approval' AND replay_id = x'{}'",
+                    hex(&[replay; 16])
+                ))
+                .await,
+            1,
+            "{replay:#x}"
+        );
+    }
+    // The intact approval still serves its session and its evidence; the
+    // quarantined one does neither, even once its row is put back.
+    assert_eq!(server.me(&intact_access).await.0, 200);
+    let served = |signer: [u8; 32]| {
+        let server = &server;
+        let intact_access = intact_access.clone();
+        async move { containers(&evidence(server, &intact_access, &[signer]).await) }
+    };
+    assert!(served(intact.signing_key_id)
+        .await
+        .contains(&intact_container));
+    assert!(!served(drifted.signing_key_id)
+        .await
+        .contains(&drifted_container));
+    server
+        .sql(
+            "UPDATE v2_device_approvals SET subject_hpke_key_id = ? WHERE replay_id = ?",
+            &[&drifted.hpke_key_id, &[0x73; 16]],
+        )
+        .await;
+    assert_eq!(server.me(&drifted_access).await.0, 401);
+    assert!(!served(drifted.signing_key_id)
+        .await
+        .contains(&drifted_container));
+    // A second pass finds nothing new.
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_approval'")
+            .await,
+        2
     );
 }
