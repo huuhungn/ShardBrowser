@@ -901,9 +901,12 @@ fn refusal(reason: &'static str, field: &str) -> (&'static str, anyhow::Error) {
 /// never pinned). A new head the last leaf ends at is accepted as rule 6
 /// accepts one ([`verify_leaf_head`]). A lease from before the restore is
 /// released first. The exact transition and proof bytes are stored and read
-/// back, and the binding, as it was read, accepts the new epoch and pins
-/// the leaf's new head, in one transaction. Anything else keeps it
-/// quarantined under a named reason; a lost reply changes nothing.
+/// back, the binding, as it was read, accepts the new epoch and pins the
+/// leaf's new head, and the trust evaluation they relied on is recorded
+/// (`ledger::record`), in one transaction. Anything else keeps it
+/// quarantined under a named reason, and the evaluation is still recorded,
+/// as collecting a fleet key records one whose grant does not open, so a
+/// lapse it observed is kept; a lost reply changes nothing else.
 // shortcut: a binding pinned behind both heads of its leaf (it missed
 // commits before the restore) stays quarantined; accept it once the
 // manifests from its pin to the leaf's previous head can be verified.
@@ -946,91 +949,110 @@ async fn accept_transitions(
     }
     let listed = listed.ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
     let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
-    let chain = ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?.map(|(_, c)| c);
-    let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
-        .iter()
-        .flat_map(|p| &p.signing_public_keys)
-        .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
-        .collect();
-    let mut head = b.head;
-    let mut steps = Vec::new();
-    for e in b.epoch..epoch {
-        let epochs = (e, e + 1);
-        let get = |profile| client.restore_epoch_transition(access, &b.tenant, epochs, profile);
-        let reply = get(None).await?;
-        let checked = match reply.status {
-            404 => Err(refusal(TRANSITION_REQUIRED, "")),
-            _ => {
-                let body = ok(reply)?.body;
-                verify_transition(db, dev, b, chain.as_ref(), &keys, epochs, &body, now)
-            }
-        };
-        let checked = match checked {
-            Ok(t) => {
-                let reply = get(Some(&b.profile)).await?;
-                match reply.status {
-                    404 => Err(refusal("RESTORE_EPOCH_PROOF_MISSING", "")),
+    let evaluated = ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?;
+    let chain = evaluated.as_ref().map(|(_, c)| c);
+    // A reborrow moves in: the future stays Send across its awaits.
+    let accepted = {
+        let db = &mut *db;
+        let pages = &pages;
+        async move {
+            let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
+                .iter()
+                .flat_map(|p| &p.signing_public_keys)
+                .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
+                .collect();
+            let mut head = b.head;
+            let mut steps = Vec::new();
+            for e in b.epoch..epoch {
+                let epochs = (e, e + 1);
+                let get =
+                    |profile| client.restore_epoch_transition(access, &b.tenant, epochs, profile);
+                let reply = get(None).await?;
+                let checked = match reply.status {
+                    404 => Err(refusal(TRANSITION_REQUIRED, "")),
                     _ => {
                         let body = ok(reply)?.body;
-                        verify_proof(&t, b, head, body).map(|(p, bytes)| (t, p, bytes))
+                        verify_transition(db, dev, b, chain, &keys, epochs, &body, now)
+                    }
+                };
+                let checked = match checked {
+                    Ok(t) => {
+                        let reply = get(Some(&b.profile)).await?;
+                        match reply.status {
+                            404 => Err(refusal("RESTORE_EPOCH_PROOF_MISSING", "")),
+                            _ => {
+                                let body = ok(reply)?.body;
+                                verify_proof(&t, b, head, body).map(|(p, bytes)| (t, p, bytes))
+                            }
+                        }
+                    }
+                    Err(r) => Err(r),
+                };
+                let (transition, proof, proof_bytes) = match checked {
+                    Ok(s) => s,
+                    Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
+                };
+                head = Some(proof.leaf.new_signed_head_hash);
+                steps.push(Step {
+                    transition,
+                    proof,
+                    proof_bytes,
+                });
+            }
+            // An unchanged pin keeps its version. Otherwise the leaf's new head is a
+            // committed manifest whose exact bytes hash to it, at most `LEAF_SEARCH`
+            // versions at or below the pinned one (a restore only goes back), and
+            // accepted as a new head is (rule 6) except for its earlier epoch.
+            let version = if head == b.head {
+                b.version
+            } else {
+                let top = b.version.min(listed.current_version);
+                let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
+                let mut found = None;
+                for v in (low..=top).rev() {
+                    let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
+                    let m = SignedSnapshotManifestV2::parse(&reply.body)
+                        .map_err(|_| bad("SignedSnapshotManifestV2"))?;
+                    if Some(m.head_hash()) == head {
+                        found = Some((v, m));
+                        break;
                     }
                 }
-            }
-            Err(r) => Err(r),
-        };
-        let (transition, proof, proof_bytes) = match checked {
-            Ok(s) => s,
-            Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
-        };
-        head = Some(proof.leaf.new_signed_head_hash);
-        steps.push(Step {
-            transition,
-            proof,
-            proof_bytes,
-        });
+                let checked = match found {
+                    Some((v, m)) => {
+                        verify_leaf_head(db, dev, b, chain, &keys, m, (v, epoch), now).map(|()| v)
+                    }
+                    None => Err(refusal(
+                        "RESTORE_EPOCH_TRANSITION_INVALID",
+                        "new_signed_head_hash",
+                    )),
+                };
+                match checked {
+                    Ok(v) => v,
+                    Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
+                }
+            };
+            Ok::<_, anyhow::Error>((steps, version, head))
+        }
     }
-    // An unchanged pin keeps its version. Otherwise the leaf's new head is a
-    // committed manifest whose exact bytes hash to it, at most `LEAF_SEARCH`
-    // versions at or below the pinned one (a restore only goes back), and
-    // accepted as a new head is (rule 6) except for its earlier epoch.
-    let version = if head == b.head {
-        b.version
-    } else {
-        let top = b.version.min(listed.current_version);
-        let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
-        let mut found = None;
-        for v in (low..=top).rev() {
-            let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
-            let m = SignedSnapshotManifestV2::parse(&reply.body)
-                .map_err(|_| bad("SignedSnapshotManifestV2"))?;
-            if Some(m.head_hash()) == head {
-                found = Some((v, m));
-                break;
-            }
-        }
-        let checked = match found {
-            Some((v, m)) => {
-                let c = chain.as_ref();
-                verify_leaf_head(db, dev, b, c, &keys, m, (v, epoch), now).map(|()| v)
-            }
-            None => Err(refusal(
-                "RESTORE_EPOCH_TRANSITION_INVALID",
-                "new_signed_head_hash",
-            )),
-        };
-        match checked {
-            Ok(v) => v,
-            Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
-        }
+    .await;
+    let record = |tx: &rusqlite::Connection| match &evaluated {
+        Some((seen, c)) => ledger::record_in(tx, &dev.pin.0, seen, c, None, now),
+        None => Ok(()),
     };
-    match store_transitions(db, client.base_url(), b, &steps, epoch, version, head) {
-        Ok(true) => Ok(()),
+    let refused = match accepted.and_then(|(steps, version, head)| {
+        let url = client.base_url();
+        store_transitions(db, url, b, &steps, (epoch, version, head), record)
+    }) {
+        Ok(true) => return Ok(()),
         Ok(false) => {
             let (reason, err) = refusal("RESTORE_EPOCH_TRANSITION_INVALID", "readback");
-            Err(quarantine(db, &b.local, reason, err))
+            quarantine(db, &b.local, reason, err)
         }
-        Err(e) => Err(e),
-    }
+        Err(e) => e,
+    };
+    record(&db.conn)?;
+    Err(refused)
 }
 
 type Refused = (&'static str, anyhow::Error);
@@ -1169,9 +1191,8 @@ fn store_transitions(
     server_url: &str,
     b: &Bound,
     steps: &[Step],
-    epoch: u64,
-    version: u64,
-    head: Option<[u8; 32]>,
+    (epoch, version, head): (u64, u64, Option<[u8; 32]>),
+    record: impl FnOnce(&rusqlite::Connection) -> Result<()>,
 ) -> Result<bool> {
     let tx = db.conn.transaction()?;
     let (instance, tenant, profile) = (hex(&b.instance), hex(&b.tenant), hex(&b.profile));
@@ -1285,6 +1306,7 @@ fn store_transitions(
     if moved != 1 {
         bail!(code("sync.bindingChanged"));
     }
+    record(&tx)?;
     tx.commit()?;
     Ok(true)
 }
@@ -5621,18 +5643,6 @@ mod tests {
     }
 
     impl World {
-        /// Records, as collecting a fleet key does, an evaluation at `at` of
-        /// the evidence the fake serves.
-        fn observe(&self, at: u64) {
-            let page = TenantTrustEvidencePageV2::parse(&self.fake().pages).unwrap();
-            let mut db = self.db();
-            let (seen, chain) =
-                ledger::evaluate(&db, &self.dev.pin.0, &self.dev.pin.1, &[page], at)
-                    .unwrap()
-                    .unwrap();
-            ledger::record(&mut db, &self.dev.pin.0, &seen, &chain, None, at).unwrap();
-        }
-
         /// Since when custodian `k` is held lapsed here, if it is.
         fn lapse_of(&self, k: &Ed25519SigningKey) -> Option<i64> {
             let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
@@ -5691,27 +5701,59 @@ mod tests {
         }
     }
 
+    /// A second custodian whose custody ends at NOW + 1 day, seen only while
+    /// transitions are being accepted: at NOW, before any is served, and at
+    /// NOW + 2 days, when it is held lapsed. Then it is re-appointed from
+    /// NOW + 3 days. Its key.
+    fn lapsed_then_reappointed(w: &World, seed: u8) -> Ed25519SigningKey {
+        let out = w.udd.with_file_name("out");
+        let first = (T0, T0, NOW + DAY);
+        let k = custodian(w, seed, &[first]);
+        let missing = w.pull_at(&out, NOW).unwrap_err();
+        assert!(has(&missing, "sync.epochTransitionMissing"), "{missing:#}");
+        assert_eq!(w.lapse_of(&k), None);
+        let lapse = NOW + 2 * DAY;
+        w.pull_at(&out, lapse).unwrap_err();
+        assert_eq!(w.lapse_of(&k), Some(lapse as i64), "kept by acceptance");
+        let again = NOW + 3 * DAY;
+        custodian(w, seed, &[first, (again, again, NOW + 100 * DAY)]);
+        k
+    }
+
     /// Q-25: a lapse refuses only what is dated at or before it. A custodian
-    /// whose custody ended is held lapsed, is re-appointed after the lapse,
-    /// and then signs a transition this device accepts.
+    /// held lapsed and re-appointed after the lapse signs a transition this
+    /// device accepts, and the evaluation accepting it is recorded once,
+    /// with it.
     #[test]
     fn a_custodian_reappointed_after_its_lapse_signs_again() {
         let w = world();
         let heads = restored(&w);
-        let out = w.udd.with_file_name("out");
-        let first = (T0, T0, NOW + DAY);
-        let k = custodian(&w, 0x70, &[first]);
-        // Seen while a custodian, then held lapsed once its custody ended.
-        w.observe(NOW);
-        assert_eq!(w.lapse_of(&k), None);
-        let lapse = NOW + 2 * DAY;
-        w.observe(lapse);
-        assert_eq!(w.lapse_of(&k), Some(lapse as i64));
-        let again = NOW + 3 * DAY;
-        custodian(&w, 0x70, &[first, (again, again, NOW + 100 * DAY)]);
+        let k = lapsed_then_reappointed(&w, 0x70);
         file_by(&w, &k, 0x70, NOW + 4 * DAY, heads);
-        w.pull_at(&out, NOW + 4 * DAY).unwrap();
+        let evaluations = || w.count("SELECT count(*) FROM trust_evaluations");
+        let before = evaluations();
+        w.pull_at(&w.udd.with_file_name("out"), NOW + 4 * DAY)
+            .unwrap();
         assert_eq!(w.state(LOCAL).2, 1);
+        assert_eq!(evaluations(), before + 1);
+    }
+
+    /// A lapse observed only while accepting transitions is kept (no fleet
+    /// key was collected meanwhile), so a later transition the same key
+    /// backdates into its old custody is refused, though it is a custodian
+    /// again by then.
+    #[test]
+    fn a_lapse_seen_while_accepting_refuses_a_backdated_transition() {
+        let w = world();
+        let heads = restored(&w);
+        let k = lapsed_then_reappointed(&w, 0x80);
+        file_by(&w, &k, 0x80, NOW + DAY / 2, heads);
+        let err = w
+            .pull_at(&w.udd.with_file_name("out"), NOW + 4 * DAY)
+            .unwrap_err();
+        assert!(has(&err, "sync.epochTransitionInvalid"), "{err:#}");
+        assert_eq!(w.state(LOCAL).2, 0);
+        assert_eq!(w.filed(), 0);
     }
 
     /// A lease release that fails before the server sees it is retried as

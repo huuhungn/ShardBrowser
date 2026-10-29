@@ -517,8 +517,23 @@ pub fn record(
     opened: Option<Opened>,
     now: u64,
 ) -> Result<()> {
-    let (instance, tenant) = ids(binding);
     let tx = db.conn.transaction()?;
+    record_in(&tx, binding, seen, chain, opened, now)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`record`] inside the caller's transaction `tx`, so the evaluation is kept
+/// with what it let the caller do.
+pub fn record_in(
+    tx: &rusqlite::Connection,
+    binding: &Binding,
+    seen: &[TenantTrustEvidencePageV2],
+    chain: &TrustChain,
+    opened: Option<Opened>,
+    now: u64,
+) -> Result<()> {
+    let (instance, tenant) = ids(binding);
     tx.execute(
         "INSERT INTO trust_evaluations(server_instance_id, tenant_id, evaluated_at_ms)
          VALUES (?1, ?2, ?3)",
@@ -606,7 +621,7 @@ pub fn record(
             ],
         )?;
     }
-    hold_lapses(&tx, binding, evaluation, now)?;
+    hold_lapses(tx, binding, evaluation, now)?;
     if let Some(o) = opened {
         tx.execute(
             "INSERT INTO trust_fleet_generations VALUES (?1, ?2, ?3, ?4)
@@ -640,9 +655,8 @@ pub fn record(
             ],
         )?;
         // Probe 3 (L2032): the exact grant with every column it decides.
-        super::records::keep(&tx, o.server_url, o.container, now)?;
+        super::records::keep(tx, o.server_url, o.container, now)?;
     }
-    tx.commit()?;
     Ok(())
 }
 
