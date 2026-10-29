@@ -322,6 +322,12 @@ fn guard(version: i64) -> (String, String, &'static str) {
                 .into(),
             "a ledger row is superseded once, by the next restore epoch",
         ),
+        // The rebuilt quarantine takes device revocations and is still kept.
+        32 => (
+            quarantined("device_revocation"),
+            "DELETE FROM v2_grant_quarantine".into(),
+            "a grant quarantine is never removed",
+        ),
         _ => unreachable!("no guard for {version}"),
     }
 }
@@ -1366,4 +1372,15 @@ async fn fixtures_1_to_4_hold_on_a_populated_0016_file_after_its_upgrade() {
     let pool = reopen(pool, &dir.db()).await;
     run_migrations(&pool).await.unwrap();
     fixtures_on(pool, &dir.db(), "0016 world upgraded").await;
+}
+
+#[tokio::test]
+async fn m0032_the_rebuilt_grant_quarantine_keeps_its_rows_and_takes_device_revocations() {
+    let pool = upgrade(32).await;
+    for kind in ["device_approval", "unknown_kind"] {
+        let e = exec(&pool, &quarantined(kind)).await;
+        assert_eq!(kind == "unknown_kind", e.is_err(), "{kind}: {e:?}");
+    }
+    let e = exec(&pool, &quarantined("root_grant")).await.unwrap_err();
+    assert!(e.contains("a grant is quarantined once"), "{e}");
 }
