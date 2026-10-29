@@ -4420,10 +4420,14 @@ mod profile_mutation_boundary_tests {
             profile_id.to_string(),
             "passphrase".to_string(),
             0,
+            None,
+            None,
         )));
         assert_running_blocked(rt.block_on(sync_cmd::profile_sync_pull(
             profile_id.to_string(),
             "passphrase".to_string(),
+            None,
+            None,
         )));
 
         tracker.set_running_for_test(profile_id, false);

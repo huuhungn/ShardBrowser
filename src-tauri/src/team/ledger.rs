@@ -415,6 +415,74 @@ pub fn fleet_key_grant(
     Ok(Some((container, pages)))
 }
 
+/// ADR 0002 Q-18: whether this device refuses to commit under `generation`
+/// of `fleet_id` because a counted `DeviceRevocationV2` with reason
+/// `compromised` exposes it. Exposed means the kept evidence of the
+/// generation shows a `DeviceHpkeGrant` of it to, or issued by, the revoked
+/// key, or this device verified the generation no later than it counted the
+/// revocation, so a newer, unexposed generation is not yet ACTIVE here
+/// (missing evidence counts as flagged, C-1). A revocation whose reason this
+/// device cannot verify counts as `compromised`.
+// shortcut: the fleet flagged through the root (a RecoveryGrant under an
+// exposed root generation, C-1) is not derived; add it with the root
+// rotation banner (Q-20).
+pub fn commit_blocked(
+    db: &Db,
+    binding: &Binding,
+    anchor: &[u8; 32],
+    fleet_id: &[u8; 16],
+    generation: u64,
+) -> Result<bool> {
+    use shardx_core::authz_record::DeviceRevocationReason;
+    let (instance, tenant) = ids(binding);
+    let kept = fleet_key_grant(db, binding, anchor, fleet_id, generation)?;
+    let verified: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT verified_evaluation FROM trust_fleet_key_grants
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3 AND generation = ?4",
+            params![instance, tenant, hex(fleet_id), wire(generation)?],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let pages = kept.map(|(_, pages)| pages).unwrap_or_default();
+    let keys = keys_of(&pages);
+    let payload = |c: &[u8]| {
+        let r = AuthorizationRecord::parse(c).ok()?;
+        let pk = keys.get(r.issuer_signing_key_id())?;
+        let issuer = *r.issuer_signing_key_id();
+        Some((issuer, r.verify_signature(pk).ok()?.payload().clone()))
+    };
+    let mut s = db.conn.prepare(
+        "SELECT signing_key_id, counted_evaluation, exact_signed_container_bytes
+         FROM trust_proven_revocations WHERE server_instance_id = ?1 AND tenant_id = ?2
+           AND source = 'DEVICE_REVOCATION'",
+    )?;
+    let mut rows = s.query(params![instance, tenant])?;
+    while let Some(r) = rows.next()? {
+        let key = decode_hex32(&r.get::<_, String>(0)?, "signing_key_id")?;
+        let counted: i64 = r.get(1)?;
+        let container: Vec<u8> = r.get(2)?;
+        if matches!(payload(&container), Some((_, Payload::DeviceRevocation(d)))
+            if d.reason_code != DeviceRevocationReason::Compromised)
+        {
+            continue;
+        }
+        if verified.is_none_or(|v| v <= counted) {
+            return Ok(true);
+        }
+        let exposes = pages.iter().flat_map(|p| &p.containers).any(|c| {
+            matches!(payload(c), Some((issuer, Payload::DeviceHpkeGrant(g)))
+                if g.fleet_id == *fleet_id && g.generation == generation
+                    && (issuer == key || g.subject_signing_key_id == key))
+        });
+        if exposes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// After `chain` evaluated `seen` (from [`evaluate`]), in one transaction:
 /// a new evaluation, the first sighting of every container, the reported
 /// revocations, every `DeviceRevocationV2` rule 6 counts, the custodian keys

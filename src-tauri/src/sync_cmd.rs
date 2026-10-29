@@ -26,7 +26,7 @@
 
 use serde::Serialize;
 
-use crate::{fleet_client, fleet_keys, profile, team_config};
+use crate::{fleet_client, fleet_keys, profile, team, team_config};
 
 /// Result of a completed push.
 #[derive(Debug, Serialize)]
@@ -87,11 +87,20 @@ fn fleet_id(c: &team_config::TeamConfig) -> String {
 /// `profile_sync_status`, or 0 for a first push. The server rejects a commit
 /// whose base does not match the current head, which is what stops two devices
 /// silently overwriting each other.
+///
+/// A published profile (one `team-sync.db` binds) goes over the G2 wire
+/// instead (`team::sync`): sealed under the verified fleet key, never the
+/// passphrase, in a device session the account `username` and `password`
+/// open for this call only.
+// shortcut: the sync dialog does not ask for the account yet, so a
+// published profile syncs only once the Team profile UI passes it.
 #[tauri::command]
 pub async fn profile_sync_push(
     profile_id: String,
     passphrase: String,
     base_version: i64,
+    username: Option<String>,
+    password: Option<String>,
 ) -> Result<PushResult, String> {
     // Running-state first: a user whose profile is running must be told to
     // stop it, not sent to fix server settings that were never the problem.
@@ -106,6 +115,25 @@ pub async fn profile_sync_push(
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if !udd.exists() {
         return Err(crate::errcode::code("sync.noDataToPush"));
+    }
+    if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
+        let (client, session, dev) = published_session(&c, username, password).await?;
+        let pushed = team::sync::push(
+            &client,
+            &session.access_token,
+            &dev,
+            &profile_id,
+            &udd,
+            now_ms(),
+        )
+        .await;
+        client.end_session(&session.access_token).await;
+        let p = pushed.map_err(|e| format!("{e:#}"))?;
+        return Ok(PushResult {
+            version: p.version as i64,
+            container_bytes: p.ciphertext_size,
+            sha256: fleet_client::hex(&p.ciphertext_sha256),
+        });
     }
 
     // Argon2id is deliberately slow and packing is IO-bound: not on the UI
@@ -210,8 +238,16 @@ pub(crate) fn pull_candidates(c: &team_config::TeamConfig, now: u64) -> Vec<([u8
 /// The container is downloaded and fully authenticated in memory before
 /// anything touches the profile directory, so a wrong passphrase or a damaged
 /// transfer cannot leave a half-written profile behind.
+///
+/// A published profile is pulled over the G2 wire (`team::sync`), as
+/// `profile_sync_push` describes.
 #[tauri::command]
-pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result<u64, String> {
+pub async fn profile_sync_pull(
+    profile_id: String,
+    passphrase: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<u64, String> {
     let _claim = profile::begin_user_mutation(
         [&profile_id],
         &crate::errcode::code("profile.actionPullFromTeam"),
@@ -221,6 +257,20 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
     profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
+    if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
+        let (client, session, dev) = published_session(&c, username, password).await?;
+        let pulled = team::sync::pull(
+            &client,
+            &session.access_token,
+            &dev,
+            &profile_id,
+            &udd,
+            now_ms(),
+        )
+        .await;
+        client.end_session(&session.access_token).await;
+        return pulled.map_err(|e| format!("{e:#}"));
+    }
 
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
@@ -241,10 +291,7 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
-    let candidates = pull_candidates(&c, now);
+    let candidates = pull_candidates(&c, now_ms());
 
     tokio::task::spawn_blocking(move || {
         open_pulled(&container, &udd, &profile_id, &candidates, &passphrase)
@@ -253,6 +300,52 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
     .map_err(|e| {
         crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
     })?
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A device session for published-profile sync (ADR 0001 R2), opened with
+/// the account password for this call only: the session and the password
+/// stay in memory and the caller ends the session (plan L2048). This device
+/// syncs a published profile only under the anchor it pinned.
+async fn published_session(
+    c: &team_config::TeamConfig,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<
+    (
+        fleet_client::FleetClient,
+        fleet_client::DeviceSession,
+        team::sync::Device,
+    ),
+    String,
+> {
+    let username = username.unwrap_or_default();
+    let password = zeroize::Zeroizing::new(password.unwrap_or_default());
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let pin =
+        crate::pinned_anchor(c).ok_or_else(|| crate::errcode::code("sync.noVerifiedFleetKey"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let hpke_seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let me = crate::recipient(c).map_err(|e| e.to_string())?;
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username: username.trim(),
+        password: &password,
+    };
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &hpke_seed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((client, session, team::sync::Device { signer, me, pin }))
 }
 
 /// What the server currently holds for `profile_id`, or `None` if nothing.
@@ -453,6 +546,70 @@ mod tests {
         );
     }
 
+    /// A published profile never takes the passphrase path: without the
+    /// account that opens a device session, push and pull ask for it,
+    /// whatever passphrase is given.
+    #[test]
+    fn a_published_profile_never_takes_the_passphrase_path() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _lifecycle = profile::lifecycle_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+
+        let mut stored = profile::StoredProfile::default();
+        profile::save_raw(&mut stored).unwrap();
+        let id = stored.meta.id.clone();
+        let udd = profile::user_data_dir(&id).unwrap();
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let seed = "11".repeat(32);
+        team_config::save(&team_config::TeamConfig {
+            server_url: "http://127.0.0.1:9".into(),
+            token: "t".into(),
+            tenant_id: "aa".repeat(16),
+            device_id: "bb".repeat(16),
+            account_id: "cc".repeat(16),
+            fleet_id: "dd".repeat(16),
+            signing_key_seed: seed.clone(),
+            hpke_key_seed: seed,
+            ..Default::default()
+        })
+        .unwrap();
+        team::db::Db::open()
+            .unwrap()
+            .conn
+            .execute(
+                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
+                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
+                 VALUES (?1, ?2, ?2, ?2, ?2, 0, 0, 'AVAILABLE')",
+                [id.clone(), "ee".repeat(16)],
+            )
+            .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pushed = rt.block_on(profile_sync_push(
+            id.clone(),
+            "team-passphrase".into(),
+            0,
+            None,
+            None,
+        ));
+        let pulled = rt.block_on(profile_sync_pull(id, "team-passphrase".into(), None, None));
+        crate::store::set_config_root(None);
+
+        for err in [
+            pushed.map(|_| ()).unwrap_err(),
+            pulled.map(|_| ()).unwrap_err(),
+        ] {
+            assert!(
+                crate::errcode::has_code(&err, "fleet.setAccountFirst"),
+                "{err}"
+            );
+        }
+    }
+
     /// A fleet key cached from the team server must not stand in for the
     /// passphrase: the server may have chosen that key.
     #[test]
@@ -492,7 +649,7 @@ mod tests {
 
         let result = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(profile_sync_push(id, String::new(), 0));
+            .block_on(profile_sync_push(id, String::new(), 0, None, None));
         crate::store::set_config_root(None);
 
         let err = result.expect_err("push must refuse without a passphrase");
