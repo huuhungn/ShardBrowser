@@ -2383,7 +2383,7 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
     assert_restored(&d, txn).await;
 
     // A restore does not read around a revocation either: one of another
-    // server instance, or one that is quarantined, refuses it.
+    // server instance refuses it, naming which row and what clears it.
     reset(&d);
     let third = peer(&d, &w.dev, 0x77, w.instance).await;
     revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
@@ -2394,7 +2394,14 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
         &format!("UPDATE v2_device_revocations SET server_instance_id = zeroblob(16) {row}"),
     )
     .await;
-    assert_refused_cleanly(&d, txn, "quarantined or of another server instance").await;
+    let named = format!(
+        "device revocation {} of tenant {}",
+        hex(&[0x90; 16]),
+        hex(&TENANT)
+    );
+    assert_refused_cleanly(&d, txn, &named).await;
+    assert_refused_cleanly(&d, txn, "belongs to another server instance").await;
+    assert_refused_cleanly(&d, txn, "restoring the row and restarting clears it").await;
     exec(
         &d,
         &format!(
@@ -2403,6 +2410,9 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
         ),
     )
     .await;
+
+    // A row that was marked but verifies intact is served again, so the
+    // mark alone does not stop a restore.
     exec(
         &d,
         "INSERT INTO v2_grant_quarantine
@@ -2411,7 +2421,28 @@ async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
                 'container_mismatch', 't' FROM v2_device_revocations",
     )
     .await;
-    assert_refused_cleanly(&d, txn, "quarantined or of another server instance").await;
+    ok(prepare(&d, None, txn));
+    ok(cli(&d, &["restore", "commit"]));
+    assert_restored(&d, txn).await;
+
+    // A mark whose row is gone refuses it: the revocation may have been
+    // removed to hide a device.
+    reset(&d);
+    let third = peer(&d, &w.dev, 0x77, w.instance).await;
+    revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
+    exec(
+        &d,
+        "INSERT INTO v2_grant_quarantine
+           (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+         SELECT 'device_revocation', server_instance_id, tenant_id, replay_id,
+                'container_mismatch', 't' FROM v2_device_revocations",
+    )
+    .await;
+    exec(&d, "DROP TRIGGER v2_device_revocations_no_delete").await;
+    on_backup(&d, "DROP TRIGGER v2_device_revocations_no_delete").await;
+    exec(&d, "DELETE FROM v2_device_revocations").await;
+    assert_refused_cleanly(&d, txn, "is quarantined and its row is missing").await;
+    assert_refused_cleanly(&d, txn, &named).await;
     done(&d);
 }
 
@@ -2661,4 +2692,153 @@ async fn g2_55_a_read_only_start_on_a_network_data_directory_writes_no_count() {
     let said = refused_start(&u, 28437);
     assert!(said.contains("network share"), "{said}");
     assert!(!d.data.join("audit-ro-failures").exists());
+}
+
+/// N2: the episode key changes while a restore runs (the manifest appears), and
+/// the count under the old key is not dropped: `restore status` lists it in
+/// every class, commit and abort clear only their own episode, and
+/// `restore clear-audit-count` acknowledges the rest by name.
+#[tokio::test]
+async fn g2_55_a_count_under_a_changed_episode_key_is_kept_and_cleared_by_name() {
+    let d = dirs("wi-audit-switch");
+    initialised(&d);
+    assert_server_normal(&d, 28438).await;
+    // K5a before any manifest parses: the episode is the record's.
+    std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
+    assert_class(&d, "K5a", "L2260");
+    two_failed_logins(&d, 28438).await;
+    let status = ok(cli(&d, &["restore", "status"]));
+    assert_eq!(field(&status, "audit_write_failures"), "2");
+    let old_key = {
+        let counts = std::fs::read_to_string(d.data.join("audit-ro-failures")).unwrap();
+        let (key, count) = counts.trim().split_once(' ').unwrap();
+        assert_eq!(count, "2");
+        assert!(key.starts_with("record-"), "{key}");
+        key.to_string()
+    };
+
+    // The junk goes and a real preparation takes its place: another key.
+    std::fs::remove_file(d.identity.join(MANIFEST_FILE)).unwrap();
+    std::fs::copy(d.db(), &d.backup).unwrap();
+    let txn = exported(&d).0;
+    ok(prepare(&d, None, &txn));
+    assert_class(&d, "K7", "L2260");
+    two_failed_logins(&d, 28438).await;
+    let status = ok(cli(&d, &["restore", "status"]));
+    assert_eq!(field(&status, "audit_write_failures"), "2");
+    assert_eq!(
+        field(&status, "audit_write_failures_kept"),
+        format!("{old_key} 2")
+    );
+
+    // The restore ends: its own count is printed and cleared, the old key's
+    // is printed as kept and stays, in K3 too.
+    let committed = ok(cli(&d, &["restore", "commit"]));
+    assert_eq!(field(&committed, "audit_write_failures"), "2");
+    assert_eq!(
+        field(&committed, "audit_write_failures_kept"),
+        format!("{old_key} 2")
+    );
+    assert_class(&d, "K3", "L2259");
+    let k3 = ok(cli(&d, &["restore", "status"]));
+    assert_eq!(
+        field(&k3, "audit_write_failures_kept"),
+        format!("{old_key} 2")
+    );
+    assert!(!String::from_utf8_lossy(&k3.stdout).contains("audit_write_failures="));
+
+    // Only a named acknowledgement clears it.
+    refused(
+        cli(
+            &d,
+            &["restore", "clear-audit-count", "--episode", "record-nope"],
+        ),
+        "no audit failure count is kept",
+    );
+    let cleared = ok(cli(
+        &d,
+        &["restore", "clear-audit-count", "--episode", &old_key],
+    ));
+    assert_eq!(
+        field(&cleared, "cleared_audit_count"),
+        format!("{old_key} 2")
+    );
+    assert!(!d.data.join("audit-ro-failures").exists());
+    assert!(
+        !String::from_utf8_lossy(&cli(&d, &["restore", "status"]).stdout)
+            .contains("audit_write_failures")
+    );
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// N4: `SHARDX_IDENTITY_DIR=""` is a configuration error, not "unset": the
+/// server and the restore commands refuse with that named reason.
+#[tokio::test]
+async fn an_empty_identity_directory_setting_refuses_to_start() {
+    let d = dirs("empty-identity-dir");
+    initialised(&d);
+    assert_server_normal(&d, 28439).await;
+    let blank = Dirs {
+        base: d.base.clone(),
+        data: d.data.clone(),
+        identity: PathBuf::new(),
+        backup: d.backup.clone(),
+    };
+    let said = refused_start(&blank, 28439);
+    assert!(
+        said.contains("SHARDX_IDENTITY_DIR is set but empty"),
+        "{said}"
+    );
+    for args in [&["restore", "status"][..], &["identity", "show"]] {
+        let o = cli(&blank, args);
+        assert!(!o.status.success(), "{args:?}: {}", text(&o));
+        assert!(
+            text(&o).contains("SHARDX_IDENTITY_DIR is set but empty"),
+            "{args:?}: {}",
+            text(&o)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d.base);
+}
+
+/// Makes `link` a symbolic link to `target`, or says why it cannot (Windows
+/// needs Developer Mode or an administrator, as the GitHub runner is).
+fn symlink_file(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(target, link);
+    match made {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("SKIPPED: cannot create a symlink here: {e}");
+            false
+        }
+    }
+}
+
+/// N3: `require_plain` is the only gate against a link, so a symlink that
+/// points to a VALID manifest is still not the manifest: without the gate the
+/// manifest would parse and the class would be the prepared K7.
+#[tokio::test]
+async fn a_symlink_to_a_valid_manifest_is_not_the_manifest() {
+    let d = dirs("symlinked-manifest");
+    initialised(&d);
+    assert_server_normal(&d, 28440).await;
+    std::fs::copy(d.db(), &d.backup).unwrap();
+    let txn = exported(&d).0;
+    ok(prepare(&d, None, &txn));
+    assert_class(&d, "K7", "L2260");
+    let manifest = d.identity.join(MANIFEST_FILE);
+    let moved = d.base.join("moved-manifest.bin");
+    std::fs::rename(&manifest, &moved).unwrap();
+    if !symlink_file(&moved, &manifest) {
+        std::fs::rename(&moved, &manifest).unwrap();
+        return;
+    }
+    assert_eq!(class(&d).0, "K5a", "a link is an unparsable manifest");
+    std::fs::remove_file(&manifest).unwrap();
+    std::fs::rename(&moved, &manifest).unwrap();
+    assert_class(&d, "K7", "L2260");
+    let _ = std::fs::remove_dir_all(&d.base);
 }

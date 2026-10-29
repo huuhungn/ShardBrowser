@@ -82,6 +82,12 @@ pub fn hex(bytes: &[u8]) -> String {
 /// data directory nor inside or around it, because the data directory is in
 /// the DB backup and rollback scope the record must stay out of.
 pub fn preflight(identity_dir: &str, data_dir: &str) -> Result<PathBuf, String> {
+    if identity_dir.is_empty() {
+        return Err(
+            "SHARDX_IDENTITY_DIR is set but empty; set it to the identity directory or remove it"
+                .into(),
+        );
+    }
     let identity = std::fs::canonicalize(identity_dir)
         .map_err(|e| format!("SHARDX_IDENTITY_DIR {identity_dir:?}: {e}"))?;
     if !identity.is_dir() {
@@ -238,7 +244,6 @@ pub(crate) fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Re
         )
     };
     let entry = match std::fs::symlink_metadata(&path) {
-        Ok(m) if is_link(&m) => return Err(not_regular()),
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(refuse(
@@ -248,9 +253,8 @@ pub(crate) fn read_record(dir: &Path) -> Result<(IdentityRecordV2, [u8; 32]), Re
         }
         Err(e) => return Err(unreadable(e)),
     };
-    if !entry.file_type().is_file() {
-        return Err(not_regular());
-    }
+    // The one gate for a link, a reparse point, another kind of entry and
+    // another volume; the handle is compared with this entry below.
     require_plain(&path, false).map_err(|e| refuse(ReasonCode::Corrupt, e))?;
     let file = open_no_follow(&path).map_err(unreadable)?;
     // Checked again on the open handle, so a swap after the first check fails.

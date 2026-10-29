@@ -40,10 +40,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
 
 use crate::config::Config;
-use crate::error::AppError;
 use crate::identity::{self, hex, Mirror, Verified, RECORD_FILE};
 use crate::routes::v2_auth::Session;
-use crate::routes::v2_device_revoke::load_revocation;
+use crate::routes::v2_device_revoke::look_at_revocations;
 use crate::routes::v2_root_grants::is_active_custodian;
 use crate::util;
 
@@ -399,8 +398,9 @@ fn read_manifest(site: &Site) -> Prep {
     let path = site.identity.join(MANIFEST_FILE);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Prep::Absent,
-        // A link or reparse point is not the manifest, whatever it points to.
-        Ok(m) if m.file_type().is_file() && identity::require_plain(&path, false).is_ok() => {
+        // A link or reparse point is not the manifest, whatever it points to;
+        // require_plain is the one gate.
+        Ok(_) if identity::require_plain(&path, false).is_ok() => {
             let mut bytes = Vec::new();
             let read = std::fs::File::open(&path)
                 .and_then(|f| f.take(rm::MANIFEST_LEN as u64 + 1).read_to_end(&mut bytes));
@@ -525,20 +525,41 @@ pub async fn startup_gate(cfg: &Config) -> anyhow::Result<(Class, Option<String>
     Ok((class, class.read_only().then(|| episode(&o)).flatten()))
 }
 
-/// WI-AUDIT-RO: the v1 audit writes the read-only DB refused in this episode.
-fn print_audit_failures(cfg: &Config, episode: &str) {
-    println!(
-        "audit_write_failures={}",
-        crate::audit::read_only_failures(&cfg.data_dir, episode)
-    );
+/// WI-AUDIT-RO: the v1 audit writes the read-only DB refused in this episode,
+/// when `episode` is one (a read-only class), and the counts kept for other
+/// episodes in every class: an episode's key can change mid-restore, and its
+/// count waits for `restore clear-audit-count --episode <key>`.
+fn print_audit_failures(cfg: &Config, episode: Option<&str>) {
+    if let Some(episode) = episode {
+        println!(
+            "audit_write_failures={}",
+            crate::audit::read_only_failures(&cfg.data_dir, episode)
+        );
+    }
+    for kept in crate::audit::kept_failures(&cfg.data_dir, episode) {
+        println!("audit_write_failures_kept={kept}");
+    }
 }
 
-/// A restore ends: print its episode's failed audit writes, then clear them.
+/// A restore ends: print its episode's failed audit writes and those kept for
+/// other episodes, then clear its own.
 fn finish_episode(cfg: &Config, episode: Option<&str>) {
+    print_audit_failures(cfg, episode);
     if let Some(episode) = episode {
-        print_audit_failures(cfg, episode);
-        crate::audit::clear_read_only_count(&cfg.data_dir);
+        crate::audit::clear_read_only_count(&cfg.data_dir, episode);
     }
+}
+
+/// `restore clear-audit-count --episode <key>`: acknowledges the failed audit
+/// writes counted under a key that no restore will end. There is no offline
+/// audit path for it: the v2 audit events are per tenant and the database may
+/// be read-only, so the cleared count is printed for the operator's record.
+pub fn clear_audit_count(cfg: &Config, episode: &str) -> anyhow::Result<()> {
+    match crate::audit::clear_episode(&cfg.data_dir, episode)? {
+        Some(count) => println!("cleared_audit_count={episode} {count}"),
+        None => bail!("no audit failure count is kept for episode {episode:?}"),
+    }
+    Ok(())
 }
 
 /// The incident output `identity show` adds: the class and the failed audit
@@ -546,10 +567,11 @@ fn finish_episode(cfg: &Config, episode: Option<&str>) {
 pub async fn print_incident(cfg: &Config) {
     if let Ok((_, o)) = observe(cfg).await {
         let class = classify(&o);
-        if let Some(episode) = class.read_only().then(|| episode(&o)).flatten() {
+        let episode = class.read_only().then(|| episode(&o)).flatten();
+        if episode.is_some() {
             println!("class={class:?}");
-            print_audit_failures(cfg, &episode);
         }
+        print_audit_failures(cfg, episode.as_deref());
     }
 }
 
@@ -559,9 +581,10 @@ pub async fn status(cfg: &Config) -> anyhow::Result<()> {
     let class = classify(&o);
     println!("class={class:?}");
     println!("row={}", class.row());
-    if let Some(episode) = class.read_only().then(|| episode(&o)).flatten() {
-        print_audit_failures(cfg, &episode);
-    }
+    print_audit_failures(
+        cfg,
+        class.read_only().then(|| episode(&o)).flatten().as_deref(),
+    );
     if let (Class::K3, Some(site)) = (class, &site) {
         for path in orphans(site) {
             println!("orphan={}", path.display());
@@ -806,41 +829,19 @@ pub async fn export_heads(cfg: &Config, backup: &Path, out: &Path) -> anyhow::Re
     Ok(())
 }
 
-/// Every device revocation row must still hold what its signed container
-/// says, and be of this instance and unquarantined, before a restore reads
-/// its columns: a tampered row could hide a revocation from the signer and
-/// snapshot checks. Offline, so nothing is quarantined here; it refuses.
+/// Every device revocation must be served correctly right now before a
+/// restore reads the rows: a tampered or moved row could hide a revocation
+/// from the signer and snapshot checks. A row marked before that verifies
+/// again passes. Offline, so nothing is quarantined here; it refuses.
 async fn ensure_revocations_intact(
     conn: &mut SqliteConnection,
     instance: &[u8; 16],
 ) -> anyhow::Result<()> {
-    let rows = sqlx::query("SELECT tenant_id, replay_id FROM v2_device_revocations")
-        .fetch_all(&mut *conn)
-        .await?;
-    for r in rows {
-        let id = |i: usize| -> anyhow::Result<[u8; 16]> {
-            r.get::<Vec<u8>, _>(i)
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("a device revocation row has a malformed key"))
-        };
-        let (tenant, replay) = (id(0)?, id(1)?);
-        match load_revocation(conn, instance, &tenant, &replay).await {
-            Ok(Some(_)) => {}
-            // The row exists, so none found is quarantined or of another instance.
-            Ok(None) => bail!(
-                "refusing: device revocation {} of tenant {} is quarantined or of another \
-                 server instance",
-                hex(&replay),
-                hex(&tenant)
-            ),
-            Err(AppError::Quarantine(_)) => bail!(
-                "refusing: device revocation {} of tenant {} does not match its signed \
-                 container or is quarantined",
-                hex(&replay),
-                hex(&tenant)
-            ),
-            Err(e) => bail!("refusing: checking a device revocation failed: {e:?}"),
-        }
+    let found = look_at_revocations(conn, instance, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("refusing: checking the device revocations failed: {e:?}"))?;
+    if let Some(first) = found.unserved.first() {
+        bail!("refusing: {}", first.describe());
     }
     Ok(())
 }

@@ -25,7 +25,7 @@ use shared::trust_evidence::{
 
 use super::v2_approval::{cbor, coded};
 use super::v2_auth::{reload_session, unhex, verified, Principal};
-use super::v2_device_revoke::load_revocation;
+use super::v2_device_revoke::{load_revocation, look_at_revocations};
 use crate::error::AppError;
 use crate::identity::{ReasonCode, Verified};
 use crate::state::AppState;
@@ -39,11 +39,12 @@ pub const MAX_SIGNERS: usize = 64;
 /// rows and whether they are scoped. Approvals and capability grants are
 /// scoped: those of the root grant subjects and of the named signers. Every
 /// other table is served whole.
+/// Revocations have no kind here: a marked one is served while it verifies.
 const KINDS: [(&str, Option<&str>, bool); 7] = [
     ("v2_tenant_root_key_grants", Some("root_grant"), false),
     ("v2_device_approvals", Some("device_approval"), true),
     ("v2_capability_grants", Some("capability_grant"), true),
-    (REVOCATIONS, Some("device_revocation"), false),
+    (REVOCATIONS, None, false),
     (
         "v2_fleet_device_hpke_grants",
         Some("fleet_device_hpke_grant"),
@@ -150,7 +151,8 @@ fn revoked_at_ms(revoked_at: &str) -> u64 {
 
 /// The rows of `kind` after `after`, at most `limit`, without their
 /// containers: a page loads only the containers it serves. Quarantined rows
-/// are left out, except that a quarantined revocation refuses the page.
+/// are left out, except revocations: one is served as long as its row verifies
+/// and refuses the page when it does not.
 async fn rows(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -162,17 +164,13 @@ async fn rows(
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, AppError> {
     let (table, quarantine_kind, scoped) = KINDS[usize::from(kind)];
     // A page that left a revocation out would let a revoked device pass as
-    // live, so one that cannot be trusted refuses the page, as the startup
-    // pass does. Rows of other instances count: moving one hides it.
+    // live, so one that is not served correctly right now refuses the page,
+    // as the startup pass does. Rows of other instances count: moving one
+    // hides it. Every row served is verified when it is loaded.
     if table == REVOCATIONS {
-        let untrusted: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM v2_grant_quarantine WHERE kind = 'device_revocation')
-                 OR EXISTS (SELECT 1 FROM v2_device_revocations WHERE server_instance_id <> ?)",
-        )
-        .bind(v.server_instance_id.as_slice())
-        .fetch_one(&mut *conn)
-        .await?;
-        if untrusted {
+        let found = look_at_revocations(&mut *conn, &v.server_instance_id, false).await?;
+        if let Some(first) = found.unserved.first() {
+            tracing::warn!("{}", first.describe());
             return Err(AppError::EpochAuthority(
                 ReasonCode::ControlPlaneIntegrityUntrusted,
             ));
