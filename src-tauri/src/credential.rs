@@ -320,23 +320,33 @@ mod tests {
         println!("G2-48-CHILD-OK");
     }
 
-    /// A key that went to the key file because the OS store was unavailable
-    /// is there for a fresh process, locked until the passphrase opens it.
     #[test]
-    fn a_key_file_key_is_locked_then_served_in_a_fresh_process() {
-        let guard = crate::store::config_root_test_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let root = tempfile::tempdir().unwrap();
-        crate::store::set_config_root(Some(root.path().to_path_buf()));
+    #[ignore = "child process of the G2-48 check"]
+    fn child_files_a_key_in_the_key_file() {
+        let Some(root) = env("SHARDX_G2_48_ROOT") else {
+            return;
+        };
+        crate::store::set_config_root(Some(root.into()));
         OS_STORE_DOWN.with(|d| d.set(true));
-        crate::key_file::close();
         crate::key_file::create("g2-48 test passphrase").unwrap();
         store("device-hpke.g2-48", &[0x48; 32]).unwrap();
-        crate::key_file::close();
-        OS_STORE_DOWN.with(|d| d.set(false));
-        crate::store::set_config_root(None);
-        drop(guard);
+        println!("G2-48-CHILD-OK");
+    }
+
+    /// A key that went to the key file because the OS store was unavailable
+    /// is there for a fresh process, locked until the passphrase opens it.
+    /// Both runs are child processes: the config root and the open key file
+    /// are process-global, and a locked file under the root would fail the
+    /// other credential tests running beside this one.
+    #[test]
+    fn a_key_file_key_is_locked_then_served_in_a_fresh_process() {
+        let root = tempfile::tempdir().unwrap();
+        let child = crate::crash_harness::spawn(
+            "credential::tests::child_files_a_key_in_the_key_file",
+            "-",
+            &[("SHARDX_G2_48_ROOT", root.path())],
+        );
+        assert!(crate::crash_harness::kill_after(child, "G2-48-CHILD-OK"));
         let child = crate::crash_harness::spawn(
             "credential::tests::child_unlocks_the_key_file",
             "-",
