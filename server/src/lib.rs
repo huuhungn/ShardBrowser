@@ -6,6 +6,7 @@ use sqlx::migrate::{Migration, Migrator};
 use sqlx::{SqliteConnection, SqlitePool};
 
 pub mod identity_record;
+pub mod restore_manifest;
 
 /// Apply the embedded migrations, accepting a database whose applied
 /// migrations were checksummed with the other line ending.
