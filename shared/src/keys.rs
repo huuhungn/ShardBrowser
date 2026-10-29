@@ -163,6 +163,92 @@ pub fn unwrap_dek(
     Ok(Zeroizing::new(arr))
 }
 
+// ---------------------------------------------------------- profile label --
+
+/// Domain label of the AAD a profile label is sealed under.
+pub const L_PROFILE_LABEL: &str = "SHARDX-PROFILE-LABEL-V2\0";
+/// Longest label `seal_label` takes, in bytes: the server stores at most 4096
+/// bytes of `label_ciphertext` (plan L948), which also holds the nonce and tag.
+pub const MAX_LABEL_LEN: usize = 1024;
+
+fn label_aad(
+    tenant_id: &[u8; 16],
+    fleet_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    generation: u64,
+) -> Vec<u8> {
+    let mut aad = L_PROFILE_LABEL.as_bytes().to_vec();
+    aad.extend_from_slice(tenant_id);
+    aad.extend_from_slice(fleet_id);
+    aad.extend_from_slice(profile_id);
+    aad.extend_from_slice(&generation.to_be_bytes());
+    aad
+}
+
+/// Seals the display `label` of a profile under the fleet key, as
+/// `nonce || ciphertext || tag`: the `label_ciphertext` of a publish-create
+/// request, which the server stores and never reads (plan L364). The AAD
+/// names the tenant, fleet, profile and key generation, so the ciphertext
+/// opens nowhere else. An empty or overlong label is refused.
+pub fn seal_label(
+    fkek: &[u8; 32],
+    nonce: &[u8; WRAP_NONCE_LEN],
+    tenant_id: &[u8; 16],
+    fleet_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    generation: u64,
+    label: &[u8],
+) -> Result<Vec<u8>, KeyError> {
+    if label.is_empty() || label.len() > MAX_LABEL_LEN {
+        return Err(KeyError::BadLength {
+            field: "label",
+            got: label.len(),
+        });
+    }
+    let aad = label_aad(tenant_id, fleet_id, profile_id, generation);
+    let sealed = ChaCha20Poly1305::new(&(*fkek).into())
+        .encrypt(
+            &(*nonce).into(),
+            Payload {
+                msg: label,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| KeyError::Aead)?;
+    Ok([nonce.as_slice(), &sealed].concat())
+}
+
+/// The label `seal_label` sealed, or `KeyError::Aead` for any other key, tenant,
+/// fleet, profile, generation or byte.
+pub fn open_label(
+    fkek: &[u8; 32],
+    tenant_id: &[u8; 16],
+    fleet_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    generation: u64,
+    sealed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+    if sealed.len() < WRAP_NONCE_LEN + AEAD_TAG_LEN {
+        return Err(KeyError::BadLength {
+            field: "label_ciphertext",
+            got: sealed.len(),
+        });
+    }
+    let (nonce, body) = sealed.split_at(WRAP_NONCE_LEN);
+    let nonce: [u8; WRAP_NONCE_LEN] = nonce.try_into().map_err(|_| KeyError::Aead)?;
+    let aad = label_aad(tenant_id, fleet_id, profile_id, generation);
+    ChaCha20Poly1305::new(&(*fkek).into())
+        .decrypt(
+            &nonce.into(),
+            Payload {
+                msg: body,
+                aad: &aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| KeyError::Aead)
+}
+
 /// Fill `out` with OS entropy.
 ///
 /// Callers generate key seeds with this rather than reaching for a random
@@ -270,6 +356,72 @@ mod tests {
             "a9ff431ad94588073a79aeea593edfe8819917f13249a867d70aef982ee12b7d",
             "root_key_id diverged from the G2-pinned golden vector"
         );
+    }
+
+    // ----------------------------------------------------- profile label ----
+
+    #[test]
+    fn a_profile_label_opens_only_where_it_was_sealed() {
+        let fkek = [0x5a; 32];
+        let (t, f, p) = ([1; 16], [2; 16], [3; 16]);
+        let sealed = seal_label(
+            &fkek,
+            &[9; WRAP_NONCE_LEN],
+            &t,
+            &f,
+            &p,
+            7,
+            "Work".as_bytes(),
+        )
+        .expect("seal");
+        assert_eq!(sealed.len(), WRAP_NONCE_LEN + 4 + AEAD_TAG_LEN);
+        assert!(!sealed.windows(4).any(|w| w == b"Work"));
+        assert_eq!(
+            *open_label(&fkek, &t, &f, &p, 7, &sealed).expect("open"),
+            b"Work"
+        );
+        for (name, key, t2, f2, p2, g) in [
+            ("key", [0x5b; 32], t, f, p, 7),
+            ("tenant", fkek, [8; 16], f, p, 7),
+            ("fleet", fkek, t, [8; 16], p, 7),
+            ("profile", fkek, t, f, [8; 16], 7),
+            ("generation", fkek, t, f, p, 8),
+        ] {
+            assert_eq!(
+                open_label(&key, &t2, &f2, &p2, g, &sealed).err(),
+                Some(KeyError::Aead),
+                "{name}"
+            );
+        }
+        for i in 0..sealed.len() {
+            let mut moved = sealed.clone();
+            moved[i] ^= 1;
+            assert!(
+                open_label(&fkek, &t, &f, &p, 7, &moved).is_err(),
+                "byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_label_has_a_length_bound_both_ways() {
+        let (fkek, ids) = ([0x5a; 32], [1; 16]);
+        let nonce = [9; WRAP_NONCE_LEN];
+        let seal = |l: &[u8]| seal_label(&fkek, &nonce, &ids, &ids, &ids, 1, l);
+        assert!(matches!(seal(b""), Err(KeyError::BadLength { .. })));
+        assert!(seal(&[b'x'; MAX_LABEL_LEN]).is_ok());
+        assert!(matches!(
+            seal(&[b'x'; MAX_LABEL_LEN + 1]),
+            Err(KeyError::BadLength { .. })
+        ));
+        let sealed = seal(&[b'x'; MAX_LABEL_LEN]).unwrap();
+        assert!(sealed.len() <= 4096, "fits label_ciphertext");
+        for short in [0, WRAP_NONCE_LEN, WRAP_NONCE_LEN + AEAD_TAG_LEN - 1] {
+            assert!(matches!(
+                open_label(&fkek, &ids, &ids, &ids, 1, &sealed[..short]),
+                Err(KeyError::BadLength { .. })
+            ));
+        }
     }
 
     // ----------------------------------------------------- DEK wrapping ----

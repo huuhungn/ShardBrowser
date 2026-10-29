@@ -4574,6 +4574,12 @@ mod profile_mutation_boundary_tests {
             None,
             None,
         )));
+        assert_running_blocked(rt.block_on(sync_cmd::profile_sync_publish(
+            profile_id.to_string(),
+            None,
+            None,
+            None,
+        )));
 
         tracker.set_running_for_test(profile_id, false);
     }
@@ -4640,6 +4646,7 @@ pub fn run() {
             team_enroll_device,
             backup_cmd::profile_backup_create,
             sync_cmd::profile_sync_push,
+            sync_cmd::profile_sync_publish,
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
             sync_cmd::team_unbind_profile,

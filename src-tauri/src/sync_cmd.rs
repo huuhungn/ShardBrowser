@@ -40,6 +40,17 @@ pub struct PushResult {
     pub sha256: String,
 }
 
+/// A profile the team server now holds at version 0.
+#[derive(Debug, Serialize)]
+pub struct PublishResult {
+    /// The new remote profile ID, hex.
+    pub profile_id: String,
+    /// The fence of the first lease this device holds on it.
+    pub fencing_token: u64,
+    /// When that lease ends, by the server's clock.
+    pub lease_expires_at_ms: u64,
+}
+
 /// What the team server knows about a profile, without downloading it.
 #[derive(Debug, Serialize)]
 pub struct RemoteSnapshot {
@@ -181,6 +192,54 @@ pub async fn profile_sync_push(
         version,
         container_bytes: sealed.info.file_bytes,
         sha256: sealed.info.sha256,
+    })
+}
+
+/// Publish `profile_id` as a new profile of this device's fleet (`team::sync`),
+/// in a device session the account `username` and `password` open for this
+/// call only. The server holds the profile at version 0 with the first lease
+/// this device owns; the next push seals the data. `label` is the name the
+/// fleet lists it by, sealed under the verified fleet key; it defaults to the
+/// profile's name.
+#[tauri::command]
+pub async fn profile_sync_publish(
+    profile_id: String,
+    label: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<PublishResult, String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionPublishToTeam"),
+    )
+    .map_err(|error| error.to_string())?;
+    let c = ready_config()?;
+    let stored = profile::load_raw(&profile_id)
+        .map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
+    let label = label
+        .or_else(|| stored.config.get("name")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
+    let remote = fleet_client::decode_hex16(&fleet_client::random_id_hex(), "profile_id")
+        .map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let published = team::sync::publish(
+        &client,
+        &session.access_token,
+        &dev,
+        &profile_id,
+        &label,
+        fleet,
+        remote,
+        now_ms(),
+    )
+    .await;
+    client.end_session(&session.access_token).await;
+    let p = published.map_err(|e| format!("{e:#}"))?;
+    Ok(PublishResult {
+        profile_id: fleet_client::hex(&p.profile),
+        fencing_token: p.lease.fencing_token,
+        lease_expires_at_ms: p.expires_at_ms,
     })
 }
 
