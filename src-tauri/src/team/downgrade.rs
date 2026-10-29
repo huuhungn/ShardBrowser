@@ -1492,20 +1492,16 @@ mod tests {
 
     fn bind(id: &str) {
         let db = Db::open().unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                   fleet_id, remote_profile_id, remote_version, accepted_restore_epoch, sync_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'AVAILABLE')",
-                params![
-                    id,
-                    "03".repeat(16),
-                    "02".repeat(16),
-                    "04".repeat(16),
-                    hex(&sha256(id.as_bytes()))[..32].to_string()
-                ],
-            )
-            .unwrap();
+        crate::team::db::fixtures::seed_binding(
+            &db.conn,
+            "s",
+            id,
+            &"03".repeat(16),
+            &"02".repeat(16),
+            &"04".repeat(16),
+            &hex(&sha256(id.as_bytes()))[..32],
+            0,
+        );
     }
 
     fn seeded() -> (Env, Snapshot) {
@@ -2830,12 +2826,12 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
-                   server_instance_id, restore_epoch, tenant_id, operation_scope, kind,
+                   server_id, server_instance_id, restore_epoch, tenant_id, operation_scope, kind,
                    idempotency_key, canonical_request_hash, exact_request_bytes,
                    exact_request_bytes_sha256, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?2, 'i', 0, 't', 's', ?3, ?1, zeroblob(32), x'01', zeroblob(32),
-                   ?4, 't', 't')",
-                params![op, LOCAL, kind, state],
+                 VALUES (?1, ?2, ?2, 's', ?5, 0, ?6, 's', ?3, ?1, zeroblob(32), x'01',
+                   zeroblob(32), ?4, 't', 't')",
+                params![op, LOCAL, kind, state, "03".repeat(16), "02".repeat(16)],
             )
             .unwrap();
     }
@@ -2844,30 +2840,38 @@ mod tests {
         db.conn
             .execute(
                 "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
-                   server_instance_id, restore_epoch, tenant_id, operation_scope, kind,
+                   server_id, server_instance_id, restore_epoch, tenant_id, operation_scope, kind,
                    idempotency_key, canonical_request_hash, exact_request_bytes,
                    exact_request_bytes_sha256, state, remote_upload_id, lease_id, fencing_token,
                    base_version, snapshot_id, manifest_replay_id, intent_hash, ciphertext_sha256,
                    signed_manifest_container_bytes, signed_manifest_container_hash,
                    signed_manifest_container_bytes_sha256, created_at, updated_at)
-                 VALUES ('commit', ?1, ?1, 'i', 0, 't', 's', 'COMMIT', 'k', zeroblob(32), x'01',
-                   zeroblob(32), 'FAILED', 'u', 'l', 1, 0, zeroblob(16), zeroblob(16),
+                 VALUES ('commit', ?1, ?1, 's', ?2, 0, ?3, 's', 'COMMIT', 'k', zeroblob(32),
+                   x'01', zeroblob(32), 'FAILED', 'u', 'l', 1, 0, zeroblob(16), zeroblob(16),
                    zeroblob(32), zeroblob(32), x'01', zeroblob(32), zeroblob(32), 't', 't')",
-                params![LOCAL],
+                params![LOCAL, "03".repeat(16), "02".repeat(16)],
             )
             .unwrap();
         db.conn
             .execute(
                 "INSERT INTO upload_sessions(upload_local_id, local_profile_id,
-                   local_profile_id_at_request, commit_op_id, server_instance_id, restore_epoch,
-                   tenant_id, fleet_id, remote_profile_id, remote_upload_id, snapshot_id,
-                   manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256,
+                   local_profile_id_at_request, commit_op_id, server_id, server_instance_id,
+                   restore_epoch, tenant_id, fleet_id, remote_profile_id, remote_upload_id,
+                   snapshot_id, manifest_replay_id, operation_scope, idempotency_key,
+                   canonical_request_hash, intent_hash, preamble_sha256, dek_slot_sha256,
                    fkek_key_id, key_generation, expected_ciphertext_sha256,
-                   expected_ciphertext_size, spool_ref, state, created_at, updated_at)
-                 VALUES ('up', ?1, ?1, 'commit', 'i', 0, 't', 'f', 'r', 'u', zeroblob(16),
-                   zeroblob(16), zeroblob(32), zeroblob(32), zeroblob(32), 'k', 1, zeroblob(32),
-                   0, 'spool', ?2, 't', 't')",
-                params![LOCAL, state],
+                   expected_ciphertext_size, spool_ref, state, retry_state, created_at, updated_at)
+                 VALUES ('up', ?1, ?1, 'commit', 's', ?3, 0, ?4, ?5, 'r', 'u', zeroblob(16),
+                   zeroblob(16), 's', 'k', zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32),
+                   ?6, 1, zeroblob(32), 0, 'spool', ?2, 'NONE', 't', 't')",
+                params![
+                    LOCAL,
+                    state,
+                    "03".repeat(16),
+                    "02".repeat(16),
+                    "04".repeat(16),
+                    "cd".repeat(32)
+                ],
             )
             .unwrap();
     }
@@ -2890,14 +2894,16 @@ mod tests {
         let db = Db::open().unwrap();
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1",
+                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1,
+                   lease_expires_at = 't'",
                 [],
             )
             .unwrap();
         refuse(LOCAL, "downgrade.leaseHeld");
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+                   lease_expires_at = NULL",
                 [],
             )
             .unwrap();
@@ -3124,6 +3130,25 @@ mod tests {
         }
     }
 
+    /// A lease a version 5 file carried is marked LEASE_AT_RISK: still a held
+    /// lease, so it blocks the downgrade by the same name, and a clone is
+    /// refused for it. Readiness reads the lease, not the state.
+    #[test]
+    fn a_lease_at_risk_blocks_the_downgrade_as_a_held_lease() {
+        let (_e, _) = seeded();
+        let db = Db::open().unwrap();
+        db.conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'LEASE_AT_RISK', lease_id = 'aa',
+                   fencing_token = 1, lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                [],
+            )
+            .unwrap();
+        assert!(ready_codes().contains(&"downgrade.blockLease"));
+        let e = start_clone(LOCAL).unwrap_err();
+        assert!(has(&e, "downgrade.leaseHeld"), "{e:#}");
+    }
+
     #[test]
     fn each_open_fact_blocks_the_downgrade_by_name() {
         let (_e, _) = seeded();
@@ -3134,14 +3159,16 @@ mod tests {
         // A lease.
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1",
+                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1,
+                   lease_expires_at = 't'",
                 [],
             )
             .unwrap();
         assert!(blocked("downgrade.blockLease"));
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+                   lease_expires_at = NULL",
                 [],
             )
             .unwrap();
@@ -3306,7 +3333,8 @@ mod tests {
         let db = Db::open().unwrap();
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = ?1, fencing_token = 1",
+                "UPDATE profile_bindings SET lease_id = ?1, fencing_token = 1,
+                   lease_expires_at = 't'",
                 [&"aa".repeat(16)],
             )
             .unwrap();
@@ -3314,7 +3342,8 @@ mod tests {
         assert!(has(&e, "sync.unbindLeaseHeld"), "{e:#}");
         db.conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+                   lease_expires_at = NULL",
                 [],
             )
             .unwrap();
