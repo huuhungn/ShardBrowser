@@ -56,18 +56,30 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
 /// no downgrade flow runs meanwhile (it holds their lock, and they refuse
 /// while the flag is up), and none is recorded, as checked under that lock.
 pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
-    if MIGRATING.swap(true, Ordering::SeqCst) {
-        anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
+    let _flag = Migrating::raise()?;
+    let Some(_flow) = crate::team::downgrade::try_exclusive() else {
+        anyhow::bail!(crate::errcode::code("migrate.downgradeRunning"));
+    };
+    refuse_while_journals()?;
+    work()
+}
+
+/// The flag while a move runs; it comes down on every way out, a panic too.
+struct Migrating;
+
+impl Migrating {
+    fn raise() -> Result<Self> {
+        if MIGRATING.swap(true, Ordering::SeqCst) {
+            anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
+        }
+        Ok(Self)
     }
-    let out = (|| {
-        let Some(_flow) = crate::team::downgrade::try_exclusive() else {
-            anyhow::bail!(crate::errcode::code("migrate.downgradeRunning"));
-        };
-        refuse_while_journals()?;
-        work()
-    })();
-    MIGRATING.store(false, Ordering::SeqCst);
-    out
+}
+
+impl Drop for Migrating {
+    fn drop(&mut self) {
+        MIGRATING.store(false, Ordering::SeqCst);
+    }
 }
 
 /// A saved downgrade or restore names paths inside the current data root, and
@@ -76,6 +88,14 @@ pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 pub(crate) fn refuse_while_journals() -> Result<()> {
     if crate::team::downgrade::journals_exist()? {
         anyhow::bail!(crate::errcode::code("migrate.downgradeJournal"));
+    }
+    // A clone kept by a rolled-back downgrade lives in the archive of the
+    // current root; a person decides what becomes of it before the root moves.
+    if let Some(kept) = crate::team::downgrade::retired_clone()? {
+        anyhow::bail!(crate::errcode::code_with(
+            "migrate.retiredClone",
+            &[("path", &kept.display().to_string())]
+        ));
     }
     Ok(())
 }

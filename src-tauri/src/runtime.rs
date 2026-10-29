@@ -481,14 +481,15 @@ fn migrate_all_to(
 
 /// [`migrate_all_to`] off the async threads: it waits for a downgrade flow,
 /// which can take a while. It is awaited, not skipped, because the caller
-/// records the signature as applied once it returns.
+/// records the signature as applied once it returns. `None` when the work
+/// panicked: nothing is then known to be migrated.
 async fn migrate_all_blocking(
     chromium_version: String,
     grease_brand: Option<String>,
     grease_version: Option<String>,
     tls: Option<serde_json::Value>,
-) -> usize {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Option<usize> {
+    blocking(move || {
         migrate_all_to(
             &chromium_version,
             grease_brand.as_deref(),
@@ -497,7 +498,20 @@ async fn migrate_all_blocking(
         )
     })
     .await
-    .unwrap_or(0)
+}
+
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tauri::async_runtime::spawn_blocking(work).await.ok()
+}
+
+/// What to record as applied after a migration: the new value if it ran,
+/// otherwise what was there, so the next start tries again.
+fn applied_after<T>(migrated: bool, new: T, previous: Option<T>) -> Option<T> {
+    if migrated {
+        Some(new)
+    } else {
+        previous
+    }
 }
 
 /// Startup hook: migrate saved profiles + the fingerprint library (bundled +
@@ -525,13 +539,18 @@ pub async fn ensure_profiles_migrated() {
     if local.applied_signature.as_deref() == Some(sig.as_str()) {
         return;
     }
-    let n = migrate_all_blocking(
+    // A migration that did not finish is not recorded as applied: the next
+    // start runs it again.
+    let Some(n) = migrate_all_blocking(
         target.clone(),
         m.grease_brand.clone(),
         m.grease_version.clone(),
         m.tls.clone(),
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     if n > 0 {
         eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
     }
@@ -777,16 +796,21 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
             .map(|t| t.to_string())
             .unwrap_or_default(),
     );
+    let mut migrated = true;
     if local.applied_signature.as_deref() != Some(sig.as_str()) {
-        let n = migrate_all_blocking(
+        match migrate_all_blocking(
             target_ver.clone(),
             manifest.grease_brand.clone(),
             manifest.grease_version.clone(),
             manifest.tls.clone(),
         )
-        .await;
-        if n > 0 {
-            eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
+        .await
+        {
+            Some(n) if n > 0 => {
+                eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
+            }
+            Some(_) => {}
+            None => migrated = false,
         }
     }
 
@@ -794,8 +818,12 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         browser_etag: Some(browser_etag),
         widevine_etag,
         fingerprints_etag: fp_etag,
-        applied_chromium_version: Some(target_ver.clone()),
-        applied_signature: Some(sig),
+        applied_chromium_version: applied_after(
+            migrated,
+            target_ver.clone(),
+            local.applied_chromium_version.clone(),
+        ),
+        applied_signature: applied_after(migrated, sig, local.applied_signature.clone()),
         // Authoritative: we just successfully extracted exactly target_ver (the
         // old tree was wiped first). Recording the known value beats re-reading
         // it off disk, which is what let a leftover `<old>.manifest` keep the
@@ -1176,6 +1204,22 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEW-F: a migration that panics is not "applied": the caller gets `None`
+    /// and records nothing new, so the next start runs it again.
+    #[test]
+    fn a_migration_that_panicked_is_not_recorded_as_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(blocking(|| 3usize)), Some(3));
+        let lost = rt.block_on(blocking(|| -> usize { panic!("the migration failed") }));
+        assert_eq!(lost, None);
+        assert_eq!(applied_after(true, "new", Some("old")), Some("new"));
+        assert_eq!(applied_after(false, "new", Some("old")), Some("old"));
+        assert_eq!(applied_after(false, "new", None), None);
+    }
 
     /// NEW-D: waiting for a downgrade flow does not hold up an async thread.
     #[test]

@@ -265,7 +265,8 @@ MUTANTS = [
     ("D83-settle-in-drive", D, "    settle_probe(&w)?;\n    point(\"claim_held\")?;", "    point(\"claim_held\")?;"),
     ("D84-unlocked-step", D, "                    prove_unlocked(&w)?;\n", ""),
     ("D85-unlocked-code", D, ".map_err(|_| anyhow!(code(\"downgrade.dataInUse\")))?;", "?;"),
-    ("D86-unlocked-back", D, "    move_new(&w.probe, &w.data_src)\n}", "    Ok(())\n}"),
+    ("D86-unlocked-back", D,
+     "let mut back = move_new(&w.probe, &w.data_src);", "let mut back: Result<()> = Ok(());"),
     ("D87-settle-moves-back", D, "(true, false) => move_new(&w.probe, &w.data_src),", "(true, false) => Ok(()),"),
     ("D88-settle-both", D,
      "(true, true) => bail!(code(\"downgrade.archiveConflict\")),\n        _ => Ok(()),",
@@ -283,6 +284,16 @@ MUTANTS = [
     ("D94-rollback-begin", D,
      "pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = begin()?;",
      "pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = exclusive();"),
+    # --- third review: the way back, the disk first, the kept clone ---------------
+    ("D95-trial-back-no-retry", D, "    for _ in 0..10 {", "    for _ in 0..0 {"),
+    ("D96-in-flow-never", D, "Ok(path) if path.exists() => Db::open()", "Ok(path) if false => Db::open()"),
+    ("D97-claimed-volume-last", D,
+     "                    same_volume(&w.data_src, &w.dir)?;\n                    prove_idle(&w.data_src)?;\n                    prove_unlocked(&w)?;",
+     "                    prove_idle(&w.data_src)?;\n                    prove_unlocked(&w)?;\n                    same_volume(&w.data_src, &w.dir)?;"),
+    ("D98-start-volume-last", D,
+     "    same_volume(&data, &archive)?;\n    if exists(&data) {\n        listing(&data, false)?;\n        prove_idle(&data)?;\n    }",
+     "    if exists(&data) {\n        listing(&data, false)?;\n        prove_idle(&data)?;\n    }\n    same_volume(&data, &archive)?;"),
+    ("D99-retired-clone-unseen", D, "        if exists(&kept) {", "        if false {"),
 ]
 
 

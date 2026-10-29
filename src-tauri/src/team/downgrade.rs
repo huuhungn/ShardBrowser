@@ -68,6 +68,8 @@ type Hook = (String, Box<dyn Fn()>);
 #[cfg(test)]
 thread_local! {
     static CRASH_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// A folder the tests put on another volume.
+    static FAKE_VOLUME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// Runs at the named point, as another process would between two steps.
     static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
 }
@@ -538,17 +540,18 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
         bail!(code("downgrade.originalUnreadable"));
     }
     // What would leave the profile half moved is refused before a journal or
-    // a move exists: a link in its data, a browser holding it, another disk.
+    // a move exists: another disk, a link in its data, a browser holding it.
+    // The disk comes first: on another disk a move fails whatever holds it.
     let data = store::user_data_root()?.join(local);
-    if exists(&data) {
-        listing(&data, false)?;
-        prove_idle(&data)?;
-    }
     let archive = archive_root()?;
     make_dir(&archive)?;
     store::require_local_ntfs(&archive)?;
     outside_discovery(&archive)?;
     same_volume(&data, &archive)?;
+    if exists(&data) {
+        listing(&data, false)?;
+        prove_idle(&data)?;
+    }
     if discover()?.mentions(&new) {
         bail!(code("downgrade.archiveConflict"));
     }
@@ -603,9 +606,9 @@ fn drive(mut db: Db, mut j: DowngradeJournal) -> Result<CloneDone> {
                     make_dir(&w.dir)?;
                     store::require_local_ntfs(&w.dir)?;
                     outside_discovery(&w.dir)?;
+                    same_volume(&w.data_src, &w.dir)?;
                     prove_idle(&w.data_src)?;
                     prove_unlocked(&w)?;
-                    same_volume(&w.data_src, &w.dir)?;
                     move_path(&w.metadata_src, &w.metadata_dst, "downgrade.originalGone")?;
                     advance(&db, &j, Phase::OriginalMetadataMoved, Patch::default())?
                 }
@@ -719,9 +722,19 @@ fn prove_idle(data: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The serial number of the volume holding `path`.
-#[cfg(windows)]
+/// The serial number of the volume holding `path`. A test can move a folder to
+/// another "volume" with [`FAKE_VOLUME`].
 fn volume_serial(path: &Path) -> Result<u64> {
+    let serial = disk_serial(path)?;
+    #[cfg(test)]
+    if FAKE_VOLUME.with(|f| f.borrow().as_ref().is_some_and(|p| path.starts_with(p))) {
+        return Ok(serial ^ 1);
+    }
+    Ok(serial)
+}
+
+#[cfg(windows)]
+fn disk_serial(path: &Path) -> Result<u64> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -739,7 +752,7 @@ fn volume_serial(path: &Path) -> Result<u64> {
 }
 
 #[cfg(not(windows))]
-fn volume_serial(path: &Path) -> Result<u64> {
+fn disk_serial(path: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(std::fs::metadata(path)?.dev())
 }
@@ -779,7 +792,43 @@ fn prove_unlocked(w: &Places) -> Result<()> {
     }
     durable::move_new(&w.data_src, &w.probe).map_err(|_| anyhow!(code("downgrade.dataInUse")))?;
     point("probe:renamed")?;
-    move_new(&w.probe, &w.data_src)
+    // Something may open the folder in its new place (a scanner, say) and
+    // block the way back. Try again for a while, with the claim still held;
+    // if it stays blocked, the data is still in the probe and `settle_probe`
+    // brings it home on the next run, and nothing recreates `user-data/<id>`
+    // meanwhile (`profile::user_data_dir` refuses while the journal is open).
+    let mut back = move_new(&w.probe, &w.data_src);
+    for _ in 0..10 {
+        if back.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        back = settle_probe(w);
+    }
+    back
+}
+
+/// Whether `local` is inside a flow that has not been rolled back, so nothing
+/// else may create or use its data. A launcher whose Team database cannot be
+/// opened has no flow to protect and keeps starting local profiles.
+pub(crate) fn in_flow(local: &str) -> bool {
+    match Db::path() {
+        Ok(path) if path.exists() => Db::open()
+            .and_then(|db| journal::flow_taken(&db, local))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// A clone a rolled-back downgrade kept in the archive: the folder that holds it.
+pub(crate) fn retired_clone() -> Result<Option<PathBuf>> {
+    for dir in entries(&archive_root()?)? {
+        let kept = dir.join("clone-retired");
+        if exists(&kept) {
+            return Ok(Some(kept));
+        }
+    }
+    Ok(None)
 }
 
 /// Puts the user data back if a trial move was cut off with it away.
@@ -1342,6 +1391,7 @@ mod tests {
         fn drop(&mut self) {
             CRASH_AT.with(|c| *c.borrow_mut() = None);
             HOOK.with(|h| *h.borrow_mut() = None);
+            FAKE_VOLUME.with(|f| *f.borrow_mut() = None);
             crate::process::Tracker::shared().set_running_for_test("another-profile", false);
             store::set_config_root(None);
             store::set_data_root(None);
@@ -2598,6 +2648,182 @@ mod tests {
         let e = crate::migrate::guarded::<()>(|| panic!("the move must not start")).unwrap_err();
         assert!(has(&e, "migrate.downgradeJournal"), "{e:#}");
         assert!(!crate::migrate::in_progress() && try_exclusive().is_some());
+    }
+
+    /// NEW-G: the way back from the trial move is blocked by a handle opened on
+    /// the folder in its new place. A short block is waited out, a long one
+    /// leaves the data safe in the probe, and nothing makes a fresh, empty
+    /// `user-data/<id>` meanwhile.
+    #[cfg(windows)]
+    #[test]
+    fn a_handle_on_the_trial_folder_is_waited_out_or_leaves_the_data_safe() {
+        use std::os::windows::fs::OpenOptionsExt;
+        fn open_on_probe(
+            keep_for: Option<std::time::Duration>,
+        ) -> std::rc::Rc<std::cell::RefCell<Option<std::fs::File>>> {
+            let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let slot = held.clone();
+            set_hook("probe:renamed", move || {
+                let w = places(&the_journal()).unwrap();
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(1)
+                    .open(w.probe.join("Default").join("Cookies"))
+                    .unwrap();
+                match keep_for {
+                    // Let go after a while, from another thread.
+                    Some(wait) => {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(wait);
+                            drop(file);
+                        });
+                    }
+                    None => *slot.borrow_mut() = Some(file),
+                }
+            });
+            held
+        }
+        // Let go within the retries: the flow goes on to the end.
+        let (_e, before) = seeded();
+        open_on_probe(Some(std::time::Duration::from_millis(300)));
+        assert_eq!(start_clone(LOCAL).unwrap().phase, "COMPLETED");
+        assert_cloned(&before);
+        drop(_e);
+        // Held throughout: the error comes back with the data safe in the probe.
+        let (_e, before) = seeded();
+        let held = open_on_probe(None);
+        let err = start_clone(LOCAL).unwrap_err();
+        HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(has(&err, "downgrade.moveFailed"), "{err:#}");
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        assert_eq!(j.phase, P::Claimed);
+        assert!(exists(&w.metadata_src) && exists(&w.probe) && !exists(&w.data_src));
+        assert!(discover().unwrap().lists(LOCAL));
+        // Launch, cookie import, backup and the rest get no empty folder.
+        let e = profile::user_data_dir(LOCAL).unwrap_err();
+        assert!(has(&e, "downgrade.profileInFlow"), "{e:#}");
+        assert!(!exists(&w.data_src));
+        // Let go, and the next run brings the data home and finishes.
+        drop(held.borrow_mut().take());
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+        assert_cloned(&before);
+    }
+
+    /// NEW-G: a profile in an open flow gets no user-data folder from anyone;
+    /// one that is not, or whose flow was rolled back, does.
+    #[test]
+    fn a_profile_in_an_open_flow_gets_no_user_data_folder() {
+        let (_e, _) = seeded();
+        let (j, w) = at("after:CLAIMED");
+        let e = profile::user_data_dir(LOCAL).unwrap_err();
+        assert!(has(&e, "downgrade.profileInFlow"), "{e:#}");
+        assert!(in_flow(LOCAL) && !in_flow(OTHER));
+        assert!(profile::user_data_dir(OTHER).is_ok());
+        assert!(exists(&w.data_src));
+        // Finished is still a flow taken: the original is archived, not back.
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+        assert!(in_flow(LOCAL));
+        assert!(!exists(&w.data_src));
+        let e = profile::user_data_dir(LOCAL).unwrap_err();
+        assert!(has(&e, "downgrade.profileInFlow"), "{e:#}");
+        assert!(!exists(&w.data_src));
+        drop(_e);
+        // Rolled back, the profile is its own again.
+        let (_e, _) = seeded();
+        let (j, _) = at("after:CLAIMED");
+        assert_eq!(roll_back_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
+        assert!(!in_flow(LOCAL));
+        assert!(profile::user_data_dir(LOCAL).is_ok());
+    }
+
+    /// NEW-E: the flag of a data root move comes down however the work ends.
+    #[test]
+    fn a_panic_in_the_move_does_not_leave_the_flag_up() {
+        let _e = env();
+        let lost = std::panic::catch_unwind(|| {
+            let _ = crate::migrate::guarded(|| -> Result<()> { panic!("the move failed") });
+        });
+        assert!(lost.is_err());
+        assert!(!crate::migrate::in_progress());
+        assert!(try_exclusive().is_some());
+        assert_eq!(crate::migrate::guarded(|| Ok(1)).unwrap(), 1);
+        // Nor does an error leave it up.
+        crate::migrate::guarded(|| -> Result<()> { bail!("no") }).unwrap_err();
+        assert!(!crate::migrate::in_progress());
+    }
+
+    /// NEW-H: a source on another volume is reported as that, whether or not
+    /// something also holds its files.
+    #[test]
+    fn a_source_on_another_volume_is_not_reported_as_in_use() {
+        // The start checks the disk before it looks for a holder.
+        let (_e, _) = seeded();
+        let data = store::user_data_root().unwrap().join(LOCAL);
+        let held = hold(&data);
+        FAKE_VOLUME.with(|f| *f.borrow_mut() = Some(archive_root().unwrap()));
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.volumeMismatch"), "{err:#}");
+        assert!(journal::downgrade_for(&Db::open().unwrap(), LOCAL)
+            .unwrap()
+            .is_empty());
+        drop(held);
+        drop(_e);
+        // So does a resume, which sees the disk change after the start.
+        let (_e, before) = seeded();
+        set_hook("created", || {
+            FAKE_VOLUME.with(|f| *f.borrow_mut() = Some(archive_root().unwrap()));
+        });
+        // A file held where only the trial move could find it.
+        #[cfg(windows)]
+        let cookies = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let data = store::user_data_root().unwrap().join(LOCAL);
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(data.join("Default").join("Cookies"))
+                .unwrap()
+        };
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.volumeMismatch"), "{err:#}");
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        assert_eq!(j.phase, P::Claimed);
+        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+        assert!(!exists(&w.metadata_dst) && !exists(&w.probe) && exists(&w.data_src));
+        FAKE_VOLUME.with(|f| *f.borrow_mut() = None);
+        #[cfg(windows)]
+        drop(cookies);
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+        assert_cloned(&before);
+    }
+
+    /// NOTE: a clone kept by a rolled-back downgrade stays in the archive of
+    /// the root it was made in, so the root does not move until a person has
+    /// dealt with it, and is told where it is.
+    #[test]
+    fn a_kept_clone_blocks_a_data_root_move_and_names_where() {
+        let (_e, _) = seeded();
+        // A rollback from before any clone keeps nothing.
+        let (j, _) = at("after:CLAIMED");
+        roll_back_clone(&j.journal_id).unwrap();
+        assert!(retired_clone().unwrap().is_none());
+        crate::migrate::guarded(|| Ok(())).unwrap();
+        drop(_e);
+        // One from after the clone was written keeps it.
+        let (_e, _) = seeded();
+        let (j, w) = at("after:CLONE_WRITTEN");
+        roll_back_clone(&j.journal_id).unwrap();
+        let kept = retired_clone().unwrap().unwrap();
+        assert_eq!(kept, w.retired_data.parent().unwrap());
+        let e = crate::migrate::guarded::<()>(|| panic!("the move must not start")).unwrap_err();
+        assert!(has(&e, "migrate.retiredClone"), "{e:#}");
+        assert!(format!("{e:#}").contains("clone-retired"), "{e:#}");
+        assert!(!crate::migrate::in_progress());
+        // Once it is dealt with, the move may go on.
+        std::fs::remove_dir_all(&kept).unwrap();
+        crate::migrate::guarded(|| Ok(())).unwrap();
     }
 
     fn insert_op(db: &Db, op: &str, kind: &str, state: &str) {

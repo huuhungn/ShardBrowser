@@ -1247,10 +1247,15 @@ pub fn delete_tag(name: &str) -> Result<usize> {
     Ok(total)
 }
 
-/// Per-profile user-data-dir; created on first call.
+/// Per-profile user-data-dir; created on first call. Not while a downgrade or
+/// restore of the profile is open: its data is then somewhere else on purpose,
+/// and an empty folder made here would block it from coming back.
 pub fn user_data_dir(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
         anyhow::bail!(crate::errcode::code("profile.invalidId"));
+    }
+    if crate::team::downgrade::in_flow(id) {
+        anyhow::bail!(crate::errcode::code("downgrade.profileInFlow"));
     }
     let p = store::user_data_root()?.join(id);
     std::fs::create_dir_all(&p)?;
