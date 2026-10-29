@@ -59,7 +59,7 @@ fn restrict(path: &Path) {
 fn restrict(_path: &Path) {}
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => fs::File::open(dir)?.sync_all(),
         _ => Ok(()),
@@ -68,7 +68,7 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 
 /// `MOVEFILE_WRITE_THROUGH` already flushed the move.
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -103,6 +103,46 @@ pub(crate) fn replace_file(source: &Path, destination: &Path) -> std::io::Result
     Ok(())
 }
 
+/// Moves `source` to `destination`, which must not exist: unlike
+/// [`replace_file`] it never replaces anything, so a move that races with
+/// another writer fails instead of destroying what that writer made. Works on
+/// files and directories on one volume; flushed like `replace_file`.
+#[cfg(not(windows))]
+pub(crate) fn move_new(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // shortcut: the check and the rename are two steps off Windows, where the
+    // launcher's Team runtime does not run yet; use renameat2(NOREPLACE) there.
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+pub(crate) fn move_new(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Without MOVEFILE_REPLACE_EXISTING the call fails if the destination
+    // exists, and without MOVEFILE_COPY_ALLOWED it fails across volumes.
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +161,29 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn a_move_never_replaces_a_file_or_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"one").unwrap();
+        move_new(&a, &b).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read(&b).unwrap(), b"one");
+        fs::write(&a, b"two").unwrap();
+        assert!(move_new(&a, &b).is_err());
+        assert_eq!(fs::read(&a).unwrap(), b"two");
+        assert_eq!(fs::read(&b).unwrap(), b"one");
+        let (d, e) = (dir.path().join("d"), dir.path().join("e"));
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("f"), b"in d").unwrap();
+        fs::create_dir(&e).unwrap();
+        assert!(move_new(&d, &e).is_err());
+        assert_eq!(fs::read(d.join("f")).unwrap(), b"in d");
+        fs::remove_dir(&e).unwrap();
+        move_new(&d, &e).unwrap();
+        assert_eq!(fs::read(e.join("f")).unwrap(), b"in d");
     }
 
     #[test]
