@@ -828,7 +828,10 @@ grpcfuse /host fakeowner rw 0 0
             &std::fs::symlink_metadata(dir.join("sub")).unwrap()
         ));
         // The link, not its target, goes.
+        #[cfg(windows)]
         std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
         assert!(dir.join("sub").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
