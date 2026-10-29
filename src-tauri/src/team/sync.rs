@@ -5447,6 +5447,31 @@ mod tests {
         }
     }
 
+    /// A lease a version 5 file carried is marked LEASE_AT_RISK, its expiry
+    /// unknown: it is still held, so a pull does not write over the profile
+    /// and the next push goes on with that lease.
+    #[test]
+    fn a_lease_at_risk_is_still_a_held_lease() {
+        let w = world();
+        w.fake().tamper = Some("manifest");
+        w.push().unwrap_err();
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'LEASE_AT_RISK',
+                   lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                [],
+            )
+            .unwrap();
+        let out = w.udd.with_file_name("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.pushPending"), "{err:#}");
+        assert!(!out.exists());
+        w.fake().tamper = None;
+        assert_eq!(w.push().unwrap().version, 1);
+        assert_eq!(w.sent("POST", "/checkout").len(), 1, "the same lease");
+    }
+
     /// A 2xx release reply that does not parse is a protocol error: each
     /// push reports it and the release stays stored, replayed as it was
     /// until a readable reply completes it.

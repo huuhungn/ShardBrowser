@@ -926,6 +926,91 @@ mod tests {
         assert_eq!(kept[0].containers, [unverifiable]);
     }
 
+    /// L-2: the instance reached through a second origin (another URL) files
+    /// the key state of a new generation. The credential references name the
+    /// device's and fleet's secrets, which both origins share, so they are
+    /// unique per server and the second origin gets its own rows; a second
+    /// row of the same server still may not take a reference already used.
+    #[test]
+    fn a_second_origin_of_the_instance_files_a_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let (i, t, f) = ("33".repeat(16), "44".repeat(16), "55".repeat(16));
+        super::super::db::fixtures::seed_binding(&db.conn, "s", "p", &i, &t, &f, &f, 0);
+        db.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE copy AS SELECT * FROM signed_authorization_records
+                   WHERE record_id = 'rec-{f}';
+                 UPDATE copy SET record_id = 'rec2', generation = 2,
+                   replay_id = x'{:0>32}', fkek_key_id = '{}', exact_signed_container_bytes = x'ac';
+                 INSERT INTO signed_authorization_records SELECT * FROM copy;
+                 DROP TABLE copy;",
+                "02",
+                "e2".repeat(32)
+            ))
+            .unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        keep_key_state(
+            &tx,
+            &i,
+            &t,
+            &Opened {
+                server_url: "https://alias.test",
+                fleet_id: &decode_hex16(&f, "fleet").unwrap(),
+                generation: 2,
+                fkek_key_id: decode_hex32(&"e2".repeat(32), "fkek_key_id").unwrap(),
+                container: &[0xac],
+                pages: &[],
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM server_origins"), 2);
+        assert_eq!(
+            count(
+                "SELECT count(DISTINCT server_id) FROM device_state
+                 WHERE signing_credential_ref = 'device-signing.' || device_id"
+            ),
+            2
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM fleet_key_state k JOIN server_origins o USING (server_id)
+                 WHERE o.host = 'alias.test' AND k.generation = 2 AND k.state = 'ACTIVE'"
+            ),
+            1
+        );
+        // The fleet key's reference is shared the same way: the first
+        // generation's row, copied to the second origin under another grant.
+        db.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TABLE copy AS SELECT * FROM signed_authorization_records
+                   WHERE record_id = 'rec-{f}';
+                 UPDATE copy SET record_id = 'rec3', replay_id = x'{:0>32}',
+                   exact_signed_container_bytes = x'ad';
+                 INSERT INTO signed_authorization_records SELECT * FROM copy;
+                 DROP TABLE copy;
+                 INSERT INTO fleet_key_state
+                   SELECT o.server_id, k.server_instance_id, k.tenant_id, k.fleet_id,
+                     k.generation, k.fkek_key_id, k.device_id, 'rec3', k.fkek_credential_ref,
+                     'RETIRED', NULL, k.created_at
+                   FROM fleet_key_state k, server_origins o
+                   WHERE k.server_id = 's' AND k.generation = 1 AND o.host = 'alias.test';",
+                "03"
+            ))
+            .unwrap();
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO device_state SELECT server_id, tenant_id, account_id, 'other',
+                   'k1', 'k2', signing_credential_ref, 'x', 0 FROM device_state LIMIT 1",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+
     /// G2-36: a grant filed as opened files the account, device and fleet key
     /// rows it names. The newest generation is ACTIVE and retires the one
     /// before, an older one is filed RETIRED, a renewed grant of the same key

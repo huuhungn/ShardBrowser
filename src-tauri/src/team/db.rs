@@ -946,7 +946,9 @@ CREATE TABLE profile_bindings_v6 (
 -- Each binding's server, account and fleet key come from the rows above; one
 -- that has none, or more than one, makes the NOT NULL column refuse, and the
 -- whole migration with it. A lease kept without its server expiry (version 3
--- kept none) is recorded as already ended.
+-- kept none) is marked LEASE_AT_RISK, with the migration's own time as the
+-- expiry the CHECK below needs: the lease stays held (nothing reads the
+-- expiry to free it), and the next renewal or push writes the server's.
 INSERT INTO profile_bindings_v6(local_profile_id, server_id, server_instance_id, tenant_id,
   account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
   accepted_restore_epoch, fencing_token, lease_id, lease_expires_at, fkek_key_id, key_generation,
@@ -954,8 +956,10 @@ INSERT INTO profile_bindings_v6(local_profile_id, server_id, server_instance_id,
 SELECT b.local_profile_id, so.server_id, b.server_instance_id, b.tenant_id, ac.account_id,
   ac.device_id, b.fleet_id, b.remote_profile_id, b.remote_version, b.remote_version,
   b.accepted_restore_epoch, b.fencing_token, b.lease_id,
-  CASE WHEN b.lease_id IS NULL THEN NULL ELSE '1970-01-01T00:00:00.000Z' END,
-  fk.fkek_key_id, fk.generation, b.last_observed_head_hash, b.sync_state, 0, b.last_error_code
+  CASE WHEN b.lease_id IS NULL THEN NULL ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now') END,
+  fk.fkek_key_id, fk.generation, b.last_observed_head_hash,
+  CASE WHEN b.lease_id IS NOT NULL AND b.sync_state <> 'QUARANTINED'
+       THEN 'LEASE_AT_RISK' ELSE b.sync_state END, 0, b.last_error_code
 FROM profile_bindings b
 LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
            GROUP BY server_instance_id HAVING count(*) = 1) so
@@ -1053,7 +1057,9 @@ LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_or
   ON so.server_instance_id = p.server_instance_id;
 
 -- Plan L1872-L1929; `spool_ref` names `team-sync/spool/<it>.part`. The
--- request's scope, key and hash mirror the COMMIT operation's.
+-- request's scope, key and hash mirror the COMMIT operation's; a session whose
+-- COMMIT operation is gone has none to mirror, so the NOT NULL columns refuse
+-- the whole migration instead of dropping it.
 CREATE TABLE upload_sessions_v6 (
   upload_local_id             TEXT PRIMARY KEY,
   local_profile_id            TEXT REFERENCES profile_bindings(local_profile_id) ON DELETE SET NULL,
@@ -1131,7 +1137,7 @@ SELECT u.upload_local_id, u.local_profile_id, u.local_profile_id_at_request, u.c
   u.exact_commit_receipt_binding_bytes, u.commit_receipt_binding_bytes_sha256, u.created_at,
   u.updated_at
 FROM upload_sessions u
-JOIN operations c ON c.op_id = u.commit_op_id
+LEFT JOIN operations c ON c.op_id = u.commit_op_id
 LEFT JOIN (SELECT server_instance_id, min(server_id) AS server_id FROM server_origins
            GROUP BY server_instance_id HAVING count(*) = 1) so
   ON so.server_instance_id = u.server_instance_id;
@@ -1142,6 +1148,63 @@ DROP TABLE profile_bindings;
 ALTER TABLE profile_bindings_v6 RENAME TO profile_bindings;
 ALTER TABLE operations_v6 RENAME TO operations;
 ALTER TABLE upload_sessions_v6 RENAME TO upload_sessions;
+
+-- The credential references name secrets in the credential store, and the
+-- same device reached through two origins of one instance shares them, so
+-- they are unique per server, not across the file.
+CREATE TABLE device_state_v6 (
+  server_id              TEXT NOT NULL,
+  tenant_id              TEXT NOT NULL,
+  account_id             TEXT NOT NULL,
+  device_id              TEXT NOT NULL,
+  signing_key_id         TEXT NOT NULL,
+  hpke_key_id            TEXT NOT NULL,
+  signing_credential_ref TEXT NOT NULL,
+  hpke_credential_ref    TEXT NOT NULL,
+  recovery_ready         INTEGER NOT NULL CHECK (recovery_ready IN (0,1)),
+  PRIMARY KEY(server_id, tenant_id, device_id),
+  UNIQUE(server_id, signing_credential_ref),
+  UNIQUE(server_id, hpke_credential_ref),
+  FOREIGN KEY(server_id, tenant_id, account_id, device_id)
+    REFERENCES accounts(server_id, tenant_id, account_id, device_id) ON DELETE CASCADE,
+  CHECK (signing_key_id <> hpke_key_id),
+  CHECK (signing_credential_ref <> hpke_credential_ref)
+) STRICT;
+INSERT INTO device_state_v6 SELECT * FROM device_state;
+
+CREATE TABLE fleet_key_state_v6 (
+  server_id                  TEXT NOT NULL,
+  server_instance_id         TEXT NOT NULL,
+  tenant_id                  TEXT NOT NULL,
+  fleet_id                   TEXT NOT NULL,
+  generation                 INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  fkek_key_id                TEXT NOT NULL,
+  device_id                  TEXT NOT NULL,
+  device_hpke_grant_record_id TEXT NOT NULL UNIQUE REFERENCES signed_authorization_records(record_id) ON DELETE RESTRICT,
+  fkek_credential_ref        TEXT NOT NULL,
+  state                      TEXT NOT NULL CHECK (state IN ('PREPARING','ACTIVE','RETIRED')),
+  acknowledged_at            TEXT,
+  created_at                 TEXT NOT NULL,
+  PRIMARY KEY(server_id, server_instance_id, tenant_id, fleet_id, generation),
+  UNIQUE(server_id, fkek_credential_ref),
+  UNIQUE(server_id, server_instance_id, tenant_id, fleet_id, fkek_key_id),
+  UNIQUE(server_id, server_instance_id, tenant_id, fleet_id, generation, fkek_key_id),
+  FOREIGN KEY(server_id, server_instance_id)
+    REFERENCES server_origins(server_id, server_instance_id) ON DELETE RESTRICT,
+  FOREIGN KEY(server_id, tenant_id, device_id)
+    REFERENCES device_state(server_id, tenant_id, device_id) ON DELETE RESTRICT,
+  CHECK (length(device_hpke_grant_record_id) > 0)
+) STRICT;
+INSERT INTO fleet_key_state_v6 SELECT * FROM fleet_key_state;
+
+DROP TABLE fleet_key_state;
+DROP TABLE device_state;
+ALTER TABLE device_state_v6 RENAME TO device_state;
+ALTER TABLE fleet_key_state_v6 RENAME TO fleet_key_state;
+CREATE UNIQUE INDEX fleet_key_one_active_generation
+ON fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id)
+WHERE state = 'ACTIVE';
+
 CREATE TRIGGER restore_epoch_binding_proofs_need_binding
 BEFORE INSERT ON restore_epoch_binding_proofs
 WHEN NOT EXISTS (SELECT 1 FROM profile_bindings
@@ -1946,6 +2009,87 @@ mod tests {
         }
     }
 
+    /// L-1: a version 5 upload session whose COMMIT operation is gone has
+    /// nothing to mirror its scope and key from, so the migration refuses the
+    /// whole file instead of dropping the session, and leaves it as it was.
+    #[test]
+    fn a_version_5_upload_session_without_its_commit_operation_refuses_the_file() {
+        let i = "11".repeat(16);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3, MIGRATE_V4, MIGRATE_V5] {
+                c.execute_batch(sql).unwrap();
+            }
+            c.execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO server_origins(server_id, scheme, host, port, tls_policy,
+                   server_instance_id, last_restore_epoch, status)
+                 VALUES ('s', 'https', 'fleet.test', 443, 'SYSTEM', '{i}', 0, 'ACTIVE');
+                 INSERT INTO upload_sessions(upload_local_id, local_profile_id,
+                   local_profile_id_at_request, commit_op_id, server_instance_id, restore_epoch,
+                   tenant_id, fleet_id, remote_profile_id, remote_upload_id, snapshot_id,
+                   manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
+                   key_generation, committed_offset, expected_ciphertext_sha256,
+                   expected_ciphertext_size, spool_ref, state, created_at, updated_at)
+                 VALUES ('u1', NULL, 'p', 'ghost', '{i}', 0, '{i}', '{i}', '{i}', 'up1',
+                   zeroblob(16), zeroblob(16), zeroblob(32), zeroblob(32), zeroblob(32), 'k',
+                   1, 5, zeroblob(32), 10, 'u1.part', 'OPEN', 't1', 't2');"
+            ))
+            .unwrap();
+        }
+        let err = Db::open_at(&path)
+            .err()
+            .expect("the broken file is refused");
+        assert!(
+            err.to_string().contains("team.trustLedgerUnreadable"),
+            "{err}"
+        );
+        let c = Connection::open(&path).unwrap();
+        let (version, sessions): (i64, i64) = c
+            .query_row(
+                "SELECT (SELECT schema_version FROM schema_meta),
+                        (SELECT count(*) FROM upload_sessions)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((version, sessions), (5, 1), "rolled back whole");
+    }
+
+    /// Every named trigger and index of a version 5 file is still there, with
+    /// the same SQL, after the migration to version 6.
+    #[test]
+    fn the_triggers_and_indexes_of_a_version_5_file_survive_version_6() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        let list = |c: &Connection| -> Vec<(String, String, String)> {
+            c.prepare(
+                "SELECT type, name, coalesce(sql, '') FROM sqlite_schema
+                 WHERE type IN ('trigger', 'index') AND name NOT LIKE 'sqlite_autoindex%'
+                 ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = {
+            let c = Connection::open(&path).unwrap();
+            for sql in [SCHEMA_V1, MIGRATE_V2, MIGRATE_V3, MIGRATE_V4, MIGRATE_V5] {
+                c.execute_batch(sql).unwrap();
+            }
+            list(&c)
+        };
+        assert!(before.len() > 10, "{}", before.len());
+        let after = list(&Db::open_at(&path).unwrap().conn);
+        for kept in &before {
+            assert!(after.contains(kept), "lost or changed {kept:?}");
+        }
+    }
+
     /// G2-32, G2-35, G2-36: a clean version 5 file with data moves to
     /// version 6 with every row it had, exactly: the three sync tables are
     /// rebuilt without their foreign-key actions firing (an operation keeps
@@ -1972,7 +2116,8 @@ mod tests {
                    accepted_restore_epoch, fencing_token, lease_id, sync_state)
                  VALUES ('p', '{i}', '{i}', '{i}', '{i}', 3, zeroblob(32), 4, 2, '{lease}',
                    'CHECKED_OUT'),
-                   ('q', '{i}', '{i}', '{i}', '{other}', 0, NULL, 4, NULL, NULL, 'AVAILABLE');
+                   ('q', '{i}', '{i}', '{i}', '{other}', 0, NULL, 4, NULL, NULL, 'AVAILABLE'),
+                   ('r', '{i}', '{i}', '{i}', '{third}', 0, NULL, 4, 5, '{lease2}', 'QUARANTINED');
                  INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
                    server_instance_id, restore_epoch, tenant_id, fleet_id, remote_profile_id,
                    snapshot_id, manifest_replay_id, operation_scope, kind, idempotency_key,
@@ -2004,6 +2149,8 @@ mod tests {
                    zeroblob(32), 't', 't');",
                 lease = "aa".repeat(16),
                 other = "22".repeat(16),
+                third = "33".repeat(16),
+                lease2 = "bb".repeat(16),
                 canonical = "0a".repeat(32),
             ))
             .unwrap();
@@ -2041,6 +2188,8 @@ mod tests {
                     .unwrap()
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
+                // A held lease is marked at risk, checked apart below.
+                let cols: Vec<String> = cols.into_iter().filter(|c| c != "sync_state").collect();
                 let rows = dump(&c, table, &cols);
                 had.push((table, cols, rows));
             }
@@ -2060,12 +2209,31 @@ mod tests {
                 ),
                 format!("s{account}{device}{key}130"),
             );
+            // The lease is still held, marked at risk with the migration's time
+            // as its unknown expiry: no 1970 sentinel, and not free.
             assert_eq!(
-                one("SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = 'p'"),
-                "1970-01-01T00:00:00.000Z"
+                count(
+                    "SELECT count(*) FROM profile_bindings WHERE local_profile_id = 'p'
+                       AND sync_state = 'LEASE_AT_RISK' AND lease_id IS NOT NULL
+                       AND fencing_token = 2
+                       AND lease_expires_at > '2020' AND lease_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                ),
+                1
             );
             assert_eq!(
-                count("SELECT count(*) FROM profile_bindings WHERE lease_expires_at IS NULL"),
+                count(
+                    "SELECT count(*) FROM profile_bindings WHERE lease_expires_at IS NULL
+                       AND sync_state = 'AVAILABLE'"
+                ),
+                1
+            );
+            // A quarantined lease keeps its reason's state.
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM profile_bindings WHERE local_profile_id = 'r'
+                       AND sync_state = 'QUARANTINED' AND lease_id IS NOT NULL
+                       AND lease_expires_at IS NOT NULL"
+                ),
                 1
             );
             assert_eq!(
