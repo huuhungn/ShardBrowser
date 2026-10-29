@@ -195,11 +195,12 @@ fn open_pulled(
     open_profile_for(container, udd, passphrase, profile_id).map_err(|e| format!("{e:#}"))
 }
 
-/// The fleet keys pull tries, newest first: a store that cannot be read
-/// leaves only the passphrase.
-fn pull_candidates(fleet_id: &str) -> Vec<([u8; 32], u64)> {
+/// The fleet keys pull tries, newest first: a key from a verified grant only
+/// while that grant reverifies at `now` (G2-35, `fleet_key_verifies`). A store
+/// that cannot be read leaves only the passphrase.
+pub(crate) fn pull_candidates(c: &team_config::TeamConfig, now: u64) -> Vec<([u8; 32], u64)> {
     fleet_keys::load()
-        .map(|s| s.keys_newest_first(fleet_id))
+        .map(|s| s.keys_newest_first(&c.fleet_id, |g, k| crate::fleet_key_usable(c, g, k, now)))
         .unwrap_or_default()
 }
 
@@ -240,7 +241,10 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    let candidates = pull_candidates(&c.fleet_id);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let candidates = pull_candidates(&c, now);
 
     tokio::task::spawn_blocking(move || {
         open_pulled(&container, &udd, &profile_id, &candidates, &passphrase)
@@ -310,11 +314,11 @@ mod tests {
         assert_ne!(profile_ref("a"), profile_ref("b"));
     }
 
-    /// Pull tries a key cached by 2.4.2, never one collected from a verified
-    /// grant: until sticky lapse and the reverify before use, such a key could
-    /// come from a stolen custodian key whose custody lapsed.
+    /// Pull tries a key cached by 2.4.2, and one collected from a verified
+    /// grant only once that grant reverifies (G2-35): with no pinned anchor
+    /// and no kept grant, it is not tried.
     #[test]
-    fn pull_does_not_try_a_key_from_a_verified_grant() {
+    fn pull_does_not_try_a_key_from_a_grant_that_does_not_reverify() {
         let _config = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -326,7 +330,11 @@ mod tests {
         let mut keys = fleet_keys::load().unwrap();
         keys.insert(&fleet, 2, &legacy);
         fleet_keys::save(&keys).unwrap();
-        let candidates = pull_candidates(&fleet);
+        let c = team_config::TeamConfig {
+            fleet_id: fleet.clone(),
+            ..Default::default()
+        };
+        let candidates = pull_candidates(&c, 0);
         let udd = dir.path().join("udd");
         std::fs::create_dir_all(&udd).unwrap();
         std::fs::write(udd.join("Preferences"), b"{}").unwrap();
@@ -342,7 +350,7 @@ mod tests {
         crate::store::set_config_root(None);
 
         assert_eq!(candidates, [(legacy, 2)]);
-        let err = from_verified.expect_err("the verified grant's key is not tried");
+        let err = from_verified.expect_err("a key whose grant does not reverify is not tried");
         assert!(
             crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
             "{err}"
