@@ -7,6 +7,8 @@ mod bookmarks;
 pub mod cdp;
 mod codex_mcp;
 mod cookies;
+#[cfg(test)]
+mod crash_harness;
 mod credential;
 pub mod db;
 mod dpapi;
@@ -2941,6 +2943,29 @@ fn block_exit_if_browsers_running(app: &tauri::AppHandle) -> bool {
     true
 }
 
+/// Ends the run before it writes anything. The interface is not up yet, so
+/// the operator reads the English sentence of the code in a system dialog.
+fn refuse_to_start(code: &str) -> ! {
+    let message = crate::errcode::resolve_to_english(code);
+    eprintln!("[launcher] refusing to start: {message}");
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (text, title) = (wide(&message), wide("ShardX Launcher"));
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONERROR,
+            )
+        };
+    }
+    std::process::exit(1)
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("main") {
@@ -4723,6 +4748,20 @@ pub fn run() {
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
 
+            // Point the heavy directories wherever the operator moved them,
+            // before anything reads a profile.
+            if let Ok(s) = settings::load() {
+                if let Some(root) = s.data_root.as_deref().filter(|r| !r.is_empty()) {
+                    store::set_data_root(Some(std::path::PathBuf::from(root)));
+                }
+            }
+
+            // Before the first write: state lives on local NTFS only (ADR 0002
+            // Q-29, plan L2335).
+            if let Err(refusal) = store::require_local_ntfs_roots() {
+                refuse_to_start(&refusal.to_string());
+            }
+
             // Devices enrolled before ADR 0004 still hold their seeds in
             // team.json and their fleet keys in fleet_keys.json; move both
             // into the OS credential store.
@@ -4800,14 +4839,6 @@ pub fn run() {
             tauri::async_runtime::spawn(async {
                 runtime::ensure_profiles_migrated().await;
             });
-
-            // Point the heavy directories wherever the operator moved them,
-            // before anything reads a profile.
-            if let Ok(s) = settings::load() {
-                if let Some(root) = s.data_root.as_deref().filter(|r| !r.is_empty()) {
-                    store::set_data_root(Some(std::path::PathBuf::from(root)));
-                }
-            }
 
             // Trash older than its week.
             match trash::purge_expired() {
