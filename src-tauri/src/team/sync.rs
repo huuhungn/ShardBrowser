@@ -4965,6 +4965,125 @@ mod tests {
         }
     }
 
+    /// G2-35 (plan L2032), the launcher half of WP-14: a kept
+    /// `DeviceRevocationV2` is reloaded before the Q-18 commit block reads it,
+    /// with every column its row carries equal to the exact bytes: the row's
+    /// key is the revoked key, and the container is a revocation of this
+    /// tenant and instance. A row that does not reload makes the ledger
+    /// unreadable and nothing is uploaded; one that reloads but whose signer
+    /// this device cannot verify still counts as `compromised`.
+    #[test]
+    fn a_kept_revocation_reloads_with_every_column_equal() {
+        let mut other_tenant = common(30);
+        other_tenant.tenant_id = [0x55; 16];
+        let mut other_instance = common(30);
+        other_instance.server_instance_id = [0x56; 16];
+        let revocation = |common: CommonFields, subject: [u8; 32]| DeviceRevocationV2 {
+            common,
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: subject,
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let stranger = Ed25519SigningKey::from_bytes(&[9; 32]);
+        for (what, container, unreadable) in [
+            ("a matching revocation", None, false),
+            (
+                "another revoked key",
+                Some(revocation(common(30), [0x79; 32])),
+                true,
+            ),
+            (
+                "another tenant",
+                Some(revocation(other_tenant, [0x77; 32])),
+                true,
+            ),
+            (
+                "another instance",
+                Some(revocation(other_instance, [0x77; 32])),
+                true,
+            ),
+        ] {
+            let w = world();
+            let matching = revocation(common(30), [0x77; 32]);
+            let container = build_record(
+                &w.me.sk,
+                DOMAIN_DEVICE_REVOCATION,
+                &container.unwrap_or(matching).encode(),
+            );
+            w.db()
+                .conn
+                .execute(
+                    "INSERT INTO trust_proven_revocations
+                     VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                    params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+                )
+                .unwrap();
+            let err = w.push().unwrap_err();
+            let key = if unreadable {
+                "team.trustLedgerUnreadable"
+            } else {
+                "sync.commitBlockedCompromised"
+            };
+            assert!(has(&err, key), "{what}: {err:#}");
+            assert!(w.sent("POST", "/uploads").is_empty(), "{what}");
+        }
+        // A kept row that is not a revocation at all, or not even a record.
+        let w = world();
+        let not_a_revocation = w.grant.clone();
+        let mut g = DeviceHpkeGrantV2 {
+            common: common(40),
+            fleet_id: FLEET,
+            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&FKEK),
+            generation: GEN,
+            subject_account_id: w.me.to.account_id,
+            subject_device_id: w.me.to.device_id,
+            subject_signing_key_id: w.me.to.signing_key_id,
+            recipient_hpke_key_id: w.me.to.hpke_key_id,
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        };
+        shardx_core::grants::seal_device_fkek(&w.me.hpke_pk, &mut g, &FKEK).unwrap();
+        let by_stranger = build_record(&stranger, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode());
+        for (what, container) in [
+            ("another record", not_a_revocation),
+            ("another record this device cannot verify", by_stranger),
+            ("bytes that are no record", vec![1, 2, 3]),
+        ] {
+            w.db()
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO trust_proven_revocations
+                     VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                    params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+                )
+                .unwrap();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "team.trustLedgerUnreadable"), "{what}: {err:#}");
+            assert!(w.sent("POST", "/uploads").is_empty(), "{what}");
+        }
+        // Signed by a key this device has no evidence for: it cannot verify
+        // the reason, so the revocation counts as `compromised` (Q-18).
+        drop(w);
+        let w = world();
+        let unverifiable = build_record(
+            &stranger,
+            DOMAIN_DEVICE_REVOCATION,
+            &revocation(common(30), [0x77; 32]).encode(),
+        );
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), unverifiable],
+            )
+            .unwrap();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+    }
+
     /// Rule 6, first acceptance: a new head is restored only while its
     /// signer holds, now, an approval and a device-scoped `profile.commit`
     /// covering the profile or its fleet.

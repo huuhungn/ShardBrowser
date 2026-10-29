@@ -454,6 +454,7 @@ pub fn commit_blocked(
     generation: u64,
 ) -> Result<bool> {
     use shardx_core::authz_record::DeviceRevocationReason;
+    let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
     let (instance, tenant) = ids(binding);
     let kept = fleet_key_grant(db, binding, anchor, fleet_id, generation)?;
     let verified: Option<i64> = db
@@ -483,10 +484,29 @@ pub fn commit_blocked(
         let key = decode_hex32(&r.get::<_, String>(0)?, "signing_key_id")?;
         let counted: i64 = r.get(1)?;
         let container: Vec<u8> = r.get(2)?;
-        if matches!(payload(&container), Some((_, Payload::DeviceRevocation(d)))
-            if d.reason_code != DeviceRevocationReason::Compromised)
-        {
-            continue;
+        // Plan L2032, G2-35: the kept container reloads as a revocation of
+        // this tenant and instance, of the key its row names, or the ledger
+        // is unreadable. One this device cannot verify still counts.
+        let Ok(record) = AuthorizationRecord::parse(&container) else {
+            return Err(unreadable());
+        };
+        if record.payload_domain() != DOMAIN_DEVICE_REVOCATION {
+            return Err(unreadable());
+        }
+        match payload(&container) {
+            Some((_, Payload::DeviceRevocation(d))) => {
+                if d.subject_signing_key_id != key
+                    || d.common.server_instance_id != binding.server_instance_id
+                    || d.common.tenant_id != binding.tenant_id
+                {
+                    return Err(unreadable());
+                }
+                if d.reason_code != DeviceRevocationReason::Compromised {
+                    continue;
+                }
+            }
+            Some(_) => return Err(unreadable()),
+            None => {}
         }
         if verified.is_none_or(|v| v <= counted) {
             return Ok(true);
