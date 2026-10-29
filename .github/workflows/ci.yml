@@ -94,6 +94,18 @@ jobs:
             sdks/rust/target
           key: windows-rust-${{ hashFiles('shared/Cargo.lock', 'server/Cargo.lock', 'src-tauri/Cargo.lock', 'sdks/rust/Cargo.lock') }}
 
+      # The supported-filesystem gate (ADR 0002 Q-29) must refuse an SMB
+      # share. The runner is elevated, so it shares an empty directory; the
+      # volume tests of all three crates read SHARDX_TEST_SMB_DIR and only
+      # query the share, never write to it.
+      - name: Create a temporary SMB share
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'shardx-g2-smb'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          New-SmbShare -Name shardx-g2-smb -Path $dir -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
+          "SHARDX_TEST_SMB_DIR=\\localhost\shardx-g2-smb" >> $env:GITHUB_ENV
+
       - name: Shared core tests
         run: cargo test --manifest-path shared/Cargo.toml
 
@@ -110,6 +122,11 @@ jobs:
       # were otherwise compiled only on Linux and macOS.
       - name: Rust SDK tests
         run: cargo test --manifest-path sdks/rust/Cargo.toml --all-features
+
+      - name: Remove the temporary SMB share
+        if: always()
+        shell: pwsh
+        run: Remove-SmbShare -Name shardx-g2-smb -Force -ErrorAction SilentlyContinue
 
   macos-check:
     # The hosted arm64 pool repeatedly leaves this job unacquired ("capacity

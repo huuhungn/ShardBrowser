@@ -67,6 +67,8 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     }
     std::fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
     writable(&dst)?;
+    // A target the next start would refuse is refused now (ADR 0002 Q-29).
+    store::require_local_ntfs(&dst)?;
 
     emit(
         app,

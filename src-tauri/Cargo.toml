@@ -87,6 +87,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography", # CryptProtectData / CryptUnprotectData
     "Win32_Storage_FileSystem",    # Atomic profile JSON replacement
     "Win32_System_Recovery",       # RegisterApplicationRestart
+    "Win32_UI_WindowsAndMessaging", # The refused-start dialog
 ] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

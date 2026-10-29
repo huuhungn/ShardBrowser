@@ -36,6 +36,7 @@ pub mod snapshot;
 pub mod snapshot_v2;
 pub mod trust_chain;
 pub mod trust_evidence;
+pub mod volume;
 pub mod webdata;
 
 pub use oscrypt::LocalCrypt;
