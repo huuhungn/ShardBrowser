@@ -2580,6 +2580,7 @@ async fn collect_fleet_grant(
         device_sk,
         now,
         &mut ledger,
+        &c.server_url,
     )?;
     keep_fleet_key(&c.fleet_id, generation, fkek)
 }
@@ -2648,6 +2649,7 @@ fn open_fleet_grant(
     device_sk: &[u8],
     now: u64,
     ledger: &mut team::db::Db,
+    server_url: &str,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, String> {
     use team::ledger;
     let failed = |e: anyhow::Error| {
@@ -2671,6 +2673,7 @@ fn open_fleet_grant(
     let grant = chain.device_hpke_grant(container, me, fleet_id, generation, now);
     let fkek = grant.and_then(|g| shardx_core::grants::open_device_fkek(device_sk, g).ok());
     let opened = grant.filter(|_| fkek.is_some()).map(|g| ledger::Opened {
+        server_url,
         fleet_id,
         generation,
         fkek_key_id: g.fkek_key_id,
@@ -2727,6 +2730,16 @@ fn fleet_key_verifies(
     let Ok(record) = shardx_core::authz_record::AuthorizationRecord::parse(&container) else {
         return Ok(false);
     };
+    // Plan L2032: the kept record reloads with every column equal to the
+    // exact bytes, or the key is refused.
+    let kept = team::records::load(
+        &ledger.conn,
+        team::records::SIGNED,
+        record.signed_container_hash(),
+    );
+    if kept.ok().as_deref() != Some(container.as_slice()) {
+        return Ok(false);
+    }
     if ledger::withdrawn(ledger, binding, record.issuer_signing_key_id())? {
         return Ok(false);
     }
@@ -2736,6 +2749,32 @@ fn fleet_key_verifies(
     Ok(chain
         .device_hpke_grant(&container, me, fleet_id, generation, now)
         .is_some_and(|g| g.fkek_key_id == shardx_core::fleet_grants::fkek_key_id(key)))
+}
+
+/// Whether the ledger keeps the grant of `generation` of `fleet_id` but no
+/// signed authorization record for it: a fleet key collected under schema
+/// version 3, which kept none. No sync collects it again; only collecting the
+/// fleet key in Settings (`team_collect_custody`) does.
+fn fleet_key_needs_recollect(
+    ledger: &team::db::Db,
+    (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
+    fleet_id: &[u8; 16],
+    generation: u64,
+) -> bool {
+    let Ok(Some((container, _))) =
+        team::ledger::fleet_key_grant(ledger, binding, anchor, fleet_id, generation)
+    else {
+        return false;
+    };
+    let Ok(record) = shardx_core::authz_record::AuthorizationRecord::parse(&container) else {
+        return false;
+    };
+    let kept = ledger.conn.query_row(
+        "SELECT count(*) FROM signed_authorization_records WHERE signed_container_hash = ?1",
+        [&record.signed_container_hash()[..]],
+        |r| r.get::<_, i64>(0),
+    );
+    matches!(kept, Ok(0))
 }
 
 /// Whether sync pull may use `key`, collected as `generation` of this
@@ -3133,6 +3172,7 @@ mod custody_tests {
                 sk,
                 now,
                 &mut ledger,
+                "https://fleet.test",
             )
             .unwrap()
         };
@@ -3367,6 +3407,7 @@ mod custody_tests {
             &me.hpke_sk,
             now,
             &mut ledger,
+            "https://fleet.test",
         )
         .unwrap()
         .map(|k| *k)
@@ -3960,6 +4001,77 @@ mod custody_tests {
             });
         assert_eq!(collect(&path, &reported, &[], 1), None);
         assert!(!verifies(&pin, 1, &fkek, &me.to, now), "reported since");
+    }
+
+    /// G2-35 (plan L2032): collecting a grant also keeps it as a signed
+    /// authorization record, and its key is used only while that record
+    /// reloads with every column equal to its bytes and the same bytes as
+    /// the ledger's grant; a missing or changed record refuses the key.
+    #[test]
+    fn a_key_is_used_only_while_its_kept_record_reloads_exactly() {
+        let me = me();
+        let fkek = [0x71; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&fkek);
+        let from_d = grant_by(&d_key(), &me, 1, 41, kid, &fkek);
+        let pages = with_d(
+            &me,
+            evidence(&me, from_d.clone()),
+            Some(T0 + 300 * DAY),
+            Vec::new(),
+        );
+        let (_dir, path) = ledger_at();
+        let pin = (BINDING, me.to.signing_key_id);
+        let now = T0 + 2 * DAY;
+        assert_eq!(collect(&path, &pages, &from_d, 1), Some(fkek));
+        let verifies = || {
+            let db = team::db::Db::open_at(&path).unwrap();
+            fleet_key_verifies(&db, &pin, &me.to, &FLEET, 1, &fkek, now).unwrap()
+        };
+        assert!(verifies());
+        let db = team::db::Db::open_at(&path).unwrap();
+        let kept: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT exact_signed_container_bytes FROM signed_authorization_records",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, from_d);
+        db.conn
+            .execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 CREATE TABLE saved AS SELECT * FROM signed_authorization_records;",
+            )
+            .unwrap();
+        let pin_now = (BINDING, me.to.signing_key_id);
+        assert!(!fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1));
+        for (sql, undo) in [
+            (
+                "UPDATE signed_authorization_records SET generation = 2",
+                "UPDATE signed_authorization_records SET generation = 1",
+            ),
+            (
+                "UPDATE signed_authorization_records SET revoked_at_ms = 0",
+                "UPDATE signed_authorization_records SET revoked_at_ms = NULL",
+            ),
+            (
+                "DELETE FROM signed_authorization_records",
+                "INSERT INTO signed_authorization_records SELECT * FROM saved",
+            ),
+        ] {
+            db.conn.execute_batch(sql).unwrap();
+            assert!(!verifies(), "{sql}");
+            // Only a missing record asks for the key to be collected again.
+            let missing = sql.starts_with("DELETE");
+            assert_eq!(
+                fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1),
+                missing,
+                "{sql}"
+            );
+            db.conn.execute_batch(undo).unwrap();
+            assert!(verifies(), "{undo}");
+        }
     }
 
     /// Q-25 against the D-6 (b) attack with no evaluation between the end of

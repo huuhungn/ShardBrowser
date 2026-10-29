@@ -718,8 +718,28 @@ pub async fn run(
         },
         passphrase,
     };
-    let result = bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await;
-    result.map(|()| BootstrapStatus::of(&state))
+    // A bootstrap returns Ok only once the generation is active.
+    bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await?;
+    keep_records(client.base_url(), &state)?;
+    Ok(BootstrapStatus::of(&state))
+}
+
+/// Files the activated generation 0, its self-grant and this device's
+/// approval in the team database (plan L1510-L1744). Each run after
+/// activation files what is missing and refuses a row that changed.
+fn keep_records(server_url: &str, state: &BootstrapState) -> Result<()> {
+    let mut db = crate::team::db::Db::open()?;
+    let tx = db.conn.transaction()?;
+    crate::team::records::keep_root_bootstrap(
+        &tx,
+        server_url,
+        &unhex_vec(&state.approval)?,
+        &unhex_vec(&state.self_grant)?,
+        &unhex(&state.recovery_bundle_sha256)?,
+        now_ms(),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// How far the bootstrap got, for the UI: nothing of the state's secrets.
@@ -797,6 +817,105 @@ mod tests {
             panic!("an approval")
         };
         a.clone()
+    }
+
+    /// After activation, every `run` files generation 0, the self-grant and
+    /// the approval in the team database without reaching the server, and
+    /// they reload exactly; a second run changes nothing.
+    #[test]
+    fn an_activated_run_keeps_the_root_records_and_they_reload_exactly() {
+        use crate::team::records::{load, ROOT_GRANTS, SIGNED};
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let seed = [7; 32];
+        let (_, pk) = derive_keypair(&seed);
+        let cx = Context16 {
+            hpke_key_id: hpke_key_id(&pk),
+            ..cx()
+        };
+        let now = 1_800_000_000_000;
+        let approval = self_approval(&cx, &signer(), now).unwrap();
+        let replay = approval_of(&approval).common.replay_id;
+        let grant = self_grant(&cx, &signer(), &pk, &[9; 32], replay, now).unwrap();
+        save(&BootstrapState {
+            tenant_id: hex(&cx.tenant),
+            device_id: hex(&cx.device),
+            server_instance_id: hex(&cx.instance),
+            approval: hex(&approval),
+            self_grant: hex(&grant),
+            recovery_bundle_sha256: hex(&[8; 32]),
+            activated: true,
+            anchor: hex(&cx.signing_key_id),
+            ..Default::default()
+        })
+        .unwrap();
+        // Nothing listens here: an activated run never calls the server.
+        let client = FleetClient::new("http://127.0.0.1:9", "t").unwrap();
+        let (tenant, device_id, account) = (hex(&cx.tenant), hex(&cx.device), hex(&cx.account));
+        let signer = signer();
+        let device = BootstrapDevice {
+            login: AccountLogin {
+                tenant_id: &tenant,
+                username: "u",
+                password: "p",
+            },
+            device_id: &device_id,
+            account_id: &account,
+            signer: &signer,
+            hpke_seed: &seed,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for _ in 0..2 {
+            let status = rt.block_on(run(&client, &device, Path::new("unused"), "pass"));
+            assert!(status.unwrap().activated);
+        }
+        let db = crate::team::db::Db::open();
+        crate::store::set_config_root(None);
+        let db = db.unwrap();
+        let hash = |c: &[u8]| {
+            *AuthorizationRecord::parse(c)
+                .unwrap()
+                .signed_container_hash()
+        };
+        assert_eq!(load(&db.conn, ROOT_GRANTS, &hash(&grant)).unwrap(), grant);
+        assert_eq!(load(&db.conn, SIGNED, &hash(&approval)).unwrap(), approval);
+        let generation: (i64, String, String, Vec<u8>, i64, Vec<u8>, i64) = db
+            .conn
+            .query_row(
+                "SELECT root_generation, root_key_id, state, recovery_bundle_sha256,
+                   required_custodian_grant_count, required_custodian_grant_set_hash,
+                   (SELECT count(*) FROM tenant_root_key_generations)
+                 FROM tenant_root_key_generations",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let set = root_custodian_grant_set_hash(&[hash(&grant)]).unwrap();
+        assert_eq!(
+            generation,
+            (
+                0,
+                hex(&root_key_id(&[9; 32])),
+                "ACTIVE".into(),
+                vec![8; 32],
+                1,
+                set.to_vec(),
+                1
+            )
+        );
     }
 
     #[test]

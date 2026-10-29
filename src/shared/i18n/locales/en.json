@@ -1216,6 +1216,7 @@
   "sync.deviceNotEnrolled": "This device is not enrolled. Enroll it in Settings.",
   "sync.enrolledBeforeSyncExisted": "This device was enrolled before profile sync existed — enroll it again in Settings.",
   "sync.epochTransitionRequired": "The team server was restored and this profile needs a verified restore transition first. The profile is quarantined.",
+  "sync.fleetKeyRecollect": "This device's fleet key was collected by an earlier version and must be collected again: open Settings and collect the fleet key.",
   "sync.fleetKeyStoreUnreadable": "The saved fleet keys file cannot be read, so it was left untouched. Restore it from a backup before collecting fleet keys again.",
   "sync.headRollback": "The team server offered an older state of this profile than this device already accepted. The profile is quarantined.",
   "sync.holdWorkInOneWindowAlone": "Hold — work in one window alone",

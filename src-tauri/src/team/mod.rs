@@ -7,4 +7,5 @@
 
 pub mod db;
 pub mod ledger;
+pub mod records;
 pub mod sync;
