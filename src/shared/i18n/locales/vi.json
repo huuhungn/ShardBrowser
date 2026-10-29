@@ -1216,6 +1216,7 @@
   "sync.deviceNotEnrolled": "Thiết bị này chưa được ghi danh. Hãy ghi danh trong Cài đặt.",
   "sync.enrolledBeforeSyncExisted": "Thiết bị này được ghi danh trước khi có đồng bộ hồ sơ — hãy ghi danh lại trong Cài đặt.",
   "sync.epochTransitionRequired": "Máy chủ nhóm đã được khôi phục và hồ sơ này cần một bước chuyển khôi phục đã xác minh trước. Hồ sơ đã bị cách ly.",
+  "sync.fleetKeyRecollect": "Khóa nhóm của thiết bị này được nhận bởi phiên bản cũ và cần nhận lại: mở Cài đặt và nhận khóa nhóm.",
   "sync.fleetKeyStoreUnreadable": "Không đọc được tệp khóa fleet đã lưu, nên tệp được giữ nguyên. Hãy khôi phục tệp từ bản sao lưu rồi mới nhận khóa fleet lại.",
   "sync.headRollback": "Máy chủ nhóm đưa ra một trạng thái cũ hơn trạng thái thiết bị này đã chấp nhận. Hồ sơ đã bị cách ly.",
   "sync.holdWorkInOneWindowAlone": "Tách riêng — làm việc trong một cửa sổ",

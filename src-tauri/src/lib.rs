@@ -2751,6 +2751,32 @@ fn fleet_key_verifies(
         .is_some_and(|g| g.fkek_key_id == shardx_core::fleet_grants::fkek_key_id(key)))
 }
 
+/// Whether the ledger keeps the grant of `generation` of `fleet_id` but no
+/// signed authorization record for it: a fleet key collected under schema
+/// version 3, which kept none. No sync collects it again; only collecting the
+/// fleet key in Settings (`team_collect_custody`) does.
+fn fleet_key_needs_recollect(
+    ledger: &team::db::Db,
+    (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
+    fleet_id: &[u8; 16],
+    generation: u64,
+) -> bool {
+    let Ok(Some((container, _))) =
+        team::ledger::fleet_key_grant(ledger, binding, anchor, fleet_id, generation)
+    else {
+        return false;
+    };
+    let Ok(record) = shardx_core::authz_record::AuthorizationRecord::parse(&container) else {
+        return false;
+    };
+    let kept = ledger.conn.query_row(
+        "SELECT count(*) FROM signed_authorization_records WHERE signed_container_hash = ?1",
+        [&record.signed_container_hash()[..]],
+        |r| r.get::<_, i64>(0),
+    );
+    matches!(kept, Ok(0))
+}
+
 /// Whether sync pull may use `key`, collected as `generation` of this
 /// device's fleet from a verified grant: only while `fleet_key_verifies`
 /// passes at `now`, against the anchor this device pinned. Anything
@@ -4018,6 +4044,8 @@ mod custody_tests {
                  CREATE TABLE saved AS SELECT * FROM signed_authorization_records;",
             )
             .unwrap();
+        let pin_now = (BINDING, me.to.signing_key_id);
+        assert!(!fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1));
         for (sql, undo) in [
             (
                 "UPDATE signed_authorization_records SET generation = 2",
@@ -4034,6 +4062,13 @@ mod custody_tests {
         ] {
             db.conn.execute_batch(sql).unwrap();
             assert!(!verifies(), "{sql}");
+            // Only a missing record asks for the key to be collected again.
+            let missing = sql.starts_with("DELETE");
+            assert_eq!(
+                fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1),
+                missing,
+                "{sql}"
+            );
             db.conn.execute_batch(undo).unwrap();
             assert!(verifies(), "{undo}");
         }

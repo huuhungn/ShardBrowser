@@ -840,7 +840,13 @@ fn verified_key(
                     .unwrap_or(false)
         })
         .map(|(k, _)| Zeroizing::new(k))
-        .ok_or_else(none)
+        .ok_or_else(|| {
+            if crate::fleet_key_needs_recollect(db, &dev.pin, fleet, generation) {
+                anyhow!(code("sync.fleetKeyRecollect"))
+            } else {
+                none()
+            }
+        })
 }
 
 // ---------------------------------------------------------------- push ----
@@ -2718,6 +2724,25 @@ mod tests {
             assert!(has(&err, "sync.bindingQuarantined"), "{sql}: {err:#}");
             assert_eq!(w.fake().log.len(), before, "{sql}");
         }
+    }
+
+    /// A fleet key collected before the kept records (schema version 3) is
+    /// refused with the named error that asks for it to be collected again
+    /// in Settings: no sync files its record. The lease is released and
+    /// nothing is uploaded.
+    #[test]
+    fn a_key_without_its_kept_record_asks_to_be_collected_again() {
+        let w = world();
+        w.db()
+            .conn
+            .execute("DELETE FROM signed_authorization_records", [])
+            .unwrap();
+        for _ in 0..2 {
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.fleetKeyRecollect"), "{err:#}");
+            assert!(w.fake().lease.is_none(), "the server released it");
+        }
+        assert!(w.sent("POST", "/uploads").is_empty());
     }
 
     /// G2-34: a release whose reply was lost stays stored, and the next push
