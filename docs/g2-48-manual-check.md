@@ -1,6 +1,6 @@
 # G2-48 manual check: the Windows credential store
 
-ADR 0002 Q-31 makes the evidence for G2-48 a log from this real Windows
+ADR 0002 Q-29 makes the evidence for G2-48 a log from this real Windows
 machine: a credential filed the way the launcher files its device keys
 survives a restart, is readable while the session is locked and after it is
 unlocked, and is not handed out to a logon session that has no credential
