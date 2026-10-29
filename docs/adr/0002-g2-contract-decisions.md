@@ -94,6 +94,15 @@ These narrow D-1 toward fail-closed behaviour; each was reviewed independently.
 | **Q-34 Rolled-back outcomes and replay order** | A restore marks the ledger rows of rolled-back COMMIT, CREATE_UPLOAD, FINALIZE_UPLOAD and PROFILE_PUBLISH_CREATE with `superseded_by_restore_epoch = E+1` (set once, by trigger). The idempotency ledger is consulted before the restore-epoch check on publish, checkout, release, create-upload and finalize, so a replay of a superseded commit answers 409 `BASE_VERSION_MISMATCH` with `superseded_by_restore_epoch`, a superseded create or finalize answers `RESOURCE_NOT_FOUND`, and a kept outcome replays its stored bytes | L377-L389 |
 | **Q-35 Not in this cut** | No `--drop-unreferenced`: a profile or head present on one side only refuses the restore. Candidate = a copy of the live DB with the backup's data plane attached (equivalent to the D-1 merge). `abort --orphans` keeps `pre-restore-*` archives unless `--delete-archives` is given. Release builds refuse `export-heads` and `prepare` (as D-1 requires before v0.2.2); crash points exist only in debug builds | the `--drop-unreferenced` paragraph, K3, L584 |
 
+### Implementation choices recorded on 2026-10-29 (WP-4 launcher restore-epoch client)
+
+Found by the independent review of WP-4; both fail closed.
+
+| Choice | Decision | Plan text it narrows or corrects |
+|---|---|---|
+| **Q-36 Transition signer and leaf head** | The launcher accepts a restore-epoch transition only when its signer is an ACTIVE root custodian at `issued_at_ms`, is still one when the launcher first sees the transition, and was not observed lapsed at or before `issued_at_ms` (the revocation rule of D-6 (b), since `issued_at_ms` is chosen by the signer). A head named by a proof leaf is accepted only after its manifest verifies as a first acceptance under rule 6 (signature, tenant, fleet, profile, instance, version, signer authority now), exempt only from the epoch check, so a restored head whose signer no longer holds an approval keeps the binding quarantined; refused transitions are not retried automatically and no operator command clears them in this cut. A device offline past a custodian's lapse therefore cannot accept that custodian's transitions, the same cost Q-25 accepts | rule 6, D-1 launcher acceptance |
+| **Q-37 Binding proofs outlive unbind** | `restore_epoch_binding_proofs` keeps its foreign key to `restore_epoch_transitions` but replaces the `ON DELETE RESTRICT` key to `profile_bindings` with an insert-only trigger (a proof is filed only for a bound profile), and filed transitions and proofs are append-only (update triggers abort). The plan DDL's key made every binding with a filed proof impossible to unbind, contradicting the requirement that receipts and tombstones survive the binding delete. Launcher schema v5 | DDL at L2002-L2028 against L1422 and L2239 |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
