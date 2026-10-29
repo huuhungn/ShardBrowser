@@ -1439,6 +1439,7 @@ pub(crate) async fn push(
     clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
     loop {
         let b = bound(&db, local)?;
         if awaits_transition(&b) {
@@ -1555,6 +1556,7 @@ pub(crate) async fn publish(
     now: u64,
 ) -> Result<Published> {
     let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
     if is_bound(&db, local)? {
         bail!(code("sync.alreadyPublished"));
     }
@@ -1749,7 +1751,6 @@ async fn send_publish(
             ("key_generation", g.key_generation == asked.key_generation),
             // The first fence of a new profile.
             ("fencing_token", g.lease.fencing_token == 1),
-            ("expires_at_ms", lease_expiry_ok(g.expires_at_ms, now)),
         ];
         match checks.iter().find(|(_, ok)| !ok) {
             Some((field, _)) => Err(bad(field)),
@@ -1760,16 +1761,33 @@ async fn send_publish(
         Ok(g) => g,
         Err(e) => return Err(refuse_publish(client, access, db, &b, op, &body, e).await),
     };
+    // The profile exists whatever its lease says, so a reply that names it
+    // is always bound (plan L2048). A lease already over is not held; one
+    // further ahead than a TTL and the skew allowance is held at risk, for
+    // one TTL from now.
+    let held = g.expires_at_ms > now;
+    let at_risk = held && !lease_expiry_ok(g.expires_at_ms, now);
+    let expiry = if at_risk {
+        now + u64::from(LEASE_TTL_SECONDS) * 1000
+    } else {
+        g.expires_at_ms
+    };
+    let state = match (held, at_risk) {
+        (false, _) => "AVAILABLE",
+        (true, true) => "LEASE_AT_RISK",
+        (true, false) => "CHECKED_OUT",
+    };
     let lease = hex(&g.lease.lease_id);
-    let tx = db.conn.transaction()?;
-    complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
-    tx.execute(
+    {
+        let tx = db.conn.transaction()?;
+        complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
+        tx.execute(
         "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
            account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
            accepted_restore_epoch, fencing_token, lease_id, lease_expires_at, fkek_key_id,
            key_generation, sync_state, dirty)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ', ?12 / 1000.0, 'unixepoch'), ?13, ?14,
-           'CHECKED_OUT', 1)",
+           ?15, 1)",
         params![
             b.local,
             b.server,
@@ -1780,29 +1798,43 @@ async fn send_publish(
             hex(&b.fleet),
             hex(&b.profile),
             wire(op.epoch)?,
-            wire(g.lease.fencing_token)?,
-            lease,
-            wire(g.expires_at_ms)?,
+            held.then(|| wire(g.lease.fencing_token)).transpose()?,
+            held.then_some(&lease),
+            held.then(|| wire(expiry)).transpose()?,
             hex(&g.fkek_key_id),
-            wire(g.key_generation)?
+            wire(g.key_generation)?,
+            state
         ],
     )?;
-    tx.execute(
-        "UPDATE operations SET local_profile_id = ?2, lease_id = ?3, fencing_token = ?4,
+        tx.execute(
+            "UPDATE operations SET local_profile_id = ?2, lease_id = ?3, fencing_token = ?4,
            base_version = ?5 WHERE op_id = ?1",
-        params![
-            op.op_id,
-            b.local,
-            lease,
-            wire(g.lease.fencing_token)?,
-            wire(g.lease.base_version)?
-        ],
-    )?;
-    tx.commit()?;
+            params![
+                op.op_id,
+                b.local,
+                lease,
+                wire(g.lease.fencing_token)?,
+                wire(g.lease.base_version)?
+            ],
+        )?;
+        tx.commit()?;
+    }
+    if !held {
+        // Over already: the stored lease is let go, best effort. The binding
+        // exists now, so a push replays the release if this one is lost.
+        let sent = async {
+            let release = release_op(&db.conn, &b, g.lease, ReleaseReason::UserRelease)?;
+            let release = get_op(db, &release)?;
+            release_reply(client, access, db, &b, &release).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] release of an ended first lease: {e:#}");
+        }
+    }
     Ok(Published {
         profile: b.profile,
         lease: g.lease,
-        expires_at_ms: g.expires_at_ms,
+        expires_at_ms: expiry,
     })
 }
 
@@ -1843,14 +1875,72 @@ async fn refuse_publish(
     err
 }
 
+/// Ends the unbound releases too old to matter and returns the rest.
+fn due_unbound_releases(db: &Db) -> Result<Vec<Op>> {
+    let ttl = u64::from(LEASE_TTL_SECONDS) + LEASE_SKEW_MS / 1000;
+    db.conn.execute(
+        "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE kind = 'RELEASE' AND state = 'PENDING' AND local_profile_id IS NULL
+           AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ?1 || ' seconds')",
+        [ttl],
+    )?;
+    let mut stmt = db.conn.prepare(&format!(
+        "SELECT {OP_COLUMNS} FROM operations
+         WHERE kind = 'RELEASE' AND state = 'PENDING' AND local_profile_id IS NULL
+         ORDER BY rowid"
+    ))?;
+    let ops = stmt
+        .query_map([], op_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ops)
+}
+
+/// Retries the `cancel_publish` releases an earlier attempt left PENDING: they
+/// name no binding, so nothing else would. One older than a TTL and the skew
+/// allowance (the lease it names cannot be live any more) is ended FAILED
+/// without a request; the rest are sent as stored. Best effort: a failure is
+/// logged and the release waits for the next publish, push or pull.
+async fn retry_unbound_releases(client: &FleetClient, access: &str, db: &mut Db) {
+    let ops = match due_unbound_releases(db) {
+        Ok(ops) => ops,
+        Err(e) => {
+            eprintln!("[sync] unbound releases: {e:#}");
+            return;
+        }
+    };
+    for op in ops {
+        let sent = async {
+            let request = IdempotentMutationRequestV2::parse(&op.exact)
+                .map_err(|_| bad("IdempotentMutationRequestV2"))?;
+            let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes)
+                .map_err(|_| bad("ReleaseLeaseV2"))?;
+            let b = Bound {
+                local: String::new(),
+                server: op.server.clone(),
+                instance: decode_hex16(&op.instance, "server_instance_id")?,
+                tenant: release.profile.tenant_id,
+                fleet: release.profile.fleet_id,
+                profile: release.profile.profile_id,
+                version: 0,
+                head: None,
+                epoch: op.epoch,
+                lease: None,
+                state: "LOCAL".into(),
+                error: None,
+            };
+            release_reply(client, access, db, &b, &op).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] cancel_publish release retried: {e:#}");
+        }
+    }
+}
+
 /// Ends the pending publish of `local` without sending it: the way out of a
 /// stored request that `publish` keeps refusing (a key withdrawn or a
 /// compromise counted since it was stored). Nothing is sent, so a request
 /// that had already reached the server leaves its first lease to lapse at its
 /// TTL and the empty profile listed; the next publish names a new profile.
-// shortcut: no command calls this yet, as push and pull have no cancel or
-// release command; add one with the Team profile UI.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cancel_publish(local: &str) -> Result<()> {
     let db = Db::open()?;
     let op = pending_publish(&db, local)?.ok_or_else(|| anyhow!(code("sync.noPublishPending")))?;
@@ -2891,6 +2981,7 @@ pub(crate) async fn pull(
     now: u64,
 ) -> Result<u64> {
     let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
     let mut b = bound(&db, local)?;
     if awaits_transition(&b) {
         accept_transitions(client, access, dev, &mut db, &b, now).await?;
@@ -3537,7 +3628,6 @@ mod tests {
                                 "publish-profile" => g.profile.profile_id = [0xee; 16],
                                 "publish-tenant" => g.profile.tenant_id = [0xee; 16],
                                 "publish-fleet" => g.profile.fleet_id = [0xee; 16],
-                                "publish-expiry" => g.expires_at_ms = 1,
                                 "publish-key" => g.fkek_key_id = [0xee; 32],
                                 "publish-generation" => g.key_generation += 1,
                                 "publish-fence" => g.lease.fencing_token = 2,
@@ -4636,7 +4726,6 @@ mod tests {
             ("publish-key", "fkek_key_id", true),
             ("publish-generation", "key_generation", true),
             ("publish-fence", "fencing_token", true),
-            ("publish-expiry", "expires_at_ms", true),
         ] {
             let w = world_unbound();
             w.fake().tamper = Some(tamper);
@@ -4778,47 +4867,247 @@ mod tests {
         assert_eq!(sent[0], sent[1], "the stored request, replayed");
     }
 
-    /// L-3: the expiry of a first lease is pinned only inside the window:
-    /// ahead of now and no further than one TTL and the skew allowance. A
-    /// reply outside it is refused by name, and the operation ends.
+    impl World {
+        fn publish_at(&self, profile: [u8; 16], now: u64) -> Result<Published> {
+            self.rt.block_on(publish(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                "Work profile",
+                FLEET,
+                profile,
+                now,
+            ))
+        }
+    }
+
+    /// The row the one binding of a publish is: its lease, expiry and state.
+    fn publish_row(w: &World) -> (Option<String>, Option<String>, String, i64) {
+        w.db()
+            .conn
+            .query_row(
+                "SELECT lease_id, lease_expires_at, sync_state, dirty FROM profile_bindings",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// NEW-1: a reply that names the request on every identity field is bound
+    /// at version 0 whatever its lease expiry says (plan L2048): one server
+    /// profile, one binding. Inside the window the lease is held as given; a
+    /// lease already over is not held and is released, best effort; one
+    /// further ahead than a TTL and the skew allowance is held at risk for one
+    /// TTL from now.
     #[test]
-    fn a_publish_lease_expiry_outside_the_ttl_is_refused() {
-        for (ms, kept) in [
-            (NOW + 1, true),
-            (NOW + 300_000 + 60_000, true),
-            (NOW, false),
-            (NOW + 300_000 + 60_000 + 1, false),
-            (1, false),
-            (9_000_000_000_000, false),
+    fn a_publish_is_bound_whatever_its_lease_expiry_says() {
+        for ms in [
+            NOW + 1,
+            NOW + 300_000 + 60_000,
+            NOW,
+            1,
+            NOW + 300_000 + 60_000 + 1,
+            9_000_000_000_000,
         ] {
             let w = world_unbound();
             w.fake().expires = Some(ms);
-            let result = w.publish();
-            if kept {
-                assert_eq!(result.unwrap().expires_at_ms, ms, "{ms}");
+            if ms <= NOW {
+                // The release is lost: the binding must not hold the lease.
+                w.fake().refuse.push(("release", 503));
+            }
+            let done = w.publish().unwrap();
+            assert_eq!(w.fake().published, [PROFILE], "{ms}");
+            let (lease, expiry, state, dirty) = publish_row(&w);
+            assert_eq!(dirty, 1, "{ms}");
+            let releases = w.sent("POST", "/release");
+            if ms <= NOW {
                 assert_eq!(
-                    w.count(&format!(
-                        "SELECT count(*) FROM profile_bindings
-                         WHERE lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', {ms} / 1000.0, 'unixepoch')"
-                    )),
-                    1,
+                    (lease, expiry, state.as_str()),
+                    (None, None, "AVAILABLE"),
                     "{ms}"
                 );
-                continue;
+                assert_eq!(releases.len(), 1, "{ms}: the ended lease is let go");
+                assert_eq!(
+                    w.count(
+                        "SELECT count(*) FROM operations WHERE kind = 'RELEASE'
+                           AND state = 'PENDING' AND local_profile_id = 'local-profile'"
+                    ),
+                    1,
+                    "{ms}: kept for a push to replay"
+                );
+                let request = IdempotentMutationRequestV2::parse(&releases[0]).unwrap();
+                let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes).unwrap();
+                assert_eq!(release.lease, done.lease, "{ms}");
+                assert_eq!(release.reason_code, ReleaseReason::UserRelease, "{ms}");
+                assert_eq!(done.expires_at_ms, ms, "{ms}");
+            } else if ms <= NOW + 360_000 {
+                assert_eq!(state, "CHECKED_OUT", "{ms}");
+                assert_eq!(expiry, Some(w.stored_as(ms)), "{ms}");
+                assert!(lease.is_some() && releases.is_empty(), "{ms}");
+                assert_eq!(done.expires_at_ms, ms, "{ms}");
+            } else {
+                assert_eq!(state, "LEASE_AT_RISK", "{ms}");
+                assert_eq!(expiry, Some(w.stored_as(NOW + 300_000)), "{ms}");
+                assert!(lease.is_some() && releases.is_empty(), "{ms}");
+                assert_eq!(done.expires_at_ms, NOW + 300_000, "{ms}");
             }
-            let err = result.unwrap_err();
-            assert!(has(&err, "sync.badReplySync"), "{ms}: {err:#}");
-            assert!(
-                format!("{err:#}").contains("expires_at_ms"),
-                "{ms}: {err:#}"
-            );
-            assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0, "{ms}");
             assert_eq!(
-                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'QUARANTINED'"),
+                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'COMPLETED'"),
                 1,
                 "{ms}"
             );
         }
+    }
+
+    /// P6: the reply is lost and the device comes back after the lease's
+    /// TTL. The replay returns the stored first lease, long over: the profile
+    /// is bound without a lease and nothing is made twice.
+    #[test]
+    fn a_publish_replayed_after_its_lease_ended_binds_the_one_profile() {
+        let w = world_unbound();
+        w.fake().lose.push("publish");
+        w.publish_at(PROFILE, NOW).unwrap_err();
+        assert_eq!(w.fake().published, [PROFILE]);
+        w.publish_at(PROFILE2, NOW + 600_000).unwrap();
+        assert_eq!(w.fake().published, [PROFILE], "no second profile");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM profile_bindings WHERE remote_profile_id = '{}'
+                   AND lease_id IS NULL",
+                hex(&PROFILE)
+            )),
+            1
+        );
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state <> 'COMPLETED'"
+            ),
+            0
+        );
+        // The next push takes a lease as any bound profile does.
+        assert_eq!(w.push().unwrap().version, 1);
+    }
+
+    /// P7: a device clock more than the skew allowance behind the server:
+    /// the first lease looks too far ahead, and is bound at risk, once.
+    #[test]
+    fn a_device_clock_behind_the_server_still_binds_one_profile() {
+        let w = world_unbound();
+        w.fake().expires = Some(NOW + 300_000 + 61_000);
+        w.publish().unwrap();
+        assert_eq!(w.fake().published, [PROFILE]);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        let err = w.publish_as(PROFILE2, "Work").unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!(w.fake().published, [PROFILE], "no profile per attempt");
+        assert_eq!(publish_row(&w).2, "LEASE_AT_RISK");
+    }
+
+    /// NEW-2: a `cancel_publish` release that fails stays PENDING with no
+    /// binding. The next publish, push or pull sends it again; once its lease
+    /// can no longer be live (older than a TTL and the skew allowance) it is
+    /// ended FAILED without a request.
+    #[test]
+    fn an_unsent_cancel_release_is_retried_and_then_given_up() {
+        let unbound_pending = |w: &World| {
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'PENDING'
+                   AND local_profile_id IS NULL",
+            )
+        };
+        for age in [false, true] {
+            let w = world_unbound();
+            w.fake().tamper = Some("publish-fence");
+            w.fake().refuse.push(("release", 503));
+            w.publish().unwrap_err();
+            assert_eq!(unbound_pending(&w), 1, "{age}");
+            assert_eq!(w.sent("POST", "/release").len(), 1, "{age}");
+            if age {
+                w.db()
+                    .conn
+                    .execute(
+                        "UPDATE operations SET created_at = '2020-01-01T00:00:00.000Z'
+                         WHERE kind = 'RELEASE'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            w.fake().tamper = None;
+            w.publish_as(PROFILE2, "Work").unwrap();
+            assert_eq!(unbound_pending(&w), 0, "{age}");
+            assert_eq!(
+                w.sent("POST", "/release").len(),
+                if age { 1 } else { 2 },
+                "{age}: sent again only while the lease may be live"
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'FAILED'"),
+                1,
+                "{age}: the release ends, FAILED (the fence the tampered reply named was never the server's)"
+            );
+        }
+        // A push and a pull retry it too.
+        for pull in [false, true] {
+            let w = world();
+            w.push().unwrap();
+            let b = bound(&w.db(), LOCAL).unwrap();
+            let db = w.db();
+            let lease = LeaseRef {
+                lease_id: [0x42; 16],
+                fencing_token: 1,
+                base_version: 0,
+            };
+            let op = release_op(&db.conn, &b, lease, ReleaseReason::CancelPublish).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE operations SET local_profile_id = NULL WHERE op_id = ?1",
+                    [&op],
+                )
+                .unwrap();
+            drop(db);
+            let before = w.sent("POST", "/release").len();
+            if pull {
+                w.pull(&w.udd.with_file_name("out")).unwrap();
+            } else {
+                w.push().unwrap();
+            }
+            assert_eq!(w.sent("POST", "/release").len(), before + 1, "{pull}");
+            assert_eq!(unbound_pending(&w), 0, "{pull}");
+        }
+    }
+
+    /// NEW-3: a publish M-1 keeps unsent blocks a downgrade by a name that
+    /// points at the cancel; the cancel command ends it and the blocker goes.
+    #[test]
+    fn a_blocked_publish_is_cancelled_by_its_command_and_stops_blocking_a_downgrade() {
+        let blocked = |key: &str| {
+            crate::team::downgrade::readiness()
+                .unwrap()
+                .blockers
+                .iter()
+                .any(|b| b.code == key)
+        };
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        count_a_compromise(&w);
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(blocked("downgrade.blockPendingPublish"));
+        assert!(blocked("downgrade.blockOperation"));
+        w.rt.block_on(crate::sync_cmd::profile_sync_cancel_publish(LOCAL.into()))
+            .unwrap();
+        assert!(!blocked("downgrade.blockPendingPublish"));
+        assert!(!blocked("downgrade.blockOperation"));
+        let err =
+            w.rt.block_on(crate::sync_cmd::profile_sync_cancel_publish(LOCAL.into()))
+                .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "sync.noPublishPending"),
+            "{err}"
+        );
     }
 
     /// L-5, L-3: a checkout reply that names another tenant or fleet, or a

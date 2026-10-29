@@ -1302,6 +1302,11 @@ pub(crate) fn readiness() -> Result<Readiness> {
                           WHERE state IN ('OPEN', 'FINALIZING', 'READY'))",
             )?,
         );
+        // The way out of a publish that cannot be sent is the cancel command.
+        block(
+            "downgrade.blockPendingPublish",
+            count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'")?,
+        );
         let spool = store::config_root()?.join("team-sync").join("spool");
         block(
             "downgrade.blockSpool",

@@ -245,6 +245,20 @@ pub async fn profile_sync_publish(
     })
 }
 
+/// Cancels the unfinished publish of `profile_id` (`team::sync::cancel_publish`):
+/// the way out when the stored request cannot be sent any more, because the
+/// fleet key it was sealed under was withdrawn or a compromise was counted.
+/// Nothing is sent to the server.
+#[tauri::command]
+pub async fn profile_sync_cancel_publish(profile_id: String) -> Result<(), String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionCancelPublish"),
+    )
+    .map_err(|error| error.to_string())?;
+    team::sync::cancel_publish(&profile_id).map_err(|e| format!("{e:#}"))
+}
+
 /// Seal a profile for push: always under the passphrase, never a cached fleet
 /// key. Those came from the team server, which cannot yet prove who issued
 /// them, and sealing under a key the server chose would let it read every push
