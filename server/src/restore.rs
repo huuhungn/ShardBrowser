@@ -40,8 +40,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
 
 use crate::config::Config;
+use crate::error::AppError;
 use crate::identity::{self, hex, Mirror, Verified, RECORD_FILE};
 use crate::routes::v2_auth::Session;
+use crate::routes::v2_device_revoke::load_revocation;
 use crate::routes::v2_root_grants::is_active_custodian;
 use crate::util;
 
@@ -760,6 +762,38 @@ pub async fn export_heads(cfg: &Config, backup: &Path, out: &Path) -> anyhow::Re
     Ok(())
 }
 
+/// Every device revocation row must still hold what its signed container
+/// says, and be of this instance and unquarantined, before a restore reads
+/// its columns: a tampered row could hide a revocation from the signer and
+/// snapshot checks. Offline, so nothing is quarantined here; it refuses.
+async fn ensure_revocations_intact(
+    conn: &mut SqliteConnection,
+    instance: &[u8; 16],
+) -> anyhow::Result<()> {
+    let rows = sqlx::query("SELECT tenant_id, replay_id FROM v2_device_revocations")
+        .fetch_all(&mut *conn)
+        .await?;
+    for r in rows {
+        let id = |i: usize| -> anyhow::Result<[u8; 16]> {
+            r.get::<Vec<u8>, _>(i)
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("a device revocation row has a malformed key"))
+        };
+        let (tenant, replay) = (id(0)?, id(1)?);
+        match load_revocation(conn, instance, &tenant, &replay).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(AppError::Quarantine(_)) => bail!(
+                "refusing: device revocation {} of tenant {} does not match its signed \
+                 container, is quarantined or is of another instance",
+                hex(&replay),
+                hex(&tenant)
+            ),
+            Err(e) => bail!("refusing: checking a device revocation failed: {e:?}"),
+        }
+    }
+    Ok(())
+}
+
 /// One verified tenant transition with its exact bytes, in leaf order.
 struct Staged {
     entry: IndexEntry,
@@ -1143,6 +1177,8 @@ pub async fn prepare(cfg: &Config, backup: &Path, txn: [u8; 16]) -> anyhow::Resu
             restore_epoch: x.restore_epoch,
             external_record_sha256: xsha,
         };
+        // The signer and snapshot checks below read revocation columns.
+        ensure_revocations_intact(&mut conn, &x.server_instance_id).await?;
         let staged = staged(&mut conn, &v, &x, &tenants).await?;
         merge(&mut conn, &x).await?;
         sqlx::query("DETACH DATABASE bk").execute(&mut conn).await?;

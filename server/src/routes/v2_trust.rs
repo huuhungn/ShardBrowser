@@ -315,7 +315,7 @@ pub async fn trust_evidence(
                     .try_into()
                     .map_err(|_| AppError::Internal("a replay id is not 16 bytes".into()))?;
                 // The reported device is the verified record's, never a column's.
-                let stored = load_revocation(&mut tx, v, &tenant, &replay)
+                let stored = load_revocation(&mut tx, &v.server_instance_id, &tenant, &replay)
                     .await?
                     .ok_or_else(|| AppError::Internal("a revocation left the page".into()))?;
                 let device_id = stored.revocation.subject_device_id;
