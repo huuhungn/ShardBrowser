@@ -66,7 +66,7 @@ pub(crate) struct StoredRevocation {
 /// quarantined (plan L507); one quarantined before is no revocation.
 pub(crate) async fn load_revocation(
     conn: &mut SqliteConnection,
-    v: &Verified,
+    instance: &[u8; 16],
     tenant: &[u8; 16],
     replay: &[u8; 16],
 ) -> Result<Option<StoredRevocation>, AppError> {
@@ -74,7 +74,7 @@ pub(crate) async fn load_revocation(
         "SELECT exact_signed_container_bytes FROM {TABLE}
           WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?"
     ))
-    .bind(v.server_instance_id.as_slice())
+    .bind(instance.as_slice())
     .bind(tenant.as_slice())
     .bind(replay.as_slice())
     .fetch_optional(&mut *conn)
@@ -82,7 +82,7 @@ pub(crate) async fn load_revocation(
     let Some(exact) = exact else { return Ok(None) };
     let mark = Mark {
         kind: Kind::DeviceRevocation,
-        server_instance_id: v.server_instance_id,
+        server_instance_id: *instance,
         tenant_id: *tenant,
         replay_id: *replay,
     };
@@ -105,9 +105,7 @@ pub(crate) async fn load_revocation(
         return Err(broken());
     };
     let c = &revocation.common;
-    if (&c.server_instance_id, &c.tenant_id, &c.replay_id)
-        != (&v.server_instance_id, tenant, replay)
-    {
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id) != (instance, tenant, replay) {
         return Err(broken());
     }
     let cols = revocation_columns(&revocation, record.record()).map_err(|_| broken())?;
@@ -129,7 +127,7 @@ async fn filed(
     replay: &[u8; 16],
     hash: &[u8; 32],
 ) -> Result<bool, AppError> {
-    Ok(load_revocation(conn, v, tenant, replay)
+    Ok(load_revocation(conn, &v.server_instance_id, tenant, replay)
         .await?
         .is_some_and(|r| r.signed_container_hash == *hash))
 }

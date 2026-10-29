@@ -14,7 +14,7 @@ use std::time::Duration;
 use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use zeroize::Zeroizing;
 
 use shardx_team_server::identity_record::{external_record_sha256, IdentityRecordV2};
@@ -8619,15 +8619,94 @@ async fn matrix_pool(server: &Server, table: &str) -> SqlitePool {
     pool
 }
 
+/// Every column of the `table` row `replay`, as SQL literals.
+async fn row_literals(pool: &SqlitePool, table: &str, cols: &[String], replay: u8) -> Vec<String> {
+    let select: Vec<String> = cols.iter().map(|c| format!("quote({c})")).collect();
+    let row = sqlx::query(&format!(
+        "SELECT {} FROM {table} WHERE replay_id = ?",
+        select.join(", ")
+    ))
+    .bind([replay; 16].as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (0..cols.len()).map(|i| row.get::<String, _>(i)).collect()
+}
+
+/// Puts the whole row back as [`row_literals`] read it, and releases the
+/// quarantine.
+async fn put_row_back(
+    pool: &SqlitePool,
+    table: &str,
+    cols: &[String],
+    literals: &[String],
+    replay: u8,
+) {
+    let set: Vec<String> = cols
+        .iter()
+        .zip(literals)
+        .map(|(c, l)| format!("{c} = {l}"))
+        .collect();
+    sqlx::query(&format!(
+        "UPDATE {table} SET {} WHERE replay_id = ?",
+        set.join(", ")
+    ))
+    .bind([replay; 16].as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM v2_grant_quarantine")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Changes `col` of the `table` row `replay` to another value of its type,
+/// or runs the assignments in `other_values` for it. An error means the
+/// schema pins the column.
+async fn change_column(
+    pool: &SqlitePool,
+    table: &str,
+    col: &str,
+    replay: u8,
+    other_values: &[(&str, &str)],
+) -> sqlx::Result<()> {
+    match other_values.iter().find(|(c, _)| *c == col) {
+        Some((_, assignments)) => sqlx::query(&format!(
+            "UPDATE {table} SET {assignments} WHERE replay_id = ?"
+        ))
+        .bind([replay; 16].as_slice())
+        .execute(pool)
+        .await
+        .map(|_| ()),
+        None => mutate(pool, table, col, replay).await,
+    }
+}
+
+async fn column_names(pool: &SqlitePool, table: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+fn quarantined_count(kind: &str, replay: u8) -> String {
+    format!(
+        "SELECT count(*) FROM v2_grant_quarantine WHERE kind = '{kind}' AND replay_id = x'{}'",
+        hex(&[replay; 16])
+    )
+}
+
 /// Changes each column of the `table` row `replay` but `skip`, one at a time
-/// and behind the server's back. `ask` must then be refused as a column
-/// mismatch with the row quarantined as `kind`, and answer `intact` again once
-/// the column is put back and the quarantine released. A column is changed to
-/// another value of its type, or to the SQL in `other_values`; a value the
-/// schema refuses can never disagree with a filed container. A column in
-/// `other_answers` is refused earlier, by the request's own comparison, with
-/// that answer and no quarantine. Returns the columns compared and the
-/// columns the schema pins.
+/// and behind the server's back. `ask` (told the changed column) must then
+/// be refused as a column mismatch with the row quarantined as `kind`, and
+/// answer `intact` again once the row is put back and the quarantine
+/// released. A column is changed to another value of its type, or by the
+/// assignments in `other_values`; a value the schema refuses can never
+/// disagree with a filed container. A column in `other_answers` is refused
+/// earlier, by the request's own comparison, with that answer and no
+/// quarantine. Returns the columns compared and the columns the schema pins.
 #[allow(clippy::too_many_arguments)]
 async fn each_column_is_compared<Fut: std::future::Future<Output = (u16, String)>>(
     server: &Server,
@@ -8639,35 +8718,17 @@ async fn each_column_is_compared<Fut: std::future::Future<Output = (u16, String)
     other_values: &[(&str, &str)],
     other_answers: &[(&str, u16, &str)],
     intact: u16,
-    ask: impl Fn() -> Fut,
+    ask: impl Fn(&str) -> Fut,
 ) -> (Vec<String>, Vec<String>) {
-    let cols: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-            .bind(table)
-            .fetch_all(pool)
-            .await
-            .unwrap();
-    assert_eq!(ask().await.0, intact, "{table} before");
+    let cols = column_names(pool, table).await;
+    assert_eq!(ask("").await.0, intact, "{table} before");
     let (mut compared, mut pinned) = (Vec::new(), Vec::new());
     for col in cols.iter().filter(|c| !skip.contains(&c.as_str())) {
-        let before: (String,) = sqlx::query_as(&format!(
-            "SELECT quote({col}) FROM {table} WHERE replay_id = ?"
-        ))
-        .bind([replay; 16].as_slice())
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        let changed = match other_values.iter().find(|(c, _)| c == col) {
-            Some((_, sql)) => sqlx::query(&format!(
-                "UPDATE {table} SET {col} = {sql} WHERE replay_id = ?"
-            ))
-            .bind([replay; 16].as_slice())
-            .execute(pool)
+        let before = row_literals(pool, table, &cols, replay).await;
+        if change_column(pool, table, col, replay, other_values)
             .await
-            .map(|_| ()),
-            None => mutate(pool, table, col, replay).await,
-        };
-        if changed.is_err() {
+            .is_err()
+        {
             pinned.push(col.clone());
             continue;
         }
@@ -8675,33 +8736,64 @@ async fn each_column_is_compared<Fut: std::future::Future<Output = (u16, String)
             Some((_, status, code)) => (*status, *code, 0),
             None => (422, "AUTH_CLAIM_COLUMN_MISMATCH", 1),
         };
-        assert_eq!(ask().await, (status, code.into()), "{table}.{col}");
+        assert_eq!(ask(col).await, (status, code.into()), "{table}.{col}");
         assert_eq!(
-            server
-                .count(&format!(
-                    "SELECT count(*) FROM v2_grant_quarantine
-                      WHERE kind = '{kind}' AND replay_id = x'{}'",
-                    hex(&[replay; 16])
-                ))
-                .await,
+            server.count(&quarantined_count(kind, replay)).await,
             quarantined,
             "{table}.{col} is quarantined"
         );
-        sqlx::query(&format!(
-            "UPDATE {table} SET {col} = {} WHERE replay_id = ?",
-            before.0
-        ))
-        .bind([replay; 16].as_slice())
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query("DELETE FROM v2_grant_quarantine")
-            .execute(pool)
-            .await
-            .unwrap();
-        assert_eq!(ask().await.0, intact, "{table}.{col} restored");
+        put_row_back(pool, table, &cols, &before, replay).await;
+        assert_eq!(ask("").await.0, intact, "{table}.{col} restored");
         compared.push(col.clone());
     }
+    (compared, pinned)
+}
+
+/// The startup pass of a restarted server quarantines the `table` row
+/// `replay` as `kind` for a change to any column but `skip`, and leaves it
+/// alone once the row is whole. Columns are changed as in
+/// [`each_column_is_compared`]; returns the columns compared and pinned.
+async fn each_column_is_quarantined_at_startup(
+    server: &mut Server,
+    pool: &SqlitePool,
+    table: &str,
+    kind: &str,
+    replay: u8,
+    skip: &[&str],
+    other_values: &[(&str, &str)],
+) -> (Vec<String>, Vec<String>) {
+    let cols = column_names(pool, table).await;
+    server.restart().await;
+    assert_eq!(
+        server.count(&quarantined_count(kind, replay)).await,
+        0,
+        "{table} is whole at the start"
+    );
+    let (mut compared, mut pinned) = (Vec::new(), Vec::new());
+    for col in cols.iter().filter(|c| !skip.contains(&c.as_str())) {
+        let before = row_literals(pool, table, &cols, replay).await;
+        if change_column(pool, table, col, replay, other_values)
+            .await
+            .is_err()
+        {
+            pinned.push(col.clone());
+            continue;
+        }
+        server.restart().await;
+        assert_eq!(
+            server.count(&quarantined_count(kind, replay)).await,
+            1,
+            "{table}.{col} is quarantined at startup"
+        );
+        put_row_back(pool, table, &cols, &before, replay).await;
+        compared.push(col.clone());
+    }
+    server.restart().await;
+    assert_eq!(
+        server.count(&quarantined_count(kind, replay)).await,
+        0,
+        "{table} is whole at the end"
+    );
     (compared, pinned)
 }
 
@@ -8724,10 +8816,38 @@ fn assert_compared(
 }
 
 #[tokio::test]
-async fn every_root_grant_column_is_compared_with_its_container_on_each_request() {
+async fn every_root_grant_column_is_compared_with_its_container_on_each_request_and_at_startup() {
     const TABLE: &str = "v2_tenant_root_key_grants";
     let mut server = start("g2-30-root-columns", 28312).await;
-    let (_dev, access, _, _) = bootstrapped(&mut server, 0x66).await;
+    let (dev, access, _) = custodian(&mut server, 0x66).await;
+    // A second root generation, so a RotationGrant row exists beside the
+    // FirstRootSelfGrant one.
+    let key_rotate = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xc3; 16];
+        g.capability = Capability::KeyRotate;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&key_rotate)).await.0, 201);
+    let k0 = shared::keys::root_key_id(&TRK);
+    let after0 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: k0,
+        previous_root_generation: 0,
+    };
+    let trk1 = [0x7d; 32];
+    let rotation = root_grant_of(&dev, &dev, APPROVAL_REPLAY, 0xe1, &trk1, 1, after0);
+    let target = rotation_target(&trk1, 1, &[rotation.as_slice()]);
+    let gen0 = PreviousRoot {
+        root_key_id: k0,
+        root_generation: 0,
+    };
+    let (status, body) = server
+        .root(&TENANT, &access, &rotation_create(0xd1, target, gen0))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let grants_1 = format!("/v2/tenants/{}/root-key-generations/1/grants", hex(&TENANT));
+    let request = root_grant_create_request(0xd8, &dev, &rotation);
+    let (status, body) = server.call(&grants_1, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let rotation_replay = 0xe1;
     let pool = matrix_pool(&server, TABLE).await;
     let path = grant_path("0", &SELF_GRANT_REPLAY);
     let columns = each_column_is_compared(
@@ -8747,12 +8867,12 @@ async fn every_root_grant_column_is_compared_with_its_container_on_each_request(
             "created_at",
         ],
         &[
-            ("grant_variant", "'ExistingRootGrant'"),
-            ("issued_at_ms", "issued_at_ms - 1"),
+            ("grant_variant", "grant_variant = 'ExistingRootGrant'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
         ],
         &[],
         200,
-        || async {
+        |_| async {
             let (status, body) = server.call(&path, &access, None).await;
             (status, code_of(&body))
         },
@@ -8804,11 +8924,183 @@ async fn every_root_grant_column_is_compared_with_its_container_on_each_request(
             "issuer_signing_key_id",
         ],
     );
+
+    // The RotationGrant row: its previous root is compared too. A change of
+    // the previous generation moves the generation with it (the schema ties
+    // the two), so the request asks for the row under its new generation.
+    let moves_generation = &[
+        (
+            "grant_variant",
+            "grant_variant = 'ExistingRootGrant', previous_root_key_id = NULL, \
+             previous_root_generation = NULL",
+        ),
+        ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
+        (
+            "previous_root_generation",
+            "previous_root_generation = 5, root_generation = 6",
+        ),
+    ];
+    let rotation_columns = each_column_is_compared(
+        &server,
+        &pool,
+        TABLE,
+        "root_grant",
+        rotation_replay,
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "root_generation",
+            "acked_at",
+            "revoked_at",
+            "created_at",
+        ],
+        moves_generation,
+        &[],
+        200,
+        |col| {
+            let generation = if col == "previous_root_generation" {
+                "6"
+            } else {
+                "1"
+            };
+            let path = grant_path(generation, &[rotation_replay; 16]);
+            let (server, access) = (&server, &access);
+            async move {
+                let (status, body) = server.call(&path, access, None).await;
+                (status, code_of(&body))
+            }
+        },
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        rotation_columns,
+        &[
+            "grant_variant",
+            "previous_root_key_id",
+            "previous_root_generation",
+            "root_key_id",
+            "subject_device_id",
+            "hpke_wrapped_trk_bytes",
+            "exact_signed_container_bytes",
+        ],
+        ROTATION_PINNED,
+    );
+
+    // The startup pass compares every column of both rows, the generation
+    // too (the pass reads the row's own).
+    let marks = &[
+        "server_instance_id",
+        "tenant_id",
+        "replay_id",
+        "acked_at",
+        "revoked_at",
+        "created_at",
+    ];
+    let self_grant = each_column_is_quarantined_at_startup(
+        &mut server,
+        &pool,
+        TABLE,
+        "root_grant",
+        SELF_GRANT_REPLAY[0],
+        marks,
+        &[
+            ("grant_variant", "grant_variant = 'ExistingRootGrant'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
+        ],
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        self_grant,
+        &[
+            "root_key_id",
+            "grant_variant",
+            "subject_device_id",
+            "hpke_wrapped_trk_bytes",
+            "exact_signed_container_bytes",
+        ],
+        SELF_GRANT_STARTUP_PINNED,
+    );
+    let rotation_row = each_column_is_quarantined_at_startup(
+        &mut server,
+        &pool,
+        TABLE,
+        "root_grant",
+        rotation_replay,
+        marks,
+        &[
+            moves_generation[0],
+            moves_generation[1],
+            moves_generation[2],
+            (
+                "root_generation",
+                "root_generation = 6, previous_root_generation = 5",
+            ),
+        ],
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        rotation_row,
+        &[
+            "root_key_id",
+            "root_generation",
+            "grant_variant",
+            "previous_root_key_id",
+            "previous_root_generation",
+            "subject_device_id",
+            "hpke_wrapped_trk_bytes",
+            "exact_signed_container_bytes",
+        ],
+        ROTATION_PINNED,
+    );
     pool.close().await;
 }
 
+/// The columns the schema pins on a RotationGrant row.
+const ROTATION_PINNED: &[&str] = &[
+    "container_domain",
+    "container_version",
+    "payload_domain",
+    "payload_version",
+    "grant_capability",
+    "subject_device_approval_payload_domain",
+    "hpke_suite_id",
+    "hpke_mode_id",
+    "hpke_kem_id",
+    "hpke_kdf_id",
+    "hpke_aead_id",
+    "signature_suite_id",
+    "signature_version",
+];
+/// The columns the schema pins on a FirstRootSelfGrant row at startup: the
+/// per-request list, and the generation, which is 0 for this variant.
+const SELF_GRANT_STARTUP_PINNED: &[&str] = &[
+    "container_domain",
+    "container_version",
+    "payload_domain",
+    "payload_version",
+    "root_generation",
+    "grant_capability",
+    "subject_signing_key_id",
+    "subject_device_approval_payload_domain",
+    "hpke_suite_id",
+    "hpke_mode_id",
+    "hpke_kem_id",
+    "hpke_kdf_id",
+    "hpke_aead_id",
+    "previous_root_key_id",
+    "previous_root_generation",
+    "signature_suite_id",
+    "signature_version",
+    "issuer_signing_key_id",
+];
+
 #[tokio::test]
-async fn every_capability_grant_column_is_compared_with_its_container_on_each_request() {
+async fn every_capability_grant_column_is_compared_with_its_container_on_each_request_and_at_startup(
+) {
     const TABLE: &str = "v2_capability_grants";
     let mut server = start("g2-30-capability-columns", 28313).await;
     let (dev, access, _) = custodian(&mut server, 0x6a).await;
@@ -8829,13 +9121,13 @@ async fn every_capability_grant_column_is_compared_with_its_container_on_each_re
             "created_at",
         ],
         &[
-            ("capability", "'device.revoke'"),
-            ("issued_at_ms", "issued_at_ms - 1"),
+            ("capability", "capability = 'device.revoke'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
         ],
         // The retry's bytes are compared with the stored container first.
         &[("exact_signed_container_bytes", 409, "IDEMPOTENCY_MISMATCH")],
         201,
-        || async {
+        |_| async {
             let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
             (status, code_of(&body))
         },
@@ -8863,6 +9155,56 @@ async fn every_capability_grant_column_is_compared_with_its_container_on_each_re
             "exact_signed_container_bytes_sha256",
         ],
         // Constants, and the kind and scope the schema ties to each other.
+        &[
+            "payload_domain",
+            "payload_version",
+            "subject_kind",
+            "scope_kind",
+            "scope_id",
+            "signature_suite_id",
+            "signature_version",
+        ],
+    );
+    let at_startup = each_column_is_quarantined_at_startup(
+        &mut server,
+        &pool,
+        TABLE,
+        "capability_grant",
+        0xa1,
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "revoked_at",
+            "created_at",
+        ],
+        &[
+            ("capability", "capability = 'device.revoke'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
+        ],
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        at_startup,
+        &[
+            "subject_account_id",
+            "subject_device_id",
+            "subject_signing_key_id",
+            "subject_hpke_key_id",
+            "capability",
+            "issued_at_ms",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "issuer_signing_key_id",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ],
         &[
             "payload_domain",
             "payload_version",
@@ -8930,12 +9272,12 @@ async fn every_device_revocation_column_is_compared_with_its_container_on_each_r
             "filed_at_ms",
         ],
         &[
-            ("reason_code", "'lost'"),
-            ("issued_at_ms", "issued_at_ms - 1"),
+            ("reason_code", "reason_code = 'lost'"),
+            ("issued_at_ms", "issued_at_ms = issued_at_ms - 1"),
         ],
         &[],
         201,
-        || async {
+        |_| async {
             let (status, body) = server.call(&path, &access, Some(&request)).await;
             (status, code_of(&body))
         },
@@ -9183,4 +9525,61 @@ async fn a_revocation_row_swapped_for_another_genuine_one_does_not_answer_a_retr
         (status, code_of(&body).as_str()),
         (422, "MUTATION_RESPONSE_MISMATCH")
     );
+}
+
+/// A revocation row the query itself cannot read (its container stored as an
+/// integer) is neither skipped nor quarantined: the pass fails, v2 is refused
+/// as untrusted, and putting the row back and restarting recovers.
+#[tokio::test]
+async fn a_revocation_row_the_startup_pass_cannot_read_turns_v2_off() {
+    let mut server = start("g2-30-revocation-unreadable", 28318).await;
+    let (dev, access, _) = custodian(&mut server, 0x73).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&subject.id),
+            &access,
+            Some(&revoke_request(
+                0xa6,
+                &revocation(&dev.sk, &subject, 0x90, 29),
+            )),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(server.me(&access).await.0, 200);
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    let container: Vec<u8> =
+        sqlx::query_scalar("SELECT exact_signed_container_bytes FROM v2_device_revocations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE v2_device_revocations SET exact_signed_container_bytes = 5")
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    let (status, body) = server.call(GRANTS, &access, Some(&duty)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (423, "CONTROL_PLANE_INTEGRITY_UNTRUSTED")
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        0
+    );
+    sqlx::query("UPDATE v2_device_revocations SET exact_signed_container_bytes = ?")
+        .bind(container)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    server.restart().await;
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
 }

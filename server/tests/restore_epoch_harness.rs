@@ -2155,3 +2155,118 @@ async fn d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_re
     drop(_s);
     done(&d);
 }
+
+/// `from` revokes `subject`: the filed row, stored the way the route stores it.
+async fn revoke_row(d: &Dirs, from: &Device, subject: &Device, replay: u8, instance: [u8; 16]) {
+    use shared::authz_record::{
+        DeviceRevocationReason, DeviceRevocationV2, DOMAIN_DEVICE_REVOCATION,
+    };
+    let r = DeviceRevocationV2 {
+        common: common([replay; 16], instance),
+        subject_account_id: ACCOUNT,
+        subject_device_id: subject.id,
+        subject_signing_key_id: subject.signing_key_id,
+        subject_hpke_key_id: subject.hpke_key_id,
+        reason_code: DeviceRevocationReason::Lost,
+    };
+    let c = &r.common;
+    let exact = build_record(&from.sk, DOMAIN_DEVICE_REVOCATION, &r.encode());
+    let rec = AuthorizationRecord::parse(&exact).unwrap();
+    let p = pool(d).await;
+    sqlx::query(&format!(
+        "INSERT INTO v2_device_revocations (
+           server_instance_id, tenant_id, replay_id, payload_domain, payload_version,
+           subject_account_id, subject_device_id, subject_signing_key_id, subject_hpke_key_id,
+           reason_code, issuer_signing_key_id, issued_at_ms, not_before_ms, not_after_ms,
+           restore_epoch, canonical_payload_bytes, payload_sha256, signature_suite_id,
+           signature_version, signature_bytes, signed_container_hash,
+           exact_signed_container_bytes, exact_signed_container_bytes_sha256, filed_at_ms)
+         VALUES (?, ?, ?, '{DOMAIN_DEVICE_REVOCATION}', 2, ?, ?, ?, ?, 'lost', ?, {}, {}, {},
+                 0, ?, ?, 1, 1, ?, ?, ?, ?, {})",
+        c.issued_at_ms,
+        c.not_before_ms,
+        c.not_after_ms,
+        now_ms()
+    ))
+    .bind(instance.as_slice())
+    .bind(TENANT.as_slice())
+    .bind([replay; 16].as_slice())
+    .bind(ACCOUNT.as_slice())
+    .bind(subject.id.as_slice())
+    .bind(subject.signing_key_id.as_slice())
+    .bind(subject.hpke_key_id.as_slice())
+    .bind(rec.issuer_signing_key_id().as_slice())
+    .bind(rec.canonical_payload_bytes())
+    .bind(rec.payload_sha256().as_slice())
+    .bind(rec.signature_bytes())
+    .bind(rec.signed_container_hash().as_slice())
+    .bind(rec.exact_signed_container_bytes())
+    .bind(rec.exact_signed_container_bytes_sha256().as_slice())
+    .execute(&p)
+    .await
+    .unwrap();
+    p.close().await;
+}
+
+/// A restore reads the revocation rows to decide whether a signer is live
+/// (ADR 0002 D-1): a row that left its signed container, or hides one, must
+/// refuse the restore, not feed it.
+#[tokio::test]
+async fn d1_prepare_refuses_a_device_revocation_row_that_left_its_container() {
+    let d = dirs("revocation-rows");
+    let w = world(&d, 28427, true).await;
+    let txn = w.txn.as_str();
+    let third = peer(&d, &w.dev, 0x77, w.instance).await;
+    revoke_row(&d, &w.dev, &third, 0x90, w.instance).await;
+    // The backup must keep the live schema, so both lose the trigger.
+    exec(&d, "DROP TRIGGER v2_device_revocations_no_update").await;
+    on_backup(&d, "DROP TRIGGER v2_device_revocations_no_update").await;
+    let row = "WHERE replay_id = x'90909090909090909090909090909090'";
+
+    // The row no longer names the device it revokes, so a restore would see
+    // that device as live.
+    let was: Vec<u8> = {
+        let p = pool(&d).await;
+        let v = sqlx::query_scalar(&format!(
+            "SELECT subject_device_id FROM v2_device_revocations {row}"
+        ))
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        p.close().await;
+        v
+    };
+    exec(
+        &d,
+        &format!("UPDATE v2_device_revocations SET subject_device_id = zeroblob(16) {row}"),
+    )
+    .await;
+    assert_refused_cleanly(&d, txn, "does not match its signed container").await;
+    exec(
+        &d,
+        &format!(
+            "UPDATE v2_device_revocations SET subject_device_id = x'{}' {row}",
+            hex(&was)
+        ),
+    )
+    .await;
+
+    // A column of the record itself.
+    exec(
+        &d,
+        &format!("UPDATE v2_device_revocations SET reason_code = 'rekeyed' {row}"),
+    )
+    .await;
+    assert_refused_cleanly(&d, txn, "does not match its signed container").await;
+    exec(
+        &d,
+        &format!("UPDATE v2_device_revocations SET reason_code = 'lost' {row}"),
+    )
+    .await;
+
+    // With the row whole again, the same restore goes through.
+    ok(prepare(&d, None, txn));
+    ok(cli(&d, &["restore", "commit"]));
+    assert_restored(&d, txn).await;
+    done(&d);
+}

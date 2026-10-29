@@ -311,7 +311,8 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
     for row in revocations {
         let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
         let mut conn = pool.acquire().await?;
-        let checked = v2_device_revoke::load_revocation(&mut conn, v, &tenant, &replay).await;
+        let checked =
+            v2_device_revoke::load_revocation(&mut conn, &instance, &tenant, &replay).await;
         drop(conn);
         match checked {
             Ok(_) => {}
