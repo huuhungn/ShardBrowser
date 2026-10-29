@@ -15,6 +15,9 @@ use crate::util;
 pub enum Kind {
     RootGrant,
     CapabilityGrant,
+    FleetDeviceHpke,
+    FleetRecovery,
+    FleetRotation,
 }
 
 impl Kind {
@@ -22,6 +25,9 @@ impl Kind {
         match self {
             Self::RootGrant => "root_grant",
             Self::CapabilityGrant => "capability_grant",
+            Self::FleetDeviceHpke => "fleet_device_hpke_grant",
+            Self::FleetRecovery => "fleet_recovery_grant",
+            Self::FleetRotation => "fleet_rotation_grant",
         }
     }
 }

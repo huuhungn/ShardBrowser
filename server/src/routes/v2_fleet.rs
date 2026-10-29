@@ -49,6 +49,7 @@ use super::v2_root::{
 use super::v2_root_grants::{at, is_active_custodian, outer_request, wraps_under};
 use crate::error::AppError;
 use crate::identity::Verified;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::{now_ms, now_rfc3339};
 
@@ -523,7 +524,7 @@ const GRANT_TABLES: [&str; 3] = [
     "v2_fleet_rotation_grants",
 ];
 
-fn table_of(variant: FleetGrantVariant) -> &'static str {
+pub(crate) fn table_of(variant: FleetGrantVariant) -> &'static str {
     match variant {
         FleetGrantVariant::DeviceHpke => GRANT_TABLES[0],
         FleetGrantVariant::Recovery => GRANT_TABLES[1],
@@ -1059,7 +1060,7 @@ fn integrity() -> AppError {
 }
 
 /// A filed fleet grant whose row matched its verified container.
-struct StoredFleetGrant {
+pub(crate) struct StoredFleetGrant {
     record: VerifiedRecord,
     payload: Payload,
     fleet: ([u8; 16], [u8; 32], u64),
@@ -1071,8 +1072,9 @@ struct StoredFleetGrant {
 
 /// The grant `replay` of `variant` on this instance, reparsed, verified under
 /// its issuer's key and required to hold exactly the columns its container
-/// determines; a row that disagrees refuses the request (422).
-async fn load_fleet_grant(
+/// determines. A row that disagrees, or was quarantined before, refuses the
+/// request (422) and is quarantined (plan L507).
+pub(crate) async fn load_fleet_grant(
     conn: &mut SqliteConnection,
     v: &Verified,
     tenant: &[u8; 16],
@@ -1090,8 +1092,22 @@ async fn load_fleet_grant(
     .fetch_optional(&mut *conn)
     .await?;
     let Some(row) = row else { return Ok(None) };
+    let mark = Mark {
+        kind: match variant {
+            FleetGrantVariant::DeviceHpke => Kind::FleetDeviceHpke,
+            FleetGrantVariant::Recovery => Kind::FleetRecovery,
+            FleetGrantVariant::Rotation => Kind::FleetRotation,
+        },
+        server_instance_id: v.server_instance_id,
+        tenant_id: *tenant,
+        replay_id: *replay,
+    };
+    let broken = || AppError::Quarantine(Box::new(mark.clone()));
+    if quarantine::holds(conn, &mark).await? {
+        return Err(broken());
+    }
     let exact: Vec<u8> = row.get("exact_signed_container_bytes");
-    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| integrity())?;
+    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
     let issuer: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
     )
@@ -1099,19 +1115,17 @@ async fn load_fleet_grant(
     .bind(parsed.issuer_signing_key_id().as_slice())
     .fetch_optional(&mut *conn)
     .await?;
-    let issuer: [u8; 32] = issuer
-        .and_then(|k| k.try_into().ok())
-        .ok_or_else(integrity)?;
-    let record = parsed.verify_signature(&issuer).map_err(|_| integrity())?;
+    let issuer: [u8; 32] = issuer.and_then(|k| k.try_into().ok()).ok_or_else(broken)?;
+    let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
     let payload = record.payload().clone();
-    let f = filing(&payload, record.record())?;
+    let f = filing(&payload, record.record()).map_err(|_| broken())?;
     let c = &f.common;
     if variant_of(&payload) != Some(variant)
         || (&c.server_instance_id, &c.tenant_id, &c.replay_id)
             != (&v.server_instance_id, tenant, replay)
         || !row_holds(conn, table, &f.cols).await?
     {
-        return Err(integrity());
+        return Err(broken());
     }
     Ok(Some(StoredFleetGrant {
         fleet: f.fleet,

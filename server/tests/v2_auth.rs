@@ -7694,3 +7694,540 @@ async fn a_first_device_confirmed_before_a_restore_is_approved_or_cancelled_afte
         1
     );
 }
+
+// ------------------------------------------- G2-30 fleet grant equality ---
+
+/// One filed, acknowledged fleet grant of each variant.
+struct FiledFleetGrant {
+    variant: shared::fleet_lifecycle::FleetGrantVariant,
+    table: &'static str,
+    kind: &'static str,
+    generation: u64,
+    fkek: [u8; 32],
+    replay: u8,
+    container: Vec<u8>,
+}
+
+/// A custodian with fleet generation 0 ACTIVE (its device and recovery
+/// grants acknowledged) and generation 1 PREPARING with its acknowledged
+/// rotation grant.
+async fn fleet_grants_filed(server: &mut Server) -> (String, Vec<FiledFleetGrant>) {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, RotationGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationActivateV2, FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+        FleetRotation,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let (dev, access, _) = custodian(server, 0x6e).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    for (replay, capability) in [
+        (0xa7, Capability::FleetManage),
+        (0xa8, Capability::KeyRotate),
+    ] {
+        let grant = capability_grant(&dev, &dev.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let gen_ref = |generation: u64, fkek: [u8; 32]| FleetGenerationRef {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        fleet_id: FLEET,
+        generation,
+        fkek_key_id: fkek,
+    };
+    let (fkek0, fkek1) = ([0xe0; 32], [0xe1; 32]);
+    let device0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &DeviceHpkeGrantV2 {
+            common: fleet_common(0xd0, 365),
+            fleet_id: FLEET,
+            fkek_key_id: fkek0,
+            generation: 0,
+            subject_account_id: OWNER,
+            subject_device_id: dev.id,
+            subject_signing_key_id: dev.signing_key_id,
+            recipient_hpke_key_id: dev.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        }
+        .encode(),
+    );
+    let recovery = |replay: u8, generation: u64, fkek: [u8; 32]| {
+        let g = RecoveryGrantV2 {
+            common: fleet_common(replay, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek,
+            generation,
+            recipient_root_key_id: shared::keys::root_key_id(&TRK),
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &g.encode())
+    };
+    let recovery0 = recovery(0xd1, 0, fkek0);
+    let path = fleet_generation_path();
+    let terms0 = FleetGenerationTerms {
+        generation: gen_ref(0, fkek0),
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device0)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery0),
+        rotation: None,
+    };
+    let create0 = FleetKeyGenerationCreateV2 {
+        terms: terms0,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create0.encode());
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let ack = |key: u8, generation: u64, fkek: [u8; 32], variant: V, replay: u8, c: &[u8]| {
+        let grant = fleet_grant_ref(generation, fkek, variant, replay, c);
+        lifecycle_request(
+            OperationKind::FleetGrantAck,
+            key,
+            FleetKeyGrantAckV2 { grant }.encode(),
+        )
+    };
+    for (key, variant, replay, c) in [
+        (0xb1, V::DeviceHpke, 0xd0, &device0),
+        (0xb2, V::Recovery, 0xd1, &recovery0),
+    ] {
+        let request = fleet_grant_request(key, 0, fkek0, variant, replay, c);
+        assert_eq!(
+            server
+                .call(&fleet_grants_path(0), &access, Some(&request))
+                .await
+                .0,
+            201
+        );
+        let request = ack(key + 2, 0, fkek0, variant, replay, c);
+        let ack0 = format!("{path}/0/ack");
+        assert_eq!(server.call(&ack0, &access, Some(&request)).await.0, 201);
+    }
+    let activate0 = lifecycle_request(
+        OperationKind::FleetGenerationActivate,
+        0xb5,
+        FleetKeyGenerationActivateV2 { terms: terms0 }.encode(),
+    );
+    let activate0_path = format!("{path}/0/activate");
+    assert_eq!(
+        server
+            .call(&activate0_path, &access, Some(&activate0))
+            .await
+            .0,
+        201
+    );
+
+    let device1 = device0.clone();
+    let recovery1 = recovery(0xd6, 1, fkek1);
+    let rotation1 = {
+        let common = fleet_common(0xd7, 30);
+        let g = RotationGrantV2 {
+            activation_not_before_ms: common.not_before_ms,
+            common,
+            fleet_id: FLEET,
+            fkek_key_id: fkek1,
+            generation: 1,
+            previous_fkek_key_id: fkek0,
+            previous_generation: 0,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(
+                &device1,
+            )])
+            .unwrap(),
+            recovery_grant_signed_container_hash: container_hash(&recovery1),
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &g.encode())
+    };
+    let terms1 = FleetGenerationTerms {
+        generation: gen_ref(1, fkek1),
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device1)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery1),
+        rotation: Some(FleetRotation {
+            previous_generation: 0,
+            previous_fkek_key_id: fkek0,
+            rotation_grant_signed_container_hash: container_hash(&rotation1),
+        }),
+    };
+    let create1 = FleetKeyGenerationCreateV2 {
+        terms: terms1,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc0, create1.encode());
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    let request = fleet_grant_request(0xc1, 1, fkek1, V::Rotation, 0xd7, &rotation1);
+    let (status, body) = server
+        .call(&fleet_grants_path(1), &access, Some(&request))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let request = ack(0xc2, 1, fkek1, V::Rotation, 0xd7, &rotation1);
+    let ack1 = format!("{path}/1/ack");
+    assert_eq!(server.call(&ack1, &access, Some(&request)).await.0, 201);
+
+    let filed = vec![
+        FiledFleetGrant {
+            variant: V::DeviceHpke,
+            table: "v2_fleet_device_hpke_grants",
+            kind: "fleet_device_hpke_grant",
+            generation: 0,
+            fkek: fkek0,
+            replay: 0xd0,
+            container: device0,
+        },
+        FiledFleetGrant {
+            variant: V::Recovery,
+            table: "v2_fleet_recovery_grants",
+            kind: "fleet_recovery_grant",
+            generation: 0,
+            fkek: fkek0,
+            replay: 0xd1,
+            container: recovery0,
+        },
+        FiledFleetGrant {
+            variant: V::Rotation,
+            table: "v2_fleet_rotation_grants",
+            kind: "fleet_rotation_grant",
+            generation: 1,
+            fkek: fkek1,
+            replay: 0xd7,
+            container: rotation1,
+        },
+    ];
+    (access, filed)
+}
+
+/// A repeated acknowledgement of `g` under the fresh idempotency key `key`:
+/// it reparses the stored grant, so a row that left its container answers
+/// 422, and an intact one 409 (it is acknowledged already).
+async fn ack_again(server: &Server, access: &str, g: &FiledFleetGrant, key: u16) -> (u16, String) {
+    use shared::fleet_lifecycle::FleetKeyGrantAckV2;
+    let mut idempotency_key = [0x5a; 16];
+    idempotency_key[..2].copy_from_slice(&key.to_be_bytes());
+    let request = IdempotentMutationRequestV2 {
+        operation_kind: OperationKind::FleetGrantAck,
+        idempotency_key,
+        canonical_payload_bytes: FleetKeyGrantAckV2 {
+            grant: fleet_grant_ref(g.generation, g.fkek, g.variant, g.replay, &g.container),
+        }
+        .encode(),
+        client_request_nonce: [0x92; 16],
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+    }
+    .encode();
+    let path = format!("{}/{}/ack", fleet_generation_path(), g.generation);
+    let (status, body) = server.call(&path, access, Some(&request)).await;
+    (status, code_of(&body))
+}
+
+/// The columns a fleet grant row keeps beside its container: who filed it,
+/// and its marks.
+const FLEET_GRANT_ROW_ONLY: [&str; 3] = ["acked_at", "revoked_at", "created_at"];
+/// The row key: a row under another key is another grant (see the startup
+/// pass test).
+const FLEET_GRANT_KEY: [&str; 3] = ["server_instance_id", "tenant_id", "replay_id"];
+
+/// `col` of the grant row changed to another value of its type.
+async fn mutate(pool: &SqlitePool, table: &str, col: &str, replay: u8) -> sqlx::Result<()> {
+    let ty: String = sqlx::query_scalar(&format!(
+        "SELECT typeof({col}) FROM {table} WHERE replay_id = ?"
+    ))
+    .bind([replay; 16].as_slice())
+    .fetch_one(pool)
+    .await?;
+    let sql = format!("UPDATE {table} SET {col} = ? WHERE replay_id = ?");
+    let q = sqlx::query(&sql);
+    let q = match ty.as_str() {
+        "blob" => {
+            let mut b: Vec<u8> =
+                sqlx::query_scalar(&format!("SELECT {col} FROM {table} WHERE replay_id = ?"))
+                    .bind([replay; 16].as_slice())
+                    .fetch_one(pool)
+                    .await?;
+            b[0] ^= 0xff;
+            q.bind(b)
+        }
+        "integer" => {
+            let n: i64 =
+                sqlx::query_scalar(&format!("SELECT {col} FROM {table} WHERE replay_id = ?"))
+                    .bind([replay; 16].as_slice())
+                    .fetch_one(pool)
+                    .await?;
+            q.bind(n + 1)
+        }
+        _ => {
+            let t: String =
+                sqlx::query_scalar(&format!("SELECT {col} FROM {table} WHERE replay_id = ?"))
+                    .bind([replay; 16].as_slice())
+                    .fetch_one(pool)
+                    .await?;
+            q.bind(format!("{t}x"))
+        }
+    };
+    q.bind([replay; 16].as_slice())
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Drops every trigger on `table`, so the test can change rows behind the
+/// server's back.
+async fn drop_triggers(pool: &SqlitePool, table: &str) {
+    let triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for t in triggers {
+        sqlx::query(&format!("DROP TRIGGER {t}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn every_fleet_grant_column_is_compared_with_its_container_on_each_request() {
+    let mut server = start("g2-30-fleet-columns", 28310).await;
+    let (access, filed) = fleet_grants_filed(&mut server).await;
+    // One connection with foreign keys off: a changed fleet, generation or
+    // key ID must be caught by the request, not only by the schema.
+    let pool = db(&server.data).await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop_triggers(&pool, "v2_grant_quarantine").await;
+    let mut key = 0u16;
+    for g in &filed {
+        key += 1;
+        assert_eq!(
+            ack_again(&server, &access, g, key).await,
+            (409, "FLEET_GRANT_NOT_PENDING".into()),
+            "{}",
+            g.table
+        );
+        drop_triggers(&pool, g.table).await;
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(g.table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let mut by_request = Vec::new();
+        for col in cols
+            .iter()
+            .filter(|c| !FLEET_GRANT_ROW_ONLY.contains(&c.as_str()))
+            .filter(|c| !FLEET_GRANT_KEY.contains(&c.as_str()))
+        {
+            let before: Vec<(String,)> = sqlx::query_as(&format!(
+                "SELECT quote({col}) FROM {} WHERE replay_id = ?",
+                g.table
+            ))
+            .bind([g.replay; 16].as_slice())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            // A value the schema refuses can never disagree with a filed
+            // container; every other one must be refused by the request.
+            if mutate(&pool, g.table, col, g.replay).await.is_err() {
+                continue;
+            }
+            key += 1;
+            assert_eq!(
+                ack_again(&server, &access, g, key).await,
+                (422, "AUTH_CLAIM_COLUMN_MISMATCH".into()),
+                "{}.{col}",
+                g.table
+            );
+            assert_eq!(
+                server
+                    .count(&format!(
+                        "SELECT count(*) FROM v2_grant_quarantine
+                          WHERE kind = '{}' AND replay_id = x'{}'",
+                        g.kind,
+                        hex(&[g.replay; 16])
+                    ))
+                    .await,
+                1,
+                "{}.{col} is quarantined",
+                g.table
+            );
+            // Put back and released, the grant answers as before: the
+            // refusal was this column's.
+            sqlx::query(&format!(
+                "UPDATE {} SET {col} = {} WHERE replay_id = ?",
+                g.table, before[0].0
+            ))
+            .bind([g.replay; 16].as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM v2_grant_quarantine")
+                .execute(&pool)
+                .await
+                .unwrap();
+            key += 1;
+            assert_eq!(
+                ack_again(&server, &access, g, key).await,
+                (409, "FLEET_GRANT_NOT_PENDING".into()),
+                "{}.{col} restored",
+                g.table
+            );
+            by_request.push(col.as_str());
+        }
+        // The container, signature and issuer columns, and every HPKE or
+        // wrap byte, are among those the request compares.
+        let mut required = vec![
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "issuer_signing_key_id",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+            "fleet_id",
+            "fkek_key_id",
+            "not_after_ms",
+        ];
+        // A rotation grant's generations and start are tied to each other
+        // by its CHECKs, so the schema refuses them one at a time.
+        required.extend(match g.table {
+            "v2_fleet_device_hpke_grants" => vec![
+                "generation",
+                "not_before_ms",
+                "subject_device_id",
+                "subject_signing_key_id",
+                "recipient_hpke_key_id",
+                "hpke_info_bytes",
+                "hpke_encapped_key_bytes",
+                "hpke_wrapped_fleet_key_bytes",
+            ],
+            "v2_fleet_recovery_grants" => vec![
+                "generation",
+                "not_before_ms",
+                "recipient_root_key_id",
+                "recipient_root_generation",
+                "root_wrap_nonce_bytes",
+                "root_wrap_context_bytes",
+                "wrapped_fleet_key_bytes",
+            ],
+            _ => vec![
+                "previous_fkek_key_id",
+                "required_device_grant_count",
+                "required_device_grant_set_hash",
+                "recovery_grant_signed_container_hash",
+                "activation_not_before_ms",
+            ],
+        });
+        for col in required {
+            assert!(
+                by_request.contains(&col),
+                "{}.{col}: {by_request:?}",
+                g.table
+            );
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn the_startup_pass_quarantines_fleet_grants_that_left_their_containers() {
+    let mut server = start("g2-30-fleet-startup", 28311).await;
+    let (access, filed) = fleet_grants_filed(&mut server).await;
+    let (device, recovery, rotation) = (&filed[0], &filed[1], &filed[2]);
+    // While the server is down the device grant's HPKE info and the
+    // recovery grant's wrapped key drift, and a row under another replay ID
+    // takes the rotation grant's exact container.
+    let pool = db(&server.data).await;
+    let info: Vec<u8> =
+        sqlx::query_scalar("SELECT hpke_info_bytes FROM v2_fleet_device_hpke_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    for g in &filed {
+        drop_triggers(&pool, g.table).await;
+    }
+    for statement in [
+        "UPDATE v2_fleet_device_hpke_grants SET hpke_info_bytes = x'00'",
+        "UPDATE v2_fleet_recovery_grants SET wrapped_fleet_key_bytes = zeroblob(48)",
+        "DROP INDEX idx_v2_fleet_rotation_grants_one_per_generation",
+        "CREATE TABLE borrowed AS SELECT * FROM v2_fleet_rotation_grants",
+        "UPDATE borrowed SET replay_id = x'e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9'",
+        "INSERT INTO v2_fleet_rotation_grants SELECT * FROM borrowed",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    server.restart().await;
+    for (kind, replay) in [
+        ("fleet_device_hpke_grant", device.replay),
+        ("fleet_recovery_grant", recovery.replay),
+        ("fleet_rotation_grant", 0xe9),
+    ] {
+        assert_eq!(
+            server
+                .count(&format!(
+                    "SELECT count(*) FROM v2_grant_quarantine
+                      WHERE kind = '{kind}' AND replay_id = x'{}'",
+                    hex(&[replay; 16])
+                ))
+                .await,
+            1,
+            "{kind}"
+        );
+    }
+    // The drifted grants are refused, the intact rotation grant is not.
+    for (g, key) in [(device, 1), (recovery, 2)] {
+        assert_eq!(
+            ack_again(&server, &access, g, key).await,
+            (422, "AUTH_CLAIM_COLUMN_MISMATCH".into()),
+            "{}",
+            g.table
+        );
+    }
+    assert_eq!(
+        ack_again(&server, &access, rotation, 3).await,
+        (409, "FLEET_GRANT_NOT_PENDING".into())
+    );
+    // A quarantined grant stays refused once its row is put back.
+    let pool = db(&server.data).await;
+    sqlx::query("UPDATE v2_fleet_device_hpke_grants SET hpke_info_bytes = ?")
+        .bind(info)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(
+        ack_again(&server, &access, device, 4).await,
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH".into())
+    );
+    // A second pass finds nothing new.
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine")
+            .await,
+        3
+    );
+}
