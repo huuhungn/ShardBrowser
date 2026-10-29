@@ -25,6 +25,7 @@ use shared::trust_evidence::{
 
 use super::v2_approval::{cbor, coded};
 use super::v2_auth::{reload_session, unhex, verified, Principal};
+use super::v2_device_revoke::load_revocation;
 use crate::error::AppError;
 use crate::identity::Verified;
 use crate::state::AppState;
@@ -42,7 +43,7 @@ const KINDS: [(&str, Option<&str>, bool); 7] = [
     ("v2_tenant_root_key_grants", Some("root_grant"), false),
     ("v2_device_approvals", Some("device_approval"), true),
     ("v2_capability_grants", Some("capability_grant"), true),
-    (REVOCATIONS, None, false),
+    (REVOCATIONS, Some("device_revocation"), false),
     (
         "v2_fleet_device_hpke_grants",
         Some("fleet_device_hpke_grant"),
@@ -309,15 +310,21 @@ pub async fn trust_evidence(
                 });
             }
             if table == REVOCATIONS {
-                let (device, filed_at): (Vec<u8>, i64) = sqlx::query_as(
-                    "SELECT subject_device_id, filed_at_ms FROM v2_device_revocations WHERE rowid = ?",
+                let replay: [u8; 16] = row
+                    .get::<Vec<u8>, _>("replay_id")
+                    .try_into()
+                    .map_err(|_| AppError::Internal("a replay id is not 16 bytes".into()))?;
+                // The reported device is the verified record's, never a column's.
+                let stored = load_revocation(&mut tx, v, &tenant, &replay)
+                    .await?
+                    .ok_or_else(|| AppError::Internal("a revocation left the page".into()))?;
+                let device_id = stored.revocation.subject_device_id;
+                let filed_at: i64 = sqlx::query_scalar(
+                    "SELECT filed_at_ms FROM v2_device_revocations WHERE rowid = ?",
                 )
                 .bind(after)
                 .fetch_one(&mut *tx)
                 .await?;
-                let device_id: [u8; 16] = device
-                    .try_into()
-                    .map_err(|_| AppError::Internal("a device id is not 16 bytes".into()))?;
                 // The earliest filing on this page; a client takes the
                 // earliest over all pages, so a later one only repeats it.
                 if !page

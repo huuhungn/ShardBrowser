@@ -30,12 +30,13 @@ use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, reload_session, revoke_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
 use super::v2_root::{
-    ledger_row, mismatch, record_error, same_request, stale, store_response, stored_payload,
-    stored_response,
+    bind, ledger_row, mismatch, record_error, row_holds, same_request, stale, store_response,
+    stored_payload, stored_response, Col,
 };
 use super::v2_root_grants::{at, custodian_besides, is_active_custodian, outer_request};
 use crate::error::AppError;
 use crate::identity::Verified;
+use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
 use crate::util::now_ms;
 
@@ -54,6 +55,75 @@ fn response_mismatch() -> AppError {
     )
 }
 
+const TABLE: &str = "v2_device_revocations";
+
+/// A filed revocation whose row matched its verified container.
+pub(crate) struct StoredRevocation {
+    pub(crate) revocation: DeviceRevocationV2,
+    pub(crate) signed_container_hash: [u8; 32],
+}
+
+/// The revocation `replay` of this instance, reparsed, verified under its
+/// issuer's key and required to hold exactly the columns its container
+/// determines. A row that disagrees refuses the request (422) and is
+/// quarantined (plan L507); one quarantined before is no revocation.
+pub(crate) async fn load_revocation(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    replay: &[u8; 16],
+) -> Result<Option<StoredRevocation>, AppError> {
+    let exact: Option<Vec<u8>> = sqlx::query_scalar(&format!(
+        "SELECT exact_signed_container_bytes FROM {TABLE}
+          WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?"
+    ))
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(replay.as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(exact) = exact else { return Ok(None) };
+    let mark = Mark {
+        kind: Kind::DeviceRevocation,
+        server_instance_id: v.server_instance_id,
+        tenant_id: *tenant,
+        replay_id: *replay,
+    };
+    if quarantine::holds(conn, &mark).await? {
+        return Ok(None);
+    }
+    let broken = || AppError::Quarantine(Box::new(mark.clone()));
+    let parsed = AuthorizationRecord::parse(&exact).map_err(|_| broken())?;
+    // The issuer's device row outlives its own revocation, so its key stays.
+    let issuer: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM v2_devices WHERE tenant_id = ? AND signing_key_id = ?",
+    )
+    .bind(tenant.as_slice())
+    .bind(parsed.issuer_signing_key_id().as_slice())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let issuer: [u8; 32] = issuer.and_then(|k| k.try_into().ok()).ok_or_else(broken)?;
+    let record = parsed.verify_signature(&issuer).map_err(|_| broken())?;
+    let Payload::DeviceRevocation(revocation) = record.payload().clone() else {
+        return Err(broken());
+    };
+    let c = &revocation.common;
+    if (&c.server_instance_id, &c.tenant_id, &c.replay_id)
+        != (&v.server_instance_id, tenant, replay)
+    {
+        return Err(broken());
+    }
+    let cols = revocation_columns(&revocation, record.record()).map_err(|_| broken())?;
+    // The key is among the columns, so this is a check of that one row.
+    if !row_holds(conn, TABLE, &cols).await? {
+        return Err(broken());
+    }
+    Ok(Some(StoredRevocation {
+        revocation,
+        signed_container_hash: *record.record().signed_container_hash(),
+    }))
+}
+
 /// Whether the row `replay` holds exactly the filed container `hash`.
 async fn filed(
     conn: &mut SqliteConnection,
@@ -62,17 +132,9 @@ async fn filed(
     replay: &[u8; 16],
     hash: &[u8; 32],
 ) -> Result<bool, AppError> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM v2_device_revocations
-                         WHERE server_instance_id = ? AND tenant_id = ? AND replay_id = ?
-                           AND signed_container_hash = ?)",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .bind(replay.as_slice())
-    .bind(hash.as_slice())
-    .fetch_one(&mut *conn)
-    .await?)
+    Ok(load_revocation(conn, v, tenant, replay)
+        .await?
+        .is_some_and(|r| r.signed_container_hash == *hash))
 }
 
 /// The session's device holds a live, device-scoped `device.revoke` grant
@@ -141,6 +203,53 @@ async fn may_revoke(
     Ok(covered)
 }
 
+/// The columns a verified revocation determines (plan 5.6.1
+/// `DeviceRevocationV2`); `filed_at_ms` is the server's own and not among them.
+/// Filing and readback both use this list, so a column cannot be written one
+/// way and checked another.
+fn revocation_columns(
+    r: &DeviceRevocationV2,
+    record: &AuthorizationRecord,
+) -> Result<Vec<(&'static str, Col)>, AppError> {
+    let c = &r.common;
+    let b = |bytes: &[u8]| Col::Blob(bytes.to_vec());
+    let (suite, version) = record.signature_suite();
+    Ok(vec![
+        ("server_instance_id", b(&c.server_instance_id)),
+        ("tenant_id", b(&c.tenant_id)),
+        ("replay_id", b(&c.replay_id)),
+        ("payload_domain", Col::Text(DOMAIN_DEVICE_REVOCATION)),
+        ("payload_version", Col::Int(2)),
+        ("subject_account_id", b(&r.subject_account_id)),
+        ("subject_device_id", b(&r.subject_device_id)),
+        ("subject_signing_key_id", b(&r.subject_signing_key_id)),
+        ("subject_hpke_key_id", b(&r.subject_hpke_key_id)),
+        ("reason_code", Col::Text(r.reason_code.as_str())),
+        ("issuer_signing_key_id", b(record.issuer_signing_key_id())),
+        ("issued_at_ms", Col::Int(int(c.issued_at_ms)?)),
+        ("not_before_ms", Col::Int(int(c.not_before_ms)?)),
+        ("not_after_ms", Col::Int(int(c.not_after_ms)?)),
+        ("restore_epoch", Col::Int(int(c.restore_epoch)?)),
+        (
+            "canonical_payload_bytes",
+            b(record.canonical_payload_bytes()),
+        ),
+        ("payload_sha256", b(record.payload_sha256())),
+        ("signature_suite_id", Col::Int(i64::from(suite))),
+        ("signature_version", Col::Int(i64::from(version))),
+        ("signature_bytes", b(record.signature_bytes())),
+        ("signed_container_hash", b(record.signed_container_hash())),
+        (
+            "exact_signed_container_bytes",
+            b(record.exact_signed_container_bytes()),
+        ),
+        (
+            "exact_signed_container_bytes_sha256",
+            b(record.exact_signed_container_bytes_sha256()),
+        ),
+    ])
+}
+
 /// Inserts the revocation row: every column from the verified record.
 async fn insert_revocation(
     conn: &mut SqliteConnection,
@@ -148,43 +257,19 @@ async fn insert_revocation(
     record: &AuthorizationRecord,
     now: i64,
 ) -> Result<(), AppError> {
-    let c = &r.common;
-    let (suite, version) = record.signature_suite();
-    sqlx::query(
-        "INSERT INTO v2_device_revocations
-             (server_instance_id, tenant_id, replay_id, payload_domain, payload_version,
-              subject_account_id, subject_device_id, subject_signing_key_id, subject_hpke_key_id,
-              reason_code, issuer_signing_key_id, issued_at_ms, not_before_ms, not_after_ms,
-              restore_epoch, canonical_payload_bytes, payload_sha256, signature_suite_id,
-              signature_version, signature_bytes, signed_container_hash,
-              exact_signed_container_bytes, exact_signed_container_bytes_sha256, filed_at_ms)
-         VALUES (?, ?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(c.server_instance_id.as_slice())
-    .bind(c.tenant_id.as_slice())
-    .bind(c.replay_id.as_slice())
-    .bind(DOMAIN_DEVICE_REVOCATION)
-    .bind(r.subject_account_id.as_slice())
-    .bind(r.subject_device_id.as_slice())
-    .bind(r.subject_signing_key_id.as_slice())
-    .bind(r.subject_hpke_key_id.as_slice())
-    .bind(r.reason_code.as_str())
-    .bind(record.issuer_signing_key_id().as_slice())
-    .bind(int(c.issued_at_ms)?)
-    .bind(int(c.not_before_ms)?)
-    .bind(int(c.not_after_ms)?)
-    .bind(int(c.restore_epoch)?)
-    .bind(record.canonical_payload_bytes())
-    .bind(record.payload_sha256().as_slice())
-    .bind(i64::from(suite))
-    .bind(i64::from(version))
-    .bind(record.signature_bytes())
-    .bind(record.signed_container_hash().as_slice())
-    .bind(record.exact_signed_container_bytes())
-    .bind(record.exact_signed_container_bytes_sha256().as_slice())
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
+    let mut cols = revocation_columns(r, record)?;
+    cols.push(("filed_at_ms", Col::Int(now)));
+    let names: Vec<&str> = cols.iter().map(|(name, _)| *name).collect();
+    let sql = format!(
+        "INSERT INTO {TABLE} ({}) VALUES ({})",
+        names.join(", "),
+        vec!["?"; cols.len()].join(", ")
+    );
+    let mut q = sqlx::query(&sql);
+    for (_, col) in &cols {
+        q = bind(q, col);
+    }
+    q.execute(&mut *conn).await?;
     Ok(())
 }
 

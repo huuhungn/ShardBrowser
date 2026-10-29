@@ -19,7 +19,7 @@ use sqlx::{Row, SqlitePool};
 use crate::error::AppError;
 use crate::identity::{ReasonCode, Refusal, Verified};
 use crate::quarantine::{self, Kind, Mark};
-use crate::routes::{v2_approval, v2_capability, v2_fleet, v2_root_grants};
+use crate::routes::{v2_approval, v2_capability, v2_device_revoke, v2_fleet, v2_root_grants};
 use crate::util;
 
 /// Why a device's stored keys cannot be trusted.
@@ -200,9 +200,9 @@ async fn quarantine_bad_keys(pool: &SqlitePool) -> Result<usize> {
 }
 
 /// Quarantines every root, capability and fleet key grant and every device
-/// approval of this instance whose row disagrees with its signed container,
-/// through the same checks every request path uses. Returns how many it newly
-/// quarantined.
+/// approval and revocation of this instance whose row disagrees with its
+/// signed container, through the same checks every request path uses. Returns
+/// how many it newly quarantined.
 async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize> {
     let instance = v.server_instance_id;
     let id = |row: &sqlx::sqlite::SqliteRow, col: &str| -> Result<[u8; 16]> {
@@ -300,6 +300,25 @@ async fn quarantine_bad_grants(pool: &SqlitePool, v: &Verified) -> Result<usize>
                 quarantined += usize::from(quarantine::record(pool, &mark).await?)
             }
             Err(e) => anyhow::bail!("checking a device approval failed: {e:?}"),
+        }
+    }
+    let revocations = sqlx::query(
+        "SELECT tenant_id, replay_id FROM v2_device_revocations WHERE server_instance_id = ?",
+    )
+    .bind(instance.as_slice())
+    .fetch_all(pool)
+    .await?;
+    for row in revocations {
+        let (tenant, replay) = (id(&row, "tenant_id")?, id(&row, "replay_id")?);
+        let mut conn = pool.acquire().await?;
+        let checked = v2_device_revoke::load_revocation(&mut conn, v, &tenant, &replay).await;
+        drop(conn);
+        match checked {
+            Ok(_) => {}
+            Err(AppError::Quarantine(mark)) => {
+                quarantined += usize::from(quarantine::record(pool, &mark).await?)
+            }
+            Err(e) => anyhow::bail!("checking a device revocation failed: {e:?}"),
         }
     }
     Ok(quarantined)

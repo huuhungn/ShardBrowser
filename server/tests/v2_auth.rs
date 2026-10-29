@@ -8603,3 +8603,584 @@ async fn the_startup_pass_quarantines_approvals_that_left_their_containers() {
         2
     );
 }
+
+// ----------------------------------- G2-30 root, capability and revocation ---
+
+/// A pool on the server's DB for changing rows behind its back: foreign keys
+/// off, and no trigger on `table` or on the quarantine to stop the test.
+async fn matrix_pool(server: &Server, table: &str) -> SqlitePool {
+    let pool = db(&server.data).await;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&pool)
+        .await
+        .unwrap();
+    drop_triggers(&pool, "v2_grant_quarantine").await;
+    drop_triggers(&pool, table).await;
+    pool
+}
+
+/// Changes each column of the `table` row `replay` but `skip`, one at a time
+/// and behind the server's back. `ask` must then be refused as a column
+/// mismatch with the row quarantined as `kind`, and answer `intact` again once
+/// the column is put back and the quarantine released. A column is changed to
+/// another value of its type, or to the SQL in `other_values`; a value the
+/// schema refuses can never disagree with a filed container. A column in
+/// `other_answers` is refused earlier, by the request's own comparison, with
+/// that answer and no quarantine. Returns the columns compared and the
+/// columns the schema pins.
+#[allow(clippy::too_many_arguments)]
+async fn each_column_is_compared<Fut: std::future::Future<Output = (u16, String)>>(
+    server: &Server,
+    pool: &SqlitePool,
+    table: &str,
+    kind: &str,
+    replay: u8,
+    skip: &[&str],
+    other_values: &[(&str, &str)],
+    other_answers: &[(&str, u16, &str)],
+    intact: u16,
+    ask: impl Fn() -> Fut,
+) -> (Vec<String>, Vec<String>) {
+    let cols: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            .bind(table)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(ask().await.0, intact, "{table} before");
+    let (mut compared, mut pinned) = (Vec::new(), Vec::new());
+    for col in cols.iter().filter(|c| !skip.contains(&c.as_str())) {
+        let before: (String,) = sqlx::query_as(&format!(
+            "SELECT quote({col}) FROM {table} WHERE replay_id = ?"
+        ))
+        .bind([replay; 16].as_slice())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let changed = match other_values.iter().find(|(c, _)| c == col) {
+            Some((_, sql)) => sqlx::query(&format!(
+                "UPDATE {table} SET {col} = {sql} WHERE replay_id = ?"
+            ))
+            .bind([replay; 16].as_slice())
+            .execute(pool)
+            .await
+            .map(|_| ()),
+            None => mutate(pool, table, col, replay).await,
+        };
+        if changed.is_err() {
+            pinned.push(col.clone());
+            continue;
+        }
+        let (status, code, quarantined) = match other_answers.iter().find(|(c, ..)| c == col) {
+            Some((_, status, code)) => (*status, *code, 0),
+            None => (422, "AUTH_CLAIM_COLUMN_MISMATCH", 1),
+        };
+        assert_eq!(ask().await, (status, code.into()), "{table}.{col}");
+        assert_eq!(
+            server
+                .count(&format!(
+                    "SELECT count(*) FROM v2_grant_quarantine
+                      WHERE kind = '{kind}' AND replay_id = x'{}'",
+                    hex(&[replay; 16])
+                ))
+                .await,
+            quarantined,
+            "{table}.{col} is quarantined"
+        );
+        sqlx::query(&format!(
+            "UPDATE {table} SET {col} = {} WHERE replay_id = ?",
+            before.0
+        ))
+        .bind([replay; 16].as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM v2_grant_quarantine")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(ask().await.0, intact, "{table}.{col} restored");
+        compared.push(col.clone());
+    }
+    (compared, pinned)
+}
+
+/// Every column of the table is either compared with the container or one
+/// the schema pins to a constant or ties to another column: `compared` holds
+/// `required`, and `pinned` is exactly `pinned_by_schema`.
+fn assert_compared(
+    table: &str,
+    (compared, pinned): (Vec<String>, Vec<String>),
+    required: &[&str],
+    pinned_by_schema: &[&str],
+) {
+    for col in required {
+        assert!(
+            compared.iter().any(|c| c == col),
+            "{table}.{col}: {compared:?}"
+        );
+    }
+    assert_eq!(pinned, pinned_by_schema, "{table}: pinned columns");
+}
+
+#[tokio::test]
+async fn every_root_grant_column_is_compared_with_its_container_on_each_request() {
+    const TABLE: &str = "v2_tenant_root_key_grants";
+    let mut server = start("g2-30-root-columns", 28312).await;
+    let (_dev, access, _, _) = bootstrapped(&mut server, 0x66).await;
+    let pool = matrix_pool(&server, TABLE).await;
+    let path = grant_path("0", &SELF_GRANT_REPLAY);
+    let columns = each_column_is_compared(
+        &server,
+        &pool,
+        TABLE,
+        "root_grant",
+        SELF_GRANT_REPLAY[0],
+        // The row key and the marks the grant's lifecycle keeps beside it.
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "root_generation",
+            "acked_at",
+            "revoked_at",
+            "created_at",
+        ],
+        &[
+            ("grant_variant", "'ExistingRootGrant'"),
+            ("issued_at_ms", "issued_at_ms - 1"),
+        ],
+        &[],
+        200,
+        || async {
+            let (status, body) = server.call(&path, &access, None).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        columns,
+        &[
+            "root_key_id",
+            "grant_variant",
+            "subject_account_id",
+            "subject_device_id",
+            "subject_device_approval_replay_id",
+            "recipient_hpke_key_id",
+            "hpke_info_bytes",
+            "hpke_encapped_key_bytes",
+            "hpke_wrapped_trk_bytes",
+            "issued_at_ms",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ],
+        // Constants, and the two key IDs a self-grant ties to each other.
+        // A rotation grant's previous root is NULL on this variant.
+        &[
+            "container_domain",
+            "container_version",
+            "payload_domain",
+            "payload_version",
+            "grant_capability",
+            "subject_signing_key_id",
+            "subject_device_approval_payload_domain",
+            "hpke_suite_id",
+            "hpke_mode_id",
+            "hpke_kem_id",
+            "hpke_kdf_id",
+            "hpke_aead_id",
+            "previous_root_key_id",
+            "previous_root_generation",
+            "signature_suite_id",
+            "signature_version",
+            "issuer_signing_key_id",
+        ],
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn every_capability_grant_column_is_compared_with_its_container_on_each_request() {
+    const TABLE: &str = "v2_capability_grants";
+    let mut server = start("g2-30-capability-columns", 28313).await;
+    let (dev, access, _) = custodian(&mut server, 0x6a).await;
+    let own = capability_grant(&dev, &dev.sk, |_| {});
+    assert_eq!(server.call(GRANTS, &access, Some(&own)).await.0, 201);
+    let pool = matrix_pool(&server, TABLE).await;
+    let columns = each_column_is_compared(
+        &server,
+        &pool,
+        TABLE,
+        "capability_grant",
+        0xa1,
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "revoked_at",
+            "created_at",
+        ],
+        &[
+            ("capability", "'device.revoke'"),
+            ("issued_at_ms", "issued_at_ms - 1"),
+        ],
+        // The retry's bytes are compared with the stored container first.
+        &[("exact_signed_container_bytes", 409, "IDEMPOTENCY_MISMATCH")],
+        201,
+        || async {
+            let (status, body) = server.call(GRANTS, &access, Some(&own)).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        columns,
+        &[
+            "subject_account_id",
+            "subject_device_id",
+            "subject_signing_key_id",
+            "subject_hpke_key_id",
+            "capability",
+            "issued_at_ms",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "issuer_signing_key_id",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ],
+        // Constants, and the kind and scope the schema ties to each other.
+        &[
+            "payload_domain",
+            "payload_version",
+            "subject_kind",
+            "scope_kind",
+            "scope_id",
+            "signature_suite_id",
+            "signature_version",
+        ],
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn every_device_revocation_column_is_compared_with_its_container_on_each_request() {
+    const TABLE: &str = "v2_device_revocations";
+    let mut server = start("g2-30-revocation-columns", 28314).await;
+    let (dev, access, _) = custodian(&mut server, 0x6f).await;
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let path = device_revoke_path(&subject.id);
+    // 29 days, so the window is not at the schema's 30-day bound.
+    let request = revoke_request(0xa6, &revocation(&dev.sk, &subject, 0x90, 29));
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    // The row holds the values the record carries, not only values that
+    // agree with each other.
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM {TABLE}
+                  WHERE replay_id = x'{}' AND subject_account_id = x'{}'
+                    AND subject_device_id = x'{}' AND subject_signing_key_id = x'{}'
+                    AND subject_hpke_key_id = x'{}' AND issuer_signing_key_id = x'{}'
+                    AND reason_code = 'compromised' AND restore_epoch = 0
+                    AND issued_at_ms = not_before_ms
+                    AND not_after_ms - not_before_ms = {}",
+                hex(&[0x90; 16]),
+                hex(&OWNER),
+                hex(&subject.id),
+                hex(&subject.signing_key_id),
+                hex(&subject.hpke_key_id),
+                hex(&dev.signing_key_id),
+                29 * DAY_MS
+            ))
+            .await,
+        1
+    );
+    let pool = matrix_pool(&server, TABLE).await;
+    let columns = each_column_is_compared(
+        &server,
+        &pool,
+        TABLE,
+        "device_revocation",
+        0x90,
+        // The row key, and the time the server filed it.
+        &[
+            "server_instance_id",
+            "tenant_id",
+            "replay_id",
+            "filed_at_ms",
+        ],
+        &[
+            ("reason_code", "'lost'"),
+            ("issued_at_ms", "issued_at_ms - 1"),
+        ],
+        &[],
+        201,
+        || async {
+            let (status, body) = server.call(&path, &access, Some(&request)).await;
+            (status, code_of(&body))
+        },
+    )
+    .await;
+    assert_compared(
+        TABLE,
+        columns,
+        &[
+            "subject_account_id",
+            "subject_device_id",
+            "subject_signing_key_id",
+            "subject_hpke_key_id",
+            "reason_code",
+            "issuer_signing_key_id",
+            "issued_at_ms",
+            "not_before_ms",
+            "not_after_ms",
+            "restore_epoch",
+            "canonical_payload_bytes",
+            "payload_sha256",
+            "signature_bytes",
+            "signed_container_hash",
+            "exact_signed_container_bytes",
+            "exact_signed_container_bytes_sha256",
+        ],
+        // The constants the schema pins.
+        &[
+            "payload_domain",
+            "payload_version",
+            "signature_suite_id",
+            "signature_version",
+        ],
+    );
+    pool.close().await;
+}
+
+/// The containers the trust evidence serves, and whether it reports `a` and
+/// `b` as revoked devices.
+async fn served_revocations(
+    server: &Server,
+    access: &str,
+    a: [u8; 16],
+    b: [u8; 16],
+) -> (Vec<Vec<u8>>, bool, bool) {
+    let pages = evidence(server, access, &[]).await;
+    let reported: Vec<[u8; 16]> = pages
+        .iter()
+        .flat_map(|p| p.device_revocations.iter().map(|d| d.device_id))
+        .collect();
+    (
+        containers(&pages),
+        reported.contains(&a),
+        reported.contains(&b),
+    )
+}
+
+#[tokio::test]
+async fn the_startup_pass_quarantines_device_revocations_that_left_their_containers() {
+    let mut server = start("g2-30-revocation-startup", 28315).await;
+    let (dev, access, _) = custodian(&mut server, 0x70).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (drifted, intact) = (
+        device(&server, OWNER, 0x7b, "pending").await,
+        device(&server, OWNER, 0x7c, "pending").await,
+    );
+    let drifted_container = revocation(&dev.sk, &drifted, 0x90, 29);
+    let intact_container = revocation(&dev.sk, &intact, 0x91, 29);
+    let drifted_request = revoke_request(0xa6, &drifted_container);
+    let intact_request = revoke_request(0xa7, &intact_container);
+    for (device, request) in [(&drifted, &drifted_request), (&intact, &intact_request)] {
+        let (status, body) = server
+            .call(&device_revoke_path(&device.id), &access, Some(request))
+            .await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    }
+    let pool = db(&server.data).await;
+    // While the server is down one revocation's HPKE key ID drifts, out of
+    // every request's sight, and a row under another replay ID takes the
+    // intact revocation's exact container.
+    drop_triggers(&pool, "v2_device_revocations").await;
+    for statement in [
+        "UPDATE v2_device_revocations SET subject_hpke_key_id = zeroblob(32)
+          WHERE replay_id = x'90909090909090909090909090909090'",
+        "CREATE TABLE borrowed AS SELECT * FROM v2_device_revocations
+          WHERE replay_id = x'91919191919191919191919191919191'",
+        "UPDATE borrowed SET replay_id = x'e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8e8'",
+        "INSERT INTO v2_device_revocations SELECT * FROM borrowed",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    server.restart().await;
+    let quarantined = |replay: u8| {
+        format!(
+            "SELECT count(*) FROM v2_grant_quarantine
+              WHERE kind = 'device_revocation' AND replay_id = x'{}'",
+            hex(&[replay; 16])
+        )
+    };
+    for (replay, want) in [(0x90, 1), (0xe8, 1), (0x91, 0)] {
+        assert_eq!(
+            server.count(&quarantined(replay)).await,
+            want,
+            "{replay:#x}"
+        );
+    }
+    // The intact revocation is still served and reported; the quarantined
+    // one is neither, even once its row is put back.
+    let (all, drifted_reported, intact_reported) =
+        served_revocations(&server, &access, drifted.id, intact.id).await;
+    assert!(all.contains(&intact_container));
+    assert!(!all.contains(&drifted_container));
+    assert!(intact_reported && !drifted_reported);
+    server
+        .sql(
+            "UPDATE v2_device_revocations SET subject_hpke_key_id = ? WHERE replay_id = ?",
+            &[&drifted.hpke_key_id, &[0x90; 16]],
+        )
+        .await;
+    let (all, drifted_reported, _) =
+        served_revocations(&server, &access, drifted.id, intact.id).await;
+    assert!(!all.contains(&drifted_container) && !drifted_reported);
+    // A retry of either filing finds its row: the intact one answers as
+    // before, the quarantined one is no revocation.
+    let retry = |device: &Device, request: Vec<u8>| {
+        let (server, access, path) = (&server, access.clone(), device_revoke_path(&device.id));
+        async move { server.call(&path, &access, Some(&request)).await.0 }
+    };
+    assert_eq!(retry(&intact, intact_request).await, 201);
+    assert_eq!(retry(&drifted, drifted_request).await, 422);
+    // A second pass finds nothing new.
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn the_trust_evidence_reports_a_revoked_device_from_its_record_not_its_column() {
+    let mut server = start("g2-30-revocation-trust", 28316).await;
+    let (dev, access, _) = custodian(&mut server, 0x71).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(&server, OWNER, 0x7b, "pending").await;
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&subject.id),
+            &access,
+            Some(&revoke_request(0xa6, &container)),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let page = format!("/v2/tenants/{}/trust-evidence", hex(&TENANT));
+    let pages = evidence(&server, &access, &[]).await;
+    assert!(containers(&pages).contains(&container));
+
+    // The device column drifts after startup: the page that would report
+    // another device is refused, and the row quarantined.
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    sqlx::query("UPDATE v2_device_revocations SET subject_device_id = zeroblob(16)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let (status, body) = server.call(&page, &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "AUTH_CLAIM_COLUMN_MISMATCH")
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation'")
+            .await,
+        1
+    );
+    // Afterwards the page answers without the quarantined revocation.
+    let pages = evidence(&server, &access, &[]).await;
+    assert!(!containers(&pages).contains(&container));
+    assert!(pages.iter().all(|p| p.device_revocations.is_empty()));
+}
+
+/// A retry is answered only while the row still holds the container that was
+/// filed: a row swapped for another genuine revocation under the same replay
+/// ID verifies and matches its own columns, but is not the filing.
+#[tokio::test]
+async fn a_revocation_row_swapped_for_another_genuine_one_does_not_answer_a_retry() {
+    let mut server = start("g2-30-revocation-swapped", 28317).await;
+    let (dev, access, _) = custodian(&mut server, 0x72).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (ours, other) = (
+        device(&server, OWNER, 0x7b, "pending").await,
+        device(&server, OWNER, 0x7c, "pending").await,
+    );
+    // The other revocation is filed first and its row set aside, so the same
+    // replay ID can be filed again for the device whose retry is tested.
+    let swapped = revocation(&dev.sk, &other, 0x90, 28);
+    let (status, body) = server
+        .call(
+            &device_revoke_path(&other.id),
+            &access,
+            Some(&revoke_request(0xa7, &swapped)),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    for statement in [
+        "CREATE TABLE set_aside AS SELECT * FROM v2_device_revocations",
+        "DELETE FROM v2_device_revocations",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    let request = revoke_request(0xa6, &revocation(&dev.sk, &ours, 0x90, 29));
+    let path = device_revoke_path(&ours.id);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.call(&path, &access, Some(&request)).await,
+        (201, body)
+    );
+    for statement in [
+        "DELETE FROM v2_device_revocations",
+        "INSERT INTO v2_device_revocations SELECT * FROM set_aside",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (422, "MUTATION_RESPONSE_MISMATCH")
+    );
+}
