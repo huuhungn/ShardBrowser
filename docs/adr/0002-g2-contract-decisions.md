@@ -75,6 +75,25 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 | **Q-27 A device offline across several fleet rotations** | **Fail closed.** A device accepts a fleet generation only one step above the highest it has verified (or any generation on first sighting). A device that missed two or more rotations refuses the newer generation and must be enrolled again. Rejected: walking the `RotationGrant` chain to catch up (more design for a rare case) | none |
 | **Q-28 A generation left PREPARING across a restore** (D-1, Q-1) | **Fail closed.** A root or fleet generation still PREPARING at restore epoch `E` does not activate at `E+1`, and no new grant can be filed into it, because new grants carry the generation's epoch. The custodian creates a new generation after the restore. Rejected: letting an older-epoch generation activate after a restore | none |
 
+### Decided on 2026-10-29 (G2 evidence scope chosen by the user)
+
+| Choice | Decision | Plan lines |
+|---|---|---|
+| **Q-29 Windows credential store evidence** (G2-48) | **A scripted manual run on a real Windows machine.** The repository ships a script that checks the credential store across a machine restart, a locked session and an unavailable store; the user runs it by hand and its log is the evidence. Rejected: CI-only evidence, which cannot restart or lock a session | G2-48 |
+| **Q-30 Supported filesystems and crash evidence** (G2-49, G2-50, G2-52) | **Local NTFS only.** A data directory on a network share (SMB), exFAT or FAT32 is refused at startup (fail closed, tested). Crash evidence is a process kill or an injected crash point at every write, rename and fsync; no power-loss run is required. Rejected: ReFS (no CI support) and a power-pull requirement | G2-49, G2-50, G2-52 |
+| **Q-31 Network-share probe** (G2-50) | **A temporary SMB share on the test machine**, pointing at an empty scratch directory and deleted after the test, proves the network-share refusal | G2-50 |
+| **Q-32 Independent verifier** (G2-64) | **Hermes or Codex**, in its own worktree, reading the plan and the code but not the implementer's reports, runs the checks and gives the verdict. The release waits for its PASS | G2-64, L2341, L2510 |
+
+### Implementation choices recorded on 2026-10-29 (WP-6 offline restore)
+
+These narrow D-1 toward fail-closed behaviour; each was reviewed independently.
+
+| Choice | Decision | D-1 text it narrows |
+|---|---|---|
+| **Q-33 Transition source and withdrawal** | `restore prepare` takes the transitions already submitted online (`POST` restore-epoch route) instead of `--transitions <dir>`, considers only the step being prepared (E to E+1), and re-checks at prepare that each signer is a live, unrevoked device that is an ACTIVE root custodian at E. Because a signed transition carries no restore transaction id, a submitted row cannot be bound to one restore; an audited offline `restore withdraw-transitions --tenant` (allowed only before a restore is prepared) removes a tenant's submitted rows so one custodian cannot block every later restore | step 1', the `prepare` row of the command table |
+| **Q-34 Rolled-back outcomes and replay order** | A restore marks the ledger rows of rolled-back COMMIT, CREATE_UPLOAD, FINALIZE_UPLOAD and PROFILE_PUBLISH_CREATE with `superseded_by_restore_epoch = E+1` (set once, by trigger). The idempotency ledger is consulted before the restore-epoch check on publish, checkout, release, create-upload and finalize, so a replay of a superseded commit answers 409 `BASE_VERSION_MISMATCH` with `superseded_by_restore_epoch`, a superseded create or finalize answers `RESOURCE_NOT_FOUND`, and a kept outcome replays its stored bytes | L377-L389 |
+| **Q-35 Not in this cut** | No `--drop-unreferenced`: a profile or head present on one side only refuses the restore. Candidate = a copy of the live DB with the backup's data plane attached (equivalent to the D-1 merge). `abort --orphans` keeps `pre-restore-*` archives unless `--delete-archives` is given. Release builds refuse `export-heads` and `prepare` (as D-1 requires before v0.2.2); crash points exist only in debug builds | the `--drop-unreferenced` paragraph, K3, L584 |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
