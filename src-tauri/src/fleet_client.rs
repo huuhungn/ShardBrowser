@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use shardx_core::canonical as c;
 use shardx_core::fleet_manifest::{build_snapshot_manifest, ManifestFields};
@@ -195,7 +196,7 @@ pub struct EnrolledDevice {
 pub struct FleetClient {
     http: reqwest::Client,
     base_url: String,
-    token: String,
+    token: Zeroizing<String>,
 }
 
 impl FleetClient {
@@ -214,7 +215,7 @@ impl FleetClient {
         Ok(Self {
             http,
             base_url: base,
-            token: token.to_string(),
+            token: token.to_string().into(),
         })
     }
 
@@ -672,7 +673,7 @@ impl FleetClient {
         let res = self
             .http
             .get(self.url("/v2/server-identity"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableIdentity"))?;
@@ -696,7 +697,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/leases"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": tenant_id,
                 "profile_id": profile_id,
@@ -719,7 +720,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/leases/release"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({ "tenant_id": tenant_id, "lease_id": lease_id }))
             .send()
             .await
@@ -732,7 +733,7 @@ impl FleetClient {
         let res = self
             .http
             .get(self.url(&format!("/v2/fleet/snapshots/{tenant_id}/{profile_id}")))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableHead"))?;
@@ -765,7 +766,7 @@ impl FleetClient {
                 .get(self.url(&format!(
                     "/v2/fleet/snapshots/{tenant_id}/{profile_id}/range"
                 )))
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .query(&[
                     ("version", version.to_string()),
                     ("offset", out.len().to_string()),
@@ -820,7 +821,7 @@ impl FleetClient {
             .get(self.url(&format!(
                 "/v2/tenants/{tenant_id}/devices/{device_id}/root-key-grants"
             )))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
@@ -843,7 +844,7 @@ impl FleetClient {
             .get(self.url(&format!(
                 "/v2/tenants/{tenant_id}/fleets/{fleet_id}/key-generation"
             )))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
@@ -1157,7 +1158,7 @@ impl FleetClient {
         let open = self
             .http
             .post(self.url("/v2/fleet/uploads"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": req.tenant_id,
                 "profile_id": req.profile_id,
@@ -1185,7 +1186,7 @@ impl FleetClient {
         let commit = self
             .http
             .post(self.url("/v2/fleet/uploads/commit"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": req.tenant_id,
                 "profile_id": req.profile_id,
@@ -1224,7 +1225,7 @@ impl FleetClient {
                     "/v2/fleet/uploads/{}/{}/chunk",
                     req.tenant_id, session_id
                 )))
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .header("x-chunk-offset", offset.to_string())
                 .header("content-type", "application/octet-stream")
                 .body(req.container[offset..end].to_vec())
@@ -1241,7 +1242,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/uploads/abort"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({ "tenant_id": tenant_id, "session_id": session_id }))
             .send()
             .await
@@ -1483,6 +1484,14 @@ mod tests {
         let printed = format!("{s:?}");
         assert!(printed.contains("sid"));
         assert!(!printed.contains("access-secret") && !printed.contains("refresh-secret"));
+    }
+
+    /// The bearer token a client holds is wiped on drop (G2-47).
+    #[test]
+    fn the_client_token_zeroizes_on_drop() {
+        let c = FleetClient::new("https://team.example.com", "tok").unwrap();
+        let _: &dyn zeroize::ZeroizeOnDrop = &c.token;
+        assert_eq!(c.token.as_str(), "tok");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub struct TeamConfig {
     pub server_url: String,
     /// Session token for that server.
     #[serde(default)]
-    pub token: String,
+    pub token: Zeroizing<String>,
     /// Tenant this device belongs to, hex-encoded.
     #[serde(default)]
     pub tenant_id: String,
@@ -49,10 +49,10 @@ pub struct TeamConfig {
     pub fleet_id: String,
     /// Ed25519 signing key seed, hex-encoded. Present once enrolled.
     #[serde(default)]
-    pub signing_key_seed: String,
+    pub signing_key_seed: Zeroizing<String>,
     /// HPKE recipient key seed, hex-encoded. Present once enrolled.
     #[serde(default)]
-    pub hpke_key_seed: String,
+    pub hpke_key_seed: Zeroizing<String>,
     /// Where the signing seed lives once it left this file: its reference in
     /// the OS credential store (ADR 0004). Then `signing_key_seed` is empty.
     #[serde(default)]
@@ -277,8 +277,8 @@ pub fn load() -> Result<TeamConfig> {
             let _ = write(&path, &stored);
         }
     }
-    stored.signing_key_seed = dpapi::reveal(&stored.signing_key_seed);
-    stored.hpke_key_seed = dpapi::reveal(&stored.hpke_key_seed);
+    stored.signing_key_seed = dpapi::reveal(&stored.signing_key_seed).into();
+    stored.hpke_key_seed = dpapi::reveal(&stored.hpke_key_seed).into();
     Ok(stored)
 }
 
@@ -301,8 +301,8 @@ fn has_plaintext_keys(c: &TeamConfig) -> bool {
 /// Write `c` with its seeds protected. Callers hold `WRITE_LOCK`.
 fn write(path: &std::path::Path, c: &TeamConfig) -> Result<()> {
     let mut on_disk = c.clone();
-    on_disk.signing_key_seed = dpapi::conceal(&c.signing_key_seed)?;
-    on_disk.hpke_key_seed = dpapi::conceal(&c.hpke_key_seed)?;
+    on_disk.signing_key_seed = dpapi::conceal(&c.signing_key_seed)?.into();
+    on_disk.hpke_key_seed = dpapi::conceal(&c.hpke_key_seed)?.into();
     // A crash mid-write must not leave a half-written file that reads back as
     // "not enrolled" and orphans the device on the server.
     crate::durable::write_private(path, serde_json::to_string_pretty(&on_disk)?.as_bytes())?;
@@ -354,8 +354,8 @@ mod tests {
         store::set_config_root(Some(dir.path().to_path_buf()));
         let mut c = TeamConfig {
             device_id: "ab".repeat(16),
-            signing_key_seed: "11".repeat(32),
-            hpke_key_seed: "22".repeat(32),
+            signing_key_seed: "11".repeat(32).into(),
+            hpke_key_seed: "22".repeat(32).into(),
             ..Default::default()
         };
         save(&c).unwrap();
@@ -385,7 +385,7 @@ mod tests {
 
         // A seed written back to the file (re-enrollment) wins over the store.
         let mut fresh = saved.clone();
-        fresh.signing_key_seed = "33".repeat(32);
+        fresh.signing_key_seed = "33".repeat(32).into();
         assert_eq!(fresh.signing_key().unwrap().to_bytes(), [0x33; 32]);
 
         // A reference whose credential is gone fails closed.
@@ -403,15 +403,15 @@ mod tests {
         store::set_config_root(Some(dir.path().to_path_buf()));
         let mut c = TeamConfig {
             device_id: "cd".repeat(16),
-            signing_key_seed: "44".repeat(32),
-            hpke_key_seed: "55".repeat(32),
+            signing_key_seed: "44".repeat(32).into(),
+            hpke_key_seed: "55".repeat(32).into(),
             ..Default::default()
         };
         crate::credential::fail_next_call(&format!("device-signing.{}", "cd".repeat(16)));
 
         assert!(protect_keys(&mut c).unwrap());
         let saved = load().unwrap();
-        assert_eq!(saved.signing_key_seed, "44".repeat(32));
+        assert_eq!(saved.signing_key_seed.as_str(), "44".repeat(32));
         assert!(
             !status().unwrap().keys_protected,
             "a plaintext seed is reported"
@@ -426,10 +426,10 @@ mod tests {
     #[test]
     fn debug_never_prints_the_token_or_a_seed() {
         let c = TeamConfig {
-            token: "tok-secret".into(),
+            token: "tok-secret".to_string().into(),
             device_id: "ab".repeat(16),
-            signing_key_seed: "5a".repeat(32),
-            hpke_key_seed: "6b".repeat(32),
+            signing_key_seed: "5a".repeat(32).into(),
+            hpke_key_seed: "6b".repeat(32).into(),
             ..Default::default()
         };
         let printed = format!("{c:?}");
@@ -440,14 +440,30 @@ mod tests {
         assert!(format!("{:?}", TeamConfig::default()).contains("<none>"));
     }
 
+    /// The token and seeds are wiped when the config is dropped (G2-47), and
+    /// the wrapper changes nothing on disk: the existing format loads and
+    /// writes back byte for byte.
+    #[test]
+    fn secrets_zeroize_on_drop_and_the_file_format_is_unchanged() {
+        let c = enrolled();
+        let _: [&dyn zeroize::ZeroizeOnDrop; 3] = [&c.token, &c.signing_key_seed, &c.hpke_key_seed];
+        let golden = r#"{"server_url":"https://team.example.com","token":"secret-token","tenant_id":"aa","device_id":"bb","account_id":"cc","fleet_id":"dd","signing_key_seed":"S","hpke_key_seed":"H","signing_credential_ref":"","hpke_credential_ref":""}"#
+            .replace("\"S\"", &format!("\"{SIGNING}\""))
+            .replace("\"H\"", &format!("\"{HPKE}\""));
+        assert_eq!(serde_json::to_string(&c).unwrap(), golden);
+        let back: TeamConfig = serde_json::from_str(&golden).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), golden);
+        assert_eq!(back.hpke_seed().unwrap(), [0x22; 32]);
+    }
+
     #[test]
     fn a_device_without_an_identity_moves_nothing() {
         let mut c = TeamConfig {
-            signing_key_seed: "11".repeat(32),
+            signing_key_seed: "11".repeat(32).into(),
             ..Default::default()
         };
         assert!(!protect_keys(&mut c).unwrap());
-        assert_eq!(c.signing_key_seed, "11".repeat(32));
+        assert_eq!(c.signing_key_seed.as_str(), "11".repeat(32));
     }
 
     const SIGNING: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -456,13 +472,13 @@ mod tests {
     fn enrolled() -> TeamConfig {
         TeamConfig {
             server_url: "https://team.example.com".into(),
-            token: "secret-token".into(),
+            token: "secret-token".to_string().into(),
             tenant_id: "aa".into(),
             device_id: "bb".into(),
             account_id: "cc".into(),
             fleet_id: "dd".into(),
-            signing_key_seed: SIGNING.into(),
-            hpke_key_seed: HPKE.into(),
+            signing_key_seed: SIGNING.to_string().into(),
+            hpke_key_seed: HPKE.to_string().into(),
             ..Default::default()
         }
     }
@@ -479,8 +495,8 @@ mod tests {
         store::set_config_root(Some(dir.path().to_path_buf()));
         let junk = "dpapi:AAAA";
         let mut c = enrolled();
-        c.signing_key_seed = junk.into();
-        c.hpke_key_seed = junk.into();
+        c.signing_key_seed = junk.to_string().into();
+        c.hpke_key_seed = junk.to_string().into();
         save(&c).unwrap();
         let mut loaded = load().unwrap();
         let moved = protect_keys(&mut loaded).unwrap();
@@ -545,8 +561,8 @@ mod tests {
 
         assert!(!body.contains(SIGNING) && !body.contains(HPKE), "{body}");
         assert!(body.contains("dpapi:"), "{body}");
-        assert_eq!(loaded.signing_key_seed, SIGNING);
-        assert_eq!(loaded.hpke_key_seed, HPKE);
+        assert_eq!(loaded.signing_key_seed.as_str(), SIGNING);
+        assert_eq!(loaded.hpke_key_seed.as_str(), HPKE);
         assert!(loaded.signing_key().is_ok());
     }
 
@@ -562,12 +578,20 @@ mod tests {
         let second = load().unwrap();
         store::set_config_root(None);
 
-        assert_eq!(first.signing_key_seed, SIGNING, "plaintext still loads");
-        assert_eq!(first.hpke_key_seed, HPKE);
+        assert_eq!(
+            first.signing_key_seed.as_str(),
+            SIGNING,
+            "plaintext still loads"
+        );
+        assert_eq!(first.hpke_key_seed.as_str(), HPKE);
         assert!(!body.contains(SIGNING) && !body.contains(HPKE), "{body}");
-        assert_eq!(second.signing_key_seed, SIGNING, "no key lost on migration");
-        assert_eq!(second.hpke_key_seed, HPKE);
-        assert_eq!(second.token, "secret-token", "other fields kept");
+        assert_eq!(
+            second.signing_key_seed.as_str(),
+            SIGNING,
+            "no key lost on migration"
+        );
+        assert_eq!(second.hpke_key_seed.as_str(), HPKE);
+        assert_eq!(second.token.as_str(), "secret-token", "other fields kept");
     }
 
     /// A 2.4.3 or 2.4.4 file holds DPAPI-protected seeds; they still move into

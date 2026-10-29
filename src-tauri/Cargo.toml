@@ -4,6 +4,7 @@ version = "2.4.4"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -33,7 +34,7 @@ shardx-core = { path = "../shared" }
 # Device keys in the OS credential store (ADR 0004). The core crate has no
 # platform code; the Windows backend is below.
 keyring-core = "=1.0.0"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 dirs = "5"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"

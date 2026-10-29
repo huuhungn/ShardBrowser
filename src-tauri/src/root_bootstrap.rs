@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use shardx_core::approval_receipt::{device_approve_request_hash, DeviceApprovalReceiptV2};
 use shardx_core::authz_record::{
@@ -74,7 +75,7 @@ pub struct BootstrapState {
     #[serde(default)]
     pub approval: String,
     #[serde(default)]
-    pub trk: String,
+    pub trk: Zeroizing<String>,
     /// The exact first root self-grant container.
     #[serde(default)]
     pub self_grant: String,
@@ -498,9 +499,9 @@ impl Run<'_> {
         // 2. The TRK is saved before anything names it.
         if state.trk.is_empty() {
             let trk = hex(&random::<32>()?);
-            commit(state, save, |s| s.trk = trk)?;
+            commit(state, save, |s| s.trk = trk.into())?;
         }
-        let trk: [u8; 32] = unhex(&state.trk)?;
+        let trk = Zeroizing::new(unhex::<32>(&state.trk)?);
         if state.self_grant.is_empty() {
             let grant = hex(&self_grant(
                 cx,
@@ -590,7 +591,7 @@ impl Run<'_> {
         let opens = match descriptor.record().payload() {
             Payload::TenantRootKeyGrant(g) => g
                 .open_trk(self.hpke_secret)
-                .is_ok_and(|opened| *opened == trk),
+                .is_ok_and(|opened| *opened == *trk),
             _ => false,
         };
         let live = matches!(
@@ -1092,23 +1093,38 @@ mod tests {
     fn a_failed_save_leaves_the_callers_state_as_it_was() {
         let mut state = BootstrapState::default();
         let mut refuse = |_: &BootstrapState| -> Result<()> { anyhow::bail!("disk full") };
-        assert!(commit(&mut state, &mut refuse, |s| s.trk = "ab".into()).is_err());
+        assert!(commit(&mut state, &mut refuse, |s| s.trk = "ab".to_string().into()).is_err());
         assert!(state.trk.is_empty());
         let mut saved = Vec::new();
         let mut accept = |s: &BootstrapState| -> Result<()> {
-            saved.push(s.trk.clone());
+            saved.push(s.trk.to_string());
             Ok(())
         };
-        commit(&mut state, &mut accept, |s| s.trk = "ab".into()).unwrap();
+        commit(&mut state, &mut accept, |s| s.trk = "ab".to_string().into()).unwrap();
         assert_eq!((state.trk.as_str(), saved), ("ab", vec!["ab".to_string()]));
     }
 
     #[test]
     fn the_saved_state_never_prints_the_trk() {
         let s = BootstrapState {
-            trk: "ab".repeat(32),
+            trk: "ab".repeat(32).into(),
             ..Default::default()
         };
         assert!(!format!("{s:?}").contains("abab"));
+    }
+
+    /// The saved TRK is wiped on drop (G2-47) and stays a plain hex string on
+    /// disk.
+    #[test]
+    fn the_saved_trk_zeroizes_on_drop_and_serializes_as_before() {
+        let s = BootstrapState {
+            trk: "ab".repeat(32).into(),
+            ..Default::default()
+        };
+        let _: &dyn zeroize::ZeroizeOnDrop = &s.trk;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["trk"], "ab".repeat(32));
+        let back: BootstrapState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
     }
 }

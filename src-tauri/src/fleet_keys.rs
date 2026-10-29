@@ -46,7 +46,7 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 pub struct FleetKeys {
     /// Generation number to hex-encoded 32-byte key.
     #[serde(default)]
-    pub keys: BTreeMap<u64, String>,
+    pub keys: BTreeMap<u64, Zeroizing<String>>,
     /// Generation number to the key's reference in the OS credential store,
     /// once it left `keys`.
     #[serde(default)]
@@ -111,7 +111,7 @@ impl FleetKeyStore {
     /// Record a collected key.
     pub fn insert(&mut self, fleet_id: &str, generation: u64, key: &[u8; 32]) {
         let f = self.fleets.entry(fleet_id.to_string()).or_default();
-        f.keys.insert(generation, to_hex(key));
+        f.keys.insert(generation, to_hex(key).into());
         if generation >= f.active_generation {
             f.active_generation = generation;
         }
@@ -121,7 +121,7 @@ impl FleetKeyStore {
         let mut out = self.clone();
         for keys in out.fleets.values_mut() {
             for value in keys.keys.values_mut() {
-                *value = f(value)?;
+                *value = f(value)?.into();
             }
         }
         Ok(out)
@@ -375,7 +375,11 @@ mod tests {
         // On Windows the key left in the file is a DPAPI blob, never plaintext.
         assert_eq!(body.contains(&"61".repeat(32)), !cfg!(windows), "{body}");
         let f = &saved.fleets[&fleet];
-        assert_eq!(f.keys.get(&1), Some(&"61".repeat(32)), "kept in the file");
+        assert_eq!(
+            f.keys.get(&1).map(|k| k.as_str()),
+            Some("61".repeat(32).as_str()),
+            "kept in the file"
+        );
         assert_eq!(f.credential_refs.keys().collect::<Vec<_>>(), [&2]);
         assert_eq!(saved.active_key(&fleet), Some(([0x62; 32], 2)));
         let all = saved.keys_newest_first(&fleet, |_, _| false);
@@ -409,6 +413,21 @@ mod tests {
         let printed = format!("{s:?}");
         assert!(!printed.contains("c3c3"), "{printed}");
         assert!(printed.contains("active_generation: 1"), "{printed}");
+    }
+
+    /// A held key is wiped on drop (G2-47) and stored exactly as before.
+    #[test]
+    fn a_held_key_zeroizes_on_drop_and_serializes_as_before() {
+        let mut s = FleetKeyStore::default();
+        s.insert("ab", 1, &[0xc3; 32]);
+        let _: &dyn zeroize::ZeroizeOnDrop = &s.fleets["ab"].keys[&1];
+        let golden = format!(
+            r#"{{"fleets":{{"ab":{{"keys":{{"1":"{}"}},"credential_refs":{{}},"active_generation":1,"verified":[]}}}}}}"#,
+            "c3".repeat(32)
+        );
+        assert_eq!(serde_json::to_string(&s).unwrap(), golden);
+        let back: FleetKeyStore = serde_json::from_str(&golden).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), golden);
     }
 
     /// A fleet this device holds nothing for yields nothing, rather than a

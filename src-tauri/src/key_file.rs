@@ -255,8 +255,8 @@ mod tests {
         close();
         let mut c = TeamConfig {
             device_id: "ee".repeat(16),
-            signing_key_seed: "66".repeat(32),
-            hpke_key_seed: "77".repeat(32),
+            signing_key_seed: "66".repeat(32).into(),
+            hpke_key_seed: "77".repeat(32).into(),
             ..Default::default()
         };
         team_config::save(&c).unwrap();
