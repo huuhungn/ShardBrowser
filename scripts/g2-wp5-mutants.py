@@ -16,9 +16,10 @@ Not mutated, because no test can observe the difference:
 - the directory and file flushes (`durable::sync_parent`, `sync_all`): they only
   matter across a power cut, and the tests kill the process, not the machine;
 - `store::require_local_ntfs(archive)`: it passes on every local NTFS test dir;
-- `volume_serial` itself and the call to `refuse_while_journals` in
-  `migrate::do_run`: a test run has one volume and no `AppHandle`. The lock in
-  `runtime::migrate_all_to` is checked by hand against its own test.
+- `volume_serial` itself: a test run has one volume.
+- `migrate.rs` and `runtime.rs`: this script only mutates the two files in
+  `team/`. Their checks (`migrate::guarded`, the lock in
+  `runtime::migrate_all_to`) are mutated by hand against their own tests.
 
 Some mutants survive by design; each removes a check that a second check
 repeats, so no behaviour changes (EQUIVALENT below).
@@ -98,7 +99,8 @@ MUTANTS = [
      "if !current.phase.allows(current.mode, to) {", "if false {"),
     # --- downgrade: moves ----------------------------------------------------
     ("D01-overwrite-archive", D,
-     "(true, true) => bail!(code(\"downgrade.archiveConflict\")),", "(true, true) => Ok(()),"),
+     "(true, true) => bail!(code(\"downgrade.archiveConflict\")),\n        (false, false)",
+     "(true, true) => Ok(()),\n        (false, false)"),
     ("D02-prove-archived", D,
      "if !exists(&w.metadata_dst) || !exists(&w.data_dst) {\n        bail!(code(\"downgrade.originalGone\"));\n    }\n    outside_discovery",
      "if false {\n        bail!(code(\"downgrade.originalGone\"));\n    }\n    outside_discovery"),
@@ -162,9 +164,6 @@ MUTANTS = [
      "if exists(dst) {\n            if false && exists(src) {\n                bail!(code(\"downgrade.rollbackConflict\"));"),
     ("D29-rollback-foreign-clone", D,
      ".is_ok_and(|p| Some(p.meta.id) == j.new_local_profile_id);", ".is_ok_and(|_| true);"),
-    ("D30-rollback-keeps-clone", D,
-     "for dir in [&w.clone_data, &w.clone_staging] {\n        if exists(dir) {",
-     "for dir in [&w.clone_data, &w.clone_staging] {\n        if false && exists(dir) {"),
     ("D31-conflict-keeps-going", D,
      "let _ = journal::downgrade_advance(\n                    &db,\n                    &j.journal_id,\n                    Phase::RollbackRequired,\n                    Patch::default(),\n                );",
      ""),
@@ -222,8 +221,6 @@ MUTANTS = [
      "if (in_place && archived) || (clone_present && !in_place && !archived) {",
      "if in_place && archived {"),
     ("D58-restorable-clone-record", D, "        if !ours {\n            return Err(conflict());", "        if false {\n            return Err(conflict());"),
-    ("D59-restorable-listing", D,
-     "if listing(&w.clone_data, false)? != listing(original, true)? {", "if false {"),
     ("D60-rollback-unchecked", D, "    check_restorable(&j, w)?;\n", ""),
     ("D61-original-gone-after-clone", D,
      "&& !(clone_exists && *key == \"downgrade.originalGone\"))", ")"),
@@ -241,7 +238,7 @@ MUTANTS = [
     ("D66-start-idle", D, "        listing(&data, false)?;\n        prove_idle(&data)?;", "        listing(&data, false)?;"),
     ("D67-start-links", D, "        listing(&data, false)?;\n        prove_idle(&data)?;", "        prove_idle(&data)?;"),
     ("D68-start-volume", D, "    same_volume(&data, &archive)?;\n", ""),
-    ("D69-claimed-idle", D, "                    prove_idle(&w.data_src)?;\n                    same_volume", "                    same_volume"),
+    ("D69-claimed-idle", D, "                    prove_idle(&w.data_src)?;\n                    prove_unlocked(&w)?;", "                    prove_unlocked(&w)?;"),
     ("D70-metadata-moved-idle", D,
      "                    prove_idle(&w.data_src)?;\n                    move_data(&w)?;", "                    move_data(&w)?;"),
     ("D71-claimed-volume", D, "                    same_volume(&w.data_src, &w.dir)?;\n", ""),
@@ -254,6 +251,38 @@ MUTANTS = [
     ("D76-journals-exist-rolled-back", D,
      "WHERE phase <> 'ROLLED_BACK')", "WHERE phase <> 'COMPLETED')"),
     ("D77-journals-exist-none", D, "    Ok(count > 0)\n}\n\n/// What a resume", "    Ok(false)\n}\n\n/// What a resume"),
+    # --- second review: retire, trial move, migration ---------------------------
+    ("D78-retire-record-deleted", D,
+     "    retire(&w.clone_metadata, &w.retired_metadata)?;\n",
+     "    if exists(&w.clone_metadata) {\n        std::fs::remove_file(&w.clone_metadata)?;\n    }\n"),
+    ("D79-retire-data-deleted", D,
+     "    retire(&w.clone_data, &w.retired_data)?;\n",
+     "    if exists(&w.clone_data) {\n        std::fs::remove_dir_all(&w.clone_data)?;\n    }\n"),
+    ("D80-retire-record-skipped", D, "    retire(&w.clone_metadata, &w.retired_metadata)?;\n", ""),
+    ("D81-retired-twice-data", D,
+     "\n        || (exists(&w.clone_data) && exists(&w.retired_data))\n", "\n"),
+    ("D82-settle-in-rollback", D, "    settle_probe(w)?;\n    check_restorable", "    check_restorable"),
+    ("D83-settle-in-drive", D, "    settle_probe(&w)?;\n    point(\"claim_held\")?;", "    point(\"claim_held\")?;"),
+    ("D84-unlocked-step", D, "                    prove_unlocked(&w)?;\n", ""),
+    ("D85-unlocked-code", D, ".map_err(|_| anyhow!(code(\"downgrade.dataInUse\")))?;", "?;"),
+    ("D86-unlocked-back", D, "    move_new(&w.probe, &w.data_src)\n}", "    Ok(())\n}"),
+    ("D87-settle-moves-back", D, "(true, false) => move_new(&w.probe, &w.data_src),", "(true, false) => Ok(()),"),
+    ("D88-settle-both", D,
+     "(true, true) => bail!(code(\"downgrade.archiveConflict\")),\n        _ => Ok(()),",
+     "(true, true) => Ok(()),\n        _ => Ok(()),"),
+    ("D89-staging-kept", D,
+     "if exists(&w.clone_staging) && exists(&w.data_dst) {", "if false {"),
+    ("D90-migrating-flag", D, "    if crate::migrate::in_progress() {\n        bail!(code(\"downgrade.migrating\"));",
+     "    if false {\n        bail!(code(\"downgrade.migrating\"));"),
+    ("D91-unbind-migrating", D, "    valid_id(local)?;\n    refuse_while_migrating()?;", "    valid_id(local)?;"),
+    ("D92-start-begin", D,
+     "    valid_id(local)?;\n    let _flow = begin()?;", "    valid_id(local)?;\n    let _flow = exclusive();"),
+    ("D93-run-begin", D,
+     "pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = begin()?;",
+     "pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = exclusive();"),
+    ("D94-rollback-begin", D,
+     "pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = begin()?;",
+     "pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {\n    let _flow = exclusive();"),
 ]
 
 
@@ -269,6 +298,9 @@ EQUIVALENT = {
     # has one volume: only `one_volume` and `same_volume` are observable.
     "D68-start-volume",
     "D71-claimed-volume",
+    # On Windows the trial move of `prove_unlocked` refuses a held lockfile too;
+    # `prove_idle` is the check that matters elsewhere.
+    "D69-claimed-idle",
 }
 
 

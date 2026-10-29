@@ -284,6 +284,11 @@ struct Places {
     clone_metadata: PathBuf,
     clone_data: PathBuf,
     clone_staging: PathBuf,
+    /// Where a rolled-back clone is kept, inside the journal's archive.
+    retired_metadata: PathBuf,
+    retired_data: PathBuf,
+    /// Where the trial move of the user data rests while it is under way.
+    probe: PathBuf,
 }
 
 /// The paths of journal `j`, recomputed from its IDs. The paths the journal
@@ -319,6 +324,9 @@ fn places(j: &DowngradeJournal) -> Result<Places> {
         clone_metadata: store::profiles_dir()?.join(format!("{new}.json")),
         clone_data: store::user_data_root()?.join(new),
         clone_staging: dir.join("clone-user-data.partial"),
+        retired_metadata: dir.join("clone-retired").join(format!("{new}.json")),
+        retired_data: dir.join("clone-retired").join("user-data"),
+        probe: dir.join("idle-probe"),
         dir,
         metadata_dst,
         data_dst,
@@ -446,8 +454,33 @@ fn pending_work(db: &Db, local: &str) -> Result<u64> {
 /// startup resume and the fingerprint migration of `runtime` (which rewrites
 /// profile files) take turns, so none of them sees another half done.
 pub(crate) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-    static FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
     FLOW.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+static FLOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The same lock without waiting: `None` while a flow holds it.
+pub(crate) fn try_exclusive() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match FLOW.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// A move of the data root changes every folder a flow reads, so no flow
+/// starts while one runs.
+fn refuse_while_migrating() -> Result<()> {
+    if crate::migrate::in_progress() {
+        bail!(code("downgrade.migrating"));
+    }
+    Ok(())
+}
+
+/// The turn to run a flow in, or a refusal while the data root moves.
+fn begin() -> Result<std::sync::MutexGuard<'static, ()>> {
+    refuse_while_migrating()?;
+    Ok(exclusive())
 }
 
 /// The claim on the profiles a flow touches: the original and the clone. A
@@ -492,7 +525,7 @@ fn claimed(id: &str) -> Result<(Option<profile::ProfileClaimGuard>, Db, Downgrad
 /// it to the end, under one claim.
 pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
     valid_id(local)?;
-    let _flow = exclusive();
+    let _flow = begin()?;
     require_legacy_layout()?;
     let new = random_id()?;
     let _claim = claim(local, Some(&new))?;
@@ -546,7 +579,7 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
 /// Runs the clone journal `journal_id` from the phase it is at to the end (or
 /// to its rollback), as a start after a crash does.
 pub(crate) fn run_clone(journal_id: &str) -> Result<CloneDone> {
-    let _flow = exclusive();
+    let _flow = begin()?;
     let (_claim, db, j) = claimed(journal_id)?;
     drive(db, j)
 }
@@ -557,6 +590,7 @@ fn drive(mut db: Db, mut j: DowngradeJournal) -> Result<CloneDone> {
         return Ok(done(&j));
     }
     let w = places(&j)?;
+    settle_probe(&w)?;
     point("claim_held")?;
     loop {
         let step: Result<DowngradeJournal> = (|| {
@@ -570,6 +604,7 @@ fn drive(mut db: Db, mut j: DowngradeJournal) -> Result<CloneDone> {
                     store::require_local_ntfs(&w.dir)?;
                     outside_discovery(&w.dir)?;
                     prove_idle(&w.data_src)?;
+                    prove_unlocked(&w)?;
                     same_volume(&w.data_src, &w.dir)?;
                     move_path(&w.metadata_src, &w.metadata_dst, "downgrade.originalGone")?;
                     advance(&db, &j, Phase::OriginalMetadataMoved, Patch::default())?
@@ -729,6 +764,31 @@ fn same_volume(data: &Path, archive: &Path) -> Result<()> {
         .map(|p| volume_serial(p))
         .collect::<Result<Vec<_>>>()?;
     one_volume(&serials)
+}
+
+/// Proves nothing holds a file under the profile's data before the record
+/// moves: the directory is renamed into the archive and straight back, which
+/// Windows refuses while any file in it is open. A refusal is `dataInUse` and
+/// nothing has moved. A cut-off in between is mended by [`settle_probe`].
+fn prove_unlocked(w: &Places) -> Result<()> {
+    if !exists(&w.data_src) {
+        return Ok(());
+    }
+    if exists(&w.probe) {
+        bail!(code("downgrade.archiveConflict"));
+    }
+    durable::move_new(&w.data_src, &w.probe).map_err(|_| anyhow!(code("downgrade.dataInUse")))?;
+    point("probe:renamed")?;
+    move_new(&w.probe, &w.data_src)
+}
+
+/// Puts the user data back if a trial move was cut off with it away.
+fn settle_probe(w: &Places) -> Result<()> {
+    match (exists(&w.probe), exists(&w.data_src)) {
+        (true, false) => move_new(&w.probe, &w.data_src),
+        (true, true) => bail!(code("downgrade.archiveConflict")),
+        _ => Ok(()),
+    }
 }
 
 fn move_data(w: &Places) -> Result<()> {
@@ -953,10 +1013,10 @@ fn readback_digest(j: &DowngradeJournal) -> [u8; 32] {
     sha256(&input)
 }
 
-/// Whether the original can be put back, decided before anything is deleted.
-/// The clone may hold the only copy of a profile's data, so it is removed
-/// only when the original is in the archive (or already back in place), in
-/// one place only, and the clone holds nothing the archive does not.
+/// Whether the original can be put back, decided before anything moves. The
+/// clone may hold the only copy of a profile's data, so it is retired only
+/// when the original is in the archive (or already back in place), in one
+/// place only, and the clone's own record is the clone's.
 fn check_restorable(j: &DowngradeJournal, w: &Places) -> Result<()> {
     let conflict = || anyhow!(code("downgrade.rollbackConflict"));
     let clone_present = exists(&w.clone_metadata) || exists(&w.clone_data);
@@ -969,6 +1029,12 @@ fn check_restorable(j: &DowngradeJournal, w: &Places) -> Result<()> {
             return Err(conflict());
         }
     }
+    // A clone found twice, in place and retired, is for a person to sort out.
+    if (exists(&w.clone_metadata) && exists(&w.retired_metadata))
+        || (exists(&w.clone_data) && exists(&w.retired_data))
+    {
+        return Err(conflict());
+    }
     if exists(&w.clone_metadata) {
         let body = std::fs::read(&w.clone_metadata)?;
         let ours = serde_json::from_slice::<profile::StoredProfile>(&body)
@@ -977,39 +1043,46 @@ fn check_restorable(j: &DowngradeJournal, w: &Places) -> Result<()> {
             return Err(conflict());
         }
     }
-    if exists(&w.clone_data) {
-        let original = if exists(&w.data_dst) {
-            &w.data_dst
-        } else {
-            &w.data_src
-        };
-        if listing(&w.clone_data, false)? != listing(original, true)? {
-            return Err(conflict());
-        }
-    }
     Ok(())
 }
 
-/// Puts the original back and removes what the clone wrote. Nothing is
-/// deleted unless [`check_restorable`] passes, and the moves back never
-/// replace, so a state with the original in two places stays
-/// `ROLLBACK_REQUIRED` for a person.
+/// Moves `src` to `dst` if it is there; nothing if it was moved already. A
+/// repeat after a cut-off finishes the move.
+fn retire(src: &Path, dst: &Path) -> Result<()> {
+    if !exists(src) {
+        return Ok(());
+    }
+    if exists(dst) {
+        bail!(code("downgrade.rollbackConflict"));
+    }
+    if let Some(parent) = dst.parent() {
+        make_dir(parent)?;
+    }
+    move_new(src, dst)
+}
+
+/// Puts the original back and takes the clone out of the profile folders. The
+/// clone is never deleted: its record and data move into the journal's
+/// archive directory (`clone-retired`), where v0.1.28 does not look and a
+/// person can still find them. Nothing moves unless [`check_restorable`]
+/// passes, and no move replaces anything, so a state with the original in two
+/// places stays `ROLLBACK_REQUIRED` for a person. Every step can be repeated.
 fn roll_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<DowngradeJournal> {
     let j = if j.phase == Phase::RollbackRequired {
         j.clone()
     } else {
         journal::downgrade_advance(db, &j.journal_id, Phase::RollbackRequired, Patch::default())?
     };
+    settle_probe(w)?;
     check_restorable(&j, w)?;
-    if exists(&w.clone_metadata) {
-        std::fs::remove_file(&w.clone_metadata)?;
-        durable::sync_parent(&w.clone_metadata)?;
-    }
-    for dir in [&w.clone_data, &w.clone_staging] {
-        if exists(dir) {
-            std::fs::remove_dir_all(dir)?;
-            durable::sync_parent(dir)?;
-        }
+    retire(&w.clone_metadata, &w.retired_metadata)?;
+    point("rollback:record_retired")?;
+    retire(&w.clone_data, &w.retired_data)?;
+    // A half-made copy is rebuilt from the archive, so it goes while the
+    // archive it was copied from is still there.
+    if exists(&w.clone_staging) && exists(&w.data_dst) {
+        std::fs::remove_dir_all(&w.clone_staging)?;
+        durable::sync_parent(&w.clone_staging)?;
     }
     point("rollback:clone_removed")?;
     for (src, dst) in [
@@ -1025,14 +1098,14 @@ fn roll_back(db: &Db, j: &DowngradeJournal, w: &Places) -> Result<DowngradeJourn
     }
     point("rollback:restored")?;
     let next = journal::downgrade_advance(db, &j.journal_id, Phase::RolledBack, Patch::default())?;
-    // The archive directory is empty now; a leftover is harmless.
+    // The archive directory is empty now unless a clone was retired into it.
     let _ = std::fs::remove_dir(&w.dir);
     Ok(next)
 }
 
 /// Rolls the journal `journal_id` back on request.
 pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {
-    let _flow = exclusive();
+    let _flow = begin()?;
     let (_claim, db, j) = claimed(journal_id)?;
     if j.phase == Phase::Completed {
         bail!(code_with(
@@ -1115,6 +1188,7 @@ pub struct Unbound {
 /// binding), then the binding is read back as gone and the profile re-scanned.
 pub(crate) fn unbind_profile(local: &str, server_url: &str, now: u64) -> Result<Unbound> {
     valid_id(local)?;
+    refuse_while_migrating()?;
     let _claim = profile::begin_user_mutation([local], &code("downgrade.actionUnbind"))?;
     if Db::path()?.exists() && journal::flow_taken(&Db::open()?, local)? {
         bail!(code("downgrade.flowTaken"));
@@ -1752,11 +1826,16 @@ mod tests {
 
     #[test]
     fn a_rollback_cut_off_resumes_to_the_same_restored_original() {
-        for point in ["rollback:clone_removed", "rollback:restored"] {
+        for point in [
+            "rollback:record_retired",
+            "rollback:clone_removed",
+            "rollback:restored",
+        ] {
             let (_e, before) = seeded();
             crash_at("after:CLONE_WRITTEN");
             start_clone(LOCAL).unwrap_err();
             let j = the_journal();
+            let kept = std::fs::read(places(&j).unwrap().clone_metadata).unwrap();
             crash_at(point);
             roll_back_clone(&j.journal_id).unwrap_err();
             no_crash();
@@ -1771,6 +1850,14 @@ mod tests {
                 "{point}"
             );
             assert_eq!(tree_digest(&w.data_src), before.data, "{point}");
+            // Cut off half way through retiring the clone, it is still all
+            // there, once, in the retired place.
+            assert_eq!(std::fs::read(&w.retired_metadata).unwrap(), kept, "{point}");
+            assert!(exists(&w.retired_data.join("Default")), "{point}");
+            assert!(
+                !exists(&w.clone_metadata) && !exists(&w.clone_data),
+                "{point}"
+            );
         }
     }
 
@@ -2082,18 +2169,50 @@ mod tests {
         assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
         assert!(exists(&w.clone_data) && exists(&w.clone_metadata));
         assert!(exists(&w.metadata_dst) && exists(&w.data_dst));
-        drop(_e);
-        // Work done in the clone since it was written.
+    }
+
+    /// NEW-A: a clone changed since it was written, by new files or by bytes
+    /// that keep every size, is moved into the archive and not deleted.
+    #[test]
+    fn a_rollback_retires_a_changed_clone_and_never_deletes_it() {
+        let (_e, before) = seeded();
+        let (j, w) = at("after:CLONE_WRITTEN");
+        let cookies = w.clone_data.join("Default").join("Cookies");
+        let mut changed = std::fs::read(&cookies).unwrap();
+        changed[0] ^= 0xff;
+        std::fs::write(&cookies, &changed).unwrap();
+        std::fs::write(w.clone_data.join("Default").join("work.txt"), b"work").unwrap();
+        let record = std::fs::read(&w.clone_metadata).unwrap();
+        assert_eq!(roll_back_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
+        // The original is back whole; the clone is where a person can find it.
+        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+        assert_eq!(tree_digest(&w.data_src), before.data);
+        assert!(!exists(&w.clone_metadata) && !exists(&w.clone_data));
+        assert_eq!(std::fs::read(&w.retired_metadata).unwrap(), record);
+        let kept = w.retired_data.join("Default");
+        assert_eq!(std::fs::read(kept.join("Cookies")).unwrap(), changed);
+        assert_eq!(std::fs::read(kept.join("work.txt")).unwrap(), b"work");
+        // The retired clone is outside everything v0.1.28 and this launcher
+        // list, and is not a profile either of them knows.
+        outside_discovery(&w.retired_data).unwrap();
+        outside_discovery(&w.retired_metadata).unwrap();
+        let new = j.new_local_profile_id.unwrap();
+        assert!(!discover().unwrap().mentions(&new));
+        assert!(profile::list_all().unwrap().iter().all(|p| p.id != new));
+        assert!(ready_codes().contains(&"downgrade.blockUnfinishedBinding"));
+    }
+
+    /// NEW-A: a clone that turns up in the retired place as well is for a
+    /// person, and nothing is replaced.
+    #[test]
+    fn a_clone_found_in_place_and_retired_is_a_conflict() {
         let (_e, _) = seeded();
         let (j, w) = at("after:CLONE_WRITTEN");
-        std::fs::write(w.clone_data.join("Default").join("work.txt"), b"work").unwrap();
+        std::fs::create_dir_all(&w.retired_data).unwrap();
         let e = roll_back_clone(&j.journal_id).unwrap_err();
         assert!(has(&e, "downgrade.rollbackConflict"), "{e:#}");
         assert!(exists(&w.clone_data) && exists(&w.clone_metadata));
         assert!(!exists(&w.data_src) && exists(&w.data_dst));
-        // Taking the work out lets the rollback through.
-        std::fs::remove_file(w.clone_data.join("Default").join("work.txt")).unwrap();
-        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
     }
 
     /// LOW 3: nothing here replaces: a move into an occupied place fails and
@@ -2359,6 +2478,126 @@ mod tests {
         same_volume(&data.join("none"), &archive).unwrap();
         same_volume(&data, &archive).unwrap();
         assert!(same_volume(&data, &archive.join("missing")).is_err());
+    }
+
+    /// LOW-2: a held file other than the lockfile is found before the record
+    /// moves: the flow stops at CLAIMED with the profile whole and listed.
+    #[cfg(windows)]
+    #[test]
+    fn any_file_held_under_the_user_data_stops_the_flow_before_the_record_moves() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (_e, before) = seeded();
+        let data = store::user_data_root().unwrap().join(LOCAL);
+        // As a browser would: read access, FILE_SHARE_READ.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(data.join("Default").join("Cookies"))
+            .unwrap();
+        let err = start_clone(LOCAL).unwrap_err();
+        assert!(has(&err, "downgrade.dataInUse"), "{err:#}");
+        let j = the_journal();
+        let w = places(&j).unwrap();
+        assert_eq!(j.phase, P::Claimed);
+        assert_eq!(std::fs::read(&w.metadata_src).unwrap(), before.metadata);
+        assert!(!exists(&w.metadata_dst) && !exists(&w.probe));
+        assert_eq!(tree_digest(&w.data_src), before.data);
+        assert!(discover().unwrap().lists(LOCAL));
+        // Still held on a later start; done once it is let go.
+        let err = run_clone(&j.journal_id).unwrap_err();
+        assert!(has(&err, "downgrade.dataInUse"), "{err:#}");
+        drop(file);
+        assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+        assert_cloned(&before);
+    }
+
+    /// LOW-2: the trial move is cut off with the data away: the next run, or
+    /// a rollback, puts it back first.
+    #[test]
+    fn a_trial_move_cut_off_with_the_data_away_is_mended_first() {
+        for rollback in [false, true] {
+            let (_e, before) = seeded();
+            crash_at("probe:renamed");
+            start_clone(LOCAL).unwrap_err();
+            no_crash();
+            let j = the_journal();
+            let w = places(&j).unwrap();
+            assert_eq!(j.phase, P::Claimed);
+            assert!(exists(&w.probe) && !exists(&w.data_src));
+            if rollback {
+                assert_eq!(roll_back_clone(&j.journal_id).unwrap().phase, "ROLLED_BACK");
+                assert_eq!(tree_digest(&w.data_src), before.data);
+                assert!(!exists(&w.probe));
+            } else {
+                assert_eq!(run_clone(&j.journal_id).unwrap().phase, "COMPLETED");
+                assert_cloned(&before);
+                assert!(!exists(&w.probe));
+            }
+        }
+        // Both places holding data is not guessed at.
+        let (_e, _) = seeded();
+        let (j, w) = at("after:CLAIMED");
+        std::fs::create_dir_all(&w.probe).unwrap();
+        let err = run_clone(&j.journal_id).unwrap_err();
+        assert!(has(&err, "downgrade.archiveConflict"), "{err:#}");
+        assert!(exists(&w.data_src) && exists(&w.probe));
+        // Nor does a rollback: it leaves both for a person.
+        let err = roll_back_clone(&j.journal_id).unwrap_err();
+        assert!(has(&err, "downgrade.archiveConflict"), "{err:#}");
+        assert!(exists(&w.data_src) && exists(&w.probe));
+        assert_eq!(the_journal().phase, P::RollbackRequired);
+    }
+
+    /// NEW-C: the move of the data root holds the flow lock and the flag for
+    /// all of it; every downgrade entry point refuses meanwhile, and it
+    /// refuses while a flow runs or a journal is recorded.
+    #[test]
+    fn a_data_root_move_and_a_downgrade_never_run_together() {
+        let (_e, _) = seeded();
+        let ran = crate::migrate::guarded(|| {
+            assert!(crate::migrate::in_progress());
+            assert!(try_exclusive().is_none());
+            // Each on its own thread: one that did not refuse would wait for
+            // the lock this thread holds, and the test must fail, not hang.
+            fn refused(call: impl FnOnce() -> anyhow::Error + Send + 'static) -> anyhow::Error {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || tx.send(call()));
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("an entry point waited for the flow lock")
+            }
+            for e in [
+                refused(|| start_clone(LOCAL).unwrap_err()),
+                refused(|| run_clone(JOURNAL).unwrap_err()),
+                refused(|| roll_back_clone(JOURNAL).unwrap_err()),
+                refused(|| unbind_profile(LOCAL, SERVER, 0).unwrap_err()),
+            ] {
+                assert!(has(&e, "downgrade.migrating"), "{e:#}");
+            }
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(ran, 7);
+        assert!(!crate::migrate::in_progress() && try_exclusive().is_some());
+        // The same flag stops a second move.
+        crate::migrate::guarded(|| {
+            let e = crate::migrate::guarded(|| Ok(())).unwrap_err();
+            assert!(has(&e, "migrate.alreadyRunning"), "{e:#}");
+            Ok(())
+        })
+        .unwrap();
+        // A flow that runs holds the move off, and the flag is down again.
+        let flow = exclusive();
+        let e = crate::migrate::guarded(|| Ok(())).unwrap_err();
+        assert!(has(&e, "migrate.downgradeRunning"), "{e:#}");
+        assert!(!crate::migrate::in_progress());
+        drop(flow);
+        // A recorded journal is refused under the lock, and the work never runs.
+        crash_at("after:CLAIMED");
+        start_clone(LOCAL).unwrap_err();
+        no_crash();
+        let e = crate::migrate::guarded::<()>(|| panic!("the move must not start")).unwrap_err();
+        assert!(has(&e, "migrate.downgradeJournal"), "{e:#}");
+        assert!(!crate::migrate::in_progress() && try_exclusive().is_some());
     }
 
     fn insert_op(db: &Db, op: &str, kind: &str, state: &str) {

@@ -479,6 +479,27 @@ fn migrate_all_to(
     n
 }
 
+/// [`migrate_all_to`] off the async threads: it waits for a downgrade flow,
+/// which can take a while. It is awaited, not skipped, because the caller
+/// records the signature as applied once it returns.
+async fn migrate_all_blocking(
+    chromium_version: String,
+    grease_brand: Option<String>,
+    grease_version: Option<String>,
+    tls: Option<serde_json::Value>,
+) -> usize {
+    tauri::async_runtime::spawn_blocking(move || {
+        migrate_all_to(
+            &chromium_version,
+            grease_brand.as_deref(),
+            grease_version.as_deref(),
+            tls.as_ref(),
+        )
+    })
+    .await
+    .unwrap_or(0)
+}
+
 /// Startup hook: migrate saved profiles + the fingerprint library (bundled +
 /// user-added) to the manifest's engine descriptor when not already done. One
 /// GitHub-manifest GET (never S3). Guarded by a signature of
@@ -504,12 +525,13 @@ pub async fn ensure_profiles_migrated() {
     if local.applied_signature.as_deref() == Some(sig.as_str()) {
         return;
     }
-    let n = migrate_all_to(
-        &target,
-        m.grease_brand.as_deref(),
-        m.grease_version.as_deref(),
-        m.tls.as_ref(),
-    );
+    let n = migrate_all_blocking(
+        target.clone(),
+        m.grease_brand.clone(),
+        m.grease_version.clone(),
+        m.tls.clone(),
+    )
+    .await;
     if n > 0 {
         eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
     }
@@ -756,12 +778,13 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
             .unwrap_or_default(),
     );
     if local.applied_signature.as_deref() != Some(sig.as_str()) {
-        let n = migrate_all_to(
-            &target_ver,
-            manifest.grease_brand.as_deref(),
-            manifest.grease_version.as_deref(),
-            manifest.tls.as_ref(),
-        );
+        let n = migrate_all_blocking(
+            target_ver.clone(),
+            manifest.grease_brand.clone(),
+            manifest.grease_version.clone(),
+            manifest.tls.clone(),
+        )
+        .await;
         if n > 0 {
             eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
         }
@@ -1153,6 +1176,30 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEW-D: waiting for a downgrade flow does not hold up an async thread.
+    #[test]
+    fn the_profile_migration_waits_off_the_async_thread() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().join("config")));
+        let flow = crate::team::downgrade::exclusive();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let worker = tokio::spawn(migrate_all_blocking("1.0.0".into(), None, None, None));
+            // The only async thread is free to run other work meanwhile.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(!worker.is_finished());
+            drop(flow);
+            worker.await.unwrap();
+        });
+        crate::store::set_config_root(None);
+    }
 
     /// The migration rewrites profile files without a claim, so it waits for a
     /// downgrade that is moving them.

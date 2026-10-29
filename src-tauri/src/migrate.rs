@@ -36,11 +36,7 @@ fn emit(app: &tauri::AppHandle, p: Progress) {
 
 /// Move the data root to `dst`. Returns the number of files moved.
 pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
-    if MIGRATING.swap(true, Ordering::SeqCst) {
-        anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
-    }
-    let out = do_run(app, dst);
-    MIGRATING.store(false, Ordering::SeqCst);
+    let out = guarded(|| do_run(app, dst));
     if out.is_err() {
         emit(
             app,
@@ -56,6 +52,24 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     out
 }
 
+/// Runs `work` as the one move of the data root: the flag is up for all of it,
+/// no downgrade flow runs meanwhile (it holds their lock, and they refuse
+/// while the flag is up), and none is recorded, as checked under that lock.
+pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    if MIGRATING.swap(true, Ordering::SeqCst) {
+        anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
+    }
+    let out = (|| {
+        let Some(_flow) = crate::team::downgrade::try_exclusive() else {
+            anyhow::bail!(crate::errcode::code("migrate.downgradeRunning"));
+        };
+        refuse_while_journals()?;
+        work()
+    })();
+    MIGRATING.store(false, Ordering::SeqCst);
+    out
+}
+
 /// A saved downgrade or restore names paths inside the current data root, and
 /// a rollback or resume that finds them elsewhere would leave a profile
 /// stranded: the root does not move while one is recorded.
@@ -67,7 +81,6 @@ pub(crate) fn refuse_while_journals() -> Result<()> {
 }
 
 fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
-    refuse_while_journals()?;
     let src = store::data_root()?;
     let dst = dst.to_path_buf();
     if dst == src {
