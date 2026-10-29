@@ -6,7 +6,6 @@
 //! session and the record are checked independently — neither substitutes
 //! for the other.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -15,10 +14,9 @@ use sqlx::Row;
 
 use crate::auth::AuthUser;
 use crate::authz::{self, VerificationContext};
-use crate::enrollment::{HPKE_SUITE_X25519_HKDF_SHA256, SIGNING_SUITE_ED25519};
 use crate::error::AppError;
 use crate::fleet;
-use crate::idempotency::{self, OperationClaim, ReplayClaim, ReplayTable};
+use crate::idempotency::{self, OperationClaim};
 use crate::state::AppState;
 use crate::util;
 
@@ -30,15 +28,7 @@ fn parse_id16(hex: &str, field: &'static str) -> Result<[u8; 16], AppError> {
         .map_err(|_| AppError::BadRequest(format!("{field}: must be 16 bytes")))
 }
 
-/// Parse a 32-byte identifier such as a root key id.
-fn parse_id32(hex: &str, field: &'static str) -> Result<[u8; 32], AppError> {
-    let bytes = decode_hex(hex).ok_or_else(|| AppError::BadRequest(format!("{field}: not hex")))?;
-    bytes
-        .try_into()
-        .map_err(|_| AppError::BadRequest(format!("{field}: expected 32 bytes")))
-}
-
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -96,10 +86,19 @@ async fn verification_context(
         server_instance_id: instance
             .try_into()
             .map_err(|_| AppError::BadRequest("corrupt server_instance_id".into()))?,
-        restore_epoch: epoch as u64,
+        restore_epoch: crate::util::stored_uint(epoch)?,
         now_ms,
         trusted_issuers: trusted,
     })
+}
+
+/// The instance id the startup check verified, or the reason it did not.
+fn verified_instance(app: &AppState) -> Result<[u8; 16], AppError> {
+    app.authority
+        .as_ref()
+        .as_ref()
+        .map(|v| v.server_instance_id)
+        .map_err(|r| AppError::EpochAuthority(r.code))
 }
 
 /// Publish the deployment identity a client must bind its signed records to.
@@ -107,11 +106,14 @@ async fn verification_context(
 /// A client cannot construct a valid manifest without `server_instance_id` and
 /// `restore_epoch`. The verifier checks both against live deployment state, so
 /// a client that guesses them produces records the server refuses. Read-only
-/// and derived from the same singleton row the verifier reads.
+/// and derived from the same singleton row the verifier reads. Until the
+/// external record verifies, the mirror is not something a client may pin, so
+/// this reports the reason instead.
 pub async fn server_identity(
     State(app): State<AppState>,
     _user: AuthUser,
 ) -> Result<impl IntoResponse, AppError> {
+    verified_instance(&app)?;
     let row = sqlx::query(
         "SELECT server_instance_id, restore_epoch FROM v2_server_state WHERE singleton = 1",
     )
@@ -126,103 +128,6 @@ pub async fn server_identity(
         "server_instance_id": hex(&instance),
         "restore_epoch": epoch,
     })))
-}
-
-#[derive(Deserialize)]
-pub struct BeginRootGenerationReq {
-    pub tenant_id: String,
-    /// Identifier of a root key generated on the caller's device. The key
-    /// itself is never sent.
-    pub root_key_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct BeginFleetGenerationReq {
-    pub tenant_id: String,
-    pub fleet_id: String,
-    /// Identifier of a fleet key generated on the caller's device. The key
-    /// itself is never sent.
-    pub fkek_key_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct ActivateFleetGenerationReq {
-    pub tenant_id: String,
-    pub fleet_id: String,
-    pub generation: u64,
-}
-
-#[derive(Deserialize)]
-pub struct ActivateRootGenerationReq {
-    pub tenant_id: String,
-    pub generation: u64,
-}
-#[derive(Deserialize)]
-pub struct PresentRecordReq {
-    /// Tenant this operation targets, hex-encoded.
-    pub tenant_id: String,
-    /// Hex-encoded exact signed container bytes, verified as received.
-    pub record_hex: String,
-}
-
-/// Present a signed device approval.
-///
-/// Verification and consumption are separate steps on purpose: verification
-/// is a pure function of bytes and context, while consumption mutates state
-/// and can lose a race. Both must succeed.
-pub async fn present_device_approval(
-    State(app): State<AppState>,
-    user: AuthUser,
-    headers: HeaderMap,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_DEVICE_APPROVAL, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Consume after verification: an invalid record must not burn a replay id,
-    // or an attacker could disable a legitimate record by submitting a
-    // corrupted copy of it first.
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::DeviceApprovals,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.device_approval.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    let _ = headers;
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
-    ))
 }
 
 #[derive(Deserialize)]
@@ -263,152 +168,6 @@ pub async fn complete_idempotent_operation(
     Ok((
         StatusCode::OK,
         axum::Json(serde_json::json!({ "recorded": true })),
-    ))
-}
-
-/// Present a signed capability grant.
-///
-/// Same two-step shape as a device approval — verify, then consume — but
-/// under its own domain, so a grant and an approval can never be substituted
-/// for one another even if they share a replay id.
-pub async fn present_capability_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_CAPABILITY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::CapabilityGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.capability_grant.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
-    ))
-}
-
-/// Present a signed tenant root key grant.
-///
-/// The server verifies and files the grant but cannot read it: the payload is
-/// HPKE-sealed to the recipient device's public key, so only that device can
-/// recover the tenant root key. Storing it here is a delivery mechanism, not
-/// an escrow.
-pub async fn present_tenant_root_key_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_TENANT_ROOT_KEY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Only a member may deposit a grant for this tenant. The record's signature
-    // proves an issuer wrote it, not that the caller is entitled to file it.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    // Read the grant out of the signed fields before claiming the replay id, so
-    // a malformed record does not burn one.
-    let row = crate::grants::grant_row_from_record(&verified)?;
-
-    // A grant names a generation and a root key. Both must match a generation
-    // this tenant actually has, and a first self-grant is only accepted while
-    // that generation is still preparing and unclaimed. Checked before the
-    // replay id is claimed so a rejected grant does not burn one.
-    crate::generations::check_grant_against_generation(
-        &app.db,
-        &tenant_id,
-        &row.grant_variant,
-        row.root_generation,
-        &row.root_key_id,
-    )
-    .await?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::TenantRootKeyGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record already used".into(),
-            ))
-        }
-    }
-
-    // The grant is stored only after the replay id is claimed, so a retry of an
-    // already-filed record cannot write a second copy.
-    crate::grants::insert_grant(
-        &app.db,
-        &tenant_id,
-        &ctx.server_instance_id,
-        ctx.restore_epoch,
-        &verified,
-        &record_bytes,
-        &row,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.tenant_root_key_grant.accepted",
-        None,
-        &hex(&verified.signed_container_hash),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "accepted": true,
-            "signed_container_hash": hex(&verified.signed_container_hash),
-        })),
     ))
 }
 
@@ -500,194 +259,6 @@ async fn require_tenant_member(
     account_id_for(app, tenant_id, &user.id).await
 }
 
-/// The caller's account in `tenant_id`, if it is an active account holding an
-/// active owner membership.
-///
-/// Root generation begin and activate decide which key the whole tenant is
-/// sealed under, so membership alone is not enough. ADR 0001 S7 also requires
-/// the `root.custody` capability, which `owner` does not imply; the server
-/// does not model capabilities yet, so this is the narrower interim rule.
-async fn require_tenant_owner(
-    app: &AppState,
-    tenant_id: [u8; 16],
-    user: &AuthUser,
-) -> Result<[u8; 16], AppError> {
-    let account_id = account_id_for(app, tenant_id, &user.id).await?;
-    sqlx::query(
-        "SELECT 1 FROM v2_tenant_memberships m
-         JOIN v2_accounts a ON a.tenant_id = m.tenant_id AND a.id = m.account_id
-         WHERE m.tenant_id = ? AND m.account_id = ? AND m.role = 'owner'
-           AND m.status = 'active' AND a.status = 'active'",
-    )
-    .bind(tenant_id.as_slice())
-    .bind(account_id.as_slice())
-    .fetch_optional(&app.db)
-    .await?
-    .ok_or(AppError::Forbidden)?;
-    Ok(account_id)
-}
-
-// ---------------------------------------------------------------------------
-// Device enrollment
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct ChallengeReq {
-    /// Tenant the device will belong to, hex-encoded.
-    pub tenant_id: String,
-    /// Hex-encoded 32-byte Ed25519 public key the device will sign with.
-    pub signing_public_key: String,
-    /// Hex-encoded 32-byte HPKE recipient public key.
-    pub hpke_public_key: String,
-}
-
-/// Issue an enrollment challenge for the calling account.
-///
-/// The account is taken from the session, never from the body: a caller may
-/// only enroll devices for itself.
-pub async fn create_enrollment_challenge(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ChallengeReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let account_id = require_tenant_member(&app, tenant_id, &user).await?;
-
-    let signing_public_key: [u8; 32] = decode_hex(&req.signing_public_key)
-        .ok_or_else(|| AppError::BadRequest("signing_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("signing_public_key: must be 32 bytes".into()))?;
-    let hpke_public_key: [u8; 32] = decode_hex(&req.hpke_public_key)
-        .ok_or_else(|| AppError::BadRequest("hpke_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("hpke_public_key: must be 32 bytes".into()))?;
-
-    let now = chrono::Utc::now();
-    let ctx = verification_context(&app, tenant_id, now.timestamp_millis().max(0) as u64).await?;
-
-    let commitment = crate::enrollment::key_commitment(&signing_public_key, &hpke_public_key);
-    let challenge = crate::enrollment::issue_challenge(
-        &app.db,
-        &tenant_id,
-        &commitment,
-        &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
-        now,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "challenge_id": hex(&challenge.id),
-            "nonce": hex(&challenge.nonce),
-            "account_id": hex(&account_id),
-            "server_instance_id": hex(&ctx.server_instance_id),
-            "restore_epoch": ctx.restore_epoch,
-            "expires_at": challenge.expires_at,
-        })),
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct EnrollReq {
-    pub tenant_id: String,
-    pub challenge_id: String,
-    /// Hex-encoded 32-byte nonce from the challenge response.
-    pub nonce: String,
-    /// Hex-encoded 32-byte Ed25519 public key the device will sign with.
-    pub signing_public_key: String,
-    /// Hex-encoded 32-byte HPKE recipient public key.
-    pub hpke_public_key: String,
-    /// Hex-encoded 64-byte signature over the canonical proof bytes.
-    pub proof_signature: String,
-    /// Opaque, client-encrypted device label. The server stores it without
-    /// reading it, so a device list cannot leak machine names.
-    pub label_ciphertext: String,
-}
-
-/// Complete enrollment by proving possession of the signing key.
-pub async fn enroll_device(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<EnrollReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let account_id = require_tenant_member(&app, tenant_id, &user).await?;
-    let challenge_id = parse_id16(&req.challenge_id, "challenge_id")?;
-    let nonce: [u8; 32] = decode_hex(&req.nonce)
-        .ok_or_else(|| AppError::BadRequest("nonce: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("nonce: must be 32 bytes".into()))?;
-
-    let signing_public_key: [u8; 32] = decode_hex(&req.signing_public_key)
-        .ok_or_else(|| AppError::BadRequest("signing_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("signing_public_key: must be 32 bytes".into()))?;
-    let hpke_public_key: [u8; 32] = decode_hex(&req.hpke_public_key)
-        .ok_or_else(|| AppError::BadRequest("hpke_public_key: not hex".into()))?
-        .try_into()
-        .map_err(|_| AppError::BadRequest("hpke_public_key: must be 32 bytes".into()))?;
-    let proof_signature = decode_hex(&req.proof_signature)
-        .ok_or_else(|| AppError::BadRequest("proof_signature: not hex".into()))?;
-    let label_ciphertext = decode_hex(&req.label_ciphertext)
-        .ok_or_else(|| AppError::BadRequest("label_ciphertext: not hex".into()))?;
-
-    let now = chrono::Utc::now();
-    let ctx = verification_context(&app, tenant_id, now.timestamp_millis().max(0) as u64).await?;
-
-    // The device id is minted server-side. Letting the client choose it would
-    // let one account claim an id another tenant's device already uses, and
-    // nothing in the proof binds it.
-    let mut device_id = [0u8; 16];
-    OsRng.fill_bytes(&mut device_id);
-
-    crate::enrollment::enroll_device(
-        &app.db,
-        crate::enrollment::EnrollRequest {
-            tenant_id: &tenant_id,
-            account_id: &account_id,
-            challenge_id: &challenge_id,
-            nonce: &nonce,
-            device_id: &device_id,
-            label_ciphertext: &label_ciphertext,
-            signing_public_key: &signing_public_key,
-            signing_suite: SIGNING_SUITE_ED25519,
-            hpke_public_key: &hpke_public_key,
-            hpke_suite: HPKE_SUITE_X25519_HKDF_SHA256,
-            signature: &proof_signature,
-        },
-        &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
-        &now.to_rfc3339(),
-    )
-    .await
-    .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    let signing_key_id = shared::keys::signing_key_id(&signing_public_key);
-
-    crate::audit::log(
-        &app.db,
-        Some(&user.id),
-        "v2.device.enrolled",
-        None,
-        &hex(&device_id),
-    )
-    .await;
-
-    Ok((
-        StatusCode::CREATED,
-        axum::Json(serde_json::json!({
-            "device_id": hex(&device_id),
-            "signing_key_id": hex(&signing_key_id),
-            // Fleet routes are scoped by account. The client cannot infer this
-            // and must not invent it, so return the one we authenticated.
-            "account_id": hex(&account_id),
-        })),
-    ))
-}
-
 /// Map a v1 session user to a v2 account within a tenant.
 async fn account_id_for(
     app: &AppState,
@@ -709,6 +280,33 @@ async fn account_id_for(
 // ---------------------------------------------------------------------------
 // Fleet sync transfer
 // ---------------------------------------------------------------------------
+
+/// A profile published through `POST /v2/fleets/{id}/profiles` is synced only
+/// through its own lease routes (`v2_profiles`); a lease, upload or commit
+/// here would take a second fence and move its version. Migration 0025 holds
+/// the lease and upload inserts to the same rule under any race.
+async fn refuse_published(
+    app: &AppState,
+    tenant_id: &[u8; 16],
+    profile_id: &[u8; 16],
+) -> Result<(), AppError> {
+    let published: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM v2_profiles
+                         WHERE tenant_id = ? AND id = ? AND label_ciphertext IS NOT NULL)",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(profile_id.as_slice())
+    .fetch_one(&app.db)
+    .await?;
+    if published {
+        return Err(AppError::Coded(
+            StatusCode::CONFLICT,
+            "PROFILE_PUBLISHED",
+            "this profile syncs through /v2/profiles, not the legacy fleet routes".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct AcquireLeaseReq {
@@ -743,6 +341,7 @@ pub async fn acquire_profile_lease(
     if caller_account_id != account_id {
         return Err(AppError::Forbidden);
     }
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     if !(MIN_LEASE_TTL_SECONDS..=MAX_LEASE_TTL_SECONDS).contains(&req.ttl_seconds) {
         return Err(AppError::BadRequest(format!(
@@ -762,7 +361,7 @@ pub async fn acquire_profile_lease(
         &account_id,
         &device_id,
         &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
+        crate::util::sql_int(ctx.restore_epoch)?,
         &now.to_rfc3339(),
         &expires.to_rfc3339(),
     )
@@ -845,6 +444,7 @@ pub async fn open_snapshot_upload(
     let lease_id = parse_id16(&req.lease_id, "lease_id")?;
 
     require_tenant_member(&app, tenant_id, &user).await?;
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     let intent_hash: [u8; 32] = decode_hex(&req.intent_hash)
         .ok_or_else(|| AppError::BadRequest("intent_hash: not hex".into()))?
@@ -868,7 +468,7 @@ pub async fn open_snapshot_upload(
         &session_id,
         &lease_id,
         &ctx.server_instance_id,
-        ctx.restore_epoch as i64,
+        crate::util::sql_int(ctx.restore_epoch)?,
         req.fencing_token,
         req.target_version,
         &intent_hash,
@@ -961,6 +561,7 @@ pub async fn commit_snapshot_upload(
     if caller_account_id != author_account_id {
         return Err(AppError::Forbidden);
     }
+    refuse_published(&app, &tenant_id, &profile_id).await?;
 
     let container_sha256: [u8; 32] = decode_hex(&req.container_sha256)
         .ok_or_else(|| AppError::BadRequest("container_sha256: not hex".into()))?
@@ -995,10 +596,15 @@ pub async fn commit_snapshot_upload(
     if verified.signed_id16("fleet_id") != Some(fleet_id) {
         return Err(signed_mismatch("fleet_id"));
     }
-    if verified.signed_uint("base_version") != Some(req.base_version.max(0) as u64) {
+    // A negative body value has no unsigned counterpart, so it never matches;
+    // clamping it would let -1 pass as 0 and fail only after the blob moved.
+    let signed_eq = |field: &'static str, body: i64| {
+        u64::try_from(body).is_ok_and(|v| verified.signed_uint(field) == Some(v))
+    };
+    if !signed_eq("base_version", req.base_version) {
         return Err(signed_mismatch("base_version"));
     }
-    if verified.signed_uint("key_generation") != Some(req.key_generation.max(0) as u64) {
+    if !signed_eq("key_generation", req.key_generation) {
         return Err(signed_mismatch("key_generation"));
     }
 
@@ -1013,7 +619,7 @@ pub async fn commit_snapshot_upload(
             fleet_id,
             base_version: req.base_version,
             key_generation: req.key_generation,
-            restore_epoch: ctx.restore_epoch as i64,
+            restore_epoch: crate::util::sql_int(ctx.restore_epoch)?,
             server_instance_id: ctx.server_instance_id,
             // Binds the stored manifest row to the exact verified bytes.
             intent_hash: verified.exact_bytes_sha256,
@@ -1095,63 +701,6 @@ pub async fn head_snapshot(
     })))
 }
 
-/// Begin the tenant's first root key generation.
-///
-/// The caller generates the root key locally and sends only its identifier;
-/// the key itself never leaves the device, which is why the server can hold
-/// this record without being able to read anything sealed under it.
-pub async fn begin_root_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<BeginRootGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_owner(&app, tenant_id, &user).await?;
-
-    let root_key_id = parse_id32(&req.root_key_id, "root_key_id")?;
-
-    let generation = crate::generations::begin_first_generation(
-        &app.db,
-        &tenant_id,
-        &root_key_id,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": generation,
-        "state": crate::generations::STATE_PREPARING,
-    })))
-}
-
-/// Activate a prepared generation once its holder has proven it can unwrap.
-///
-/// Activation is a separate call because filing a grant only proves it was
-/// written, not that anyone can open it. The caller unwraps its own grant
-/// first; activating before that could leave a tenant sealed under a key that
-/// no device can recover.
-pub async fn activate_root_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ActivateRootGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_owner(&app, tenant_id, &user).await?;
-
-    crate::generations::activate_generation(
-        &app.db,
-        &tenant_id,
-        req.generation,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": req.generation,
-        "state": crate::generations::STATE_ACTIVE,
-    })))
-}
-
 /// Report which generation is in force, so a device knows what to seal under.
 pub async fn get_active_root_generation(
     State(app): State<AppState>,
@@ -1161,7 +710,9 @@ pub async fn get_active_root_generation(
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    match crate::generations::active_generation(&app.db, &tenant_id).await? {
+    match crate::generations::active_generation(&app.db, &verified_instance(&app)?, &tenant_id)
+        .await?
+    {
         Some(g) => Ok(axum::Json(serde_json::json!({
             "active": true,
             "generation": g.generation,
@@ -1284,64 +835,6 @@ fn fleet_error(e: fleet::FleetError) -> AppError {
     }
 }
 
-/// Begin a fleet's first key generation.
-///
-/// The caller generates the fleet key locally and sends only its identifier.
-/// The key never leaves the device, which is why the server can coordinate
-/// custody without being able to read anything sealed under it.
-pub async fn begin_fleet_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<BeginFleetGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let fleet_id = parse_id16(&req.fleet_id, "fleet_id")?;
-    let fkek_key_id = parse_id32(&req.fkek_key_id, "fkek_key_id")?;
-
-    let generation = crate::fleet_generations::begin_first_generation(
-        &app.db,
-        &tenant_id,
-        &fleet_id,
-        &fkek_key_id,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": generation,
-        "state": crate::fleet_generations::STATE_PREPARING,
-    })))
-}
-
-/// Activate a prepared fleet key generation once its holder has proven it can
-/// unwrap the grant it filed.
-pub async fn activate_fleet_generation(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<ActivateFleetGenerationReq>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let fleet_id = parse_id16(&req.fleet_id, "fleet_id")?;
-
-    crate::fleet_generations::activate_generation(
-        &app.db,
-        &tenant_id,
-        &fleet_id,
-        req.generation,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({
-        "generation": req.generation,
-        "state": crate::fleet_generations::STATE_ACTIVE,
-    })))
-}
-
 /// The fleet's active key generation, or null before one is activated.
 ///
 /// A device reads this to learn which key to encrypt under. Null is a real
@@ -1356,8 +849,13 @@ pub async fn get_active_fleet_generation(
     let fleet_id = parse_id16(&fleet_hex, "fleet_id")?;
     require_tenant_member(&app, tenant_id, &user).await?;
 
-    let active =
-        crate::fleet_generations::active_generation(&app.db, &tenant_id, &fleet_id).await?;
+    let active = crate::fleet_generations::active_generation(
+        &app.db,
+        &verified_instance(&app)?,
+        &tenant_id,
+        &fleet_id,
+    )
+    .await?;
 
     Ok(axum::Json(match active {
         Some(g) => serde_json::json!({
@@ -1368,110 +866,4 @@ pub async fn get_active_fleet_generation(
         }),
         None => serde_json::Value::Null,
     }))
-}
-
-/// File a fleet key grant.
-///
-/// The record is verified, then read entirely from its signed fields. The
-/// server stores ciphertext it cannot open.
-pub async fn present_fleet_key_grant(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::Json(req): axum::Json<PresentRecordReq>,
-) -> Result<impl IntoResponse, AppError> {
-    let tenant_id = parse_id16(&req.tenant_id, "tenant_id")?;
-    let record_bytes = decode_hex(&req.record_hex)
-        .ok_or_else(|| AppError::BadRequest("record_hex: not hex".into()))?;
-
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let ctx = verification_context(&app, tenant_id, now_ms).await?;
-
-    let verified = authz::verify_record(&record_bytes, authz::DOMAIN_FLEET_KEY_GRANT, &ctx)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
-    // Only a member may file a grant for this tenant. The signature proves an
-    // issuer wrote the record, not that the caller may deposit it here.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    // Read the grant from the signed fields before claiming the replay id, so a
-    // malformed record does not burn one.
-    let row = crate::fleet_grants::fleet_grant_row_from_record(&verified)?;
-
-    crate::fleet_generations::check_grant_against_generation(
-        &app.db,
-        &tenant_id,
-        &row.fleet_id,
-        row.fleet_generation,
-        &row.fkek_key_id,
-        &row.grant_variant,
-    )
-    .await?;
-
-    match idempotency::consume_replay_id(
-        &app.db,
-        &tenant_id,
-        ReplayTable::FleetKeyGrants,
-        &verified,
-        &util::now_rfc3339(),
-    )
-    .await?
-    {
-        ReplayClaim::Fresh => {}
-        ReplayClaim::AlreadyUsed => {
-            return Err(AppError::Conflict(
-                "authorization record replay id has already been used".into(),
-            ));
-        }
-    }
-
-    crate::fleet_grants::insert_fleet_grant(
-        &app.db,
-        &tenant_id,
-        &ctx.server_instance_id,
-        ctx.restore_epoch,
-        &verified,
-        &record_bytes,
-        &row,
-        &util::now_rfc3339(),
-    )
-    .await?;
-
-    Ok(axum::Json(serde_json::json!({ "stored": true })))
-}
-
-/// Every fleet key grant addressed to one device.
-pub async fn list_fleet_key_grants(
-    State(app): State<AppState>,
-    user: AuthUser,
-    axum::extract::Path((tenant_hex, device_hex)): axum::extract::Path<(String, String)>,
-) -> Result<axum::Json<serde_json::Value>, AppError> {
-    let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
-    let device_id = parse_id16(&device_hex, "device_id")?;
-
-    // Membership is checked against the authenticated user, not the path, so a
-    // caller cannot read another tenant's grants by naming that tenant.
-    require_tenant_member(&app, tenant_id, &user).await?;
-
-    let grants =
-        crate::fleet_grants::fleet_grants_for_device(&app.db, &tenant_id, &device_id).await?;
-
-    let items: Vec<_> = grants
-        .into_iter()
-        .map(|g| {
-            serde_json::json!({
-                "grant_variant": g.grant_variant,
-                "fleet_id": hex(&g.fleet_id),
-                "fkek_key_id": hex(&g.fkek_key_id),
-                "fleet_generation": g.fleet_generation,
-                "recipient_hpke_key_id": hex(&g.recipient_hpke_key_id),
-                "hpke_info_hex": hex(&g.hpke_info_bytes),
-                "hpke_encapped_key_hex": hex(&g.hpke_encapped_key_bytes),
-                "hpke_wrapped_fkek_hex": hex(&g.hpke_wrapped_fkek_bytes),
-                "signed_container_hex": hex(&g.exact_signed_container_bytes),
-                "created_at": g.created_at,
-            })
-        })
-        .collect();
-
-    Ok(axum::Json(serde_json::json!({ "grants": items })))
 }

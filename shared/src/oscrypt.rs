@@ -19,20 +19,20 @@ use sha2::{Digest, Sha256};
 /// A resolved local os_crypt key plus the per-OS cipher.
 #[derive(Clone)]
 pub struct LocalCrypt {
-    key: Vec<u8>,
+    key: zeroize::Zeroizing<Vec<u8>>,
 }
 
 impl LocalCrypt {
     /// Resolve the machine's key for the given user-data-dir.
     pub fn open(udd: &Path) -> Result<Self> {
         Ok(Self {
-            key: local_key(udd)?,
+            key: local_key(udd)?.into(),
         })
     }
 
     /// Construct with an explicit key (cross-machine re-keying, tests).
     pub fn with_key(key: Vec<u8>) -> Self {
-        Self { key }
+        Self { key: key.into() }
     }
 
     /// Encrypt a cookie value (adds the v10 frame + SHA256(host) prefix).
@@ -293,6 +293,13 @@ mod cipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The os_crypt key is wiped when the crypt is dropped (G2-47).
+    #[test]
+    fn the_key_zeroizes_on_drop() {
+        let c = LocalCrypt::with_key(vec![7; 16]);
+        let _: &dyn zeroize::ZeroizeOnDrop = &c.key;
+    }
 
     // The cross-machine guarantee: a value encrypted under one key decrypts to
     // the same plaintext after being re-encrypted under a different key — this

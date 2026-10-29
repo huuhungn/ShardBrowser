@@ -4,7 +4,7 @@
 
 use axum::extract::{Query, State};
 use axum::Json;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::auth::AuthUser;
 use crate::error::AppError;
@@ -29,6 +29,37 @@ pub async fn log(
     .bind(util::now_rfc3339())
     .execute(db)
     .await;
+}
+
+/// A structured v2 audit row for an offline operator command, inside the
+/// command's own transaction: if it fails, the command's writes roll back.
+/// ADR 0001 D3: an offline action has no live account or device.
+pub async fn insert_offline(
+    conn: &mut SqliteConnection,
+    tenant_id: &[u8],
+    action: &str,
+    target_type: &str,
+    target_id: &[u8],
+    request_id: &[u8; 16],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    sqlx::query(
+        "INSERT INTO v2_audit_events \
+         (tenant_id, id, actor_account_id, actor_device_id, action, target_type, target_id, \
+          outcome, reason_code, request_id, created_at) \
+         VALUES (?, ?, NULL, NULL, ?, ?, ?, 'success', 'offline_operator_cli', ?, ?)",
+    )
+    .bind(tenant_id)
+    .bind(uuid::Uuid::new_v4().into_bytes().as_slice())
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(request_id.as_slice())
+    .bind(util::now_rfc3339())
+    .execute(conn)
+    .await
+    .context("inserting the audit event")?;
+    Ok(())
 }
 
 /// Admin: newest-first audit entries, optionally filtered by env/action.

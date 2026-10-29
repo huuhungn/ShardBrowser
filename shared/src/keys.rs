@@ -29,8 +29,18 @@ use crate::canonical as c;
 
 /// `envelope_suite_id` — STREAM AEAD over ChaCha20-Poly1305 (IETF, 96-bit nonce).
 pub const ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM: u16 = 1;
+/// `envelope_suite_id` 2 — `SHARDX_ENVELOPE_XCHACHA20POLY1305_STREAM_LE31_V1`,
+/// the `SHARDXBK` object (ADR 0003). Suite 1 is never valid in that preamble.
+pub const ENVELOPE_SUITE_ID_XCHACHA20POLY1305_STREAM_LE31: u16 = 2;
 /// `wrap_suite_id` — DEK wrap under FKEK with ChaCha20-Poly1305.
 pub const WRAP_SUITE_ID_CHACHA20POLY1305: u16 = 1;
+/// `archive_format_id` — tar, as `snapshot::pack` writes it.
+pub const ARCHIVE_FORMAT_ID_TAR: u16 = 1;
+/// `archive_policy_id` — the profile snapshot policy `snapshot::unpack`
+/// enforces: relative paths, plain files and directories, one entry per path.
+pub const ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT: u16 = 1;
+/// `compression_id` — gzip (RFC 1952).
+pub const COMPRESSION_ID_GZIP: u16 = 1;
 
 /// RFC 9180 base mode tuple required by `TenantRootKeyGrantV2`:
 /// `(mode, KEM, KDF, AEAD) = (0, 0x0020, 0x0001, 0x0003)`

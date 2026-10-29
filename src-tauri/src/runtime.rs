@@ -466,6 +466,9 @@ fn migrate_all_to(
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
 ) -> usize {
+    // Profile files are rewritten here without a claim; a downgrade in flight
+    // is moving them, so the two take turns.
+    let _flow = crate::team::downgrade::exclusive();
     let mut n = 0;
     if let Ok(d) = crate::store::profiles_dir() {
         n += migrate_dir_to(&d, chromium_version, grease_brand, grease_version, tls).unwrap_or(0);
@@ -474,6 +477,41 @@ fn migrate_all_to(
         n += migrate_dir_to(&d, chromium_version, grease_brand, grease_version, tls).unwrap_or(0);
     }
     n
+}
+
+/// [`migrate_all_to`] off the async threads: it waits for a downgrade flow,
+/// which can take a while. It is awaited, not skipped, because the caller
+/// records the signature as applied once it returns. `None` when the work
+/// panicked: nothing is then known to be migrated.
+async fn migrate_all_blocking(
+    chromium_version: String,
+    grease_brand: Option<String>,
+    grease_version: Option<String>,
+    tls: Option<serde_json::Value>,
+) -> Option<usize> {
+    blocking(move || {
+        migrate_all_to(
+            &chromium_version,
+            grease_brand.as_deref(),
+            grease_version.as_deref(),
+            tls.as_ref(),
+        )
+    })
+    .await
+}
+
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tauri::async_runtime::spawn_blocking(work).await.ok()
+}
+
+/// What to record as applied after a migration: the new value if it ran,
+/// otherwise what was there, so the next start tries again.
+fn applied_after<T>(migrated: bool, new: T, previous: Option<T>) -> Option<T> {
+    if migrated {
+        Some(new)
+    } else {
+        previous
+    }
 }
 
 /// Startup hook: migrate saved profiles + the fingerprint library (bundled +
@@ -501,12 +539,18 @@ pub async fn ensure_profiles_migrated() {
     if local.applied_signature.as_deref() == Some(sig.as_str()) {
         return;
     }
-    let n = migrate_all_to(
-        &target,
-        m.grease_brand.as_deref(),
-        m.grease_version.as_deref(),
-        m.tls.as_ref(),
-    );
+    // A migration that did not finish is not recorded as applied: the next
+    // start runs it again.
+    let Some(n) = migrate_all_blocking(
+        target.clone(),
+        m.grease_brand.clone(),
+        m.grease_version.clone(),
+        m.tls.clone(),
+    )
+    .await
+    else {
+        return;
+    };
     if n > 0 {
         eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
     }
@@ -752,15 +796,21 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
             .map(|t| t.to_string())
             .unwrap_or_default(),
     );
+    let mut migrated = true;
     if local.applied_signature.as_deref() != Some(sig.as_str()) {
-        let n = migrate_all_to(
-            &target_ver,
-            manifest.grease_brand.as_deref(),
-            manifest.grease_version.as_deref(),
-            manifest.tls.as_ref(),
-        );
-        if n > 0 {
-            eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
+        match migrate_all_blocking(
+            target_ver.clone(),
+            manifest.grease_brand.clone(),
+            manifest.grease_version.clone(),
+            manifest.tls.clone(),
+        )
+        .await
+        {
+            Some(n) if n > 0 => {
+                eprintln!("[runtime] migrated {n} profile/fingerprint file(s) to {sig}");
+            }
+            Some(_) => {}
+            None => migrated = false,
         }
     }
 
@@ -768,8 +818,12 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         browser_etag: Some(browser_etag),
         widevine_etag,
         fingerprints_etag: fp_etag,
-        applied_chromium_version: Some(target_ver.clone()),
-        applied_signature: Some(sig),
+        applied_chromium_version: applied_after(
+            migrated,
+            target_ver.clone(),
+            local.applied_chromium_version.clone(),
+        ),
+        applied_signature: applied_after(migrated, sig, local.applied_signature.clone()),
         // Authoritative: we just successfully extracted exactly target_ver (the
         // old tree was wiped first). Recording the known value beats re-reading
         // it off disk, which is what let a leftover `<old>.manifest` keep the
@@ -1150,6 +1204,70 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEW-F: a migration that panics is not "applied": the caller gets `None`
+    /// and records nothing new, so the next start runs it again.
+    #[test]
+    fn a_migration_that_panicked_is_not_recorded_as_applied() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(blocking(|| 3usize)), Some(3));
+        let lost = rt.block_on(blocking(|| -> usize { panic!("the migration failed") }));
+        assert_eq!(lost, None);
+        assert_eq!(applied_after(true, "new", Some("old")), Some("new"));
+        assert_eq!(applied_after(false, "new", Some("old")), Some("old"));
+        assert_eq!(applied_after(false, "new", None), None);
+    }
+
+    /// NEW-D: waiting for a downgrade flow does not hold up an async thread.
+    #[test]
+    fn the_profile_migration_waits_off_the_async_thread() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().join("config")));
+        let flow = crate::team::downgrade::exclusive();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let worker = tokio::spawn(migrate_all_blocking("1.0.0".into(), None, None, None));
+            // The only async thread is free to run other work meanwhile.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(!worker.is_finished());
+            drop(flow);
+            worker.await.unwrap();
+        });
+        crate::store::set_config_root(None);
+    }
+
+    /// The migration rewrites profile files without a claim, so it waits for a
+    /// downgrade that is moving them.
+    #[test]
+    fn the_profile_migration_waits_for_a_downgrade_in_flight() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().join("config")));
+        let flow = crate::team::downgrade::exclusive();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = finished.clone();
+        let worker = std::thread::spawn(move || {
+            migrate_all_to("1.0.0", None, None, None);
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        drop(flow);
+        worker.join().unwrap();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        crate::store::set_config_root(None);
+    }
 
     /// #114: a network that accepts the connection and never answers used to
     /// hold the first-run gate, and with it the whole window, indefinitely.

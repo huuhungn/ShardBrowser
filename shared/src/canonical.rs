@@ -36,25 +36,35 @@ pub enum Value {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CborError {
+    /// A length or count not in its shortest form.
     NonCanonicalIntegerForm,
+    /// An integer (major type 0 or 1) not in its shortest form. Kept apart from
+    /// lengths because plan L1236 gives integers `WIRE_INTEGER_OUT_OF_RANGE`.
+    OverlongInteger,
     IndefiniteLength,
     UnsupportedMajorType(u8),
     FloatOrSimpleValue,
     Tag,
     DuplicateKey(String),
-    UnsortedKey { previous: String, current: String },
+    UnsortedKey {
+        previous: String,
+        current: String,
+    },
     NonTextKey,
     TrailingBytes(usize),
     UnexpectedEof,
     InvalidUtf8,
     NulInText,
     IntegerOutOfSqliteDomain(u64),
+    /// Arrays and maps nested deeper than [`MAX_NESTING`].
+    NestingTooDeep,
 }
 
 impl std::fmt::Display for CborError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NonCanonicalIntegerForm => write!(f, "non-canonical integer/length form"),
+            Self::OverlongInteger => write!(f, "integer not in its shortest form"),
             Self::IndefiniteLength => write!(f, "indefinite-length item"),
             Self::UnsupportedMajorType(m) => write!(f, "unsupported CBOR major type {m}"),
             Self::FloatOrSimpleValue => write!(f, "float or disallowed simple value"),
@@ -71,6 +81,7 @@ impl std::fmt::Display for CborError {
             Self::IntegerOutOfSqliteDomain(v) => {
                 write!(f, "integer {v} outside 0..=i64::MAX SQLite domain")
             }
+            Self::NestingTooDeep => write!(f, "arrays or maps nested deeper than {MAX_NESTING}"),
         }
     }
 }
@@ -81,6 +92,11 @@ impl std::error::Error for CborError {}
 /// accepted domain of `0..=i64::MAX`. This is enforced at codec level so no
 /// value can reach a cast or SQL bind out of range.
 pub const MAX_SQLITE_WIRE_UINT: u64 = i64::MAX as u64;
+
+/// Deepest array/map nesting a decoder accepts. Every v2 record is far
+/// shallower; the bound stops a few kilobytes of nested arrays from
+/// overflowing the stack of whoever parses untrusted bytes.
+pub const MAX_NESTING: usize = 16;
 
 // ---------------------------------------------------------------- encoding --
 
@@ -155,9 +171,18 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Decoder<'a> {
+    fn enter(&mut self) -> Result<(), CborError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(CborError::NestingTooDeep);
+        }
+        Ok(())
+    }
+
     fn byte(&mut self) -> Result<u8, CborError> {
         let b = *self.buf.get(self.pos).ok_or(CborError::UnexpectedEof)?;
         self.pos += 1;
@@ -179,12 +204,17 @@ impl<'a> Decoder<'a> {
         let ib = self.byte()?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
+        let overlong = if major <= 1 {
+            CborError::OverlongInteger
+        } else {
+            CborError::NonCanonicalIntegerForm
+        };
         let arg = match ai {
             0..=23 => ai as u64,
             24 => {
                 let v = self.byte()? as u64;
                 if v < 24 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -192,7 +222,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(2)?;
                 let v = u16::from_be_bytes([b[0], b[1]]) as u64;
                 if v <= u8::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -200,7 +230,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(4)?;
                 let v = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
                 if v <= u16::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -208,7 +238,7 @@ impl<'a> Decoder<'a> {
                 let b = self.take(8)?;
                 let v = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
                 if v <= u32::MAX as u64 {
-                    return Err(CborError::NonCanonicalIntegerForm);
+                    return Err(overlong);
                 }
                 v
             }
@@ -256,12 +286,15 @@ impl<'a> Decoder<'a> {
             }
             4 => {
                 let mut items = Vec::with_capacity(arg.min(1024) as usize);
+                self.enter()?;
                 for _ in 0..arg {
                     items.push(self.value()?);
                 }
+                self.depth -= 1;
                 Ok(Value::Array(items))
             }
             5 => {
+                self.enter()?;
                 let mut entries: Vec<(String, Value)> = Vec::with_capacity(arg.min(1024) as usize);
                 let mut prev_key: Option<Vec<u8>> = None;
                 for _ in 0..arg {
@@ -298,6 +331,7 @@ impl<'a> Decoder<'a> {
                     let v = self.value()?;
                     entries.push((key, v));
                 }
+                self.depth -= 1;
                 Ok(Value::Map(entries))
             }
             other => Err(CborError::UnsupportedMajorType(other)),
@@ -307,7 +341,11 @@ impl<'a> Decoder<'a> {
 
 /// Strict decode: canonical form, no trailing bytes.
 pub fn decode(buf: &[u8]) -> Result<Value, CborError> {
-    let mut d = Decoder { buf, pos: 0 };
+    let mut d = Decoder {
+        buf,
+        pos: 0,
+        depth: 0,
+    };
     let v = d.value()?;
     if d.pos != buf.len() {
         return Err(CborError::TrailingBytes(buf.len() - d.pos));
@@ -355,10 +393,17 @@ pub const L_DEK_SLOT_CONTEXT: &str = "SHARDX-DEK-SLOT-CONTEXT-V2\0";
 pub const L_DEK_SLOT: &str = "SHARDX-DEK-SLOT-V2\0";
 pub const L_ENVELOPE_INTENT: &str = "SHARDX-ENVELOPE-INTENT-V2\0";
 pub const L_COMMIT_REQUEST: &str = "SHARDX-COMMIT-REQUEST-V2\0";
+/// `head_hash` label (plan L535-L537).
+pub const L_SNAPSHOT_HEAD: &str = "SHARDX-SNAPSHOT-HEAD-V2\0";
 pub const L_RESTORE_EPOCH_LEAF: &str = "SHARDX-RESTORE-EPOCH-LEAF-V2\0";
 pub const L_RESTORE_EPOCH_NODE2: &str = "SHARDX-RESTORE-EPOCH-NODE2-V2\0";
 pub const L_RESTORE_EPOCH_NODE1: &str = "SHARDX-RESTORE-EPOCH-NODE1-V2\0";
 pub const L_RESTORE_EPOCH_PROOF: &str = "SHARDX-RESTORE-EPOCH-PROOF-V2\0";
+/// Plan 5.6.3 L745 and L748: the transition signs and hashes under its own
+/// labels, not the authorization container's.
+pub const L_RESTORE_EPOCH_TRANSITION_TBS: &str = "SHARDX-RESTORE-EPOCH-TRANSITION-TBS-V2\0";
+pub const L_RESTORE_EPOCH_TRANSITION_CONTAINER: &str =
+    "SHARDX-RESTORE-EPOCH-TRANSITION-CONTAINER-V2\0";
 
 /// Bound on Merkle leaf count, enforced before any allocation sized by input.
 pub const MAX_RESTORE_EPOCH_LEAVES_V2: u64 = 1_000_000;
@@ -391,6 +436,34 @@ pub fn u(n: u64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_is_bounded_before_the_stack_is() {
+        // [[...[0]...]] with `n` arrays.
+        let nested = |n: usize| {
+            let mut v = vec![0x81u8; n];
+            v.push(0x00);
+            v
+        };
+        assert!(decode(&nested(MAX_NESTING)).is_ok());
+        assert_eq!(
+            decode(&nested(MAX_NESTING + 1)),
+            Err(CborError::NestingTooDeep)
+        );
+        // A few kilobytes that used to overflow the stack now fail cleanly.
+        assert_eq!(decode(&nested(5_000)), Err(CborError::NestingTooDeep));
+        // Maps count too: {"a": {"a": ... 0}}.
+        let mut deep_map = Vec::new();
+        for _ in 0..=MAX_NESTING {
+            deep_map.extend_from_slice(&[0xa1, 0x61, b'a']);
+        }
+        deep_map.push(0x00);
+        assert_eq!(decode(&deep_map), Err(CborError::NestingTooDeep));
+        // Siblings do not add depth.
+        let mut wide = vec![0x98, 100];
+        wide.extend(std::iter::repeat_n([0x81u8, 0x00], 100).flatten());
+        assert!(decode(&wide).is_ok());
+    }
 
     fn hex32(h: &[u8; 32]) -> String {
         h.iter().map(|b| format!("{b:02x}")).collect()
@@ -432,8 +505,20 @@ mod tests {
     fn shortest_form_is_required_on_decode() {
         // 24 encoded in two bytes (0x18 0x18) is canonical; 0x18 0x17 is not.
         assert_eq!(decode(&[0x18, 0x18]), Ok(Value::Uint(24)));
+        assert_eq!(decode(&[0x18, 0x17]), Err(CborError::OverlongInteger));
+        // -1 as 0x38 0x00, and 1 at every wider width.
+        for overlong in [
+            &[0x38, 0x00][..],
+            &[0x19, 0x00, 0x01],
+            &[0x1a, 0, 0, 0, 1],
+            &[0x1b, 0, 0, 0, 0, 0, 0, 0, 1],
+        ] {
+            assert_eq!(decode(overlong), Err(CborError::OverlongInteger));
+        }
+        // A length keeps the generic code: a one-byte text string with a
+        // two-byte length head.
         assert_eq!(
-            decode(&[0x18, 0x17]),
+            decode(&[0x78, 0x01, b'a']),
             Err(CborError::NonCanonicalIntegerForm)
         );
     }
@@ -559,10 +644,13 @@ mod tests {
             L_DEK_SLOT,
             L_ENVELOPE_INTENT,
             L_COMMIT_REQUEST,
+            L_SNAPSHOT_HEAD,
             L_RESTORE_EPOCH_LEAF,
             L_RESTORE_EPOCH_NODE2,
             L_RESTORE_EPOCH_NODE1,
             L_RESTORE_EPOCH_PROOF,
+            L_RESTORE_EPOCH_TRANSITION_TBS,
+            L_RESTORE_EPOCH_TRANSITION_CONTAINER,
         ] {
             assert!(label.ends_with('\0'), "missing NUL: {label}");
             assert!(label.is_ascii(), "non-ASCII label: {label}");

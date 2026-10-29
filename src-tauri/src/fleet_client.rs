@@ -26,9 +26,13 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use shardx_core::canonical as c;
 use shardx_core::fleet_manifest::{build_snapshot_manifest, ManifestFields};
+use shardx_core::session_binding::{
+    open_pop_secret, sign_enrollment, sign_pop, DeviceSessionBindingV2, EnrollmentBindingV2,
+};
 use shardx_core::signing::Ed25519SigningKey;
 
 /// Upload chunk size. The server caps a ranged read at 8 MiB; staying below it
@@ -78,12 +82,104 @@ pub struct UploadRequest<'a> {
     pub container: &'a [u8],
 }
 
+/// The v2 account that enrolls this device. The password serves one login
+/// and is never stored.
+pub struct AccountLogin<'a> {
+    pub tenant_id: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+}
+
+/// A v2 device session: the bearer every custody route takes. Its class says
+/// what it may do (`pending_setup`, `root_setup`); the server decides it.
+#[derive(Clone, Deserialize)]
+pub struct DeviceSession {
+    pub session_id: String,
+    pub class: String,
+    pub access_token: String,
+    pub access_expires_at_ms: i64,
+    pub refresh_token: String,
+    pub absolute_expires_at_ms: i64,
+}
+
+impl Drop for DeviceSession {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
+impl std::fmt::Debug for DeviceSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSession")
+            .field("session_id", &self.session_id)
+            .field("class", &self.class)
+            .field("access_token", &"<redacted>")
+            .field("access_expires_at_ms", &self.access_expires_at_ms)
+            .field("refresh_token", &"<redacted>")
+            .field("absolute_expires_at_ms", &self.absolute_expires_at_ms)
+            .finish()
+    }
+}
+
+/// What a device session binding must name. The device, its keys and the
+/// tenant come from this machine; the rest only has to agree with the ticket
+/// and challenge the same server issued.
+struct SessionExpectation {
+    device_id: [u8; 16],
+    signing_public_key: [u8; 32],
+    hpke_public_key: [u8; 32],
+    tenant_id: [u8; 16],
+    account_id: [u8; 16],
+    ticket_id: [u8; 16],
+    challenge_id: [u8; 16],
+    server_instance_id: [u8; 16],
+    restore_epoch: u64,
+}
+
+/// Whether `got` names exactly what `want` expects. The nonce and expiry are
+/// the server's to choose, and `parse` already pins the suites and derives
+/// the key ids from the keys compared here.
+fn session_binding_matches(got: &DeviceSessionBindingV2, want: &SessionExpectation) -> bool {
+    let f = &got.fields;
+    got.device_id == want.device_id
+        && f.signing_public_key == want.signing_public_key
+        && f.hpke_public_key == want.hpke_public_key
+        && f.tenant_id == want.tenant_id
+        && f.account_id == want.account_id
+        && f.pre_device_session_id == want.ticket_id
+        && f.challenge_id == want.challenge_id
+        && f.server_instance_id == want.server_instance_id
+        && f.restore_epoch == want.restore_epoch
+}
+
+/// Server response to a device session challenge request.
+#[derive(Deserialize)]
+struct SessionChallenge {
+    challenge_id: String,
+    /// Hex of the exact `DeviceSessionBindingV2` bytes the proofs cover.
+    binding: String,
+    encapsulated_key: String,
+    ciphertext: String,
+}
+
+/// An account-only pre-device ticket and the server facts it was issued under.
+#[derive(Deserialize)]
+struct Ticket {
+    ticket: String,
+    ticket_id: String,
+    account_id: String,
+    server_instance_id: String,
+    restore_epoch: u64,
+}
+
 /// Server response to an enrollment challenge request.
 #[derive(Deserialize)]
 struct EnrollmentChallenge {
     challenge_id: String,
-    nonce: String,
-    account_id: String,
+    /// Hex of the exact `EnrollmentBindingV2` bytes to sign.
+    binding: String,
 }
 
 /// Ids the server assigned to a freshly enrolled device.
@@ -100,7 +196,7 @@ pub struct EnrolledDevice {
 pub struct FleetClient {
     http: reqwest::Client,
     base_url: String,
-    token: String,
+    token: Zeroizing<String>,
 }
 
 impl FleetClient {
@@ -111,12 +207,15 @@ impl FleetClient {
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
+            // A redirect would resend the body, and a login body holds the
+            // account password. The API never redirects.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context(crate::errcode::code("fleet.netClientFailed"))?;
         Ok(Self {
             http,
             base_url: base,
-            token: token.to_string(),
+            token: token.to_string().into(),
         })
     }
 
@@ -124,6 +223,26 @@ impl FleetClient {
         format!("{}{}", self.base_url, path)
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+/// True for `https://`, or `http://` to this machine.
+fn sends_secrets_safely(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Domain(d))) => d.eq_ignore_ascii_case("localhost"),
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+impl FleetClient {
     /// Turn a non-2xx response into an error that keeps the server reason.
     /// The body carries refusal text (version conflicts, expired leases), no
     /// key material.
@@ -146,29 +265,360 @@ impl FleetClient {
         )))
     }
 
-    /// Register this device's signing key with the server.
+    /// Register this device's keys with the server, as `login`'s account.
     ///
-    /// Two round trips: the server issues a nonce committed to the key pair,
-    /// and the device signs it. The private key never leaves this process —
-    /// what proves possession is the signature, not the key.
+    /// The account logs in for a pre-device ticket, the server issues an
+    /// `EnrollmentBindingV2` naming both keys, and the device signs it. The
+    /// binding is checked against the keys, tenant, account and ticket before
+    /// signing, so a server cannot get a signature over anything else. The
+    /// private key never leaves this process; the signature proves possession.
     ///
     /// Returns the ids the server assigned. The caller stores them; a device
     /// enrolls once per server.
     pub async fn enroll_device(
         &self,
+        login: &AccountLogin<'_>,
+        signer: &Ed25519SigningKey,
+        hpke_public_key: &[u8; 32],
+        label_ciphertext: &[u8],
+    ) -> Result<EnrolledDevice> {
+        let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+        let ticket = self.login_ticket(login).await?;
+        let enrolled = self
+            .enroll_with_ticket(&ticket, &tenant, signer, hpke_public_key, label_ciphertext)
+            .await;
+        self.end_ticket(&ticket).await;
+        enrolled
+    }
+
+    /// Logs `login` in for an account-only ticket.
+    async fn login_ticket(&self, login: &AccountLogin<'_>) -> Result<Ticket> {
+        // The password is a long-lived account secret, unlike the token, so
+        // it never crosses a network in clear.
+        if !sends_secrets_safely(&self.base_url) {
+            bail!(crate::errcode::code("fleet.insecureLogin"));
+        }
+        let res = self
+            .http
+            .post(self.url("/v2/auth/login"))
+            .json(&serde_json::json!({
+                "tenant_id": login.tenant_id,
+                "username": login.username,
+                "password": login.password,
+            }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableLogin"))?;
+        Self::ok_or_err(res, "fleet.refusedLogin")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyLogin"))
+    }
+
+    /// Ends a device session. Best effort: it expires on its own.
+    pub async fn end_session(&self, access_token: &str) {
+        let _ = self
+            .http
+            .post(self.url("/v2/auth/logout"))
+            .bearer_auth(access_token)
+            .send()
+            .await;
+    }
+
+    /// Ends a ticket that served one step. Best effort: it expires in ten
+    /// minutes regardless.
+    async fn end_ticket(&self, ticket: &Ticket) {
+        let _ = self
+            .http
+            .post(self.url("/v2/auth/logout"))
+            .bearer_auth(&ticket.ticket)
+            .send()
+            .await;
+    }
+
+    /// Opens a v2 device session for this enrolled device, as `login`'s
+    /// account (ADR 0001 R2).
+    ///
+    /// The account logs in for a ticket; the server issues a
+    /// `DeviceSessionBindingV2` naming this device and its keys, with a secret
+    /// sealed to its HPKE key. Before anything is opened or signed, the
+    /// binding must name this device, its keys and the tenant, and agree with
+    /// the ticket and challenge, so a server cannot get a proof for another
+    /// device or key. Opening the secret proves the HPKE key; signing binding
+    /// and secret proves the signing key.
+    pub async fn open_device_session(
+        &self,
+        login: &AccountLogin<'_>,
+        device_id: &str,
+        signer: &Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+    ) -> Result<DeviceSession> {
+        let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
+        let device = decode_hex16(device_id, "device_id")?;
+        let ticket = self.login_ticket(login).await?;
+        let session = self
+            .session_with_ticket(&ticket, &tenant, &device, signer, hpke_seed)
+            .await;
+        self.end_ticket(&ticket).await;
+        session
+    }
+
+    async fn session_with_ticket(
+        &self,
+        ticket: &Ticket,
+        tenant: &[u8; 16],
+        device: &[u8; 16],
+        signer: &Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+    ) -> Result<DeviceSession> {
+        let res = self
+            .http
+            .post(self.url("/v2/auth/device-session-challenges"))
+            .bearer_auth(&ticket.ticket)
+            .json(&serde_json::json!({ "device_id": hex(device) }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        let challenge: SessionChallenge = Self::ok_or_err(res, "fleet.refusedSession")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))?;
+
+        let mismatch = || anyhow!(crate::errcode::code("fleet.sessionBindingMismatch"));
+        let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
+        let parsed = DeviceSessionBindingV2::parse(&binding).map_err(|_| mismatch())?;
+        let (hpke_secret, hpke_public) = shardx_core::grants::derive_keypair(hpke_seed);
+        let want = SessionExpectation {
+            device_id: *device,
+            signing_public_key: signer.verifying_key().to_bytes(),
+            hpke_public_key: hpke_public.as_slice().try_into().map_err(|_| mismatch())?,
+            tenant_id: *tenant,
+            account_id: decode_hex16(&ticket.account_id, "account_id")?,
+            ticket_id: decode_hex16(&ticket.ticket_id, "ticket_id")?,
+            challenge_id: decode_hex16(&challenge.challenge_id, "challenge_id")?,
+            server_instance_id: decode_hex16(&ticket.server_instance_id, "server_instance_id")?,
+            restore_epoch: ticket.restore_epoch,
+        };
+        if !session_binding_matches(&parsed, &want) {
+            return Err(mismatch());
+        }
+        let unsealed = || anyhow!(crate::errcode::code("fleet.sessionProofFailed"));
+        let secret = open_pop_secret(
+            &hpke_secret,
+            &binding,
+            &decode_hex(&challenge.encapsulated_key).ok_or_else(unsealed)?,
+            &decode_hex(&challenge.ciphertext).ok_or_else(unsealed)?,
+        )
+        .map_err(|_| unsealed())?;
+        let signature = sign_pop(signer, &binding, &secret);
+
+        let res = self
+            .http
+            .post(self.url("/v2/auth/device-session-proofs"))
+            .bearer_auth(&ticket.ticket)
+            .json(&serde_json::json!({
+                "challenge_id": challenge.challenge_id,
+                "secret": hex(&*secret),
+                "signature": hex(&signature),
+            }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        Self::ok_or_err(res, "fleet.refusedSession")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))
+    }
+
+    /// POSTs exact CBOR bytes under a device session and returns the exact
+    /// response bytes. Custody routes take and answer canonical CBOR.
+    async fn post_cbor(&self, path: &str, access_token: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let res = self
+            .http
+            .post(self.url(path))
+            .bearer_auth(access_token)
+            .header("content-type", "application/cbor")
+            .body(body.to_vec())
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableCustody"))?;
+        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyCustody"))?;
+        Ok(body.to_vec())
+    }
+
+    /// D1: files this device's approval of itself (ADR 0001 D1). Returns the
+    /// exact `DeviceApprovalReceiptV2` bytes.
+    pub async fn approve_device(
+        &self,
+        access_token: &str,
+        device_id: &str,
+        approval_container: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/devices/{device_id}/approve"),
+            access_token,
+            approval_container,
+        )
+        .await
+    }
+
+    /// Creates a root key generation. Returns the exact stored response.
+    pub async fn create_root_generation(
+        &self,
+        access_token: &str,
         tenant_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/tenants/{tenant_id}/root-key-generations"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Reads one root grant back as its exact `TenantRootGrantDescriptorV2`.
+    pub async fn read_root_grant(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        replay_id: &str,
+    ) -> Result<Vec<u8>> {
+        let res = self
+            .http
+            .get(self.url(&format!(
+                "/v2/tenants/{tenant_id}/root-key-generations/{generation}/grants/{replay_id}"
+            )))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableCustody"))?;
+        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyCustody"))?;
+        Ok(body.to_vec())
+    }
+
+    /// Every page of the tenant's trust evidence, following the cursors. The
+    /// pages are only parsed here; `trust_chain` verifies what they hold.
+    pub async fn trust_evidence(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2>> {
+        use shardx_core::trust_chain::MAX_EVIDENCE_PAGES;
+        use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
+        let mut pages = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            if pages.len() >= MAX_EVIDENCE_PAGES {
+                bail!(crate::errcode::code("fleet.trustEvidenceRefused"));
+            }
+            let mut url = self.url(&format!("/v2/tenants/{tenant_id}/trust-evidence"));
+            if !cursor.is_empty() {
+                url = format!("{url}?cursor={cursor}");
+            }
+            let res = self
+                .http
+                .get(url)
+                .bearer_auth(access_token)
+                .send()
+                .await
+                .context(crate::errcode::code("fleet.unreachableCustody"))?;
+            let body = Self::ok_or_err(res, "fleet.refusedCustody")
+                .await?
+                .bytes()
+                .await
+                .context(crate::errcode::code("fleet.badReplyCustody"))?;
+            let page = TenantTrustEvidencePageV2::parse(&body)
+                .map_err(|_| anyhow!(crate::errcode::code("fleet.badReplyCustody")))?;
+            cursor = hex(&page.next_cursor);
+            pages.push(page);
+            if cursor.is_empty() {
+                return Ok(pages);
+            }
+        }
+    }
+
+    /// Acknowledges one root grant. Returns the exact stored response.
+    pub async fn ack_root_grant(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        replay_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!(
+                "/v2/tenants/{tenant_id}/root-key-generations/{generation}/grants/{replay_id}/ack"
+            ),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Activates a root key generation. Returns the exact stored response.
+    pub async fn activate_root_generation(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/tenants/{tenant_id}/root-key-generations/{generation}/activate"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Rotates a device session's tokens. The old refresh token is spent:
+    /// never retry with it, because a reused token revokes the session.
+    pub async fn refresh_device_session(&self, refresh_token: &str) -> Result<DeviceSession> {
+        if !sends_secrets_safely(&self.base_url) {
+            bail!(crate::errcode::code("fleet.insecureSession"));
+        }
+        let res = self
+            .http
+            .post(self.url("/v2/auth/refresh"))
+            .json(&serde_json::json!({ "refresh_token": refresh_token }))
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableSession"))?;
+        Self::ok_or_err(res, "fleet.refusedRefresh")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))
+    }
+
+    async fn enroll_with_ticket(
+        &self,
+        ticket: &Ticket,
+        tenant: &[u8; 16],
         signer: &Ed25519SigningKey,
         hpke_public_key: &[u8; 32],
         label_ciphertext: &[u8],
     ) -> Result<EnrolledDevice> {
         let signing_public_key = signer.verifying_key().to_bytes();
-
         let res = self
             .http
             .post(self.url("/v2/devices/enrollment-challenges"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&ticket.ticket)
             .json(&serde_json::json!({
-                "tenant_id": tenant_id,
                 "signing_public_key": hex(&signing_public_key),
                 "hpke_public_key": hex(hpke_public_key),
             }))
@@ -181,35 +631,31 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
-        let nonce = decode_hex32(
-            &challenge.nonce,
-            &crate::errcode::code("fleet.fieldChallengeNonce"),
-        )?;
-        let challenge_id = decode_hex16(&challenge.challenge_id, "challenge_id")?;
-        let account_id = decode_hex16(&challenge.account_id, "account_id")?;
-        let tenant_bytes = decode_hex16(tenant_id, "tenant_id")?;
-
-        let tbs = enrollment_proof_bytes(
-            &challenge_id,
-            &nonce,
-            &tenant_bytes,
-            &account_id,
-            &signing_public_key,
-            hpke_public_key,
-        );
-        let signature = shardx_core::signing::sign_tbs(signer, &tbs);
+        let mismatch = || anyhow!(crate::errcode::code("fleet.bindingMismatch"));
+        let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
+        let parsed = EnrollmentBindingV2::parse(&binding).map_err(|_| mismatch())?;
+        let f = &parsed.fields;
+        let expected = f.signing_public_key == signing_public_key
+            && f.hpke_public_key == *hpke_public_key
+            && f.tenant_id == *tenant
+            && f.account_id == decode_hex16(&ticket.account_id, "account_id")?
+            && f.pre_device_session_id == decode_hex16(&ticket.ticket_id, "ticket_id")?
+            && f.challenge_id == decode_hex16(&challenge.challenge_id, "challenge_id")?
+            && f.server_instance_id
+                == decode_hex16(&ticket.server_instance_id, "server_instance_id")?
+            && f.restore_epoch == ticket.restore_epoch;
+        if !expected {
+            return Err(mismatch());
+        }
+        let signature = sign_enrollment(signer, &binding);
 
         let res = self
             .http
             .post(self.url("/v2/devices/enrollment-proofs"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&ticket.ticket)
             .json(&serde_json::json!({
-                "tenant_id": tenant_id,
                 "challenge_id": challenge.challenge_id,
-                "nonce": challenge.nonce,
-                "signing_public_key": hex(&signing_public_key),
-                "hpke_public_key": hex(hpke_public_key),
-                "proof_signature": hex(&signature),
+                "signature": hex(&signature),
                 "label_ciphertext": hex(label_ciphertext),
             }))
             .send()
@@ -227,7 +673,7 @@ impl FleetClient {
         let res = self
             .http
             .get(self.url("/v2/server-identity"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableIdentity"))?;
@@ -251,7 +697,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/leases"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": tenant_id,
                 "profile_id": profile_id,
@@ -274,7 +720,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/leases/release"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({ "tenant_id": tenant_id, "lease_id": lease_id }))
             .send()
             .await
@@ -287,7 +733,7 @@ impl FleetClient {
         let res = self
             .http
             .get(self.url(&format!("/v2/fleet/snapshots/{tenant_id}/{profile_id}")))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableHead"))?;
@@ -320,7 +766,7 @@ impl FleetClient {
                 .get(self.url(&format!(
                     "/v2/fleet/snapshots/{tenant_id}/{profile_id}/range"
                 )))
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .query(&[
                     ("version", version.to_string()),
                     ("offset", out.len().to_string()),
@@ -375,7 +821,7 @@ impl FleetClient {
             .get(self.url(&format!(
                 "/v2/tenants/{tenant_id}/devices/{device_id}/root-key-grants"
             )))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
@@ -387,30 +833,297 @@ impl FleetClient {
         Ok(body.grants)
     }
 
-    /// Fleet key grants filed for this device.
-    ///
-    /// The fleet key is what actually opens profile snapshots, so this is the
-    /// call that lets an enrolled device read what its fleet has pushed.
-    pub async fn fleet_key_grants(
+    /// The fleet's ACTIVE key generation, if it has one.
+    pub async fn active_fleet_generation(
         &self,
         tenant_id: &str,
-        device_id: &str,
-    ) -> Result<Vec<FleetKeyGrant>> {
+        fleet_id: &str,
+    ) -> Result<Option<u64>> {
         let res = self
             .http
             .get(self.url(&format!(
-                "/v2/tenants/{tenant_id}/devices/{device_id}/fleet-key-grants"
+                "/v2/tenants/{tenant_id}/fleets/{fleet_id}/key-generation"
             )))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
-        let body: FleetKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedTeamKeys")
+        let body: Option<ActiveFleetGeneration> = Self::ok_or_err(res, "fleet.refusedTeamKeys")
             .await?
             .json()
             .await
             .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
-        Ok(body.grants)
+        Ok(body.map(|g| g.generation))
+    }
+
+    /// This device's D-9 `DeviceHpkeGrant` of `generation` as its exact
+    /// `FleetDeviceGrantDescriptorV2` (plan L1131), `None` when none is filed.
+    /// The server serves it to this device's own session only.
+    pub async fn read_fleet_device_grant(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        generation: u64,
+        device_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let res = self
+            .http
+            .get(self.url(&format!(
+                "/v2/fleets/{fleet_id}/key-generations/{generation}/grants/{device_id}"
+            )))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = Self::ok_or_err(res, "fleet.refusedTeamKeys")
+            .await?
+            .bytes()
+            .await
+            .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
+        Ok(Some(body.to_vec()))
+    }
+
+    /// Sends `req` under a device session and returns the reply as received.
+    /// Only a reply that never arrived, or one too large to hold, is an
+    /// error: the caller decides what a status means, and replays the same
+    /// stored bytes after a lost one. 408 and 429 are resent as they were
+    /// after `Retry-After`, a bounded number of times (plan 8.2 L1244).
+    async fn exact(&self, req: reqwest::RequestBuilder, access_token: &str) -> Result<Exact> {
+        let lost = || crate::errcode::code("fleet.unreachableSync");
+        let req = req.bearer_auth(access_token);
+        let mut retries = 0;
+        let mut res = loop {
+            let res = req
+                .try_clone()
+                .ok_or_else(|| anyhow!(lost()))?
+                .send()
+                .await
+                .context(lost())?;
+            if !matches!(res.status().as_u16(), 408 | 429) || retries == EXACT_RETRIES {
+                break res;
+            }
+            retries += 1;
+            let wait = res
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()?.parse::<u64>().ok())
+                .unwrap_or(1)
+                .min(EXACT_RETRY_AFTER_MAX_SECS);
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        };
+        let status = res.status().as_u16();
+        let headers = res.headers().clone();
+        let mut body = Vec::new();
+        while let Some(chunk) = res.chunk().await.context(lost())? {
+            if body.len() + chunk.len() > MAX_EXACT_BYTES {
+                bail!(crate::errcode::code_with(
+                    "sync.badReplySync",
+                    &[("field", "body-size")]
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Exact {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    /// POSTs exact CBOR request bytes (plan 8.1 L1137-L1152).
+    async fn post_exact(&self, path: &str, access_token: &str, body: &[u8]) -> Result<Exact> {
+        let req = self
+            .http
+            .post(self.url(path))
+            .header("content-type", "application/cbor")
+            .body(body.to_vec());
+        self.exact(req, access_token).await
+    }
+
+    /// `GET /v2/fleets/{fleet_id}/profiles`, one `FleetProfilePageV2`.
+    pub async fn list_fleet_profiles(
+        &self,
+        access_token: &str,
+        fleet_id: &[u8; 16],
+        after: Option<&[u8; 16]>,
+    ) -> Result<Exact> {
+        let mut url = self.url(&format!("/v2/fleets/{}/profiles", hex(fleet_id)));
+        if let Some(a) = after {
+            url = format!("{url}?after={}", hex(a));
+        }
+        self.exact(self.http.get(url), access_token).await
+    }
+
+    /// `PROFILE_PUBLISH_CREATE` (L1137).
+    // shortcut: nothing calls publish yet; the Team profile UI that lets a
+    // user publish a local profile (and records its binding) triggers it.
+    pub async fn publish_profile(
+        &self,
+        access_token: &str,
+        fleet_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/fleets/{}/profiles", hex(fleet_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `PROFILE_CHECKOUT` (L1138).
+    pub async fn checkout_profile(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/profiles/{}/checkout", hex(profile_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `LeaseRenewV2` (L1139).
+    pub async fn renew_lease_v2(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        lease_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!(
+            "/v2/profiles/{}/leases/{}/renew",
+            hex(profile_id),
+            hex(lease_id)
+        );
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `RELEASE_LEASE` (L1140).
+    pub async fn release_lease_v2(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        lease_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!(
+            "/v2/profiles/{}/leases/{}/release",
+            hex(profile_id),
+            hex(lease_id)
+        );
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `CREATE_UPLOAD` (L1147).
+    pub async fn create_upload(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/profiles/{}/uploads", hex(profile_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// `HEAD /v2/uploads/{upload_id}`: the committed offset and state (L1148).
+    pub async fn upload_head(&self, access_token: &str, upload_id: &[u8; 16]) -> Result<Exact> {
+        let url = self.url(&format!("/v2/uploads/{}", hex(upload_id)));
+        self.exact(self.http.head(url), access_token).await
+    }
+
+    /// `PATCH /v2/uploads/{upload_id}`: one chunk at `offset` (L1149).
+    pub async fn upload_patch(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        offset: u64,
+        chunk: &[u8],
+    ) -> Result<Exact> {
+        let req = self
+            .http
+            .patch(self.url(&format!("/v2/uploads/{}", hex(upload_id))))
+            .header("upload-offset", offset.to_string())
+            .header(
+                "upload-chunk-sha256",
+                hex(&shardx_core::canonical::sha256(chunk)),
+            )
+            .body(chunk.to_vec());
+        self.exact(req, access_token).await
+    }
+
+    /// `FINALIZE_UPLOAD` (L1150).
+    pub async fn finalize_upload(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/uploads/{}/finalize", hex(upload_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// The exact `CommitRequestV2` (L1151).
+    pub async fn commit_upload(
+        &self,
+        access_token: &str,
+        upload_id: &[u8; 16],
+        request: &[u8],
+    ) -> Result<Exact> {
+        let path = format!("/v2/uploads/{}/commit", hex(upload_id));
+        self.post_exact(&path, access_token, request).await
+    }
+
+    /// The exact signed `previous -> new` restore-epoch transition of
+    /// `tenant_id` or, with `profile_id`, that profile's exact inclusion
+    /// proof under it (L1131).
+    pub async fn restore_epoch_transition(
+        &self,
+        access_token: &str,
+        tenant_id: &[u8; 16],
+        (previous, new): (u64, u64),
+        profile_id: Option<&[u8; 16]>,
+    ) -> Result<Exact> {
+        let mut path = format!(
+            "/v2/recovery/restore-epoch-transitions/{}/{previous}/{new}",
+            hex(tenant_id)
+        );
+        if let Some(p) = profile_id {
+            path = format!("{path}/proofs/{}", hex(p));
+        }
+        self.exact(self.http.get(self.url(&path)), access_token)
+            .await
+    }
+
+    /// The exact signed manifest of a committed version (L1153).
+    pub async fn snapshot_manifest(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        version: u64,
+    ) -> Result<Exact> {
+        let url = self.url(&format!(
+            "/v2/profiles/{}/snapshots/{version}/manifest",
+            hex(profile_id)
+        ));
+        self.exact(self.http.get(url), access_token).await
+    }
+
+    /// Bytes `start..=end` of a committed version's ciphertext (L1153).
+    pub async fn snapshot_range(
+        &self,
+        access_token: &str,
+        profile_id: &[u8; 16],
+        version: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Exact> {
+        let req = self
+            .http
+            .get(self.url(&format!(
+                "/v2/profiles/{}/snapshots/{version}",
+                hex(profile_id)
+            )))
+            .header("range", format!("bytes={start}-{end}"));
+        self.exact(req, access_token).await
     }
 
     /// Lease, stage, and publish a sealed container. Returns the new version.
@@ -466,7 +1179,7 @@ impl FleetClient {
         let open = self
             .http
             .post(self.url("/v2/fleet/uploads"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": req.tenant_id,
                 "profile_id": req.profile_id,
@@ -494,7 +1207,7 @@ impl FleetClient {
         let commit = self
             .http
             .post(self.url("/v2/fleet/uploads/commit"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({
                 "tenant_id": req.tenant_id,
                 "profile_id": req.profile_id,
@@ -533,7 +1246,7 @@ impl FleetClient {
                     "/v2/fleet/uploads/{}/{}/chunk",
                     req.tenant_id, session_id
                 )))
-                .bearer_auth(&self.token)
+                .bearer_auth(self.token.as_str())
                 .header("x-chunk-offset", offset.to_string())
                 .header("content-type", "application/octet-stream")
                 .body(req.container[offset..end].to_vec())
@@ -550,7 +1263,7 @@ impl FleetClient {
         let res = self
             .http
             .post(self.url("/v2/fleet/uploads/abort"))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .json(&serde_json::json!({ "tenant_id": tenant_id, "session_id": session_id }))
             .send()
             .await
@@ -593,7 +1306,7 @@ impl FleetClient {
     }
 }
 
-fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     if s.len() != 64 {
         bail!(crate::errcode::code_with(
             "fleet.malformedHex64",
@@ -612,40 +1325,30 @@ fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Canonical bytes a device signs to prove it holds its signing key.
-///
-/// Must match the server's `enrollment::proof_tbs_bytes` exactly; the domain
-/// label keeps this signature from being valid as any other record.
-fn enrollment_proof_bytes(
-    challenge_id: &[u8; 16],
-    nonce: &[u8; 32],
-    tenant_id: &[u8; 16],
-    account_id: &[u8; 16],
-    signing_public_key: &[u8; 32],
-    hpke_public_key: &[u8; 32],
-) -> Vec<u8> {
-    // Shared with the server: one definition, so a mismatch is impossible
-    // rather than merely unlikely.
-    shardx_core::enrollment_proof::enrollment_proof_tbs(
-        &shardx_core::enrollment_proof::EnrollmentProofFields {
-            challenge_id,
-            nonce,
-            tenant_id,
-            account_id,
-            signing_public_key,
-            hpke_public_key,
-        },
-    )
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
+pub(crate) fn decode_hex16(s: &str, field: &str) -> Result<[u8; 16]> {
     if s.len() != 32 {
         bail!(crate::errcode::code_with(
             "fleet.malformedHex32",
+            &[("field", field)]
+        ));
+    }
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(crate::errcode::code_with(
+            "fleet.malformedHexDigits",
             &[("field", field)]
         ));
     }
@@ -684,20 +1387,24 @@ struct RootKeyGrantsResponse {
 
 /// A fleet key grant as the server returns it.
 #[derive(Debug, serde::Deserialize)]
-pub struct FleetKeyGrant {
-    pub grant_variant: String,
-    pub fleet_id: String,
-    pub fkek_key_id: String,
-    pub fleet_generation: i64,
-    pub recipient_hpke_key_id: String,
-    pub hpke_info_hex: String,
-    pub hpke_encapped_key_hex: String,
-    pub hpke_wrapped_fkek_hex: String,
+struct ActiveFleetGeneration {
+    generation: u64,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct FleetKeyGrantsResponse {
-    grants: Vec<FleetKeyGrant>,
+/// The largest v2 reply held: a Range reply is at most the server's 8 MiB
+/// chunk cap (the client asks for 4 MiB), every other reply is far smaller.
+// shortcut: the plan names no response bound, so this is the chunk cap plus a
+// manifest's 128 KiB; take the plan's figure once it sets one.
+const MAX_EXACT_BYTES: usize = 8 * 1024 * 1024 + 128 * 1024;
+/// 408/429 resends, and the longest `Retry-After` waited for, per reply.
+const EXACT_RETRIES: u32 = 2;
+const EXACT_RETRY_AFTER_MAX_SECS: u64 = 30;
+
+/// A v2 reply exactly as received.
+pub struct Exact {
+    pub status: u16,
+    pub headers: reqwest::header::HeaderMap,
+    pub body: Vec<u8>,
 }
 
 pub fn random_id_hex() -> String {
@@ -706,7 +1413,140 @@ pub fn random_id_hex() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex16, random_id_hex, FleetClient};
+    use super::{
+        decode_hex, decode_hex16, random_id_hex, sends_secrets_safely, session_binding_matches,
+        DeviceSession, FleetClient, SessionExpectation,
+    };
+    use shardx_core::session_binding::{BindingFields, DeviceSessionBindingV2};
+
+    fn binding() -> DeviceSessionBindingV2 {
+        DeviceSessionBindingV2 {
+            device_id: [1; 16],
+            fields: BindingFields {
+                server_instance_id: [2; 16],
+                restore_epoch: 3,
+                tenant_id: [4; 16],
+                account_id: [5; 16],
+                pre_device_session_id: [6; 16],
+                challenge_id: [7; 16],
+                nonce: [8; 16],
+                signing_suite: 1,
+                signing_public_key: [9; 32],
+                signing_key_id: [10; 32],
+                hpke_suite: 1,
+                hpke_public_key: [11; 32],
+                hpke_key_id: [12; 32],
+                expires_at_ms: 13,
+            },
+        }
+    }
+
+    fn expectation() -> SessionExpectation {
+        SessionExpectation {
+            device_id: [1; 16],
+            signing_public_key: [9; 32],
+            hpke_public_key: [11; 32],
+            tenant_id: [4; 16],
+            account_id: [5; 16],
+            ticket_id: [6; 16],
+            challenge_id: [7; 16],
+            server_instance_id: [2; 16],
+            restore_epoch: 3,
+        }
+    }
+
+    #[test]
+    fn a_session_binding_must_name_every_expected_field() {
+        assert!(session_binding_matches(&binding(), &expectation()));
+        // The server's own choices do not have to match anything.
+        let mut b = binding();
+        b.fields.nonce = [0xEE; 16];
+        b.fields.expires_at_ms = 99;
+        assert!(session_binding_matches(&b, &expectation()));
+
+        type Mutation = fn(&mut DeviceSessionBindingV2);
+        let changes: [(&str, Mutation); 9] = [
+            ("device_id", |b| b.device_id[0] ^= 1),
+            ("signing_public_key", |b| {
+                b.fields.signing_public_key[0] ^= 1
+            }),
+            ("hpke_public_key", |b| b.fields.hpke_public_key[0] ^= 1),
+            ("tenant_id", |b| b.fields.tenant_id[0] ^= 1),
+            ("account_id", |b| b.fields.account_id[0] ^= 1),
+            ("pre_device_session_id", |b| {
+                b.fields.pre_device_session_id[0] ^= 1
+            }),
+            ("challenge_id", |b| b.fields.challenge_id[0] ^= 1),
+            ("server_instance_id", |b| {
+                b.fields.server_instance_id[0] ^= 1
+            }),
+            ("restore_epoch", |b| b.fields.restore_epoch += 1),
+        ];
+        for (name, change) in changes {
+            let mut b = binding();
+            change(&mut b);
+            assert!(
+                !session_binding_matches(&b, &expectation()),
+                "a binding with another {name} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_debug_print_hides_its_tokens() {
+        let s = DeviceSession {
+            session_id: "sid".into(),
+            class: "pending_setup".into(),
+            access_token: "access-secret".into(),
+            access_expires_at_ms: 1,
+            refresh_token: "refresh-secret".into(),
+            absolute_expires_at_ms: 2,
+        };
+        let printed = format!("{s:?}");
+        assert!(printed.contains("sid"));
+        assert!(!printed.contains("access-secret") && !printed.contains("refresh-secret"));
+    }
+
+    /// The bearer token a client holds is wiped on drop (G2-47).
+    #[test]
+    fn the_client_token_zeroizes_on_drop() {
+        let c = FleetClient::new("https://team.example.com", "tok").unwrap();
+        let _: &dyn zeroize::ZeroizeOnDrop = &c.token;
+        assert_eq!(c.token.as_str(), "tok");
+    }
+
+    #[test]
+    fn hex_from_the_server_never_panics_or_takes_signs() {
+        // 32 bytes, but a multi-byte char straddles a digit pair.
+        let straddle = format!("a\u{e9}{}", "0".repeat(29));
+        assert_eq!(straddle.len(), 32);
+        assert!(decode_hex16(&straddle, "x").is_err());
+        assert!(decode_hex16(&format!("+f{}", "0".repeat(30)), "x").is_err());
+        assert_eq!(decode_hex("+f"), None);
+        assert_eq!(decode_hex("0aFF"), Some(vec![0x0a, 0xff]));
+    }
+
+    #[test]
+    fn a_password_goes_only_over_https_or_to_this_machine() {
+        for ok in [
+            "https://team.example",
+            "https://10.0.0.5:8443",
+            "http://127.0.0.1:38200",
+            "http://localhost:8080",
+            "http://[::1]:9000",
+        ] {
+            assert!(sends_secrets_safely(ok), "{ok}");
+        }
+        for bad in [
+            "http://team.lan",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1.example",
+            "ftp://127.0.0.1",
+            "not a url",
+        ] {
+            assert!(!sends_secrets_safely(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn a_base_url_must_carry_a_scheme() {

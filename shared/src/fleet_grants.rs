@@ -156,7 +156,9 @@ pub fn open_fkek_with_info(
         &grant.ciphertext_bytes,
         &aad,
     )
-    .map_err(|_| GrantError::HpkeFailure)?;
+    .map_err(|_| GrantError::HpkeFailure)
+    // The plaintext is key material: wipe this buffer too, not only the copy.
+    .map(Zeroizing::new)?;
 
     if pt.len() != FKEK_LEN {
         return Err(GrantError::BadFkekLength);

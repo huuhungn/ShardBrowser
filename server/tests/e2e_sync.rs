@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+// Test ports are fixed at 28xxx: below the Linux ephemeral range (32768+),
+// where a parallel test's client socket could already hold them.
 fn base(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -81,7 +83,7 @@ async fn token(c: &reqwest::Client, port: u16, user: &str, pass: &str) -> String
 
 #[tokio::test]
 async fn checkout_checkin_snapshot_roundtrip() {
-    let port = 38080u16;
+    let port = 28080u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -202,7 +204,7 @@ async fn checkout_checkin_snapshot_roundtrip() {
 
 #[tokio::test]
 async fn acl_perm_and_folder_recursion_and_proxy_scoping() {
-    let port = 38081u16;
+    let port = 28081u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-acl-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -393,7 +395,7 @@ async fn acl_perm_and_folder_recursion_and_proxy_scoping() {
 
 #[tokio::test]
 async fn stale_lock_takeover_and_password_invalidation() {
-    let port = 38082u16;
+    let port = 28082u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-lock-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -559,7 +561,7 @@ async fn stale_lock_takeover_and_password_invalidation() {
 /// snapshot out from under the live session.
 #[tokio::test]
 async fn snapshot_download_requires_lock_token() {
-    let port = 38083u16;
+    let port = 28083u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-dl-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -697,7 +699,7 @@ async fn snapshot_download_requires_lock_token() {
 /// fresh token, and steal the lock (which would also bypass the download check).
 #[tokio::test]
 async fn reacquiring_live_lock_requires_token() {
-    let port = 38084u16;
+    let port = 28084u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-remint-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -758,7 +760,7 @@ async fn reacquiring_live_lock_requires_token() {
 /// before any password verify — brute-force / Argon2 CPU-exhaustion guard.
 #[tokio::test]
 async fn login_throttles_after_repeated_failures() {
-    let port = 38085u16;
+    let port = 28085u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-throttle-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -791,7 +793,7 @@ async fn login_throttles_after_repeated_failures() {
 /// maps to 400, not a 500 leaking SQL / constraint text.
 #[tokio::test]
 async fn bad_foreign_key_is_client_error_not_500() {
-    let port = 38086u16;
+    let port = 28086u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-fk-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -817,7 +819,7 @@ async fn bad_foreign_key_is_client_error_not_500() {
 /// ACL grants against a nonexistent target or user are refused (no ghost rows).
 #[tokio::test]
 async fn acl_grant_rejects_ghost_target_or_user() {
-    let port = 38087u16;
+    let port = 28087u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-ghost-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -896,7 +898,7 @@ async fn acl_grant_rejects_ghost_target_or_user() {
 /// with 404 (not a 500/leaky FK error).
 #[tokio::test]
 async fn env_update_clears_folder_and_rejects_bad_folder() {
-    let port = 38088u16;
+    let port = 28088u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-envupd-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
@@ -953,7 +955,7 @@ async fn env_update_clears_folder_and_rejects_bad_folder() {
 /// not axum's default plain-text rejection.
 #[tokio::test]
 async fn malformed_json_body_returns_json_error() {
-    let port = 38089u16;
+    let port = 28089u16;
     let data = std::env::temp_dir().join(format!("shardx-e2e-badjson-{}", std::process::id()));
     let _guard = spawn_server(&data, port);
     let c = client();
