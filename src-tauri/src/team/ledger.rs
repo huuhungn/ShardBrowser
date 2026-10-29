@@ -27,10 +27,11 @@
 //!   moves earlier and starts the 1095-day clip of every later evaluation,
 //!   the latest end, which only moves later, and the local time this device
 //!   first found that known custody ended (sticky lapse, [`lapse_allows`]).
+//!   That lapse is taken from history before new containers are accepted
+//!   (Q-25, [`observe_lapses`]), never from the evidence being accepted.
 //! - **Fleet key grants** (G2-35): the exact grant behind each collected
-//!   fleet key and the pages it verified against, so sync can reverify it
-//!   before use ([`fleet_key_grant`]); sync does not use such keys yet
-//!   (`fleet_keys::keys_newest_first`).
+//!   fleet key and the pages it verified against, so sync pull reverifies it
+//!   before each use ([`fleet_key_grant`], [`withdrawn`]).
 //!
 //! Not here yet: the custodian change events of D-6 (a), whose wording and
 //! acknowledgement follow the Q-17 UX review.
@@ -130,16 +131,19 @@ pub fn distrust_key(db: &Db, binding: &Binding, key: &[u8; 32], now: u64) -> Res
     Ok(())
 }
 
-/// `pages` as this device's history lets it see them ([`prepare`]), and the
-/// chain they verify to from `anchor`, with every key's windows clipped from
-/// its cached `first_not_before` when that is earlier (D-6 (c)). `None` when
-/// they do not verify.
+/// `pages` at `now` as this device's history lets it see them: first the
+/// lapses history shows ([`observe_lapses`]), then [`prepare`], and the chain
+/// they verify to from `anchor`, with every key's windows clipped from its
+/// cached `first_not_before` when that is earlier (D-6 (c)). `None` when they
+/// do not verify.
 pub fn evaluate(
     db: &Db,
     binding: &Binding,
     anchor: &[u8; 32],
     pages: &[TenantTrustEvidencePageV2],
+    now: u64,
 ) -> Result<Option<(Vec<TenantTrustEvidencePageV2>, TrustChain)>> {
+    observe_lapses(db, binding, now)?;
     let seen = prepare(db, binding, pages)?;
     let Ok(mut evidence) = Evidence::collect(binding, &seen) else {
         return Ok(None);
@@ -157,6 +161,71 @@ pub fn evaluate(
     Ok(TrustChain::evaluate(evidence, Some(anchor))
         .ok()
         .map(|chain| (seen, chain)))
+}
+
+/// Q-25, before any new container is accepted: every custodian key whose
+/// known custody, from the root grants earlier evaluations counted, has
+/// ended at `now` is held as lapsed as of the latest evaluation, so whatever
+/// is first seen from here on meets that lapse. For such a key nothing in the
+/// evidence being accepted can backdate past it or extend the key first, and
+/// a key the evidence leaves out is not lapsed while its known custody runs.
+///
+/// Only keys an earlier evaluation counted are covered (the D-6 no-history
+/// limit): a server that withheld D's root grant for all of D's window, or a
+/// device offline for it, finds nothing here, so when the root grant arrives
+/// later with a grant backdated into that window from D's stolen key, the
+/// lapse is recorded in that accepting evaluation and the grant keeps its
+/// standing.
+fn observe_lapses(db: &Db, binding: &Binding, now: u64) -> Result<()> {
+    let (instance, tenant) = ids(binding);
+    let latest: Option<i64> = db.conn.query_row(
+        "SELECT max(evaluation_id) FROM trust_evaluations
+         WHERE server_instance_id = ?1 AND tenant_id = ?2",
+        params![instance, tenant],
+        |r| r.get(0),
+    )?;
+    match latest {
+        Some(evaluation) => hold_lapses(&db.conn, binding, evaluation, now),
+        None => Ok(()),
+    }
+}
+
+/// Holds as lapsed in `evaluation`, at `now`, every custodian key of
+/// `binding` not yet lapsed whose known custody, clipped at its key age, has
+/// ended within the clock tolerance.
+fn hold_lapses(
+    conn: &rusqlite::Connection,
+    binding: &Binding,
+    evaluation: i64,
+    now: u64,
+) -> Result<()> {
+    let (instance, tenant) = ids(binding);
+    conn.execute(
+        "UPDATE trust_custodian_keys SET lapsed_evaluation = ?3, observed_lapsed_at_ms = ?4
+         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND lapsed_evaluation IS NULL
+           AND min(latest_not_after_ms, first_not_before_ms + ?5) <= ?6",
+        params![
+            instance,
+            tenant,
+            evaluation,
+            wire(now)?,
+            wire(MAX_CUSTODIAN_KEY_AGE_MS)?,
+            wire(now.saturating_sub(CLOCK_TOLERANCE_MS))?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Q-26: whether `key` is now proven revoked (rule 6) or locally distrusted,
+/// whenever that was learned.
+pub fn withdrawn(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
+    let (instance, tenant) = ids(binding);
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM trust_proven_revocations
+         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)",
+        params![instance, tenant, hex(key)],
+        |r| r.get(0),
+    )?)
 }
 
 /// `pages` as this device's history lets it see them: containers signed by a
@@ -425,8 +494,9 @@ pub fn record(
     // D-6 (a)-(c), from counted root grants only: the cached
     // `first_not_before` only moves earlier, the known end of custody only
     // later, and a key whose known custody (clipped at its key age) has
-    // ended is held as lapsed from the first evaluation that finds it. A key
-    // the server leaves out keeps what this device already knows.
+    // ended is held as lapsed from this evaluation on, if the history
+    // `evaluate` read had not lapsed it already (Q-25). A key the server
+    // leaves out keeps what this device already knows.
     for (key, first_not_before, end) in chain.custodians() {
         // A window that starts past the year 292 million is no custody yet.
         let Ok(at) = wire(first_not_before) else {
@@ -447,19 +517,7 @@ pub fn record(
             ],
         )?;
     }
-    tx.execute(
-        "UPDATE trust_custodian_keys SET lapsed_evaluation = ?3, observed_lapsed_at_ms = ?4
-         WHERE server_instance_id = ?1 AND tenant_id = ?2 AND lapsed_evaluation IS NULL
-           AND min(latest_not_after_ms, first_not_before_ms + ?5) <= ?6",
-        params![
-            instance,
-            tenant,
-            evaluation,
-            wire(now)?,
-            wire(MAX_CUSTODIAN_KEY_AGE_MS)?,
-            wire(now.saturating_sub(CLOCK_TOLERANCE_MS))?
-        ],
-    )?;
+    hold_lapses(&tx, binding, evaluation, now)?;
     if let Some(o) = opened {
         tx.execute(
             "INSERT INTO trust_fleet_generations VALUES (?1, ?2, ?3, ?4)
