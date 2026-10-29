@@ -682,8 +682,8 @@ CREATE UNIQUE INDEX fleet_key_one_active_generation
 ON fleet_key_state(server_id, server_instance_id, tenant_id, fleet_id)
 WHERE state = 'ACTIVE';
 
--- shortcut: schema only; the recovery and downgrade journals are written by
--- WP-5 (probe 9, L2044).
+-- The recovery and downgrade journals are written by `team::journal` and
+-- used by `team::downgrade` (probe 9, L2044).
 CREATE TABLE restore_journals (
   local_profile_id   TEXT PRIMARY KEY REFERENCES profile_bindings(local_profile_id) ON DELETE RESTRICT,
   journal_id         TEXT NOT NULL UNIQUE,

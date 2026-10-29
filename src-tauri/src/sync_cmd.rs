@@ -390,6 +390,72 @@ fn profile_ref(profile_id: &str) -> String {
     full[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Unbinds the stopped profile `profile_id` from its team profile in the
+/// Launcher database alone (plan L2239): the exact `UNBIND` receipt is stored
+/// before the binding is deleted, and the profile stays a local one.
+#[tauri::command]
+pub async fn team_unbind_profile(profile_id: String) -> Result<team::downgrade::Unbound, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        team::downgrade::unbind_profile(&profile_id, &c.server_url, now_ms())
+    })
+    .await
+    .map_err(|e| crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())]))?
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// Whether this launcher may go back to v0.1.28 now, and what stops it
+/// (plan L2240). Derived from the database and the disk on every call.
+#[tauri::command]
+pub async fn team_downgrade_status() -> Result<team::downgrade::Readiness, String> {
+    tauri::async_runtime::spawn_blocking(team::downgrade::readiness)
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The downgrade clone flow for the stopped, bound profile `profile_id`
+/// (plan L2240): the original moves out of everything v0.1.28 reads, and a
+/// clone with a new local ID takes its place.
+#[tauri::command]
+pub async fn team_downgrade_clone(
+    profile_id: String,
+) -> Result<team::downgrade::CloneDone, String> {
+    tauri::async_runtime::spawn_blocking(move || team::downgrade::start_clone(&profile_id))
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Puts the original profile back and removes the clone, for a downgrade that
+/// cannot finish (plan L2240: a journal that asks for it rolls back).
+#[tauri::command]
+pub async fn team_downgrade_rollback(
+    journal_id: String,
+) -> Result<team::downgrade::CloneDone, String> {
+    tauri::async_runtime::spawn_blocking(move || team::downgrade::roll_back_clone(&journal_id))
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Finishes, or rolls back, every downgrade a crash cut off.
+#[tauri::command]
+pub async fn team_downgrade_resume() -> Result<Vec<team::downgrade::Resumed>, String> {
+    tauri::async_runtime::spawn_blocking(team::downgrade::resume_open)
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

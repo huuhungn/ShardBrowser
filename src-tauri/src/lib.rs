@@ -4642,6 +4642,11 @@ pub fn run() {
             sync_cmd::profile_sync_push,
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
+            sync_cmd::team_unbind_profile,
+            sync_cmd::team_downgrade_status,
+            sync_cmd::team_downgrade_clone,
+            sync_cmd::team_downgrade_resume,
+            sync_cmd::team_downgrade_rollback,
             backup_cmd::profile_backup_restore,
             backup_cmd::profile_backup_inspect,
             trash_list,
@@ -4846,6 +4851,21 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[launcher] trash sweep failed: {e}"),
             }
+
+            // Finish, or undo, a downgrade a crash cut off (plan L2240).
+            tauri::async_runtime::spawn_blocking(|| match team::downgrade::resume_open() {
+                Ok(resumed) => {
+                    for r in resumed.iter().filter(|r| r.error.is_some()) {
+                        eprintln!(
+                            "[launcher] downgrade {} stays at {}: {}",
+                            r.journal_id,
+                            r.phase,
+                            r.error.as_deref().unwrap_or_default()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[launcher] downgrade resume failed: {e:#}"),
+            });
 
             // Clean up temporary profiles from crashed runs.
             match profile::purge_temporary() {

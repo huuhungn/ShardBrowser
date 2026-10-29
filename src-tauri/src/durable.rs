@@ -59,7 +59,7 @@ fn restrict(path: &Path) {
 fn restrict(_path: &Path) {}
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => fs::File::open(dir)?.sync_all(),
         _ => Ok(()),
@@ -68,7 +68,7 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 
 /// `MOVEFILE_WRITE_THROUGH` already flushed the move.
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

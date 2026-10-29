@@ -2208,9 +2208,6 @@ async fn release_reply(
 /// binding is gone, a retry returns the stored response again, after its
 /// tombstone recomputes from the stored request and response (L969-L970).
 /// `server_url` names the `server_id` the tombstone carries.
-// shortcut: no command calls this yet, as no product path files a binding;
-// the downgrade flow (L2232-L2239) adds the command with its UI.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>> {
     let db = Db::open()?;
     let tx =
