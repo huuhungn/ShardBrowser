@@ -47,9 +47,10 @@ use shardx_core::mutation::{
 use shardx_core::profile_lease::{
     CreateUploadV2, LeaseOrigin, LeaseRef, LeaseReleasedV2, LeaseRenewV2, LeaseRenewedV2,
     LocalBindingTombstoneV2, LocalUnbindV2, LocalUnboundV2, ProfileCheckoutV2, ProfileLeaseV2,
-    ProfileRef, ReleaseLeaseV2, ReleaseReason, UnboundBinding, UploadCreatedV2, UploadFinalizedV2,
-    RECORD_TYPE_CHECKED_OUT, RECORD_TYPE_LEASE_RELEASED, RECORD_TYPE_LOCAL_UNBOUND,
-    RECORD_TYPE_UPLOAD_CREATED, RECORD_TYPE_UPLOAD_FINALIZED,
+    ProfilePublishCreateV2, ProfileRef, ReleaseLeaseV2, ReleaseReason, UnboundBinding,
+    UploadCreatedV2, UploadFinalizedV2, RECORD_TYPE_CHECKED_OUT, RECORD_TYPE_LEASE_RELEASED,
+    RECORD_TYPE_LOCAL_UNBOUND, RECORD_TYPE_PUBLISH_CREATED, RECORD_TYPE_UPLOAD_CREATED,
+    RECORD_TYPE_UPLOAD_FINALIZED,
 };
 use shardx_core::restore_epoch::{
     verify_inclusion, InclusionError, RestoreEpochInclusionProofV2, SignedRestoreEpochTransitionV2,
@@ -67,6 +68,10 @@ use crate::fleet_client::{decode_hex16, hex, Exact, FleetClient};
 
 /// The pilot lease TTL (plan 10.1 L1398 proposes 90 s; uploads renew).
 const LEASE_TTL_SECONDS: u32 = 300;
+/// How far past `now` plus one TTL a lease expiry the server grants may lie.
+// shortcut: a fixed allowance for clock skew between this device and the
+// server; make it configurable when a fleet needs a different one.
+const LEASE_SKEW_MS: u64 = 60_000;
 /// PATCH chunk size; the server takes up to 8 MiB.
 #[cfg(not(test))]
 const CHUNK: usize = 4 << 20;
@@ -93,6 +98,8 @@ pub(crate) struct Pushed {
 /// A `profile_bindings` row.
 struct Bound {
     local: String,
+    /// The `server_origins` row of the instance.
+    server: String,
     instance: [u8; 16],
     tenant: [u8; 16],
     fleet: [u8; 16],
@@ -139,6 +146,8 @@ struct Op {
     manifest_hash: Option<Vec<u8>>,
     manifest_sha: Option<Vec<u8>>,
     receipt: Option<Vec<u8>>,
+    server: String,
+    scope: String,
 }
 
 /// What a new operation row carries besides its request.
@@ -150,6 +159,9 @@ struct Columns<'a> {
     intent: Option<[u8; 32]>,
     cipher: Option<[u8; 32]>,
     manifest: Option<&'a SignedSnapshotManifestV2>,
+    /// The operation precedes its binding (a publish): `local_profile_id` stays
+    /// NULL, as an unbind leaves it, and the binding adopts the row.
+    unbound: bool,
 }
 
 fn bad(field: &str) -> anyhow::Error {
@@ -206,7 +218,7 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
         .query_row(
             "SELECT server_instance_id, tenant_id, fleet_id, remote_profile_id, remote_version,
                     last_observed_head_hash, accepted_restore_epoch, lease_id, fencing_token,
-                    sync_state, last_error_code
+                    sync_state, last_error_code, server_id
              FROM profile_bindings WHERE local_profile_id = ?1",
             [local],
             |r| {
@@ -219,13 +231,23 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
                     r.get::<_, Option<i64>>(8)?,
                     r.get::<_, String>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
                 ))
             },
         )
         .optional()?
         .ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
-    let ([instance, tenant, fleet, profile], version, head, epoch, lease_id, fence, state, error) =
-        row;
+    let (
+        [instance, tenant, fleet, profile],
+        version,
+        head,
+        epoch,
+        lease_id,
+        fence,
+        state,
+        error,
+        server,
+    ) = row;
     let version = version as u64;
     let lease = match (lease_id, fence) {
         (Some(id), Some(f)) => Some(LeaseRef {
@@ -237,6 +259,7 @@ fn bound(db: &Db, local: &str) -> Result<Bound> {
     };
     Ok(Bound {
         local: local.to_string(),
+        server,
         instance: decode_hex16(&instance, "server_instance_id")?,
         tenant: decode_hex16(&tenant, "tenant_id")?,
         fleet: decode_hex16(&fleet, "fleet_id")?,
@@ -278,7 +301,7 @@ const OP_COLUMNS: &str = "op_id, kind, state, server_instance_id, restore_epoch,
     exact_request_bytes_sha256, remote_upload_id, lease_id, fencing_token, base_version,
     snapshot_id, manifest_replay_id, intent_hash, ciphertext_sha256,
     signed_manifest_container_bytes, signed_manifest_container_hash,
-    signed_manifest_container_bytes_sha256, exact_receipt_bytes";
+    signed_manifest_container_bytes_sha256, exact_receipt_bytes, server_id, operation_scope";
 
 fn op_row(r: &rusqlite::Row) -> rusqlite::Result<Op> {
     Ok(Op {
@@ -304,6 +327,8 @@ fn op_row(r: &rusqlite::Row) -> rusqlite::Result<Op> {
         manifest_hash: r.get(19)?,
         manifest_sha: r.get(20)?,
         receipt: r.get(21)?,
+        server: r.get(22)?,
+        scope: r.get(23)?,
     })
 }
 
@@ -355,14 +380,14 @@ fn insert_op(
 ) -> Result<()> {
     let m = c.manifest;
     conn.execute(
-        "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request,
+        "INSERT INTO operations(op_id, local_profile_id, local_profile_id_at_request, server_id,
            server_instance_id, restore_epoch, tenant_id, fleet_id, remote_profile_id,
            snapshot_id, manifest_replay_id, operation_scope, kind, idempotency_key,
            canonical_request_hash, exact_request_bytes, exact_request_bytes_sha256,
            remote_upload_id, lease_id, fencing_token, base_version, intent_hash,
            ciphertext_sha256, signed_manifest_container_bytes, signed_manifest_container_hash,
            signed_manifest_container_bytes_sha256, state, created_at, updated_at)
-         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+         VALUES (?1, ?25, ?2, ?26, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
            ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'PENDING',
            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         params![
@@ -390,6 +415,8 @@ fn insert_op(
             m.map(|m| m.exact_bytes().to_vec()),
             m.map(|m| m.signed_container_hash().to_vec()),
             m.map(|m| m.exact_bytes_sha256().to_vec()),
+            (!c.unbound).then_some(&b.local),
+            b.server,
         ],
     )?;
     Ok(())
@@ -418,6 +445,7 @@ fn mutation(
 
 fn kind_of(kind: &str) -> Option<OperationKind> {
     Some(match kind {
+        "PUBLISH" => OperationKind::ProfilePublishCreate,
         "CHECKOUT" => OperationKind::ProfileCheckout,
         "UPLOAD" => OperationKind::CreateUpload,
         "FINALIZE" => OperationKind::FinalizeUpload,
@@ -461,6 +489,11 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
         ]);
         let p = &req.canonical_payload_bytes;
         match kind {
+            OperationKind::ProfilePublishCreate => {
+                let ok = ProfilePublishCreateV2::parse(p)
+                    .is_ok_and(|c| text(&op.remote_profile, &c.profile.profile_id));
+                checks.push(("remote_profile_id", ok));
+            }
             OperationKind::ProfileCheckout => {
                 let ok = ProfileCheckoutV2::parse(p)
                     .is_ok_and(|c| text(&op.remote_profile, &c.profile.profile_id));
@@ -596,6 +629,10 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
                 "upload.dek_slot_sha256",
                 s.dek_slot[..] == p.dek_slot_sha256,
             ),
+            ("upload.server_id", s.server == op.server),
+            ("upload.operation_scope", s.scope == op.scope),
+            ("upload.idempotency_key", s.key == op.key),
+            ("upload.canonical_request_hash", s.canonical == op.canonical),
             ("upload.fkek_key_id", s.fkek_key_id == hex(&p.fkek_key_id)),
             (
                 "upload.key_generation",
@@ -612,12 +649,23 @@ fn first_drift(db: &Db, op: &Op) -> Result<Option<&'static str>> {
             ("spool", sha256(&spooled) == p.ciphertext_sha256),
         ]);
     }
+    let filed: i64 = db.conn.query_row(
+        "SELECT count(*) FROM server_origins WHERE server_id = ?1 AND server_instance_id = ?2",
+        [&op.server, &op.instance],
+        |r| r.get(0),
+    )?;
+    checks.push(("server_id", filed == 1));
     Ok(checks.into_iter().find(|(_, ok)| !ok).map(|(f, _)| f))
 }
 
 /// `op`'s exact stored bytes, once its columns still match them; otherwise
 /// the binding is quarantined and nothing is sent.
 fn stored<'a>(db: &Db, b: &Bound, op: &'a Op) -> Result<&'a [u8]> {
+    stored_for(db, &b.local, op)
+}
+
+/// [`stored`] for the profile `local`, whose binding may not exist yet.
+fn stored_for<'a>(db: &Db, local: &str, op: &'a Op) -> Result<&'a [u8]> {
     if let Some(field) = first_drift(db, op)? {
         let _ = db.conn.execute(
             "UPDATE operations SET state = 'QUARANTINED' WHERE op_id = ?1",
@@ -625,7 +673,7 @@ fn stored<'a>(db: &Db, b: &Bound, op: &'a Op) -> Result<&'a [u8]> {
         );
         return Err(quarantine(
             db,
-            &b.local,
+            local,
             "STORED_REQUEST_MISMATCH",
             anyhow!(code_with("sync.storedRequestMismatch", &[("field", field)])),
         ));
@@ -656,6 +704,13 @@ fn settle(db: &Db, op: &Op, reply: Exact) -> Result<std::result::Result<Vec<u8>,
 /// ask to resend later (plan 8.2 L1224, L1244).
 fn terminal(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 401 | 408 | 429)
+}
+
+/// Whether a lease expiry the server granted is plausible at `now`: still
+/// ahead, and no further than one TTL and the skew allowance.
+fn lease_expiry_ok(expires_at_ms: u64, now: u64) -> bool {
+    expires_at_ms > now
+        && expires_at_ms <= now + u64::from(LEASE_TTL_SECONDS) * 1000 + LEASE_SKEW_MS
 }
 
 fn refused(reply: &Exact) -> anyhow::Error {
@@ -727,9 +782,9 @@ fn stored_response(op: &Op, record_type: &str, body: &[u8]) -> Result<Vec<u8>> {
 
 /// Marks `op` COMPLETED with its exact response, which is also its receipt
 /// for a commit or release.
-fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]) -> Result<()> {
+fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]) -> Result<usize> {
     let receipt = matches!(op.kind.as_str(), "COMMIT" | "RELEASE");
-    conn.execute(
+    Ok(conn.execute(
         "UPDATE operations SET state = 'COMPLETED', response_record_type = ?2,
            exact_response_bytes = ?3, exact_response_bytes_sha256 = ?4,
            exact_receipt_bytes = CASE WHEN ?5 THEN ?3 END,
@@ -737,8 +792,7 @@ fn complete(conn: &rusqlite::Connection, op: &Op, record_type: &str, body: &[u8]
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE op_id = ?1 AND state = 'PENDING'",
         params![op.op_id, record_type, body, sha256(body).to_vec(), receipt],
-    )?;
-    Ok(())
+    )?)
 }
 
 /// An `upload_sessions` row.
@@ -758,6 +812,10 @@ struct Session {
     size: u64,
     spool: String,
     state: String,
+    server: String,
+    scope: String,
+    key: String,
+    canonical: Vec<u8>,
 }
 
 fn session(db: &Db, commit_op: &str) -> Result<Session> {
@@ -765,7 +823,7 @@ fn session(db: &Db, commit_op: &str) -> Result<Session> {
         "SELECT upload_local_id, server_instance_id, restore_epoch, remote_upload_id, snapshot_id,
                 manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
                 key_generation, expected_ciphertext_sha256, expected_ciphertext_size, spool_ref,
-                state
+                state, server_id, operation_scope, idempotency_key, canonical_request_hash
          FROM upload_sessions WHERE commit_op_id = ?1",
         [commit_op],
         |r| {
@@ -785,6 +843,10 @@ fn session(db: &Db, commit_op: &str) -> Result<Session> {
                 size: r.get::<_, i64>(12)? as u64,
                 spool: r.get(13)?,
                 state: r.get(14)?,
+                server: r.get(15)?,
+                scope: r.get(16)?,
+                key: r.get(17)?,
+                canonical: r.get(18)?,
             })
         },
     )?)
@@ -925,7 +987,10 @@ async fn accept_transitions(
         Some(lease) => {
             let op = match find(db, &b.local, "RELEASE", Some(&lease), Some("PENDING"))? {
                 Some(op) => op,
-                None => get_op(db, &release_op(&db.conn, b, lease)?)?,
+                None => get_op(
+                    db,
+                    &release_op(&db.conn, b, lease, ReleaseReason::UserRelease)?,
+                )?,
             };
             release_reply(client, access, db, b, &op).await?;
             db.conn.execute(
@@ -1200,7 +1265,12 @@ fn store_transitions(
     (epoch, version, head): (u64, u64, Option<[u8; 32]>),
     record: impl FnOnce(&rusqlite::Connection) -> Result<()>,
 ) -> Result<bool> {
-    let tx = db.conn.transaction()?;
+    // Immediate: this one reads before it writes, and a deferred transaction
+    // that must upgrade while another handle commits is refused at once
+    // ("database is locked") instead of waiting out the busy timeout.
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (instance, tenant, profile) = (hex(&b.instance), hex(&b.tenant), hex(&b.profile));
     let server = super::records::origin(&tx, server_url, &instance, wire(b.epoch)?)?;
     for s in steps {
@@ -1317,7 +1387,7 @@ fn store_transitions(
     Ok(true)
 }
 
-/// The FKEK of `generation` naming `fkek_key_id`, from a grant that
+/// The FKEK of `generation` naming `fkek_key_id` (any, for `None`), from a grant that
 /// reverifies now (G2-35, Q-25, Q-26). A generation below the highest this
 /// device verified is refused ("Fleet generation freshness"). Never a
 /// passphrase.
@@ -1326,7 +1396,7 @@ fn verified_key(
     dev: &Device,
     fleet: &[u8; 16],
     generation: u64,
-    fkek_key_id: &[u8; 32],
+    fkek_key_id: Option<&[u8; 32]>,
     now: u64,
 ) -> Result<Zeroizing<[u8; 32]>> {
     let none = || anyhow!(code("sync.noVerifiedFleetKey"));
@@ -1339,7 +1409,7 @@ fn verified_key(
         .into_iter()
         .find(|(k, g)| {
             *g == generation
-                && shardx_core::fleet_grants::fkek_key_id(k) == *fkek_key_id
+                && fkek_key_id.is_none_or(|id| shardx_core::fleet_grants::fkek_key_id(k) == *id)
                 && crate::fleet_key_verifies(db, &dev.pin, &dev.me, fleet, *g, k, now)
                     .unwrap_or(false)
         })
@@ -1356,7 +1426,8 @@ fn verified_key(
 // ---------------------------------------------------------------- push ----
 
 /// Pushes the published profile `local` from `udd`, resuming whatever
-/// operation an earlier attempt left (plan L1137-L1215).
+/// operation an earlier attempt left (plan L1137-L1215). `clock` is the time
+/// since the push began, which decides when the lease is renewed.
 pub(crate) async fn push(
     client: &FleetClient,
     access: &str,
@@ -1364,8 +1435,10 @@ pub(crate) async fn push(
     local: &str,
     udd: &Path,
     now: u64,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
     loop {
         let b = bound(&db, local)?;
         if awaits_transition(&b) {
@@ -1404,7 +1477,17 @@ pub(crate) async fn push(
         match s.state.as_str() {
             "OPEN" => {
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
-                    transfer(client, access, &mut db, &b, lease, &commit_op, &s).await?;
+                    transfer(
+                        client,
+                        access,
+                        &mut db,
+                        &b,
+                        lease,
+                        &commit_op,
+                        &s,
+                        (now, clock),
+                    )
+                    .await?;
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
@@ -1412,6 +1495,478 @@ pub(crate) async fn push(
             _ => return Err(bad("upload_sessions.state")),
         }
     }
+}
+
+// ------------------------------------------------------------- publish ----
+
+/// The server a fleet key was filed under (G2-36): the one `fleet_key_state`
+/// row of `b`'s fleet that holds `generation` as `fkek_key_id`.
+fn key_server(db: &Db, b: &Bound, generation: u64, fkek_key_id: &[u8; 32]) -> Result<String> {
+    let rows = db
+        .conn
+        .prepare(
+            "SELECT server_id FROM fleet_key_state
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+               AND generation = ?4 AND fkek_key_id = ?5",
+        )?
+        .query_map(
+            params![
+                hex(&b.instance),
+                hex(&b.tenant),
+                hex(&b.fleet),
+                wire(generation)?,
+                hex(fkek_key_id)
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match <[String; 1]>::try_from(rows) {
+        Ok([server]) => Ok(server),
+        Err(_) => bail!(code("sync.fleetKeyRecollect")),
+    }
+}
+
+/// A finished publish: the version-0 profile and the first lease.
+#[derive(Debug)]
+pub(crate) struct Published {
+    pub profile: [u8; 16],
+    pub lease: LeaseRef,
+    pub expires_at_ms: u64,
+}
+
+/// `PROFILE_PUBLISH_CREATE` of `local` as the new profile `profile` of
+/// `fleet`, labelled `label` (sealed under the verified fleet key), or the
+/// replay of the one an earlier attempt stored (plan L300, L1137, L1422,
+/// L2048). The request is stored as exact bytes before it is sent; a lost
+/// reply is answered by the server's stored response, so no second profile
+/// or lease exists. The binding is written only with the complete response
+/// (L2233), in the transaction that completes the operation.
+// A pending publish of another fleet is refused rather than replayed into
+// the wrong fleet, and `profile` only names a new request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    label: &str,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    now: u64,
+) -> Result<Published> {
+    let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
+    if is_bound(&db, local)? {
+        bail!(code("sync.alreadyPublished"));
+    }
+    let op = match pending_publish(&db, local)? {
+        Some(op) => op,
+        None => {
+            store_publish(
+                client, access, &mut db, dev, local, label, fleet, profile, now,
+            )
+            .await?
+        }
+    };
+    send_publish(client, access, &mut db, dev, local, fleet, &op, now).await
+}
+
+fn is_bound(db: &Db, local: &str) -> Result<bool> {
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
+        [local],
+        |r| r.get(0),
+    )?)
+}
+
+/// The newest PENDING `PUBLISH` requested for `local`. Its binding does not
+/// exist yet, so it is found by the name it was requested under.
+fn pending_publish(db: &Db, local: &str) -> Result<Option<Op>> {
+    Ok(db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT {OP_COLUMNS} FROM operations
+                 WHERE kind = 'PUBLISH' AND local_profile_id_at_request = ?1 AND state = 'PENDING'
+                 ORDER BY rowid DESC LIMIT 1"
+            ),
+            [local],
+            op_row,
+        )
+        .optional()?)
+}
+
+/// Builds the request of a new publish and stores it, PENDING, unsent.
+#[allow(clippy::too_many_arguments)]
+async fn store_publish(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    local: &str,
+    label: &str,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    now: u64,
+) -> Result<Op> {
+    let mut b = Bound {
+        local: local.to_string(),
+        server: String::new(),
+        instance: dev.pin.0.server_instance_id,
+        tenant: dev.pin.0.tenant_id,
+        fleet,
+        profile,
+        version: 0,
+        head: None,
+        epoch: 0,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    };
+    // The listing names the server's instance and epoch (it must be the
+    // pinned instance) and shows whether the ID is taken.
+    let (epoch, listed) = listing(client, access, &b).await?;
+    if listed.is_some() {
+        bail!(code("sync.publishProfileTaken"));
+    }
+    // A new profile has no history to roll back, so an epoch ahead of the one
+    // this device accepted is taken as it is; one behind it is a rollback.
+    let accepted: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT last_restore_epoch FROM server_origins WHERE server_instance_id = ?1",
+            [hex(&b.instance)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if accepted.is_some_and(|e| epoch < e as u64) {
+        bail!(code("sync.headRollback"));
+    }
+    b.epoch = epoch;
+    let generation = ledger::highest_generation(db, &dev.pin.0, &fleet)?
+        .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
+    let fkek = verified_key(db, dev, &fleet, generation, None, now)?;
+    b.server = key_server(
+        db,
+        &b,
+        generation,
+        &shardx_core::fleet_grants::fkek_key_id(&fkek),
+    )?;
+    if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &fleet, generation)? {
+        bail!(code("sync.commitBlockedCompromised"));
+    }
+    let label_ciphertext = shardx_core::keys::seal_label(
+        &fkek,
+        &random()?,
+        &b.tenant,
+        &fleet,
+        &profile,
+        generation,
+        label.trim().as_bytes(),
+    )
+    .map_err(|_| anyhow!(code("sync.badProfileLabel")))?;
+    let request = ProfilePublishCreateV2 {
+        profile: b.pref(),
+        label_ciphertext,
+        requested_lease_ttl_seconds: LEASE_TTL_SECONDS,
+        fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&fkek),
+        key_generation: generation,
+    };
+    let kind = OperationKind::ProfilePublishCreate;
+    let (key, exact, canonical) = mutation(kind, request.encode(), &b)?;
+    let op_id = hex(&random::<16>()?);
+    let scope = format!("{} /v2/fleets/{}/profiles", kind.scope(), hex(&fleet));
+    let columns = Columns {
+        unbound: true,
+        ..Default::default()
+    };
+    insert_op(
+        &db.conn, &b, &op_id, "PUBLISH", &scope, &key, &canonical, &exact, &columns,
+    )?;
+    get_op(db, &op_id)
+}
+
+/// Sends the stored `PUBLISH`, checks the stored response names exactly what
+/// was asked, and files the binding with the operation's completion.
+#[allow(clippy::too_many_arguments)]
+async fn send_publish(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    local: &str,
+    fleet: [u8; 16],
+    op: &Op,
+    now: u64,
+) -> Result<Published> {
+    let me = &dev.me;
+    let exact = stored_for(db, local, op)?;
+    let asked = IdempotentMutationRequestV2::parse(exact)
+        .ok()
+        .and_then(|r| ProfilePublishCreateV2::parse(&r.canonical_payload_bytes).ok())
+        .ok_or_else(|| bad("ProfilePublishCreateV2"))?;
+    if asked.profile.fleet_id != fleet {
+        bail!(code("sync.publishPendingElsewhere"));
+    }
+    let b = Bound {
+        local: local.to_string(),
+        server: op.server.clone(),
+        instance: decode_hex16(&op.instance, "server_instance_id")?,
+        tenant: asked.profile.tenant_id,
+        fleet,
+        profile: asked.profile.profile_id,
+        version: 0,
+        head: None,
+        epoch: op.epoch,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    };
+    // Every send, a replay included, needs the key still verified and not
+    // blocked: a compromise counted or a key withdrawn since it was stored
+    // keeps it unsent (cancel it with `cancel_publish`).
+    verified_key(
+        db,
+        dev,
+        &fleet,
+        asked.key_generation,
+        Some(&asked.fkek_key_id),
+        now,
+    )?;
+    if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &fleet, asked.key_generation)? {
+        bail!(code("sync.commitBlockedCompromised"));
+    }
+    let reply = client.publish_profile(access, &fleet, exact).await?;
+    let body = settle(db, op, reply)??;
+    let accepted = || -> Result<ProfileLeaseV2> {
+        let payload = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
+        let g = ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &payload)
+            .map_err(|_| bad("ProfileLeaseV2"))?;
+        let checks = [
+            ("profile", g.profile == b.pref()),
+            ("server_instance_id", g.server_instance_id == b.instance),
+            ("restore_epoch", g.restore_epoch == op.epoch),
+            ("fkek_key_id", g.fkek_key_id == asked.fkek_key_id),
+            ("key_generation", g.key_generation == asked.key_generation),
+            // The first fence of a new profile.
+            ("fencing_token", g.lease.fencing_token == 1),
+        ];
+        match checks.iter().find(|(_, ok)| !ok) {
+            Some((field, _)) => Err(bad(field)),
+            None => Ok(g),
+        }
+    };
+    let g = match accepted() {
+        Ok(g) => g,
+        Err(e) => return Err(refuse_publish(client, access, db, &b, op, &body, e).await),
+    };
+    // The profile exists whatever its lease says, so a reply that names it
+    // is always bound (plan L2048). A lease already over is not held; one
+    // further ahead than a TTL and the skew allowance is held at risk, for
+    // one TTL from now.
+    let held = g.expires_at_ms > now;
+    let at_risk = held && !lease_expiry_ok(g.expires_at_ms, now);
+    let expiry = if at_risk {
+        now + u64::from(LEASE_TTL_SECONDS) * 1000
+    } else {
+        g.expires_at_ms
+    };
+    let state = match (held, at_risk) {
+        (false, _) => "AVAILABLE",
+        (true, true) => "LEASE_AT_RISK",
+        (true, false) => "CHECKED_OUT",
+    };
+    let lease = hex(&g.lease.lease_id);
+    {
+        let tx = db.conn.transaction()?;
+        // Another process may have cancelled the publish since it was read:
+        // the binding is filed only with the completion of this very operation.
+        if complete(&tx, op, RECORD_TYPE_PUBLISH_CREATED, &body)? != 1 {
+            bail!(code("sync.publishChanged"));
+        }
+        tx.execute(
+        "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
+           account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+           accepted_restore_epoch, fencing_token, lease_id, lease_expires_at, fkek_key_id,
+           key_generation, sync_state, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ', ?12 / 1000.0, 'unixepoch'), ?13, ?14,
+           ?15, 1)",
+        params![
+            b.local,
+            b.server,
+            hex(&b.instance),
+            hex(&b.tenant),
+            hex(&me.account_id),
+            hex(&me.device_id),
+            hex(&b.fleet),
+            hex(&b.profile),
+            wire(op.epoch)?,
+            held.then(|| wire(g.lease.fencing_token)).transpose()?,
+            held.then_some(&lease),
+            held.then(|| wire(expiry)).transpose()?,
+            hex(&g.fkek_key_id),
+            wire(g.key_generation)?,
+            state
+        ],
+    )?;
+        tx.execute(
+            "UPDATE operations SET local_profile_id = ?2, lease_id = ?3, fencing_token = ?4,
+           base_version = ?5 WHERE op_id = ?1",
+            params![
+                op.op_id,
+                b.local,
+                lease,
+                wire(g.lease.fencing_token)?,
+                wire(g.lease.base_version)?
+            ],
+        )?;
+        tx.commit()?;
+    }
+    if !held {
+        // Over already: the stored lease is let go, best effort. The binding
+        // exists now, so a push replays the release if this one is lost.
+        let sent = async {
+            let release = release_op(&db.conn, &b, g.lease, ReleaseReason::UserRelease)?;
+            let release = get_op(db, &release)?;
+            release_reply(client, access, db, &b, &release).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] release of an ended first lease: {e:#}");
+        }
+    }
+    Ok(Published {
+        profile: b.profile,
+        lease: g.lease,
+        expires_at_ms: expiry,
+    })
+}
+
+/// A 2xx reply to a stored publish that cannot be accepted ends it: the
+/// operation is QUARANTINED under `err`'s named reason and never replayed
+/// (the server would answer the same). If the reply still names a lease of this
+/// profile in a stored response that verifies, that lease is released with
+/// `cancel_publish`, once and best effort: it lapses at its TTL otherwise.
+async fn refuse_publish(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    b: &Bound,
+    op: &Op,
+    body: &[u8],
+    err: anyhow::Error,
+) -> anyhow::Error {
+    let _ = db.conn.execute(
+        "UPDATE operations SET state = 'QUARANTINED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE op_id = ?1 AND state = 'PENDING'",
+        [&op.op_id],
+    );
+    let lease = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, body)
+        .ok()
+        .and_then(|p| ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &p).ok())
+        .filter(|g| g.profile == b.pref())
+        .map(|g| g.lease);
+    if let Some(lease) = lease {
+        let sent = async {
+            let release = release_op(&db.conn, b, lease, ReleaseReason::CancelPublish)?;
+            let release = get_op(db, &release)?;
+            release_reply(client, access, db, b, &release).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] cancel_publish release: {e:#}");
+        }
+    }
+    err
+}
+
+/// How long an unbound release is worth sending: the lease it names, asked for
+/// one TTL, cannot be live after that and the skew allowance.
+const UNBOUND_RELEASE_SECONDS: u64 = LEASE_TTL_SECONDS as u64 + LEASE_SKEW_MS / 1000;
+
+/// SQL for an unbound release that is past it, which is given up unsent and no
+/// longer counts as work in flight (the downgrade readiness uses it too).
+pub(crate) fn given_up_unbound_release() -> String {
+    format!(
+        "(kind = 'RELEASE' AND local_profile_id IS NULL
+          AND created_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{UNBOUND_RELEASE_SECONDS} seconds'))"
+    )
+}
+
+/// Ends the unbound releases too old to matter and returns the rest.
+fn due_unbound_releases(db: &Db) -> Result<Vec<Op>> {
+    db.conn.execute(
+        &format!(
+            "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE state = 'PENDING' AND {}",
+            given_up_unbound_release()
+        ),
+        [],
+    )?;
+    let mut stmt = db.conn.prepare(&format!(
+        "SELECT {OP_COLUMNS} FROM operations
+         WHERE kind = 'RELEASE' AND state = 'PENDING' AND local_profile_id IS NULL
+         ORDER BY rowid"
+    ))?;
+    let ops = stmt
+        .query_map([], op_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ops)
+}
+
+/// Retries the `cancel_publish` releases an earlier attempt left PENDING: they
+/// name no binding, so nothing else would. One older than a TTL and the skew
+/// allowance (the lease it names cannot be live any more) is ended FAILED
+/// without a request; the rest are sent as stored. Best effort: a failure is
+/// logged and the release waits for the next publish, push or pull.
+async fn retry_unbound_releases(client: &FleetClient, access: &str, db: &mut Db) {
+    let ops = match due_unbound_releases(db) {
+        Ok(ops) => ops,
+        Err(e) => {
+            eprintln!("[sync] unbound releases: {e:#}");
+            return;
+        }
+    };
+    for op in ops {
+        let sent = async {
+            let request = IdempotentMutationRequestV2::parse(&op.exact)
+                .map_err(|_| bad("IdempotentMutationRequestV2"))?;
+            let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes)
+                .map_err(|_| bad("ReleaseLeaseV2"))?;
+            let b = Bound {
+                local: String::new(),
+                server: op.server.clone(),
+                instance: decode_hex16(&op.instance, "server_instance_id")?,
+                tenant: release.profile.tenant_id,
+                fleet: release.profile.fleet_id,
+                profile: release.profile.profile_id,
+                version: 0,
+                head: None,
+                epoch: op.epoch,
+                lease: None,
+                state: "LOCAL".into(),
+                error: None,
+            };
+            release_reply(client, access, db, &b, &op).await
+        };
+        if let Err(e) = sent.await {
+            eprintln!("[sync] cancel_publish release retried: {e:#}");
+        }
+    }
+}
+
+/// Ends the pending publish of `local` without sending it: the way out of a
+/// stored request that `publish` keeps refusing (a key withdrawn or a
+/// compromise counted since it was stored). Nothing is sent, so a request
+/// that had already reached the server leaves its first lease to lapse at its
+/// TTL and the empty profile listed; the next publish names a new profile.
+pub(crate) fn cancel_publish(local: &str) -> Result<()> {
+    let db = Db::open()?;
+    let op = pending_publish(&db, local)?.ok_or_else(|| anyhow!(code("sync.noPublishPending")))?;
+    db.conn.execute(
+        "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE op_id = ?1 AND state = 'PENDING'",
+        [&op.op_id],
+    )?;
+    Ok(())
 }
 
 /// `PROFILE_CHECKOUT` at the pinned head, or the replay of a stored one.
@@ -1463,6 +2018,11 @@ async fn checkout(
         ("profile", g.profile == b.pref()),
         ("server_instance_id", g.server_instance_id == b.instance),
         ("restore_epoch", g.restore_epoch == op.epoch),
+        // A replay may return a lease that has ended since (released below).
+        (
+            "expires_at_ms",
+            lease_expiry_ok(g.expires_at_ms, now) || (replayed && g.expires_at_ms <= now),
+        ),
     ];
     if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
         return Err(bad(field));
@@ -1482,7 +2042,7 @@ async fn checkout(
                  WHERE op_id = ?1",
                 [&op.op_id],
             )?;
-            let release = release_op(&tx, b, g.lease)?;
+            let release = release_op(&tx, b, g.lease, ReleaseReason::UserRelease)?;
             tx.commit()?;
             get_op(db, &release)?
         };
@@ -1500,29 +2060,38 @@ async fn checkout(
         ],
     )?;
     tx.execute(
-        "UPDATE profile_bindings SET lease_id = ?2, fencing_token = ?3, sync_state = 'CHECKED_OUT'
+        "UPDATE profile_bindings SET lease_id = ?2, fencing_token = ?3, sync_state = 'CHECKED_OUT',
+           lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?4 / 1000.0, 'unixepoch')
          WHERE local_profile_id = ?1",
         params![
             b.local,
             hex(&g.lease.lease_id),
-            wire(g.lease.fencing_token)?
+            wire(g.lease.fencing_token)?,
+            wire(g.expires_at_ms)?
         ],
     )?;
     tx.commit()?;
     Ok(())
 }
 
-/// The lease the completed checkout of `lease` granted.
+/// The lease the completed checkout, or else the completed publish, of
+/// `lease` granted.
 fn granted(db: &Db, b: &Bound, lease: &LeaseRef) -> Result<ProfileLeaseV2> {
-    let op = find(db, &b.local, "CHECKOUT", Some(lease), Some("COMPLETED"))?
-        .ok_or_else(|| bad("lease_id"))?;
+    let (op, origin) = match find(db, &b.local, "CHECKOUT", Some(lease), Some("COMPLETED"))? {
+        Some(op) => (op, LeaseOrigin::Checkout),
+        None => (
+            find(db, &b.local, "PUBLISH", Some(lease), Some("COMPLETED"))?
+                .ok_or_else(|| bad("lease_id"))?,
+            LeaseOrigin::PublishCreate,
+        ),
+    };
     let body: Vec<u8> = db.conn.query_row(
         "SELECT exact_response_bytes FROM operations WHERE op_id = ?1",
         [&op.op_id],
         |r| r.get(0),
     )?;
-    let payload = stored_response(&op, RECORD_TYPE_CHECKED_OUT, &body)?;
-    ProfileLeaseV2::parse(LeaseOrigin::Checkout, &payload).map_err(|_| bad("ProfileLeaseV2"))
+    let payload = stored_response(&op, origin.record_type(), &body)?;
+    ProfileLeaseV2::parse(origin, &payload).map_err(|_| bad("ProfileLeaseV2"))
 }
 
 /// Seals the profile under the verified ACTIVE FKEK the checkout named, keeps
@@ -1542,7 +2111,7 @@ async fn seal_snapshot(
 ) -> Result<()> {
     let g = granted(db, b, &lease)?;
     let generation = g.key_generation;
-    let fkek = match verified_key(db, dev, &b.fleet, generation, &g.fkek_key_id, now) {
+    let fkek = match verified_key(db, dev, &b.fleet, generation, Some(&g.fkek_key_id), now) {
         Ok(k) => k,
         Err(e) => return Err(abandon(client, access, db, b, lease, e).await),
     };
@@ -1762,6 +2331,7 @@ fn prepare_commit(db: &mut Db, dev: &Device, b: &Bound, up: &Op) -> Result<()> {
         intent: Some(terms.intent_hash),
         cipher: Some(terms.expected_ciphertext_sha256),
         manifest: Some(&signed),
+        ..Default::default()
     };
     let tx = db.conn.transaction()?;
     insert_op(
@@ -1781,10 +2351,12 @@ fn prepare_commit(db: &mut Db, dev: &Device, b: &Bound, up: &Op) -> Result<()> {
            tenant_id, fleet_id, remote_profile_id, remote_upload_id, snapshot_id,
            manifest_replay_id, intent_hash, preamble_sha256, dek_slot_sha256, fkek_key_id,
            key_generation, expected_ciphertext_sha256, expected_ciphertext_size, spool_ref,
+           server_id, operation_scope, idempotency_key, canonical_request_hash, retry_state,
            state, created_at, updated_at)
-         VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-           ?18, ?19, 'OPEN', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+         SELECT ?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+           ?18, ?19, ?20, operation_scope, idempotency_key, canonical_request_hash, 'NONE', 'OPEN',
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         FROM operations WHERE op_id = ?3",
         params![
             hex(&random::<16>()?),
             b.local,
@@ -1805,6 +2377,7 @@ fn prepare_commit(db: &mut Db, dev: &Device, b: &Bound, up: &Op) -> Result<()> {
             terms.expected_ciphertext_sha256.to_vec(),
             wire(terms.expected_ciphertext_size)?,
             up.op_id,
+            b.server,
         ],
     )?;
     tx.commit()?;
@@ -1837,7 +2410,10 @@ async fn fail_upload(
 }
 
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
-/// a guessed one; an offset conflict asks `HEAD` again.
+/// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
+/// once a third of its TTL has passed on `clock`, which counts from `now`; the
+/// expiry the server then grants must be a plausible one.
+#[allow(clippy::too_many_arguments)]
 async fn transfer(
     client: &FleetClient,
     access: &str,
@@ -1846,11 +2422,12 @@ async fn transfer(
     lease: LeaseRef,
     commit_op: &Op,
     s: &Session,
+    (now, clock): (u64, &(dyn Fn() -> std::time::Duration + Sync)),
 ) -> Result<()> {
     stored(db, b, commit_op)?;
     let object = std::fs::read(spool(&s.spool)?)?;
     let upload = decode_hex16(&s.upload, "upload_id")?;
-    let mut renewed = std::time::Instant::now();
+    let mut renewed = clock();
     for _ in 0..3 {
         let reply = client.upload_head(access, &upload).await?;
         if terminal(reply.status) {
@@ -1872,9 +2449,13 @@ async fn transfer(
             if at == s.size {
                 return Ok(());
             }
-            if renewed.elapsed().as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
-                renew(client, access, b, lease).await?;
-                renewed = std::time::Instant::now();
+            if clock().saturating_sub(renewed).as_secs() > u64::from(LEASE_TTL_SECONDS / 3) {
+                let expires = renew(client, access, b, lease).await?;
+                if !lease_expiry_ok(expires, now + clock().as_millis() as u64) {
+                    return Err(bad("expires_at_ms"));
+                }
+                keep_expiry(&db.conn, &b.local, &lease, expires)?;
+                renewed = clock();
             }
             let end = (at + CHUNK as u64).min(s.size);
             let chunk = &object[at as usize..end as usize];
@@ -1896,8 +2477,9 @@ async fn transfer(
     Err(bad("upload-offset"))
 }
 
-/// `LeaseRenewV2` for the lease this push holds (L1139).
-async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -> Result<()> {
+/// `LeaseRenewV2` for the lease this push holds (L1139); returns the
+/// server's new expiry.
+async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -> Result<u64> {
     let body = LeaseRenewV2 {
         profile: b.pref(),
         lease,
@@ -1911,6 +2493,21 @@ async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -
     if (r.profile, r.lease) != (b.pref(), lease) {
         return Err(bad("lease_id"));
     }
+    Ok(r.expires_at_ms)
+}
+
+/// The server's expiry of `lease`, on the binding that holds it.
+fn keep_expiry(
+    conn: &rusqlite::Connection,
+    local: &str,
+    lease: &LeaseRef,
+    expires_at_ms: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE profile_bindings SET lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?3 / 1000.0, 'unixepoch')
+         WHERE local_profile_id = ?1 AND lease_id = ?2",
+        params![local, hex(&lease.lease_id), wire(expires_at_ms)?],
+    )?;
     Ok(())
 }
 
@@ -2077,13 +2674,17 @@ async fn finish(
     }
     let s = session(db, &op.op_id)?;
     db.conn.execute(
-        "UPDATE profile_bindings SET remote_version = ?2, last_observed_head_hash = ?3,
-           lease_id = NULL, fencing_token = NULL, sync_state = 'AVAILABLE', last_error_code = NULL
+        "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
+           last_observed_head_hash = ?3, fkek_key_id = ?4, key_generation = ?5,
+           lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL, sync_state = 'AVAILABLE',
+           last_error_code = NULL
          WHERE local_profile_id = ?1",
         params![
             b.local,
             wire(version)?,
-            receipt.resulting_head_hash.to_vec()
+            receipt.resulting_head_hash.to_vec(),
+            s.fkek_key_id,
+            wire(s.key_generation)?
         ],
     )?;
     let _ = std::fs::remove_file(spool(&s.spool)?);
@@ -2105,7 +2706,7 @@ async fn abandon(
     err: anyhow::Error,
 ) -> anyhow::Error {
     let released = async {
-        let op_id = release_op(&db.conn, b, lease)?;
+        let op_id = release_op(&db.conn, b, lease, ReleaseReason::UserRelease)?;
         let op = get_op(db, &op_id)?;
         release_reply(client, access, db, b, &op).await
     };
@@ -2116,12 +2717,17 @@ async fn abandon(
 }
 
 /// Stores a `RELEASE_LEASE` of `lease` and returns its operation ID.
-fn release_op(conn: &rusqlite::Connection, b: &Bound, lease: LeaseRef) -> Result<String> {
+fn release_op(
+    conn: &rusqlite::Connection,
+    b: &Bound,
+    lease: LeaseRef,
+    reason: ReleaseReason,
+) -> Result<String> {
     let kind = OperationKind::ReleaseLease;
     let payload = ReleaseLeaseV2 {
         profile: b.pref(),
         lease,
-        reason_code: ReleaseReason::UserRelease,
+        reason_code: reason,
     }
     .encode();
     let (key, exact, canonical) = mutation(kind, payload, b)?;
@@ -2132,8 +2738,10 @@ fn release_op(conn: &rusqlite::Connection, b: &Bound, lease: LeaseRef) -> Result
         hex(&b.profile),
         hex(&lease.lease_id)
     );
+    // A cancelled publish has no binding for the operation to name.
     let columns = Columns {
         lease: Some(lease),
+        unbound: reason == ReleaseReason::CancelPublish,
         ..Default::default()
     };
     insert_op(
@@ -2189,7 +2797,8 @@ async fn release_reply(
         params![b.local, lease],
     )?;
     tx.execute(
-        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, sync_state = 'AVAILABLE'
+        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL,
+           sync_state = 'AVAILABLE'
          WHERE local_profile_id = ?1 AND lease_id = ?2",
         params![b.local, lease],
     )?;
@@ -2323,9 +2932,9 @@ fn unbound_reply(db: &Db, local: &str) -> Result<Vec<u8>> {
             |r| {
                 Ok((
                     op_row(r)?,
-                    r.get::<_, Vec<u8>>(22)?,
-                    r.get::<_, Vec<u8>>(23)?,
                     r.get::<_, Vec<u8>>(24)?,
+                    r.get::<_, Vec<u8>>(25)?,
+                    r.get::<_, Vec<u8>>(26)?,
                 ))
             },
         )
@@ -2389,6 +2998,7 @@ pub(crate) async fn pull(
     now: u64,
 ) -> Result<u64> {
     let mut db = Db::open()?;
+    retry_unbound_releases(client, access, &mut db).await;
     let mut b = bound(&db, local)?;
     if awaits_transition(&b) {
         accept_transitions(client, access, dev, &mut db, &b, now).await?;
@@ -2519,7 +3129,14 @@ pub(crate) async fn pull(
         }
         object.extend_from_slice(&reply.body);
     }
-    let fkek = verified_key(&db, dev, &b.fleet, p.key_generation, &p.fkek_key_id, now)?;
+    let fkek = verified_key(
+        &db,
+        dev,
+        &b.fleet,
+        p.key_generation,
+        Some(&p.fkek_key_id),
+        now,
+    )?;
     let target = udd.to_path_buf();
     let restored = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut plaintext = Zeroizing::new(Vec::new());
@@ -2555,13 +3172,16 @@ pub(crate) async fn pull(
         ))
     })??;
     db.conn.execute(
-        "UPDATE profile_bindings SET remote_version = ?2, last_observed_head_hash = ?3
+        "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
+           last_observed_head_hash = ?3, fkek_key_id = ?5, key_generation = ?6
          WHERE local_profile_id = ?1 AND remote_version = ?4",
         params![
             b.local,
             wire(head.current_version)?,
             head.current_signed_head_hash.map(|h| h.to_vec()),
-            wire(b.version)?
+            wire(b.version)?,
+            hex(&p.fkek_key_id),
+            wire(p.key_generation)?
         ],
     )?;
     Ok(restored)
@@ -2812,6 +3432,8 @@ mod tests {
         commits: usize,
         /// The `expires_at_ms` a checkout grants, when not `NOW` + TTL.
         expires: Option<u64>,
+        /// The `expires_at_ms` a renewal grants, when not `T0`.
+        renewed: Option<u64>,
         /// Other profiles the list reports after `PROFILE`.
         others: Vec<FleetProfileHeadV2>,
         /// Restore-epoch transitions and proofs, by path after
@@ -2826,6 +3448,11 @@ mod tests {
         /// SQL another writer runs on the launcher's database when the next
         /// proof is served.
         on_proof: Option<String>,
+        /// `PROFILE` is not yet published: the listing omits it until a
+        /// publish-create makes it.
+        fresh: bool,
+        /// The profiles publish-create made, in order.
+        published: Vec<[u8; 16]>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -2951,21 +3578,87 @@ mod tests {
                         restore_epoch: self.epoch,
                         tenant_id: TENANT,
                         fleet_id: FLEET,
-                        profiles: std::iter::once(FleetProfileHeadV2 {
-                            profile_id: PROFILE,
-                            current_version: version,
-                            current_signed_head_hash: head,
-                            key_generation: GEN,
-                            label_ciphertext: vec![1],
-                        })
-                        .chain(self.others.iter().cloned())
-                        .collect(),
+                        profiles: (!self.fresh)
+                            .then_some(FleetProfileHeadV2 {
+                                profile_id: PROFILE,
+                                current_version: version,
+                                current_signed_head_hash: head,
+                                key_generation: GEN,
+                                label_ciphertext: vec![1],
+                            })
+                            .into_iter()
+                            .chain(self.others.iter().cloned())
+                            .collect(),
                         next_after: None,
                     };
                     reply(200, &[], page.encode())
                 }
                 ("GET", ["v2", "tenants", _, "trust-evidence"]) => {
                     reply(200, &[], self.pages.clone())
+                }
+                ("POST", ["v2", "fleets", _, "profiles"]) => {
+                    let (st, out) =
+                        self.mutation(body, 201, RECORD_TYPE_PUBLISH_CREATED, |f, p| {
+                            let c = ProfilePublishCreateV2::parse(p).map_err(|_| 422u16)?;
+                            let active = (
+                                f.generation.unwrap_or(GEN),
+                                f.fkek_key_id.unwrap_or_else(|| {
+                                    shardx_core::fleet_grants::fkek_key_id(&FKEK)
+                                }),
+                            );
+                            if (c.key_generation, c.fkek_key_id) != active {
+                                return Err(409);
+                            }
+                            if c.profile.profile_id == PROFILE && !f.fresh {
+                                return Err(409);
+                            }
+                            f.fresh = false;
+                            f.published.push(c.profile.profile_id);
+                            f.fence = 1;
+                            let lease = LeaseRef {
+                                lease_id: random().unwrap(),
+                                fencing_token: 1,
+                                base_version: 0,
+                            };
+                            f.lease = Some(lease);
+                            Ok(ProfileLeaseV2 {
+                                profile: c.profile,
+                                lease,
+                                expires_at_ms: f.expires.unwrap_or(NOW + 300_000),
+                                fkek_key_id: c.fkek_key_id,
+                                key_generation: c.key_generation,
+                                current_signed_head_hash: None,
+                                server_instance_id: INSTANCE,
+                                restore_epoch: f.epoch,
+                            }
+                            .encode(LeaseOrigin::PublishCreate))
+                        });
+                    if let Some(t) = self.tamper.filter(|t| t.starts_with("publish-")) {
+                        if st == 201 {
+                            let mut r = IdempotentStoredResponseV2::parse(&out).unwrap();
+                            let mut g = ProfileLeaseV2::parse(
+                                LeaseOrigin::PublishCreate,
+                                &r.canonical_response_payload_bytes,
+                            )
+                            .unwrap();
+                            match t {
+                                "publish-profile" => g.profile.profile_id = [0xee; 16],
+                                "publish-tenant" => g.profile.tenant_id = [0xee; 16],
+                                "publish-fleet" => g.profile.fleet_id = [0xee; 16],
+                                "publish-key" => g.fkek_key_id = [0xee; 32],
+                                "publish-generation" => g.key_generation += 1,
+                                "publish-fence" => g.lease.fencing_token = 2,
+                                "publish-instance" => g.server_instance_id = [0xee; 16],
+                                "publish-epoch" => g.restore_epoch += 1,
+                                "publish-hash" => r.exact_request_hash = [0; 32],
+                                _ => unreachable!("{t}"),
+                            }
+                            r.canonical_response_payload_bytes =
+                                g.encode(LeaseOrigin::PublishCreate);
+                            return reply(st, &[], r.encode());
+                        }
+                    }
+                    reply(st, &[], out)
                 }
                 ("POST", ["v2", "profiles", _, "checkout"]) => {
                     let (st, out) = self.mutation(body, 201, RECORD_TYPE_CHECKED_OUT, |f, p| {
@@ -3000,6 +3693,25 @@ mod tests {
                         r.exact_request_hash = [0; 32];
                         return reply(st, &[], r.encode());
                     }
+                    if let Some(t) = self.tamper.filter(|t| t.starts_with("checkout-")) {
+                        if st == 201 {
+                            let mut r = IdempotentStoredResponseV2::parse(&out).unwrap();
+                            let mut g = ProfileLeaseV2::parse(
+                                LeaseOrigin::Checkout,
+                                &r.canonical_response_payload_bytes,
+                            )
+                            .unwrap();
+                            match t {
+                                "checkout-tenant" => g.profile.tenant_id = [0xee; 16],
+                                "checkout-fleet" => g.profile.fleet_id = [0xee; 16],
+                                "checkout-late" => g.expires_at_ms = NOW + 3_600_000,
+                                "checkout-past" => g.expires_at_ms = 1,
+                                _ => unreachable!("{t}"),
+                            }
+                            r.canonical_response_payload_bytes = g.encode(LeaseOrigin::Checkout);
+                            return reply(st, &[], r.encode());
+                        }
+                    }
                     reply(st, &[], out)
                 }
                 ("POST", ["v2", "profiles", _, "leases", _, "release"]) => {
@@ -3028,7 +3740,7 @@ mod tests {
                     let out = LeaseRenewedV2 {
                         profile: r.profile,
                         lease: r.lease,
-                        expires_at_ms: T0,
+                        expires_at_ms: self.renewed.unwrap_or(T0),
                     };
                     reply(200, &[], out.encode())
                 }
@@ -3219,6 +3931,7 @@ mod tests {
         let tag = match (method.as_str(), parts.last().copied()) {
             ("PATCH", _) => "patch",
             ("HEAD", _) => "head",
+            ("POST", Some("profiles")) => "publish",
             (_, Some(last)) => last,
             _ => "",
         };
@@ -3263,6 +3976,8 @@ mod tests {
         grant: Vec<u8>,
         extra: Vec<Vec<u8>>,
         udd: std::path::PathBuf,
+        /// Whether `enroll` binds `LOCAL` to `PROFILE`.
+        bound: bool,
     }
 
     impl Drop for World {
@@ -3279,6 +3994,18 @@ mod tests {
 
     /// `world` with `extra` containers in its trust evidence.
     fn world_with(extra: Vec<Vec<u8>>) -> World {
+        world_of(extra, true)
+    }
+
+    /// This device holding `FKEK` with `LOCAL` not yet published: the server
+    /// does not list `PROFILE`.
+    fn world_unbound() -> World {
+        let w = world_of(Vec::new(), false);
+        w.fake().fresh = true;
+        w
+    }
+
+    fn world_of(extra: Vec<Vec<u8>>, bound: bool) -> World {
         let lock = crate::store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -3328,6 +4055,7 @@ mod tests {
             grant,
             extra,
             udd,
+            bound,
         };
         w.enroll(w._dir.path());
         w
@@ -3360,26 +4088,64 @@ mod tests {
             .expect("the grant verifies");
             assert_eq!(*fkek, FKEK);
             assert!(crate::fleet_keys::collect(&hex(&FLEET), GEN, &fkek).unwrap());
+            if !self.bound {
+                return;
+            }
             db.conn
                 .execute(
-                    "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                       fleet_id, remote_profile_id, remote_version, accepted_restore_epoch,
-                       sync_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 'AVAILABLE')",
-                    params![
-                        LOCAL,
-                        hex(&INSTANCE),
-                        hex(&TENANT),
-                        hex(&FLEET),
-                        hex(&PROFILE)
-                    ],
+                    "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                       tenant_id, account_id, device_id, fleet_id, remote_profile_id,
+                       remote_version, base_version, accepted_restore_epoch, fkek_key_id,
+                       key_generation, sync_state, dirty)
+                     SELECT ?1, k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+                       k.device_id, k.fleet_id, ?2, 0, 0, 0, k.fkek_key_id, k.generation,
+                       'AVAILABLE', 0
+                     FROM fleet_key_state k
+                     JOIN device_state d USING (server_id, tenant_id, device_id)
+                     WHERE k.state = 'ACTIVE'",
+                    params![LOCAL, hex(&PROFILE)],
                 )
                 .unwrap();
         }
 
         fn push(&self) -> Result<Pushed> {
-            self.rt
-                .block_on(push(&self.client, "t", &self.dev, LOCAL, &self.udd, NOW))
+            self.rt.block_on(push(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                &self.udd,
+                NOW,
+                &|| std::time::Duration::ZERO,
+            ))
+        }
+
+        /// Publishes `LOCAL` as `PROFILE`, labelled "Work profile".
+        fn publish(&self) -> Result<Published> {
+            self.publish_as(PROFILE, "Work profile")
+        }
+
+        fn publish_as(&self, profile: [u8; 16], label: &str) -> Result<Published> {
+            self.publish_by(&self.dev, FLEET, profile, label)
+        }
+
+        fn publish_by(
+            &self,
+            dev: &Device,
+            fleet: [u8; 16],
+            profile: [u8; 16],
+            label: &str,
+        ) -> Result<Published> {
+            self.rt.block_on(publish(
+                &self.client,
+                "t",
+                dev,
+                LOCAL,
+                label,
+                fleet,
+                profile,
+                NOW,
+            ))
         }
 
         fn pull(&self, udd: &Path) -> Result<u64> {
@@ -3554,6 +4320,12 @@ mod tests {
             "UPDATE upload_sessions SET restore_epoch = 1".into(),
             "UPDATE upload_sessions SET snapshot_id = zeroblob(16)".into(),
             "UPDATE upload_sessions SET manifest_replay_id = zeroblob(16)".into(),
+            "UPDATE operations SET server_id = 'elsewhere' WHERE kind = 'COMMIT'".into(),
+            "UPDATE operations SET server_id = 'elsewhere' WHERE kind = 'FINALIZE'".into(),
+            "UPDATE upload_sessions SET server_id = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET operation_scope = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET idempotency_key = 'elsewhere'".into(),
+            "UPDATE upload_sessions SET canonical_request_hash = zeroblob(32)".into(),
             "SPOOL".into(),
         ] {
             let w = world();
@@ -3589,7 +4361,7 @@ mod tests {
         let w = world();
         w.db()
             .conn
-            .execute("DELETE FROM signed_authorization_records", [])
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM signed_authorization_records")
             .unwrap();
         for _ in 0..2 {
             let err = w.push().unwrap_err();
@@ -3636,6 +4408,1116 @@ mod tests {
             w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
             1
         );
+    }
+
+    /// WP-11 (G2-31, G2-43): a local profile is published as a version-0
+    /// profile with its first lease and fence. The request is stored as exact
+    /// bytes and sent once, the label is sealed under the fleet key, the
+    /// server's exact stored response is kept, and the binding is written
+    /// with it. The next push uses that lease: no checkout.
+    #[test]
+    fn a_profile_is_published_with_its_first_lease_and_then_pushed() {
+        let w = world_unbound();
+        assert!(!is_published(LOCAL).unwrap());
+        let done = w.publish().unwrap();
+        assert!(is_published(LOCAL).unwrap());
+        assert_eq!(done.profile, PROFILE);
+        assert_eq!((done.lease.fencing_token, done.lease.base_version), (1, 0));
+        assert_eq!(w.fake().lease, Some(done.lease));
+        let (request, kept): (Vec<u8>, Vec<u8>) = w
+            .db()
+            .conn
+            .query_row(
+                "SELECT exact_request_bytes, exact_response_bytes FROM operations
+                 WHERE kind = 'PUBLISH' AND state = 'COMPLETED' AND local_profile_id = ?1",
+                [LOCAL],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let req = IdempotentMutationRequestV2::parse(&request).unwrap();
+        assert_eq!(
+            w.fake().stored[&req.idempotency_key].2,
+            kept,
+            "the exact response the server stored"
+        );
+        assert_eq!(w.sent("POST", "/profiles"), vec![request.clone()]);
+        let asked = ProfilePublishCreateV2::parse(&req.canonical_payload_bytes).unwrap();
+        assert_eq!(
+            asked.profile,
+            ProfileRef {
+                tenant_id: TENANT,
+                fleet_id: FLEET,
+                profile_id: PROFILE
+            }
+        );
+        assert_eq!(
+            (asked.key_generation, asked.fkek_key_id),
+            (GEN, shardx_core::fleet_grants::fkek_key_id(&FKEK))
+        );
+        assert!(!asked.label_ciphertext.windows(4).any(|x| x == b"Work"));
+        let label = shardx_core::keys::open_label(
+            &FKEK,
+            &TENANT,
+            &FLEET,
+            &PROFILE,
+            GEN,
+            &asked.label_ciphertext,
+        )
+        .unwrap();
+        assert_eq!(*label, b"Work profile");
+        let (version, head, epoch, fence, lease, state): (
+            i64,
+            Option<Vec<u8>>,
+            i64,
+            i64,
+            String,
+            String,
+        ) = w
+            .db()
+            .conn
+            .query_row(
+                "SELECT remote_version, last_observed_head_hash, accepted_restore_epoch,
+                            fencing_token, lease_id, sync_state FROM profile_bindings",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (version, head, epoch, fence, lease, state.as_str()),
+            (0, None, 0, 1, hex(&done.lease.lease_id), "CHECKED_OUT")
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND fencing_token = 1 AND base_version = 0"),
+            1
+        );
+
+        assert_eq!(w.push().unwrap().version, 1);
+        assert!(
+            w.sent("POST", "/checkout").is_empty(),
+            "the publish's lease was used"
+        );
+        assert_eq!(w.fake().published, [PROFILE]);
+    }
+
+    /// WP-11 probe 11 (L2048): at each crash point of a publish-create, with
+    /// the database closed and reopened, the next attempt sends the exact
+    /// stored bytes again, and the server has made one profile with one
+    /// lease and one fence. The stored request wins over any new arguments.
+    #[test]
+    fn every_publish_crash_point_resumes_with_the_exact_stored_bytes() {
+        for point in ["before send", "reply lost", "binding not written"] {
+            let w = world_unbound();
+            match point {
+                "before send" => w.fake().skip.push("publish"),
+                "reply lost" => w.fake().lose.push("publish"),
+                _ => w
+                    .db()
+                    .conn
+                    .execute_batch(
+                        "CREATE TRIGGER crash BEFORE INSERT ON profile_bindings
+                         BEGIN SELECT RAISE(ABORT, 'crash'); END",
+                    )
+                    .unwrap(),
+            }
+            let err = w.publish().expect_err(point);
+            if point == "binding not written" {
+                assert!(format!("{err:#}").contains("crash"), "{err:#}");
+            } else {
+                assert!(has(&err, "fleet.refusedSync"), "{point}: {err:#}");
+            }
+            assert_eq!(
+                w.fake().published.len(),
+                usize::from(point != "before send"),
+                "{point}"
+            );
+            // Reopened: the request is stored, nothing else is.
+            let stored: Vec<u8> = w
+                .db()
+                .conn
+                .query_row(
+                    "SELECT exact_request_bytes FROM operations
+                     WHERE kind = 'PUBLISH' AND state = 'PENDING' AND local_profile_id IS NULL
+                       AND exact_response_bytes IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect(point);
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings"),
+                0,
+                "{point}"
+            );
+            if point == "binding not written" {
+                w.db().conn.execute_batch("DROP TRIGGER crash").unwrap();
+            }
+
+            let done = w.publish_as([0x77; 16], "ignored").expect(point);
+            assert_eq!(done.profile, PROFILE, "{point}: the stored request wins");
+            let sent = w.sent("POST", "/profiles");
+            assert_eq!(sent.len(), 2, "{point}");
+            assert_eq!((&sent[0], &sent[1]), (&stored, &stored), "{point}");
+            assert_eq!(w.fake().published, [PROFILE], "{point}: one profile");
+            assert_eq!(w.fake().fence, 1, "{point}: one fence");
+            assert_eq!(w.fake().lease, Some(done.lease), "{point}: one lease");
+            let key = IdempotentMutationRequestV2::parse(&stored)
+                .unwrap()
+                .idempotency_key;
+            let kept: Vec<u8> = w
+                .db()
+                .conn
+                .query_row(
+                    "SELECT exact_response_bytes FROM operations
+                     WHERE kind = 'PUBLISH' AND state = 'COMPLETED'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(w.fake().stored[&key].2, kept, "{point}: exact stored bytes");
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH'"),
+                1
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings"),
+                1,
+                "{point}"
+            );
+        }
+    }
+
+    /// WP-12 (G2-32, G2-35, G2-36): a binding, its operations and its upload
+    /// session name the `server_origins` row, the account and device, and the
+    /// `fleet_key_state` row of the key they were made under. The lease's
+    /// server expiry is kept with the lease and dropped with it, `dirty` is
+    /// set by a publish and cleared by a push or a pull, and the pinned base
+    /// version follows the head.
+    #[test]
+    fn a_binding_and_its_rows_name_the_servers_account_and_key() {
+        let expiry = |ms: u64| {
+            format!("lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', {ms} / 1000.0, 'unixepoch')")
+        };
+        let w = world_unbound();
+        w.publish().unwrap();
+        let named = "SELECT count(*) FROM profile_bindings b
+             JOIN server_origins o ON o.server_id = b.server_id
+              AND o.server_instance_id = b.server_instance_id
+             JOIN accounts a ON a.server_id = b.server_id AND a.tenant_id = b.tenant_id
+              AND a.account_id = b.account_id AND a.device_id = b.device_id
+              AND a.role = 'member' AND a.status = 'ACTIVE'
+             JOIN device_state d ON d.server_id = b.server_id AND d.tenant_id = b.tenant_id
+              AND d.device_id = b.device_id
+              AND d.signing_credential_ref = 'device-signing.' || b.device_id
+              AND d.hpke_credential_ref = 'device-hpke.' || b.device_id
+             JOIN fleet_key_state k ON k.server_id = b.server_id
+              AND k.server_instance_id = b.server_instance_id AND k.tenant_id = b.tenant_id
+              AND k.fleet_id = b.fleet_id AND k.generation = b.key_generation
+              AND k.fkek_key_id = b.fkek_key_id AND k.state = 'ACTIVE'
+              AND k.fkek_credential_ref = 'fleet-key.' || b.fleet_id || '.' || b.key_generation
+             WHERE b.account_id = ?1 AND b.device_id = ?2 AND b.fkek_key_id = ?3
+               AND b.key_generation = 1 AND b.local_profile_id = 'local-profile'";
+        let me = me();
+        let check = |w: &World, extra: &str| {
+            w.db()
+                .conn
+                .query_row(
+                    &format!("{named} AND {extra}"),
+                    params![
+                        hex(&me.to.account_id),
+                        hex(&me.to.device_id),
+                        hex(&shardx_core::fleet_grants::fkek_key_id(&FKEK))
+                    ],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let lease = expiry(NOW + 300_000);
+        // Published: the first lease, a dirty profile, base version 0.
+        assert_eq!(
+            check(
+                &w,
+                &format!("b.dirty = 1 AND b.base_version = 0 AND b.{lease}")
+            ),
+            1
+        );
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations o JOIN profile_bindings b
+                 ON b.local_profile_id = o.local_profile_id AND b.server_id = o.server_id"
+            ),
+            w.count("SELECT count(*) FROM operations"),
+        );
+        // Pushed: the head moves, the profile is clean, the lease is gone.
+        w.push().unwrap();
+        assert_eq!(
+            check(
+                &w,
+                "b.dirty = 0 AND b.base_version = 1 AND b.remote_version = 1
+                 AND b.lease_id IS NULL AND b.lease_expires_at IS NULL"
+            ),
+            1
+        );
+        let sessions = "SELECT count(*) FROM upload_sessions u
+             JOIN operations o ON o.op_id = u.commit_op_id
+             WHERE u.server_id = o.server_id AND u.operation_scope = o.operation_scope
+               AND u.idempotency_key = o.idempotency_key
+               AND u.canonical_request_hash = o.canonical_request_hash
+               AND u.retry_state = 'NONE' AND u.fkek_key_id = ?1 AND u.key_generation = 1";
+        let kept: i64 = w
+            .db()
+            .conn
+            .query_row(
+                sessions,
+                [hex(&shardx_core::fleet_grants::fkek_key_id(&FKEK))],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        // A pull of a profile edited since is clean again.
+        w.db()
+            .conn
+            .execute("UPDATE profile_bindings SET dirty = 1", [])
+            .unwrap();
+        w.pull(&w._dir.path().join("pulled")).unwrap();
+        assert_eq!(
+            check(&w, "b.dirty = 0 AND b.base_version = b.remote_version"),
+            1
+        );
+        // A checkout that is not finished keeps the lease with its expiry.
+        drop(w);
+        let w2 = world();
+        w2.fake().skip.push("finalize");
+        w2.push().unwrap_err();
+        assert_eq!(
+            w2.count(&format!(
+                "SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL AND {lease}"
+            )),
+            1
+        );
+    }
+
+    /// WP-11 probe 11: a publish the server refuses is failed and never
+    /// resent; the next one is a new request under a new key.
+    #[test]
+    fn a_refused_publish_is_not_replayed_and_the_next_one_starts_afresh() {
+        let w = world_unbound();
+        w.fake().refuse.push(("publish", 403));
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"),
+            1
+        );
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert!(w.fake().published.is_empty());
+        w.publish().unwrap();
+        let sent = w.sent("POST", "/profiles");
+        assert_eq!(sent.len(), 2);
+        assert_ne!(sent[0], sent[1], "a new request, not a replay");
+        assert_eq!(w.fake().published, [PROFILE]);
+    }
+
+    /// WP-11, L-4: a 2xx reply that does not name exactly what was asked
+    /// (L-5: the tenant and the fleet among it) is never kept: no binding, and
+    /// the operation is QUARANTINED under the named field instead of being
+    /// replayed for good. When the reply still names a lease of the profile
+    /// in a stored response that verifies, that lease is released with
+    /// `cancel_publish`; the next publish is a new request.
+    #[test]
+    fn a_publish_reply_that_does_not_name_the_request_is_never_kept() {
+        for (tamper, field, released) in [
+            ("publish-hash", "exact_request_hash", false),
+            ("publish-profile", "profile", false),
+            ("publish-tenant", "profile", false),
+            ("publish-fleet", "profile", false),
+            ("publish-instance", "server_instance_id", true),
+            ("publish-epoch", "restore_epoch", true),
+            ("publish-key", "fkek_key_id", true),
+            ("publish-generation", "key_generation", true),
+            ("publish-fence", "fencing_token", true),
+        ] {
+            let w = world_unbound();
+            w.fake().tamper = Some(tamper);
+            let err = w.publish().unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{tamper}: {err:#}");
+            assert!(format!("{err:#}").contains(field), "{tamper}: {err:#}");
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings"),
+                0,
+                "{tamper}"
+            );
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'QUARANTINED'
+                       AND exact_response_bytes IS NULL"
+                ),
+                1,
+                "{tamper}"
+            );
+            let releases = w.sent("POST", "/release");
+            assert_eq!(releases.len(), usize::from(released), "{tamper}");
+            for sent in releases {
+                let request = IdempotentMutationRequestV2::parse(&sent).unwrap();
+                let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes).unwrap();
+                assert_eq!(
+                    release.reason_code,
+                    ReleaseReason::CancelPublish,
+                    "{tamper}"
+                );
+            }
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND local_profile_id IS NOT NULL"),
+                0,
+                "{tamper}: the release names no binding"
+            );
+            // Not replayed: the next publish is a new request.
+            w.fake().tamper = None;
+            w.publish_as(PROFILE2, "Work profile").unwrap();
+            let sent = w.sent("POST", "/profiles");
+            assert_eq!(sent.len(), 2, "{tamper}");
+            assert_ne!(sent[0], sent[1], "{tamper}: not a replay");
+        }
+    }
+
+    /// A compromised revocation of a key the fleet's devices hold, counted.
+    fn count_a_compromise(w: &World) {
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: [0x77; 32],
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+            )
+            .unwrap();
+    }
+
+    /// M-1: a stored publish is re-checked at every send, replays included. A
+    /// compromise counted, or the key withdrawn by local distrust, since it
+    /// was stored keeps it unsent under a named code, still PENDING; the
+    /// cancel path ends it, and what is left of the key stops a new request.
+    #[test]
+    fn a_stored_publish_is_not_sent_once_its_key_is_blocked_or_withdrawn() {
+        for (name, code) in [
+            ("compromise", "sync.commitBlockedCompromised"),
+            ("withdrawn", "sync.noVerifiedFleetKey"),
+        ] {
+            let w = world_unbound();
+            w.fake().skip.push("publish");
+            w.publish().unwrap_err();
+            assert_eq!(
+                w.sent("POST", "/profiles").len(),
+                1,
+                "{name}: stored and tried"
+            );
+            if name == "compromise" {
+                count_a_compromise(&w);
+            } else {
+                ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+            }
+            let err = w.publish().unwrap_err();
+            assert!(has(&err, code), "{name}: {err:#}");
+            assert_eq!(
+                w.sent("POST", "/profiles").len(),
+                1,
+                "{name}: not sent again"
+            );
+            assert!(w.fake().published.is_empty(), "{name}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'"
+                ),
+                1,
+                "{name}: kept, unsent"
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings"),
+                0,
+                "{name}"
+            );
+
+            cancel_publish(LOCAL).unwrap();
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"
+                ),
+                1,
+                "{name}"
+            );
+            let err = cancel_publish(LOCAL).unwrap_err();
+            assert!(has(&err, "sync.noPublishPending"), "{name}: {err:#}");
+            let err = w.publish_as(PROFILE2, "Work").unwrap_err();
+            assert!(
+                has(&err, code),
+                "{name}: a new request needs a good key: {err:#}"
+            );
+            assert_eq!(w.sent("POST", "/profiles").len(), 1, "{name}");
+        }
+    }
+
+    /// M-1: with the key good, the stored publish goes out as before.
+    #[test]
+    fn a_stored_publish_goes_out_while_its_key_holds() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        w.publish().unwrap();
+        assert_eq!(w.fake().published, [PROFILE]);
+        let sent = w.sent("POST", "/profiles");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1], "the stored request, replayed");
+    }
+
+    impl World {
+        fn publish_at(&self, profile: [u8; 16], now: u64) -> Result<Published> {
+            self.rt.block_on(publish(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                "Work profile",
+                FLEET,
+                profile,
+                now,
+            ))
+        }
+    }
+
+    /// The row the one binding of a publish is: its lease, expiry and state.
+    fn publish_row(w: &World) -> (Option<String>, Option<String>, String, i64) {
+        w.db()
+            .conn
+            .query_row(
+                "SELECT lease_id, lease_expires_at, sync_state, dirty FROM profile_bindings",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// NEW-1: a reply that names the request on every identity field is bound
+    /// at version 0 whatever its lease expiry says (plan L2048): one server
+    /// profile, one binding. Inside the window the lease is held as given; a
+    /// lease already over is not held and is released, best effort; one
+    /// further ahead than a TTL and the skew allowance is held at risk for one
+    /// TTL from now.
+    #[test]
+    fn a_publish_is_bound_whatever_its_lease_expiry_says() {
+        for ms in [
+            NOW + 1,
+            NOW + 300_000 + 60_000,
+            NOW,
+            1,
+            NOW + 300_000 + 60_000 + 1,
+            9_000_000_000_000,
+        ] {
+            let w = world_unbound();
+            w.fake().expires = Some(ms);
+            if ms <= NOW {
+                // The release is lost: the binding must not hold the lease.
+                w.fake().refuse.push(("release", 503));
+            }
+            let done = w.publish().unwrap();
+            assert_eq!(w.fake().published, [PROFILE], "{ms}");
+            let (lease, expiry, state, dirty) = publish_row(&w);
+            assert_eq!(dirty, 1, "{ms}");
+            let releases = w.sent("POST", "/release");
+            if ms <= NOW {
+                assert_eq!(
+                    (lease, expiry, state.as_str()),
+                    (None, None, "AVAILABLE"),
+                    "{ms}"
+                );
+                assert_eq!(releases.len(), 1, "{ms}: the ended lease is let go");
+                assert_eq!(
+                    w.count(
+                        "SELECT count(*) FROM operations WHERE kind = 'RELEASE'
+                           AND state = 'PENDING' AND local_profile_id = 'local-profile'"
+                    ),
+                    1,
+                    "{ms}: kept for a push to replay"
+                );
+                let request = IdempotentMutationRequestV2::parse(&releases[0]).unwrap();
+                let release = ReleaseLeaseV2::parse(&request.canonical_payload_bytes).unwrap();
+                assert_eq!(release.lease, done.lease, "{ms}");
+                assert_eq!(release.reason_code, ReleaseReason::UserRelease, "{ms}");
+                assert_eq!(done.expires_at_ms, ms, "{ms}");
+            } else if ms <= NOW + 360_000 {
+                assert_eq!(state, "CHECKED_OUT", "{ms}");
+                assert_eq!(expiry, Some(w.stored_as(ms)), "{ms}");
+                assert!(lease.is_some() && releases.is_empty(), "{ms}");
+                assert_eq!(done.expires_at_ms, ms, "{ms}");
+            } else {
+                assert_eq!(state, "LEASE_AT_RISK", "{ms}");
+                assert_eq!(expiry, Some(w.stored_as(NOW + 300_000)), "{ms}");
+                assert!(lease.is_some() && releases.is_empty(), "{ms}");
+                assert_eq!(done.expires_at_ms, NOW + 300_000, "{ms}");
+            }
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'COMPLETED'"),
+                1,
+                "{ms}"
+            );
+        }
+    }
+
+    /// P6: the reply is lost and the device comes back after the lease's
+    /// TTL. The replay returns the stored first lease, long over: the profile
+    /// is bound without a lease and nothing is made twice.
+    #[test]
+    fn a_publish_replayed_after_its_lease_ended_binds_the_one_profile() {
+        let w = world_unbound();
+        w.fake().lose.push("publish");
+        w.publish_at(PROFILE, NOW).unwrap_err();
+        assert_eq!(w.fake().published, [PROFILE]);
+        w.publish_at(PROFILE2, NOW + 600_000).unwrap();
+        assert_eq!(w.fake().published, [PROFILE], "no second profile");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        assert_eq!(
+            w.count(&format!(
+                "SELECT count(*) FROM profile_bindings WHERE remote_profile_id = '{}'
+                   AND lease_id IS NULL",
+                hex(&PROFILE)
+            )),
+            1
+        );
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state <> 'COMPLETED'"
+            ),
+            0
+        );
+        // The next push takes a lease as any bound profile does.
+        assert_eq!(w.push().unwrap().version, 1);
+    }
+
+    /// P7: a device clock more than the skew allowance behind the server:
+    /// the first lease looks too far ahead, and is bound at risk, once.
+    #[test]
+    fn a_device_clock_behind_the_server_still_binds_one_profile() {
+        let w = world_unbound();
+        w.fake().expires = Some(NOW + 300_000 + 61_000);
+        w.publish().unwrap();
+        assert_eq!(w.fake().published, [PROFILE]);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        let err = w.publish_as(PROFILE2, "Work").unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!(w.fake().published, [PROFILE], "no profile per attempt");
+        assert_eq!(publish_row(&w).2, "LEASE_AT_RISK");
+    }
+
+    /// NEW-2: a `cancel_publish` release that fails stays PENDING with no
+    /// binding. The next publish, push or pull sends it again; once its lease
+    /// can no longer be live (older than a TTL and the skew allowance) it is
+    /// ended FAILED without a request.
+    #[test]
+    fn an_unsent_cancel_release_is_retried_and_then_given_up() {
+        let unbound_pending = |w: &World| {
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'PENDING'
+                   AND local_profile_id IS NULL",
+            )
+        };
+        for age in [false, true] {
+            let w = world_unbound();
+            w.fake().tamper = Some("publish-fence");
+            w.fake().refuse.push(("release", 503));
+            w.publish().unwrap_err();
+            assert_eq!(unbound_pending(&w), 1, "{age}");
+            assert_eq!(w.sent("POST", "/release").len(), 1, "{age}");
+            if age {
+                w.db()
+                    .conn
+                    .execute(
+                        "UPDATE operations SET created_at = '2020-01-01T00:00:00.000Z'
+                         WHERE kind = 'RELEASE'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            w.fake().tamper = None;
+            w.publish_as(PROFILE2, "Work").unwrap();
+            assert_eq!(unbound_pending(&w), 0, "{age}");
+            assert_eq!(
+                w.sent("POST", "/release").len(),
+                if age { 1 } else { 2 },
+                "{age}: sent again only while the lease may be live"
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'FAILED'"),
+                1,
+                "{age}: the release ends, FAILED (the fence the tampered reply named was never the server's)"
+            );
+        }
+        // A push and a pull retry it too.
+        for pull in [false, true] {
+            let w = world();
+            w.push().unwrap();
+            let b = bound(&w.db(), LOCAL).unwrap();
+            let db = w.db();
+            let lease = LeaseRef {
+                lease_id: [0x42; 16],
+                fencing_token: 1,
+                base_version: 0,
+            };
+            let op = release_op(&db.conn, &b, lease, ReleaseReason::CancelPublish).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE operations SET local_profile_id = NULL WHERE op_id = ?1",
+                    [&op],
+                )
+                .unwrap();
+            drop(db);
+            let before = w.sent("POST", "/release").len();
+            if pull {
+                w.pull(&w.udd.with_file_name("out")).unwrap();
+            } else {
+                w.push().unwrap();
+            }
+            assert_eq!(w.sent("POST", "/release").len(), before + 1, "{pull}");
+            assert_eq!(unbound_pending(&w), 0, "{pull}");
+        }
+    }
+
+    /// NEW-5: a publish whose operation another process ended (a cancel) between
+    /// the read and the send binds nothing: the completion must update exactly
+    /// the one pending row, in the transaction that files the binding.
+    #[test]
+    fn a_publish_whose_operation_was_cancelled_meanwhile_binds_nothing() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        let mut db = w.db();
+        let op = pending_publish(&db, LOCAL).unwrap().unwrap();
+        cancel_publish(LOCAL).unwrap();
+        let err =
+            w.rt.block_on(send_publish(
+                &w.client, "t", &mut db, &w.dev, LOCAL, FLEET, &op, NOW,
+            ))
+            .unwrap_err();
+        assert!(has(&err, "sync.publishChanged"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"),
+            1
+        );
+    }
+
+    /// NEW-3: a publish M-1 keeps unsent blocks a downgrade by a name that
+    /// points at the cancel; the cancel command ends it and the blocker goes.
+    #[test]
+    fn a_blocked_publish_is_cancelled_by_its_command_and_stops_blocking_a_downgrade() {
+        let blocked = |key: &str| {
+            crate::team::downgrade::readiness()
+                .unwrap()
+                .blockers
+                .iter()
+                .any(|b| b.code == key)
+        };
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        count_a_compromise(&w);
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(blocked("downgrade.blockPendingPublish"));
+        assert!(blocked("downgrade.blockOperation"));
+        w.rt.block_on(crate::sync_cmd::profile_sync_cancel_publish(LOCAL.into()))
+            .unwrap();
+        assert!(!blocked("downgrade.blockPendingPublish"));
+        assert!(!blocked("downgrade.blockOperation"));
+        let err =
+            w.rt.block_on(crate::sync_cmd::profile_sync_cancel_publish(LOCAL.into()))
+                .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "sync.noPublishPending"),
+            "{err}"
+        );
+    }
+
+    /// L-5, L-3: a checkout reply that names another tenant or fleet, or a
+    /// lease that ends outside the window (a fresh one that has already
+    /// ended included), is never kept: refused by name, no lease on the
+    /// binding.
+    #[test]
+    fn a_checkout_reply_for_another_tenant_fleet_or_expiry_is_never_kept() {
+        for (tamper, field) in [
+            ("checkout-tenant", "profile"),
+            ("checkout-fleet", "profile"),
+            ("checkout-late", "expires_at_ms"),
+            ("checkout-past", "expires_at_ms"),
+        ] {
+            let w = world();
+            w.fake().tamper = Some(tamper);
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{tamper}: {err:#}");
+            assert!(format!("{err:#}").contains(field), "{tamper}: {err:#}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM profile_bindings
+                     WHERE lease_id IS NOT NULL OR lease_expires_at IS NOT NULL"
+                ),
+                0,
+                "{tamper}"
+            );
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'PENDING'"
+                ),
+                1,
+                "{tamper}"
+            );
+        }
+    }
+
+    /// WP-11: a publish that cannot be trusted is neither stored nor sent.
+    #[test]
+    fn a_publish_that_cannot_be_trusted_stores_and_sends_nothing() {
+        let nothing = |w: &World, what: &str| {
+            assert!(w.sent("POST", "/profiles").is_empty(), "{what}");
+            assert_eq!(w.count("SELECT count(*) FROM operations"), 0, "{what}");
+        };
+        // Already published.
+        let w = world();
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert!(w.fake().log.is_empty());
+
+        // The ID is taken.
+        drop(w);
+        let w = world_unbound();
+        w.fake().fresh = false;
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.publishProfileTaken"), "{err:#}");
+        nothing(&w, "taken");
+
+        // Another server than the one this device pinned.
+        drop(w);
+        let w = world_unbound();
+        let mut other = device(&w.me);
+        other.pin.0.server_instance_id = [9; 16];
+        let err = w.publish_by(&other, FLEET, PROFILE, "Work").unwrap_err();
+        assert!(has(&err, "sync.badReplySync"), "{err:#}");
+        nothing(&w, "instance");
+
+        // A name the label cannot hold.
+        drop(w);
+        for label in ["", "   ", &"x".repeat(1025)] {
+            let w = world_unbound();
+            let err = w.publish_as(PROFILE, label).unwrap_err();
+            assert!(has(&err, "sync.badProfileLabel"), "{err:#}");
+            nothing(&w, "label");
+        }
+
+        // No fleet key, or one whose grant no longer verifies.
+        let w = world_unbound();
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        nothing(&w, "no key");
+        drop(w);
+        let w = world_unbound();
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        nothing(&w, "withdrawn");
+
+        // A server epoch behind the one this device accepted is a rollback.
+        drop(w);
+        let w = world_unbound();
+        w.db()
+            .conn
+            .execute("UPDATE server_origins SET last_restore_epoch = 3", [])
+            .unwrap();
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.headRollback"), "{err:#}");
+        nothing(&w, "rollback");
+
+        // A generation a compromised device may hold.
+        drop(w);
+        let w = world_unbound();
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: [0x77; 32],
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+            )
+            .unwrap();
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        nothing(&w, "compromised");
+
+        // A pending publish is not replayed into another fleet.
+        drop(w);
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        let err = w.publish_by(&w.dev, [8; 16], PROFILE, "Work").unwrap_err();
+        assert!(has(&err, "sync.publishPendingElsewhere"), "{err:#}");
+        assert_eq!(w.sent("POST", "/profiles").len(), 1);
+    }
+
+    /// The `NOW` a push sees `JUMP` seconds after its first look at the clock:
+    /// the first renewal is due and the clock then stands still.
+    const JUMP: u64 = 101;
+
+    fn jump() -> impl Fn() -> std::time::Duration + Sync {
+        let looks = std::sync::atomic::AtomicU64::new(0);
+        move || {
+            let n = looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::time::Duration::from_secs(if n == 0 { 0 } else { JUMP })
+        }
+    }
+
+    impl World {
+        fn push_at(&self, clock: &(dyn Fn() -> std::time::Duration + Sync)) -> Result<Pushed> {
+            self.rt.block_on(push(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                &self.udd,
+                NOW,
+                clock,
+            ))
+        }
+
+        fn expiry(&self) -> Option<String> {
+            self.db()
+                .conn
+                .query_row(
+                    "SELECT lease_expires_at FROM profile_bindings WHERE local_profile_id = ?1",
+                    [LOCAL],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        /// `lease_expires_at` as the binding stores `ms`.
+        fn stored_as(&self, ms: u64) -> String {
+            self.db()
+                .conn
+                .query_row(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')",
+                    [ms as i64],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    /// WP-12: a lease renewed mid-upload keeps the expiry the server granted.
+    /// The clock jumps past a third of the TTL once, so the first chunk
+    /// renews; the binding's `lease_expires_at` is read each time the clock
+    /// is, and moves from the checkout's grant to the renewal's.
+    #[test]
+    fn a_renewed_lease_moves_the_bindings_expiry_forward() {
+        let w = world();
+        let (granted, renewed) = (NOW + 300_000, NOW + JUMP * 1000 + 300_000);
+        w.fake().renewed = Some(renewed);
+        let seen = Mutex::new(Vec::new());
+        let clock = jump();
+        let watching = || {
+            seen.lock().unwrap().push(w.expiry());
+            clock()
+        };
+        w.push_at(&watching).unwrap();
+        assert_eq!(w.sent("POST", "/renew").len(), 1);
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen[0], Some(w.stored_as(granted)), "before any renewal");
+        assert!(
+            seen.contains(&Some(w.stored_as(renewed))),
+            "a renewal moved the expiry forward: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&Some(w.stored_as(T0))),
+            "never to the stale one: {seen:?}"
+        );
+    }
+
+    /// L-3: an expiry the server grants is kept only when it lies ahead of
+    /// now and within one TTL and the skew allowance; at the edges it is kept,
+    /// one millisecond outside it is refused by name and the row is unchanged.
+    #[test]
+    fn a_lease_expiry_outside_the_ttl_is_refused_by_name() {
+        let now = NOW + JUMP * 1000;
+        let last = now + 300_000 + 60_000;
+        for (ms, kept) in [
+            (now + 1, true),
+            (last, true),
+            (now, false),
+            (last + 1, false),
+            (1, false),
+        ] {
+            let w = world();
+            w.fake().renewed = Some(ms);
+            let result = w.push_at(&jump());
+            if kept {
+                result.unwrap();
+                continue;
+            }
+            let err = result.unwrap_err();
+            assert!(has(&err, "sync.badReplySync"), "{ms}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("expires_at_ms"),
+                "{ms}: {err:#}"
+            );
+            assert_eq!(w.expiry(), Some(w.stored_as(NOW + 300_000)), "{ms}");
+        }
+    }
+
+    /// WP-11: a server epoch ahead of the accepted one is where a new profile
+    /// starts; its binding and operation carry that epoch.
+    #[test]
+    fn a_profile_published_after_a_restore_starts_at_the_servers_epoch() {
+        let w = world_unbound();
+        w.fake().epoch = 1;
+        w.publish().unwrap();
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE accepted_restore_epoch = 1"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND restore_epoch = 1"),
+            1
+        );
+    }
+
+    /// G2-37 for a publish: a stored column that no longer matches the exact
+    /// bytes it describes is never sent.
+    #[test]
+    fn a_stored_publish_that_drifts_from_its_bytes_is_never_sent() {
+        let other = format!("'{}'", "99".repeat(16));
+        for sql in [
+            format!("UPDATE operations SET remote_profile_id = {other} WHERE kind = 'PUBLISH'"),
+            format!("UPDATE operations SET server_instance_id = {other} WHERE kind = 'PUBLISH'"),
+            "UPDATE operations SET restore_epoch = 1 WHERE kind = 'PUBLISH'".into(),
+            format!("UPDATE operations SET idempotency_key = {other} WHERE kind = 'PUBLISH'"),
+            "UPDATE operations SET canonical_request_hash = zeroblob(32) WHERE kind = 'PUBLISH'"
+                .into(),
+            "UPDATE operations SET exact_request_bytes = CAST(x'00' || exact_request_bytes AS BLOB)
+               WHERE kind = 'PUBLISH'"
+                .into(),
+        ] {
+            let w = world_unbound();
+            w.fake().skip.push("publish");
+            w.publish().unwrap_err();
+            let raw = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+            raw.pragma_update(None, "foreign_keys", false).unwrap();
+            assert_eq!(raw.execute(&sql, []).unwrap(), 1, "{sql}");
+            let before = w.fake().log.len();
+            let err = w.publish().unwrap_err();
+            assert!(has(&err, "sync.storedRequestMismatch"), "{sql}: {err:#}");
+            assert_eq!(w.fake().log.len(), before, "{sql}: nothing was sent");
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'QUARANTINED'"),
+                1,
+                "{sql}"
+            );
+            assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0, "{sql}");
+        }
+    }
+
+    /// WP-11 probe 11 (L2048), G2-43: a CREATE_UPLOAD whose reply is lost
+    /// with no restore in between (not the post-restore superseded case) is
+    /// answered by the server's exact stored response when its stored bytes
+    /// are sent again: one upload, at each crash point, across a reopen.
+    #[test]
+    fn a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte() {
+        for point in ["before send", "reply lost", "reply not kept"] {
+            let w = world();
+            match point {
+                "before send" => w.fake().skip.push("upload"),
+                "reply lost" => w.fake().lose.push("upload"),
+                _ => w
+                    .db()
+                    .conn
+                    .execute_batch(
+                        "CREATE TRIGGER crash BEFORE UPDATE OF state ON operations
+                         WHEN NEW.kind = 'UPLOAD' AND NEW.state = 'COMPLETED'
+                         BEGIN SELECT RAISE(ABORT, 'crash'); END",
+                    )
+                    .unwrap(),
+            }
+            let err = w.push().expect_err(point);
+            if point == "reply not kept" {
+                assert!(format!("{err:#}").contains("crash"), "{err:#}");
+            } else {
+                assert!(has(&err, "fleet.refusedSync"), "{point}: {err:#}");
+            }
+            assert_eq!(
+                w.fake().uploads.len(),
+                usize::from(point != "before send"),
+                "{point}"
+            );
+            let stored: Vec<u8> = w
+                .db()
+                .conn
+                .query_row(
+                    "SELECT exact_request_bytes FROM operations
+                     WHERE kind = 'UPLOAD' AND state = 'PENDING'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect(point);
+            assert_eq!(
+                w.count("SELECT count(*) FROM upload_sessions"),
+                0,
+                "{point}: nothing is kept before the reply is"
+            );
+            if point == "reply not kept" {
+                w.db().conn.execute_batch("DROP TRIGGER crash").unwrap();
+            }
+
+            assert_eq!(w.push().expect(point).version, 1, "{point}");
+            let sent = w.sent("POST", "/uploads");
+            assert_eq!(sent.len(), 2, "{point}");
+            assert_eq!((&sent[0], &sent[1]), (&stored, &stored), "{point}");
+            assert_eq!(w.fake().uploads.len(), 1, "{point}: no second upload");
+            assert_eq!(w.fake().commits, 1, "{point}");
+            let (kept, upload): (Vec<u8>, String) = w
+                .db()
+                .conn
+                .query_row(
+                    "SELECT exact_response_bytes, remote_upload_id FROM operations
+                     WHERE kind = 'UPLOAD' AND state = 'COMPLETED'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let key = IdempotentMutationRequestV2::parse(&stored)
+                .unwrap()
+                .idempotency_key;
+            assert_eq!(w.fake().stored[&key].2, kept, "{point}: exact stored bytes");
+            let held = w.fake().uploads.keys().map(|k| hex(k)).collect::<Vec<_>>();
+            assert_eq!(held, [upload], "{point}: the one upload");
+        }
     }
 
     /// G2-36: an upload cut off after two chunks resumes from the offset
@@ -3849,6 +5731,162 @@ mod tests {
                 assert_eq!(pushed.unwrap().version, 1, "{reason:?} {counted}");
             }
         }
+    }
+
+    /// Probe 10 (L2045, G2-42), the wire side of the sync tables: the
+    /// conversion to a row refuses an integer past `i64::MAX` with
+    /// `WIRE_INTEGER_OUT_OF_RANGE`, and a lease whose expiry is one never
+    /// parses, so it reaches no row, whether it arrives in a checkout's or a
+    /// publish's reply.
+    #[test]
+    fn a_server_integer_past_the_signed_range_is_refused_before_any_row() {
+        assert_eq!(wire(i64::MAX as u64).unwrap(), i64::MAX);
+        for past in [1u64 << 63, u64::MAX] {
+            assert_eq!(
+                wire(past).unwrap_err().to_string(),
+                "WIRE_INTEGER_OUT_OF_RANGE"
+            );
+        }
+        for publish in [false, true] {
+            let w = if publish { world_unbound() } else { world() };
+            w.fake().expires = Some(u64::MAX);
+            let err = if publish {
+                w.publish().map(|_| ()).unwrap_err()
+            } else {
+                w.push().map(|_| ()).unwrap_err()
+            };
+            assert!(has(&err, "sync.badReplySync"), "publish {publish}: {err:#}");
+            let rows = |w: &World| {
+                w.count(
+                    "SELECT count(*) FROM profile_bindings
+                     WHERE lease_id IS NOT NULL OR lease_expires_at IS NOT NULL",
+                )
+            };
+            assert_eq!(rows(&w), 0, "publish {publish}");
+            if publish {
+                assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+                assert!(!is_published(LOCAL).unwrap());
+            }
+        }
+    }
+
+    /// G2-35 (plan L2032), the launcher half of WP-14: a kept
+    /// `DeviceRevocationV2` is reloaded before the Q-18 commit block reads it,
+    /// with every column its row carries equal to the exact bytes: the row's
+    /// key is the revoked key, and the container is a revocation of this
+    /// tenant and instance. A row that does not reload makes the ledger
+    /// unreadable and nothing is uploaded; one that reloads but whose signer
+    /// this device cannot verify still counts as `compromised`.
+    #[test]
+    fn a_kept_revocation_reloads_with_every_column_equal() {
+        let mut other_tenant = common(30);
+        other_tenant.tenant_id = [0x55; 16];
+        let mut other_instance = common(30);
+        other_instance.server_instance_id = [0x56; 16];
+        let revocation = |common: CommonFields, subject: [u8; 32]| DeviceRevocationV2 {
+            common,
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: subject,
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let stranger = Ed25519SigningKey::from_bytes(&[9; 32]);
+        for (what, container, unreadable) in [
+            ("a matching revocation", None, false),
+            (
+                "another revoked key",
+                Some(revocation(common(30), [0x79; 32])),
+                true,
+            ),
+            (
+                "another tenant",
+                Some(revocation(other_tenant, [0x77; 32])),
+                true,
+            ),
+            (
+                "another instance",
+                Some(revocation(other_instance, [0x77; 32])),
+                true,
+            ),
+        ] {
+            let w = world();
+            let matching = revocation(common(30), [0x77; 32]);
+            let container = build_record(
+                &w.me.sk,
+                DOMAIN_DEVICE_REVOCATION,
+                &container.unwrap_or(matching).encode(),
+            );
+            w.db()
+                .conn
+                .execute(
+                    "INSERT INTO trust_proven_revocations
+                     VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                    params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+                )
+                .unwrap();
+            let err = w.push().unwrap_err();
+            let key = if unreadable {
+                "team.trustLedgerUnreadable"
+            } else {
+                "sync.commitBlockedCompromised"
+            };
+            assert!(has(&err, key), "{what}: {err:#}");
+            assert!(w.sent("POST", "/uploads").is_empty(), "{what}");
+        }
+        // A kept row that is not a revocation at all, or not even a record.
+        let w = world();
+        let not_a_revocation = w.grant.clone();
+        let mut g = DeviceHpkeGrantV2 {
+            common: common(40),
+            fleet_id: FLEET,
+            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&FKEK),
+            generation: GEN,
+            subject_account_id: w.me.to.account_id,
+            subject_device_id: w.me.to.device_id,
+            subject_signing_key_id: w.me.to.signing_key_id,
+            recipient_hpke_key_id: w.me.to.hpke_key_id,
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        };
+        shardx_core::grants::seal_device_fkek(&w.me.hpke_pk, &mut g, &FKEK).unwrap();
+        let by_stranger = build_record(&stranger, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode());
+        for (what, container) in [
+            ("another record", not_a_revocation),
+            ("another record this device cannot verify", by_stranger),
+            ("bytes that are no record", vec![1, 2, 3]),
+        ] {
+            w.db()
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO trust_proven_revocations
+                     VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                    params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
+                )
+                .unwrap();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "team.trustLedgerUnreadable"), "{what}: {err:#}");
+            assert!(w.sent("POST", "/uploads").is_empty(), "{what}");
+        }
+        // Signed by a key this device has no evidence for: it cannot verify
+        // the reason, so the revocation counts as `compromised` (Q-18).
+        drop(w);
+        let w = world();
+        let unverifiable = build_record(
+            &stranger,
+            DOMAIN_DEVICE_REVOCATION,
+            &revocation(common(30), [0x77; 32]).encode(),
+        );
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), unverifiable],
+            )
+            .unwrap();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
     }
 
     /// Rule 6, first acceptance: a new head is restored only while its
@@ -4144,6 +6182,31 @@ mod tests {
         }
     }
 
+    /// A lease a version 5 file carried is marked LEASE_AT_RISK, its expiry
+    /// unknown: it is still held, so a pull does not write over the profile
+    /// and the next push goes on with that lease.
+    #[test]
+    fn a_lease_at_risk_is_still_a_held_lease() {
+        let w = world();
+        w.fake().tamper = Some("manifest");
+        w.push().unwrap_err();
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'LEASE_AT_RISK',
+                   lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                [],
+            )
+            .unwrap();
+        let out = w.udd.with_file_name("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.pushPending"), "{err:#}");
+        assert!(!out.exists());
+        w.fake().tamper = None;
+        assert_eq!(w.push().unwrap().version, 1);
+        assert_eq!(w.sent("POST", "/checkout").len(), 1, "the same lease");
+    }
+
     /// A 2xx release reply that does not parse is a protocol error: each
     /// push reports it and the release stays stored, replayed as it was
     /// until a readable reply completes it.
@@ -4376,7 +6439,8 @@ mod tests {
         w.db()
             .conn
             .execute(
-                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL",
+                "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+                   lease_expires_at = NULL",
                 [],
             )
             .unwrap();
@@ -4624,19 +6688,17 @@ mod tests {
             self.db()
                 .conn
                 .execute(
-                    "INSERT INTO profile_bindings(local_profile_id, server_instance_id, tenant_id,
-                       fleet_id, remote_profile_id, remote_version, last_observed_head_hash,
-                       accepted_restore_epoch, sync_state)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 'AVAILABLE')",
-                    params![
-                        local,
-                        hex(&INSTANCE),
-                        hex(&TENANT),
-                        hex(&FLEET),
-                        hex(&profile),
-                        version as i64,
-                        head.to_vec()
-                    ],
+                    "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                       tenant_id, account_id, device_id, fleet_id, remote_profile_id,
+                       remote_version, base_version, last_observed_head_hash,
+                       accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+                     SELECT ?1, k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+                       k.device_id, k.fleet_id, ?2, ?3, ?3, ?4, 0, k.fkek_key_id, k.generation,
+                       'AVAILABLE', 0
+                     FROM fleet_key_state k
+                     JOIN device_state d USING (server_id, tenant_id, device_id)
+                     WHERE k.state = 'ACTIVE'",
+                    params![local, hex(&profile), version as i64, head.to_vec()],
                 )
                 .unwrap();
         }
@@ -4756,6 +6818,94 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// Runs `job` on its own thread, with its own runtime and client for the
+    /// fake server at `base`, and waits for it: a call that never returns
+    /// fails the test instead of hanging it.
+    fn within<T: Send + 'static>(
+        what: &str,
+        base: &str,
+        job: impl FnOnce(&tokio::runtime::Runtime, &FleetClient, &Device) -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = base.to_string();
+        std::thread::Builder::new()
+            .name(what.into())
+            .spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let client = FleetClient::new(&base, "").unwrap();
+                tx.send(job(&rt, &client, &device(&me()))).ok();
+            })
+            .unwrap();
+        rx
+    }
+
+    fn finished<T>(what: &str, rx: &std::sync::mpsc::Receiver<T>) -> T {
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what} did not finish: a deadlock"))
+    }
+
+    /// Q-36 follow-up: a publish right after a restore epoch's acceptance, and
+    /// one running while another handle on the same database accepts it, both
+    /// finish. No lock is held across an `.await` and no second handle is
+    /// opened inside a transaction: the only locks are SQLite's file locks
+    /// (taken by single statements or by transactions that make no network
+    /// call, and bounded by the 5 s busy timeout) and the profile claims,
+    /// which refuse instead of waiting. A new profile starts at the epoch the
+    /// server lists, whichever of the two ran first. The acceptance's own
+    /// transaction reads before it writes, so it begins immediate: a deferred
+    /// one that had to upgrade under a committing publish was refused with
+    /// "database is locked" (3 runs in 40 before the fix).
+    #[test]
+    fn a_publish_at_a_restore_epoch_never_waits_on_its_acceptance() {
+        // The racing case is repeated: the window it closes is a few statements wide.
+        for concurrent in [false, true, true, true, true, true] {
+            let w = world();
+            let (h1, h2) = restored(&w);
+            let leaves = [
+                leaf(PROFILE, h2, h1),
+                leaf([0xc4; 16], [7; 32], [8; 32]),
+                leaf([0xc5; 16], [9; 32], [10; 32]),
+            ];
+            let t = transition(&w.me, 0, &leaves);
+            w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+            let base = w.client.base_url().to_string();
+            // A second handle, open and idle for the whole test.
+            let _idle = Db::open().unwrap();
+            let out = w.udd.with_file_name("out");
+            let accept = {
+                let out = out.clone();
+                move |rt: &tokio::runtime::Runtime, c: &FleetClient, d: &Device| {
+                    rt.block_on(pull(c, "t", d, LOCAL, &out, NOW))
+                }
+            };
+            let publish_new = |rt: &tokio::runtime::Runtime, c: &FleetClient, d: &Device| {
+                rt.block_on(publish(
+                    c,
+                    "t",
+                    d,
+                    "local-new",
+                    "Second",
+                    FLEET,
+                    PROFILE2,
+                    NOW,
+                ))
+            };
+            let (accepted, published) = if concurrent {
+                let a = within("accept", &base, accept);
+                let p = within("publish", &base, publish_new);
+                (finished("accept", &a), finished("publish", &p))
+            } else {
+                let accepted = finished("accept", &within("accept", &base, accept));
+                let p = within("publish", &base, publish_new);
+                (accepted, finished("publish", &p))
+            };
+            assert!(accepted.unwrap() > 0, "{concurrent}");
+            published.unwrap();
+            assert_eq!(w.state(LOCAL).2, 1, "{concurrent}");
+            assert_eq!(w.state("local-new").2, 1, "{concurrent}");
+        }
     }
 
     /// Probe 7, G2-39: a transition or proof that does not verify keeps the
@@ -5121,8 +7271,7 @@ mod tests {
     /// the original expired lease; it is released, and the new lease is
     /// taken under a new key. A checkout stored before a restore is replayed
     /// only after the listing showed the restore and its transition was
-    /// accepted, and is released the same way. A fresh lease is used
-    /// whatever its expiry says.
+    /// accepted, and is released the same way.
     #[test]
     fn a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key() {
         let w = world();
@@ -5132,6 +7281,8 @@ mod tests {
             f.lose.push("checkout");
         }
         w.push().unwrap_err();
+        // The lease the new key takes is an ordinary one.
+        w.fake().expires = None;
         assert_eq!(w.push().unwrap().version, 1);
         let checkouts = w.sent("POST", "/checkout");
         assert_eq!(checkouts.len(), 3);
@@ -5402,7 +7553,7 @@ mod tests {
             "UPDATE profile_bindings SET last_error_code = 'HEAD_ROLLBACK_DETECTED'",
             "UPDATE profile_bindings SET remote_version = 1",
             "UPDATE profile_bindings SET last_observed_head_hash = randomblob(32)",
-            "UPDATE profile_bindings SET lease_id = 'x', fencing_token = 1",
+            "UPDATE profile_bindings SET lease_id = 'x', fencing_token = 1, lease_expires_at = 'x'",
         ] {
             let w = world();
             let (h1, h2) = restored(&w);

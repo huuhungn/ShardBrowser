@@ -4079,6 +4079,8 @@ mod custody_tests {
             .unwrap();
         let pin_now = (BINDING, me.to.signing_key_id);
         assert!(!fleet_key_needs_recollect(&db, &pin_now, &FLEET, 1));
+        // A fixture bypassing the keys that hold the record.
+        db.conn.pragma_update(None, "foreign_keys", false).unwrap();
         for (sql, undo) in [
             (
                 "UPDATE signed_authorization_records SET generation = 2",
@@ -4574,6 +4576,15 @@ mod profile_mutation_boundary_tests {
             None,
             None,
         )));
+        assert_running_blocked(rt.block_on(sync_cmd::profile_sync_publish(
+            profile_id.to_string(),
+            None,
+            None,
+            None,
+        )));
+        assert_running_blocked(rt.block_on(sync_cmd::profile_sync_cancel_publish(
+            profile_id.to_string(),
+        )));
 
         tracker.set_running_for_test(profile_id, false);
     }
@@ -4640,6 +4651,8 @@ pub fn run() {
             team_enroll_device,
             backup_cmd::profile_backup_create,
             sync_cmd::profile_sync_push,
+            sync_cmd::profile_sync_publish,
+            sync_cmd::profile_sync_cancel_publish,
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
             sync_cmd::team_unbind_profile,
