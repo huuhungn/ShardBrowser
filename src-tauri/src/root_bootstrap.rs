@@ -541,7 +541,7 @@ fn finish_activation(
 /// memory (any save would drop the legacy key from the file), and one commit
 /// then clears the legacy key and sets the nonce and reference together. If
 /// the store refuses, or the run stops before that commit, the old file still
-/// has the key; a copy stored under an unsaved nonce is an orphan.
+/// has the key, and a rerun reuses the copy already stored under that nonce.
 fn migrate_legacy_trk(
     vault: &dyn TrkStore,
     state: &mut BootstrapState,
@@ -560,8 +560,10 @@ fn migrate_legacy_trk(
     {
         return commit(state, save, |s| s.legacy_trk.zeroize());
     }
+    // Derived from the public root key ID, so a rerun after a crash before the
+    // commit finds the same reference and the same key instead of a second copy.
     let nonce = if state.trk_nonce.is_empty() {
-        hex(&random::<16>()?)
+        hex(&root_key_id(&key)[..16])
     } else {
         state.trk_nonce.clone()
     };
@@ -1928,6 +1930,8 @@ mod tests {
         let reloaded = load().unwrap();
         assert_eq!(reloaded.trk_ref, own_trk_ref(&reloaded).unwrap());
         assert_eq!(*load_trk(&CredentialTrkStore, &reloaded).unwrap(), key);
+        // The rerun reused the reference the failed run stored under: no second copy.
+        assert_eq!(reloaded.trk_nonce, hex(&root_key_id(&key)[..16]));
     }
 
     #[test]
