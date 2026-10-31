@@ -42,6 +42,7 @@ use sqlx::{ConnectOptions, Connection, Row, SqliteConnection};
 use crate::config::Config;
 use crate::identity::{self, hex, Mirror, Verified, RECORD_FILE};
 use crate::routes::v2_auth::Session;
+use crate::routes::v2_device_revoke::look_at_revocations;
 use crate::routes::v2_root_grants::is_active_custodian;
 use crate::util;
 
@@ -397,7 +398,9 @@ fn read_manifest(site: &Site) -> Prep {
     let path = site.identity.join(MANIFEST_FILE);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Prep::Absent,
-        Ok(m) if m.file_type().is_file() => {
+        // A link or reparse point is not the manifest, whatever it points to;
+        // require_plain is the one gate.
+        Ok(_) if identity::require_plain(&path, false).is_ok() => {
             let mut bytes = Vec::new();
             let read = std::fs::File::open(&path)
                 .and_then(|f| f.take(rm::MANIFEST_LEN as u64 + 1).read_to_end(&mut bytes));
@@ -446,8 +449,15 @@ fn orphans(site: &Site) -> Vec<PathBuf> {
     out
 }
 
-async fn observe(cfg: &Config) -> (Option<Site>, Observed) {
-    let site = Site::new(cfg).ok();
+/// What the restore commands and the server's start read. A configured
+/// identity directory that fails its preflight is an error, never "no record":
+/// it would classify as K1 and open the DB writable, even mid-restore.
+async fn observe(cfg: &Config) -> anyhow::Result<(Option<Site>, Observed)> {
+    let site = cfg
+        .identity_dir
+        .is_some()
+        .then(|| Site::new(cfg))
+        .transpose()?;
     let m = observe_mirror(cfg).await;
     let Some(site) = site else {
         let o = Observed {
@@ -458,7 +468,7 @@ async fn observe(cfg: &Config) -> (Option<Site>, Observed) {
             c: false,
             dx: false,
         };
-        return (None, o);
+        return Ok((None, o));
     };
     let x = identity::read_record(&site.identity).ok();
     let p = read_manifest(&site);
@@ -479,18 +489,30 @@ async fn observe(cfg: &Config) -> (Option<Site>, Observed) {
         c,
         dx,
     };
-    (Some(site), o)
+    Ok((Some(site), o))
+}
+
+/// The restore episode a read-only server counts its failed audit writes
+/// under: the manifest's restore, or else the record itself (K2 and the other
+/// states with no parsable manifest).
+fn episode(o: &Observed) -> Option<String> {
+    match (&o.p, &o.x) {
+        (Prep::Parsed(p), _) => Some(format!("txn-{}", hex(&p.restore_txn_id))),
+        (_, Some((_, sha))) => Some(format!("record-{}", hex(sha))),
+        _ => None,
+    }
 }
 
 /// The class the server starts in.
-pub async fn startup_class(cfg: &Config) -> Class {
-    classify(&observe(cfg).await.1)
+pub async fn startup_class(cfg: &Config) -> anyhow::Result<Class> {
+    Ok(classify(&observe(cfg).await?.1))
 }
 
 /// [`startup_class`], refusing a K1 or K4 start that would create an empty
-/// DB at the DB path while files of a restore are left (round-4 B7).
-pub async fn startup_gate(cfg: &Config) -> anyhow::Result<Class> {
-    let (site, o) = observe(cfg).await;
+/// DB at the DB path while files of a restore are left (round-4 B7). Also the
+/// episode a read-only start counts failed audit writes under.
+pub async fn startup_gate(cfg: &Config) -> anyhow::Result<(Class, Option<String>)> {
+    let (site, o) = observe(cfg).await?;
     let class = classify(&o);
     if let (Class::K1 | Class::K4, Mirrored::Absent, Some(site)) = (class, &o.m, &site) {
         ensure!(
@@ -500,15 +522,72 @@ pub async fn startup_gate(cfg: &Config) -> anyhow::Result<Class> {
             class.row()
         );
     }
-    Ok(class)
+    Ok((class, class.read_only().then(|| episode(&o)).flatten()))
+}
+
+/// WI-AUDIT-RO: the v1 audit writes the read-only DB refused in this episode,
+/// when `episode` is one (a read-only class), and the counts kept for other
+/// episodes in every class: an episode's key can change mid-restore, and its
+/// count waits for `restore clear-audit-count --episode <key>`.
+fn print_audit_failures(cfg: &Config, episode: Option<&str>) {
+    if let Some(episode) = episode {
+        println!(
+            "audit_write_failures={}",
+            crate::audit::read_only_failures(&cfg.data_dir, episode)
+        );
+    }
+    for kept in crate::audit::kept_failures(&cfg.data_dir, episode) {
+        println!("audit_write_failures_kept={kept}");
+    }
+    for file in crate::audit::corrupt_files(&cfg.data_dir) {
+        println!("audit_write_failures_corrupt={}", file.display());
+    }
+}
+
+/// A restore ends: print its episode's failed audit writes and those kept for
+/// other episodes, then clear its own.
+fn finish_episode(cfg: &Config, episode: Option<&str>) {
+    print_audit_failures(cfg, episode);
+    if let Some(episode) = episode {
+        crate::audit::clear_read_only_count(&cfg.data_dir, episode);
+    }
+}
+
+/// `restore clear-audit-count --episode <key>`: acknowledges the failed audit
+/// writes counted under a key that no restore will end. There is no offline
+/// audit path for it: the v2 audit events are per tenant and the database may
+/// be read-only, so the cleared count is printed for the operator's record.
+pub fn clear_audit_count(cfg: &Config, episode: &str) -> anyhow::Result<()> {
+    match crate::audit::clear_episode(&cfg.data_dir, episode)? {
+        Some(count) => println!("cleared_audit_count={episode} {count}"),
+        None => bail!("no audit failure count is kept for episode {episode:?}"),
+    }
+    Ok(())
+}
+
+/// The incident output `identity show` adds: the class and the failed audit
+/// writes of a read-only server. Nothing when the class cannot be read.
+pub async fn print_incident(cfg: &Config) {
+    if let Ok((_, o)) = observe(cfg).await {
+        let class = classify(&o);
+        let episode = class.read_only().then(|| episode(&o)).flatten();
+        if episode.is_some() {
+            println!("class={class:?}");
+        }
+        print_audit_failures(cfg, episode.as_deref());
+    }
 }
 
 /// `restore status`: read-only; prints the class and the plan row.
 pub async fn status(cfg: &Config) -> anyhow::Result<()> {
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let class = classify(&o);
     println!("class={class:?}");
     println!("row={}", class.row());
+    print_audit_failures(
+        cfg,
+        class.read_only().then(|| episode(&o)).flatten().as_deref(),
+    );
     if let (Class::K3, Some(site)) = (class, &site) {
         for path in orphans(site) {
             println!("orphan={}", path.display());
@@ -720,7 +799,7 @@ async fn attach_backup(conn: &mut SqliteConnection, backup: &Path) -> anyhow::Re
 /// coverage, for its custodians to sign and file at `E`.
 pub async fn export_heads(cfg: &Config, backup: &Path, out: &Path) -> anyhow::Result<()> {
     refuse_release_build()?;
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let (x, _) = require_clean_k3(&site, &o)?;
     let backup_sha = sha256_file(backup)?;
@@ -750,6 +829,23 @@ pub async fn export_heads(cfg: &Config, backup: &Path, out: &Path) -> anyhow::Re
     println!("restore_txn_id={}", hex(&txn));
     println!("backup_db_sha256={}", hex(&backup_sha));
     println!("tenants={}", tenants.len());
+    Ok(())
+}
+
+/// Every device revocation must be served correctly right now before a
+/// restore reads the rows: a tampered or moved row could hide a revocation
+/// from the signer and snapshot checks. A row marked before that verifies
+/// again passes. Offline, so nothing is quarantined here; it refuses.
+async fn ensure_revocations_intact(
+    conn: &mut SqliteConnection,
+    instance: &[u8; 16],
+) -> anyhow::Result<()> {
+    let found = look_at_revocations(conn, instance, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("refusing: checking the device revocations failed: {e:?}"))?;
+    if let Some(first) = found.unserved.first() {
+        bail!("refusing: {}", first.describe());
+    }
     Ok(())
 }
 
@@ -1107,7 +1203,7 @@ async fn merge(conn: &mut SqliteConnection, x: &IdentityRecordV2) -> anyhow::Res
 pub async fn prepare(cfg: &Config, backup: &Path, txn: [u8; 16]) -> anyhow::Result<()> {
     refuse_release_build()?;
     ensure!(txn != [0; 16], "--txn must not be zero");
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let (x, xsha) = require_clean_k3(&site, &o)?;
 
@@ -1136,6 +1232,8 @@ pub async fn prepare(cfg: &Config, backup: &Path, txn: [u8; 16]) -> anyhow::Resu
             restore_epoch: x.restore_epoch,
             external_record_sha256: xsha,
         };
+        // The signer and snapshot checks below read revocation columns.
+        ensure_revocations_intact(&mut conn, &x.server_instance_id).await?;
         let staged = staged(&mut conn, &v, &x, &tenants).await?;
         merge(&mut conn, &x).await?;
         sqlx::query("DETACH DATABASE bk").execute(&mut conn).await?;
@@ -1234,8 +1332,10 @@ fn read_artifacts(
     p: &PreparationManifestV2,
 ) -> anyhow::Result<(BTreeMap<String, Vec<u8>>, TransitionSetIndexV2)> {
     let dir = site.artifacts(&p.restore_txn_id);
+    identity::require_plain(&dir, true).map_err(anyhow::Error::msg)?;
     let mut files = BTreeMap::new();
     for name in names_in(&dir) {
+        identity::require_plain(&dir.join(&name), false).map_err(anyhow::Error::msg)?;
         let bytes = std::fs::read(dir.join(&name))?;
         ensure!(
             hex(&c::sha256(&bytes)) == name,
@@ -1552,9 +1652,10 @@ fn retire(site: &Site, txn: &[u8; 16]) -> anyhow::Result<()> {
 
 /// `restore commit [--retire]`: the remaining steps from the current class.
 pub async fn commit(cfg: &Config, retire_only: bool) -> anyhow::Result<()> {
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let class = classify(&o);
+    let episode = class.read_only().then(|| episode(&o)).flatten();
     let x = o.x.clone();
     match (class, &o.p, retire_only) {
         (Class::K5b, _, true) => {
@@ -1610,7 +1711,8 @@ pub async fn commit(cfg: &Config, retire_only: bool) -> anyhow::Result<()> {
             class.row()
         ),
     }
-    println!("class={:?}", startup_class(cfg).await);
+    finish_episode(cfg, episode.as_deref());
+    println!("class={:?}", startup_class(cfg).await?);
     Ok(())
 }
 
@@ -1619,7 +1721,7 @@ pub async fn commit(cfg: &Config, retire_only: bool) -> anyhow::Result<()> {
 /// restore can use (other leaves, or a tenant that needs none) never blocks
 /// every restore at `E`. Only in K3: a prepared restore has bound its set.
 pub async fn withdraw_transitions(cfg: &Config, tenant: [u8; 16]) -> anyhow::Result<()> {
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let class = classify(&o);
     ensure!(
@@ -1676,7 +1778,7 @@ pub async fn withdraw_transitions(cfg: &Config, tenant: [u8; 16]) -> anyhow::Res
 /// `restore abort [--orphans [--delete-archives]]`: only while the authority
 /// is still `E`.
 pub async fn abort(cfg: &Config, orphans_only: bool, delete_archives: bool) -> anyhow::Result<()> {
-    let (site, o) = observe(cfg).await;
+    let (site, o) = observe(cfg).await?;
     let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
     let class = classify(&o);
     if orphans_only {
@@ -1710,6 +1812,7 @@ pub async fn abort(cfg: &Config, orphans_only: bool, delete_archives: bool) -> a
         "refusing: restore abort is only for K5a and K7, not {class:?} ({})",
         class.row()
     );
+    let episode = episode(&o);
     let txn = match &o.p {
         Prep::Parsed(p) => p.restore_txn_id,
         _ => [0; 16],
@@ -1732,7 +1835,8 @@ pub async fn abort(cfg: &Config, orphans_only: bool, delete_archives: bool) -> a
     identity::sync_dir(&site.identity)?;
     std::fs::remove_file(site.identity.join(MANIFEST_FILE))?;
     identity::sync_dir(&site.identity)?;
-    println!("class={:?}", startup_class(cfg).await);
+    finish_episode(cfg, episode.as_deref());
+    println!("class={:?}", startup_class(cfg).await?);
     Ok(())
 }
 

@@ -162,7 +162,7 @@ pub fn psapi_path() -> Result<PathBuf> {
     Ok(config_root()?.join("psapi.json"))
 }
 
-/// Refuses `dir` unless it is on a local NTFS volume (ADR 0002 Q-29; plan
+/// Refuses `dir` unless it is on a local NTFS volume (ADR 0002 Q-30; plan
 /// L2335: the durability harness holds on supported filesystems only, and a
 /// network share fails closed). Off Windows every directory passes.
 pub fn require_local_ntfs(dir: &std::path::Path) -> Result<()> {

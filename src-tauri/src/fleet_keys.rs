@@ -260,8 +260,8 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
 /// Moves every plaintext key in the saved file into the OS credential store,
 /// and rewrites the file without the keys that read back. Returns whether
 /// any key moved.
-// shortcut: with no usable store the keys stay in plaintext `fleet_keys.json`
-// until the fallback key file (ADR 0002, G2-48) lands.
+// shortcut: with no usable store and no open key file (ADR 0002, G2-48) the
+// keys stay in plaintext `fleet_keys.json`; opening the key file moves them.
 pub fn protect() -> Result<bool> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = store::fleet_keys_path()?;

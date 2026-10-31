@@ -29,6 +29,9 @@ pub const USAGE: &str = "usage:
   shardx-team-server restore abort [--orphans [--delete-archives]]
       drop a restore whose authority is still the previous epoch; --orphans
       keeps the pre-restore archives unless --delete-archives is given
+  shardx-team-server restore clear-audit-count --episode <key>
+      acknowledge the failed audit writes kept under an episode key that no
+      restore will end (`restore status` lists them as audit_write_failures_kept)
   shardx-team-server restore withdraw-transitions --tenant <id>
       remove a tenant's staged transition for the next restore epoch
   shardx-team-server tenant create --slug <slug> --owner-username <name> [--password-stdin]
@@ -66,6 +69,9 @@ pub enum Command {
     },
     RestoreWithdrawTransitions {
         tenant: [u8; 16],
+    },
+    RestoreClearAuditCount {
+        episode: String,
     },
     TenantCreate {
         slug: String,
@@ -121,6 +127,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::RestoreWithdrawTransitions {
                 tenant: bootstrap::parse_device_id(tenant)
                     .ok_or("--tenant must be 32 hex digits")?,
+            })
+        }
+        ["restore", "clear-audit-count", "--episode", episode] => {
+            Ok(Command::RestoreClearAuditCount {
+                episode: episode.to_string(),
             })
         }
         ["tenant", "create", rest @ ..] => parse_tenant_create(rest),
@@ -215,6 +226,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::RestoreWithdrawTransitions { tenant } => {
             restore::withdraw_transitions(&cfg, tenant).await
         }
+        Command::RestoreClearAuditCount { episode } => restore::clear_audit_count(&cfg, &episode),
         Command::TenantCreate {
             slug,
             owner_username,
@@ -519,6 +531,13 @@ mod tests {
             })
         );
         assert_eq!(parse(&args("restore status")), Ok(Command::RestoreStatus));
+        assert_eq!(
+            parse(&args("restore clear-audit-count --episode txn-ab")),
+            Ok(Command::RestoreClearAuditCount {
+                episode: "txn-ab".into()
+            })
+        );
+        assert!(parse(&args("restore clear-audit-count")).is_err());
         assert_eq!(
             parse(&args("restore export-heads --backup b.db --out o")),
             Ok(Command::RestoreExportHeads {

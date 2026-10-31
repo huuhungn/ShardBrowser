@@ -184,8 +184,8 @@ fn seed(plaintext: &str, credential_ref: &str, corrupt: &str) -> Result<Zeroizin
 /// 0004) and saves the file without them. A seed leaves the file only after
 /// it read back from the store; while the store is unavailable it stays.
 /// Returns whether any seed moved.
-// shortcut: with no usable store the seeds stay in plaintext `team.json`
-// until the fallback key file (ADR 0002, G2-48) lands.
+// shortcut: with no usable store and no open key file (ADR 0002, G2-48) the
+// seeds stay in plaintext `team.json`; opening the key file moves them.
 pub fn protect_keys(c: &mut TeamConfig) -> Result<bool> {
     if c.device_id.is_empty() {
         return Ok(false);

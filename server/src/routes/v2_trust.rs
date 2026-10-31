@@ -25,8 +25,9 @@ use shared::trust_evidence::{
 
 use super::v2_approval::{cbor, coded};
 use super::v2_auth::{reload_session, unhex, verified, Principal};
+use super::v2_device_revoke::{load_revocation, look_at_revocations};
 use crate::error::AppError;
-use crate::identity::Verified;
+use crate::identity::{ReasonCode, Verified};
 use crate::state::AppState;
 use crate::util::now_ms;
 use shared::canonical::sha256;
@@ -38,6 +39,7 @@ pub const MAX_SIGNERS: usize = 64;
 /// rows and whether they are scoped. Approvals and capability grants are
 /// scoped: those of the root grant subjects and of the named signers. Every
 /// other table is served whole.
+/// Revocations have no kind here: a marked one is served while it verifies.
 const KINDS: [(&str, Option<&str>, bool); 7] = [
     ("v2_tenant_root_key_grants", Some("root_grant"), false),
     ("v2_device_approvals", Some("device_approval"), true),
@@ -149,7 +151,8 @@ fn revoked_at_ms(revoked_at: &str) -> u64 {
 
 /// The rows of `kind` after `after`, at most `limit`, without their
 /// containers: a page loads only the containers it serves. Quarantined rows
-/// are left out.
+/// are left out, except revocations: one is served as long as its row verifies
+/// and refuses the page when it does not.
 async fn rows(
     conn: &mut SqliteConnection,
     v: &Verified,
@@ -160,6 +163,19 @@ async fn rows(
     limit: i64,
 ) -> Result<Vec<sqlx::sqlite::SqliteRow>, AppError> {
     let (table, quarantine_kind, scoped) = KINDS[usize::from(kind)];
+    // A page that left a revocation out would let a revoked device pass as
+    // live, so one that is not served correctly right now refuses the page,
+    // as the startup pass does. Rows of other instances count: moving one
+    // hides it. Every row served is verified when it is loaded.
+    if table == REVOCATIONS {
+        let found = look_at_revocations(&mut *conn, &v.server_instance_id, false).await?;
+        if let Some(first) = found.unserved.first() {
+            tracing::warn!("{}", first.describe());
+            return Err(AppError::EpochAuthority(
+                ReasonCode::ControlPlaneIntegrityUntrusted,
+            ));
+        }
+    }
     let quarantined = quarantine_kind.map_or(String::new(), |k| {
         format!(
             " AND NOT EXISTS (SELECT 1 FROM v2_grant_quarantine q
@@ -309,15 +325,21 @@ pub async fn trust_evidence(
                 });
             }
             if table == REVOCATIONS {
-                let (device, filed_at): (Vec<u8>, i64) = sqlx::query_as(
-                    "SELECT subject_device_id, filed_at_ms FROM v2_device_revocations WHERE rowid = ?",
+                let replay: [u8; 16] = row
+                    .get::<Vec<u8>, _>("replay_id")
+                    .try_into()
+                    .map_err(|_| AppError::Internal("a replay id is not 16 bytes".into()))?;
+                // The reported device is the verified record's, never a column's.
+                let stored = load_revocation(&mut tx, &v.server_instance_id, &tenant, &replay)
+                    .await?
+                    .ok_or_else(|| AppError::Internal("a revocation left the page".into()))?;
+                let device_id = stored.revocation.subject_device_id;
+                let filed_at: i64 = sqlx::query_scalar(
+                    "SELECT filed_at_ms FROM v2_device_revocations WHERE rowid = ?",
                 )
                 .bind(after)
                 .fetch_one(&mut *tx)
                 .await?;
-                let device_id: [u8; 16] = device
-                    .try_into()
-                    .map_err(|_| AppError::Internal("a device id is not 16 bytes".into()))?;
                 // The earliest filing on this page; a client takes the
                 // earliest over all pages, so a later one only repeats it.
                 if !page
