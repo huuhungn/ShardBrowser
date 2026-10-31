@@ -10,7 +10,7 @@
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 
-use crate::routes::v2_device_revoke::verified_container;
+use crate::routes::v2_device_revoke::{names_row, verified_container};
 use crate::util;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,7 @@ pub async fn record(pool: &SqlitePool, mark: &Mark) -> sqlx::Result<bool> {
                 let mut conn = pool.acquire().await?;
                 verified_container(&mut conn, &mark.tenant_id, &exact)
                     .await?
+                    .filter(|(_, r)| names_row(r, mark))
                     .map(|_| Sha256::digest(&exact).to_vec())
             }
             None => None,

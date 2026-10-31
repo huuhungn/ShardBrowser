@@ -10048,6 +10048,66 @@ async fn a_corrupt_container_is_marked_without_a_hash_and_served_again_once_rest
     pool.close().await;
 }
 
+/// A genuine container of another row (another replay ID) copied over a row is
+/// marked without a hash, so putting the row's own container back serves it
+/// again; a hash of the stray container would have refused every restore.
+#[tokio::test]
+async fn a_container_of_another_row_is_marked_without_a_hash() {
+    let mut server = start("v2-cross-row-container", 28399).await;
+    let (dev, access, _) = custodian(&mut server, 0x75).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (subject, third) = (
+        device(&server, OWNER, 0x7b, "pending").await,
+        device(&server, OWNER, 0x7d, "pending").await,
+    );
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let stray = revocation(&dev.sk, &third, 0x91, 30);
+    for (who, request) in [
+        (&subject, revoke_request(0xa6, &container)),
+        (&third, revoke_request(0xa5, &stray)),
+    ] {
+        let status = server
+            .call(&device_revoke_path(&who.id), &access, Some(&request))
+            .await
+            .0;
+        assert_eq!(status, 201);
+    }
+    let calls = [(GRANTS.to_string(), Some(duty.clone()))];
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    let set =
+        "UPDATE v2_device_revocations SET exact_signed_container_bytes = ? WHERE replay_id = ?";
+    sqlx::query(set)
+        .bind(&stray)
+        .bind([0x90u8; 16].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_grant_quarantine WHERE kind = 'device_revocation' AND container_sha256 IS NULL")
+            .await,
+        1
+    );
+    assert_all_untrusted(&server, &access, &calls).await;
+
+    sqlx::query(set)
+        .bind(&container)
+        .bind([0x90u8; 16].as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    server.restart().await;
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let (all, reported, _) = served_revocations(&server, &access, subject.id, [0; 16]).await;
+    assert!(all.contains(&container) && reported);
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn the_trust_evidence_reports_a_revoked_device_from_its_record_not_its_column() {
     let mut server = start("g2-30-revocation-trust", 28316).await;

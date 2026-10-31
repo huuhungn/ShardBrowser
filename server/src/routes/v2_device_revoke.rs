@@ -116,6 +116,14 @@ pub(crate) async fn load_revocation(
     }))
 }
 
+/// Whether a verified container is the one for `mark`'s row: the same server
+/// instance, tenant and replay ID. A genuine container of another row is not.
+pub(crate) fn names_row(revocation: &DeviceRevocationV2, mark: &Mark) -> bool {
+    let c = &revocation.common;
+    (c.server_instance_id, c.tenant_id, c.replay_id)
+        == (mark.server_instance_id, mark.tenant_id, mark.replay_id)
+}
+
 /// The container bytes alone: parsed, signed under the key of one of the
 /// tenant's devices and a `DeviceRevocationV2`. `None` if they are not. The
 /// issuer's device row outlives its own revocation, so its key stays.
@@ -306,7 +314,7 @@ async fn why_broken(conn: &mut SqliteConnection, mark: &Mark) -> Result<Why, App
             if recorded.as_slice() != Sha256::digest(&exact).as_slice()
                 && verified_container(conn, &mark.tenant_id, &exact)
                     .await?
-                    .is_some() =>
+                    .is_some_and(|(_, r)| names_row(&r, mark)) =>
         {
             Why::OtherContainer
         }
