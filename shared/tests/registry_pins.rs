@@ -86,6 +86,8 @@ const LABELS: &[&str] = &[
     k::L_SIGNING_KEY_ID,
     k::L_HPKE_KEY_ID,
     k::L_TENANT_ROOT_KEY_ID,
+    k::L_PROFILE_LABEL,
+    k::L_PROFILE_LABEL_KEY,
     s2::L_SNAPSHOT_HEAD,
 ];
 
