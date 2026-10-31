@@ -216,9 +216,10 @@ pub fn load(credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
     })
 }
 
-/// Removes the key from the open file. With no file, or a locked one, there
-/// is nothing this run can remove.
-pub fn forget(credential_ref: &str) -> Result<()> {
+/// Removes the key from the open file. `Ok(true)` means the open file does
+/// not hold it any more; `Ok(false)` that there is no file at all. A file that
+/// exists but is locked is `credential.locked`.
+pub fn forget(credential_ref: &str) -> Result<bool> {
     match with_open(|u| {
         if u.keys.contains_key(credential_ref) {
             let mut keys = u.keys.clone();
@@ -228,8 +229,9 @@ pub fn forget(credential_ref: &str) -> Result<()> {
         }
         Ok(())
     }) {
-        Err(e) if e.to_string().contains("credential.unavailable") => Ok(()),
-        other => other,
+        Ok(()) => Ok(true),
+        Err(e) if e.to_string().contains("credential.unavailable") => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -308,6 +310,60 @@ mod tests {
         close();
         crate::credential::OS_STORE_DOWN.with(|d| d.set(false));
         store::set_config_root(None);
+    }
+
+    /// Forgetting is a confirmed delete: an OS store that cannot be opened
+    /// confirms nothing, and a key file that is only locked does not undo a
+    /// delete the OS store confirmed.
+    #[test]
+    fn a_forget_succeeds_only_once_the_key_is_confirmed_gone() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        close();
+        let name = "tenant-root.ab.cd";
+        let down = |yes| crate::credential::OS_STORE_DOWN.with(|d| d.set(yes));
+
+        // (a) No OS store here and no key file: nothing is confirmed.
+        down(true);
+        assert!(err(crate::credential::forget(name)).contains("credential.unavailable"));
+
+        // With the key file open, its delete is the confirmation.
+        create(PASS).unwrap();
+        crate::credential::store(name, &[8; 32]).unwrap();
+        crate::credential::forget(name).unwrap();
+        assert!(err(crate::credential::load(name)).contains("credential.missing"));
+
+        // A locked file cannot confirm anything without the OS store...
+        crate::credential::store(name, &[8; 32]).unwrap();
+        close();
+        assert!(err(crate::credential::forget(name)).contains("credential.locked"));
+
+        // (b) ...but with the OS store up, the OS delete is the confirmation.
+        down(false);
+        crate::credential::forget(name).unwrap();
+        let os = crate::credential::store("device-hpke.os-only", &[7; 32]);
+        os.unwrap();
+        crate::credential::forget("device-hpke.os-only").unwrap();
+        assert!(err(crate::credential::load("device-hpke.os-only")).contains("credential."));
+
+        // An OS store that refuses the delete still fails it.
+        crate::credential::store("device-hpke.refused", &[6; 32]).unwrap();
+        crate::credential::fail_next_call("device-hpke.refused");
+        assert!(err(crate::credential::forget("device-hpke.refused"))
+            .contains("credential.unavailable"));
+        crate::credential::forget("device-hpke.refused").unwrap();
+
+        close();
+        down(false);
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn a_tenant_root_reference_with_a_run_nonce_is_a_trk() {
+        assert_eq!(kind_of("tenant-root.ab.cd"), Some(KeyKind::Trk));
     }
 
     #[test]

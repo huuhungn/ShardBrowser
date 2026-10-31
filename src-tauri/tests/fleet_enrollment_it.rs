@@ -660,8 +660,12 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     };
     let disk = std::cell::RefCell::new(BootstrapState::default());
     let fail_ack = std::cell::Cell::new(false);
+    let fail_activation = std::cell::Cell::new(false);
     let mut save = |s: &BootstrapState| -> anyhow::Result<()> {
         if fail_ack.get() && !s.ack_request.is_empty() {
+            anyhow::bail!("disk full");
+        }
+        if fail_activation.get() && s.activated {
             anyhow::bail!("disk full");
         }
         *disk.borrow_mut() = s.clone();
@@ -761,6 +765,21 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         "{err}"
     );
     std::fs::write(&bundle, &kept).expect("restore the bundle");
+
+    // The save of the activation fails: the generation is active on the
+    // server, but the TRK must still be in the store and its reference saved,
+    // or the rerun would make a second key.
+    fail_activation.set(true);
+    bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("a failed save of the activation stops the run");
+    fail_activation.set(false);
+    assert!(
+        vault.keys.lock().unwrap().contains_key(&resumed.trk_ref),
+        "the TRK is still stored"
+    );
+    assert!(!disk.borrow().activated && disk.borrow().trk_ref == resumed.trk_ref);
+    assert!(!state.activated && state.trk_ref == resumed.trk_ref);
     bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
         .await
         .expect("the bootstrap must resume and finish");
@@ -820,6 +839,7 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     let mut replay = BootstrapState {
         activated: false,
         trk_ref: resumed.trk_ref.clone(),
+        trk_nonce: resumed.trk_nonce.clone(),
         ..done.clone()
     };
     vault

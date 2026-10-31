@@ -95,6 +95,10 @@ pub struct BootstrapState {
     /// The exact D1 approval container.
     #[serde(default)]
     pub approval: String,
+    /// Names this run's TRK: saved before the key is stored, it makes the
+    /// reference unique, so a key an abandoned run left is never picked up.
+    #[serde(default)]
+    pub trk_nonce: String,
     /// The credential reference of the TRK, from its creation until the
     /// generation is active and the key is forgotten.
     #[serde(default)]
@@ -408,21 +412,59 @@ fn commit(
     Ok(())
 }
 
-/// The stable reference the TRK of `tenant_hex` is stored under.
-fn trk_ref(tenant_hex: &str) -> String {
-    format!("tenant-root.{}", tenant_hex.to_ascii_lowercase())
+/// A run nonce: 16 random bytes, lower-case hex.
+fn nonce_ok(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The reference the state names, once it is the one this tenant's TRK is
-/// stored under: a saved file that points at any other credential is damaged,
-/// and must not make the bootstrap read or delete it.
+/// The reference the TRK of one run of `tenant_hex` is stored under.
+fn trk_ref(tenant_hex: &str, nonce: &str) -> String {
+    format!("tenant-root.{}.{nonce}", tenant_hex.to_ascii_lowercase())
+}
+
+/// The reference the state names, once it is the one this tenant's run stored
+/// its TRK under: a saved file that points at any other credential is
+/// damaged, and must not make the bootstrap read or delete it.
 fn own_trk_ref(state: &BootstrapState) -> Result<String> {
-    let name = trk_ref(&state.tenant_id);
-    if state.trk_ref == name {
+    let name = trk_ref(&state.tenant_id, &state.trk_nonce);
+    if nonce_ok(&state.trk_nonce) && state.trk_ref == name {
         Ok(name)
     } else {
         Err(corrupt())
     }
+}
+
+/// This run's reference. The nonce is saved first: whatever is stored under
+/// the reference afterwards belongs to this run.
+fn run_ref(
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+) -> Result<String> {
+    if state.trk_nonce.is_empty() {
+        let nonce = hex(&random::<16>()?);
+        commit(state, save, |s| s.trk_nonce = nonce)?;
+    }
+    if !nonce_ok(&state.trk_nonce) {
+        return Err(corrupt());
+    }
+    Ok(trk_ref(&state.tenant_id, &state.trk_nonce))
+}
+
+/// A hex secret, decoded straight into memory that is wiped on drop.
+fn unhex_secret(s: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let digits = s.as_bytes();
+    if digits.len() != 64 {
+        return Err(corrupt());
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    for (byte, pair) in out.iter_mut().zip(digits.chunks(2)) {
+        let digit = |c: u8| (c as char).to_digit(16).ok_or_else(corrupt);
+        *byte = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Ok(out)
 }
 
 /// The TRK the state names, from the credential store. A locked or
@@ -432,20 +474,23 @@ fn load_trk(vault: &dyn TrkStore, state: &BootstrapState) -> Result<Zeroizing<[u
     vault.load(&own_trk_ref(state)?)
 }
 
+fn is_missing(e: &anyhow::Error) -> bool {
+    crate::errcode::has_code(&e.to_string(), "credential.missing")
+}
+
 /// Stores a new TRK and only then saves its reference, so the key is held
-/// before anything names it. A key left behind by a run that stopped between
-/// the two was named by nothing yet and is reused, not overwritten.
+/// before anything names it. A key under this run's reference, left by a run
+/// that stopped between the two, was named by nothing yet and is reused, not
+/// overwritten.
 fn create_trk(
     vault: &dyn TrkStore,
     state: &mut BootstrapState,
     save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<()> {
-    let name = trk_ref(&state.tenant_id);
+    let name = run_ref(state, save)?;
     match vault.load(&name) {
         Ok(_) => {}
-        Err(e) if crate::errcode::has_code(&e.to_string(), "credential.missing") => {
-            vault.store(&name, &Zeroizing::new(random::<32>()?))?
-        }
+        Err(e) if is_missing(&e) => vault.store(&name, &Zeroizing::new(random::<32>()?))?,
         Err(e) => return Err(e),
     }
     commit(state, save, |s| s.trk_ref = name)
@@ -462,13 +507,37 @@ fn release_trk(
         return Ok(());
     }
     vault.forget(&own_trk_ref(state)?)?;
-    commit(state, save, |s| s.trk_ref.clear())
+    commit(state, save, |s| {
+        s.trk_ref.clear();
+        s.trk_nonce.clear();
+    })
 }
 
-/// Moves a TRK that an earlier launcher saved in the clear into the credential
-/// store, then saves the state without it. If the store refuses, nothing is
-/// saved: the old file keeps the key, and the run stops with the store's
-/// credential error.
+/// Marks the generation active and saves that first. Only then is the stored
+/// TRK forgotten: a crash between the two resumes with the key still there,
+/// where the other order would leave a state that must make a second TRK.
+fn finish_activation(
+    vault: &dyn TrkStore,
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+    anchor: String,
+) -> Result<()> {
+    commit(state, save, |s| {
+        s.anchor = anchor;
+        s.activated = true;
+    })?;
+    release_trk(vault, state, save)
+}
+
+/// Deals with a TRK that an earlier launcher saved in the clear.
+///
+/// With no self-grant saved, nothing outside this device ever named that key:
+/// it is dropped, and the run makes a fresh one in the store. Otherwise it
+/// moves into the store under this run's reference, and the state is saved
+/// without it. A reference already set, or a different key already held
+/// there, is a damaged state and is never overwritten. If the store refuses,
+/// nothing is saved: the old file keeps the key and the run stops with the
+/// store's credential error.
 fn migrate_legacy_trk(
     vault: &dyn TrkStore,
     state: &mut BootstrapState,
@@ -477,12 +546,20 @@ fn migrate_legacy_trk(
     if state.legacy_trk.is_empty() {
         return Ok(());
     }
-    if state.tenant_id.is_empty() {
+    if state.tenant_id.is_empty() || !state.trk_ref.is_empty() {
         return Err(corrupt());
     }
-    let key = Zeroizing::new(unhex::<32>(&state.legacy_trk)?);
-    let name = trk_ref(&state.tenant_id);
-    vault.store(&name, &key)?;
+    let key = unhex_secret(&state.legacy_trk)?;
+    if state.self_grant.is_empty() {
+        return commit(state, save, |s| s.legacy_trk.zeroize());
+    }
+    let name = run_ref(state, save)?;
+    match vault.load(&name) {
+        Ok(held) if *held == *key => {}
+        Ok(_) => return Err(corrupt()),
+        Err(e) if is_missing(&e) => vault.store(&name, &key)?,
+        Err(e) => return Err(e),
+    }
     commit(state, save, |s| {
         s.legacy_trk.zeroize();
         s.trk_ref = name;
@@ -785,14 +862,9 @@ impl Run<'_> {
         if !chain.custodian_now(&cx.signing_key_id, now_ms()) {
             return Err(refused());
         }
-        let anchor = hex(chain.anchor());
-        commit(state, save, |s| {
-            s.anchor = anchor;
-            s.activated = true;
-        })?;
         // The device reopens its self-grant with its HPKE key, and the
         // recovery bundle holds the TRK: the stored copy is no longer needed.
-        release_trk(self.device.trk_store, state, save)
+        finish_activation(self.device.trk_store, state, save, hex(chain.anchor()))
     }
 }
 
@@ -890,7 +962,7 @@ pub fn load() -> Result<BootstrapState> {
     if !path.exists() {
         return Ok(BootstrapState::default());
     }
-    let body = std::fs::read_to_string(&path)?;
+    let body = Zeroizing::new(std::fs::read_to_string(&path)?);
     serde_json::from_str(&body).map_err(|_| corrupt())
 }
 
@@ -1280,14 +1352,18 @@ mod tests {
         hex(&[n; 16])
     }
 
+    /// The run nonce the tests start from, as if it were saved already.
+    const NONCE: &str = "00112233445566778899aabbccddeeff";
+
     fn name_of(n: u8) -> String {
-        format!("tenant-root.{}", tenant_of(n))
+        format!("tenant-root.{}.{NONCE}", tenant_of(n))
     }
 
     fn state_of(n: u8) -> BootstrapState {
         BootstrapState {
             tenant_id: tenant_of(n),
             device_id: hex(&[5; 16]),
+            trk_nonce: NONCE.into(),
             ..Default::default()
         }
     }
@@ -1301,9 +1377,10 @@ mod tests {
     }
 
     /// The old file format, as an earlier launcher wrote it: the TRK in hex.
-    fn write_legacy_file(n: u8, trk: &[u8; 32]) {
+    fn write_legacy_file(n: u8, trk: &[u8; 32], self_grant: &str) {
         let mut json = serde_json::to_value(BootstrapState {
             approval: "abcd".into(),
+            self_grant: self_grant.into(),
             ..state_of(n)
         })
         .unwrap();
@@ -1462,6 +1539,7 @@ mod tests {
         create_trk(&CredentialTrkStore, &mut state, &mut |s| save(s)).unwrap();
         release_trk(&CredentialTrkStore, &mut state, &mut |s| save(s)).unwrap();
         assert!(state.trk_ref.is_empty() && load().unwrap().trk_ref.is_empty());
+        assert!(state.trk_nonce.is_empty(), "the run is over");
         let err = crate::credential::load(&name_of(0x66)).unwrap_err();
         assert!(err.to_string().contains("credential.missing"), "{err}");
     }
@@ -1492,7 +1570,7 @@ mod tests {
     fn a_legacy_cleartext_trk_moves_into_the_store_and_the_file_is_rewritten_without_it() {
         let _root = rooted();
         let key = [0xa7; 32];
-        write_legacy_file(1, &key);
+        write_legacy_file(1, &key, "ab");
         let mut state = load().unwrap();
         assert_eq!(state.legacy_trk.as_str(), hex(&key));
         // The server is down: the run stops there, after the migration.
@@ -1517,7 +1595,7 @@ mod tests {
     fn a_store_that_refuses_the_legacy_trk_leaves_the_file_untouched_and_fails_closed() {
         let _root = rooted();
         let key = [0xb8; 32];
-        write_legacy_file(1, &key);
+        write_legacy_file(1, &key, "ab");
         let before = std::fs::read(file_path()).unwrap();
         let mut state = load().unwrap();
         crate::credential::fail_next_call(&name_of(1));
@@ -1574,5 +1652,218 @@ mod tests {
         let err = create_trk(&RefusesWrites, &mut state, no_save).unwrap_err();
         assert!(err.to_string().contains("credential.locked"), "{err}");
         assert!(state.trk_ref.is_empty() && !file_path().exists());
+    }
+
+    /// Crash point: the generation is active in memory but the save of that
+    /// fails. The key must still be in the store and the reference still
+    /// saved, so a rerun finishes with the same key.
+    #[test]
+    fn the_activation_is_saved_before_the_key_is_forgotten() {
+        let _root = rooted();
+        let mut state = state_of(0x6f);
+        create_trk(&CredentialTrkStore, &mut state, &mut |s| save(s)).unwrap();
+        let key = load_trk(&CredentialTrkStore, &state).unwrap();
+        let mut refuse = |s: &BootstrapState| -> Result<()> {
+            if s.activated {
+                anyhow::bail!("disk full");
+            }
+            save(s)
+        };
+        let err = finish_activation(&CredentialTrkStore, &mut state, &mut refuse, "aa".into())
+            .unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert!(!state.activated && state.trk_ref == name_of(0x6f));
+        assert_eq!(
+            *crate::credential::load(&name_of(0x6f)).unwrap(),
+            *key,
+            "the key is still stored"
+        );
+        let on_disk = load().unwrap();
+        assert!(!on_disk.activated && on_disk.trk_ref == name_of(0x6f));
+        // The rerun finishes: active, key forgotten.
+        finish_activation(
+            &CredentialTrkStore,
+            &mut state,
+            &mut |s| save(s),
+            "aa".into(),
+        )
+        .unwrap();
+        assert!(state.activated && state.trk_ref.is_empty());
+        assert!(crate::credential::load(&name_of(0x6f)).is_err());
+        let on_disk = load().unwrap();
+        assert!(on_disk.activated && on_disk.trk_ref.is_empty());
+    }
+
+    #[test]
+    fn a_new_run_never_reuses_a_key_an_abandoned_run_left() {
+        let _root = rooted();
+        let stale = format!("tenant-root.{}.{}", tenant_of(0x6a), "f".repeat(32));
+        crate::credential::store(&stale, &[9; 32]).unwrap();
+        let fresh = || BootstrapState {
+            tenant_id: tenant_of(0x6a),
+            ..Default::default()
+        };
+        let mut first = fresh();
+        create_trk(&CredentialTrkStore, &mut first, &mut |s| save(s)).unwrap();
+        let mut second = fresh();
+        create_trk(&CredentialTrkStore, &mut second, &mut |s| save(s)).unwrap();
+        assert!(nonce_ok(&first.trk_nonce) && nonce_ok(&second.trk_nonce));
+        assert_ne!(first.trk_nonce, second.trk_nonce);
+        assert_eq!(first.trk_ref, own_trk_ref(&first).unwrap());
+        assert_ne!(first.trk_ref, stale);
+        assert_ne!(*load_trk(&CredentialTrkStore, &first).unwrap(), [9; 32]);
+        assert_ne!(
+            *load_trk(&CredentialTrkStore, &second).unwrap(),
+            *load_trk(&CredentialTrkStore, &first).unwrap()
+        );
+        assert_eq!(*crate::credential::load(&stale).unwrap(), [9; 32]);
+    }
+
+    #[test]
+    fn the_run_nonce_is_saved_before_the_key_is_stored() {
+        let _root = rooted();
+        let mut state = BootstrapState {
+            tenant_id: tenant_of(0x6b),
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let mut watch = |s: &BootstrapState| -> Result<()> {
+            let stored = !s.trk_nonce.is_empty()
+                && crate::credential::load(&trk_ref(&s.tenant_id, &s.trk_nonce)).is_ok();
+            seen.push((!s.trk_nonce.is_empty(), !s.trk_ref.is_empty(), stored));
+            Ok(())
+        };
+        create_trk(&CredentialTrkStore, &mut state, &mut watch).unwrap();
+        // First save: the nonce, no key yet. Second: the key and its reference.
+        assert_eq!(seen, [(true, false, false), (true, true, true)]);
+    }
+
+    #[test]
+    fn a_reference_for_another_tenant_or_with_a_malformed_nonce_is_refused() {
+        let _root = rooted();
+        let other = format!("tenant-root.{}.{NONCE}", tenant_of(0x6d));
+        crate::credential::store(&other, &[3; 32]).unwrap();
+        let mut state = state_of(0x6c);
+        state.trk_ref = other.clone();
+        let err = load_trk(&CredentialTrkStore, &state).unwrap_err();
+        assert!(
+            err.to_string().contains("fleet.custodyStateCorrupt"),
+            "{err}"
+        );
+        assert!(release_trk(&CredentialTrkStore, &mut state, &mut |_| Ok(())).is_err());
+        assert_eq!(*crate::credential::load(&other).unwrap(), [3; 32]);
+        for bad in [
+            "",
+            "short",
+            "00112233445566778899AABBCCDDEEFF",
+            "../../device-signing.x/0000000000",
+            "0011223344556677889900112233445566",
+        ] {
+            let mut state = state_of(0x6c);
+            state.trk_nonce = bad.into();
+            state.trk_ref = trk_ref(&state.tenant_id, bad);
+            assert!(own_trk_ref(&state).is_err(), "{bad:?}");
+            assert!(run_ref(&mut state, &mut |_| Ok(())).is_err() == !bad.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_legacy_trk_is_refused_when_a_reference_is_already_set() {
+        let _root = rooted();
+        let key = [0x31; 32];
+        let mut state = BootstrapState {
+            legacy_trk: hex(&key).into(),
+            self_grant: "ab".into(),
+            trk_ref: name_of(0x70),
+            ..state_of(0x70)
+        };
+        let no_save = &mut |_: &BootstrapState| -> Result<()> { panic!("saved") };
+        let err = migrate_legacy_trk(&CredentialTrkStore, &mut state, no_save).unwrap_err();
+        assert!(
+            err.to_string().contains("fleet.custodyStateCorrupt"),
+            "{err}"
+        );
+        assert!(crate::credential::load(&name_of(0x70)).is_err());
+    }
+
+    #[test]
+    fn a_legacy_trk_the_store_already_holds_is_only_dropped() {
+        let _root = rooted();
+        let key = [0x32; 32];
+        crate::credential::store(&name_of(0x71), &key).unwrap();
+        let mut state = BootstrapState {
+            legacy_trk: hex(&key).into(),
+            self_grant: "ab".into(),
+            ..state_of(0x71)
+        };
+        migrate_legacy_trk(&CredentialTrkStore, &mut state, &mut |s| save(s)).unwrap();
+        assert!(state.legacy_trk.is_empty() && state.trk_ref == name_of(0x71));
+        assert_eq!(*crate::credential::load(&name_of(0x71)).unwrap(), key);
+        assert!(!contains(
+            &std::fs::read(file_path()).unwrap(),
+            hex(&key).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn a_legacy_trk_never_overwrites_a_different_stored_key() {
+        let _root = rooted();
+        crate::credential::store(&name_of(0x72), &[0x41; 32]).unwrap();
+        let mut state = BootstrapState {
+            legacy_trk: hex(&[0x42; 32]).into(),
+            self_grant: "ab".into(),
+            ..state_of(0x72)
+        };
+        let no_save = &mut |_: &BootstrapState| -> Result<()> { panic!("saved") };
+        let err = migrate_legacy_trk(&CredentialTrkStore, &mut state, no_save).unwrap_err();
+        assert!(
+            err.to_string().contains("fleet.custodyStateCorrupt"),
+            "{err}"
+        );
+        assert_eq!(
+            *crate::credential::load(&name_of(0x72)).unwrap(),
+            [0x41; 32]
+        );
+        assert_eq!(state.legacy_trk.as_str(), hex(&[0x42; 32]));
+    }
+
+    /// A launcher that stopped before it saved a self-grant: no other party
+    /// ever saw its key, so the key is dropped, not carried over.
+    #[test]
+    fn a_legacy_trk_nobody_has_seen_is_dropped_and_a_fresh_one_is_made() {
+        let _root = rooted();
+        let key = [0xc3; 32];
+        write_legacy_file(1, &key, "");
+        let mut state = load().unwrap();
+        // The server is down: the run stops there, after the migration.
+        assert!(run_offline(&mut state).is_err());
+        assert!(state.legacy_trk.is_empty() && state.trk_ref.is_empty());
+        assert!(
+            crate::credential::load(&name_of(1)).is_err(),
+            "not migrated"
+        );
+        let file = std::fs::read(file_path()).unwrap();
+        assert!(!contains(&file, hex(&key).as_bytes()) && !contains(&file, &key));
+        create_trk(&CredentialTrkStore, &mut state, &mut |s| save(s)).unwrap();
+        assert_ne!(*load_trk(&CredentialTrkStore, &state).unwrap(), key);
+    }
+
+    #[test]
+    fn a_hex_secret_decodes_into_32_bytes_or_is_refused() {
+        let key: Vec<u8> = (0..32).collect();
+        assert_eq!(unhex_secret(&hex(&key)).unwrap()[..], key[..]);
+        assert_eq!(
+            unhex_secret(&hex(&key).to_uppercase()).unwrap()[..],
+            key[..]
+        );
+        for bad in [
+            "",
+            "ab",
+            &"ab".repeat(33),
+            &"zz".repeat(32),
+            &"+1".repeat(32),
+        ] {
+            assert!(unhex_secret(bad).is_err(), "{bad:?}");
+        }
     }
 }

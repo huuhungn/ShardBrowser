@@ -126,13 +126,30 @@ fn os_load(credential_ref: &str) -> Result<Zeroizing<[u8; 32]>> {
 
 /// Deletes the credential under `credential_ref` from the OS store and the
 /// open key file; one that is already gone counts as deleted.
+///
+/// It succeeds only once the key is confirmed gone from somewhere it could
+/// be. An OS store that cannot be opened here confirms nothing: with it, the
+/// open key file has to be the one that removed the key, else this fails with
+/// `credential.unavailable`. A key file that is not open holds its keys
+/// encrypted, so it does not fail a delete the OS store has confirmed.
 pub fn forget(credential_ref: &str) -> Result<()> {
-    // With no OS store, the key file was the only place it could be.
-    let os = entry(credential_ref).map_or(Ok(()), |entry| match entry.delete_credential() {
-        Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-        Err(_) => Err(unavailable()),
-    });
-    os.and(crate::key_file::forget(credential_ref))
+    let os = match entry(credential_ref) {
+        Ok(entry) => match entry.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(true),
+            Err(_) => Err(unavailable()),
+        },
+        Err(_) => Ok(false),
+    };
+    let file = crate::key_file::forget(credential_ref);
+    match (os, file) {
+        (Err(e), _) => Err(e),
+        (Ok(os_gone), Ok(file_gone)) if os_gone || file_gone => Ok(()),
+        (Ok(_), Ok(_)) => Err(unavailable()),
+        (Ok(true), Err(e)) if crate::errcode::has_code(&e.to_string(), "credential.locked") => {
+            Ok(())
+        }
+        (Ok(_), Err(e)) => Err(e),
+    }
 }
 
 /// Makes the next store call on `credential_ref` fail, as a locked or
