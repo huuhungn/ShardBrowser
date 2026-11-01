@@ -36,11 +36,7 @@ fn emit(app: &tauri::AppHandle, p: Progress) {
 
 /// Move the data root to `dst`. Returns the number of files moved.
 pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
-    if MIGRATING.swap(true, Ordering::SeqCst) {
-        anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
-    }
-    let out = do_run(app, dst);
-    MIGRATING.store(false, Ordering::SeqCst);
+    let out = guarded(|| do_run(app, dst));
     if out.is_err() {
         emit(
             app,
@@ -56,6 +52,54 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     out
 }
 
+/// Runs `work` as the one move of the data root: the flag is up for all of it,
+/// no downgrade flow runs meanwhile (it holds their lock, and they refuse
+/// while the flag is up), and none is recorded, as checked under that lock.
+pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _flag = Migrating::raise()?;
+    let Some(_flow) = crate::team::downgrade::try_exclusive() else {
+        anyhow::bail!(crate::errcode::code("migrate.downgradeRunning"));
+    };
+    refuse_while_journals()?;
+    work()
+}
+
+/// The flag while a move runs; it comes down on every way out, a panic too.
+struct Migrating;
+
+impl Migrating {
+    fn raise() -> Result<Self> {
+        if MIGRATING.swap(true, Ordering::SeqCst) {
+            anyhow::bail!(crate::errcode::code("migrate.alreadyRunning"));
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for Migrating {
+    fn drop(&mut self) {
+        MIGRATING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A saved downgrade or restore names paths inside the current data root, and
+/// a rollback or resume that finds them elsewhere would leave a profile
+/// stranded: the root does not move while one is recorded.
+pub(crate) fn refuse_while_journals() -> Result<()> {
+    if crate::team::downgrade::journals_exist()? {
+        anyhow::bail!(crate::errcode::code("migrate.downgradeJournal"));
+    }
+    // A clone kept by a rolled-back downgrade lives in the archive of the
+    // current root; a person decides what becomes of it before the root moves.
+    if let Some(kept) = crate::team::downgrade::retired_clone()? {
+        anyhow::bail!(crate::errcode::code_with(
+            "migrate.retiredClone",
+            &[("path", &kept.display().to_string())]
+        ));
+    }
+    Ok(())
+}
+
 fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     let src = store::data_root()?;
     let dst = dst.to_path_buf();
@@ -67,6 +111,8 @@ fn do_run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
     }
     std::fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
     writable(&dst)?;
+    // A target the next start would refuse is refused now (ADR 0002 Q-30).
+    store::require_local_ntfs(&dst)?;
 
     emit(
         app,

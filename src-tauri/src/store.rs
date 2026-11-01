@@ -151,6 +151,113 @@ pub fn fleet_keys_path() -> Result<PathBuf> {
     Ok(config_root()?.join("fleet-keys.json"))
 }
 
+/// Where the first-device custody bootstrap keeps its exact requests between
+/// attempts. The tenant root key is not here: only its credential reference.
+pub fn custody_bootstrap_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("custody-bootstrap.json"))
+}
+
 pub fn psapi_path() -> Result<PathBuf> {
     Ok(config_root()?.join("psapi.json"))
+}
+
+/// Refuses `dir` unless it is on a local NTFS volume (ADR 0002 Q-30; plan
+/// L2335: the durability harness holds on supported filesystems only, and a
+/// network share fails closed). Off Windows every directory passes.
+pub fn require_local_ntfs(dir: &std::path::Path) -> Result<()> {
+    shardx_core::volume::require_local_ntfs(dir).map_err(|refusal| volume_error(dir, refusal))
+}
+
+fn volume_error(
+    dir: &std::path::Path,
+    refusal: shardx_core::volume::VolumeRefusal,
+) -> anyhow::Error {
+    use shardx_core::volume::VolumeRefusal;
+    let path = dir.display().to_string();
+    anyhow::anyhow!(match refusal {
+        VolumeRefusal::Network => {
+            crate::errcode::code_with("storage.networkVolume", &[("path", &path)])
+        }
+        VolumeRefusal::Unsupported(filesystem) => crate::errcode::code_with(
+            "storage.unsupportedVolume",
+            &[("path", &path), ("filesystem", &filesystem)],
+        ),
+        VolumeRefusal::Unreadable(detail) => crate::errcode::code_with(
+            "storage.volumeUnreadable",
+            &[("path", &path), ("detail", &detail)],
+        ),
+    })
+}
+
+/// The startup gate: the config root (settings, `team-sync.db`, key files)
+/// and the data root (profiles, user data) must both be on local NTFS.
+pub fn require_local_ntfs_roots() -> Result<()> {
+    require_local_ntfs(&config_root()?)?;
+    require_local_ntfs(&data_root()?)
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+    use shardx_core::volume::VolumeRefusal;
+
+    #[test]
+    fn each_refusal_is_a_named_error() {
+        let dir = std::path::Path::new("D:/data");
+        for (refusal, key, arg) in [
+            (
+                VolumeRefusal::Network,
+                "storage.networkVolume",
+                "path=D:/data",
+            ),
+            (
+                VolumeRefusal::Unsupported("exFAT".into()),
+                "storage.unsupportedVolume",
+                "filesystem=exFAT",
+            ),
+            (
+                VolumeRefusal::Unreadable("gone".into()),
+                "storage.volumeUnreadable",
+                "detail=gone",
+            ),
+        ] {
+            let err = volume_error(dir, refusal).to_string();
+            assert!(crate::errcode::has_code(&err, key), "{err}");
+            assert!(err.contains(arg), "{err}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_local_ntfs_root_passes_and_an_smb_share_or_missing_path_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        require_local_ntfs(dir.path()).unwrap();
+        let missing = require_local_ntfs(&dir.path().join("missing")).unwrap_err();
+        assert!(crate::errcode::has_code(
+            &missing.to_string(),
+            "storage.volumeUnreadable"
+        ));
+        let share = match std::env::var_os("SHARDX_TEST_SMB_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+                let local = temp.to_string_lossy().into_owned();
+                let (drive, tail) = local.trim_start_matches(r"\\?\").split_once(":\\").unwrap();
+                PathBuf::from(format!(r"\\localhost\{drive}$\{tail}"))
+            }
+        };
+        if !share.exists() {
+            assert!(
+                std::env::var_os("SHARDX_TEST_SMB_DIR").is_none(),
+                "{share:?} unreachable"
+            );
+            eprintln!("SKIPPED the SMB half: no reachable SMB share");
+            return;
+        }
+        let err = require_local_ntfs(&share).unwrap_err().to_string();
+        assert!(
+            crate::errcode::has_code(&err, "storage.networkVolume"),
+            "{err}"
+        );
+    }
 }

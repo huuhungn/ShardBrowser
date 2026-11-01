@@ -16,6 +16,7 @@ struct TestServer {
     child: Child,
     port: u16,
     data_dir: std::path::PathBuf,
+    identity_dir: std::path::PathBuf,
 }
 
 impl Drop for TestServer {
@@ -23,10 +24,16 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.data_dir);
+        let _ = std::fs::remove_dir_all(&self.identity_dir);
     }
 }
 
+/// The server built by `cargo build --manifest-path ../server/Cargo.toml`, or
+/// the one `SHARDX_TEAM_SERVER_BIN` names when it was built elsewhere.
 fn server_binary() -> std::path::PathBuf {
+    if let Some(bin) = std::env::var_os("SHARDX_TEAM_SERVER_BIN") {
+        return bin.into();
+    }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root")
@@ -53,14 +60,34 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
     if !bin.exists() {
         return None;
     }
-    // Distinct from the enrollment test's range so the two can run together.
-    let port = 41900 + (std::process::id() % 300) as u16 + slot * 400;
+    // Distinct from the enrollment test's range so the two can run together,
+    // and below the Linux ephemeral range (32768+) so no client socket holds it.
+    let port = 24900 + (std::process::id() % 300) as u16 + slot * 400;
     let data_dir = std::env::temp_dir().join(format!("shardx-sync-it-{port}"));
+    let identity_dir = std::env::temp_dir().join(format!("shardx-sync-it-{port}-identity"));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&identity_dir);
+    std::fs::create_dir_all(&identity_dir).ok()?;
+
+    // v2 answers 423 until the external identity record verifies, so set the
+    // server up the way an operator does before starting it.
+    let init = Command::new(&bin)
+        .args(["identity", "init"])
+        .env("SHARDX_DATA_DIR", &data_dir)
+        .env("SHARDX_IDENTITY_DIR", &identity_dir)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    assert!(
+        init.status.success(),
+        "identity init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
 
     let child = Command::new(&bin)
         .env("SHARDX_BIND", format!("127.0.0.1:{port}"))
         .env("SHARDX_DATA_DIR", &data_dir)
+        .env("SHARDX_IDENTITY_DIR", &identity_dir)
         .env("SHARDX_TOKEN_SECRET", "sync-integration-secret")
         .env("SHARDX_ADMIN_USER", "admin")
         .env("SHARDX_ADMIN_PASS", "sync-integration-pass")
@@ -73,6 +100,7 @@ async fn start_server_slot(slot: u16) -> Option<TestServer> {
         child,
         port,
         data_dir,
+        identity_dir,
     };
 
     let http = reqwest::Client::new();
@@ -158,18 +186,6 @@ async fn seed_fleet(
 
     let now = "2026-01-01T00:00:00Z";
 
-    let ok_state = sqlx::query(
-        "INSERT OR REPLACE INTO v2_server_state
-             (singleton, server_instance_id, restore_epoch, external_record_sha256, updated_at)
-         VALUES (1, ?, 0, ?, ?)",
-    )
-    .bind([0x22u8; 16].as_slice())
-    .bind([0u8; 32].as_slice())
-    .bind(now)
-    .execute(&pool)
-    .await
-    .is_ok();
-
     let ok_tenant = sqlx::query(
         "INSERT OR IGNORE INTO v2_tenants (id, slug, status, active_root_generation, created_at)
          VALUES (?, 'sync-tenant', 'active', 1, ?)",
@@ -251,7 +267,7 @@ async fn seed_fleet(
     .await
     .is_ok();
 
-    ok_state && ok_tenant && ok_account && ok_member && ok_fleet && ok_profile && ok_issuer
+    ok_tenant && ok_account && ok_member && ok_fleet && ok_profile && ok_issuer
 }
 
 /// The public key of the signer the test uploads with.
@@ -477,7 +493,7 @@ async fn two_devices_share_a_profile_through_the_fleet_key_without_a_passphrase(
         "the server must return the exact sealed bytes"
     );
 
-    shardx_core::backup_file::open_profile_with_fkek(&pulled, &dir_b, &fkek)
+    shardx_core::backup_file::open_profile_with_fkek(&pulled, &dir_b, &fkek, "shared")
         .expect("device B opens the snapshot with the fleet key, with no passphrase");
 
     let restored = std::fs::read(dir_b.join("Default").join("Preferences")).expect("restored file");
@@ -490,8 +506,13 @@ async fn two_devices_share_a_profile_through_the_fleet_key_without_a_passphrase(
     let outsider = std::env::temp_dir().join(format!("shardx-outsider-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&outsider);
     assert!(
-        shardx_core::backup_file::open_profile_with_fkek(&pulled, &outsider, &[0x5Du8; 32])
-            .is_err(),
+        shardx_core::backup_file::open_profile_with_fkek(
+            &pulled,
+            &outsider,
+            &[0x5Du8; 32],
+            "shared"
+        )
+        .is_err(),
         "a device without this fleet's key must not be able to open the snapshot"
     );
 

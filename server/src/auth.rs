@@ -167,7 +167,7 @@ where
 /// only when `SHARDX_TRUST_PROXY=1` (i.e. behind an edge proxy that OVERWRITES
 /// the inbound header) — otherwise a client could spoof it to dodge the per-IP
 /// limit. The header value must parse as an IP or it's ignored.
-fn client_ip(app: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
+pub(crate) fn client_ip(app: &AppState, headers: &HeaderMap, peer: SocketAddr) -> String {
     if app.cfg.trust_proxy {
         for header in ["x-forwarded-for", "x-real-ip"] {
             if let Some(raw) = headers.get(header).and_then(|v| v.to_str().ok()) {

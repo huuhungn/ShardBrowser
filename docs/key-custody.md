@@ -50,17 +50,19 @@ Enrollment (`server/src/enrollment.rs`) registers two keys per device:
 
 | Key | Purpose | Stored |
 | --- | --- | --- |
-| Ed25519 signing | Proof of possession; signs snapshot manifests | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
-| X25519 HPKE recipient | Opens root key grants sealed to this device | `team.json` seed: DPAPI blob on Windows, hex elsewhere |
+| Ed25519 signing | Proof of possession; signs snapshot manifests | OS credential store; else the key file or `team.json` |
+| X25519 HPKE recipient | Opens root key grants sealed to this device | OS credential store; else the key file or `team.json` |
 
 `team_collect_custody` uses the HPKE key to open root key grants. Fleet key
 grants are sealed to it too, but are not opened until verified key
 distribution ships (see the threat model below).
 
-On Windows both seeds are stored DPAPI-protected for the current user
-(`src-tauri/src/dpapi.rs`). Elsewhere `team.json` holds them as plaintext hex,
-protected by filesystem permissions alone; Keychain and kernel keyring are not
-wired up.
+Both seeds move into Windows Credential Manager (ADR 0004, `credential.rs`),
+and `team.json` keeps only their references. Without a usable store they go
+to the passphrase-protected key file (ADR 0002 D-5, `key_file.rs`) once the
+operator creates one. A seed still in `team.json` is DPAPI-protected for the
+current Windows user (`dpapi.rs`); elsewhere it is plaintext hex, protected by
+file permissions alone. Keychain and kernel keyring are not wired up.
 
 ## What the design calls for
 
@@ -95,10 +97,10 @@ the right model to keep.
 | Piece | State |
 | --- | --- |
 | `seal_trk` / `open_trk` | Implemented in `shared`; exercised end to end by the grant tests |
-| `v2_tenant_root_key_grants` table | Stores filed grants |
-| `POST /v2/tenant-root-key-grants` | Verifies, claims the replay id, and **stores** the sealed grant |
-| `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants |
-| Root generation lifecycle | `v2_root_key_generations` plus begin/activate/read endpoints (bootstrap only; no rotation) |
+| `v2_tenant_root_key_grants` table | The exact plan 7.2 shape since migration 0016; spike rows stay read-only in `v2_legacy_tenant_root_key_grants` |
+| `POST /v2/tenants/:tenant/root-key-generations` | S6 bootstrap: the D1 device's setup session files its signed `FirstRootSelfGrant` and generation 0 in `PREPARING`, as one exact idempotent mutation |
+| `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants of an `ACTIVE` generation only |
+| Root generation lifecycle | Bootstrap create only. Readback, acknowledgement, activation and rotation are not implemented; the spike `POST /v2/tenant-root-key-grants` and begin/activate routes were removed |
 | Grant issuance at enrollment | Not implemented — grants must be filed by an external custodian |
 | Recovery bundle | Not implemented |
 
@@ -112,13 +114,13 @@ generation committed to. Before this, the generation number in a grant was
 decoration: a grant could name any number and seal any key, and the mismatch
 would only surface later as a backup nobody could open.
 
-The bootstrap is three steps. A tenant begins a generation in `PREPARING`,
-sending only the root key's identifier — the key itself is generated on the
-device and never transmitted, which is what keeps the server unable to read
-anything sealed under it. The first device files a `FirstRootSelfGrant`, which
-is accepted only while the generation is preparing and only once per tenant.
-The generation becomes `ACTIVE` only after the holder confirms it can unwrap
-what it filed.
+The bootstrap creates generation 0 in `PREPARING` together with the first
+device's `FirstRootSelfGrant`, in one request that names only the root key's
+identifier — the key itself is generated on the device and never transmitted,
+which is what keeps the server unable to read anything sealed under it. It is
+accepted once per tenant, only on the setup session that D1 approved. The
+generation is to become `ACTIVE` only after the holder acknowledges that it can
+unwrap what it filed; that step is not built yet.
 
 Activation is deliberately separate from filing. Filing proves a grant was
 written; it does not prove anyone can open it. A tenant that activated on filing
@@ -194,9 +196,9 @@ Roughly the sequence the constraints force:
    and should stay openable on a machine that has never enrolled.
 5. **Recovery bundle plus readback**, before any of this is called
    production-ready.
-6. **Move device keys into the OS credential store.** Partly done: on
-   Windows the seeds and cached fleet keys are DPAPI-protected for the current
-   user. Keychain and kernel keyring are not wired up.
+6. **Move device keys into the OS credential store.** Done on Windows
+   (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
+   key file as the fallback. Keychain and kernel keyring are not wired up.
 
 Steps 1–3 are prerequisites for 4; shipping 4 first would mean inventing a
 distribution mechanism that the frozen design already specifies.
@@ -225,14 +227,26 @@ What holds today:
   containers only.
 - A stolen container is useless without the passphrase.
 - Tenant boundaries are enforced on every `/v2/` route (`require_tenant_member`).
-  Root key generation begin and activate are restricted to the tenant owner.
+  Root key generations are created, acknowledged and activated through signed
+  requests (`v2_root`, `v2_root_grants`), not by membership alone.
 - A stale push is refused: version fencing stops one device silently
   overwriting another.
-- Key material at rest is DPAPI-protected (current Windows user) on Windows:
-  the device signing and HPKE seeds in `team.json` and any cached fleet keys.
-  A plaintext file from an earlier version is rewritten protected the first
-  time it is read. Elsewhere these stay plaintext hex, protected by file
-  permissions alone (`fleet-keys.json` is written 0600 on Unix).
+- Key material at rest is in Windows Credential Manager (`persistence =
+  Local`, so it never roams). What has to stay in `team.json` or
+  `fleet-keys.json` is DPAPI-protected for the current Windows user. A file
+  from an earlier version is rewritten protected the first time it is read,
+  and its keys move to the store on the next protection pass. Elsewhere they
+  stay plaintext hex, protected by file permissions alone (0600 on Unix).
+- The TRK of a running root bootstrap is in the credential store (OS store, or
+  else the open key file) under `tenant-root.{tenant}`. `custody-bootstrap.json`
+  keeps only that reference, never the key, and the key is forgotten once the
+  generation is active. With no store and no open key file the bootstrap stops
+  with a `credential.*` error instead of writing the key to disk. A file from
+  an earlier version that still carries the key is moved into the store the
+  next time the bootstrap runs; if the store refuses, the file is left as it
+  was and the run fails. If that file had no self-grant yet, nobody else saw
+  the key and it is dropped for a fresh one. A launcher that held a cleartext
+  TRK should rotate to the next root generation after activation.
 
 DPAPI recovery caveat. A protected `team.json` or `fleet-keys.json` opens only
 under the same Windows account with the same DPAPI master key. An
@@ -250,7 +264,8 @@ What does not hold:
 - Per-device revocation. Everyone shares one passphrase.
 - Forward secrecy across rotations. There are no rotations.
 - Device key confidentiality against code running as the same Windows user,
-  which can call DPAPI too, or against local disk access on other platforms.
+  which can ask Credential Manager and DPAPI too, or against local disk access
+  on other platforms.
 - Integrity of snapshots pulled under a fleet key cached by an earlier
   version: if the server chose that key, it can forge a snapshot that opens.
 - Recovery of anything, if the passphrase is lost.

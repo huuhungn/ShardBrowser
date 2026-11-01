@@ -26,7 +26,7 @@
 
 use serde::Serialize;
 
-use crate::{fleet_client, fleet_keys, profile, team_config};
+use crate::{fleet_client, fleet_keys, profile, team, team_config};
 
 /// Result of a completed push.
 #[derive(Debug, Serialize)]
@@ -38,6 +38,17 @@ pub struct PushResult {
     /// SHA-256 of the container, hex — matches the digest a local backup of
     /// the same profile state would report.
     pub sha256: String,
+}
+
+/// A profile the team server now holds at version 0.
+#[derive(Debug, Serialize)]
+pub struct PublishResult {
+    /// The new remote profile ID, hex.
+    pub profile_id: String,
+    /// The fence of the first lease this device holds on it.
+    pub fencing_token: u64,
+    /// When that lease ends, by the server's clock.
+    pub lease_expires_at_ms: u64,
 }
 
 /// What the team server knows about a profile, without downloading it.
@@ -87,11 +98,20 @@ fn fleet_id(c: &team_config::TeamConfig) -> String {
 /// `profile_sync_status`, or 0 for a first push. The server rejects a commit
 /// whose base does not match the current head, which is what stops two devices
 /// silently overwriting each other.
+///
+/// A published profile (one `team-sync.db` binds) goes over the G2 wire
+/// instead (`team::sync`): sealed under the verified fleet key, never the
+/// passphrase, in a device session the account `username` and `password`
+/// open for this call only.
+// shortcut: the sync dialog does not ask for the account yet, so a
+// published profile syncs only once the Team profile UI passes it.
 #[tauri::command]
 pub async fn profile_sync_push(
     profile_id: String,
     passphrase: String,
     base_version: i64,
+    username: Option<String>,
+    password: Option<String>,
 ) -> Result<PushResult, String> {
     // Running-state first: a user whose profile is running must be told to
     // stop it, not sent to fix server settings that were never the problem.
@@ -106,6 +126,27 @@ pub async fn profile_sync_push(
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if !udd.exists() {
         return Err(crate::errcode::code("sync.noDataToPush"));
+    }
+    if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
+        let (client, session, dev) = published_session(&c, username, password).await?;
+        let started = std::time::Instant::now();
+        let pushed = team::sync::push(
+            &client,
+            &session.access_token,
+            &dev,
+            &profile_id,
+            &udd,
+            now_ms(),
+            &|| started.elapsed(),
+        )
+        .await;
+        client.end_session(&session.access_token).await;
+        let p = pushed.map_err(|e| format!("{e:#}"))?;
+        return Ok(PushResult {
+            version: p.version as i64,
+            container_bytes: p.ciphertext_size,
+            sha256: fleet_client::hex(&p.ciphertext_sha256),
+        });
     }
 
     // Argon2id is deliberately slow and packing is IO-bound: not on the UI
@@ -156,6 +197,68 @@ pub async fn profile_sync_push(
     })
 }
 
+/// Publish `profile_id` as a new profile of this device's fleet (`team::sync`),
+/// in a device session the account `username` and `password` open for this
+/// call only. The server holds the profile at version 0 with the first lease
+/// this device owns; the next push seals the data. `label` is the name the
+/// fleet lists it by, sealed under the verified fleet key; it defaults to the
+/// profile's name.
+#[tauri::command]
+pub async fn profile_sync_publish(
+    profile_id: String,
+    label: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<PublishResult, String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionPublishToTeam"),
+    )
+    .map_err(|error| error.to_string())?;
+    let c = ready_config()?;
+    let stored = profile::load_raw(&profile_id)
+        .map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
+    let label = label
+        .or_else(|| stored.config.get("name")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
+    let remote = fleet_client::decode_hex16(&fleet_client::random_id_hex(), "profile_id")
+        .map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let published = team::sync::publish(
+        &client,
+        &session.access_token,
+        &dev,
+        &profile_id,
+        &label,
+        fleet,
+        remote,
+        now_ms(),
+    )
+    .await;
+    client.end_session(&session.access_token).await;
+    let p = published.map_err(|e| format!("{e:#}"))?;
+    Ok(PublishResult {
+        profile_id: fleet_client::hex(&p.profile),
+        fencing_token: p.lease.fencing_token,
+        lease_expires_at_ms: p.expires_at_ms,
+    })
+}
+
+/// Cancels the unfinished publish of `profile_id` (`team::sync::cancel_publish`):
+/// the way out when the stored request cannot be sent any more, because the
+/// fleet key it was sealed under was withdrawn or a compromise was counted.
+/// Nothing is sent to the server.
+#[tauri::command]
+pub async fn profile_sync_cancel_publish(profile_id: String) -> Result<(), String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionCancelPublish"),
+    )
+    .map_err(|error| error.to_string())?;
+    team::sync::cancel_publish(&profile_id).map_err(|e| format!("{e:#}"))
+}
+
 /// Seal a profile for push: always under the passphrase, never a cached fleet
 /// key. Those came from the team server, which cannot yet prove who issued
 /// them, and sealing under a key the server chose would let it read every push
@@ -174,22 +277,34 @@ fn seal_for_push(
 
 /// Open a pulled container: every cached fleet key first, newest first (a
 /// snapshot an earlier version pushed under one must still restore), then the
-/// passphrase.
+/// passphrase. The server picks the bytes, so a container sealed for any
+/// profile other than `profile_id` is refused before the profile is touched.
 fn open_pulled(
     container: &[u8],
     udd: &std::path::Path,
+    profile_id: &str,
     candidates: &[([u8; 32], u64)],
     passphrase: &str,
 ) -> Result<u64, String> {
+    use shardx_core::backup_file::{open_profile_for, open_profile_with_fkek};
     for (fkek, _generation) in candidates {
-        if let Ok(bytes) = shardx_core::backup_file::open_profile_with_fkek(container, udd, fkek) {
+        if let Ok(bytes) = open_profile_with_fkek(container, udd, fkek, profile_id) {
             return Ok(bytes);
         }
     }
     if passphrase.is_empty() {
         return Err(crate::errcode::code("sync.pullPassphraseRequired"));
     }
-    shardx_core::backup_file::open_profile(container, udd, passphrase).map_err(|e| format!("{e:#}"))
+    open_profile_for(container, udd, passphrase, profile_id).map_err(|e| format!("{e:#}"))
+}
+
+/// The fleet keys pull tries, newest first: a key from a verified grant only
+/// while that grant reverifies at `now` (G2-35, `fleet_key_verifies`). A store
+/// that cannot be read leaves only the passphrase.
+pub(crate) fn pull_candidates(c: &team_config::TeamConfig, now: u64) -> Vec<([u8; 32], u64)> {
+    fleet_keys::load()
+        .map(|s| s.keys_newest_first(&c.fleet_id, |g, k| crate::fleet_key_usable(c, g, k, now)))
+        .unwrap_or_default()
 }
 
 /// Pull the current snapshot of `profile_id` and restore it over the local
@@ -198,8 +313,16 @@ fn open_pulled(
 /// The container is downloaded and fully authenticated in memory before
 /// anything touches the profile directory, so a wrong passphrase or a damaged
 /// transfer cannot leave a half-written profile behind.
+///
+/// A published profile is pulled over the G2 wire (`team::sync`), as
+/// `profile_sync_push` describes.
 #[tauri::command]
-pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result<u64, String> {
+pub async fn profile_sync_pull(
+    profile_id: String,
+    passphrase: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<u64, String> {
     let _claim = profile::begin_user_mutation(
         [&profile_id],
         &crate::errcode::code("profile.actionPullFromTeam"),
@@ -209,6 +332,20 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
     profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
 
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
+    if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
+        let (client, session, dev) = published_session(&c, username, password).await?;
+        let pulled = team::sync::pull(
+            &client,
+            &session.access_token,
+            &dev,
+            &profile_id,
+            &udd,
+            now_ms(),
+        )
+        .await;
+        client.end_session(&session.access_token).await;
+        return pulled.map_err(|e| format!("{e:#}"));
+    }
 
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
@@ -229,15 +366,61 @@ pub async fn profile_sync_pull(profile_id: String, passphrase: String) -> Result
         .await
         .map_err(|e| format!("{e:#}"))?;
 
-    let candidates = fleet_keys::load()
-        .map(|s| s.keys_newest_first(&c.fleet_id))
-        .unwrap_or_default();
+    let candidates = pull_candidates(&c, now_ms());
 
-    tokio::task::spawn_blocking(move || open_pulled(&container, &udd, &candidates, &passphrase))
+    tokio::task::spawn_blocking(move || {
+        open_pulled(&container, &udd, &profile_id, &candidates, &passphrase)
+    })
+    .await
+    .map_err(|e| {
+        crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
+    })?
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A device session for published-profile sync (ADR 0001 R2), opened with
+/// the account password for this call only: the session and the password
+/// stay in memory and the caller ends the session (plan L2048). This device
+/// syncs a published profile only under the anchor it pinned.
+async fn published_session(
+    c: &team_config::TeamConfig,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<
+    (
+        fleet_client::FleetClient,
+        fleet_client::DeviceSession,
+        team::sync::Device,
+    ),
+    String,
+> {
+    let username = username.unwrap_or_default();
+    let password = zeroize::Zeroizing::new(password.unwrap_or_default());
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let pin =
+        crate::pinned_anchor(c).ok_or_else(|| crate::errcode::code("sync.noVerifiedFleetKey"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let hpke_seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let me = crate::recipient(c).map_err(|e| e.to_string())?;
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username: username.trim(),
+        password: &password,
+    };
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &hpke_seed)
         .await
-        .map_err(|e| {
-            crate::errcode::code_with("sync.restoreTaskFailed", &[("error", &e.to_string())])
-        })?
+        .map_err(|e| e.to_string())?;
+    Ok((client, session, team::sync::Device { signer, me, pin }))
 }
 
 /// What the server currently holds for `profile_id`, or `None` if nothing.
@@ -282,6 +465,72 @@ fn profile_ref(profile_id: &str) -> String {
     full[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Unbinds the stopped profile `profile_id` from its team profile in the
+/// Launcher database alone (plan L2239): the exact `UNBIND` receipt is stored
+/// before the binding is deleted, and the profile stays a local one.
+#[tauri::command]
+pub async fn team_unbind_profile(profile_id: String) -> Result<team::downgrade::Unbound, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        team::downgrade::unbind_profile(&profile_id, &c.server_url, now_ms())
+    })
+    .await
+    .map_err(|e| crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())]))?
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// Whether this launcher may go back to v0.1.28 now, and what stops it
+/// (plan L2240). Derived from the database and the disk on every call.
+#[tauri::command]
+pub async fn team_downgrade_status() -> Result<team::downgrade::Readiness, String> {
+    tauri::async_runtime::spawn_blocking(team::downgrade::readiness)
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The downgrade clone flow for the stopped, bound profile `profile_id`
+/// (plan L2240): the original moves out of everything v0.1.28 reads, and a
+/// clone with a new local ID takes its place.
+#[tauri::command]
+pub async fn team_downgrade_clone(
+    profile_id: String,
+) -> Result<team::downgrade::CloneDone, String> {
+    tauri::async_runtime::spawn_blocking(move || team::downgrade::start_clone(&profile_id))
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Puts the original profile back and removes the clone, for a downgrade that
+/// cannot finish (plan L2240: a journal that asks for it rolls back).
+#[tauri::command]
+pub async fn team_downgrade_rollback(
+    journal_id: String,
+) -> Result<team::downgrade::CloneDone, String> {
+    tauri::async_runtime::spawn_blocking(move || team::downgrade::roll_back_clone(&journal_id))
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Finishes, or rolls back, every downgrade a crash cut off.
+#[tauri::command]
+pub async fn team_downgrade_resume() -> Result<Vec<team::downgrade::Resumed>, String> {
+    tauri::async_runtime::spawn_blocking(team::downgrade::resume_open)
+        .await
+        .map_err(|e| {
+            crate::errcode::code_with("downgrade.taskFailed", &[("error", &e.to_string())])
+        })?
+        .map_err(|e| format!("{e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +546,50 @@ mod tests {
     fn profile_ref_is_stable_and_distinct() {
         assert_eq!(profile_ref("a"), profile_ref("a"));
         assert_ne!(profile_ref("a"), profile_ref("b"));
+    }
+
+    /// Pull tries a key cached by 2.4.2, and one collected from a verified
+    /// grant only once that grant reverifies (G2-35): with no pinned anchor
+    /// and no kept grant, it is not tried.
+    #[test]
+    fn pull_does_not_try_a_key_from_a_grant_that_does_not_reverify() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "dd".repeat(16);
+        let (verified, legacy) = ([0x5Du8; 32], [0x5Eu8; 32]);
+        assert!(fleet_keys::collect(&fleet, 1, &verified).unwrap());
+        let mut keys = fleet_keys::load().unwrap();
+        keys.insert(&fleet, 2, &legacy);
+        fleet_keys::save(&keys).unwrap();
+        let c = team_config::TeamConfig {
+            fleet_id: fleet.clone(),
+            ..Default::default()
+        };
+        let candidates = pull_candidates(&c, 0);
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let seal = |key| {
+            shardx_core::backup_file::seal_profile_with_fkek("p", &udd, key)
+                .unwrap()
+                .bytes
+        };
+        let (under_verified, under_legacy) = (seal(&verified), seal(&legacy));
+        let out = dir.path().join("out");
+        let from_verified = open_pulled(&under_verified, &out, "p", &candidates, "");
+        let from_legacy = open_pulled(&under_legacy, &out, "p", &candidates, "");
+        crate::store::set_config_root(None);
+
+        assert_eq!(candidates, [(legacy, 2)]);
+        let err = from_verified.expect_err("a key whose grant does not reverify is not tried");
+        assert!(
+            crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+            "{err}"
+        );
+        assert!(from_legacy.is_ok());
     }
 
     /// With a fleet key cached and a passphrase given, push still seals a
@@ -333,7 +626,7 @@ mod tests {
         );
         let out = dir.path().join("out");
         assert!(
-            shardx_core::backup_file::open_profile_with_fkek(&bytes, &out, &fkek).is_err(),
+            shardx_core::backup_file::open_profile_with_fkek(&bytes, &out, &fkek, "p").is_err(),
             "the cached fleet key must not open it"
         );
         shardx_core::backup_file::open_profile(&bytes, &out, "team-passphrase")
@@ -354,13 +647,109 @@ mod tests {
         let out = dir.path().join("out");
 
         for candidates in [vec![], vec![([0x11u8; 32], 1)]] {
-            let err = open_pulled(&bytes, &out, &candidates, "").unwrap_err();
+            let err = open_pulled(&bytes, &out, "p", &candidates, "").unwrap_err();
             assert!(
                 crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
                 "{err}"
             );
         }
-        assert!(open_pulled(&bytes, &out, &[([0x11u8; 32], 1)], "team-passphrase").is_ok());
+        assert!(open_pulled(&bytes, &out, "p", &[([0x11u8; 32], 1)], "team-passphrase").is_ok());
+    }
+
+    /// A server that answers a pull for one profile with another profile's
+    /// genuine snapshot is refused, under a cached fleet key or the passphrase.
+    #[test]
+    fn pull_refuses_another_profiles_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let udd = dir.path().join("udd");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let fkek = [0x5Cu8; 32];
+        let by_key = shardx_core::backup_file::seal_profile_with_fkek("other", &udd, &fkek)
+            .unwrap()
+            .bytes;
+        let by_passphrase =
+            shardx_core::backup_file::seal_profile("other", &udd, "team-passphrase")
+                .unwrap()
+                .bytes;
+        let out = dir.path().join("out");
+
+        let err = open_pulled(&by_key, &out, "p", &[(fkek, 1)], "").unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "sync.pullPassphraseRequired"),
+            "{err}"
+        );
+        let err = open_pulled(&by_passphrase, &out, "p", &[], "team-passphrase").unwrap_err();
+        assert!(err.contains("another profile"), "{err}");
+        assert!(
+            !out.exists(),
+            "nothing restored from another profile's snapshot"
+        );
+    }
+
+    /// A published profile never takes the passphrase path: without the
+    /// account that opens a device session, push and pull ask for it,
+    /// whatever passphrase is given.
+    #[test]
+    fn a_published_profile_never_takes_the_passphrase_path() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _lifecycle = profile::lifecycle_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+
+        let mut stored = profile::StoredProfile::default();
+        profile::save_raw(&mut stored).unwrap();
+        let id = stored.meta.id.clone();
+        let udd = profile::user_data_dir(&id).unwrap();
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("Preferences"), b"{}").unwrap();
+        let seed = "11".repeat(32);
+        team_config::save(&team_config::TeamConfig {
+            server_url: "http://127.0.0.1:9".into(),
+            token: "t".to_string().into(),
+            tenant_id: "aa".repeat(16),
+            device_id: "bb".repeat(16),
+            account_id: "cc".repeat(16),
+            fleet_id: "dd".repeat(16),
+            signing_key_seed: seed.clone().into(),
+            hpke_key_seed: seed.into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let ee = "ee".repeat(16);
+        team::db::fixtures::seed_binding(
+            &team::db::Db::open().unwrap().conn,
+            "s",
+            &id,
+            &ee,
+            &ee,
+            &ee,
+            &ee,
+            0,
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pushed = rt.block_on(profile_sync_push(
+            id.clone(),
+            "team-passphrase".into(),
+            0,
+            None,
+            None,
+        ));
+        let pulled = rt.block_on(profile_sync_pull(id, "team-passphrase".into(), None, None));
+        crate::store::set_config_root(None);
+
+        for err in [
+            pushed.map(|_| ()).unwrap_err(),
+            pulled.map(|_| ()).unwrap_err(),
+        ] {
+            assert!(
+                crate::errcode::has_code(&err, "fleet.setAccountFirst"),
+                "{err}"
+            );
+        }
     }
 
     /// A fleet key cached from the team server must not stand in for the
@@ -386,13 +775,14 @@ mod tests {
             // Nothing listens here, so a push that got past the key check
             // fails on the network instead of with the refusal.
             server_url: "http://127.0.0.1:9".into(),
-            token: "t".into(),
+            token: "t".to_string().into(),
             tenant_id: "aa".repeat(16),
             device_id: "bb".repeat(16),
             account_id: "cc".repeat(16),
             fleet_id: "dd".repeat(16),
-            signing_key_seed: seed.clone(),
-            hpke_key_seed: seed,
+            signing_key_seed: seed.clone().into(),
+            hpke_key_seed: seed.into(),
+            ..Default::default()
         })
         .unwrap();
         let mut keys = fleet_keys::FleetKeyStore::default();
@@ -401,7 +791,7 @@ mod tests {
 
         let result = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(profile_sync_push(id, String::new(), 0));
+            .block_on(profile_sync_push(id, String::new(), 0, None, None));
         crate::store::set_config_root(None);
 
         let err = result.expect_err("push must refuse without a passphrase");

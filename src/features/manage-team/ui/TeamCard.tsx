@@ -5,8 +5,14 @@ import { toast } from "../../../shared/model/toast";
 import {
   teamStatus, teamSetConnection, teamTestConnection,
   teamEnrollDevice, teamCollectCustody, useTeam,
-  type TeamStatus,
+  teamCustodyBootstrapStatus, teamBootstrapCustody,
+  teamKeysCreateFile, teamKeysUnlock,
+  type TeamStatus, type CustodyBootstrapStatus,
 } from "../../../entities/team";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+
+/** The recovery bundle's passphrase floor, as the backend seals it. */
+const MIN_RECOVERY_PASSPHRASE = 8;
 import { t, useT } from "../../../shared/i18n";
 import { safeUiError } from "../../../shared/lib/utils";
 
@@ -48,15 +54,25 @@ export function TeamCard() {
   const [token, setToken] = useState("");
   const [tenant, setTenant] = useState("");
   const [label, setLabel] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
+  const [boot, setBoot] = useState<CustodyBootstrapStatus | null>(null);
+  const [passphrase, setPassphrase] = useState("");
+  const [passphrase2, setPassphrase2] = useState("");
+  const [keyPass, setKeyPass] = useState("");
+  const [keyPass2, setKeyPass2] = useState("");
 
   const shareStatus = useTeam((s) => s.refresh);
 
-  const refresh = () => teamStatus().then((s) => {
-    setSt(s);
-    setUrl(s.server_url);
-    setTenant(s.tenant_id);
-  }).catch(() => {});
+  const refresh = () => {
+    teamStatus().then((s) => {
+      setSt(s);
+      setUrl(s.server_url);
+      setTenant(s.tenant_id);
+    }).catch(() => {});
+    teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+  };
   useEffect(() => { refresh(); }, []);
 
   const run = async (what: string, fn: () => Promise<void>) => {
@@ -82,14 +98,80 @@ export function TeamCard() {
   });
 
   const enroll = () => run("enroll", async () => {
-    const next = await teamEnrollDevice(label.trim() || suggestLabel());
+    // Cleared before the call, so a failed attempt does not keep it either.
+    const typed = password;
+    setPassword("");
+    const next = await teamEnrollDevice(label.trim() || suggestLabel(), username, typed);
     setSt(next);
     void shareStatus();
     toast.ok(t("team.deviceEnrolled"));
   });
 
+  const createKeyFile = () => run("keyFile", async () => {
+    if (keyPass.length < MIN_RECOVERY_PASSPHRASE) {
+      toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
+      return;
+    }
+    if (keyPass !== keyPass2) {
+      toast.err(t("team.recoveryPassphrasesDiffer"));
+      return;
+    }
+    const next = await teamKeysCreateFile(keyPass);
+    setKeyPass("");
+    setKeyPass2("");
+    setSt(next);
+    void shareStatus();
+    toast.ok(t("team.keyFileCreated"));
+  });
+
+  const unlockKeys = () => run("unlock", async () => {
+    const typed = keyPass;
+    setKeyPass("");
+    const next = await teamKeysUnlock(typed);
+    setSt(next);
+    void shareStatus();
+    toast.ok(t("team.keysUnlocked"));
+  });
+
+  const bootstrap = () => run("bootstrap", async () => {
+    if (passphrase.length < MIN_RECOVERY_PASSPHRASE) {
+      toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
+      return;
+    }
+    if (passphrase !== passphrase2) {
+      toast.err(t("team.recoveryPassphrasesDiffer"));
+      return;
+    }
+    // A resumed setup keeps the bundle it already wrote; the backend ignores
+    // a new path then, so do not ask for one.
+    let path = boot?.recovery_path ?? "";
+    if (!path) {
+      const picked = await saveDialog({
+        defaultPath: "shardx-recovery.shxrecovery",
+        filters: [{ name: t("team.recoveryBundle"), extensions: ["shxrecovery"] }],
+      });
+      if (typeof picked !== "string") return; // cancelled
+      path = picked;
+    }
+    const typed = password;
+    setPassword("");
+    try {
+      const next = await teamBootstrapCustody(username, typed, path, passphrase);
+      setBoot(next);
+      setPassphrase("");
+      setPassphrase2("");
+      toast.ok(t("team.rootCustodyReady", { path: next.recovery_path }));
+    } catch (e) {
+      // Whatever step it reached is saved; show where the next try resumes.
+      teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+      throw e;
+    }
+  });
+
   const collect = () => run("collect", async () => {
-    const r = await teamCollectCustody();
+    const typed = password;
+    setPassword("");
+    const r = await teamCollectCustody(username, typed);
     if (r.grants === 0) {
       if (r.fleet_grants_waiting === 0) toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
     } else if (r.failed > 0) {
@@ -185,8 +267,27 @@ export function TeamCard() {
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
               />
+              <Input
+                label={t("team.accountUsername")}
+                inputSize="small"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+              <Input
+                label={t("team.accountPassword")}
+                inputSize="small"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+              />
               <div>
-                <Button size="small" disabled={!!busy || !connected} onClick={enroll}>
+                <Button
+                  size="small"
+                  disabled={!!busy || !connected || !username.trim() || !password}
+                  onClick={enroll}
+                >
                   {busy === "enroll" ? t("busy.enrolling") : t("team.enrolThisDevice")}
                 </Button>
               </div>
@@ -203,8 +304,138 @@ export function TeamCard() {
                 <CopyField value={st.device_id} />
               </div>
 
+              {st.keys_locked ? (
+                <div className="flex flex-col gap-2" data-testid="keys-locked">
+                  <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.keysLocked")}</p>
+                  <Input
+                    label={t("team.keyFilePassphrase")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="current-password"
+                    value={keyPass}
+                    onChange={(e) => setKeyPass(e.target.value)}
+                  />
+                  <div>
+                    <Button size="small" disabled={!!busy || !keyPass} onClick={unlockKeys}>
+                      {busy === "unlock" ? t("busy.unlocking") : t("team.unlockKeys")}
+                    </Button>
+                  </div>
+                </div>
+              ) : !st.keys_protected && (
+                <div className="flex flex-col gap-2" data-testid="keys-unprotected">
+                  <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.keysNotProtected")}</p>
+                  {!st.has_key_file && (
+                    <>
+                      <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.keyFileHint")}</p>
+                      <Input
+                        label={t("team.keyFilePassphrase")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={keyPass}
+                        onChange={(e) => setKeyPass(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.keyFilePassphraseAgain")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={keyPass2}
+                        onChange={(e) => setKeyPass2(e.target.value)}
+                      />
+                      <div>
+                        <Button size="small" disabled={!!busy || !keyPass || !keyPass2} onClick={createKeyFile}>
+                          {busy === "keyFile" ? t("busy.protectingKeys") : t("team.protectWithPassphrase")}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {boot?.activated && boot.anchor && (
+                <div>
+                  <span className="text-paragraph-xs text-text-soft-400">{t("team.bootstrapAnchor")}</span>
+                  <CopyField value={boot.anchor} />
+                </div>
+              )}
+
+              {st.can_receive_custody && st.can_sync && boot && !boot.activated && (
+                <div className="flex flex-col gap-2" data-testid="custody-bootstrap">
+                  <p className="m-0 text-paragraph-xs text-text-soft-400">
+                    {boot.started
+                      ? boot.recovery_path
+                        ? t("team.custodySetupResumeAt", { path: boot.recovery_path })
+                        : t("team.custodySetupResume")
+                      : t("team.firstDeviceCustodyHelp")}
+                  </p>
+                  <Input
+                    label={t("team.accountUsername")}
+                    inputSize="small"
+                    autoComplete="username"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.accountPassword")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.recoveryPassphrase")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="new-password"
+                    value={passphrase}
+                    onChange={(e) => setPassphrase(e.target.value)}
+                  />
+                  <Input
+                    label={t("team.recoveryPassphraseAgain")}
+                    inputSize="small"
+                    type="password"
+                    autoComplete="new-password"
+                    value={passphrase2}
+                    onChange={(e) => setPassphrase2(e.target.value)}
+                  />
+                  <div>
+                    <Button
+                      size="small"
+                      disabled={!!busy || !username.trim() || !password || !passphrase || !passphrase2}
+                      onClick={bootstrap}
+                    >
+                      {busy === "bootstrap"
+                        ? t("busy.settingUpCustody")
+                        : boot.started ? t("team.resumeCustodySetup") : t("team.setUpRootCustody")}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               {st.can_receive_custody ? (
                 <>
+                  {/* The bootstrap form above already holds the account login. */}
+                  {!(st.can_sync && boot && !boot.activated) && (
+                    <>
+                      <Input
+                        label={t("team.accountUsername")}
+                        inputSize="small"
+                        autoComplete="username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.accountPassword")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                      />
+                    </>
+                  )}
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
                       {busy === "collect" ? t("busy.collecting") : t("team.collectKeyCustody")}

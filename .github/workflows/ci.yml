@@ -45,6 +45,18 @@ jobs:
           cargo +stable install cargo-audit --locked --version 0.22.2
           cargo +stable audit --file sdks/rust/Cargo.lock
 
+      # Each ignore is a reviewed disposition in docs/dependency-review.md; a
+      # new advisory, or one of these reaching a new path, fails the build.
+      - name: Launcher, server and shared RustSec audit
+        run: |
+          cargo +stable audit --deny unsound --deny yanked --file shared/Cargo.lock
+          cargo +stable audit --deny unsound --deny yanked --file server/Cargo.lock \
+            --ignore RUSTSEC-2023-0071
+          cargo +stable audit --deny unsound --deny yanked --file src-tauri/Cargo.lock \
+            --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 \
+            --ignore RUSTSEC-2024-0429
+
       - name: Rust SDK MSRV checks
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
@@ -61,7 +73,7 @@ jobs:
   windows-rust:
     runs-on: windows-latest
     name: Rust tests on Windows
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -82,6 +94,18 @@ jobs:
             sdks/rust/target
           key: windows-rust-${{ hashFiles('shared/Cargo.lock', 'server/Cargo.lock', 'src-tauri/Cargo.lock', 'sdks/rust/Cargo.lock') }}
 
+      # The supported-filesystem gate (ADR 0002 Q-30) must refuse an SMB
+      # share. The runner is elevated, so it shares an empty directory; the
+      # volume tests of all three crates read SHARDX_TEST_SMB_DIR and only
+      # query the share, never write to it.
+      - name: Create a temporary SMB share
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'shardx-g2-smb'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          New-SmbShare -Name shardx-g2-smb -Path $dir -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
+          "SHARDX_TEST_SMB_DIR=\\localhost\shardx-g2-smb" >> $env:GITHUB_ENV
+
       - name: Shared core tests
         run: cargo test --manifest-path shared/Cargo.toml
 
@@ -98,6 +122,11 @@ jobs:
       # were otherwise compiled only on Linux and macOS.
       - name: Rust SDK tests
         run: cargo test --manifest-path sdks/rust/Cargo.toml --all-features
+
+      - name: Remove the temporary SMB share
+        if: always()
+        shell: pwsh
+        run: Remove-SmbShare -Name shardx-g2-smb -Force -ErrorAction SilentlyContinue
 
   macos-check:
     # The hosted arm64 pool repeatedly leaves this job unacquired ("capacity
@@ -310,3 +339,34 @@ jobs:
 
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # G2-62: shared, server and src-tauri each build on the `rust-version` their
+  # Cargo.toml declares, read from the manifest so the two cannot drift. A
+  # separate job, so it can change apart from the jobs above.
+  custody-msrv:
+    runs-on: ubuntu-22.04
+    name: Launcher, server and shared MSRV
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Tauri build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Check each crate on its declared rust-version
+        run: |
+          for crate in shared server src-tauri; do
+            msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' "$crate/Cargo.toml")
+            test -n "$msrv" || { echo "$crate declares no rust-version"; exit 1; }
+            rustup toolchain install "$msrv" --profile minimal
+            cargo "+$msrv" check --locked --all-targets --manifest-path "$crate/Cargo.toml"
+          done

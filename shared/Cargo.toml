@@ -2,6 +2,7 @@
 name = "shardx-core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 description = "Shared ShardX logic: Chromium os_crypt cookie/secret encryption and portable user-data-dir snapshots (Mac/Win/Linux)."
 
 [dependencies]
@@ -23,7 +24,14 @@ hpke = { version = "=0.14.0", default-features = false, features = ["alloc", "x2
 getrandom04 = { package = "getrandom", version = "=0.4.3" }
 # Argon2id for passphrase-derived local backup keys. Pinned: the cost
 # parameters and algorithm version are part of the on-disk backup format.
-argon2 = { version = "=0.5.3", features = ["std"] }
+argon2 = { version = "=0.5.3", features = ["std", "zeroize"] }
+# STREAM (LE31) over XChaCha20-Poly1305 for envelope suite 2 (ADR 0003,
+# provider A). Pinned like the AEAD it wraps.
+aead-stream = { version = "=0.6.0", features = ["alloc"] }
+# HKDF-SHA256 for the profile label subkey (RFC 5869). Both are already built
+# for hpke, which needs digest 0.11, so sha2 is renamed beside the 0.10 one.
+hkdf = { version = "=0.13.0", default-features = false }
+sha2_11 = { package = "sha2", version = "=0.11.0", default-features = false }
 
 # POSIX os_crypt: AES-128-CBC with a fixed IV.
 [target.'cfg(not(windows))'.dependencies]
@@ -41,4 +49,5 @@ serde_json = "1"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
 ] }

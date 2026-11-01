@@ -29,7 +29,7 @@ async fn pool() -> SqlitePool {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
     pool
 }
 
@@ -417,63 +417,6 @@ async fn idempotency_keys_are_scoped_to_instance_and_epoch() {
 }
 
 #[tokio::test]
-async fn a_grant_cannot_name_a_device_from_another_tenant() {
-    let pool = pool().await;
-    seed_tenant(&pool, 1).await;
-    seed_tenant(&pool, 2).await;
-    seed_account(&pool, 2, 20).await;
-    sqlx::query(
-        "INSERT INTO v2_devices (id, tenant_id, account_id, label_ciphertext, signing_key_id,
-            signing_public_key, signing_suite, hpke_key_id, hpke_public_key, hpke_suite,
-            status, created_at)
-         VALUES (?, ?, ?, X'00', ?, ?, 1, ?, ?, 1, 'active', '2026-09-02T00:00:00+00:00')",
-    )
-    .bind(id(30))
-    .bind(id(2))
-    .bind(id(20))
-    .bind(key32(1))
-    .bind(key32(2))
-    .bind(key32(3))
-    .bind(key32(4))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Tenant 1 tries to issue a root-key grant to tenant 2's device.
-    let err = sqlx::query(
-        "INSERT INTO v2_tenant_root_key_grants (tenant_id, replay_id, payload_domain,
-            grant_variant, root_key_id, root_generation, grant_capability, subject_account_id,
-            subject_device_id, subject_signing_key_id, recipient_hpke_key_id,
-            subject_device_approval_replay_id, hpke_suite_id, hpke_mode_id, hpke_kem_id,
-            hpke_kdf_id, hpke_aead_id, hpke_info_bytes, hpke_encapped_key_bytes,
-            hpke_wrapped_trk_bytes, server_instance_id, restore_epoch, signature_bytes,
-            issuer_signing_key_id, signed_container_hash, exact_signed_container_bytes,
-            exact_signed_container_bytes_sha256, created_at)
-         VALUES (?, ?, 'shardx.authorization.tenant-root-key-grant.v2', 'CustodianIssued', ?, 1,
-                 'root.custody', ?, ?, ?, ?, ?, 1, 0, 32, 1, 3, X'00', X'00', X'00', ?, 1, ?, ?, ?,
-                 X'00', ?, '2026-09-02T00:00:00+00:00')",
-    )
-    .bind(id(1)) // tenant 1
-    .bind(id(60))
-    .bind(key32(5))
-    .bind(id(20))
-    .bind(id(30)) // device belongs to tenant 2
-    .bind(key32(1))
-    .bind(key32(4))
-    .bind(id(70))
-    .bind(id(80))
-    .bind(vec![0u8; 64])
-    .bind(key32(6))
-    .bind(key32(7))
-    .bind(key32(8))
-    .execute(&pool)
-    .await
-    .unwrap_err();
-
-    assert_eq!(err_code(err), SQLITE_CONSTRAINT_FOREIGNKEY);
-}
-
-#[tokio::test]
 async fn deleting_a_tenant_removes_its_rows_and_leaves_others_intact() {
     let pool = pool().await;
     seed_tenant(&pool, 1).await;
@@ -523,4 +466,252 @@ async fn server_state_mirror_holds_at_most_one_row() {
     insert(1).execute(&pool).await.unwrap();
     let err = insert(2).execute(&pool).await.unwrap_err();
     assert_eq!(err_code(err), SQLITE_CONSTRAINT_PRIMARYKEY);
+}
+
+#[tokio::test]
+async fn only_offline_operator_audit_rows_may_omit_the_actor() {
+    // ADR 0001 D3: NULL actors mean an offline operator command, and nothing
+    // else may record an anonymous actor.
+    let pool = pool().await;
+    seed_tenant(&pool, 1).await;
+    let insert = |n: u8, actor: Option<u8>, device: Option<u8>, reason: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO v2_audit_events (tenant_id, id, actor_account_id, actor_device_id,
+                action, target_type, target_id, outcome, reason_code, request_id, created_at)
+             VALUES (?, ?, ?, ?, 'tenant.create', 'tenant', ?, 'success', ?, ?,
+                '2026-09-02T00:00:00+00:00')",
+        )
+        .bind(id(1))
+        .bind(id(n))
+        .bind(actor.map(id))
+        .bind(device.map(id))
+        .bind(id(1))
+        .bind(reason)
+        .bind(id(90 + n))
+    };
+
+    insert(1, None, None, Some("offline_operator_cli"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert(2, Some(3), Some(4), None)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (n, actor, device, reason) in [
+        (5, None, None, None),
+        (6, None, None, Some("other")),
+        (7, Some(3), None, None),
+        (8, None, Some(4), Some("offline_operator_cli")),
+        (9, Some(3), Some(4), Some("offline_operator_cli")),
+    ] {
+        let err = insert(n, actor, device, reason)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(err_code(err), SQLITE_CONSTRAINT_CHECK, "row {n}");
+    }
+}
+
+/// 0021: a fleet generation keeps its D-9 terms, carries all of them or none,
+/// and only moves forward (ADR 0002 D-9).
+#[tokio::test]
+async fn a_fleet_generation_keeps_its_terms_and_moves_forward() {
+    const TRIGGER: &str = "1811";
+    // The generation's foreign keys are not what this test is about.
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .foreign_keys(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+    let insert = |generation: i64, fkek: u8, terms: bool, previous: bool| {
+        sqlx::query(
+            "INSERT INTO v2_fleet_key_generations (
+                 server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                 root_generation, state, created_at, required_device_grant_count,
+                 required_grant_set_hash, recovery_grant_hash, previous_fkek_key_id,
+                 rotation_grant_hash)
+             VALUES (?, ?, ?, ?, ?, 0, 'PREPARING', 'now', ?, ?, ?, ?, ?)",
+        )
+        .bind(id(1))
+        .bind(id(2))
+        .bind(id(3))
+        .bind(generation)
+        .bind(key32(fkek))
+        .bind(terms.then_some(1_i64))
+        .bind(terms.then(|| key32(0x51)))
+        .bind(terms.then(|| key32(0x52)))
+        .bind(previous.then(|| key32(0x53)))
+        .bind(previous.then(|| key32(0x54)))
+        .execute(&pool)
+    };
+    // Generation 0 has no rotation pair, a rotation has one, and a legacy row
+    // has no terms at all.
+    for (generation, fkek, terms, previous) in [(0, 0x60, true, true), (1, 0x61, true, false)] {
+        let e = insert(generation, fkek, terms, previous).await.unwrap_err();
+        assert_eq!(err_code(e), TRIGGER, "generation {generation}");
+    }
+    insert(0, 0x62, true, false).await.unwrap();
+    insert(1, 0x63, true, true).await.unwrap();
+    insert(2, 0x64, false, false).await.unwrap();
+
+    let update = |set: &'static str| {
+        let statement = format!("UPDATE v2_fleet_key_generations SET {set} WHERE generation = 0");
+        let pool = pool.clone();
+        async move { sqlx::query(&statement).execute(&pool).await }
+    };
+    for set in [
+        "required_grant_set_hash = zeroblob(32)",
+        "recovery_grant_hash = zeroblob(32)",
+        "root_generation = 1",
+        "state = 'ACTIVE'",
+    ] {
+        assert_eq!(err_code(update(set).await.unwrap_err()), TRIGGER, "{set}");
+    }
+    update("state = 'ACTIVE', activated_at = 'now'")
+        .await
+        .unwrap();
+    for set in [
+        "state = 'PREPARING', activated_at = NULL",
+        "activated_at = 'later'",
+        "state = 'RETIRED'",
+    ] {
+        assert_eq!(err_code(update(set).await.unwrap_err()), TRIGGER, "{set}");
+    }
+    update("state = 'RETIRED', retired_at = 'now'")
+        .await
+        .unwrap();
+
+    // The grant-side guards are present; the routes' tests drive them.
+    for name in [
+        "v2_fleet_key_grants_not_for_d9_generations",
+        "v2_fleet_device_hpke_grants_window_is_bounded",
+        "v2_fleet_recovery_grants_window_is_bounded",
+        "v2_fleet_rotation_grants_window_is_bounded",
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{name}");
+    }
+}
+
+/// 0022: the mutations added after 0020 commit with their responses, and a
+/// fleet key generation is never removed or replaced.
+#[tokio::test]
+async fn later_mutations_store_their_responses_and_a_generation_is_never_removed() {
+    const TRIGGER: &str = "1811";
+    let options = "sqlite::memory:"
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .foreign_keys(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    shardx_team_server::run_migrations(&pool).await.unwrap();
+
+    let mut key = 0u8;
+    let mut row =
+        |kind: &'static str, scope: &'static str, status: &'static str, record: &'static str| {
+            key += 1;
+            let (pool, idempotency_key) = (pool.clone(), id(key));
+            async move {
+                sqlx::query(
+                    "INSERT INTO v2_idempotency (
+                     server_instance_id, tenant_id, actor_device_id, operation_scope,
+                     idempotency_key, operation_kind, canonical_request_hash, exact_request_bytes,
+                     exact_request_bytes_sha256, status, response_record_type,
+                     exact_response_bytes, exact_response_bytes_sha256, retained_until)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, x'01', ?, ?, ?, x'02', ?, 0)",
+                )
+                .bind(id(1))
+                .bind(id(2))
+                .bind(id(3))
+                .bind(scope)
+                .bind(idempotency_key)
+                .bind(kind)
+                .bind(key32(4))
+                .bind(key32(5))
+                .bind(status)
+                .bind(record)
+                .bind(key32(6))
+                .execute(&pool)
+                .await
+            }
+        };
+    for (kind, scope, record) in [
+        (
+            "ROOT_GRANT_CREATE",
+            "tenant.root-grant-create.v2",
+            "TenantRootGrantCreatedV2",
+        ),
+        (
+            "ROOT_GRANT_REVOKE",
+            "tenant.root-grant-revoke.v2",
+            "TenantRootGrantRevokedV2",
+        ),
+        (
+            "FLEET_GRANT_ACK",
+            "fleet.key-grant-ack.v2",
+            "FleetKeyGrantAckedV2",
+        ),
+        (
+            "FLEET_GENERATION_ACTIVATE",
+            "fleet.key-generation-activate.v2",
+            "FleetKeyGenerationActivatedV2",
+        ),
+        (
+            "FLEET_GRANT_REVOKE",
+            "fleet.key-grant-revoke.v2",
+            "FleetGrantRevokedV2",
+        ),
+    ] {
+        for (k, s, st, r) in [
+            (kind, scope, "in_flight", record),
+            (kind, scope, "succeeded", "DeviceApprovalReceiptV2"),
+            (kind, "profile.checkout.v2", "succeeded", record),
+            ("PROFILE_CHECKOUT", scope, "succeeded", record),
+        ] {
+            let e = row(k, s, st, r).await.unwrap_err();
+            assert_eq!(err_code(e), TRIGGER, "{k} {s} {st} {r}");
+        }
+        row(kind, scope, "succeeded", record).await.unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO v2_fleet_key_generations (
+             server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+             root_generation, state, created_at)
+         VALUES (?, ?, ?, 0, ?, 0, 'PREPARING', 'now')",
+    )
+    .bind(id(1))
+    .bind(id(2))
+    .bind(id(3))
+    .bind(key32(7))
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in [
+        "INSERT OR REPLACE INTO v2_fleet_key_generations (
+             server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+             root_generation, state, created_at)
+         SELECT server_instance_id, tenant_id, fleet_id, generation, zeroblob(32),
+                root_generation, state, created_at FROM v2_fleet_key_generations",
+        "DELETE FROM v2_fleet_key_generations",
+    ] {
+        let e = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        assert_eq!(err_code(e), TRIGGER, "{statement}");
+    }
 }

@@ -22,6 +22,9 @@ pub struct Config {
     /// Only enable behind a reverse proxy that sets it — otherwise a client
     /// could spoof the header to dodge the per-IP limit.
     pub trust_proxy: bool,
+    /// `SHARDX_IDENTITY_DIR`: operator-owned directory holding the external
+    /// identity record (ADR 0001 P1). No default: unset keeps v2 writes off.
+    pub identity_dir: Option<String>,
 }
 
 impl Config {
@@ -70,6 +73,9 @@ impl Config {
         let snapshot_keep = parse_env("SHARDX_SNAPSHOT_KEEP", 5);
         let max_snapshot_bytes = parse_env::<usize>("SHARDX_MAX_SNAPSHOT_BYTES", 512 * 1024 * 1024);
         let trust_proxy = env_or("SHARDX_TRUST_PROXY", "0") == "1";
+        // An empty value is kept, not read as unset: the preflight refuses it,
+        // so a blanked variable cannot start the server without an authority.
+        let identity_dir = std::env::var("SHARDX_IDENTITY_DIR").ok();
 
         Arc::new(Config {
             bind,
@@ -84,6 +90,7 @@ impl Config {
             snapshot_keep,
             max_snapshot_bytes,
             trust_proxy,
+            identity_dir,
         })
     }
 
@@ -126,6 +133,7 @@ mod tests {
             snapshot_keep: 0,
             max_snapshot_bytes: 0,
             trust_proxy: false,
+            identity_dir: None,
         }
     }
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::identity::Authority;
 use crate::ratelimit::LoginThrottle;
 
 /// Shared application state handed to every handler. Cheap to clone:
@@ -15,4 +16,7 @@ pub struct AppState {
     /// Bounds concurrent snapshot downloads — same disk/bandwidth guard on the
     /// read path, held for the whole streamed transfer.
     pub download_slots: Arc<tokio::sync::Semaphore>,
+    /// Startup verdict on the external identity record. Fixed for the run:
+    /// the record only changes offline, under the data directory lock.
+    pub authority: Arc<Authority>,
 }

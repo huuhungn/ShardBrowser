@@ -285,10 +285,8 @@ pub async fn open_upload(
     if let Some(parent) = staging.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
     }
-    // Truncate any leftover file: a session id is unique, but a crashed
-    // earlier attempt with the same id must not contribute stale bytes.
-    tokio::fs::File::create(&staging).await.map_err(io_err)?;
-
+    // The row goes in first: a repeated open for a live session fails on the
+    // primary key here, before the truncation below could wipe its bytes.
     sqlx::query(
         "INSERT INTO v2_upload_sessions
            (id, tenant_id, profile_id, lease_id, server_instance_id, restore_epoch,
@@ -311,6 +309,17 @@ pub async fn open_upload(
     .bind(now)
     .execute(db)
     .await?;
+
+    // Truncate any leftover file: an earlier attempt that crashed before its
+    // row committed must not contribute stale bytes.
+    if let Err(e) = tokio::fs::File::create(&staging).await {
+        let _ = sqlx::query("DELETE FROM v2_upload_sessions WHERE tenant_id = ? AND id = ?")
+            .bind(tenant_id.as_slice())
+            .bind(session_id.as_slice())
+            .execute(db)
+            .await;
+        return Err(io_err(e));
+    }
 
     Ok(staging)
 }
@@ -481,9 +490,26 @@ pub async fn commit_upload(
     // exist if an earlier attempt promoted the blob but died before the
     // manifest insert committed. Clearing it first makes the retry succeed.
     let _ = tokio::fs::remove_file(&final_path).await;
+    // The manifest row below names this blob, so the bytes and the rename
+    // must be on disk before it commits (G2-49). Flushing needs a writable
+    // handle on Windows.
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)
+        .await
+        .map_err(|_| FleetError::BlobUnavailable)?
+        .sync_all()
+        .await
+        .map_err(|_| FleetError::BlobUnavailable)?;
     tokio::fs::rename(&staging, &final_path)
         .await
         .map_err(|_| FleetError::BlobUnavailable)?;
+    if let Some(parent) = final_path.parent().map(Path::to_path_buf) {
+        tokio::task::spawn_blocking(move || crate::identity::sync_dir(&parent))
+            .await
+            .map_err(|_| FleetError::BlobUnavailable)?
+            .map_err(|_| FleetError::BlobUnavailable)?;
+    }
 
     let blob_str = final_path.to_string_lossy().to_string();
 
@@ -745,10 +771,24 @@ fn hex16(b: &[u8; 16]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn staging_path(root: &Path, tenant_id: &[u8; 16], session_id: &[u8; 16]) -> PathBuf {
+pub(crate) fn staging_path(root: &Path, tenant_id: &[u8; 16], session_id: &[u8; 16]) -> PathBuf {
     root.join(hex16(tenant_id))
         .join("staging")
         .join(format!("{}.part", hex16(session_id)))
+}
+
+/// A v2 object's immutable path, keyed by `snapshot_id` and never
+/// overwritten (ADR 0002 C-2).
+pub(crate) fn object_path(
+    root: &Path,
+    tenant_id: &[u8; 16],
+    profile_id: &[u8; 16],
+    snapshot_id: &[u8; 16],
+) -> PathBuf {
+    root.join(hex16(tenant_id))
+        .join("objects")
+        .join(hex16(profile_id))
+        .join(format!("{}.bin", hex16(snapshot_id)))
 }
 
 fn blob_path(root: &Path, tenant_id: &[u8; 16], profile_id: &[u8; 16], version: i64) -> PathBuf {
@@ -821,7 +861,7 @@ mod tests {
             .connect_with(opts)
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        shardx_team_server::run_migrations(&db).await.unwrap();
 
         for (t, slug) in [(TENANT, "acme"), (OTHER_TENANT, "other")] {
             sqlx::query(
@@ -1044,6 +1084,41 @@ mod tests {
             got.extend_from_slice(&part);
         }
         assert_eq!(got, payload, "downloaded bytes must equal uploaded bytes");
+    }
+
+    /// A repeated open for a live session id must fail without touching the
+    /// bytes that session already staged.
+    #[tokio::test]
+    async fn reopening_a_session_keeps_its_staged_bytes() {
+        let h = setup("reopen").await;
+        let payload = b"abc".to_vec();
+        let lease = acquire(&h, [10u8; 16], DEVICE, "2026-09-02T01:00:00+00:00").await;
+        let session = [20u8; 16];
+        open_session(&h, session, lease.id, lease.fencing_token, 1, 3).await;
+        append(&h, session, 0, &payload).await.unwrap();
+
+        let again = open_upload(
+            &h.db,
+            &h.root,
+            &TENANT,
+            &PROFILE,
+            &session,
+            &lease.id,
+            &SERVER,
+            0,
+            lease.fencing_token,
+            1,
+            &[0xAB; 32],
+            3,
+            "2026-09-02T00:00:02+00:00",
+        )
+        .await;
+        assert!(again.is_err(), "a live session id must not open twice");
+
+        let m = manifest_for(&payload, 0, [30u8; 16]);
+        commit(&h, session, &m)
+            .await
+            .expect("the staged bytes survive the refused reopen");
     }
 
     #[tokio::test]

@@ -896,7 +896,9 @@ of 5.6.5 with operation kinds `ROOT_GENERATION_CREATE`, `ROOT_GRANT_CREATE`, `RO
 `tenant.root-generation-activate.v2`, `tenant.root-grant-revoke.v2`; same-key response-loss replay
 cannot create generation/grant, activate, acknowledge or revoke twice. GET descriptor is a closed map containing
 the exact outer grant bytes/full hash plus every typed column named in 7.2;
-missing/extra descriptor field is a readback failure.
+missing/extra descriptor field is a readback failure. Its domain is `shardx.keys.tenant-root-grant-descriptor.v2`; the
+payload's own `domain`/`version` columns are named `payload_domain`/`payload_version`, and every
+map that names a stored grant calls its replay ID `replay_id`, as the 7.2 column does.
 
 Every write/read/ack/activate/revoke reparses exact payload/container and compares
 all fields one-for-one to indexed columns: common replay/tenant/time/instance/

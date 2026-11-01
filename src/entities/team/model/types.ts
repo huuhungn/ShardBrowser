@@ -25,6 +25,29 @@ export type TeamStatus = {
    * cached from the server, until verified key distribution ships.
    */
   has_fleet_key: boolean;
+  /**
+   * Whether every key this device holds is in the OS credential store. False
+   * while a key is still in plaintext on disk because no store was usable.
+   */
+  keys_protected: boolean;
+  /** Whether this device has a passphrase-protected key file. */
+  has_key_file: boolean;
+  /**
+   * Whether that file was not opened in this run yet: keys kept in it cannot
+   * be used until the passphrase is entered.
+   */
+  keys_locked: boolean;
+};
+
+/** How far `team_bootstrap_custody` got; none of its secrets. */
+export type CustodyBootstrapStatus = {
+  /** Some step ran, so the next attempt resumes rather than starts over. */
+  started: boolean;
+  activated: boolean;
+  /** Where the recovery bundle was written; empty until it was. */
+  recovery_path: string;
+  /** The bootstrap anchor the trust evidence verified to; empty until then. */
+  anchor: string;
 };
 
 /** What `team_collect_custody` found waiting on the server. */

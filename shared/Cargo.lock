@@ -29,6 +29,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead-stream"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a901e5bcd15b4a9555a8f17a608d28ef92cf77bc4aa3b4a0c1a3fce1a9cc0bac"
+dependencies = [
+ "aead 0.6.1",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,6 +90,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -804,6 +814,7 @@ dependencies = [
 name = "shardx-core"
 version = "0.1.0"
 dependencies = [
+ "aead-stream",
  "aes",
  "aes-gcm",
  "anyhow",
@@ -815,6 +826,7 @@ dependencies = [
  "flate2",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
+ "hkdf",
  "hpke",
  "pbkdf2",
  "rusqlite",
@@ -822,6 +834,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
+ "sha2 0.11.0",
  "tar",
  "windows-sys 0.59.0",
  "zeroize",

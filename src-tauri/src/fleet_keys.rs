@@ -1,36 +1,44 @@
-//! Fleet keys this device collected from its grants in earlier versions.
+//! Fleet keys this device has collected from its grants.
 //!
-//! A fleet key (FKEK) opens profile snapshots. Earlier versions opened every
-//! fleet key grant the team server delivered and cached the key here, and push
-//! sealed under it. Nothing proves who issued such a grant, so a hostile
-//! server could seal a key of its own choosing to this device and read every
-//! later push. Until verified key distribution ships, nothing adds keys here:
-//! the cache is read only by pull, so snapshots already pushed under a cached
-//! key still restore.
+//! A fleet key (FKEK) is what actually opens profile snapshots. It arrives
+//! sealed to this device's HPKE key inside a fleet key grant; once opened it
+//! is cached here so sync does not need a passphrase.
 //!
 //! Two deliberate choices:
 //!
 //! 1. **Separate from `team.json`.** That file is round-tripped by the
 //!    Settings page. Key material must not sit in a struct a partial UI save
 //!    could rewrite.
-//! 2. **Keyed by generation.** Snapshots sealed under an older generation must
-//!    stay readable, so old keys are kept rather than replaced.
+//! 2. **Keyed by generation.** Rotation issues a new generation; snapshots
+//!    sealed under the old one must stay readable, so old keys are kept rather
+//!    than replaced.
 //!
-//! This file is as sensitive as the profiles it opens. On Windows each key is
-//! DPAPI-protected for the current user (see `dpapi`). On Unix the file is
-//! written 0600.
+//! A collected key is written to this file first, so it is durable before
+//! anything else happens, and then moved into the OS credential store (ADR
+//! 0004): the file keeps only its reference once the key read back. While no
+//! store is usable the key stays here, and the file is as sensitive as the
+//! profiles it opens: 0600 on Unix, and DPAPI-protected on Windows (see
+//! `dpapi`).
+//!
+//! Since 2.4.3 a fleet key the team server delivers is cached only once its
+//! grant verifies against the tenant trust chain, as the W6 trust ledger lets
+//! this device see it (`open_fleet_grant`, `team::ledger`), and never over
+//! another key held for the same generation (`collect`). Pull uses such a key
+//! only while its grant reverifies at that moment (`keys_newest_first`,
+//! `fleet_key_verifies`); push stays on the passphrase. Keys cached by 2.4.2
+//! still open old snapshots.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::sync::Mutex;
 
 use crate::{dpapi, store};
+use zeroize::Zeroizing;
 
-/// Serialises writes. Two pulls can load at once, and both would migrate
-/// through the same temp file: one could truncate it under the other's rename.
+/// Serialises writes, so a migration rewrite cannot land on top of a newer
+/// save with the content it read before that save.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One fleet's collected keys, by generation.
@@ -38,20 +46,20 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 pub struct FleetKeys {
     /// Generation number to hex-encoded 32-byte key.
     #[serde(default)]
-    pub keys: BTreeMap<u64, String>,
-    /// Newest generation collected.
+    pub keys: BTreeMap<u64, Zeroizing<String>>,
+    /// Generation number to the key's reference in the OS credential store,
+    /// once it left `keys`.
+    #[serde(default)]
+    pub credential_refs: BTreeMap<u64, String>,
+    /// Generation sync should seal new snapshots under. Reading still tries
+    /// every generation, because an older snapshot is still valid.
     #[serde(default)]
     pub active_generation: u64,
-}
-
-/// Debug that names the generations held, never the keys.
-impl std::fmt::Debug for FleetKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FleetKeys")
-            .field("generations", &self.keys.keys().collect::<Vec<_>>())
-            .field("active_generation", &self.active_generation)
-            .finish()
-    }
+    /// Generations collected from a verified grant (`collect`), which pull
+    /// uses only once reverified. Keys cached by 2.4.2 are not listed and
+    /// keep their use.
+    #[serde(default)]
+    pub verified: BTreeSet<u64>,
 }
 
 /// All fleets this device holds keys for, by hex fleet id.
@@ -62,41 +70,58 @@ pub struct FleetKeyStore {
 }
 
 impl FleetKeyStore {
+    /// The active generation's key. Sync no longer seals under it (push uses
+    /// the passphrase), so only the tests still ask.
+    #[cfg(test)]
+    pub fn active_key(&self, fleet_id: &str) -> Option<([u8; 32], u64)> {
+        let f = self.fleets.get(fleet_id)?;
+        f.key(f.active_generation)
+            .map(|k| (*k, f.active_generation))
+    }
+
     /// Every key this device holds for a fleet, newest generation first.
     ///
     /// Restore tries these in turn: a snapshot pushed before a rotation is
-    /// still sealed under the older generation and must stay readable.
-    pub fn keys_newest_first(&self, fleet_id: &str) -> Vec<([u8; 32], u64)> {
+    /// still sealed under the older generation and must stay readable. A key
+    /// collected from a verified grant is listed only when `reverify(generation,
+    /// key)` accepts it now (G2-35).
+    pub fn keys_newest_first(
+        &self,
+        fleet_id: &str,
+        reverify: impl Fn(u64, &[u8; 32]) -> bool,
+    ) -> Vec<([u8; 32], u64)> {
         let Some(f) = self.fleets.get(fleet_id) else {
             return Vec::new();
         };
-        let mut out: Vec<_> = f
+        let generations: std::collections::BTreeSet<u64> = f
             .keys
-            .iter()
-            .filter_map(|(g, h)| decode_key(h).ok().map(|k| (k, *g)))
+            .keys()
+            .chain(f.credential_refs.keys())
+            .copied()
+            .collect();
+        let mut out: Vec<_> = generations
+            .into_iter()
+            .filter_map(|g| f.key(g).map(|k| (*k, g)))
+            .filter(|(k, g)| !f.verified.contains(g) || reverify(*g, k))
             .collect();
         out.sort_by_key(|(_, generation)| std::cmp::Reverse(*generation));
         out
     }
 
-    /// Record a key. Test-only: production adds none until verified key
-    /// distribution ships.
-    #[cfg(test)]
+    /// Record a collected key.
     pub fn insert(&mut self, fleet_id: &str, generation: u64, key: &[u8; 32]) {
         let f = self.fleets.entry(fleet_id.to_string()).or_default();
-        f.keys
-            .insert(generation, key.iter().map(|b| format!("{b:02x}")).collect());
+        f.keys.insert(generation, to_hex(key).into());
         if generation >= f.active_generation {
             f.active_generation = generation;
         }
     }
 
-    /// Apply `f` to every stored key string.
     fn map_keys(&self, f: impl Fn(&str) -> Result<String>) -> Result<Self> {
         let mut out = self.clone();
         for keys in out.fleets.values_mut() {
             for value in keys.keys.values_mut() {
-                *value = f(value)?;
+                *value = f(value)?.into();
             }
         }
         Ok(out)
@@ -108,6 +133,39 @@ impl FleetKeyStore {
             .flat_map(|f| f.keys.values())
             .any(|v| dpapi::needs_protection(v))
     }
+}
+
+/// Lists generations, never key bytes (G2-47).
+impl std::fmt::Debug for FleetKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetKeys")
+            .field("keys", &self.keys.keys().collect::<Vec<_>>())
+            .field("credential_refs", &self.credential_refs)
+            .field("active_generation", &self.active_generation)
+            .field("verified", &self.verified)
+            .finish()
+    }
+}
+
+impl FleetKeys {
+    /// The key of `generation`: from the file while it is still there (the
+    /// newer copy), else from the credential store. A key that cannot be read
+    /// is treated as not held.
+    fn key(&self, generation: u64) -> Option<Zeroizing<[u8; 32]>> {
+        match (
+            self.keys.get(&generation),
+            self.credential_refs.get(&generation),
+        ) {
+            (Some(hex), _) => decode_key(hex).ok().map(Zeroizing::new),
+            (None, Some(reference)) => crate::credential::load(reference).ok(),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Hex-encode a key for storage.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn decode_key(h: &str) -> Result<[u8; 32]> {
@@ -133,85 +191,243 @@ pub fn load() -> Result<FleetKeyStore> {
     }
     let mut stored = read(&path)?;
     if stored.has_plaintext_keys() {
-        // Written before keys were protected; rewrite it now. Re-read under
-        // the lock: another load may have migrated it already. Best effort: on
-        // failure the file keeps the keys exactly as before.
+        // Written before keys were protected: rewrite it now. Re-read under
+        // the lock, since a save may have landed; best effort, so a failure
+        // leaves the file as it was.
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         stored = read(&path)?;
         if stored.has_plaintext_keys() {
-            let _ = write(&path, &stored);
+            let _ = write(&stored);
         }
     }
     stored.map_keys(|v| Ok(dpapi::reveal(v)))
 }
 
-/// Test-only: production writes this file only to migrate it in `load`.
-#[cfg(test)]
-pub fn save(s: &FleetKeyStore) -> Result<()> {
-    let path = store::fleet_keys_path()?;
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    write(&path, s)
-}
-
-/// The file as stored: keys still in their on-disk form.
+/// The file as stored: keys still in their on-disk form. A file that does
+/// not parse is an error, never an empty store, so no writer replaces the
+/// keys it may still hold.
 fn read(path: &std::path::Path) -> Result<FleetKeyStore> {
     let body = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&body).unwrap_or_default())
+    serde_json::from_str(&body).context(crate::errcode::code("sync.fleetKeyStoreUnreadable"))
 }
 
-/// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
-fn write(path: &std::path::Path, s: &FleetKeyStore) -> Result<()> {
-    let on_disk = s.map_keys(dpapi::conceal)?;
-    // Write-then-rename, flushed before the rename: a crash must not leave a
-    // file that reads back as "no keys" and strands the snapshots. std cannot
-    // flush the parent directory on Windows, so the rename itself is not
-    // fsynced there.
-    let tmp = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(serde_json::to_string_pretty(&on_disk)?.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    restrict(&tmp);
-    fs::rename(&tmp, path)?;
+/// Writes `s`, then moves its plaintext keys into the credential store. The
+/// keys are durable once written, so the move is best effort. Only the tests
+/// save a whole store; `collect` adds one key.
+#[cfg(test)]
+pub fn save(s: &FleetKeyStore) -> Result<()> {
+    {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        write(s)?;
+    }
+    if let Err(error) = protect() {
+        eprintln!("[fleet] fleet keys stay in fleet_keys.json: {error}");
+    }
     Ok(())
 }
 
-/// Restrict the file to its owner where the platform expresses that in mode
-/// bits. A best-effort call: failure to tighten permissions must not lose the
-/// key that was just collected.
-#[cfg(unix)]
-fn restrict(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+/// Keeps `key`, opened from a verified grant, as `generation` of `fleet_id`,
+/// marked `verified`. Returns false, and saves nothing, when the store
+/// already holds a different key for that generation, or one it cannot read
+/// (ADR 0002 trust chain, rule 5: `KEY_SUBSTITUTION_DETECTED`). Reads, checks
+/// and writes under one lock, and refuses a store that does not parse.
+pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> {
+    {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = store::fleet_keys_path()?;
+        let mut s = if path.exists() {
+            read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?
+        } else {
+            FleetKeyStore::default()
+        };
+        if let Some(f) = s.fleets.get(fleet_id) {
+            if f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation) {
+                return Ok(f.key(generation).is_some_and(|held| *held == *key));
+            }
+        }
+        s.insert(fleet_id, generation, key);
+        if let Some(f) = s.fleets.get_mut(fleet_id) {
+            f.verified.insert(generation);
+        }
+        write(&s)?;
+    }
+    if let Err(error) = protect() {
+        eprintln!("[fleet] fleet keys stay in fleet_keys.json: {error}");
+    }
+    Ok(true)
 }
 
-#[cfg(not(unix))]
-fn restrict(_path: &std::path::Path) {}
+/// Moves every plaintext key in the saved file into the OS credential store,
+/// and rewrites the file without the keys that read back. Returns whether
+/// any key moved.
+// shortcut: with no usable store and no open key file (ADR 0002, G2-48) the
+// keys stay in plaintext `fleet_keys.json`; opening the key file moves them.
+pub fn protect() -> Result<bool> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = store::fleet_keys_path()?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
+    let mut moved = false;
+    for (fleet_id, f) in &mut s.fleets {
+        for (generation, hex) in std::mem::take(&mut f.keys) {
+            let name = format!("fleet-key.{fleet_id}.{generation}");
+            let stored = decode_key(&hex)
+                .map(Zeroizing::new)
+                .is_ok_and(|key| crate::credential::store(&name, &key).is_ok());
+            if stored {
+                f.credential_refs.insert(generation, name);
+                moved = true;
+            } else {
+                f.keys.insert(generation, hex);
+            }
+        }
+    }
+    if moved {
+        write(&s)?;
+    }
+    Ok(moved)
+}
+
+/// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
+fn write(s: &FleetKeyStore) -> Result<()> {
+    let path = store::fleet_keys_path()?;
+    let on_disk = s.map_keys(dpapi::conceal)?;
+    // As with team.json: a crash mid-write must not leave a file that reads
+    // back as "no keys" and silently strands the snapshots.
+    crate::durable::write_private(&path, serde_json::to_string_pretty(&on_disk)?.as_bytes())?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Newer generations come first, and older ones stay readable.
+    /// Newer generations take over as active, and older ones stay readable.
     #[test]
-    fn a_newer_generation_comes_first_without_dropping_the_old_key() {
+    fn a_newer_generation_becomes_active_without_dropping_the_old_key() {
         let mut s = FleetKeyStore::default();
         s.insert("ab", 1, &[0x11u8; 32]);
         s.insert("ab", 2, &[0x22u8; 32]);
 
-        let all = s.keys_newest_first("ab");
+        let (key, gen) = s.active_key("ab").expect("active key");
+        assert_eq!(gen, 2, "newest generation must be active");
+        assert_eq!(key, [0x22u8; 32]);
+
+        let all = s.keys_newest_first("ab", |_, _| false);
         assert_eq!(all.len(), 2, "the older key must be kept for old snapshots");
-        assert_eq!(all[0], ([0x22u8; 32], 2), "newest first");
+        assert_eq!(all[0].1, 2, "newest first");
         assert_eq!(all[1].1, 1);
     }
 
-    /// A late-arriving older key must not demote the newest generation.
+    /// A late-arriving older grant must not demote the active generation.
     #[test]
-    fn an_older_key_does_not_demote_the_active_generation() {
+    fn collecting_an_older_grant_does_not_demote_the_active_generation() {
         let mut s = FleetKeyStore::default();
         s.insert("ab", 5, &[0x55u8; 32]);
         s.insert("ab", 3, &[0x33u8; 32]);
-        assert_eq!(s.fleets["ab"].active_generation, 5);
+        let (_k, gen) = s.active_key("ab").expect("active key");
+        assert_eq!(gen, 5, "an older grant must not become active");
+    }
+
+    /// A store that does not parse is refused by every reader and writer and
+    /// left byte for byte as it was, so no 2.4.2 key is lost.
+    #[test]
+    fn an_unparseable_store_is_never_overwritten() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let path = store::fleet_keys_path().unwrap();
+        let body = br#"{"fleets": {"ab": {"keys": {"1": "#;
+        fs::write(&path, body).unwrap();
+        let collected = collect("ab", 1, &[0x61; 32]);
+        let loaded = load();
+        let protected = protect();
+        let after = fs::read(&path).unwrap();
+        store::set_config_root(None);
+        assert!(collected.is_err());
+        assert!(loaded.is_err());
+        assert!(protected.is_err());
+        assert_eq!(after, body);
+    }
+
+    #[test]
+    fn saved_keys_move_to_the_credential_store_and_still_open() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "ef".repeat(16);
+        let mut s = FleetKeyStore::default();
+        s.insert(&fleet, 1, &[0x61; 32]);
+        s.insert(&fleet, 2, &[0x62; 32]);
+        crate::credential::fail_next_call(&format!("fleet-key.{fleet}.1"));
+        save(&s).unwrap();
+
+        // Generation 1 was refused by the store and stays in the file.
+        let saved = load().unwrap();
+        let body = fs::read_to_string(store::fleet_keys_path().unwrap()).unwrap();
+        assert!(!body.contains(&"62".repeat(32)), "{body}");
+        // On Windows the key left in the file is a DPAPI blob, never plaintext.
+        assert_eq!(body.contains(&"61".repeat(32)), !cfg!(windows), "{body}");
+        let f = &saved.fleets[&fleet];
+        assert_eq!(
+            f.keys.get(&1).map(|k| k.as_str()),
+            Some("61".repeat(32).as_str()),
+            "kept in the file"
+        );
+        assert_eq!(f.credential_refs.keys().collect::<Vec<_>>(), [&2]);
+        assert_eq!(saved.active_key(&fleet), Some(([0x62; 32], 2)));
+        let all = saved.keys_newest_first(&fleet, |_, _| false);
+        assert_eq!(all, [([0x62; 32], 2), ([0x61; 32], 1)]);
+
+        // The next save moves the rest; nothing is left to move after it.
+        save(&saved).unwrap();
+        let again = load().unwrap();
+        assert!(again.fleets[&fleet].keys.is_empty());
+        assert_eq!(again.keys_newest_first(&fleet, |_, _| false).len(), 2);
+        assert!(!protect().unwrap());
+
+        // A re-collected key in the file wins over its stored copy.
+        let mut fresh = again.clone();
+        fresh.insert(&fleet, 2, &[0x72; 32]);
+        assert_eq!(fresh.active_key(&fleet), Some(([0x72; 32], 2)));
+
+        // A key whose credential is gone is not held, rather than an error.
+        crate::credential::forget(&again.fleets[&fleet].credential_refs[&1]).unwrap();
+        assert_eq!(
+            load().unwrap().keys_newest_first(&fleet, |_, _| false),
+            [([0x62; 32], 2)]
+        );
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn debug_never_prints_a_key() {
+        let mut s = FleetKeyStore::default();
+        s.insert("ab", 1, &[0xc3; 32]);
+        let printed = format!("{s:?}");
+        assert!(!printed.contains("c3c3"), "{printed}");
+        assert!(printed.contains("active_generation: 1"), "{printed}");
+    }
+
+    /// A held key is wiped on drop (G2-47) and stored exactly as before.
+    #[test]
+    fn a_held_key_zeroizes_on_drop_and_serializes_as_before() {
+        let mut s = FleetKeyStore::default();
+        s.insert("ab", 1, &[0xc3; 32]);
+        let _: &dyn zeroize::ZeroizeOnDrop = &s.fleets["ab"].keys[&1];
+        let golden = format!(
+            r#"{{"fleets":{{"ab":{{"keys":{{"1":"{}"}},"credential_refs":{{}},"active_generation":1,"verified":[]}}}}}}"#,
+            "c3".repeat(32)
+        );
+        assert_eq!(serde_json::to_string(&s).unwrap(), golden);
+        let back: FleetKeyStore = serde_json::from_str(&golden).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), golden);
     }
 
     /// A fleet this device holds nothing for yields nothing, rather than a
@@ -219,94 +435,40 @@ mod tests {
     #[test]
     fn an_unknown_fleet_has_no_key() {
         let s = FleetKeyStore::default();
-        assert!(s.keys_newest_first("nope").is_empty());
+        assert!(s.active_key("nope").is_none());
+        assert!(s.keys_newest_first("nope", |_, _| false).is_empty());
     }
 
-    #[test]
-    fn debug_output_carries_no_key() {
-        let mut s = FleetKeyStore::default();
-        s.insert("ab", 1, &[0x5Au8; 32]);
-        let shown = format!("{s:?}");
-        assert!(
-            !shown.contains(&"5a".repeat(32)),
-            "Debug leaked a key: {shown}"
-        );
-        assert!(shown.contains("ab"), "the fleet id is not secret");
-    }
-
-    /// Concurrent loads and saves (two pulls at once) must all succeed, each
-    /// see the key, and leave a file that still holds it.
+    /// A key the store refused stays in the file DPAPI-protected, still opens,
+    /// and moves out on a later pass.
     #[cfg(windows)]
     #[test]
-    fn concurrent_migrations_never_lose_the_key() {
-        let _lock = store::config_root_test_lock()
+    fn a_key_left_in_the_file_is_dpapi_protected_and_moves_later() {
+        let _guard = store::config_root_test_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         store::set_config_root(Some(dir.path().to_path_buf()));
-        let path = store::fleet_keys_path().unwrap();
+        let fleet = "ef".repeat(16);
         let mut s = FleetKeyStore::default();
-        s.insert("ab", 1, &[0x5Au8; 32]);
-        let plaintext = serde_json::to_string(&s).unwrap();
-
-        let mut lost = 0;
-        for _ in 0..40 {
-            fs::write(&path, &plaintext).unwrap();
-            let threads: Vec<_> = (0..8)
-                .map(|i| {
-                    // Half the threads also save: saves share the temp file.
-                    let s = s.clone();
-                    std::thread::spawn(move || {
-                        (0..4).all(|_| {
-                            let saved = i % 2 == 1 || save(&s).is_ok();
-                            saved && load().is_ok_and(|s| !s.keys_newest_first("ab").is_empty())
-                        })
-                    })
-                })
-                .collect();
-            for t in threads {
-                if !t.join().unwrap() {
-                    lost += 1;
-                }
-            }
-            if load().unwrap().keys_newest_first("ab").is_empty() {
-                lost += 1;
-            }
-        }
-        store::set_config_root(None);
-        assert_eq!(
-            lost, 0,
-            "a concurrent migration lost the key {lost} time(s)"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn keys_are_dpapi_protected_and_a_plaintext_file_migrates() {
-        let _lock = store::config_root_test_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        store::set_config_root(Some(dir.path().to_path_buf()));
-        let path = store::fleet_keys_path().unwrap();
-
-        let mut s = FleetKeyStore::default();
-        s.insert("ab", 1, &[0x5Au8; 32]);
-        let key_hex = "5a".repeat(32);
-        // A file as earlier versions wrote it: plaintext hex.
-        fs::write(&path, serde_json::to_string(&s).unwrap()).unwrap();
-
-        let loaded = load().unwrap();
-        let migrated = fs::read_to_string(&path).unwrap();
-        let reloaded = load().unwrap();
+        s.insert(&fleet, 1, &[0x5A; 32]);
+        crate::credential::fail_next_call(&format!("fleet-key.{fleet}.1"));
         save(&s).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
+        let path = store::fleet_keys_path().unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        let held = load().unwrap().keys_newest_first(&fleet, |_, _| false);
+        let moved = protect().unwrap();
+        let second = fs::read_to_string(&path).unwrap();
+        let after = load().unwrap().keys_newest_first(&fleet, |_, _| false);
         store::set_config_root(None);
 
-        assert_eq!(loaded.keys_newest_first("ab"), vec![([0x5Au8; 32], 1)]);
-        assert!(!migrated.contains(&key_hex), "{migrated}");
-        assert!(migrated.contains("dpapi:"), "{migrated}");
-        assert_eq!(reloaded.keys_newest_first("ab"), vec![([0x5Au8; 32], 1)]);
-        assert!(!saved.contains(&key_hex), "{saved}");
+        assert!(
+            first.contains("dpapi:") && !first.contains(&"5a".repeat(32)),
+            "{first}"
+        );
+        assert_eq!(held, vec![([0x5A; 32], 1)]);
+        assert!(moved);
+        assert!(!second.contains("dpapi:"), "{second}");
+        assert_eq!(after, vec![([0x5A; 32], 1)]);
     }
 }

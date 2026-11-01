@@ -217,18 +217,44 @@ pub fn restore(src: &Path, udd: &Path, passphrase: &str) -> Result<u64> {
 /// This is `restore` without the file read, for containers that arrived from a
 /// team server rather than from disk. Authentication and staging are identical.
 pub fn open_profile(bytes: &[u8], udd: &Path, passphrase: &str) -> Result<u64> {
-    let (salt, vk, body) = split_container(bytes, FILE_MAGIC)?;
-    let fkek = derive_backup_fkek(passphrase, &salt).map_err(|e| anyhow!("{e}"))?;
-    open_body(body, udd, &fkek, &vk)
+    open_passphrase(bytes, udd, passphrase, None)
 }
 
-/// Open a container sealed under a fleet key.
+/// `open_profile` for a container that must have been sealed for
+/// `profile_id`, such as one a team server returned for that profile.
+pub fn open_profile_for(
+    bytes: &[u8],
+    udd: &Path,
+    passphrase: &str,
+    profile_id: &str,
+) -> Result<u64> {
+    open_passphrase(bytes, udd, passphrase, Some(profile_id))
+}
+
+fn open_passphrase(
+    bytes: &[u8],
+    udd: &Path,
+    passphrase: &str,
+    profile_id: Option<&str>,
+) -> Result<u64> {
+    let (salt, vk, body) = split_container(bytes, FILE_MAGIC)?;
+    let fkek = derive_backup_fkek(passphrase, &salt).map_err(|e| anyhow!("{e}"))?;
+    open_body(body, udd, &fkek, &vk, profile_id)
+}
+
+/// Open a container sealed under a fleet key for `profile_id`.
 ///
 /// Used for profile sync, where the key comes from a fleet key grant rather
-/// than from a passphrase the user typed.
-pub fn open_profile_with_fkek(bytes: &[u8], udd: &Path, fkek: &[u8; 32]) -> Result<u64> {
+/// than from a passphrase the user typed. The server chooses which bytes to
+/// return, so a container sealed for any other profile is refused.
+pub fn open_profile_with_fkek(
+    bytes: &[u8],
+    udd: &Path,
+    fkek: &[u8; 32],
+    profile_id: &str,
+) -> Result<u64> {
     let (_salt, vk, body) = split_container(bytes, FLEET_FILE_MAGIC)?;
-    open_body(body, udd, fkek, &vk)
+    open_body(body, udd, fkek, &vk, Some(profile_id))
 }
 
 /// Split a container into its salt, signer key and sealed body, checking the
@@ -258,8 +284,15 @@ fn split_container<'a>(
     Ok((salt, vk, &bytes[header_len..]))
 }
 
-/// Decrypt a sealed body into `udd`.
-fn open_body(body: &[u8], udd: &Path, fkek: &[u8; 32], vk: &[u8; 32]) -> Result<u64> {
+/// Decrypt a sealed body into `udd`, refusing it first if it was sealed for a
+/// profile other than `profile_id`.
+fn open_body(
+    body: &[u8],
+    udd: &Path,
+    fkek: &[u8; 32],
+    vk: &[u8; 32],
+    profile_id: Option<&str>,
+) -> Result<u64> {
     let fkek = *fkek;
     let vk = *vk;
 
@@ -267,7 +300,7 @@ fn open_body(body: &[u8], udd: &Path, fkek: &[u8; 32], vk: &[u8; 32]) -> Result<
     // before it detects truncation, so nothing may touch the profile until
     // this returns Ok.
     let mut plaintext = Vec::new();
-    backup::open(
+    let opened = backup::open(
         &mut Cursor::new(body),
         &mut plaintext,
         &fkek,
@@ -276,6 +309,11 @@ fn open_body(body: &[u8], udd: &Path, fkek: &[u8; 32], vk: &[u8; 32]) -> Result<
     .map_err(|e| {
         anyhow!("could not open backup — wrong passphrase, or the file is damaged: {e}")
     })?;
+    if let Some(p) = profile_id {
+        if opened.profile_id != local_id(p, "profile") {
+            bail!("this snapshot was sealed for another profile — refusing to restore it");
+        }
+    }
 
     snapshot::unpack(&plaintext, udd).context("restore profile from backup")?;
     Ok(plaintext.len() as u64)
@@ -351,7 +389,7 @@ mod tests {
 
         let fkek = [0x31u8; 32];
         let sealed = seal_profile_with_fkek("p1", &src, &fkek).expect("seal");
-        open_profile_with_fkek(&sealed.bytes, &dst, &fkek).expect("open");
+        open_profile_with_fkek(&sealed.bytes, &dst, &fkek, "p1").expect("open");
 
         let restored = fs::read(dst.join("Default").join("Preferences")).expect("read");
         assert_eq!(restored, b"{\"k\":1}", "restored profile must match");
@@ -369,7 +407,7 @@ mod tests {
         sample_profile(&src);
 
         let sealed = seal_profile_with_fkek("p1", &src, &[0x31u8; 32]).expect("seal");
-        let err = open_profile_with_fkek(&sealed.bytes, &dst, &[0x32u8; 32]);
+        let err = open_profile_with_fkek(&sealed.bytes, &dst, &[0x32u8; 32], "p1");
         assert!(
             err.is_err(),
             "a foreign fleet key must not open the snapshot"
@@ -388,7 +426,7 @@ mod tests {
         sample_profile(&src);
 
         let by_passphrase = seal_profile("p1", &src, "correct horse").expect("seal");
-        let err = open_profile_with_fkek(&by_passphrase.bytes, &dst, &[0x31u8; 32])
+        let err = open_profile_with_fkek(&by_passphrase.bytes, &dst, &[0x31u8; 32], "p1")
             .expect_err("must refuse");
         assert!(
             err.to_string().contains("passphrase-sealed"),
@@ -401,6 +439,33 @@ mod tests {
             err.to_string().contains("fleet key"),
             "error should name the actual problem, got: {err}"
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A server that returns another profile's genuine snapshot, under the
+    /// same fleet key or passphrase, is caught before the profile is touched.
+    #[test]
+    fn a_snapshot_sealed_for_another_profile_is_refused() {
+        let tmp = std::env::temp_dir().join(format!("shx-fleet-swap-{}", std::process::id()));
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        let _ = fs::remove_dir_all(&tmp);
+        sample_profile(&src);
+        let fkek = [0x31u8; 32];
+
+        let other = seal_profile_with_fkek("p2", &src, &fkek).expect("seal");
+        let err = open_profile_with_fkek(&other.bytes, &dst, &fkek, "p1").expect_err("swap");
+        assert!(err.to_string().contains("another profile"), "{err}");
+        assert!(
+            !dst.exists(),
+            "nothing may be restored from a swapped snapshot"
+        );
+
+        let other = seal_profile("p2", &src, "correct horse").expect("seal");
+        let err = open_profile_for(&other.bytes, &dst, "correct horse", "p1").expect_err("swap");
+        assert!(err.to_string().contains("another profile"), "{err}");
+        assert!(!dst.exists());
+        open_profile_for(&other.bytes, &dst, "correct horse", "p2").expect("own profile");
         let _ = fs::remove_dir_all(&tmp);
     }
 }

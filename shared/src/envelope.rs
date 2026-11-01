@@ -28,7 +28,8 @@ use chacha20poly1305::ChaCha20Poly1305;
 
 use crate::canonical::{self as c, Value};
 use crate::keys::{
-    wrap_dek, KeyError, DEK_LEN, ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
+    wrap_dek, KeyError, ARCHIVE_FORMAT_ID_TAR, ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT,
+    COMPRESSION_ID_GZIP, DEK_LEN, ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
     STREAM_NONCE_PREFIX_LEN, WRAP_NONCE_LEN, WRAP_SUITE_ID_CHACHA20POLY1305,
 };
 
@@ -147,6 +148,8 @@ pub enum IntentError {
     NonSequentialVersion { base: u64, target: u64 },
     /// `previous_signed_head_hash` is omitted (never null) iff `base_version == 0`.
     GenesisHeadMismatch { base_version: u64, has_prev: bool },
+    /// A size field outside the plan's bounds (L649-L652).
+    OutOfBounds(&'static str),
 }
 
 impl std::fmt::Display for IntentError {
@@ -163,6 +166,7 @@ impl std::fmt::Display for IntentError {
                 f,
                 "previous_signed_head_hash presence ({has_prev}) contradicts base_version ({base_version})"
             ),
+            Self::OutOfBounds(field) => write!(f, "{field} is outside its bounds"),
         }
     }
 }
@@ -177,6 +181,26 @@ pub fn build_envelope_intent(
     ids: &IntentIds,
     nums: &IntentNumbers,
     stream_nonce_prefix: &[u8; STREAM_NONCE_PREFIX_LEN],
+    previous_signed_head_hash: Option<&[u8; 32]>,
+    slot: &SlotMaterial,
+) -> Result<IntentMaterial, IntentError> {
+    build_intent(
+        ids,
+        nums,
+        ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM,
+        stream_nonce_prefix,
+        previous_signed_head_hash,
+        slot,
+    )
+}
+
+/// The intent for any envelope suite: the suite ID and its nonce prefix are
+/// the only fields that differ (`envelope_v2` builds suite 2 with this).
+pub(crate) fn build_intent(
+    ids: &IntentIds,
+    nums: &IntentNumbers,
+    envelope_suite_id: u16,
+    stream_nonce_prefix: &[u8],
     previous_signed_head_hash: Option<&[u8; 32]>,
     slot: &SlotMaterial,
 ) -> Result<IntentMaterial, IntentError> {
@@ -209,14 +233,14 @@ pub fn build_envelope_intent(
         ("key_generation", c::u(nums.key_generation)),
         ("fkek_key_id", c::b(&ids.fkek_key_id)),
         ("preamble_version", c::u(2)),
-        (
-            "envelope_suite_id",
-            c::u(ENVELOPE_SUITE_ID_CHACHA20POLY1305_STREAM as u64),
-        ),
+        ("envelope_suite_id", c::u(envelope_suite_id as u64)),
         ("wrap_suite_id", c::u(WRAP_SUITE_ID_CHACHA20POLY1305 as u64)),
-        ("archive_format_id", c::u(1)),
-        ("archive_policy_id", c::u(1)),
-        ("compression_id", c::u(1)),
+        ("archive_format_id", c::u(ARCHIVE_FORMAT_ID_TAR as u64)),
+        (
+            "archive_policy_id",
+            c::u(ARCHIVE_POLICY_ID_PROFILE_SNAPSHOT as u64),
+        ),
+        ("compression_id", c::u(COMPRESSION_ID_GZIP as u64)),
         (
             "frame_plaintext_size",
             c::u(nums.frame_plaintext_size as u64),
@@ -327,7 +351,10 @@ pub fn restore_epoch_leaf_bytes(
     new_signed_head_hash: &[u8; 32],
 ) -> Vec<u8> {
     c::encode(&c::m(vec![
-        ("domain", c::t("shardx.restore-epoch.profile-head-leaf.v2")),
+        (
+            "domain",
+            c::t(crate::restore_epoch::DOMAIN_RESTORE_EPOCH_LEAF),
+        ),
         ("version", c::u(2)),
         ("tenant_id", c::b(tenant_id)),
         ("profile_id", c::b(profile_id)),
@@ -377,6 +404,14 @@ pub enum MerkleError {
     DuplicateTuple,
     /// Leaves must be in ascending raw tuple order.
     UnsortedLeaves,
+    /// A leaf belongs to another tenant than the transition.
+    ForeignTenant,
+    /// A leaf restores no previous head (L676).
+    ZeroPreviousHead,
+    /// The leaf index is outside the set.
+    IndexOutOfRange,
+    /// The set is not the one the transition commits to.
+    NotTheTransition,
 }
 
 impl std::fmt::Display for MerkleError {
@@ -386,6 +421,10 @@ impl std::fmt::Display for MerkleError {
             Self::TooManyLeaves(n) => write!(f, "too many leaves: {n}"),
             Self::DuplicateTuple => write!(f, "duplicate (tenant_id, profile_id) leaf"),
             Self::UnsortedLeaves => write!(f, "leaves are not in ascending tuple order"),
+            Self::ForeignTenant => write!(f, "a leaf belongs to another tenant"),
+            Self::ZeroPreviousHead => write!(f, "a leaf has no previous head"),
+            Self::IndexOutOfRange => write!(f, "leaf index is outside the set"),
+            Self::NotTheTransition => write!(f, "leaf set is not the transition's"),
         }
     }
 }
