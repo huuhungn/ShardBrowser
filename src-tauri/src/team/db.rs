@@ -30,7 +30,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -1216,6 +1216,55 @@ UPDATE schema_meta SET schema_version = 6, min_reader_version = 6,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 6 to 7 (G2-64 B1, B2): what each key held and what each fleet
+/// activation binds, so the Q-18 commit block derives exposure through the
+/// root and never forgets one (ADR 0002 C-1). A version 6 reader would block
+/// less, so 7 is also the minimum reader. `ledger::backfill_holdings` files
+/// the holdings of the evidence already kept.
+const MIGRATE_V7: &str = r#"
+-- C-1: a key holds a root generation (fleet_id '') or a fleet generation
+-- when a container this device evaluated shows it issued or received it.
+CREATE TABLE trust_key_holdings (
+  server_instance_id    TEXT NOT NULL,
+  tenant_id             TEXT NOT NULL,
+  signing_key_id        TEXT NOT NULL CHECK (length(signing_key_id) = 64 AND signing_key_id NOT GLOB '*[^0-9a-f]*'),
+  fleet_id              TEXT NOT NULL CHECK (fleet_id = '' OR (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*')),
+  generation            INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  first_seen_evaluation INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  PRIMARY KEY(server_instance_id, tenant_id, signing_key_id, fleet_id, generation),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
+) STRICT;
+
+-- C-1's root clause: the root generation of the RecoveryGrant a verified
+-- RotationGrant binds for a fleet generation and key, the lowest seen.
+CREATE TABLE trust_fleet_activations (
+  server_instance_id        TEXT NOT NULL,
+  tenant_id                 TEXT NOT NULL,
+  fleet_id                  TEXT NOT NULL CHECK (length(fleet_id) = 32 AND fleet_id NOT GLOB '*[^0-9a-f]*'),
+  generation                INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
+  fkek_key_id               TEXT NOT NULL CHECK (length(fkek_key_id) = 64 AND fkek_key_id NOT GLOB '*[^0-9a-f]*'),
+  recipient_root_generation INTEGER NOT NULL CHECK (recipient_root_generation BETWEEN 0 AND 9223372036854775807),
+  first_seen_evaluation     INTEGER NOT NULL REFERENCES trust_evaluations(evaluation_id) ON DELETE RESTRICT,
+  PRIMARY KEY(server_instance_id, tenant_id, fleet_id, generation, fkek_key_id),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER trust_key_holdings_kept BEFORE DELETE ON trust_key_holdings
+BEGIN SELECT RAISE(ABORT, 'an exposure is never forgotten'); END;
+CREATE TRIGGER trust_key_holdings_fixed BEFORE UPDATE ON trust_key_holdings
+BEGIN SELECT RAISE(ABORT, 'an exposure never changes'); END;
+CREATE TRIGGER trust_fleet_activations_kept BEFORE DELETE ON trust_fleet_activations
+BEGIN SELECT RAISE(ABORT, 'an activation is never forgotten'); END;
+CREATE TRIGGER trust_fleet_activations_lower BEFORE UPDATE ON trust_fleet_activations
+WHEN NEW.recipient_root_generation > OLD.recipient_root_generation
+  OR NEW.first_seen_evaluation IS NOT OLD.first_seen_evaluation
+BEGIN SELECT RAISE(ABORT, 'a bound root generation only moves lower'); END;
+UPDATE schema_meta SET schema_version = 7, min_reader_version = 7,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -1282,6 +1331,10 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(5, 5, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V6).with_context(unreadable)?;
         }
+        if matches!(meta(&tx).as_deref(), Ok([(6, 6, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V7).with_context(unreadable)?;
+            super::ledger::backfill_holdings(&tx).with_context(unreadable)?;
+        }
         if from.is_some_and(|v| v < SCHEMA_VERSION) {
             let broken: i64 = tx
                 .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1334,7 +1387,7 @@ pub(crate) mod fixtures {
              INSERT OR IGNORE INTO trust_evaluations VALUES (1, '{i}', '{t}', 0);
              INSERT OR IGNORE INTO trust_fleet_generations VALUES ('{i}', '{t}', '{f}', 1);
              INSERT OR IGNORE INTO trust_fleet_key_grants
-               VALUES ('{i}', '{t}', '{f}', 1, '{fkek}', 1, x'ab', x'00');
+               VALUES ('{i}', '{t}', '{f}', 1, '{fkek}', 1, x'ab', x'80');
              INSERT OR IGNORE INTO signed_authorization_records(record_id, server_id, tenant_id,
                record_kind, container_domain, container_version, payload_domain, payload_version,
                replay_id, subject_account_id, subject_device_id, subject_signing_key_id,
@@ -1443,7 +1496,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (6, 6, "CLEAN".into()));
+        assert_eq!(meta, (7, 7, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -1463,8 +1516,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 7",
-            "UPDATE schema_meta SET min_reader_version = 7",
+            "UPDATE schema_meta SET schema_version = 8",
+            "UPDATE schema_meta SET min_reader_version = 8",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -1516,7 +1569,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(6, 6, "CLEAN".to_string())]);
+            assert_eq!(rows, [(7, 7, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -1549,7 +1602,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -1599,7 +1652,7 @@ mod tests {
         drop(v3(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("profile_bindings", 0),
                 ("server_origins", 0),
@@ -1824,7 +1877,7 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
             let kept: Vec<u8> = db
                 .conn
                 .query_row(
@@ -2196,7 +2249,7 @@ mod tests {
         }
         for round in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(6, 6, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
             for (table, cols, rows) in &had {
                 assert_eq!(&dump(&db.conn, table, cols), rows, "{table} round {round}");
             }

@@ -32,6 +32,10 @@
 //! - **Fleet key grants** (G2-35): the exact grant behind each collected
 //!   fleet key and the pages it verified against, so sync pull reverifies it
 //!   before each use ([`fleet_key_grant`], [`withdrawn`]).
+//! - **Holdings and activations** (C-1, Q-18): every root or fleet
+//!   generation any evaluated evidence showed a key holding, and the root
+//!   generation each verified fleet activation binds, so the commit block
+//!   never forgets an exposure ([`holdings`], [`commit_blocked`]).
 //!
 //! Not here yet: the custodian change events of D-6 (a), whose wording and
 //! acknowledgement follow the Q-17 UX review.
@@ -435,17 +439,193 @@ pub fn fleet_key_grant(
     Ok(Some((container, pages)))
 }
 
+/// A key's hold on a generation (ADR 0002 C-1): a root generation (`None`),
+/// or a generation of the fleet named.
+pub(crate) type Holding = ([u8; 32], Option<[u8; 16]>, u64);
+
+/// C-1 "exposed": every key that a container of `binding` in `pages`, signed
+/// by a key the pages list, shows holding a generation. Issuer and subject
+/// of a `DeviceHpkeGrant` or root grant hold its generation; the issuer of a
+/// `RecoveryGrant` holds its fleet generation and the root generation it is
+/// wrapped under; the issuer of a fleet `RotationGrant` holds its generation.
+/// Whoever issues a key-carrying grant holds the key.
+pub(crate) fn holdings(
+    binding: &Binding,
+    pages: &[TenantTrustEvidencePageV2],
+) -> std::collections::BTreeSet<Holding> {
+    let keys = keys_of(pages);
+    let mut out = std::collections::BTreeSet::new();
+    for c in pages.iter().flat_map(|p| &p.containers) {
+        let Ok(r) = AuthorizationRecord::parse(c) else {
+            continue;
+        };
+        let issuer = *r.issuer_signing_key_id();
+        let Some(Ok(v)) = keys.get(&issuer).map(|pk| r.verify_signature(pk)) else {
+            continue;
+        };
+        let p = v.payload();
+        if p.common().tenant_id != binding.tenant_id
+            || p.common().server_instance_id != binding.server_instance_id
+        {
+            continue;
+        }
+        match p {
+            Payload::DeviceHpkeGrant(g) => {
+                out.insert((issuer, Some(g.fleet_id), g.generation));
+                out.insert((g.subject_signing_key_id, Some(g.fleet_id), g.generation));
+            }
+            Payload::RecoveryGrant(g) => {
+                out.insert((issuer, Some(g.fleet_id), g.generation));
+                out.insert((issuer, None, g.recipient_root_generation));
+            }
+            Payload::RotationGrant(g) => {
+                out.insert((issuer, Some(g.fleet_id), g.generation));
+            }
+            Payload::TenantRootKeyGrant(g) => {
+                out.insert((issuer, None, g.root_generation));
+                out.insert((g.subject_signing_key_id, None, g.root_generation));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// C-1's client test for the root clause: for each fleet `RotationGrant` in
+/// `seen` signed by a custodian holding `key.rotate` over its fleet when it
+/// was issued, the fleet, generation and key it activates and the root
+/// generation of the `RecoveryGrant` it binds by hash, when that grant is in
+/// `seen` and names the same fleet, generation and key.
+fn activations(
+    chain: &TrustChain,
+    binding: &Binding,
+    seen: &[TenantTrustEvidencePageV2],
+) -> Vec<([u8; 16], u64, [u8; 32], u64)> {
+    let keys = keys_of(seen);
+    let mut recoveries = BTreeMap::new();
+    let mut rotations = Vec::new();
+    for c in seen.iter().flat_map(|p| &p.containers) {
+        let Ok(r) = AuthorizationRecord::parse(c) else {
+            continue;
+        };
+        let (issuer, hash) = (*r.issuer_signing_key_id(), *r.signed_container_hash());
+        let Some(Ok(v)) = keys.get(&issuer).map(|pk| r.verify_signature(pk)) else {
+            continue;
+        };
+        let common = v.payload().common();
+        if common.tenant_id != binding.tenant_id
+            || common.server_instance_id != binding.server_instance_id
+        {
+            continue;
+        }
+        match v.payload() {
+            Payload::RecoveryGrant(g) => {
+                recoveries.insert(hash, g.clone());
+            }
+            Payload::RotationGrant(g) => rotations.push((issuer, g.clone())),
+            _ => {}
+        }
+    }
+    rotations
+        .into_iter()
+        .filter(|(issuer, g)| {
+            let t = g.common.issued_at_ms;
+            chain.custodian_at(issuer, t)
+                && chain.capability_at(issuer, Capability::KeyRotate, Scope::Fleet(g.fleet_id), t)
+        })
+        .filter_map(|(_, g)| {
+            let r = recoveries.get(&g.recovery_grant_signed_container_hash)?;
+            (r.fleet_id == g.fleet_id
+                && r.generation == g.generation
+                && r.fkek_key_id == g.fkek_key_id)
+                .then_some((
+                    g.fleet_id,
+                    g.generation,
+                    g.fkek_key_id,
+                    r.recipient_root_generation,
+                ))
+        })
+        .collect()
+}
+
+/// Files `held` as first seen in `evaluation`; a holding already filed keeps
+/// its first evaluation.
+fn file_holdings(
+    tx: &rusqlite::Connection,
+    binding: &Binding,
+    held: &std::collections::BTreeSet<Holding>,
+    evaluation: i64,
+) -> Result<()> {
+    let (instance, tenant) = ids(binding);
+    for (key, fleet, generation) in held {
+        // A generation past i64::MAX names no key a commit can use.
+        let Ok(generation) = wire(*generation) else {
+            continue;
+        };
+        tx.execute(
+            "INSERT INTO trust_key_holdings VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
+            params![
+                instance,
+                tenant,
+                hex(key),
+                fleet.map(|f| hex(&f)).unwrap_or_default(),
+                generation,
+                evaluation
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Version 7 (G2-64 B2): the holdings of the evidence each kept fleet grant
+/// verified against, as first seen in that grant's evaluation. What earlier
+/// evidence held and a later collection replaced is gone; activations need
+/// the trust chain, so each fleet stays flagged until it is collected again.
+pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
+    let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
+    let rows: Vec<(String, String, i64, Vec<u8>)> = tx
+        .prepare(
+            "SELECT server_instance_id, tenant_id, verified_evaluation, evidence_pages
+             FROM trust_fleet_key_grants",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (instance, tenant, evaluation, pages) in rows {
+        let binding = Binding {
+            server_instance_id: decode_hex16(&instance, "server_instance_id")?,
+            tenant_id: decode_hex16(&tenant, "tenant_id")?,
+        };
+        let Ok(Value::Array(items)) = decode(&pages) else {
+            return Err(unreadable());
+        };
+        let pages = items
+            .into_iter()
+            .map(|item| match item {
+                Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).map_err(|_| unreadable()),
+                _ => Err(unreadable()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        file_holdings(tx, &binding, &holdings(&binding, &pages), evaluation)?;
+    }
+    Ok(())
+}
+
 /// ADR 0002 Q-18: whether this device refuses to commit under `generation`
 /// of `fleet_id` because a counted `DeviceRevocationV2` with reason
-/// `compromised` exposes it. Exposed means the kept evidence of the
-/// generation shows a `DeviceHpkeGrant` of it to, or issued by, the revoked
-/// key, or this device verified the generation no later than it counted the
-/// revocation, so a newer, unexposed generation is not yet ACTIVE here
-/// (missing evidence counts as flagged, C-1). A revocation whose reason this
-/// device cannot verify counts as `compromised`.
-// shortcut: the fleet flagged through the root (a RecoveryGrant under an
-// exposed root generation, C-1) is not derived; add it with the root
-// rotation banner (Q-20).
+/// `compromised` exposes it (C-1). Exposed means any of:
+///
+/// - this device verified the generation no later than it counted the
+///   revocation, so a newer, unexposed generation is not yet ACTIVE here;
+/// - the revoked key holds the generation, in any evidence this device ever
+///   evaluated ([`holdings`]; an exposure is never forgotten);
+/// - the root clause: the revoked key holds the root generation the
+///   generation's activation evidence binds, or any root generation above it,
+///   PREPARING included. Generation 0 has no `RotationGrant`, so its range
+///   starts at the first root generation. Missing activation evidence counts
+///   as flagged.
+///
+/// A revocation whose reason this device cannot verify counts as
+/// `compromised`.
 pub fn commit_blocked(
     db: &Db,
     binding: &Binding,
@@ -457,22 +637,33 @@ pub fn commit_blocked(
     let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
     let (instance, tenant) = ids(binding);
     let kept = fleet_key_grant(db, binding, anchor, fleet_id, generation)?;
-    let verified: Option<i64> = db
+    let row: Option<(i64, String)> = db
         .conn
         .query_row(
-            "SELECT verified_evaluation FROM trust_fleet_key_grants
+            "SELECT verified_evaluation, fkek_key_id FROM trust_fleet_key_grants
              WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3 AND generation = ?4",
             params![instance, tenant, hex(fleet_id), wire(generation)?],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let bound: Option<i64> = match (&row, generation) {
+        (_, 0) => Some(0),
+        (None, _) => None,
+        (Some((_, fkek)), _) => db.conn.query_row(
+            "SELECT min(recipient_root_generation) FROM trust_fleet_activations
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+               AND generation = ?4 AND fkek_key_id = ?5",
+            params![instance, tenant, hex(fleet_id), wire(generation)?, fkek],
+            |r| r.get(0),
+        )?,
+    };
+    let verified = row.map(|(v, _)| v);
     let pages = kept.map(|(_, pages)| pages).unwrap_or_default();
     let keys = keys_of(&pages);
     let payload = |c: &[u8]| {
         let r = AuthorizationRecord::parse(c).ok()?;
         let pk = keys.get(r.issuer_signing_key_id())?;
-        let issuer = *r.issuer_signing_key_id();
-        Some((issuer, r.verify_signature(pk).ok()?.payload().clone()))
+        Some(r.verify_signature(pk).ok()?.payload().clone())
     };
     let mut s = db.conn.prepare(
         "SELECT signing_key_id, counted_evaluation, exact_signed_container_bytes
@@ -494,7 +685,7 @@ pub fn commit_blocked(
             return Err(unreadable());
         }
         match payload(&container) {
-            Some((_, Payload::DeviceRevocation(d))) => {
+            Some(Payload::DeviceRevocation(d)) => {
                 if d.subject_signing_key_id != key
                     || d.common.server_instance_id != binding.server_instance_id
                     || d.common.tenant_id != binding.tenant_id
@@ -511,12 +702,24 @@ pub fn commit_blocked(
         if verified.is_none_or(|v| v <= counted) {
             return Ok(true);
         }
-        let exposes = pages.iter().flat_map(|p| &p.containers).any(|c| {
-            matches!(payload(c), Some((issuer, Payload::DeviceHpkeGrant(g)))
-                if g.fleet_id == *fleet_id && g.generation == generation
-                    && (issuer == key || g.subject_signing_key_id == key))
-        });
-        if exposes {
+        let Some(bound) = bound else {
+            return Ok(true);
+        };
+        let held: bool = db.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM trust_key_holdings
+               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+                 AND ((fleet_id = ?4 AND generation = ?5) OR (fleet_id = '' AND generation >= ?6)))",
+            params![
+                instance,
+                tenant,
+                hex(&key),
+                hex(fleet_id),
+                wire(generation)?,
+                bound
+            ],
+            |r| r.get(0),
+        )?;
+        if held {
             return Ok(true);
         }
     }
@@ -593,6 +796,28 @@ pub fn record_in(
                 params![instance, tenant, hex(&revoked), evaluation, wire(now)?, c],
             )?;
         }
+    }
+    file_holdings(tx, binding, &holdings(binding, seen), evaluation)?;
+    for (fleet, generation, fkek, root) in activations(chain, binding, seen) {
+        let (Ok(generation), Ok(root)) = (wire(generation), wire(root)) else {
+            continue;
+        };
+        // The lowest bound root generation seen: a lower one only widens the
+        // range the root clause checks.
+        tx.execute(
+            "INSERT INTO trust_fleet_activations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT DO UPDATE SET recipient_root_generation =
+               min(recipient_root_generation, excluded.recipient_root_generation)",
+            params![
+                instance,
+                tenant,
+                hex(&fleet),
+                generation,
+                hex(&fkek),
+                root,
+                evaluation
+            ],
+        )?;
     }
     for r in seen.iter().flat_map(|p| &p.revocations) {
         // A time past i64::MAX revokes nothing before the year 292 million.
@@ -924,6 +1149,138 @@ mod tests {
         let unverifiable = signed_by(&d, 10, L - 1);
         let kept = prepare(&db, &B, &[page(&[&x], vec![unverifiable.clone()])]).unwrap();
         assert_eq!(kept[0].containers, [unverifiable]);
+    }
+
+    /// C-1 "exposed", the issuer clause included: whoever issues or receives
+    /// a key-carrying grant holds its generation, the issuer of a
+    /// `RecoveryGrant` also holds the root generation it is wrapped under, and
+    /// a root `RotationGrant`'s issuer holds the new root. Containers signed
+    /// by a key the pages do not list, or of another tenant, show nothing.
+    #[test]
+    fn holdings_name_every_issuer_and_subject_of_a_key_carrying_grant() {
+        let (d, e) = (
+            Ed25519SigningKey::from_bytes(&[2; 32]),
+            Ed25519SigningKey::from_bytes(&[3; 32]),
+        );
+        let fleet = [4; 16];
+        let rotation = TenantRootKeyGrantV2 {
+            common: common(1, L),
+            variant: RootGrantVariant::RotationGrant {
+                previous_root_key_id: [8; 32],
+                previous_root_generation: 0,
+            },
+            root_key_id: [9; 32],
+            root_generation: 1,
+            subject_account_id: [6; 16],
+            subject_device_id: [7; 16],
+            subject_signing_key_id: id(&e),
+            recipient_hpke_key_id: [9; 32],
+            subject_device_approval_replay_id: [5; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let recovery = RecoveryGrantV2 {
+            common: common(2, L),
+            fleet_id: fleet,
+            fkek_key_id: [0x5a; 32],
+            generation: 3,
+            recipient_root_key_id: [9; 32],
+            recipient_root_generation: 1,
+            root_wrap_nonce_bytes: [1; 12],
+            wrapped_fleet_key_bytes: [2; 48],
+        };
+        let fleet_rotation = RotationGrantV2 {
+            common: common(3, L),
+            fleet_id: fleet,
+            fkek_key_id: [0x5a; 32],
+            generation: 3,
+            previous_fkek_key_id: [0x59; 32],
+            previous_generation: 2,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: [0; 32],
+            recovery_grant_signed_container_hash: [0; 32],
+            activation_not_before_ms: L,
+        };
+        let other_tenant = TenantRootKeyGrantV2 {
+            common: CommonFields {
+                tenant_id: [0xee; 16],
+                ..common(4, L)
+            },
+            ..rotation.clone()
+        };
+        let x = Ed25519SigningKey::from_bytes(&[4; 32]);
+        let containers = vec![
+            build_record(&d, DOMAIN_TENANT_ROOT_KEY_GRANT, &rotation.encode()),
+            build_record(&d, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &recovery.encode()),
+            build_record(
+                &e,
+                DOMAIN_FLEET_KEY_GRANT_ROTATION,
+                &fleet_rotation.encode(),
+            ),
+            build_record(&d, DOMAIN_TENANT_ROOT_KEY_GRANT, &other_tenant.encode()),
+            extending(&x, &x, 5, L),
+        ];
+        let held: Vec<Holding> = holdings(&B, &[page(&[&d, &e], containers)])
+            .into_iter()
+            .collect();
+        let mut expected = vec![
+            (id(&d), None, 1),
+            (id(&e), None, 1),
+            (id(&d), Some(fleet), 3),
+            (id(&e), Some(fleet), 3),
+        ];
+        expected.sort();
+        assert_eq!(held, expected);
+    }
+
+    /// Version 6 to 7 (G2-64 B2): the holdings of the evidence a kept fleet
+    /// grant verified against are filed as first seen in its evaluation, so
+    /// an upgraded device still knows the exposures it saw.
+    #[test]
+    fn a_version_6_file_files_the_holdings_of_its_kept_evidence() {
+        let d = Ed25519SigningKey::from_bytes(&[2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open_at(&path).unwrap();
+        let (i, t) = ids(&B);
+        let pages = encode(&Value::Array(vec![Value::Bytes(
+            page(&[&d], vec![extending(&d, &d, 1, L)]).encode(),
+        )]));
+        db.conn
+            .execute_batch(&format!(
+                "DROP TABLE trust_key_holdings;
+                 DROP TABLE trust_fleet_activations;
+                 UPDATE schema_meta SET schema_version = 6, min_reader_version = 6;
+                 INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{a}', 'BOOTSTRAP', 0);
+                 INSERT INTO trust_evaluations VALUES (4, '{i}', '{t}', 0);",
+                a = hex(&id(&d)),
+            ))
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO trust_fleet_key_grants VALUES (?1, ?2, ?3, 1, ?4, 4, x'ab', ?5)",
+                params![i, t, "44".repeat(16), "cd".repeat(32), pages],
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let rows: Vec<(String, String, i64, i64)> = db
+            .conn
+            .prepare(
+                "SELECT signing_key_id, fleet_id, generation, first_seen_evaluation
+                 FROM trust_key_holdings",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [(hex(&id(&d)), String::new(), 0, 4)]);
+        let err = db
+            .conn
+            .execute("DELETE FROM trust_key_holdings", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("never forgotten"), "{err}");
     }
 
     /// L-2: the instance reached through a second origin (another URL) files
