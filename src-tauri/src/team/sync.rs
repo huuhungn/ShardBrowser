@@ -1456,9 +1456,16 @@ pub(crate) async fn push(
             // this device verified; the checkout re-checks the one it names.
             if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
                 if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, g)? {
+                    mark_blocked(&db, local, false)?;
                     bail!(code("sync.commitBlockedCompromised"));
                 }
             }
+            // Q-18 "Release": the block no longer holds, so its code goes.
+            db.conn.execute(
+                "UPDATE profile_bindings SET last_error_code = NULL
+                 WHERE local_profile_id = ?1 AND last_error_code = ?2",
+                params![local, COMPROMISED],
+            )?;
             // A listing that shows a restore quarantines; the loop accepts it.
             if let Err(e) = checkout(client, access, &mut db, &b, now).await {
                 if !awaits_transition(&bound(&db, local)?) {
@@ -2134,6 +2141,7 @@ async fn seal_snapshot(
         Err(e) => return Err(abandon(client, access, db, b, lease, e).await),
     };
     if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &b.fleet, generation)? {
+        mark_blocked(db, &b.local, true)?;
         let e = anyhow!(code("sync.commitBlockedCompromised"));
         return Err(abandon(client, access, db, b, lease, e).await);
     }
@@ -2427,6 +2435,21 @@ async fn fail_upload(
     abandon(client, access, db, b, lease, err).await
 }
 
+/// Q-18 "Local state": the client-local `last_error_code` of a binding whose
+/// commit is blocked, never sent; cleared once the block is released.
+const COMPROMISED: &str = "ROTATION_REQUIRED_COMPROMISED";
+
+/// Marks `local` blocked; `dirty` when its lease goes without a commit, so
+/// the binding ends AVAILABLE with `dirty = 1` once the release lands.
+fn mark_blocked(db: &Db, local: &str, dirty: bool) -> Result<()> {
+    db.conn.execute(
+        "UPDATE profile_bindings SET last_error_code = ?2, dirty = max(dirty, ?3)
+         WHERE local_profile_id = ?1",
+        params![local, COMPROMISED, dirty],
+    )?;
+    Ok(())
+}
+
 /// Q-18 "In-flight commits": aborts the OPEN upload `s` of `commit_op` on
 /// the server while the lease is still held, then gives it up here.
 async fn abort_compromised(
@@ -2445,6 +2468,7 @@ async fn abort_compromised(
     if let Err(e) = aborted.await {
         eprintln!("[sync] abort: {e:#}");
     }
+    let _ = mark_blocked(db, &b.local, true);
     let err = anyhow!(code("sync.commitBlockedCompromised"));
     fail_upload(client, access, db, b, lease, commit_op, err).await
 }
@@ -6221,6 +6245,56 @@ mod tests {
             w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
             1
         );
+    }
+
+    /// Q-18 "Local state": a blocked push, aborted in flight or refused
+    /// before checkout, leaves the binding AVAILABLE and dirty with the
+    /// client-local `ROTATION_REQUIRED_COMPROMISED`; a push past the check
+    /// (the block released) drops the code, even if its checkout then fails.
+    #[test]
+    fn a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code() {
+        let state = |w: &World| {
+            w.db()
+                .conn
+                .query_row(
+                    "SELECT sync_state, dirty, last_error_code FROM profile_bindings",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let blocked = || ("AVAILABLE".to_string(), 1, Some(COMPROMISED.to_string()));
+        let w = world();
+        w.fake().on_patch = Some(a_compromise(&w));
+        w.push().unwrap_err();
+        assert_eq!(state(&w), blocked(), "aborted in flight");
+        drop(w);
+        let w = world();
+        w.db()
+            .conn
+            .execute("UPDATE profile_bindings SET dirty = 1", [])
+            .unwrap();
+        count_a_compromise(&w);
+        w.push().unwrap_err();
+        assert_eq!(state(&w), blocked(), "refused before checkout");
+        drop(w);
+        let w = world();
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET last_error_code = ?1",
+                [COMPROMISED],
+            )
+            .unwrap();
+        w.fake().refuse.push(("checkout", 503));
+        w.push().unwrap_err();
+        assert_eq!(state(&w).2, None, "released");
     }
 
     /// B2: an exposure this device saw stays, whatever a later collection of
