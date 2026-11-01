@@ -2449,6 +2449,7 @@ async fn team_bootstrap_custody(
         account_id: &c.account_id,
         signer: &signer,
         hpke_seed: &hpke_seed,
+        trk_store: &root_bootstrap::CredentialTrkStore,
     };
     root_bootstrap::run(
         &client,

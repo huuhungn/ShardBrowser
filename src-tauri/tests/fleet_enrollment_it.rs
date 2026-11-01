@@ -566,14 +566,55 @@ async fn make_bootstrappable(data_dir: &std::path::Path, tenant: &[u8; 16]) {
     .expect("add the bootstrap guard");
 }
 
+/// The TRK store of the bootstrap test: in memory, and lockable like a
+/// credential store that stops answering.
+#[derive(Default)]
+struct MemVault {
+    keys: std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+    locked: std::sync::atomic::AtomicBool,
+}
+
+impl MemVault {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.locked.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("[[shardx:credential.unavailable]]");
+        }
+        Ok(())
+    }
+}
+
+impl shardx_launcher_lib::root_bootstrap::TrkStore for MemVault {
+    fn store(&self, credential_ref: &str, key: &[u8; 32]) -> anyhow::Result<()> {
+        self.check()?;
+        self.keys
+            .lock()
+            .unwrap()
+            .insert(credential_ref.into(), *key);
+        Ok(())
+    }
+    fn load(&self, credential_ref: &str) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+        self.check()?;
+        match self.keys.lock().unwrap().get(credential_ref) {
+            Some(key) => Ok(zeroize::Zeroizing::new(*key)),
+            None => anyhow::bail!("[[shardx:credential.missing]]"),
+        }
+    }
+    fn forget(&self, credential_ref: &str) -> anyhow::Result<()> {
+        self.check()?;
+        self.keys.lock().unwrap().remove(credential_ref);
+        Ok(())
+    }
+}
+
 /// The first device becomes the tenant's root custodian, resuming from its
-/// saved state after a refused approval and after a lost save, and a full
-/// replay of every saved request is answered from the server's stored
-/// responses.
+/// saved state after a refused approval, a locked credential store and a lost
+/// save, and a full replay of every saved request is answered from the
+/// server's stored responses. The TRK is only ever in the store, and gone
+/// from it once the generation is active.
 #[tokio::test]
 async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_requests() {
     use shardx_launcher_lib::root_bootstrap::{
-        bootstrap_root, BootstrapDevice, BootstrapState, RecoveryExport,
+        bootstrap_root, BootstrapDevice, BootstrapState, RecoveryExport, TrkStore,
     };
 
     let Some(mut server) = start_server_slot(3).await else {
@@ -604,12 +645,14 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
 
     let bundle = server.data_dir.join("recovery.bundle");
     let passphrase = "correct horse battery staple";
+    let vault = MemVault::default();
     let device = BootstrapDevice {
         login: account(&tenant_hex),
         device_id: &enrolled.device_id,
         account_id: &enrolled.account_id,
         signer: &signer,
         hpke_seed: &hpke_seed,
+        trk_store: &vault,
     };
     let recovery = RecoveryExport {
         path: &bundle,
@@ -617,8 +660,12 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     };
     let disk = std::cell::RefCell::new(BootstrapState::default());
     let fail_ack = std::cell::Cell::new(false);
+    let fail_activation = std::cell::Cell::new(false);
     let mut save = |s: &BootstrapState| -> anyhow::Result<()> {
         if fail_ack.get() && !s.ack_request.is_empty() {
+            anyhow::bail!("disk full");
+        }
+        if fail_activation.get() && s.activated {
             anyhow::bail!("disk full");
         }
         *disk.borrow_mut() = s.clone();
@@ -633,7 +680,7 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         .expect_err("an unconfirmed first device cannot approve itself");
     assert!(err.to_string().contains("fleet.refusedCustody"), "{err}");
     let approval = disk.borrow().approval.clone();
-    assert!(!approval.is_empty() && disk.borrow().trk.is_empty());
+    assert!(!approval.is_empty() && disk.borrow().trk_ref.is_empty());
 
     let signing_key_id = enrolled.signing_key_id.clone();
     let hpke_key_id: String = shardx_core::keys::hpke_key_id(&hpke_pk)
@@ -660,6 +707,22 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // A credential store that does not answer stops the run before the TRK
+    // exists: nothing is made up, and the file holds no key.
+    vault
+        .locked
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut state = disk.borrow().clone();
+    let err = bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("a locked credential store stops the run");
+    assert!(err.to_string().contains("credential.unavailable"), "{err}");
+    assert!(disk.borrow().trk_ref.is_empty() && disk.borrow().create_request.is_empty());
+    assert!(vault.keys.lock().unwrap().is_empty());
+    vault
+        .locked
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
     // The save of the acknowledgement fails: the run stops with the
     // generation created but not acknowledged, and the caller's state is
     // exactly what is on disk.
@@ -676,6 +739,17 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         state.ack_request.is_empty(),
         "an unsaved request never reaches the caller"
     );
+    // The TRK is in the store under the saved reference, and nowhere in the
+    // saved state.
+    let trk = *vault
+        .keys
+        .lock()
+        .unwrap()
+        .get(&resumed.trk_ref)
+        .expect("the TRK is stored under the saved reference");
+    let saved_state = serde_json::to_string(&resumed).expect("the state serializes");
+    let trk_hex: String = trk.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(!saved_state.contains(&trk_hex), "the state holds the TRK");
 
     // Activation needs the pinned bundle where it was written: gone, the run
     // stops after the acknowledgement; put back, the same in-memory state
@@ -691,6 +765,21 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         "{err}"
     );
     std::fs::write(&bundle, &kept).expect("restore the bundle");
+
+    // The save of the activation fails: the generation is active on the
+    // server, but the TRK must still be in the store and its reference saved,
+    // or the rerun would make a second key.
+    fail_activation.set(true);
+    bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
+        .await
+        .expect_err("a failed save of the activation stops the run");
+    fail_activation.set(false);
+    assert!(
+        vault.keys.lock().unwrap().contains_key(&resumed.trk_ref),
+        "the TRK is still stored"
+    );
+    assert!(!disk.borrow().activated && disk.borrow().trk_ref == resumed.trk_ref);
+    assert!(!state.activated && state.trk_ref == resumed.trk_ref);
     bootstrap_root(&client, &device, &recovery, &mut state, &mut save)
         .await
         .expect("the bootstrap must resume and finish");
@@ -718,8 +807,14 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         .json()
         .await
         .expect("active generation body");
-    assert!(done.trk.is_empty(), "the TRK leaves the state once active");
-    let trk = hex_to_32(&resumed.trk);
+    assert!(
+        done.trk_ref.is_empty(),
+        "the TRK leaves the state once active"
+    );
+    assert!(
+        vault.keys.lock().unwrap().is_empty(),
+        "the TRK is forgotten once active"
+    );
     let root_key_id: String = shardx_core::keys::root_key_id(&trk)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -743,9 +838,13 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     // its stored responses.
     let mut replay = BootstrapState {
         activated: false,
-        trk: resumed.trk.clone(),
+        trk_ref: resumed.trk_ref.clone(),
+        trk_nonce: resumed.trk_nonce.clone(),
         ..done.clone()
     };
+    vault
+        .store(&resumed.trk_ref, &trk)
+        .expect("put the TRK back");
     bootstrap_root(&client, &device, &recovery, &mut replay, &mut save)
         .await
         .expect("a full replay is answered from stored responses");
@@ -763,14 +862,6 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
         err.to_string().contains("fleet.custodyOtherDevice"),
         "{err}"
     );
-}
-
-fn hex_to_32(h: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).expect("hex");
-    }
-    out
 }
 
 fn hex_to_16(h: &str) -> [u8; 16] {

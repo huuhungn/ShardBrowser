@@ -237,6 +237,16 @@ What holds today:
   from an earlier version is rewritten protected the first time it is read,
   and its keys move to the store on the next protection pass. Elsewhere they
   stay plaintext hex, protected by file permissions alone (0600 on Unix).
+- The TRK of a running root bootstrap is in the credential store (OS store, or
+  else the open key file) under `tenant-root.{tenant}`. `custody-bootstrap.json`
+  keeps only that reference, never the key, and the key is forgotten once the
+  generation is active. With no store and no open key file the bootstrap stops
+  with a `credential.*` error instead of writing the key to disk. A file from
+  an earlier version that still carries the key is moved into the store the
+  next time the bootstrap runs; if the store refuses, the file is left as it
+  was and the run fails. If that file had no self-grant yet, nobody else saw
+  the key and it is dropped for a fresh one. A launcher that held a cleartext
+  TRK should rotate to the next root generation after activation.
 
 DPAPI recovery caveat. A protected `team.json` or `fleet-keys.json` opens only
 under the same Windows account with the same DPAPI master key. An
