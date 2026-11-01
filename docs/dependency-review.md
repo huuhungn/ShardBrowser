@@ -57,6 +57,15 @@ enables `zeroize`'s `serde` feature, so secrets held in its config structs are
 `Zeroizing` and still serialize as plain strings (G2-47). No new crate entered
 any lockfile with it.
 
+Re-checked on 2026-11-01 for the profile label (ADR Q-41): `shared` now also
+depends directly on `hkdf` 0.13.0 `[]` and `sha2` 0.11.0 `[]` (renamed
+`sha2_11`; default features off), beside `sha2` 0.10.9 `[default, std]`.
+`hpke` 0.14.0 depends on both crates and `ed25519-dalek` 3.0.0 on `sha2`
+0.11.0 (`cargo tree --locked -e normal -i hkdf@0.13.0` and `-i sha2@0.11.0`),
+so the lockfiles gained edges but no crate. `hkdf` 0.12.4 stays in the server
+lockfile only through the `sqlx-mysql` and `sqlx-postgres` entries, which are
+never built (`cargo tree --locked --target all -i hkdf@0.12.4` prints nothing).
+
 ## Unmaintained (warnings, not denied)
 
 `proc-macro-error` (RUSTSEC-2024-0370), `ttf-parser` (RUSTSEC-2026-0192), the

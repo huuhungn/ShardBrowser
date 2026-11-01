@@ -9,9 +9,10 @@
 
 use shardx_core::{
     approval_receipt as ar, authz_record as az, canonical as c, envelope as ev, envelope_v2 as e2,
-    fallback_key_file as fk, fleet_lifecycle as fl, fleet_manifest as fm, grants as gr, keys as k,
-    mutation as mu, recovery_bundle as rb, restore_epoch as re, session_binding as sb,
-    signing as sg, snapshot_v2 as s2, trust_evidence as te,
+    fallback_key_file as fk, fleet_lifecycle as fl, fleet_manifest as fm, fleet_profiles as fp,
+    grants as gr, keys as k, mutation as mu, profile_lease as pl, recovery_bundle as rb,
+    restore_epoch as re, session_binding as sb, signing as sg, snapshot_v2 as s2,
+    trust_evidence as te,
 };
 
 const DOMAINS: &[&str] = &[
@@ -66,6 +67,22 @@ const DOMAINS: &[&str] = &[
     s2::DOMAIN_COMMIT_REQUEST,
     s2::DOMAIN_COMMIT_RECEIPT_BINDING,
     te::DOMAIN_TRUST_EVIDENCE_PAGE,
+    s2::DOMAIN_FINALIZE_UPLOAD_REQUEST,
+    pl::DOMAIN_PUBLISH_CREATE_REQUEST,
+    pl::DOMAIN_PUBLISH_CREATE_RESPONSE,
+    pl::DOMAIN_CHECKOUT_REQUEST,
+    pl::DOMAIN_CHECKOUT_RESPONSE,
+    pl::DOMAIN_RELEASE_LEASE_REQUEST,
+    pl::DOMAIN_RELEASE_LEASE_RESPONSE,
+    pl::DOMAIN_LEASE_RENEW_REQUEST,
+    pl::DOMAIN_LEASE_RENEW_RESPONSE,
+    pl::DOMAIN_CREATE_UPLOAD_REQUEST,
+    pl::DOMAIN_CREATE_UPLOAD_RESPONSE,
+    pl::DOMAIN_FINALIZE_UPLOAD_RESPONSE,
+    pl::DOMAIN_LOCAL_UNBIND_REQUEST,
+    pl::DOMAIN_LOCAL_UNBIND_RESPONSE,
+    pl::DOMAIN_LOCAL_BINDING_TOMBSTONE,
+    fp::DOMAIN_FLEET_PROFILE_PAGE,
 ];
 
 const LABELS: &[&str] = &[
