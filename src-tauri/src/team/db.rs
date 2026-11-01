@@ -1280,7 +1280,7 @@ WHEN OLD.source IS NOT 'DEVICE_REVOCATION'
   OR NEW.counted_evaluation IS NOT OLD.counted_evaluation
   OR NEW.counted_at_ms IS NOT OLD.counted_at_ms
 BEGIN SELECT RAISE(ABORT, 'a proven revocation changes only its container'); END;
--- Same columns, same meaning: a version 7 reader still reads it right.
+-- Same columns, same meaning; compatible() still refuses a newer schema_version.
 UPDATE schema_meta SET schema_version = 8, min_reader_version = 7,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
