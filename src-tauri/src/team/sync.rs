@@ -1452,6 +1452,13 @@ pub(crate) async fn push(
             continue;
         }
         let Some(lease) = b.lease else {
+            // Q-18: refused before checkout, under the highest generation
+            // this device verified; the checkout re-checks the one it names.
+            if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
+                if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, g)? {
+                    bail!(code("sync.commitBlockedCompromised"));
+                }
+            }
             // A listing that shows a restore quarantines; the loop accepts it.
             if let Err(e) = checkout(client, access, &mut db, &b, now).await {
                 if !awaits_transition(&bound(&db, local)?) {
@@ -1477,6 +1484,21 @@ pub(crate) async fn push(
         match s.state.as_str() {
             "OPEN" => {
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
+                    // Q-18 "In-flight commits": an upload still OPEN when a
+                    // compromise is counted is aborted and nothing more is
+                    // sent. A finalize already stored is replayed as sent.
+                    if ledger::commit_blocked(
+                        &db,
+                        &dev.pin.0,
+                        &dev.pin.1,
+                        &b.fleet,
+                        s.key_generation,
+                    )? {
+                        let e = anyhow!(code("sync.commitBlockedCompromised"));
+                        return Err(
+                            fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await,
+                        );
+                    }
                     transfer(
                         client,
                         access,
@@ -5679,8 +5701,8 @@ mod tests {
 
     /// Q-18: a counted `compromised` revocation blocks commits under a
     /// generation it exposes (verified no later than the revocation was
-    /// counted, granted to the revoked key, or without activation evidence);
-    /// the lease is released. A `retired` one, or a generation verified after
+    /// counted, granted to the revoked key, or without activation evidence),
+    /// before a lease is taken (ADR 0002 Q-18 "Refusal"). A `retired` one, or a generation verified after
     /// it, activated under a root the key never held and never granted to
     /// that key, does not block.
     #[test]
@@ -5732,7 +5754,8 @@ mod tests {
             if blocked {
                 let err = pushed.unwrap_err();
                 assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
-                assert_eq!(w.sent("POST", "/release").len(), 1);
+                assert!(w.sent("POST", "/checkout").is_empty(), "before checkout");
+                assert!(w.sent("POST", "/release").is_empty());
                 assert!(w.sent("POST", "/uploads").is_empty());
             } else {
                 assert_eq!(pushed.unwrap().version, 1, "{reason:?} {counted}");
@@ -5951,6 +5974,50 @@ mod tests {
         assert!(w.blocked(3), "mismatched activation evidence");
         w.collect(4, &k4, 90, base(vec![]));
         assert!(w.blocked(4), "missing activation evidence");
+    }
+
+    /// B3, Q-18 "In-flight commits": a COMMIT persisted while its upload is
+    /// still OPEN, chunks unsent, when a compromise is counted, is aborted:
+    /// no chunk, finalize or commit is sent, the upload is ABORTED, the
+    /// operation fails with the commit-blocked code, and the lease is let go.
+    /// The next push is refused before it takes a lease.
+    #[test]
+    fn an_open_upload_is_aborted_once_a_compromise_is_counted() {
+        let w = world();
+        w.fake().refuse.push(("head", 401));
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.authRequired"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'OPEN'"),
+            1
+        );
+        assert!(w.sent("PATCH", "").is_empty(), "nothing sent yet");
+        count_a_compromise(&w);
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(w.sent("PATCH", "").is_empty(), "no chunk after the count");
+        assert!(w.sent("POST", "/finalize").is_empty());
+        assert!(w.sent("POST", "/commit").is_empty());
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
+        );
+        let checkouts = w.sent("POST", "/checkout").len();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert_eq!(
+            w.sent("POST", "/checkout").len(),
+            checkouts,
+            "refused before checkout"
+        );
     }
 
     /// B2: an exposure this device saw stays, whatever a later collection of
