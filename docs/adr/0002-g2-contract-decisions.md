@@ -1712,7 +1712,7 @@ display  = 32 lowercase hex digits in 8 groups of 4
 
   **Rules.**
   - **Issuer.** A custodian holding a device-scoped `device.revoke` (L1067) that covers the subject device's approval scope.
-  - **Activations.** Each one is validated as if it were sent alone. The revocation, the session and grant revocations, every included activation and the audit commit in one transaction (L1107).
+  - **Activations.** Each one is validated as if it were sent alone. The revocation, the session and grant revocations, every included activation and the audit commit in one transaction (L1107). In practice the route's request body cap, not the codec's 65535, bounds how many activations one `DEVICE_REVOKE` carries: `POST /v2/devices/{device_id}/revoke` shares the 262144-byte `MAX_ROOT_REQUEST_BODY` (`server/src/routes/v2_root.rs`) with the other root and fleet generation routes, and one fleet rotation activation adds about 545 encoded bytes to a request of about 1424 bytes without any, so about 478 fit.
   - **Rotation (C-1, decided by the user on 2026-10-25).** Activations are optional. This amends L290, L1108, L1383 and L2618, and their restatements L34, L2676 and L2764.
   - **`rotation_required` (derived, not stored; made exact in revision 10, critic r7 M24).**
     - A root or fleet generation is **exposed** if either of these holds (issuer clause added in revision 14, critic r9 M26):
