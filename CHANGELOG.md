@@ -1,5 +1,68 @@
 # Changelog
 
+## v2.5.0
+
+A Team sync release: the team server gains the v2 control plane for root
+custody, fleet keys and published profiles, and the launcher keeps every Team
+key in the OS credential store. The browser engine is unchanged (Chromium
+156.0.8078.48, engine build 1).
+
+### Upgrade notes
+
+- Update the team server before the launchers. Launcher 2.5.0 enrolls a device
+  through the new pre-device ticket, which a 2.4.x team server does not offer.
+- On Windows the launcher refuses to start when its config folder or data
+  root is not on a local NTFS volume (for example an exFAT drive or a network
+  share). Move the data root to a local NTFS folder with 2.4.4 before
+  upgrading.
+- The backend for publishing a profile, cancelling a publish, unbinding,
+  downgrading and showing lease state is in this release. The Team screens for
+  those commands come in a later release.
+
+### Security
+
+- Device signing and HPKE keys, fleet keys and the tenant root key of a
+  running custody setup live in the OS credential store (Windows Credential
+  Manager on Windows), and keys from earlier versions move there on first
+  start. Where no credential store is usable, device keys can be kept in a
+  passphrase-protected key file, and the Team card warns when this device's
+  keys are not protected by the OS store.
+- A fleet key is opened and stored only after its grant verifies against the
+  tenant's trust chain, rooted at the first device's anchor.
+- Pull refuses a snapshot sealed for another profile, one with two entries for
+  the same path, and entries with names Windows reserves (such as `COM0`,
+  `CONIN$` or `NUL .txt`); the name check applies to v1 archives too.
+- Signatures use strict Ed25519 verification, and the decoder bounds nesting
+  so untrusted bytes cannot overflow the stack.
+- Patched releases of `tokio`, `anyhow` and `event-listener`; all three
+  lockfiles are checked against the RustSec advisory database in CI.
+
+### Team server
+
+- Root custody: the first device sets up the tenant root from the Team card,
+  is confirmed offline, and approves further devices. A revoked device cannot
+  sign in again.
+- Fleet key generations are created, granted, acknowledged, activated and
+  revoked through one lifecycle, and the tenant root can be rotated once every
+  fleet generation is rewrapped under the new root.
+- Profiles can be published, checked out under one fenced lease, renewed,
+  released and uploaded in chunks with a readback of the stored snapshot.
+- An offline server restore prepares, commits or aborts by crash class, and
+  launchers accept the new restore epoch only through a custodian-signed
+  transition.
+- Records that leave their signed containers are quarantined at request time
+  and at startup, and the v2 control plane stays off while a device revocation
+  is not served correctly.
+- The server refuses to start when `SHARDX_IDENTITY_DIR` is set but fails
+  its checks (missing, not local NTFS, a link or on another volume), and it waits for the SQLite write lock instead of
+  failing requests under load.
+
+### Changed
+
+- The launcher's local Team database moves to schema version 6 on first start.
+  The migration keeps every row and refuses a file it cannot upgrade safely,
+  leaving it unchanged.
+
 ## v2.4.4
 
 A user interface release. Team sync and the browser engine are unchanged

@@ -21,9 +21,13 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
 
 ## Verdict of this packet
 
-Status counts: DONE 62, PENDING-MANUAL 1, PENDING 1.
+Status counts: DONE 58, PARTIAL 4, PENDING-MANUAL 1, FAIL 1.
 
-**This packet is not a full G2 PASS.**
+**G2 is FAIL.** The independent verifier returned FAIL on 2026-11-01
+(section 8). The owner decided to release v2.5.0 with G2 recorded as FAIL,
+because the paths the findings affect are not reachable from the launcher UI
+or the Automation API in that release. The Team UI that exposes publish must
+not ship until findings B1 to B7 are fixed and both verifiers return PASS.
 
 - **G2-48 is PENDING-MANUAL.** The plan's gate paragraph (L2343) lists
   "credential-store persistence" among the uncertainties that make G2
@@ -32,8 +36,9 @@ Status counts: DONE 62, PENDING-MANUAL 1, PENDING 1.
   credential-store-persistence evidence means G2 is not a full PASS. The owner
   chose to release without waiting for it, so the release proceeds on an owner
   decision, not on a verifier-confirmed full PASS.
-- **G2-64 is pending.** Codex and Hermes verify independently; no verdict
-  exists yet.
+- **G2-64 is FAIL.** Codex found seven blocking findings (B1 to B7); Hermes
+  produced no report. G2-14, G2-31, G2-42 and G2-61 are PARTIAL because of
+  them.
 - Every other row is DONE in the sense the gap analyses use: a test or a
   recorded run exercises the row's PASS criterion. DONE is not a G2 gate PASS.
   Rows with a weaker form of evidence say so in their **Note**.
@@ -182,7 +187,9 @@ checkout will not match; use `tr -d '\r' < file | sha256sum` for one file.
 
 Status words: **DONE** a test or recorded run exercises the row's PASS
 criterion; **PENDING-MANUAL** the evidence needs a run only the owner can do;
-**PENDING** the row's work has not happened yet. A test name followed by
+**PENDING** the row's work has not happened yet; **PARTIAL** the cited
+tests pass but a verifier finding shows the row's criterion is not fully met;
+**FAIL** the row's check was run and failed. A test name followed by
 `(vector)` pins golden bytes or an official vector. Paths are relative to the
 repository root. Section 6 gives the exact command of each row.
 
@@ -201,7 +208,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-11 | EnvelopeIntentV2 | L590-L759 | DONE | `shared/src/envelope_v2.rs`: `the_intent_bounds_are_the_plans`, `every_envelope_intent_rule_is_enforced`, `the_intent_and_slot_must_be_the_ones_the_manifest_names`; `shared/src/snapshot_v2.rs`: `manifest_binds_a_sealed_envelope_v2_object`; `shared/src/envelope.rs`: `g2_golden_vector_intent` (vector), `g2_golden_vector_intent_genesis` (vector) | D-3, ADR 0003 |
 | G2-12 | RestoreEpochLeafV2 / inclusion proof | L590-L759 | DONE | `shared/src/restore_epoch.rs`: `golden_vectors` (vector), `leaf_roundtrips_and_refuses_contract_violations`, `leaf_sets_must_be_non_empty_sorted_and_unique`, `every_leaf_proves_and_every_tampering_fails`, `a_proof_binds_tenant_profile_instance_epochs_count_and_root`, `proof_parser_refuses_every_contract_violation`; `shared/src/envelope.rs`: `g2_golden_vectors_merkle_roots` (vector) | D-1, Q-1, Q-36 |
 | G2-13 | RestoreEpochTransitionV2 / signed | L590-L759 | DONE | `shared/src/restore_epoch.rs`: `transition_roundtrips_and_verifies`, `transition_payload_refuses_every_contract_violation`, `signed_transition_refuses_every_container_defect`, `transition_signature_binds_key_bytes_and_label` | D-1, Q-33, Q-36 |
-| G2-14 | IdempotentMutationRequestV2 | L910-L1054 | DONE | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version`, `every_kind_has_one_scope_and_the_scope_must_match`, `hashes_and_closed_fields_are_checked`; `shared/src/fleet_lifecycle.rs`: `golden_vectors` (vector) | Q-5, Q-13 |
+| G2-14 | IdempotentMutationRequestV2 | L910-L1054 | PARTIAL | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version`, `every_kind_has_one_scope_and_the_scope_must_match`, `hashes_and_closed_fields_are_checked`; `shared/src/fleet_lifecycle.rs`: `golden_vectors` (vector) **Note:** PARTIAL, verifier finding B5: the DEVICE_REVOKE map accepts only an empty `activations` array, while ADR Q-13 allows 0 to 65535 included activations. | Q-5, Q-13 |
 | G2-15 | IdempotentStoredResponseV2 | L910-L1054 | DONE | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version` | D-6, Q-34 |
 | G2-16 | ROOT_GENERATION_CREATE | L915 | DONE | `server/tests/v2_auth.rs`: `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`; code: `shared/src/mutation.rs`, `server/src/routes/v2_root.rs` | Q-5, D-4, D-9, Q-28 |
 | G2-17 | ROOT_GRANT_CREATE | L915 | DONE | `server/tests/v2_auth.rs`: `every_root_grant_column_is_compared_with_its_container_on_each_request_and_at_startup`; code: `shared/src/mutation.rs`, `server/src/routes/v2_root_grants.rs` | Q-5, D-4, D-9 |
@@ -218,7 +225,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-28 | HPKE TRK/FKEK grants | L1358 | DONE | `shared/src/grants.rs`: `the_pinned_suite_matches_the_rfc_9180_vectors` (vector), `info_bytes_match_g2_vector` (vector), `only_the_granted_device_can_open`, `grant_cannot_be_replayed_into_another_tenant_or_epoch`, `the_fleet_grant_aad_is_the_label_the_length_and_the_info`, `a_device_fleet_grant_opens_only_to_the_key_it_names`; `shared/src/fleet_grants.rs`: `a_sealed_fleet_key_opens_to_the_exact_same_bytes` | D-8, D-5 |
 | G2-29 | Signing suite | L2335 | DONE | `shared/src/authz_record.rs`: `signature_binds_issuer_and_bytes`, `small_order_issuer_key_never_verifies`; `shared/src/signing.rs`: `rfc8032_vectors_sign_and_verify_strictly` (vector), `speccheck_matrix_accepts_only_the_unambiguous_case` (vector), `g2_golden_vector_signed_container_hash` (vector) | D-8 |
 | G2-30 | Grant ALL-column + HPKE equality (seven under Q-13) | L2338, L2034, L2058 | DONE | `server/tests/v2_auth.rs`: `every_device_revocation_column_is_compared_with_its_container_on_each_request`, `the_startup_pass_quarantines_device_revocations_that_left_their_containers`, `a_revocation_of_another_instance_turns_v2_off_until_it_is_put_back`, `a_revocation_quarantined_at_runtime_refuses_the_trust_evidence`, `a_quarantined_revocation_that_verifies_again_is_served_again_after_a_restart`, `a_marked_row_swapped_for_another_genuine_revocation_is_not_served_again`, `a_corrupt_container_is_marked_without_a_hash_and_served_again_once_restored`, `the_trust_evidence_reports_a_revoked_device_from_its_record_not_its_column`, `a_revocation_row_swapped_for_another_genuine_one_does_not_answer_a_retry`, `a_revocation_row_the_startup_pass_cannot_read_turns_v2_off`; `src-tauri/src/team/sync.rs`: `a_kept_revocation_reloads_with_every_column_equal`; code: `shared/src/authz_record.rs`, `server/src/routes/v2_device_revoke.rs`, `server/src/integrity.rs`, `src-tauri/src/lib.rs` | Q-13, Q-38 |
-| G2-31 | Durable response-loss replay, every operation | L2338, L1424, L2048 | DONE | `server/tests/v2_auth.rs`: `the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt`, `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`; `server/tests/v2_e2e.rs`: `v2_operations_replay_the_stored_response`; `server/tests/v2_profiles.rs`: `one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes`, `a_stored_response_naming_another_profile_or_lease_is_never_replayed`, `a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot`; `server/tests/restore_epoch_harness.rs`: `d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_replay`; `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly` | Q-34, Q-42 |
+| G2-31 | Durable response-loss replay, every operation | L2338, L1424, L2048 | PARTIAL | `server/tests/v2_auth.rs`: `the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt`, `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`; `server/tests/v2_e2e.rs`: `v2_operations_replay_the_stored_response`; `server/tests/v2_profiles.rs`: `one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes`, `a_stored_response_naming_another_profile_or_lease_is_never_replayed`, `a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot`; `server/tests/restore_epoch_harness.rs`: `d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_replay`; `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly` **Note:** PARTIAL, verifier finding B7: the generic replay test uses a prototype operation; there is no per-operation durable response-loss matrix for the fleet lifecycle, root grant and device revocation routes. | Q-34, Q-42 |
 | G2-32 | Local plan DDL + 11 probes | L1450-L2034, L2036 | DONE | `src-tauri/src/team/db.rs`: `a_new_database_reopens_with_its_schema_and_settings`, `a_version_5_file_with_data_moves_to_version_6_keeping_every_row`, `the_triggers_and_indexes_of_a_version_5_file_survive_version_6`; files: `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md` | Q-1, Q-37, Q-42 |
 | G2-33 | Probe 1 UNBIND tombstone | L2038 | DONE | `src-tauri/src/team/sync.rs`: `an_unbind_tombstone_outlives_its_binding_and_replays_exactly`, `an_unbind_cut_off_at_any_write_leaves_the_binding_whole`, `a_tombstone_that_no_longer_recomputes_is_never_returned`, `an_unbind_after_an_accepted_transition_keeps_its_evidence`; `src-tauri/src/team/db.rs`: `a_version_4_file_keeps_its_proofs_and_lets_them_outlive_the_binding` | D-7, Q-37 |
 | G2-34 | Probe 2 RELEASE replay after lease gone | L2039 | DONE | `src-tauri/src/team/sync.rs`: `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unsent_cancel_release_is_retried_and_then_given_up`, `an_unreadable_release_reply_is_reported_and_replayed` | Q-34 |
@@ -229,7 +236,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-39 | Probe 7 local epoch transition/proof | L2044 | DONE | `src-tauri/src/team/sync.rs`: `a_verified_transition_moves_only_the_bindings_it_covers`, `a_transition_that_does_not_verify_keeps_the_binding_quarantined`, `a_restore_epoch_that_goes_back_is_a_rollback`, `a_cut_off_acceptance_leaves_the_binding_quarantined_until_reopen`, `a_leaf_head_is_accepted_only_as_a_new_head_is`, `a_pinned_head_is_read_back_only_as_the_bindings_own`, `a_lapsed_or_former_custodian_signs_no_transition`, `an_unbind_after_an_accepted_transition_keeps_its_evidence`, `a_binding_changed_during_acceptance_is_not_moved`, `a_lease_from_before_the_restore_is_released_before_the_binding_moves`, `a_custodian_not_yet_appointed_signs_no_transition`, `a_failed_release_of_an_old_lease_is_retried_as_stored` | Q-1, Q-36, Q-37 |
 | G2-40 | Probe 8 unknown/newer schema | L2045 | DONE | `src-tauri/src/team/db.rs`: `an_unknown_schema_fails_closed_and_is_left_as_it_was`, `a_database_held_in_wal_mode_is_refused` | none |
 | G2-41 | Probe 9 recovery/downgrade journals | L2046 | DONE | `src-tauri/src/team/journal.rs`: `every_restore_phase_survives_close_and_reopen_in_order`, `a_restore_phase_cannot_skip_repeat_or_leave_a_terminal_one`, `a_restore_journal_retires_only_when_settled`, `the_restore_resume_table_is_fixed_per_crash_point`, `a_clone_journal_walks_its_chain_with_every_phase_surviving_reopen`, `a_downgrade_phase_cannot_skip_and_a_rollback_is_always_open`, `the_resume_table_for_a_downgrade_journal_continues_every_open_phase`, `the_digests_survive_reopen_byte_for_byte`; `src-tauri/src/team/downgrade.rs`: `a_cut_off_at_every_step_resumes_to_the_same_finished_clone`, `a_process_killed_at_every_step_resumes_to_the_same_finished_clone`, `a_rollback_from_every_step_puts_the_original_back_and_frees_the_profile`, `a_readback_that_v0_1_28_would_not_agree_with_fails_the_flow`, `discovery_sees_every_place_v0_1_28_reads_and_nothing_in_the_archive`; `src-tauri/src/team/sync.rs`: `an_unbind_is_refused_while_a_lease_request_or_journal_is_open`; code: `src-tauri/src/lib.rs`; files: `scripts/g2-wp5-mutants.py` **Note:** The restore journal has no production writer (only the downgrade flow and tests write it); the full pre-v2 restore is journal and refusal states only. That is v0.2.x scope, not a probe 9 criterion. | Q-35, Q-40 |
-| G2-42 | Probe 10 local integer range | L2047 | DONE | `src-tauri/src/team/db.rs`: `every_sync_integer_class_keeps_its_range_across_a_reopen`; `src-tauri/src/team/records.rs`: `every_integer_class_keeps_its_range_across_a_reopen` | D-6 |
+| G2-42 | Probe 10 local integer range | L2047 | PARTIAL | `src-tauri/src/team/db.rs`: `every_sync_integer_class_keeps_its_range_across_a_reopen`; `src-tauri/src/team/records.rs`: `every_integer_class_keeps_its_range_across_a_reopen` **Note:** PARTIAL, verifier finding B6: probe 10 says REAL and TEXT coercions are rejected before mutation, but both tests expect lossless coercions to succeed. | D-6 |
 | G2-43 | Probe 11 local mutation replay | L2048 | DONE | `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `a_superseded_replay_ends_cleanly_and_the_next_push_starts_fresh` | D-7, Q-42 |
 | G2-44 | Server migrations fresh + upgrade | L2080-L2222 | DONE | `server/tests/v2_upgrade_chain.rs`: `the_plan_assertions_hold_on_a_reopened_fresh_file`, `the_plan_assertions_hold_on_a_reopened_v0_1_28_file_and_its_backup_restores`, `fixtures_1_to_4_hold_on_a_fresh_file`, `fixtures_1_to_4_hold_on_a_v0_1_28_file_after_its_upgrade`, `fixtures_1_to_4_hold_on_a_populated_0016_file_after_its_upgrade`, `m0017_root_generations_only_move_forward_on_upgraded_rows`, `m0033_the_quarantine_gains_a_container_hash_and_stays_append_only`; files: `server/tests/fixtures/plan_assert.sql`, `server/tests/fixtures/v0.1.28/0001_init.sql`, `server/tests/fixtures/v0.1.28/0002_lock_token_and_token_version.sql`, `server/tests/fixtures/v0.1.28/0003_clear_empty_lock_tokens.sql`, `scripts/g2-44-migration-mutants.py` | Q-34, Q-38 |
 | G2-45 | Unsigned i64 domain (server) | L2343, L2338 | DONE | `server/tests/v2_upgrade_chain.rs`: `m0030_upgraded_integer_columns_refuse_values_that_are_no_integers`; `server/tests/v2_integer_domain.rs`: `every_class_decodes_its_domain_ends_and_refuses_everything_else`, `every_class_column_stores_its_domain_ends_and_its_check_refuses_the_rest`, `every_integer_column_of_every_v2_table_has_an_upper_bound_check`, `every_integer_column_of_every_v2_table_refuses_a_value_that_is_no_integer`, `the_bound_scan_tells_bounded_from_unbounded_columns`; files: `server/migrations/0030_v2_integer_columns_hold_integers.sql` **Note:** The gap table cited lines 861-1238 of v2_integer_domain.rs, which has 622 lines; the tests are cited here by name. | D-6 |
@@ -248,10 +255,10 @@ repository root. Section 6 gives the exact command of each row.
 | G2-58 | Ahead without evidence | L2265 | DONE | `server/tests/restore_epoch_harness.rs`: `l2263_g2_58_an_authority_ahead_without_exact_evidence_fails_closed`, `l2263_g2_58_only_a_live_custodian_transition_over_the_computed_leaves_prepares` | D-1, Q-33, Q-36 |
 | G2-59 | Behind/different instance | L2266 | DONE | `server/tests/restore_epoch_harness.rs`: `g2_55_the_k2_incident_output_prints_the_audit_failure_count`; code: `server/src/identity.rs` **Note:** The K2 incident output is asserted in the same test as G2-55; the other-instance and record-behind cases are asserted in `restore_epoch_harness.rs`. | D-1, Q-39 |
 | G2-60 | Reconciled E+1, retire bundle | L2267 | DONE | `server/tests/restore_epoch_harness.rs`: `l2265_g2_60_a_reconciled_epoch_retires_its_bundle_and_the_next_start_is_normal` | D-1, Q-28 |
-| G2-61 | Trust-boundary tests/docs | L2340 | DONE | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`; files: `docs/trust-boundaries.md` | Q-13, Q-14 |
+| G2-61 | Trust-boundary tests/docs | L2340 | PARTIAL | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`; files: `docs/trust-boundaries.md` **Note:** PARTIAL, verifier findings B1 to B4: the Q-18 compromise commit block does not derive exposure through the root, can lose a known exposure when the same generation is collected again, resumes an OPEN upload instead of aborting it, and counts only tenant-scoped device revocations. | Q-13, Q-14 |
 | G2-62 | Dependencies (license, advisories, MSRV, feature graph) | L2336, L2343 | DONE | files: `docs/dependency-review.md`, `shared/Cargo.toml`, `server/Cargo.toml`, `src-tauri/Cargo.toml`, `shared/Cargo.lock`, `server/Cargo.lock`, `src-tauri/Cargo.lock` **Note:** Evidence is CI plus the manifests: rust-version 1.87 (shared), 1.89 (server), 1.88 (launcher), `cargo audit`, and the feature graph in docs/dependency-review.md. There is no unit test. | D-3, ADR 0003 |
 | G2-63 | Security review artifact | L2341 | DONE | `shared/tests/registry_pins.rs`: `every_signing_domain_is_distinct_and_versioned`, `every_hash_label_is_distinct_and_nul_terminated`, `the_numeric_registry_holds_the_reviewed_values`; `shared/src/keys.rs`: `g2_golden_vector_profile_label` (vector), `a_profile_label_opens_only_where_it_was_sealed`, `a_profile_label_has_a_length_bound_both_ways`, `a_profile_label_is_padded_to_a_bucket`, `a_profile_label_that_is_not_canonical_is_refused`; files: `docs/security-review-g2.md`, `docs/key-custody.md`, `docs/dependency-review.md` **Note:** Closed by this packet. `registry_pins.rs` also holds the sixteen request and response domains of the lease, upload, publish, unbind and fleet-profile-page maps. | D-8, Q-41 |
-| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | PENDING | **Note:** Pending. Codex and Hermes verify independently (ADR Q-32), after the merge to main (Q-15). | Q-15, Q-32 |
+| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | FAIL | `docs/g2-evidence/verifier-codex-2026-11-01.md` **Note:** FAIL. Codex returned FAIL with findings B1 to B7 on the head of PR #213 (2b35d84f); Hermes produced no report. See section 8. | Q-15, Q-32 |
 
 ## 6. Commands per row
 
@@ -690,13 +697,45 @@ What is not proven: that the stored credential survives a machine restart, is
 readable while the session is locked, and is withheld from a logon session
 with no credential store.
 
-## 8. G2-64 is pending
+## 8. G2-64 is FAIL
 
-The independent verifier is Codex and Hermes (ADR Q-32): its own worktree, the
-plan and the code but not the implementer's reports. It starts after the
-merge to `main` (Q-15). It should run `python scripts/g2-evidence.py --check`
-first, then the gates of section 2 and the commands of section 6, and read
-back the versions of section 1. No verdict exists yet.
+The independent verifier is Codex and Hermes (ADR Q-32): each in its own
+worktree, with the plan and the code but not the implementer's reports. On
+2026-11-01 both started blind on the head of PR #213 (2b35d84f), whose tree is
+what `main` received in PR #95 plus one review file under `docs/adr/reviews/`.
+
+- **Codex: FAIL.** Its findings are in `verifier-codex-2026-11-01.md` beside
+  this file. The implementer read each one against the code and the ADR and
+  confirmed all seven:
+  - **B1.** The Q-18 commit block does not derive exposure through the root
+    (C-1 root clause, RecoveryGrant and RotationGrant issuers, PREPARING
+    roots); `src-tauri/src/team/ledger.rs` says so in a `shortcut:` comment.
+  - **B2.** Collecting the same generation again replaces its kept evidence,
+    so an exposure seen only in the replaced pages stops counting.
+  - **B3.** A COMMIT operation whose upload is still `OPEN` resumes after a
+    `compromised` revocation is counted, instead of aborting; push also takes
+    the lease before the check, where the ADR refuses before checkout.
+  - **B4.** Only tenant-scoped `device.revoke` revocations are counted, so a
+    fleet-scoped revocation of a fleet member never blocks commits.
+  - **B5.** DEVICE_REVOKE accepts only an empty `activations` array.
+  - **B6.** G2-42's tests expect lossless TEXT and REAL coercions to succeed,
+    where probe 10 says they are rejected.
+  - **B7.** G2-31 has no per-operation durable response-loss matrix.
+
+  It also noted weaker spots that it did not count as blocking: the G2-28
+  info "golden" is a roundtrip, stale plan lines in G2-21, G2-22 and G2-25, and
+  SMB and symlink branches that skip without a share or privilege. Its test
+  failures came from its sandbox, which refuses DPAPI; the implementer reran
+  `cargo test` for `shared` outside the sandbox: 300 passed, 0 failed.
+- **Hermes: no report.** Three runs stopped before a verdict: the default
+  provider's safety filter refused, a Claude model hit an HTTP 400 on modified
+  thinking blocks, and a Grok model fell into a repetition loop.
+- **Owner decision (2026-11-01).** Release v2.5.0 with G2 recorded as FAIL. In
+  that release the launcher UI does not call `profile_sync_publish` and the
+  Automation API does not expose it, and push takes the v2 path only for a
+  published profile, so the paths B1 to B4 affect are not reachable. The Team
+  UI that exposes publish must not ship until B1 to B7 are fixed and both
+  verifiers return PASS on the fixed tree.
 
 ## 9. Accepted limits
 
@@ -727,7 +766,8 @@ confirm each is stated where claimed.
 ## 10. Rows that are not DONE, and what this packet found
 
 - **G2-48** PENDING-MANUAL, see section 7.
-- **G2-64** PENDING, see section 8.
+- **G2-64** FAIL, and **G2-14**, **G2-31**, **G2-42**, **G2-61** PARTIAL,
+  see section 8.
 - **G2-63** was PARTIAL in the last gap table. It is DONE here: the provider
   and profile-label rows are in `docs/security-review-g2.md`; the two label
   constants are in `shared/tests/registry_pins.rs`; this packet is the
