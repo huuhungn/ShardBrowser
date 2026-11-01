@@ -10552,3 +10552,425 @@ async fn a_revocation_row_the_startup_pass_cannot_read_turns_v2_off() {
     server.restart().await;
     assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
 }
+
+// ------------------------------------- response loss across a restart (G2-31) ---
+
+/// Every row of every table as SQL literals, sorted within each table.
+async fn all_rows(server: &Server) -> Vec<String> {
+    let pool = db(&server.data).await;
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut rows = Vec::new();
+    for table in tables {
+        let cols: Vec<String> = column_names(&pool, &table)
+            .await
+            .iter()
+            .map(|c| format!("quote(\"{c}\")"))
+            .collect();
+        let mut got: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT '{table}:' || {} FROM \"{table}\"",
+            cols.join(" || ',' || ")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        got.sort();
+        rows.extend(got);
+    }
+    pool.close().await;
+    rows
+}
+
+/// Sends `request`, whose response the client then loses, restarts the
+/// server on the same data, and retries the exact bytes: the retry gets the
+/// first status and body byte for byte, `state` still holds, and no row of
+/// any table changed. The same key with another nonce is refused. Records the
+/// kind in `replayed` and returns the first body.
+async fn replayed_after_restart(
+    server: &mut Server,
+    path: &str,
+    access: &str,
+    request: &[u8],
+    state: &[(&str, i64)],
+    replayed: &mut Vec<OperationKind>,
+) -> Vec<u8> {
+    let outer = IdempotentMutationRequestV2::parse(request).unwrap();
+    let kind = outer.operation_kind.as_str();
+    let (status, body) = server.call(path, access, Some(request)).await;
+    assert!(
+        (200..300).contains(&status),
+        "{kind}: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    for (query, want) in state {
+        assert_eq!(server.count(query).await, *want, "{kind}: {query}");
+    }
+    let rows = all_rows(server).await;
+
+    server.restart().await;
+    assert_eq!(
+        server.call(path, access, Some(request)).await,
+        (status, body.clone()),
+        "{kind}: the retry after a restart"
+    );
+    let other = IdempotentMutationRequestV2 {
+        client_request_nonce: [0x93; 16],
+        ..outer.clone()
+    }
+    .encode();
+    let (s, b) = server.call(path, access, Some(&other)).await;
+    assert_eq!(
+        (s, code_of(&b).as_str()),
+        (409, "IDEMPOTENCY_MISMATCH"),
+        "{kind}: the same key with another request"
+    );
+    for (query, want) in state {
+        assert_eq!(server.count(query).await, *want, "{kind}: {query}");
+    }
+    assert_eq!(all_rows(server).await, rows, "{kind}: a row changed");
+    replayed.push(outer.operation_kind);
+    body
+}
+
+/// G2-31 for each custody kind: the real route performs the mutation, its
+/// response is lost, and after a restart the exact retry answers the stored
+/// bytes without a second resource or state transition.
+#[tokio::test]
+async fn every_custody_operation_replays_its_lost_response_after_a_restart() {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantRevocation, FleetGrantRevokeReason,
+        FleetGrantRevokeV2, FleetGrantVariant as V, FleetKeyGenerationActivateV2,
+        FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+    };
+    use shared::mutation::{fleet_device_grant_set_hash, RootGrantRevokeReason};
+    use OperationKind as K;
+
+    let mut server = start("replay-matrix", 28221).await;
+    let mut replayed = Vec::new();
+    let r = &mut replayed;
+
+    // The root bootstrap, its acknowledgement and its activation.
+    let (dev, access) = approved(&mut server, 0x6e).await;
+    let container = self_grant(&dev, &TRK, |_| {});
+    let create = bootstrap_create(&TRK, container.clone(), |_| {});
+    let root = format!("/v2/tenants/{}/root-key-generations", hex(&TENANT));
+    replayed_after_restart(
+        &mut server,
+        &root,
+        &access,
+        &root_request(0x91, &create),
+        &[
+            ("SELECT count(*) FROM v2_root_key_generations", 1),
+            (
+                "SELECT count(*) FROM v2_root_key_generations WHERE state = 'PREPARING'",
+                1,
+            ),
+            ("SELECT count(*) FROM v2_tenant_root_key_grants", 1),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &format!("{}/ack", grant_path("0", &SELF_GRANT_REPLAY)),
+        &access,
+        &ack_request(0xb1, grant_ref(&dev, &container)),
+        &[(
+            "SELECT count(*) FROM v2_tenant_root_key_grants WHERE acked_at IS NOT NULL",
+            1,
+        )],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &activate_path("0"),
+        &access,
+        &activate_request(0xb3, create.target.clone()),
+        &[
+            ("SELECT count(*) FROM v2_root_key_generations", 1),
+            (
+                "SELECT count(*) FROM v2_root_key_generations WHERE state = 'ACTIVE'",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+
+    // A root grant to a tenant-approved peer, and its revocation.
+    let peer = device(&server, OWNER, 0x7b, "active").await;
+    file_approval(&server, &dev, &peer, 0x7b).await;
+    let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
+    replayed_after_restart(
+        &mut server,
+        &root_grants_path(),
+        &access,
+        &root_grant_create_request(0xc4, &dev, &existing),
+        &[
+            ("SELECT count(*) FROM v2_tenant_root_key_grants", 2),
+            (
+                "SELECT count(*) FROM v2_tenant_root_key_grants
+                  WHERE grant_variant = 'ExistingRootGrant' AND revoked_at IS NULL",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &format!("{}/revoke", grant_path("0", &[0x91; 16])),
+        &access,
+        &root_revoke_request(
+            0xc5,
+            grant_ref(&dev, &existing),
+            RootGrantRevokeReason::CustodyRemoved,
+        ),
+        &[
+            ("SELECT count(*) FROM v2_tenant_root_key_grants", 2),
+            (
+                "SELECT count(*) FROM v2_tenant_root_key_grants
+                  WHERE grant_variant = 'ExistingRootGrant' AND revoked_at IS NOT NULL",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+
+    // Fleet generation 0: create, file and acknowledge its grants, revoke a
+    // superseded one, activate.
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    for (replay, capability) in [
+        (0xa7, Capability::FleetManage),
+        (0xa8, Capability::DeviceRevoke),
+    ] {
+        let grant = capability_grant(&dev, &dev.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let fkek0 = [0xe0; 32];
+    let gen0 = FleetGenerationRef {
+        tenant_id: TENANT,
+        server_instance_id: INSTANCE,
+        restore_epoch: 0,
+        fleet_id: FLEET,
+        generation: 0,
+        fkek_key_id: fkek0,
+    };
+    let device_grant = |replay: u8| {
+        let g = DeviceHpkeGrantV2 {
+            common: fleet_common(replay, 365),
+            fleet_id: FLEET,
+            fkek_key_id: fkek0,
+            generation: 0,
+            subject_account_id: OWNER,
+            subject_device_id: dev.id,
+            subject_signing_key_id: dev.signing_key_id,
+            recipient_hpke_key_id: dev.hpke_key_id,
+            hpke_encapped_key_bytes: vec![3; 32],
+            hpke_wrapped_fleet_key_bytes: vec![4; 48],
+        };
+        build_record(&dev.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    };
+    let recovery0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+        &RecoveryGrantV2 {
+            common: fleet_common(0xd1, 3650),
+            fleet_id: FLEET,
+            fkek_key_id: fkek0,
+            generation: 0,
+            recipient_root_key_id: shared::keys::root_key_id(&TRK),
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [5; 12],
+            wrapped_fleet_key_bytes: [6; 48],
+        }
+        .encode(),
+    );
+    let (device0, extra) = (device_grant(0xd0), device_grant(0xda));
+    let terms0 = FleetGenerationTerms {
+        generation: gen0,
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device0)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery0),
+        rotation: None,
+    };
+    let path = fleet_generation_path();
+    let ack0 = format!("{path}/0/ack");
+    let ack = |key: u8, variant: V, replay: u8, c: &[u8]| {
+        let grant = fleet_grant_ref(0, fkek0, variant, replay, c);
+        lifecycle_request(
+            OperationKind::FleetGrantAck,
+            key,
+            FleetKeyGrantAckV2 { grant }.encode(),
+        )
+    };
+    let create0 = FleetKeyGenerationCreateV2 {
+        terms: terms0,
+        root_generation: 0,
+    };
+    replayed_after_restart(
+        &mut server,
+        &path,
+        &access,
+        &lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create0.encode()),
+        &[
+            ("SELECT count(*) FROM v2_fleet_key_generations", 1),
+            (
+                "SELECT count(*) FROM v2_fleet_key_generations WHERE state = 'PREPARING'",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &fleet_grants_path(0),
+        &access,
+        &fleet_grant_request(0xb1, 0, fkek0, V::DeviceHpke, 0xd0, &device0),
+        &[
+            ("SELECT count(*) FROM v2_fleet_device_hpke_grants", 1),
+            (
+                "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE acked_at IS NULL",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &ack0,
+        &access,
+        &ack(0xb4, V::DeviceHpke, 0xd0, &device0),
+        &[
+            ("SELECT count(*) FROM v2_fleet_device_hpke_grants", 1),
+            (
+                "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE acked_at IS NOT NULL",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    for (key, variant, replay, c) in [
+        (0xb2, V::Recovery, 0xd1, &recovery0),
+        (0xbc, V::DeviceHpke, 0xda, &extra),
+    ] {
+        let request = fleet_grant_request(key, 0, fkek0, variant, replay, c);
+        let grants = fleet_grants_path(0);
+        assert_eq!(server.call(&grants, &access, Some(&request)).await.0, 201);
+        let request = ack(key + 0x10, variant, replay, c);
+        assert_eq!(server.call(&ack0, &access, Some(&request)).await.0, 201);
+    }
+    let superseded = FleetGrantRevokeV2 {
+        revocation: FleetGrantRevocation {
+            generation: gen0,
+            grant_variant: V::DeviceHpke,
+            replay_id: [0xda; 16],
+            signed_container_hash: container_hash(&extra),
+            reason_code: FleetGrantRevokeReason::Superseded,
+        },
+    };
+    replayed_after_restart(
+        &mut server,
+        &format!("{path}/0/grants/{}/revoke", hex(&[0xda; 16])),
+        &access,
+        &lifecycle_request(OperationKind::FleetGrantRevoke, 0xbf, superseded.encode()),
+        &[
+            ("SELECT count(*) FROM v2_fleet_device_hpke_grants", 2),
+            (
+                "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE revoked_at IS NOT NULL",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &format!("{path}/0/activate"),
+        &access,
+        &lifecycle_request(
+            OperationKind::FleetGenerationActivate,
+            0xb3,
+            FleetKeyGenerationActivateV2 { terms: terms0 }.encode(),
+        ),
+        &[
+            ("SELECT count(*) FROM v2_fleet_key_generations", 1),
+            (
+                "SELECT count(*) FROM v2_fleet_key_generations WHERE state = 'ACTIVE'",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+
+    // A pending device revoked by the custodian holding `device.revoke`.
+    let victim = device(&server, OWNER, 0x7d, "pending").await;
+    replayed_after_restart(
+        &mut server,
+        &device_revoke_path(&victim.id),
+        &access,
+        &revoke_request(0xa0, &revocation(&dev.sk, &victim, 0x90, 30)),
+        &[
+            ("SELECT count(*) FROM v2_device_revocations", 1),
+            (
+                "SELECT count(*) FROM v2_devices WHERE status = 'revoked'",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+
+    // Every closed kind is replayed above or names the test that replays it;
+    // a new kind does not compile until it is placed here.
+    for kind in OperationKind::ALL {
+        let here = match kind {
+            K::RootGenerationCreate
+            | K::RootGrantCreate
+            | K::RootGrantAck
+            | K::RootGenerationActivate
+            | K::RootGrantRevoke
+            | K::FleetGenerationCreate
+            | K::FleetGrantCreate
+            | K::FleetGrantAck
+            | K::FleetGenerationActivate
+            | K::FleetGrantRevoke
+            | K::DeviceRevoke => true,
+            // Replayed after a restart by v2_profiles.rs
+            // `every_profile_operation_replays_its_lost_response_after_a_restart`.
+            K::ProfilePublishCreate
+            | K::ProfileCheckout
+            | K::CreateUpload
+            | K::FinalizeUpload
+            | K::ReleaseLease => false,
+            // No server route: the launcher keeps it in its own database
+            // (L934-L936). Its replay across a reopen is src-tauri
+            // `team::sync::tests::an_unbind_tombstone_outlives_its_binding_and_replays_exactly`.
+            K::LocalUnbind => false,
+        };
+        assert_eq!(replayed.contains(&kind), here, "{}", kind.as_str());
+    }
+}

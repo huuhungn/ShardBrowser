@@ -3884,3 +3884,222 @@ async fn the_fleet_list_needs_fleet_wide_checkout_and_hides_other_fleets() {
         vec![P1]
     );
 }
+
+// ------------------------------------- response loss across a restart (G2-31) ---
+
+/// Every row of every table as SQL literals, sorted within each table.
+async fn all_rows(server: &Server) -> Vec<String> {
+    let pool = db(&server.data).await;
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut rows = Vec::new();
+    for table in tables {
+        let cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let cols: Vec<String> = cols.iter().map(|c| format!("quote(\"{c}\")")).collect();
+        let mut got: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT '{table}:' || {} FROM \"{table}\"",
+            cols.join(" || ',' || ")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        got.sort();
+        rows.extend(got);
+    }
+    pool.close().await;
+    rows
+}
+
+/// Sends `request`, whose response the client then loses, restarts the
+/// server on the same data, and retries the exact bytes: the retry gets the
+/// first status and body byte for byte, `state` still holds, and no row of
+/// any table changed. The same key with another nonce is refused. Records the
+/// kind in `replayed` and returns the first body.
+async fn replayed_after_restart(
+    server: &mut Server,
+    path: &str,
+    access: &str,
+    request: &[u8],
+    state: &[(&str, i64)],
+    replayed: &mut Vec<OperationKind>,
+) -> Vec<u8> {
+    let outer = IdempotentMutationRequestV2::parse(request).unwrap();
+    let kind = outer.operation_kind.as_str();
+    let (status, body) = server.call(path, access, request).await;
+    assert!(
+        (200..300).contains(&status),
+        "{kind}: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    for (query, want) in state {
+        assert_eq!(server.count(query).await, *want, "{kind}: {query}");
+    }
+    let rows = all_rows(server).await;
+
+    server.restart().await;
+    assert_eq!(
+        server.call(path, access, request).await,
+        (status, body.clone()),
+        "{kind}: the retry after a restart"
+    );
+    let other = IdempotentMutationRequestV2 {
+        client_request_nonce: [0x93; 16],
+        ..outer.clone()
+    }
+    .encode();
+    expect(server, path, access, &other, (409, "IDEMPOTENCY_MISMATCH")).await;
+    for (query, want) in state {
+        assert_eq!(server.count(query).await, *want, "{kind}: {query}");
+    }
+    assert_eq!(all_rows(server).await, rows, "{kind}: a row changed");
+    replayed.push(outer.operation_kind);
+    body
+}
+
+/// G2-31 for each profile kind: the real route performs the mutation, its
+/// response is lost, and after a restart the exact retry answers the stored
+/// bytes without a second profile, lease, fence or upload.
+#[tokio::test]
+async fn every_profile_operation_replays_its_lost_response_after_a_restart() {
+    use OperationKind as K;
+
+    let mut server = start("replay-matrix", 28267).await;
+    let (dev, access) = custodian(&mut server, 0x6c).await;
+    fleets(&server).await;
+    let c = (&dev, access.as_str());
+    use CapabilityScopeKind as S;
+    for (replay, capability, scope) in [
+        (0xa1, Capability::ProfilePublish, (S::Tenant, TENANT)),
+        (0xa2, Capability::ProfileCheckout, (S::Fleet, FLEET)),
+        (0xa3, Capability::ProfileCommit, (S::Fleet, FLEET)),
+    ] {
+        grant(&server, c, Some(&dev), replay, capability, scope).await;
+    }
+    let mut replayed = Vec::new();
+    let r = &mut replayed;
+
+    // Publish P1, then open and finalize its first upload.
+    let p = pref(P1);
+    let body = replayed_after_restart(
+        &mut server,
+        &publish_path(FLEET),
+        &access,
+        &publish(0x01, p),
+        &[
+            ("SELECT count(*) FROM v2_profiles", 1),
+            (
+                "SELECT count(*) FROM v2_profiles WHERE last_fencing_token = 1",
+                1,
+            ),
+            ("SELECT count(*) FROM v2_profile_leases", 1),
+        ],
+        r,
+    )
+    .await;
+    let first = granted(LeaseOrigin::PublishCreate, &body);
+    let s1 = snap(p, first.lease, &dev, 0x11, None);
+    let body = replayed_after_restart(
+        &mut server,
+        &uploads_path(P1),
+        &access,
+        &upload_req(0x02, &s1.terms),
+        &[
+            ("SELECT count(*) FROM v2_uploads", 1),
+            (
+                "SELECT count(*) FROM v2_uploads WHERE state = 'OPEN' AND committed_offset = 0",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+    let id = created(&body).upload_id;
+    server.send(&id, &access, &s1.object, 0).await;
+    replayed_after_restart(
+        &mut server,
+        &upload_path(&id, "finalize"),
+        &access,
+        &finalize_req(0x03, &commit_request(&s1.manifest, &dev, id, 0x31, 0x41)),
+        &[
+            ("SELECT count(*) FROM v2_uploads", 1),
+            ("SELECT count(*) FROM v2_uploads WHERE state = 'READY'", 1),
+            ("SELECT count(*) FROM v2_snapshots", 0),
+        ],
+        r,
+    )
+    .await;
+
+    // Publish P2, release its lease, and check it out again: fence 2.
+    let p2 = pref(P2);
+    let (status, body) = server
+        .call(&publish_path(FLEET), &access, &publish(0x04, p2))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let lease = granted(LeaseOrigin::PublishCreate, &body).lease;
+    replayed_after_restart(
+        &mut server,
+        &lease_path(P2, &lease.lease_id, "release"),
+        &access,
+        &release(0x05, p2, lease),
+        &[
+            ("SELECT count(*) FROM v2_profiles", 2),
+            ("SELECT count(*) FROM v2_profile_leases", 1),
+        ],
+        r,
+    )
+    .await;
+    replayed_after_restart(
+        &mut server,
+        &checkout_path(P2),
+        &access,
+        &checkout(0x06, p2, 0),
+        &[
+            ("SELECT count(*) FROM v2_profiles", 2),
+            ("SELECT count(*) FROM v2_profile_leases", 2),
+            (
+                "SELECT count(*) FROM v2_profiles WHERE last_fencing_token = 2",
+                1,
+            ),
+        ],
+        r,
+    )
+    .await;
+
+    // Every closed kind is replayed above or names the test that replays it;
+    // a new kind does not compile until it is placed here.
+    for kind in OperationKind::ALL {
+        let here = match kind {
+            K::ProfilePublishCreate
+            | K::ProfileCheckout
+            | K::CreateUpload
+            | K::FinalizeUpload
+            | K::ReleaseLease => true,
+            // Replayed after a restart by v2_auth.rs
+            // `every_custody_operation_replays_its_lost_response_after_a_restart`.
+            K::RootGenerationCreate
+            | K::RootGrantCreate
+            | K::RootGrantAck
+            | K::RootGenerationActivate
+            | K::RootGrantRevoke
+            | K::FleetGenerationCreate
+            | K::FleetGrantCreate
+            | K::FleetGrantAck
+            | K::FleetGenerationActivate
+            | K::FleetGrantRevoke
+            | K::DeviceRevoke => false,
+            // No server route: the launcher keeps it in its own database
+            // (L934-L936). Its replay across a reopen is src-tauri
+            // `team::sync::tests::an_unbind_tombstone_outlives_its_binding_and_replays_exactly`.
+            K::LocalUnbind => false,
+        };
+        assert_eq!(replayed.contains(&kind), here, "{}", kind.as_str());
+    }
+}
