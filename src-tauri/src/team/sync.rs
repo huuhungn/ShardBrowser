@@ -6018,6 +6018,60 @@ mod tests {
         assert!(w.blocked(GEN), "a custodian with no root holding");
     }
 
+    /// N1: a `compromised` revocation of a key this device already counted
+    /// as `lost` replaces the kept one, so the Q-18 block starts; a later
+    /// `retired` one never replaces a kept `compromised` one.
+    #[test]
+    fn a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks() {
+        let me = me();
+        let device_revoke = TenantCapabilityGrantV2 {
+            common: common(15),
+            subject: device_subject(&me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceRevoke,
+        };
+        let device_revoke = build_record(
+            &me.sk,
+            DOMAIN_TENANT_CAPABILITY_GRANT,
+            &device_revoke.encode(),
+        );
+        let revocation = |replay, reason_code| {
+            let r = DeviceRevocationV2 {
+                common: common(replay),
+                subject_account_id: [6; 16],
+                subject_device_id: [0x77; 16],
+                subject_signing_key_id: REVOKED,
+                subject_hpke_key_id: [0x78; 32],
+                reason_code,
+            };
+            build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &r.encode())
+        };
+        let lost = revocation(30, DeviceRevocationReason::Lost);
+        let compromised = revocation(31, DeviceRevocationReason::Compromised);
+        let retired = revocation(32, DeviceRevocationReason::Retired);
+        let w = world();
+        let counted = || w.count("SELECT counted_evaluation FROM trust_proven_revocations");
+        w.collect(2, &[0x52; 32], 70, vec![device_revoke.clone(), lost]);
+        assert!(!w.blocked(GEN), "lost stays advisory");
+        let first = counted();
+        w.collect(
+            3,
+            &[0x53; 32],
+            71,
+            vec![device_revoke.clone(), compromised.clone()],
+        );
+        assert!(w.blocked(GEN), "the compromise replaces the kept lost one");
+        assert_eq!(counted(), first, "the earliest count stays");
+        w.collect(
+            4,
+            &[0x54; 32],
+            72,
+            vec![device_revoke, compromised, retired],
+        );
+        assert!(w.blocked(GEN), "retired never replaces compromised");
+    }
+
     /// B3, Q-18 "In-flight commits": a COMMIT persisted while its upload is
     /// still OPEN, chunks unsent, when a compromise is counted, is aborted:
     /// no chunk, finalize or commit is sent, the upload is ABORTED, the
