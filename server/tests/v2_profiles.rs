@@ -702,6 +702,7 @@ fn revoke_request(issuer: &Device, subject: &Device, key: u8) -> Vec<u8> {
             .unwrap()
             .signed_container_hash(),
         exact_signed_revocation_container_bytes: container,
+        activations: Vec::new(),
     };
     outer(OperationKind::DeviceRevoke, key, request.encode())
 }

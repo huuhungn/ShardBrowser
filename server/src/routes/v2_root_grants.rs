@@ -502,143 +502,7 @@ pub async fn activate_root_generation(
         return Ok(cbor(StatusCode::CREATED, response));
     }
 
-    let allowed = if generation == 0 {
-        s.class == "root_setup" && sole_owner(&mut tx, &s).await?
-    } else {
-        holds_capability(&mut tx, v, &s, None, Capability::KeyRotate, now).await?
-    };
-    if !allowed {
-        return Err(AppError::Forbidden);
-    }
-    let row = sqlx::query(
-        "SELECT root_key_id, state, required_custodian_grant_count,
-                required_custodian_grant_set_hash, recovery_bundle_sha256
-           FROM v2_root_key_generations
-          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ?",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .bind(int(generation)?)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(not_found)?;
-    let terms_match = blob::<32>(&row, "root_key_id")? == t.root_key_id
-        && row.get::<Option<i64>, _>("required_custodian_grant_count")
-            == Some(i64::from(t.required_custodian_grant_count))
-        && row
-            .get::<Option<Vec<u8>>, _>("required_custodian_grant_set_hash")
-            .as_deref()
-            == Some(&t.required_custodian_grant_set_hash[..])
-        && row
-            .get::<Option<Vec<u8>>, _>("recovery_bundle_sha256")
-            .as_deref()
-            == Some(&t.recovery_bundle_sha256[..]);
-    if !terms_match {
-        return Err(column_mismatch(
-            "the activation names other terms than the generation was created with",
-        ));
-    }
-    // Generation 0 follows no root; a rotation follows exactly the ACTIVE one.
-    let follows = match activate.previous {
-        None => active_pointer(&mut tx, &tenant).await?.is_none(),
-        Some(p) => {
-            active_root(&mut tx, v, &tenant).await? == Some((p.root_generation, p.root_key_id))
-        }
-    };
-    if row.get::<String, _>("state") != RootGenerationState::Preparing.as_str() || !follows {
-        return Err(generation_mismatch(
-            "the generation is not the next to activate",
-        ));
-    }
-    // D-5: no retained FKEK is left reachable only through a RETIRED root.
-    if !fleet_keys_wrapped_under(&mut tx, v, &s, (generation, t.root_key_id), now).await? {
-        return Err(generation_mismatch(
-            "a fleet generation has no recovery grant under the new root",
-        ));
-    }
-
-    // The acknowledged, unrevoked grants of the generation, each read back,
-    // are exactly the required set (ADR 0002 D-4); the actor holds one.
-    let replays: Vec<Vec<u8>> = sqlx::query_scalar(
-        "SELECT replay_id FROM v2_tenant_root_key_grants
-          WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
-            AND acked_at IS NOT NULL AND revoked_at IS NULL",
-    )
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .bind(int(generation)?)
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut hashes = Vec::with_capacity(replays.len());
-    let mut actor_holds_one = false;
-    for replay in replays {
-        let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
-        let g = load_grant(&mut tx, v, &tenant, generation, &replay)
-            .await?
-            .ok_or_else(integrity)?;
-        if !inside_window(&g.grant, now)? {
-            continue;
-        }
-        actor_holds_one |= subject_of(&s, &g.grant).is_ok();
-        hashes.push(*g.record.record().signed_container_hash());
-    }
-    if hashes.len() != t.required_custodian_grant_count as usize
-        || root_custodian_grant_set_hash(&hashes) != Some(t.required_custodian_grant_set_hash)
-    {
-        return Err(generation_mismatch(
-            "the acknowledged grants are not the generation's required set",
-        ));
-    }
-    if !actor_holds_one {
-        return Err(AppError::Forbidden);
-    }
-
-    let activated_at = at(now);
-    let previous = activate
-        .previous
-        .map(|p| int(p.root_generation))
-        .transpose()?;
-    if let Some(p) = previous {
-        // Retire first: at most one root generation is ACTIVE (0011).
-        let retired = sqlx::query(
-            "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = ?
-              WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
-        )
-        .bind(&activated_at)
-        .bind(v.server_instance_id.as_slice())
-        .bind(tenant.as_slice())
-        .bind(p)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if retired != 1 {
-            return Err(integrity());
-        }
-    }
-    let activated = sqlx::query(
-        "UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = ?
-          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'PREPARING'",
-    )
-    .bind(&activated_at)
-    .bind(v.server_instance_id.as_slice())
-    .bind(tenant.as_slice())
-    .bind(int(generation)?)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    let moved = sqlx::query(
-        "UPDATE v2_tenants SET active_root_generation = ?
-          WHERE id = ? AND active_root_generation IS ?",
-    )
-    .bind(int(generation)?)
-    .bind(tenant.as_slice())
-    .bind(previous)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if (activated, moved) != (1, 1) {
-        return Err(integrity());
-    }
+    apply_root_activation(&mut tx, v, &s, &activate, now).await?;
     let activated_at_ms = u64::try_from(now).unwrap_or_default();
     let payload = TenantRootGenerationActivatedV2 {
         target: t.clone(),
@@ -667,8 +531,160 @@ pub async fn activate_root_generation(
         retained_until,
     )
     .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+/// Checks a root activation against live state and applies it, with its
+/// audit row, inside the caller's transaction: the activate route, and a
+/// device revocation carrying it (ADR 0002 Q-13). The caller has checked its
+/// tenant, instance and epoch.
+pub(super) async fn apply_root_activation(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    activate: &TenantRootGenerationActivateV2,
+    now: i64,
+) -> Result<(), AppError> {
+    let t = &activate.target;
+    let (tenant, generation) = (t.tenant_id, t.root_generation);
+    let allowed = if generation == 0 {
+        s.class == "root_setup" && sole_owner(conn, s).await?
+    } else {
+        holds_capability(conn, v, s, None, Capability::KeyRotate, now).await?
+    };
+    if !allowed {
+        return Err(AppError::Forbidden);
+    }
+    let row = sqlx::query(
+        "SELECT root_key_id, state, required_custodian_grant_count,
+                required_custodian_grant_set_hash, recovery_bundle_sha256
+           FROM v2_root_key_generations
+          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ?",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(int(generation)?)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(not_found)?;
+    let terms_match = blob::<32>(&row, "root_key_id")? == t.root_key_id
+        && row.get::<Option<i64>, _>("required_custodian_grant_count")
+            == Some(i64::from(t.required_custodian_grant_count))
+        && row
+            .get::<Option<Vec<u8>>, _>("required_custodian_grant_set_hash")
+            .as_deref()
+            == Some(&t.required_custodian_grant_set_hash[..])
+        && row
+            .get::<Option<Vec<u8>>, _>("recovery_bundle_sha256")
+            .as_deref()
+            == Some(&t.recovery_bundle_sha256[..]);
+    if !terms_match {
+        return Err(column_mismatch(
+            "the activation names other terms than the generation was created with",
+        ));
+    }
+    // Generation 0 follows no root; a rotation follows exactly the ACTIVE one.
+    let follows = match activate.previous {
+        None => active_pointer(conn, &tenant).await?.is_none(),
+        Some(p) => active_root(conn, v, &tenant).await? == Some((p.root_generation, p.root_key_id)),
+    };
+    if row.get::<String, _>("state") != RootGenerationState::Preparing.as_str() || !follows {
+        return Err(generation_mismatch(
+            "the generation is not the next to activate",
+        ));
+    }
+    // D-5: no retained FKEK is left reachable only through a RETIRED root.
+    if !fleet_keys_wrapped_under(conn, v, s, (generation, t.root_key_id), now).await? {
+        return Err(generation_mismatch(
+            "a fleet generation has no recovery grant under the new root",
+        ));
+    }
+
+    // The acknowledged, unrevoked grants of the generation, each read back,
+    // are exactly the required set (ADR 0002 D-4); the actor holds one.
+    let replays: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT replay_id FROM v2_tenant_root_key_grants
+          WHERE server_instance_id = ? AND tenant_id = ? AND root_generation = ?
+            AND acked_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(int(generation)?)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut hashes = Vec::with_capacity(replays.len());
+    let mut actor_holds_one = false;
+    for replay in replays {
+        let replay: [u8; 16] = replay.try_into().map_err(|_| integrity())?;
+        let g = load_grant(conn, v, &tenant, generation, &replay)
+            .await?
+            .ok_or_else(integrity)?;
+        if !inside_window(&g.grant, now)? {
+            continue;
+        }
+        actor_holds_one |= subject_of(s, &g.grant).is_ok();
+        hashes.push(*g.record.record().signed_container_hash());
+    }
+    if hashes.len() != t.required_custodian_grant_count as usize
+        || root_custodian_grant_set_hash(&hashes) != Some(t.required_custodian_grant_set_hash)
+    {
+        return Err(generation_mismatch(
+            "the acknowledged grants are not the generation's required set",
+        ));
+    }
+    if !actor_holds_one {
+        return Err(AppError::Forbidden);
+    }
+
+    let activated_at = at(now);
+    let previous = activate
+        .previous
+        .map(|p| int(p.root_generation))
+        .transpose()?;
+    if let Some(p) = previous {
+        // Retire first: at most one root generation is ACTIVE (0011).
+        let retired = sqlx::query(
+            "UPDATE v2_root_key_generations SET state = 'RETIRED', retired_at = ?
+              WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'ACTIVE'",
+        )
+        .bind(&activated_at)
+        .bind(v.server_instance_id.as_slice())
+        .bind(tenant.as_slice())
+        .bind(p)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if retired != 1 {
+            return Err(integrity());
+        }
+    }
+    let activated = sqlx::query(
+        "UPDATE v2_root_key_generations SET state = 'ACTIVE', activated_at = ?
+          WHERE server_instance_id = ? AND tenant_id = ? AND generation = ? AND state = 'PREPARING'",
+    )
+    .bind(&activated_at)
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(int(generation)?)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let moved = sqlx::query(
+        "UPDATE v2_tenants SET active_root_generation = ?
+          WHERE id = ? AND active_root_generation IS ?",
+    )
+    .bind(int(generation)?)
+    .bind(tenant.as_slice())
+    .bind(previous)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if (activated, moved) != (1, 1) {
+        return Err(integrity());
+    }
     audit(
-        &mut tx,
+        conn,
         &s.tenant_id,
         &s.account_id,
         &s.device_id,
@@ -676,9 +692,7 @@ pub async fn activate_root_generation(
         "root_generation",
         &t.root_key_id,
     )
-    .await?;
-    tx.commit().await?;
-    Ok(cbor(StatusCode::CREATED, response))
+    .await
 }
 
 async fn active_pointer(
