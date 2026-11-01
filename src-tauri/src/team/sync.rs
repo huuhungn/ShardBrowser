@@ -1503,6 +1503,7 @@ pub(crate) async fn push(
                         client,
                         access,
                         &mut db,
+                        dev,
                         &b,
                         lease,
                         &commit_op,
@@ -2434,12 +2435,15 @@ async fn fail_upload(
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
 /// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
 /// once a third of its TTL has passed on `clock`, which counts from `now`; the
-/// expiry the server then grants must be a plausible one.
+/// expiry the server then grants must be a plausible one. A compromise
+/// counted meanwhile (Q-18) aborts the upload before the next chunk or the
+/// finalize.
 #[allow(clippy::too_many_arguments)]
 async fn transfer(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
+    dev: &Device,
     b: &Bound,
     lease: LeaseRef,
     commit_op: &Op,
@@ -2468,6 +2472,10 @@ async fn transfer(
                  WHERE upload_local_id = ?1",
                 params![s.upload_local_id, wire(at)?],
             )?;
+            if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)? {
+                let e = anyhow!(code("sync.commitBlockedCompromised"));
+                return Err(fail_upload(client, access, db, b, lease, commit_op, e).await);
+            }
             if at == s.size {
                 return Ok(());
             }
@@ -3470,6 +3478,9 @@ mod tests {
         /// SQL another writer runs on the launcher's database when the next
         /// proof is served.
         on_proof: Option<String>,
+        /// SQL another writer runs on the launcher's database when the next
+        /// PATCH is served.
+        on_patch: Option<String>,
         /// `PROFILE` is not yet published: the listing omits it until a
         /// publish-create makes it.
         fresh: bool,
@@ -3969,6 +3980,10 @@ mod tests {
                     return reply(503, &[], Vec::new());
                 }
                 *n -= 1;
+            }
+            if let Some(sql) = f.on_patch.take() {
+                let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
             }
         }
         if take(&mut f.skip, tag) {
@@ -4811,6 +4826,11 @@ mod tests {
 
     /// A compromised revocation of a key the fleet's devices hold, counted.
     fn count_a_compromise(w: &World) {
+        assert_eq!(w.db().conn.execute(&a_compromise(w), []).unwrap(), 1);
+    }
+
+    /// The SQL that counts [`count_a_compromise`]'s revocation.
+    fn a_compromise(w: &World) -> String {
         let revocation = DeviceRevocationV2 {
             common: common(30),
             subject_account_id: [6; 16],
@@ -4820,14 +4840,14 @@ mod tests {
             reason_code: DeviceRevocationReason::Compromised,
         };
         let container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
-        w.db()
-            .conn
-            .execute(
-                "INSERT INTO trust_proven_revocations
-                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', 1, 0, ?4)",
-                params![hex(&INSTANCE), hex(&TENANT), hex(&[0x77; 32]), container],
-            )
-            .unwrap();
+        format!(
+            "INSERT INTO trust_proven_revocations
+             VALUES ('{}', '{}', '{}', 'DEVICE_REVOCATION', 1, 0, x'{}')",
+            hex(&INSTANCE),
+            hex(&TENANT),
+            hex(&[0x77; 32]),
+            hex(&container)
+        )
     }
 
     /// M-1: a stored publish is re-checked at every send, replays included. A
@@ -6017,6 +6037,35 @@ mod tests {
             w.sent("POST", "/checkout").len(),
             checkouts,
             "refused before checkout"
+        );
+    }
+
+    /// B3 mid-transfer: a compromise counted while the chunks go out stops
+    /// the upload before the next chunk or the finalize: it is ABORTED, no
+    /// finalize or commit is sent, the operation fails with the
+    /// commit-blocked code, and the lease is let go.
+    #[test]
+    fn a_compromise_counted_mid_transfer_aborts_the_upload() {
+        let w = world();
+        let sql = a_compromise(&w);
+        w.fake().on_patch = Some(sql);
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(w.fake().on_patch.is_none(), "counted during a PATCH");
+        assert_eq!(w.sent("PATCH", "").len(), 1, "no chunk after the count");
+        assert!(w.sent("POST", "/finalize").is_empty());
+        assert!(w.sent("POST", "/commit").is_empty());
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
         );
     }
 
