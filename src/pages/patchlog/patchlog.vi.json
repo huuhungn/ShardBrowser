@@ -1,6 +1,33 @@
 {
   "releases": [
     {
+      "version": "2.5.0",
+      "date": "2026-11-01",
+      "entries": [
+        {
+          "id": "team-keys-in-credential-store",
+          "title": "Khóa Team chuyển vào kho thông tin xác thực của Windows",
+          "lead": "Khóa Team giờ do Windows giữ thay vì nằm trong tệp, và team server có nền tảng cho việc chia sẻ hồ sơ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Khóa thiết bị và khóa fleet của Team sync giờ nằm trong Windows Credential Manager. Khóa từ các bản trước được chuyển vào đó ở lần mở đầu tiên. Nếu máy không có kho thông tin xác thực dùng được, thẻ Team sẽ cảnh báo rằng khóa không được kho này bảo vệ."
+            },
+            {
+              "type": "note",
+              "text": "Hãy cập nhật team server trước các launcher: bản này đăng ký thiết bị theo cách mà team server cũ không hỗ trợ. Launcher cũng không khởi động khi thư mục dữ liệu nằm trên ổ exFAT hoặc thư mục mạng; hãy chuyển nó sang một thư mục NTFS trên máy trước."
+            },
+            {
+              "type": "p",
+              "text": "Hồ sơ kéo về được kiểm tra chặt hơn, còn các màn hình để publish và chia sẻ hồ sơ trong team sẽ có ở bản sau."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.4.4",
       "date": "2026-10-25",
       "entries": [
