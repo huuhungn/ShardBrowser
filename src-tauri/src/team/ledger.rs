@@ -825,25 +825,26 @@ pub fn record_in(
                         if p.reason_code == DeviceRevocationReason::Compromised)
                 })
         };
+        let Some(k) = kept.as_deref() else {
+            tx.execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', ?4, ?5, ?6) ON CONFLICT DO NOTHING",
+                params![instance, tenant, revoked, evaluation, wire(now)?, c],
+            )?;
+            continue;
+        };
         // Q-18: only a compromised revocation replaces a kept one, and only a
         // kept one that is not (verifiably) compromised, so the block starts.
-        if kept.as_deref().is_some_and(|k| {
-            d.reason_code != DeviceRevocationReason::Compromised || kept_compromised(k)
-        }) {
+        if d.reason_code != DeviceRevocationReason::Compromised || kept_compromised(k) {
             continue;
         }
         // The earliest count stays: no generation made after it went to the
         // revoked key, and the holdings clauses still catch real exposure.
-        // REPLACE fires no delete trigger (recursive triggers are off) and no
-        // update trigger: the revocation is kept, only its container changes.
         tx.execute(
-            "INSERT OR REPLACE INTO trust_proven_revocations
-             SELECT ?1, ?2, ?3, 'DEVICE_REVOCATION', coalesce(min(counted_evaluation), ?4),
-               coalesce(min(counted_at_ms), ?5), ?6
-             FROM trust_proven_revocations
+            "UPDATE trust_proven_revocations SET exact_signed_container_bytes = ?4
              WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
                AND source = 'DEVICE_REVOCATION'",
-            params![instance, tenant, revoked, evaluation, wire(now)?, c],
+            params![instance, tenant, revoked, c],
         )?;
     }
     file_holdings(tx, binding, &holdings(binding, seen), evaluation)?;
