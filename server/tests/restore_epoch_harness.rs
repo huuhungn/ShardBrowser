@@ -2732,6 +2732,10 @@ async fn g2_55_a_read_only_start_on_a_network_data_directory_writes_no_count() {
     std::fs::write(d.identity.join(MANIFEST_FILE), b"junk").unwrap();
     assert_class(&d, "K5a", "L2260");
     let Some(unc) = loopback_of(&d.data) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set and the loopback administrative share is unreachable"
+        );
         eprintln!("no loopback administrative share on this machine; not checked");
         return;
     };
