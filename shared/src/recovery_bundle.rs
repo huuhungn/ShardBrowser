@@ -25,11 +25,11 @@ use crate::keys::{fill_random, root_key_id};
 use crate::passphrase::MIN_PASSPHRASE_LEN;
 
 pub const DOMAIN_RECOVERY_BUNDLE: &str = "shardx.recovery.bundle.v2";
-const DOMAIN_PLAINTEXT: &str = "shardx.recovery.bundle-plaintext.v2";
-const DOMAIN_READINESS_PROBE: &str = "shardx.recovery.readiness-probe.v2";
+pub const DOMAIN_PLAINTEXT: &str = "shardx.recovery.bundle-plaintext.v2";
+pub const DOMAIN_READINESS_PROBE: &str = "shardx.recovery.readiness-probe.v2";
 const VERSION: u64 = 2;
-const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-RECOVERY-BUNDLE-KDF-V2\0";
-const L_RECOVERY_BUNDLE: &str = "SHARDX-RECOVERY-BUNDLE-V2\0";
+pub const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-RECOVERY-BUNDLE-KDF-V2\0";
+pub const L_RECOVERY_BUNDLE: &str = "SHARDX-RECOVERY-BUNDLE-V2\0";
 
 /// Argon2id, version 0x13.
 pub(crate) const KDF_ARGON2ID: u64 = 1;

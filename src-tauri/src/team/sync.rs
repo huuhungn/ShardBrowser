@@ -1456,9 +1456,16 @@ pub(crate) async fn push(
             // this device verified; the checkout re-checks the one it names.
             if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
                 if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, g)? {
+                    mark_blocked(&db, local, false)?;
                     bail!(code("sync.commitBlockedCompromised"));
                 }
             }
+            // Q-18 "Release": the block no longer holds, so its code goes.
+            db.conn.execute(
+                "UPDATE profile_bindings SET last_error_code = NULL
+                 WHERE local_profile_id = ?1 AND last_error_code = ?2",
+                params![local, COMPROMISED],
+            )?;
             // A listing that shows a restore quarantines; the loop accepts it.
             if let Err(e) = checkout(client, access, &mut db, &b, now).await {
                 if !awaits_transition(&bound(&db, local)?) {
@@ -1483,22 +1490,17 @@ pub(crate) async fn push(
         let s = session(&db, &commit_op.op_id)?;
         match s.state.as_str() {
             "OPEN" => {
+                // Q-18 "In-flight commits": an upload still OPEN here never
+                // reached READY, so once a compromise is counted it is
+                // aborted and nothing more is sent, a stored finalize included.
+                if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)?
+                {
+                    return Err(abort_compromised(
+                        client, access, &mut db, &b, lease, &commit_op, &s,
+                    )
+                    .await);
+                }
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
-                    // Q-18 "In-flight commits": an upload still OPEN when a
-                    // compromise is counted is aborted and nothing more is
-                    // sent. A finalize already stored is replayed as sent.
-                    if ledger::commit_blocked(
-                        &db,
-                        &dev.pin.0,
-                        &dev.pin.1,
-                        &b.fleet,
-                        s.key_generation,
-                    )? {
-                        let e = anyhow!(code("sync.commitBlockedCompromised"));
-                        return Err(
-                            fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await,
-                        );
-                    }
                     transfer(
                         client,
                         access,
@@ -2139,6 +2141,7 @@ async fn seal_snapshot(
         Err(e) => return Err(abandon(client, access, db, b, lease, e).await),
     };
     if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &b.fleet, generation)? {
+        mark_blocked(db, &b.local, true)?;
         let e = anyhow!(code("sync.commitBlockedCompromised"));
         return Err(abandon(client, access, db, b, lease, e).await);
     }
@@ -2432,6 +2435,44 @@ async fn fail_upload(
     abandon(client, access, db, b, lease, err).await
 }
 
+/// Q-18 "Local state": the client-local `last_error_code` of a binding whose
+/// commit is blocked, never sent; cleared once the block is released.
+const COMPROMISED: &str = "ROTATION_REQUIRED_COMPROMISED";
+
+/// Marks `local` blocked; `dirty` when its lease goes without a commit, so
+/// the binding ends AVAILABLE with `dirty = 1` once the release lands.
+fn mark_blocked(db: &Db, local: &str, dirty: bool) -> Result<()> {
+    db.conn.execute(
+        "UPDATE profile_bindings SET last_error_code = ?2, dirty = max(dirty, ?3)
+         WHERE local_profile_id = ?1",
+        params![local, COMPROMISED, dirty],
+    )?;
+    Ok(())
+}
+
+/// Q-18 "In-flight commits": aborts the OPEN upload `s` of `commit_op` on
+/// the server while the lease is still held, then gives it up here.
+async fn abort_compromised(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    b: &Bound,
+    lease: LeaseRef,
+    commit_op: &Op,
+    s: &Session,
+) -> anyhow::Error {
+    let aborted = async {
+        let upload = decode_hex16(&s.upload, "upload_id")?;
+        ok(client.upload_abort(access, &upload).await?)
+    };
+    if let Err(e) = aborted.await {
+        eprintln!("[sync] abort: {e:#}");
+    }
+    let _ = mark_blocked(db, &b.local, true);
+    let err = anyhow!(code("sync.commitBlockedCompromised"));
+    fail_upload(client, access, db, b, lease, commit_op, err).await
+}
+
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
 /// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
 /// once a third of its TTL has passed on `clock`, which counts from `now`; the
@@ -2473,8 +2514,7 @@ async fn transfer(
                 params![s.upload_local_id, wire(at)?],
             )?;
             if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)? {
-                let e = anyhow!(code("sync.commitBlockedCompromised"));
-                return Err(fail_upload(client, access, db, b, lease, commit_op, e).await);
+                return Err(abort_compromised(client, access, db, b, lease, commit_op, s).await);
             }
             if at == s.size {
                 return Ok(());
@@ -3819,6 +3859,16 @@ mod tests {
                         ("upload-state", up.state.to_string()),
                     ];
                     reply(200, &headers, Vec::new())
+                }
+                ("DELETE", ["v2", "uploads", u]) => {
+                    let lease = self.lease;
+                    let up = self.uploads.get_mut(&id(u)).unwrap();
+                    match up.state {
+                        "ABORTED" => {}
+                        "OPEN" | "READY" if lease == Some(up.terms.lease) => up.state = "ABORTED",
+                        _ => return reply(409, &[], b"UPLOAD_STATE_CONFLICT".to_vec()),
+                    }
+                    reply(204, &[], Vec::new())
                 }
                 ("PATCH", ["v2", "uploads", u]) => {
                     let up = self.uploads.get_mut(&id(u)).unwrap();
@@ -6018,6 +6068,60 @@ mod tests {
         assert!(w.blocked(GEN), "a custodian with no root holding");
     }
 
+    /// N1: a `compromised` revocation of a key this device already counted
+    /// as `lost` replaces the kept one, so the Q-18 block starts; a later
+    /// `retired` one never replaces a kept `compromised` one.
+    #[test]
+    fn a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks() {
+        let me = me();
+        let device_revoke = TenantCapabilityGrantV2 {
+            common: common(15),
+            subject: device_subject(&me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceRevoke,
+        };
+        let device_revoke = build_record(
+            &me.sk,
+            DOMAIN_TENANT_CAPABILITY_GRANT,
+            &device_revoke.encode(),
+        );
+        let revocation = |replay, reason_code| {
+            let r = DeviceRevocationV2 {
+                common: common(replay),
+                subject_account_id: [6; 16],
+                subject_device_id: [0x77; 16],
+                subject_signing_key_id: REVOKED,
+                subject_hpke_key_id: [0x78; 32],
+                reason_code,
+            };
+            build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &r.encode())
+        };
+        let lost = revocation(30, DeviceRevocationReason::Lost);
+        let compromised = revocation(31, DeviceRevocationReason::Compromised);
+        let retired = revocation(32, DeviceRevocationReason::Retired);
+        let w = world();
+        let counted = || w.count("SELECT counted_evaluation FROM trust_proven_revocations");
+        w.collect(2, &[0x52; 32], 70, vec![device_revoke.clone(), lost]);
+        assert!(!w.blocked(GEN), "lost stays advisory");
+        let first = counted();
+        w.collect(
+            3,
+            &[0x53; 32],
+            71,
+            vec![device_revoke.clone(), compromised.clone()],
+        );
+        assert!(w.blocked(GEN), "the compromise replaces the kept lost one");
+        assert_eq!(counted(), first, "the earliest count stays");
+        w.collect(
+            4,
+            &[0x54; 32],
+            72,
+            vec![device_revoke, compromised, retired],
+        );
+        assert!(w.blocked(GEN), "retired never replaces compromised");
+    }
+
     /// B3, Q-18 "In-flight commits": a COMMIT persisted while its upload is
     /// still OPEN, chunks unsent, when a compromise is counted, is aborted:
     /// no chunk, finalize or commit is sent, the upload is ABORTED, the
@@ -6044,6 +6148,13 @@ mod tests {
             w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
             1
@@ -6081,6 +6192,13 @@ mod tests {
             w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
             1
@@ -6089,6 +6207,94 @@ mod tests {
             w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
             1
         );
+    }
+
+    /// N2: a FINALIZE stored but dropped unprocessed leaves the upload OPEN
+    /// (it never reached READY), so a compromise counted before the push
+    /// resumes aborts it: the stored finalize is not sent again, and no
+    /// commit is sent.
+    #[test]
+    fn a_stored_finalize_is_not_sent_once_a_compromise_is_counted() {
+        let w = world();
+        w.fake().skip.push("finalize");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'FINALIZE' AND state = 'PENDING'"
+            ),
+            1
+        );
+        count_a_compromise(&w);
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert_eq!(w.sent("POST", "/finalize").len(), 1, "only the dropped one");
+        assert!(w.sent("POST", "/commit").is_empty());
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
+            1
+        );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
+        );
+    }
+
+    /// Q-18 "Local state": a blocked push, aborted in flight or refused
+    /// before checkout, leaves the binding AVAILABLE and dirty with the
+    /// client-local `ROTATION_REQUIRED_COMPROMISED`; a push past the check
+    /// (the block released) drops the code, even if its checkout then fails.
+    #[test]
+    fn a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code() {
+        let state = |w: &World| {
+            w.db()
+                .conn
+                .query_row(
+                    "SELECT sync_state, dirty, last_error_code FROM profile_bindings",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let blocked = || ("AVAILABLE".to_string(), 1, Some(COMPROMISED.to_string()));
+        let w = world();
+        w.fake().on_patch = Some(a_compromise(&w));
+        w.push().unwrap_err();
+        assert_eq!(state(&w), blocked(), "aborted in flight");
+        drop(w);
+        let w = world();
+        w.db()
+            .conn
+            .execute("UPDATE profile_bindings SET dirty = 1", [])
+            .unwrap();
+        count_a_compromise(&w);
+        w.push().unwrap_err();
+        assert_eq!(state(&w), blocked(), "refused before checkout");
+        drop(w);
+        let w = world();
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET last_error_code = ?1",
+                [COMPROMISED],
+            )
+            .unwrap();
+        w.fake().refuse.push(("checkout", 503));
+        w.push().unwrap_err();
+        assert_eq!(state(&w).2, None, "released");
     }
 
     /// B2: an exposure this device saw stays, whatever a later collection of

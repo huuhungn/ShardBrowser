@@ -45,15 +45,15 @@ pub const DOMAIN_ROOT_GRANT_DESCRIPTOR: &str = "shardx.keys.tenant-root-grant-de
 pub const DOMAIN_FLEET_DEVICE_GRANT_DESCRIPTOR: &str =
     "shardx.keys.fleet-device-grant-descriptor.v2";
 pub(crate) const VERSION: u64 = 2;
-const L_REQUEST_HASH: &str = "SHARDX-IDEMPOTENT-MUTATION-REQUEST-V2\0";
-const L_RESPONSE_HASH: &str = "SHARDX-IDEMPOTENT-STORED-RESPONSE-V2\0";
+pub const L_REQUEST_HASH: &str = "SHARDX-IDEMPOTENT-MUTATION-REQUEST-V2\0";
+pub const L_RESPONSE_HASH: &str = "SHARDX-IDEMPOTENT-STORED-RESPONSE-V2\0";
 const MAX_OPERATION_PAYLOAD: usize = 262144;
 /// Plan 5.6.4 bound on an embedded signed grant container.
 pub const MAX_EMBEDDED_GRANT_BYTES: usize = 131072;
 const OUTCOME_SUCCEEDED: &str = "succeeded";
 pub(crate) const GENERATION_STATE_PREPARING: &str = "PREPARING";
-const L_ROOT_CUSTODIAN_SET: &str = "SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2\0";
-const L_FLEET_DEVICE_SET: &str = "SHARDX-FLEET-DEVICE-GRANT-SET-V2\0";
+pub const L_ROOT_CUSTODIAN_SET: &str = "SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2\0";
+pub const L_FLEET_DEVICE_SET: &str = "SHARDX-FLEET-DEVICE-GRANT-SET-V2\0";
 
 /// ADR 0002 D-4 `required_custodian_grant_set_hash`: the members' internal
 /// `signed_container_hash` values, sorted ascending, concatenated and domain

@@ -45,8 +45,8 @@ use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeMap;
 
 use shardx_core::authz_record::{
-    AuthorizationRecord, Capability, Payload, DOMAIN_DEVICE_REVOCATION,
-    DOMAIN_TENANT_ROOT_KEY_GRANT,
+    AuthorizationRecord, Capability, DeviceRevocationReason, DeviceRevocationV2, Payload,
+    DOMAIN_DEVICE_REVOCATION, DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shardx_core::canonical::{decode, encode, Value};
 use shardx_core::trust_chain::{
@@ -638,7 +638,6 @@ pub fn commit_blocked(
     fleet_id: &[u8; 16],
     generation: u64,
 ) -> Result<bool> {
-    use shardx_core::authz_record::DeviceRevocationReason;
     let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
     let (instance, tenant) = ids(binding);
     let kept = fleet_key_grant(db, binding, anchor, fleet_id, generation)?;
@@ -801,13 +800,52 @@ pub fn record_in(
             params![instance, tenant, hash],
             |row| row.get(0),
         )?;
-        if let Some(revoked) = counted(chain, binding, &keys, r, first_seen_ms as u64) {
+        let Some(d) = counted(chain, binding, &keys, r, first_seen_ms as u64) else {
+            continue;
+        };
+        let revoked = hex(&d.subject_signing_key_id);
+        let kept: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT exact_signed_container_bytes FROM trust_proven_revocations
+                 WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+                   AND source = 'DEVICE_REVOCATION'",
+                params![instance, tenant, revoked],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let kept_compromised = |k: &[u8]| {
+            AuthorizationRecord::parse(k)
+                .ok()
+                .and_then(|r| {
+                    let pk = keys.get(r.issuer_signing_key_id())?;
+                    r.verify_signature(pk).ok()
+                })
+                .is_some_and(|v| {
+                    matches!(v.payload(), Payload::DeviceRevocation(p)
+                        if p.reason_code == DeviceRevocationReason::Compromised)
+                })
+        };
+        let Some(k) = kept.as_deref() else {
             tx.execute(
                 "INSERT INTO trust_proven_revocations
                  VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', ?4, ?5, ?6) ON CONFLICT DO NOTHING",
-                params![instance, tenant, hex(&revoked), evaluation, wire(now)?, c],
+                params![instance, tenant, revoked, evaluation, wire(now)?, c],
             )?;
+            continue;
+        };
+        // Q-18: only a compromised revocation replaces a kept one, and only a
+        // kept one that is not (verifiably) compromised, so the block starts.
+        if d.reason_code != DeviceRevocationReason::Compromised || kept_compromised(k) {
+            continue;
         }
+        // The earliest count stays: no generation made after it went to the
+        // revoked key, and the holdings clauses still catch real exposure.
+        tx.execute(
+            "UPDATE trust_proven_revocations SET exact_signed_container_bytes = ?4
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+               AND source = 'DEVICE_REVOCATION'",
+            params![instance, tenant, revoked, c],
+        )?;
     }
     file_holdings(tx, binding, &holdings(binding, seen), evaluation)?;
     for (fleet, generation, fkek, root) in activations(chain, binding, seen) {
@@ -1009,7 +1047,7 @@ fn counted(
     keys: &BTreeMap<[u8; 32], [u8; 32]>,
     record: AuthorizationRecord,
     first_seen_ms: u64,
-) -> Option<[u8; 32]> {
+) -> Option<DeviceRevocationV2> {
     let issuer = *record.issuer_signing_key_id();
     let verified = record.verify_signature(keys.get(&issuer)?).ok()?;
     let Payload::DeviceRevocation(d) = verified.payload() else {
@@ -1026,7 +1064,7 @@ fn counted(
             t,
         )
         && chain.custodian_now(&issuer, first_seen_ms))
-    .then_some(d.subject_signing_key_id)
+    .then(|| d.clone())
 }
 
 #[cfg(test)]

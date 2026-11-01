@@ -30,7 +30,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -1265,6 +1265,26 @@ UPDATE schema_meta SET schema_version = 7, min_reader_version = 7,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 7 to 8 (Q-18): a counted `compromised` revocation replaces the
+/// kept container of a non-compromised one for the same key, so a proven
+/// revocation may change its container and nothing else.
+const MIGRATE_V8: &str = r#"
+DROP TRIGGER trust_proven_revocations_fixed;
+CREATE TRIGGER trust_proven_revocations_fixed BEFORE UPDATE ON trust_proven_revocations
+WHEN OLD.source IS NOT 'DEVICE_REVOCATION'
+  OR NEW.exact_signed_container_bytes IS NULL
+  OR NEW.server_instance_id IS NOT OLD.server_instance_id
+  OR NEW.tenant_id IS NOT OLD.tenant_id
+  OR NEW.signing_key_id IS NOT OLD.signing_key_id
+  OR NEW.source IS NOT OLD.source
+  OR NEW.counted_evaluation IS NOT OLD.counted_evaluation
+  OR NEW.counted_at_ms IS NOT OLD.counted_at_ms
+BEGIN SELECT RAISE(ABORT, 'a proven revocation changes only its container'); END;
+-- Same columns, same meaning; compatible() still refuses a newer schema_version.
+UPDATE schema_meta SET schema_version = 8, min_reader_version = 7,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -1334,6 +1354,9 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(6, 6, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V7).with_context(unreadable)?;
             super::ledger::backfill_holdings(&tx).with_context(unreadable)?;
+        }
+        if matches!(meta(&tx).as_deref(), Ok([(7, 7, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V8).with_context(unreadable)?;
         }
         if from.is_some_and(|v| v < SCHEMA_VERSION) {
             let broken: i64 = tx
@@ -1496,7 +1519,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (7, 7, "CLEAN".into()));
+        assert_eq!(meta, (8, 7, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -1516,8 +1539,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 8",
-            "UPDATE schema_meta SET min_reader_version = 8",
+            "UPDATE schema_meta SET schema_version = 9",
+            "UPDATE schema_meta SET min_reader_version = 9",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -1569,7 +1592,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(7, 7, "CLEAN".to_string())]);
+            assert_eq!(rows, [(8, 7, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -1602,7 +1625,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -1652,7 +1675,7 @@ mod tests {
         drop(v3(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("profile_bindings", 0),
                 ("server_origins", 0),
@@ -1877,7 +1900,7 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
             let kept: Vec<u8> = db
                 .conn
                 .query_row(
@@ -1992,7 +2015,8 @@ mod tests {
             .execute_batch(&format!(
                 "INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{k}', 'BOOTSTRAP', 0);
                  INSERT INTO trust_proven_revocations VALUES
-                   ('{i}', '{t}', '{k}', 'LOCAL_DISTRUST', 0, 0, NULL);
+                   ('{i}', '{t}', '{k}', 'LOCAL_DISTRUST', 0, 0, NULL),
+                   ('{i}', '{t}', '{k}', 'DEVICE_REVOCATION', 0, 0, x'01');
                  INSERT INTO trust_reported_revocations VALUES ('{i}', '{t}', 'd', '{i}', 5);
                  INSERT INTO trust_reported_device_revocations VALUES ('{i}', '{t}', '{i}', 5);
                  INSERT INTO trust_fleet_generations VALUES ('{i}', '{t}', '{i}', 3);
@@ -2012,6 +2036,10 @@ mod tests {
             "DELETE FROM trust_custodian_keys",
             "UPDATE trust_anchors SET anchor_key_id = lower(hex(zeroblob(32)))",
             "UPDATE trust_proven_revocations SET counted_evaluation = 9",
+            "UPDATE trust_proven_revocations SET counted_at_ms = 9, exact_signed_container_bytes = x'02'
+               WHERE source = 'DEVICE_REVOCATION'",
+            "UPDATE trust_proven_revocations SET signing_key_id = lower(hex(zeroblob(32)))
+               WHERE source = 'DEVICE_REVOCATION'",
             "DELETE FROM trust_proven_revocations",
             "DELETE FROM trust_reported_revocations",
             "UPDATE trust_reported_revocations SET revoked_at_ms = 6",
@@ -2022,6 +2050,29 @@ mod tests {
         ] {
             assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
         }
+        // Checks off, so only the trigger refuses: no container goes NULL, and
+        // a local distrust never gains one.
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = 1")
+            .unwrap();
+        for sql in [
+            "UPDATE trust_proven_revocations SET exact_signed_container_bytes = NULL
+               WHERE source = 'DEVICE_REVOCATION'",
+            "UPDATE trust_proven_revocations SET exact_signed_container_bytes = x'02'
+               WHERE source = 'LOCAL_DISTRUST'",
+        ] {
+            assert!(db.conn.execute_batch(sql).is_err(), "{sql}");
+        }
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = 0")
+            .unwrap();
+        // Q-18: a counted revocation may replace its container alone.
+        db.conn
+            .execute_batch(
+                "UPDATE trust_proven_revocations SET exact_signed_container_bytes = x'02'
+                 WHERE source = 'DEVICE_REVOCATION'",
+            )
+            .unwrap();
         // Moving forward is allowed.
         db.conn
             .execute_batch(
@@ -2139,6 +2190,13 @@ mod tests {
         assert!(before.len() > 10, "{}", before.len());
         let after = list(&Db::open_at(&path).unwrap().conn);
         for kept in &before {
+            // Version 8 replaces it on purpose (Q-18), under the same name.
+            if kept.1 == "trust_proven_revocations_fixed" {
+                assert!(after
+                    .iter()
+                    .any(|a| a.1 == kept.1 && a.2.contains("changes only its container")));
+                continue;
+            }
             assert!(after.contains(kept), "lost or changed {kept:?}");
         }
     }
@@ -2249,7 +2307,7 @@ mod tests {
         }
         for round in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(7, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
             for (table, cols, rows) in &had {
                 assert_eq!(&dump(&db.conn, table, cols), rows, "{table} round {round}");
             }

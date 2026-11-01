@@ -21,7 +21,7 @@ pub const BACKUP_SALT_LEN: usize = 16;
 
 /// Domain separator, so a passphrase stretched here can never collide with the
 /// same passphrase stretched for some other future purpose.
-const BACKUP_KDF_CONTEXT: &[u8] = b"SHARDX-LOCAL-BACKUP-FKEK-V1\0";
+pub const BACKUP_KDF_CONTEXT: &[u8] = b"SHARDX-LOCAL-BACKUP-FKEK-V1\0";
 
 /// Argon2id cost parameters.
 ///

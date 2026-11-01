@@ -30,7 +30,7 @@ pub const MAX_FLEET_ROTATION_GRANT_TTL_MS: u64 = 2_592_000_000;
 /// ADR 0002 D-6 `authorization_replay_retention` (90 days): how long past
 /// `not_after_ms` a derived ledger row such as a stored receipt is kept.
 pub const AUTHORIZATION_REPLAY_RETENTION_MS: u64 = 7_776_000_000;
-const REQUEST_HASH_LABEL: &[u8] = b"SHARDX-DEVICE-APPROVE-REQUEST-V2\0";
+pub const REQUEST_HASH_LABEL: &[u8] = b"SHARDX-DEVICE-APPROVE-REQUEST-V2\0";
 const OUTCOME_SUCCEEDED: &str = "succeeded";
 
 /// The closed receipt map. `confirmation_id` is present exactly for a D1

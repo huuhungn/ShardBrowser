@@ -49,7 +49,7 @@ pub const HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305: u16 = 1;
 pub const GRANT_CAPABILITY_ROOT_CUSTODY: &str = "root.custody";
 
 /// AAD label, per plan 5.6.4.
-const L_ROOT_GRANT_AAD: &[u8] = b"SHARDX-TENANT-ROOT-GRANT-AAD-V2\0";
+pub const L_ROOT_GRANT_AAD: &[u8] = b"SHARDX-TENANT-ROOT-GRANT-AAD-V2\0";
 
 /// Length of a tenant root key.
 pub const TRK_LEN: usize = 32;
@@ -340,7 +340,7 @@ pub fn open_trk(
 }
 
 /// AAD label of a `DeviceHpkeGrant` (ADR 0002 D-8).
-const L_FLEET_GRANT_AAD: &[u8] = b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0";
+pub const L_FLEET_GRANT_AAD: &[u8] = b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0";
 
 /// Exact `DeviceHpkeGrant` AAD (ADR 0002 D-8), the root grant's pattern:
 /// label + u32be length + info bytes.
@@ -622,6 +622,11 @@ mod tests {
         let info = root_grant_info(&scope_for(&pk));
         // Canonical encoding must round-trip through the strict decoder.
         c::assert_canonical_roundtrip(&info).expect("info is canonical");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            Sha256::digest(&info).to_vec(),
+            h("620962718813f10b5300922863f97c7b663acb2e559446fd53ab07f23deceb8a")
+        );
     }
 
     #[test]

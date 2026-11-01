@@ -583,7 +583,7 @@ pub const DOMAIN_LOCAL_UNBIND_RESPONSE: &str = "shardx.local.unbind-response.v2"
 pub const RECORD_TYPE_LOCAL_UNBOUND: &str = "LocalUnbindResponseV2";
 /// ADR 0002 D-7.
 pub const DOMAIN_LOCAL_BINDING_TOMBSTONE: &str = "shardx.local.binding-tombstone.v2";
-const L_LOCAL_BINDING_TOMBSTONE: &str = "SHARDX-LOCAL-BINDING-TOMBSTONE-V2\0";
+pub const L_LOCAL_BINDING_TOMBSTONE: &str = "SHARDX-LOCAL-BINDING-TOMBSTONE-V2\0";
 const UNBIND_OUTCOME_UNBOUND: &str = "unbound";
 /// L953 `server_id:Text(1,512)` and `local_profile_id:Text(1,255)`, in bytes.
 pub const MAX_SERVER_ID: usize = 512;
