@@ -1483,22 +1483,17 @@ pub(crate) async fn push(
         let s = session(&db, &commit_op.op_id)?;
         match s.state.as_str() {
             "OPEN" => {
+                // Q-18 "In-flight commits": an upload still OPEN here never
+                // reached READY, so once a compromise is counted it is
+                // aborted and nothing more is sent, a stored finalize included.
+                if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)?
+                {
+                    let e = anyhow!(code("sync.commitBlockedCompromised"));
+                    return Err(
+                        fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await,
+                    );
+                }
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
-                    // Q-18 "In-flight commits": an upload still OPEN when a
-                    // compromise is counted is aborted and nothing more is
-                    // sent. A finalize already stored is replayed as sent.
-                    if ledger::commit_blocked(
-                        &db,
-                        &dev.pin.0,
-                        &dev.pin.1,
-                        &b.fleet,
-                        s.key_generation,
-                    )? {
-                        let e = anyhow!(code("sync.commitBlockedCompromised"));
-                        return Err(
-                            fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await,
-                        );
-                    }
                     transfer(
                         client,
                         access,
@@ -6137,6 +6132,37 @@ mod tests {
         );
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
+            1
+        );
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
+        );
+    }
+
+    /// N2: a FINALIZE stored but dropped unprocessed leaves the upload OPEN
+    /// (it never reached READY), so a compromise counted before the push
+    /// resumes aborts it: the stored finalize is not sent again, and no
+    /// commit is sent.
+    #[test]
+    fn a_stored_finalize_is_not_sent_once_a_compromise_is_counted() {
+        let w = world();
+        w.fake().skip.push("finalize");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM operations WHERE kind = 'FINALIZE' AND state = 'PENDING'"
+            ),
+            1
+        );
+        count_a_compromise(&w);
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert_eq!(w.sent("POST", "/finalize").len(), 1, "only the dropped one");
+        assert!(w.sent("POST", "/commit").is_empty());
+        assert_eq!(
+            w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
         assert_eq!(
