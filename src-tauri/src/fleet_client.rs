@@ -1030,6 +1030,13 @@ impl FleetClient {
         self.exact(self.http.head(url), access_token).await
     }
 
+    /// `DELETE /v2/uploads/{upload_id}`: the lease holder aborts its OPEN or
+    /// READY upload (L1152).
+    pub async fn upload_abort(&self, access_token: &str, upload_id: &[u8; 16]) -> Result<Exact> {
+        let url = self.url(&format!("/v2/uploads/{}", hex(upload_id)));
+        self.exact(self.http.delete(url), access_token).await
+    }
+
     /// `PATCH /v2/uploads/{upload_id}`: one chunk at `offset` (L1149).
     pub async fn upload_patch(
         &self,

@@ -1488,10 +1488,10 @@ pub(crate) async fn push(
                 // aborted and nothing more is sent, a stored finalize included.
                 if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)?
                 {
-                    let e = anyhow!(code("sync.commitBlockedCompromised"));
-                    return Err(
-                        fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await,
-                    );
+                    return Err(abort_compromised(
+                        client, access, &mut db, &b, lease, &commit_op, &s,
+                    )
+                    .await);
                 }
                 if find(&db, local, "FINALIZE", Some(&lease), Some("PENDING"))?.is_none() {
                     transfer(
@@ -2427,6 +2427,28 @@ async fn fail_upload(
     abandon(client, access, db, b, lease, err).await
 }
 
+/// Q-18 "In-flight commits": aborts the OPEN upload `s` of `commit_op` on
+/// the server while the lease is still held, then gives it up here.
+async fn abort_compromised(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    b: &Bound,
+    lease: LeaseRef,
+    commit_op: &Op,
+    s: &Session,
+) -> anyhow::Error {
+    let aborted = async {
+        let upload = decode_hex16(&s.upload, "upload_id")?;
+        ok(client.upload_abort(access, &upload).await?)
+    };
+    if let Err(e) = aborted.await {
+        eprintln!("[sync] abort: {e:#}");
+    }
+    let err = anyhow!(code("sync.commitBlockedCompromised"));
+    fail_upload(client, access, db, b, lease, commit_op, err).await
+}
+
 /// G2-36: sends the spooled ciphertext from the offset `HEAD` reports, never
 /// a guessed one; an offset conflict asks `HEAD` again. The lease is renewed
 /// once a third of its TTL has passed on `clock`, which counts from `now`; the
@@ -2468,8 +2490,7 @@ async fn transfer(
                 params![s.upload_local_id, wire(at)?],
             )?;
             if ledger::commit_blocked(db, &dev.pin.0, &dev.pin.1, &b.fleet, s.key_generation)? {
-                let e = anyhow!(code("sync.commitBlockedCompromised"));
-                return Err(fail_upload(client, access, db, b, lease, commit_op, e).await);
+                return Err(abort_compromised(client, access, db, b, lease, commit_op, s).await);
             }
             if at == s.size {
                 return Ok(());
@@ -3814,6 +3835,16 @@ mod tests {
                         ("upload-state", up.state.to_string()),
                     ];
                     reply(200, &headers, Vec::new())
+                }
+                ("DELETE", ["v2", "uploads", u]) => {
+                    let lease = self.lease;
+                    let up = self.uploads.get_mut(&id(u)).unwrap();
+                    match up.state {
+                        "ABORTED" => {}
+                        "OPEN" | "READY" if lease == Some(up.terms.lease) => up.state = "ABORTED",
+                        _ => return reply(409, &[], b"UPLOAD_STATE_CONFLICT".to_vec()),
+                    }
+                    reply(204, &[], Vec::new())
                 }
                 ("PATCH", ["v2", "uploads", u]) => {
                     let up = self.uploads.get_mut(&id(u)).unwrap();
@@ -6093,6 +6124,13 @@ mod tests {
             w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
             1
@@ -6130,6 +6168,13 @@ mod tests {
             w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
         assert_eq!(
             w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'FAILED'"),
             1
@@ -6165,6 +6210,13 @@ mod tests {
             w.count("SELECT count(*) FROM upload_sessions WHERE state = 'ABORTED'"),
             1
         );
+        let server = w
+            .fake()
+            .uploads
+            .values()
+            .map(|u| u.state)
+            .collect::<Vec<_>>();
+        assert_eq!(server, ["ABORTED"], "aborted on the server too");
         assert_eq!(
             w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
             1
