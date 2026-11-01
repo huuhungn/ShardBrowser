@@ -30,8 +30,10 @@ Status counts: DONE 62, PENDING-MANUAL 1, FAIL 1.
 because the paths the findings affect are not reachable from the launcher UI
 or the Automation API in that release. The Team UI that exposes publish must
 not ship until findings B1 to B7 are fixed and both verifiers return PASS.
-B1 to B7 are now fixed on `main` (section 8); G2 stays FAIL until both
-verifiers return PASS on the fixed tree.
+B1 to B7 are now fixed on `main` (section 8). Both verifiers reran on
+9e29a2c6 on 2026-11-02 and returned FAIL again, Codex for two new findings
+(N1, N2) and Hermes for the skipped SMB branches; those are fixed here too.
+G2 stays FAIL until both verifiers return PASS on the fixed tree.
 
 - **G2-48 is PENDING-MANUAL.** The plan's gate paragraph (L2343) lists
   "credential-store persistence" among the uncertainties that make G2
@@ -42,7 +44,8 @@ verifiers return PASS on the fixed tree.
   decision, not on a verifier-confirmed full PASS.
 - **G2-64 is FAIL.** Codex found seven blocking findings (B1 to B7); Hermes
   produced no report. All seven are fixed and G2-14, G2-31, G2-42 and G2-61
-  are DONE again; the verifiers rerun on the fixed tree (section 8).
+  are DONE again. The 2026-11-02 rerun found N1 and N2 (Codex) and the
+  skipped SMB branches (Hermes); they are fixed as well (section 8).
 - Every other row is DONE in the sense the gap analyses use: a test or a
   recorded run exercises the row's PASS criterion. DONE is not a G2 gate PASS.
   Rows with a weaker form of evidence say so in their **Note**.
@@ -260,10 +263,10 @@ repository root. Section 6 gives the exact command of each row.
 | G2-58 | Ahead without evidence | L2265 | DONE | `server/tests/restore_epoch_harness.rs`: `l2263_g2_58_an_authority_ahead_without_exact_evidence_fails_closed`, `l2263_g2_58_only_a_live_custodian_transition_over_the_computed_leaves_prepares` | D-1, Q-33, Q-36 |
 | G2-59 | Behind/different instance | L2266 | DONE | `server/tests/restore_epoch_harness.rs`: `g2_55_the_k2_incident_output_prints_the_audit_failure_count`; code: `server/src/identity.rs` **Note:** The K2 incident output is asserted in the same test as G2-55; the other-instance and record-behind cases are asserted in `restore_epoch_harness.rs`. | D-1, Q-39 |
 | G2-60 | Reconciled E+1, retire bundle | L2267 | DONE | `server/tests/restore_epoch_harness.rs`: `l2265_g2_60_a_reconciled_epoch_retires_its_bundle_and_the_next_start_is_normal` | D-1, Q-28 |
-| G2-61 | Trust-boundary tests/docs | L2340 | DONE | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`, `a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet`; `src-tauri/src/team/sync.rs`: `a_compromised_revocation_blocks_commits_under_an_exposed_generation`, `a_compromised_custodian_blocks_every_fleet_through_the_root`, `an_exposure_survives_a_recollection_that_omits_its_grant`, `an_open_upload_is_aborted_once_a_compromise_is_counted`; files: `docs/trust-boundaries.md` **Note:** verifier findings B1 to B4 are fixed (PRs #216, #217, #218): the Q-18 commit block derives exposure through the root from every verified grant and never forgets one, push refuses before checkout and an OPEN upload is aborted, and a fleet-scoped `device.revoke` is counted. | Q-13, Q-14, Q-18 |
+| G2-61 | Trust-boundary tests/docs | L2340 | DONE | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`, `a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet`; `src-tauri/src/team/sync.rs`: `a_compromised_revocation_blocks_commits_under_an_exposed_generation`, `a_compromised_custodian_blocks_every_fleet_through_the_root`, `an_exposure_survives_a_recollection_that_omits_its_grant`, `an_open_upload_is_aborted_once_a_compromise_is_counted`, `a_compromise_counted_mid_transfer_aborts_the_upload`, `a_known_custodian_with_no_root_holding_blocks`, `a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks`, `a_stored_finalize_is_not_sent_once_a_compromise_is_counted`, `a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code`; `src-tauri/src/team/ledger.rs`: `a_version_6_file_with_unreadable_kept_pages_still_opens`; files: `docs/trust-boundaries.md` **Note:** verifier findings B1 to B4 are fixed (PRs #216, #217, #218, #223); N1 and N2 of the rerun are fixed too (section 8): the Q-18 commit block derives exposure through the root from every verified grant and never forgets one, push refuses before checkout and an OPEN upload is aborted, and a fleet-scoped `device.revoke` is counted. | Q-13, Q-14, Q-18 |
 | G2-62 | Dependencies (license, advisories, MSRV, feature graph) | L2336, L2343 | DONE | files: `docs/dependency-review.md`, `shared/Cargo.toml`, `server/Cargo.toml`, `src-tauri/Cargo.toml`, `shared/Cargo.lock`, `server/Cargo.lock`, `src-tauri/Cargo.lock` **Note:** Evidence is CI plus the manifests: rust-version 1.87 (shared), 1.89 (server), 1.88 (launcher), `cargo audit`, and the feature graph in docs/dependency-review.md. There is no unit test. | D-3, ADR 0003 |
 | G2-63 | Security review artifact | L2341 | DONE | `shared/tests/registry_pins.rs`: `every_signing_domain_is_distinct_and_versioned`, `every_hash_label_is_distinct_and_nul_terminated`, `the_numeric_registry_holds_the_reviewed_values`; `shared/src/keys.rs`: `g2_golden_vector_profile_label` (vector), `a_profile_label_opens_only_where_it_was_sealed`, `a_profile_label_has_a_length_bound_both_ways`, `a_profile_label_is_padded_to_a_bucket`, `a_profile_label_that_is_not_canonical_is_refused`; files: `docs/security-review-g2.md`, `docs/key-custody.md`, `docs/dependency-review.md` **Note:** Closed by this packet. `registry_pins.rs` also holds the sixteen request and response domains of the lease, upload, publish, unbind and fleet-profile-page maps. | D-8, Q-41 |
-| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | FAIL | `docs/g2-evidence/verifier-codex-2026-11-01.md` **Note:** FAIL. Codex returned FAIL with findings B1 to B7 on the head of PR #213 (2b35d84f); Hermes produced no report. B1 to B7 are fixed; see section 8. | Q-15, Q-32 |
+| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | FAIL | `docs/g2-evidence/verifier-codex-2026-11-01.md`, `docs/g2-evidence/verifier-codex-2026-11-02.md`, `docs/g2-evidence/verifier-hermes-2026-11-02.md` **Note:** FAIL. Codex returned FAIL with findings B1 to B7 on the head of PR #213 (2b35d84f); Hermes produced no report. B1 to B7 are fixed. The rerun on 9e29a2c6 returned FAIL from both verifiers; its findings are fixed; see section 8. | Q-15, Q-32 |
 
 ## 6. Commands per row
 
@@ -667,7 +670,7 @@ cargo test --locked --manifest-path server/Cargo.toml --test restore_epoch_harne
 ```
 cargo test --locked --manifest-path shared/Cargo.toml --lib -- a_snapshot_sealed_for_another_profile_is_refused every_single_byte_mutation_is_detected truncation_at_any_length_is_detected cross_envelope_frame_splice_is_rejected another_fleet_key_cannot_open_it grant_cannot_be_replayed_into_another_tenant_or_epoch tampering_with_the_stored_info_fails_the_open
 cargo test --locked --manifest-path shared/Cargo.toml --test backup_file_roundtrip -- the_ciphertext_does_not_contain_the_plaintext a_tampered_backup_body_is_refused a_truncated_backup_is_refused_and_leaves_the_destination_untouched
-cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- pull_refuses_another_profiles_snapshot push_seals_under_the_passphrase_even_with_a_cached_fleet_key a_server_delivered_fleet_key_is_counted_but_never_cached a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet a_compromised_revocation_blocks_commits_under_an_exposed_generation a_compromised_custodian_blocks_every_fleet_through_the_root an_exposure_survives_a_recollection_that_omits_its_grant an_open_upload_is_aborted_once_a_compromise_is_counted
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- pull_refuses_another_profiles_snapshot push_seals_under_the_passphrase_even_with_a_cached_fleet_key a_server_delivered_fleet_key_is_counted_but_never_cached a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet a_compromised_revocation_blocks_commits_under_an_exposed_generation a_compromised_custodian_blocks_every_fleet_through_the_root an_exposure_survives_a_recollection_that_omits_its_grant an_open_upload_is_aborted_once_a_compromise_is_counted a_compromise_counted_mid_transfer_aborts_the_upload a_known_custodian_with_no_root_holding_blocks a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks a_stored_finalize_is_not_sent_once_a_compromise_is_counted a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code a_version_6_file_with_unreadable_kept_pages_still_opens
 cargo test --locked --manifest-path server/Cargo.toml --test identity_authority -- an_interrupted_init_is_reported_and_never_repaired
 cargo test --locked --manifest-path server/Cargo.toml --bin shardx-team-server -- wrong_domain_hpke_ids_are_quarantined_once
 ```
@@ -769,6 +772,51 @@ forcing one replay to run its operation again makes them fail:
 - **B6, PR #220.** The owner chose to clarify the contract instead of
   rebuilding the tables: ADR Q-43.
 - **B7, PR #221.** A durable response-loss matrix over every operation kind.
+- **Review follow-ups, PR #223.** An unreadable kept evidence page no longer
+  fails the version 7 migration; a known custodian with no root holding
+  counts as holding every root; a compromise counted during the transfer
+  stops the upload before the next chunk or the finalize.
+
+### The rerun on 9e29a2c6 (2026-11-02)
+
+Both verifiers ran blind again, each in its own worktree with its own build
+directory, on `main` at 9e29a2c6. Hermes used `cx/gpt-6-astra`.
+
+- **Codex: FAIL** (`verifier-codex-2026-11-02.md`). It judged B4, B5 and B6
+  closed and B1, B2 and B7 fixed in source, but could not run their launcher
+  tests because its sandbox refuses DPAPI. It found two new defects, both
+  confirmed against the code:
+  - **N1 (high).** `trust_proven_revocations` kept the first counted
+    revocation of a key, so a later `compromised` revocation after a `lost`
+    one was dropped and never blocked commits. Fixed: local schema 8 lets a
+    counted compromised revocation replace a kept non-compromised container
+    by an explicit `UPDATE`; its trigger refuses any other change, and the
+    earliest count stays. Test:
+    `a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks`.
+  - **N2 (medium).** With a FINALIZE stored but never processed, a resumed
+    push skipped the OPEN-upload check and sent finalize and commit. Fixed:
+    an OPEN upload is aborted whether or not a FINALIZE is pending. Test:
+    `a_stored_finalize_is_not_sent_once_a_compromise_is_counted`.
+  - Also fixed from its B3 notes: the abort now sends
+    `DELETE /v2/uploads/{id}` so the server upload is `ABORTED` too, and the
+    launcher keeps `last_error_code = ROTATION_REQUIRED_COMPROMISED` on the
+    blocked binding until the block is released (ADR Q-18). Test:
+    `a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code`.
+  - Its coverage notes are addressed: `shared/tests/registry_pins.rs` now
+    holds every domain and label `shared` declares (D-8);
+    `info_bytes_match_g2_vector` now pins the hash it names; Q-43 states the
+    rounding of decimal or exponent TEXT above 2^53; the plan lines of G2-21,
+    G2-22, G2-25 and G2-30 are corrected.
+- **Hermes: FAIL** (`verifier-hermes-2026-11-02.md`). It judged B1 to B7
+  closed and ran every suite (shared 314, server 347, launcher 496 passed,
+  0 failed). It failed the gate only because the SMB branches of G2-49, G2-50
+  and G2-55 skipped on its machine. The owner chose CI as the SMB evidence:
+  the Windows job creates a share and sets `SHARDX_TEST_SMB_DIR`, and every
+  SMB test panics instead of skipping when that variable names an unreachable
+  share. The one test that used only the loopback administrative share,
+  `g2_55_a_read_only_start_on_a_network_data_directory_writes_no_count`, now
+  panics when `CI` is set and that share is unreachable.
+- ADR Q-32 asks for Hermes or Codex; the owner asked for both.
 
 ## 9. Accepted limits
 
@@ -791,8 +839,9 @@ confirm each is stated where claimed.
 - **Orphaned keys.** A key orphaned by an abandoned bootstrap run stays in the
   credential store (a new run never reuses it and nothing deletes it), and so
   does one left in a locked key file (`docs/security-review-g2.md`, Key storage).
-- Also recorded in the rows: the SMB tests run only where
-  `SHARDX_TEST_SMB_DIR` is set (G2-49, G2-50); the restore journal has no
+- Also recorded in the rows: outside CI the SMB tests run only where
+  `SHARDX_TEST_SMB_DIR` is set or the loopback administrative share is
+  reachable, and skip otherwise; in CI they cannot skip (G2-49, G2-50, G2-55); the restore journal has no
   production writer (G2-41); local backups keep p=1 (G2-46); zeroization is
   type-level evidence (G2-47).
 
