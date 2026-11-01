@@ -5,15 +5,17 @@ G2-64). It lists all 64 G2 rows with their plan line, status, evidence and the
 ADR decision that narrows them; the commands, toolchains and gates to
 reproduce the evidence; and a SHA-256 for every artifact it cites.
 
-- **Packet date:** 2026-11-01. **Code under review:** the head of PR #212
-  (`g2/trk-at-rest`, 5c1cd7b8), plus this packet (branch `g2/evidence-packet`).
+- **Packet date:** 2026-11-01. **Code under review:** `main` at fe8c8e36, which
+  carries the fixes for verifier findings B1 to B7 (section 8), plus this
+  refresh (branch `g2/evidence-b1-b7`). The first packet reviewed the head of
+  PR #212 (`g2/trk-at-rest`, 5c1cd7b8).
 - **Plan:** `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md`.
   The G2 rows are cited by plan line; lines after about L900 are 2 lower in
   older citations (test names such as `l2259_g2_54_...` keep the old numbers).
   The G2 gate paragraph is at L2343: every row needs reproducible evidence, then
   an independent verifier reads back commands, fixtures, versions and SHA-256
   and gives the verdict `PASS`.
-- **ADR:** `docs/adr/0002-g2-contract-decisions.md` as on `main` (Q-1 to Q-42).
+- **ADR:** `docs/adr/0002-g2-contract-decisions.md` as on `main` (Q-1 to Q-43).
   ADRs 0003 (envelope v2 and STREAM) and 0004 (credential store) are cited
   where a row depends on them.
 - **Row IDs** G2-01 to G2-64 are the numbering of the G2 gap analyses; the
@@ -21,13 +23,15 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
 
 ## Verdict of this packet
 
-Status counts: DONE 58, PARTIAL 4, PENDING-MANUAL 1, FAIL 1.
+Status counts: DONE 62, PENDING-MANUAL 1, FAIL 1.
 
 **G2 is FAIL.** The independent verifier returned FAIL on 2026-11-01
 (section 8). The owner decided to release v2.5.0 with G2 recorded as FAIL,
 because the paths the findings affect are not reachable from the launcher UI
 or the Automation API in that release. The Team UI that exposes publish must
 not ship until findings B1 to B7 are fixed and both verifiers return PASS.
+B1 to B7 are now fixed on `main` (section 8); G2 stays FAIL until both
+verifiers return PASS on the fixed tree.
 
 - **G2-48 is PENDING-MANUAL.** The plan's gate paragraph (L2343) lists
   "credential-store persistence" among the uncertainties that make G2
@@ -37,8 +41,8 @@ not ship until findings B1 to B7 are fixed and both verifiers return PASS.
   chose to release without waiting for it, so the release proceeds on an owner
   decision, not on a verifier-confirmed full PASS.
 - **G2-64 is FAIL.** Codex found seven blocking findings (B1 to B7); Hermes
-  produced no report. G2-14, G2-31, G2-42 and G2-61 are PARTIAL because of
-  them.
+  produced no report. All seven are fixed and G2-14, G2-31, G2-42 and G2-61
+  are DONE again; the verifiers rerun on the fixed tree (section 8).
 - Every other row is DONE in the sense the gap analyses use: a test or a
   recorded run exercises the row's PASS criterion. DONE is not a G2 gate PASS.
   Rows with a weaker form of evidence say so in their **Note**.
@@ -156,7 +160,8 @@ State read with `gh run list` on 2026-11-01, which the verifier must read again:
 | --- | --- | --- | --- |
 | da400ea0 | `team-custody-production` (PR #209 head) | 41247149446 | success |
 | 0387f3a1 | `main` | 41248535227 | success |
-| 5c1cd7b8 | `g2/trk-at-rest` (PR #212 head, the code this packet reviews) | 41254563480 | in progress when read |
+| 5c1cd7b8 | `g2/trk-at-rest` (PR #212 head, the code the first packet reviewed) | 41254563480 | in progress when read |
+| fe8c8e36 | `main` (B1 to B7 fixed, the code this refresh reviews) | 41328861443 | in progress when read |
 
 The commit that carries this packet has not been pushed, so it has no run yet. The release commit needs its own green run (Q-15).
 
@@ -208,7 +213,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-11 | EnvelopeIntentV2 | L590-L759 | DONE | `shared/src/envelope_v2.rs`: `the_intent_bounds_are_the_plans`, `every_envelope_intent_rule_is_enforced`, `the_intent_and_slot_must_be_the_ones_the_manifest_names`; `shared/src/snapshot_v2.rs`: `manifest_binds_a_sealed_envelope_v2_object`; `shared/src/envelope.rs`: `g2_golden_vector_intent` (vector), `g2_golden_vector_intent_genesis` (vector) | D-3, ADR 0003 |
 | G2-12 | RestoreEpochLeafV2 / inclusion proof | L590-L759 | DONE | `shared/src/restore_epoch.rs`: `golden_vectors` (vector), `leaf_roundtrips_and_refuses_contract_violations`, `leaf_sets_must_be_non_empty_sorted_and_unique`, `every_leaf_proves_and_every_tampering_fails`, `a_proof_binds_tenant_profile_instance_epochs_count_and_root`, `proof_parser_refuses_every_contract_violation`; `shared/src/envelope.rs`: `g2_golden_vectors_merkle_roots` (vector) | D-1, Q-1, Q-36 |
 | G2-13 | RestoreEpochTransitionV2 / signed | L590-L759 | DONE | `shared/src/restore_epoch.rs`: `transition_roundtrips_and_verifies`, `transition_payload_refuses_every_contract_violation`, `signed_transition_refuses_every_container_defect`, `transition_signature_binds_key_bytes_and_label` | D-1, Q-33, Q-36 |
-| G2-14 | IdempotentMutationRequestV2 | L910-L1054 | PARTIAL | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version`, `every_kind_has_one_scope_and_the_scope_must_match`, `hashes_and_closed_fields_are_checked`; `shared/src/fleet_lifecycle.rs`: `golden_vectors` (vector) **Note:** PARTIAL, verifier finding B5: the DEVICE_REVOKE map accepts only an empty `activations` array, while ADR Q-13 allows 0 to 65535 included activations. | Q-5, Q-13 |
+| G2-14 | IdempotentMutationRequestV2 | L910-L1054 | DONE | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version`, `every_kind_has_one_scope_and_the_scope_must_match`, `hashes_and_closed_fields_are_checked`, `device_revoke_maps_carry_one_container_and_roundtrip`; `server/tests/v2_auth.rs`: `a_revocation_commits_its_fleet_activation_or_nothing`, `a_revocation_commits_its_root_activation`; `shared/src/fleet_lifecycle.rs`: `golden_vectors` (vector) **Note:** verifier finding B5 is fixed (PR #219): the DEVICE_REVOKE map takes 0 to 65535 sorted, unique activations, and the server commits them with the revocation or not at all. | Q-5, Q-13 |
 | G2-15 | IdempotentStoredResponseV2 | L910-L1054 | DONE | `shared/src/mutation.rs`: `golden_vectors` (vector), `every_map_roundtrips_byte_for_byte`, `every_map_refuses_another_domain_or_version` | D-6, Q-34 |
 | G2-16 | ROOT_GENERATION_CREATE | L915 | DONE | `server/tests/v2_auth.rs`: `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`; code: `shared/src/mutation.rs`, `server/src/routes/v2_root.rs` | Q-5, D-4, D-9, Q-28 |
 | G2-17 | ROOT_GRANT_CREATE | L915 | DONE | `server/tests/v2_auth.rs`: `every_root_grant_column_is_compared_with_its_container_on_each_request_and_at_startup`; code: `shared/src/mutation.rs`, `server/src/routes/v2_root_grants.rs` | Q-5, D-4, D-9 |
@@ -225,7 +230,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-28 | HPKE TRK/FKEK grants | L1358 | DONE | `shared/src/grants.rs`: `the_pinned_suite_matches_the_rfc_9180_vectors` (vector), `info_bytes_match_g2_vector` (vector), `only_the_granted_device_can_open`, `grant_cannot_be_replayed_into_another_tenant_or_epoch`, `the_fleet_grant_aad_is_the_label_the_length_and_the_info`, `a_device_fleet_grant_opens_only_to_the_key_it_names`; `shared/src/fleet_grants.rs`: `a_sealed_fleet_key_opens_to_the_exact_same_bytes` | D-8, D-5 |
 | G2-29 | Signing suite | L2335 | DONE | `shared/src/authz_record.rs`: `signature_binds_issuer_and_bytes`, `small_order_issuer_key_never_verifies`; `shared/src/signing.rs`: `rfc8032_vectors_sign_and_verify_strictly` (vector), `speccheck_matrix_accepts_only_the_unambiguous_case` (vector), `g2_golden_vector_signed_container_hash` (vector) | D-8 |
 | G2-30 | Grant ALL-column + HPKE equality (seven under Q-13) | L2338, L2034, L2058 | DONE | `server/tests/v2_auth.rs`: `every_device_revocation_column_is_compared_with_its_container_on_each_request`, `the_startup_pass_quarantines_device_revocations_that_left_their_containers`, `a_revocation_of_another_instance_turns_v2_off_until_it_is_put_back`, `a_revocation_quarantined_at_runtime_refuses_the_trust_evidence`, `a_quarantined_revocation_that_verifies_again_is_served_again_after_a_restart`, `a_marked_row_swapped_for_another_genuine_revocation_is_not_served_again`, `a_corrupt_container_is_marked_without_a_hash_and_served_again_once_restored`, `the_trust_evidence_reports_a_revoked_device_from_its_record_not_its_column`, `a_revocation_row_swapped_for_another_genuine_one_does_not_answer_a_retry`, `a_revocation_row_the_startup_pass_cannot_read_turns_v2_off`; `src-tauri/src/team/sync.rs`: `a_kept_revocation_reloads_with_every_column_equal`; code: `shared/src/authz_record.rs`, `server/src/routes/v2_device_revoke.rs`, `server/src/integrity.rs`, `src-tauri/src/lib.rs` | Q-13, Q-38 |
-| G2-31 | Durable response-loss replay, every operation | L2338, L1424, L2048 | PARTIAL | `server/tests/v2_auth.rs`: `the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt`, `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`; `server/tests/v2_e2e.rs`: `v2_operations_replay_the_stored_response`; `server/tests/v2_profiles.rs`: `one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes`, `a_stored_response_naming_another_profile_or_lease_is_never_replayed`, `a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot`; `server/tests/restore_epoch_harness.rs`: `d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_replay`; `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly` **Note:** PARTIAL, verifier finding B7: the generic replay test uses a prototype operation; there is no per-operation durable response-loss matrix for the fleet lifecycle, root grant and device revocation routes. | Q-34, Q-42 |
+| G2-31 | Durable response-loss replay, every operation | L2338, L1424, L2048 | DONE | `server/tests/v2_auth.rs`: `the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt`, `the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response`, `every_custody_operation_replays_its_lost_response_after_a_restart`; `server/tests/v2_e2e.rs`: `v2_operations_replay_the_stored_response`; `server/tests/v2_profiles.rs`: `one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes`, `a_stored_response_naming_another_profile_or_lease_is_never_replayed`, `a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot`, `every_profile_operation_replays_its_lost_response_after_a_restart`; `server/tests/restore_epoch_harness.rs`: `d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_replay`; `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly` **Note:** verifier finding B7 is fixed (PR #221): the two `every_..._operation_replays_...` tests match on every `OperationKind`, so a new kind without a case does not compile; each case performs the real mutation, restarts the server on the same database, replays, and asserts the same bytes and no second resource. `LocalUnbind` never reaches the server and is covered by `an_unbind_tombstone_outlives_its_binding_and_replays_exactly`. | Q-34, Q-42 |
 | G2-32 | Local plan DDL + 11 probes | L1450-L2034, L2036 | DONE | `src-tauri/src/team/db.rs`: `a_new_database_reopens_with_its_schema_and_settings`, `a_version_5_file_with_data_moves_to_version_6_keeping_every_row`, `the_triggers_and_indexes_of_a_version_5_file_survive_version_6`; files: `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md` | Q-1, Q-37, Q-42 |
 | G2-33 | Probe 1 UNBIND tombstone | L2038 | DONE | `src-tauri/src/team/sync.rs`: `an_unbind_tombstone_outlives_its_binding_and_replays_exactly`, `an_unbind_cut_off_at_any_write_leaves_the_binding_whole`, `a_tombstone_that_no_longer_recomputes_is_never_returned`, `an_unbind_after_an_accepted_transition_keeps_its_evidence`; `src-tauri/src/team/db.rs`: `a_version_4_file_keeps_its_proofs_and_lets_them_outlive_the_binding` | D-7, Q-37 |
 | G2-34 | Probe 2 RELEASE replay after lease gone | L2039 | DONE | `src-tauri/src/team/sync.rs`: `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `an_unsent_cancel_release_is_retried_and_then_given_up`, `an_unreadable_release_reply_is_reported_and_replayed` | Q-34 |
@@ -236,7 +241,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-39 | Probe 7 local epoch transition/proof | L2044 | DONE | `src-tauri/src/team/sync.rs`: `a_verified_transition_moves_only_the_bindings_it_covers`, `a_transition_that_does_not_verify_keeps_the_binding_quarantined`, `a_restore_epoch_that_goes_back_is_a_rollback`, `a_cut_off_acceptance_leaves_the_binding_quarantined_until_reopen`, `a_leaf_head_is_accepted_only_as_a_new_head_is`, `a_pinned_head_is_read_back_only_as_the_bindings_own`, `a_lapsed_or_former_custodian_signs_no_transition`, `an_unbind_after_an_accepted_transition_keeps_its_evidence`, `a_binding_changed_during_acceptance_is_not_moved`, `a_lease_from_before_the_restore_is_released_before_the_binding_moves`, `a_custodian_not_yet_appointed_signs_no_transition`, `a_failed_release_of_an_old_lease_is_retried_as_stored` | Q-1, Q-36, Q-37 |
 | G2-40 | Probe 8 unknown/newer schema | L2045 | DONE | `src-tauri/src/team/db.rs`: `an_unknown_schema_fails_closed_and_is_left_as_it_was`, `a_database_held_in_wal_mode_is_refused` | none |
 | G2-41 | Probe 9 recovery/downgrade journals | L2046 | DONE | `src-tauri/src/team/journal.rs`: `every_restore_phase_survives_close_and_reopen_in_order`, `a_restore_phase_cannot_skip_repeat_or_leave_a_terminal_one`, `a_restore_journal_retires_only_when_settled`, `the_restore_resume_table_is_fixed_per_crash_point`, `a_clone_journal_walks_its_chain_with_every_phase_surviving_reopen`, `a_downgrade_phase_cannot_skip_and_a_rollback_is_always_open`, `the_resume_table_for_a_downgrade_journal_continues_every_open_phase`, `the_digests_survive_reopen_byte_for_byte`; `src-tauri/src/team/downgrade.rs`: `a_cut_off_at_every_step_resumes_to_the_same_finished_clone`, `a_process_killed_at_every_step_resumes_to_the_same_finished_clone`, `a_rollback_from_every_step_puts_the_original_back_and_frees_the_profile`, `a_readback_that_v0_1_28_would_not_agree_with_fails_the_flow`, `discovery_sees_every_place_v0_1_28_reads_and_nothing_in_the_archive`; `src-tauri/src/team/sync.rs`: `an_unbind_is_refused_while_a_lease_request_or_journal_is_open`; code: `src-tauri/src/lib.rs`; files: `scripts/g2-wp5-mutants.py` **Note:** The restore journal has no production writer (only the downgrade flow and tests write it); the full pre-v2 restore is journal and refusal states only. That is v0.2.x scope, not a probe 9 criterion. | Q-35, Q-40 |
-| G2-42 | Probe 10 local integer range | L2047 | PARTIAL | `src-tauri/src/team/db.rs`: `every_sync_integer_class_keeps_its_range_across_a_reopen`; `src-tauri/src/team/records.rs`: `every_integer_class_keeps_its_range_across_a_reopen` **Note:** PARTIAL, verifier finding B6: probe 10 says REAL and TEXT coercions are rejected before mutation, but both tests expect lossless coercions to succeed. | D-6 |
+| G2-42 | Probe 10 local integer range | L2047 | DONE | `src-tauri/src/team/db.rs`: `every_sync_integer_class_keeps_its_range_across_a_reopen`; `src-tauri/src/team/records.rs`: `every_integer_class_keeps_its_range_across_a_reopen` **Note:** verifier finding B6 is resolved by a contract decision, ADR Q-43 (PR #220): probe 10 refuses the coercions that would change a value; a lossless TEXT or REAL is stored as the exact INTEGER, which is what both tests assert. | D-6, Q-43 |
 | G2-43 | Probe 11 local mutation replay | L2048 | DONE | `src-tauri/src/team/sync.rs`: `every_publish_crash_point_resumes_with_the_exact_stored_bytes`, `a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key`, `a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte`, `every_crash_point_resumes_with_the_exact_stored_bytes`, `an_unbind_tombstone_outlives_its_binding_and_replays_exactly`, `a_release_whose_reply_was_lost_is_replayed_byte_for_byte`, `a_superseded_replay_ends_cleanly_and_the_next_push_starts_fresh` | D-7, Q-42 |
 | G2-44 | Server migrations fresh + upgrade | L2080-L2222 | DONE | `server/tests/v2_upgrade_chain.rs`: `the_plan_assertions_hold_on_a_reopened_fresh_file`, `the_plan_assertions_hold_on_a_reopened_v0_1_28_file_and_its_backup_restores`, `fixtures_1_to_4_hold_on_a_fresh_file`, `fixtures_1_to_4_hold_on_a_v0_1_28_file_after_its_upgrade`, `fixtures_1_to_4_hold_on_a_populated_0016_file_after_its_upgrade`, `m0017_root_generations_only_move_forward_on_upgraded_rows`, `m0033_the_quarantine_gains_a_container_hash_and_stays_append_only`; files: `server/tests/fixtures/plan_assert.sql`, `server/tests/fixtures/v0.1.28/0001_init.sql`, `server/tests/fixtures/v0.1.28/0002_lock_token_and_token_version.sql`, `server/tests/fixtures/v0.1.28/0003_clear_empty_lock_tokens.sql`, `scripts/g2-44-migration-mutants.py` | Q-34, Q-38 |
 | G2-45 | Unsigned i64 domain (server) | L2343, L2338 | DONE | `server/tests/v2_upgrade_chain.rs`: `m0030_upgraded_integer_columns_refuse_values_that_are_no_integers`; `server/tests/v2_integer_domain.rs`: `every_class_decodes_its_domain_ends_and_refuses_everything_else`, `every_class_column_stores_its_domain_ends_and_its_check_refuses_the_rest`, `every_integer_column_of_every_v2_table_has_an_upper_bound_check`, `every_integer_column_of_every_v2_table_refuses_a_value_that_is_no_integer`, `the_bound_scan_tells_bounded_from_unbounded_columns`; files: `server/migrations/0030_v2_integer_columns_hold_integers.sql` **Note:** The gap table cited lines 861-1238 of v2_integer_domain.rs, which has 622 lines; the tests are cited here by name. | D-6 |
@@ -255,10 +260,10 @@ repository root. Section 6 gives the exact command of each row.
 | G2-58 | Ahead without evidence | L2265 | DONE | `server/tests/restore_epoch_harness.rs`: `l2263_g2_58_an_authority_ahead_without_exact_evidence_fails_closed`, `l2263_g2_58_only_a_live_custodian_transition_over_the_computed_leaves_prepares` | D-1, Q-33, Q-36 |
 | G2-59 | Behind/different instance | L2266 | DONE | `server/tests/restore_epoch_harness.rs`: `g2_55_the_k2_incident_output_prints_the_audit_failure_count`; code: `server/src/identity.rs` **Note:** The K2 incident output is asserted in the same test as G2-55; the other-instance and record-behind cases are asserted in `restore_epoch_harness.rs`. | D-1, Q-39 |
 | G2-60 | Reconciled E+1, retire bundle | L2267 | DONE | `server/tests/restore_epoch_harness.rs`: `l2265_g2_60_a_reconciled_epoch_retires_its_bundle_and_the_next_start_is_normal` | D-1, Q-28 |
-| G2-61 | Trust-boundary tests/docs | L2340 | PARTIAL | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`; files: `docs/trust-boundaries.md` **Note:** PARTIAL, verifier findings B1 to B4: the Q-18 compromise commit block does not derive exposure through the root, can lose a known exposure when the same generation is collected again, resumes an OPEN upload instead of aborting it, and counts only tenant-scoped device revocations. | Q-13, Q-14 |
+| G2-61 | Trust-boundary tests/docs | L2340 | DONE | `shared/src/backup_file.rs`: `a_snapshot_sealed_for_another_profile_is_refused`, `another_fleet_key_cannot_open_it`; `shared/tests/backup_file_roundtrip.rs`: `the_ciphertext_does_not_contain_the_plaintext`, `a_tampered_backup_body_is_refused`, `a_truncated_backup_is_refused_and_leaves_the_destination_untouched`; `shared/src/backup.rs`: `every_single_byte_mutation_is_detected`, `truncation_at_any_length_is_detected`, `cross_envelope_frame_splice_is_rejected`; `src-tauri/src/sync_cmd.rs`: `pull_refuses_another_profiles_snapshot`, `push_seals_under_the_passphrase_even_with_a_cached_fleet_key`; `shared/src/grants.rs`: `grant_cannot_be_replayed_into_another_tenant_or_epoch`; `shared/src/fleet_grants.rs`: `tampering_with_the_stored_info_fails_the_open`; `server/tests/identity_authority.rs`: `an_interrupted_init_is_reported_and_never_repaired`; `server/src/integrity.rs`: `wrong_domain_hpke_ids_are_quarantined_once`; `src-tauri/src/lib.rs`: `a_server_delivered_fleet_key_is_counted_but_never_cached`, `a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet`; `src-tauri/src/team/sync.rs`: `a_compromised_revocation_blocks_commits_under_an_exposed_generation`, `a_compromised_custodian_blocks_every_fleet_through_the_root`, `an_exposure_survives_a_recollection_that_omits_its_grant`, `an_open_upload_is_aborted_once_a_compromise_is_counted`; files: `docs/trust-boundaries.md` **Note:** verifier findings B1 to B4 are fixed (PRs #216, #217, #218): the Q-18 commit block derives exposure through the root from every verified grant and never forgets one, push refuses before checkout and an OPEN upload is aborted, and a fleet-scoped `device.revoke` is counted. | Q-13, Q-14, Q-18 |
 | G2-62 | Dependencies (license, advisories, MSRV, feature graph) | L2336, L2343 | DONE | files: `docs/dependency-review.md`, `shared/Cargo.toml`, `server/Cargo.toml`, `src-tauri/Cargo.toml`, `shared/Cargo.lock`, `server/Cargo.lock`, `src-tauri/Cargo.lock` **Note:** Evidence is CI plus the manifests: rust-version 1.87 (shared), 1.89 (server), 1.88 (launcher), `cargo audit`, and the feature graph in docs/dependency-review.md. There is no unit test. | D-3, ADR 0003 |
 | G2-63 | Security review artifact | L2341 | DONE | `shared/tests/registry_pins.rs`: `every_signing_domain_is_distinct_and_versioned`, `every_hash_label_is_distinct_and_nul_terminated`, `the_numeric_registry_holds_the_reviewed_values`; `shared/src/keys.rs`: `g2_golden_vector_profile_label` (vector), `a_profile_label_opens_only_where_it_was_sealed`, `a_profile_label_has_a_length_bound_both_ways`, `a_profile_label_is_padded_to_a_bucket`, `a_profile_label_that_is_not_canonical_is_refused`; files: `docs/security-review-g2.md`, `docs/key-custody.md`, `docs/dependency-review.md` **Note:** Closed by this packet. `registry_pins.rs` also holds the sixteen request and response domains of the lease, upload, publish, unbind and fleet-profile-page maps. | D-8, Q-41 |
-| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | FAIL | `docs/g2-evidence/verifier-codex-2026-11-01.md` **Note:** FAIL. Codex returned FAIL with findings B1 to B7 on the head of PR #213 (2b35d84f); Hermes produced no report. See section 8. | Q-15, Q-32 |
+| G2-64 | Independent verifier PASS | L2343, L2512, L2565 | FAIL | `docs/g2-evidence/verifier-codex-2026-11-01.md` **Note:** FAIL. Codex returned FAIL with findings B1 to B7 on the head of PR #213 (2b35d84f); Hermes produced no report. B1 to B7 are fixed; see section 8. | Q-15, Q-32 |
 
 ## 6. Commands per row
 
@@ -355,7 +360,8 @@ cargo test --locked --manifest-path shared/Cargo.toml --lib -- transition_roundt
 #### G2-14
 
 ```
-cargo test --locked --manifest-path shared/Cargo.toml --lib -- mutation::tests::golden_vectors every_map_roundtrips_byte_for_byte every_map_refuses_another_domain_or_version every_kind_has_one_scope_and_the_scope_must_match hashes_and_closed_fields_are_checked fleet_lifecycle::tests::golden_vectors
+cargo test --locked --manifest-path shared/Cargo.toml --lib -- mutation::tests::golden_vectors every_map_roundtrips_byte_for_byte every_map_refuses_another_domain_or_version every_kind_has_one_scope_and_the_scope_must_match hashes_and_closed_fields_are_checked device_revoke_maps_carry_one_container_and_roundtrip fleet_lifecycle::tests::golden_vectors
+cargo test --locked --manifest-path server/Cargo.toml --test v2_auth -- a_revocation_commits_its_fleet_activation_or_nothing a_revocation_commits_its_root_activation
 ```
 
 #### G2-15
@@ -465,9 +471,9 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- a_kept_revocat
 #### G2-31
 
 ```
-cargo test --locked --manifest-path server/Cargo.toml --test v2_auth -- the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response
+cargo test --locked --manifest-path server/Cargo.toml --test v2_auth -- the_first_device_approves_itself_once_and_a_retry_gets_the_same_receipt the_first_device_bootstraps_the_root_once_and_a_retry_gets_the_same_response every_custody_operation_replays_its_lost_response_after_a_restart
 cargo test --locked --manifest-path server/Cargo.toml --test v2_e2e -- v2_operations_replay_the_stored_response
-cargo test --locked --manifest-path server/Cargo.toml --test v2_profiles -- one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes a_stored_response_naming_another_profile_or_lease_is_never_replayed a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot
+cargo test --locked --manifest-path server/Cargo.toml --test v2_profiles -- one_lease_and_one_fence_per_grant_and_every_retry_gets_the_stored_bytes a_stored_response_naming_another_profile_or_lease_is_never_replayed a_restart_reconciles_uploads_and_an_abort_frees_the_lease_slot every_profile_operation_replays_its_lost_response_after_a_restart
 cargo test --locked --manifest-path server/Cargo.toml --test restore_epoch_harness -- d1_replays_of_rolled_back_results_answer_as_superseded_and_kept_ones_replay
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- every_publish_crash_point_resumes_with_the_exact_stored_bytes a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte every_crash_point_resumes_with_the_exact_stored_bytes a_release_whose_reply_was_lost_is_replayed_byte_for_byte an_unbind_tombstone_outlives_its_binding_and_replays_exactly
 ```
@@ -661,7 +667,7 @@ cargo test --locked --manifest-path server/Cargo.toml --test restore_epoch_harne
 ```
 cargo test --locked --manifest-path shared/Cargo.toml --lib -- a_snapshot_sealed_for_another_profile_is_refused every_single_byte_mutation_is_detected truncation_at_any_length_is_detected cross_envelope_frame_splice_is_rejected another_fleet_key_cannot_open_it grant_cannot_be_replayed_into_another_tenant_or_epoch tampering_with_the_stored_info_fails_the_open
 cargo test --locked --manifest-path shared/Cargo.toml --test backup_file_roundtrip -- the_ciphertext_does_not_contain_the_plaintext a_tampered_backup_body_is_refused a_truncated_backup_is_refused_and_leaves_the_destination_untouched
-cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- pull_refuses_another_profiles_snapshot push_seals_under_the_passphrase_even_with_a_cached_fleet_key a_server_delivered_fleet_key_is_counted_but_never_cached
+cargo test --locked --manifest-path src-tauri/Cargo.toml --lib -- pull_refuses_another_profiles_snapshot push_seals_under_the_passphrase_even_with_a_cached_fleet_key a_server_delivered_fleet_key_is_counted_but_never_cached a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet a_compromised_revocation_blocks_commits_under_an_exposed_generation a_compromised_custodian_blocks_every_fleet_through_the_root an_exposure_survives_a_recollection_that_omits_its_grant an_open_upload_is_aborted_once_a_compromise_is_counted
 cargo test --locked --manifest-path server/Cargo.toml --test identity_authority -- an_interrupted_init_is_reported_and_never_repaired
 cargo test --locked --manifest-path server/Cargo.toml --bin shardx-team-server -- wrong_domain_hpke_ids_are_quarantined_once
 ```
@@ -737,6 +743,33 @@ what `main` received in PR #95 plus one review file under `docs/adr/reviews/`.
   UI that exposes publish must not ship until B1 to B7 are fixed and both
   verifiers return PASS on the fixed tree.
 
+### The fixes
+
+One PR per finding. B1 to B5 each add a regression test that failed on the
+code before the fix; B6 is a contract decision; B7 adds tests only, and
+forcing one replay to run its operation again makes them fail:
+
+- **B1 and B2, PR #216.** Every verified grant files who holds which root or
+  fleet generation in `trust_key_holdings`, and every fleet activation its
+  root generation in `trust_fleet_activations` (local schema 7); rows are
+  never updated or deleted, and existing databases are backfilled. The block
+  holds while a counted compromised key holds the fleet generation, or holds
+  the generation's root or any higher one, or the evidence is missing.
+  Tests: `a_compromised_custodian_blocks_every_fleet_through_the_root`,
+  `an_exposure_survives_a_recollection_that_omits_its_grant`.
+- **B4, PR #217.** A revocation counts when it is filed under the subject's
+  revocation scope: the fleet when every usable approval of the key names that
+  fleet, else the tenant. Test:
+  `a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet`.
+- **B3, PR #218.** Push refuses with `sync.commitBlockedCompromised` before
+  checkout, and a COMMIT whose upload is still OPEN aborts it and releases the
+  lease. Test: `an_open_upload_is_aborted_once_a_compromise_is_counted`.
+- **B5, PR #219.** DEVICE_REVOKE carries 0 to 65535 activations, and the server
+  applies them in the revocation's transaction.
+- **B6, PR #220.** The owner chose to clarify the contract instead of
+  rebuilding the tables: ADR Q-43.
+- **B7, PR #221.** A durable response-loss matrix over every operation kind.
+
 ## 9. Accepted limits
 
 These are decisions or deferrals, not open defects. The verifier should
@@ -766,8 +799,8 @@ confirm each is stated where claimed.
 ## 10. Rows that are not DONE, and what this packet found
 
 - **G2-48** PENDING-MANUAL, see section 7.
-- **G2-64** FAIL, and **G2-14**, **G2-31**, **G2-42**, **G2-61** PARTIAL,
-  see section 8.
+- **G2-64** FAIL, see section 8. **G2-14**, **G2-31**, **G2-42** and
+  **G2-61** were PARTIAL because of findings B1 to B7 and are DONE again.
 - **G2-63** was PARTIAL in the last gap table. It is DONE here: the provider
   and profile-label rows are in `docs/security-review-g2.md`; the two label
   constants are in `shared/tests/registry_pins.rs`; this packet is the
@@ -788,3 +821,5 @@ On 2026-11-01, on a Windows 11 machine with stable rustc 1.99.1, the commands of
 Also run: `cargo +stable fmt --check` on `shared`; `cargo +1.87.0 check --locked --all-targets` on `shared` (finished, no errors); `npm run test:i18n` (16 passed), `test:rust-strings` (3 passed) and `test:backend-locale` (7 passed); `python scripts/g2-evidence.py --write`, `--check` and `--self-test`.
 
 Not run here: clippy, the full `cargo test` of each crate, the MSRV checks of `server` (1.89) and the launcher (1.88), `cargo audit`, the macOS compile, the Playwright and MCP checks, and the SMB tests (no share was set up, so they skipped). Those rest on the CI runs in section 3 and the verifier.
+
+**Refresh for B1 to B7.** On 2026-11-01 the section 6 commands of G2-14, G2-31, G2-42 and G2-61 were run with `cargo test --locked -j 4` against the tree `main` received in PR #221 (the head of that PR): 13 invocations, all `ok`, 0 failed, 0 ignored. Each fix PR also ran the feedback gate (clippy `-D warnings` and the tests of `shared`, `server` and the launcher's `team` module) clean against a baseline taken on `main` before the first fix, except PR #220, which changed only the ADR and two test comments, and passed the five CI jobs of section 3 on its exact head before merge.
