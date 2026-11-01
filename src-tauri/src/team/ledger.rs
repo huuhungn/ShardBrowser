@@ -581,8 +581,9 @@ fn file_holdings(
 /// verified against, as first seen in that grant's evaluation. What earlier
 /// evidence held and a later collection replaced is gone; activations need
 /// the trust chain, so each fleet stays flagged until it is collected again.
+/// Kept pages that do not parse file nothing rather than fail the upgrade:
+/// that fleet has no activation either, so Q-18 keeps it blocked.
 pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
-    let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
     let rows: Vec<(String, String, i64, Vec<u8>)> = tx
         .prepare(
             "SELECT server_instance_id, tenant_id, verified_evaluation, evidence_pages
@@ -596,15 +597,18 @@ pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
             tenant_id: decode_hex16(&tenant, "tenant_id")?,
         };
         let Ok(Value::Array(items)) = decode(&pages) else {
-            return Err(unreadable());
+            continue;
         };
-        let pages = items
+        let Some(pages) = items
             .into_iter()
             .map(|item| match item {
-                Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).map_err(|_| unreadable()),
-                _ => Err(unreadable()),
+                Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).ok(),
+                _ => None,
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
         file_holdings(tx, &binding, &holdings(&binding, &pages), evaluation)?;
     }
     Ok(())
@@ -622,7 +626,8 @@ pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
 ///   generation's activation evidence binds, or any root generation above it,
 ///   PREPARING included. Generation 0 has no `RotationGrant`, so its range
 ///   starts at the first root generation. Missing activation evidence counts
-///   as flagged.
+///   as flagged, and so does a revoked key this device knows as a custodian
+///   but has no root holding filed for.
 ///
 /// A revocation whose reason this device cannot verify counts as
 /// `compromised`.
@@ -705,10 +710,17 @@ pub fn commit_blocked(
         let Some(bound) = bound else {
             return Ok(true);
         };
+        // A known custodian with no root holding filed (a version 6 file
+        // kept no holdings) holds every root generation: missing evidence.
         let held: bool = db.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM trust_key_holdings
                WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
-                 AND ((fleet_id = ?4 AND generation = ?5) OR (fleet_id = '' AND generation >= ?6)))",
+                 AND ((fleet_id = ?4 AND generation = ?5) OR (fleet_id = '' AND generation >= ?6)))
+             OR (EXISTS (SELECT 1 FROM trust_custodian_keys
+                   WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)
+                 AND NOT EXISTS (SELECT 1 FROM trust_key_holdings
+                   WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+                     AND fleet_id = ''))",
             params![
                 instance,
                 tenant,
@@ -1284,6 +1296,47 @@ mod tests {
             .execute("DELETE FROM trust_key_holdings", [])
             .unwrap_err();
         assert!(err.to_string().contains("never forgotten"), "{err}");
+    }
+
+    /// A version 6 file whose kept evidence pages do not parse still opens:
+    /// that grant files no holding and no activation, so Q-18 keeps its fleet
+    /// blocked, and the other kept grants are backfilled as usual.
+    #[test]
+    fn a_version_6_file_with_unreadable_kept_pages_still_opens() {
+        let d = Ed25519SigningKey::from_bytes(&[2; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open_at(&path).unwrap();
+        let (i, t) = ids(&B);
+        let pages = encode(&Value::Array(vec![Value::Bytes(
+            page(&[&d], vec![extending(&d, &d, 1, L)]).encode(),
+        )]));
+        db.conn
+            .execute_batch(&format!(
+                "DROP TABLE trust_key_holdings;
+                 DROP TABLE trust_fleet_activations;
+                 UPDATE schema_meta SET schema_version = 6, min_reader_version = 6;
+                 INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{a}', 'BOOTSTRAP', 0);
+                 INSERT INTO trust_evaluations VALUES (4, '{i}', '{t}', 0);",
+                a = hex(&id(&d)),
+            ))
+            .unwrap();
+        for (fleet, pages) in [
+            ("44".repeat(16), b"garbage".to_vec()),
+            ("45".repeat(16), pages),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO trust_fleet_key_grants VALUES (?1, ?2, ?3, 1, ?4, 4, x'ab', ?5)",
+                    params![i, t, fleet, "cd".repeat(32), pages],
+                )
+                .unwrap();
+        }
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let count = |sql: &str| -> i64 { db.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM trust_key_holdings"), 1);
+        assert_eq!(count("SELECT count(*) FROM trust_fleet_activations"), 0);
     }
 
     /// L-2: the instance reached through a second origin (another URL) files
