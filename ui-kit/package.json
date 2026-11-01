@@ -75,6 +75,7 @@
     "@hugeicons/react": "^1.1.9"
   },
   "overrides": {
-    "@parcel/watcher": "^2.6.0"
+    "@parcel/watcher": "^2.6.0",
+    "minimatch": "^11.0.1"
   }
 }
