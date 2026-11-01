@@ -5914,12 +5914,293 @@ fn revoke_request(key: u8, container: &[u8]) -> Vec<u8> {
     let request = shared::mutation::DeviceRevokeRequestV2 {
         signed_container_hash: container_hash(container),
         exact_signed_revocation_container_bytes: container.to_vec(),
+        activations: Vec::new(),
     };
     lifecycle_request(OperationKind::DeviceRevoke, key, request.encode())
 }
 
 fn device_revoke_path(device: &[u8; 16]) -> String {
     format!("/v2/devices/{}/revoke", hex(device))
+}
+
+/// A revoke request carrying `activations`, each the exact payload bytes of
+/// the standalone activation request (ADR 0002 Q-13).
+fn revoke_request_with(key: u8, container: &[u8], activations: &[&[u8]]) -> Vec<u8> {
+    use shared::canonical::{self as c, Value as V};
+    let request = shared::mutation::DeviceRevokeRequestV2 {
+        signed_container_hash: container_hash(container),
+        exact_signed_revocation_container_bytes: container.to_vec(),
+        activations: Vec::new(),
+    };
+    let Ok(V::Map(mut map)) = c::decode(&request.encode()) else {
+        panic!("not a map")
+    };
+    map.retain(|(k, _)| k != "activations");
+    map.push((
+        "activations".into(),
+        V::Array(activations.iter().map(|a| c::b(a)).collect()),
+    ));
+    lifecycle_request(OperationKind::DeviceRevoke, key, c::encode(&V::Map(map)))
+}
+
+/// Q-13: a revocation carrying a fleet activation commits both or neither;
+/// the activation is checked as if it were sent alone.
+#[tokio::test]
+async fn a_revocation_commits_its_fleet_activation_or_nothing() {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationActivateV2, FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let mut server = start("q13-revoke-fleet-activation", 28511).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    for (replay, capability) in [
+        (0xa7, Capability::FleetManage),
+        (0xa8, Capability::DeviceRevoke),
+    ] {
+        let grant = capability_grant(&dev, &dev.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let pending = device(&server, OWNER, 0x7b, "pending").await;
+    session(&server, &pending).await;
+
+    let fkek = [0xe0; 32];
+    let device0 = DeviceHpkeGrantV2 {
+        common: fleet_common(0xd0, 365),
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: dev.id,
+        subject_signing_key_id: dev.signing_key_id,
+        recipient_hpke_key_id: dev.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let device0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        &device0.encode(),
+    );
+    let recovery0 = RecoveryGrantV2 {
+        common: fleet_common(0xd1, 3650),
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 0,
+        recipient_root_key_id: shared::keys::root_key_id(&TRK),
+        recipient_root_generation: 0,
+        root_wrap_nonce_bytes: [5; 12],
+        wrapped_fleet_key_bytes: [6; 48],
+    };
+    let recovery0 = build_record(
+        &dev.sk,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+        &recovery0.encode(),
+    );
+    let terms = FleetGenerationTerms {
+        generation: FleetGenerationRef {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            fleet_id: FLEET,
+            generation: 0,
+            fkek_key_id: fkek,
+        },
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device0)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery0),
+        rotation: None,
+    };
+    let create = FleetKeyGenerationCreateV2 {
+        terms,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create.encode());
+    assert_eq!(
+        server
+            .call(&fleet_generation_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let ack_path = format!("{}/0/ack", fleet_generation_path());
+    for (key, variant, replay, container) in [
+        (0xb1, V::DeviceHpke, 0xd0, &device0),
+        (0xb2, V::Recovery, 0xd1, &recovery0),
+    ] {
+        let request = fleet_grant_request(key, 0, fkek, variant, replay, container);
+        assert_eq!(
+            server
+                .call(&fleet_grants_path(0), &access, Some(&request))
+                .await
+                .0,
+            201
+        );
+    }
+    let ack = |key: u8, variant: V, replay: u8, container: &[u8]| {
+        let grant = fleet_grant_ref(0, fkek, variant, replay, container);
+        lifecycle_request(
+            OperationKind::FleetGrantAck,
+            key,
+            FleetKeyGrantAckV2 { grant }.encode(),
+        )
+    };
+    let device_ack = ack(0xb3, V::DeviceHpke, 0xd0, &device0);
+    assert_eq!(
+        server.call(&ack_path, &access, Some(&device_ack)).await.0,
+        201
+    );
+
+    let path = device_revoke_path(&pending.id);
+    let good = revocation(&dev.sk, &pending, 0x90, 30);
+    let activation = FleetKeyGenerationActivateV2 { terms }.encode();
+    let state = |s: &str| {
+        format!(
+            "SELECT count(*) FROM v2_fleet_key_generations WHERE generation = 0 AND state = '{s}'"
+        )
+    };
+    let live_sessions = format!(
+        "SELECT count(*) FROM v2_sessions WHERE device_id = X'{}' AND revoked_at_ms IS NULL",
+        hex(&pending.id)
+    );
+
+    // The recovery grant is unacknowledged: the activation fails as it
+    // would alone, and the revocation is not filed either.
+    let (status, body) = server
+        .call(
+            &path,
+            &access,
+            Some(&revoke_request_with(0xc0, &good, &[&activation])),
+        )
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "FLEET_GRANTS_INCOMPLETE")
+    );
+    for (query, want) in [
+        ("SELECT count(*) FROM v2_device_revocations".to_string(), 0),
+        (state("PREPARING"), 1),
+        (live_sessions.clone(), 1),
+        (
+            format!(
+                "SELECT count(*) FROM v2_devices WHERE status = 'revoked' AND id = X'{}'",
+                hex(&pending.id)
+            ),
+            0,
+        ),
+    ] {
+        assert_eq!(server.count(&query).await, want, "{query}");
+    }
+
+    // Once the set is complete both commit, and a retry gets the same bytes.
+    let recovery_ack = ack(0xb4, V::Recovery, 0xd1, &recovery0);
+    assert_eq!(
+        server.call(&ack_path, &access, Some(&recovery_ack)).await.0,
+        201
+    );
+    let request = revoke_request_with(0xc1, &good, &[&activation]);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.call(&path, &access, Some(&request)).await,
+        (201, body)
+    );
+    for (query, want) in [
+        ("SELECT count(*) FROM v2_device_revocations".to_string(), 1),
+        (state("ACTIVE"), 1),
+        (live_sessions, 0),
+        (
+            "SELECT count(*) FROM v2_audit_events
+              WHERE action = 'fleet.key_generation.activate'"
+                .to_string(),
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(&query).await, want, "{query}");
+    }
+}
+
+/// Q-13: a revocation carrying a root rotation's activation commits both.
+#[tokio::test]
+async fn a_revocation_commits_its_root_activation() {
+    let mut server = start("q13-revoke-root-activation", 28512).await;
+    let (a, access, _) = custodian(&mut server, 0x6e).await;
+    for (replay, capability) in [
+        (0xc3, Capability::KeyRotate),
+        (0xc4, Capability::DeviceRevoke),
+    ] {
+        let grant = capability_grant(&a, &a.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let pending = device(&server, OWNER, 0x7b, "pending").await;
+
+    let gen0 = PreviousRoot {
+        root_key_id: shared::keys::root_key_id(&TRK),
+        root_generation: 0,
+    };
+    let after0 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: gen0.root_key_id,
+        previous_root_generation: 0,
+    };
+    let trk1 = [0x7d; 32];
+    let grant_a = root_grant_of(&a, &a, APPROVAL_REPLAY, 0xe1, &trk1, 1, after0);
+    let target = rotation_target(&trk1, 1, &[grant_a.as_slice()]);
+    let create = rotation_create(0xd1, target.clone(), gen0);
+    assert_eq!(server.root(&TENANT, &access, &create).await.0, 201);
+    let grants = format!("/v2/tenants/{}/root-key-generations/1/grants", hex(&TENANT));
+    let request = root_grant_create_request(0xd8, &a, &grant_a);
+    assert_eq!(server.call(&grants, &access, Some(&request)).await.0, 201);
+    let ack = ack_request(0xda, grant_ref(&a, &grant_a));
+    let ack_path = format!("{}/ack", grant_path("1", &[0xe1; 16]));
+    assert_eq!(server.call(&ack_path, &access, Some(&ack)).await.0, 201);
+
+    let activation = TenantRootGenerationActivateV2 {
+        target,
+        previous: Some(gen0),
+    }
+    .encode();
+    let good = revocation(&a.sk, &pending, 0x90, 30);
+    let request = revoke_request_with(0xc0, &good, &[&activation]);
+    let path = device_revoke_path(&pending.id);
+    let (status, body) = server.call(&path, &access, Some(&request)).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server.call(&path, &access, Some(&request)).await,
+        (201, body)
+    );
+    for (query, want) in [
+        ("SELECT count(*) FROM v2_device_revocations", 1),
+        (
+            "SELECT count(*) FROM v2_tenants WHERE active_root_generation = 1",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE (generation, state) IN (VALUES (0, 'RETIRED'), (1, 'ACTIVE'))",
+            2,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
 }
 
 /// Q-13: a custodian holding `device.revoke` files a signed revocation; the

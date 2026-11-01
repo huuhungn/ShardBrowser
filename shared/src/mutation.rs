@@ -12,6 +12,7 @@ use crate::authz_record::{
     CONTAINER_DOMAIN, CONTAINER_VERSION, MAX_RECORD_BYTES,
 };
 use crate::canonical::{self as c, Value};
+use crate::fleet_lifecycle::{FleetKeyGenerationActivateV2, DOMAIN_FLEET_GENERATION_ACTIVATE};
 
 type Result<T> = std::result::Result<T, RecordError>;
 
@@ -1012,15 +1013,68 @@ impl TenantRootGrantRevokedV2 {
 
 // ----------------------------------------------------------- device revoke ---
 
+/// One activation a revocation carries (ADR 0002 Q-13, C-1): the exact
+/// request payload of a standalone root or fleet generation activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationActivation {
+    Root(TenantRootGenerationActivateV2),
+    Fleet(FleetKeyGenerationActivateV2),
+}
+
+impl GenerationActivation {
+    fn parse(item: Value) -> Result<Self> {
+        let bad = || RecordError::BadValue("activations");
+        let Value::Bytes(bytes) = item else {
+            return Err(bad());
+        };
+        let domain = match c::decode(&bytes) {
+            Ok(Value::Map(entries)) => entries.into_iter().find(|(k, _)| k == "domain"),
+            _ => None,
+        };
+        let parsed = match domain {
+            Some((_, Value::Text(d))) if d == DOMAIN_ROOT_GENERATION_ACTIVATE => {
+                Self::Root(TenantRootGenerationActivateV2::parse(&bytes)?)
+            }
+            Some((_, Value::Text(d))) if d == DOMAIN_FLEET_GENERATION_ACTIVATE => {
+                Self::Fleet(FleetKeyGenerationActivateV2::parse(&bytes)?)
+            }
+            _ => return Err(bad()),
+        };
+        if parsed.encode() != bytes {
+            return Err(bad());
+        }
+        Ok(parsed)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Self::Root(a) => a.encode(),
+            Self::Fleet(a) => a.encode(),
+        }
+    }
+
+    /// The ADR's order (kind, fleet_id, generation): roots first, under an
+    /// all-zero fleet_id since a root generation belongs to no fleet.
+    fn sort_key(&self) -> (u8, [u8; 16], u64) {
+        match self {
+            Self::Root(a) => (0, [0; 16], a.target.root_generation),
+            Self::Fleet(a) => (
+                1,
+                a.terms.generation.fleet_id,
+                a.terms.generation.generation,
+            ),
+        }
+    }
+}
+
 /// ADR 0002 Q-13 `DeviceRevokeRequestV2`, the `DEVICE_REVOKE` payload: the
-/// exact signed `DeviceRevocationV2` container and its hash.
-///
-/// shortcut: `activations` must be empty, so a revocation never carries the
-/// optional activations of C-1; accept them when the client sends any.
+/// exact signed `DeviceRevocationV2` container, its hash, and the optional
+/// activations committed with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRevokeRequestV2 {
     pub signed_container_hash: [u8; 32],
     pub exact_signed_revocation_container_bytes: Vec<u8>,
+    pub activations: Vec<GenerationActivation>,
 }
 
 impl DeviceRevokeRequestV2 {
@@ -1033,7 +1087,21 @@ impl DeviceRevokeRequestV2 {
             1,
             MAX_EMBEDDED_GRANT_BYTES,
         )?;
-        if !matches!(f.req("activations")?, Value::Array(a) if a.is_empty()) {
+        let Value::Array(items) = f.req("activations")? else {
+            return Err(RecordError::BadValue("activations"));
+        };
+        if items.len() > usize::from(u16::MAX) {
+            return Err(RecordError::BadValue("activations"));
+        }
+        let activations = items
+            .into_iter()
+            .map(GenerationActivation::parse)
+            .collect::<Result<Vec<_>>>()?;
+        // Strictly increasing keys: sorted, and no generation twice.
+        if !activations
+            .windows(2)
+            .all(|w| w[0].sort_key() < w[1].sort_key())
+        {
             return Err(RecordError::BadValue("activations"));
         }
         f.finish()?;
@@ -1044,6 +1112,7 @@ impl DeviceRevokeRequestV2 {
         Ok(Self {
             signed_container_hash,
             exact_signed_revocation_container_bytes: bytes,
+            activations,
         })
     }
 
@@ -1056,7 +1125,10 @@ impl DeviceRevokeRequestV2 {
                 "exact_signed_revocation_container_bytes",
                 c::b(&self.exact_signed_revocation_container_bytes),
             ),
-            ("activations", Value::Array(Vec::new())),
+            (
+                "activations",
+                Value::Array(self.activations.iter().map(|a| c::b(&a.encode())).collect()),
+            ),
         ]))
     }
 }
@@ -2281,7 +2353,7 @@ mod tests {
     }
 
     /// Q-13: the revoke request carries exactly one parseable container under
-    /// its own hash and no activation; the response roundtrips.
+    /// its own hash and sorted, unique activations; the response roundtrips.
     #[test]
     fn device_revoke_maps_carry_one_container_and_roundtrip() {
         use crate::authz_record::{
@@ -2310,9 +2382,88 @@ mod tests {
                 .unwrap()
                 .signed_container_hash(),
             exact_signed_revocation_container_bytes: container.clone(),
+            activations: Vec::new(),
         };
         let raw = request.encode();
         assert_eq!(DeviceRevokeRequestV2::parse(&raw), Ok(request.clone()));
+
+        // C-1: the optional activations, each the exact standalone request
+        // payload, sorted by (kind, fleet_id, generation) with root first.
+        let fleet = |fleet_id: u8| {
+            use crate::fleet_lifecycle::{FleetGenerationRef, FleetGenerationTerms};
+            FleetKeyGenerationActivateV2 {
+                terms: FleetGenerationTerms {
+                    generation: FleetGenerationRef {
+                        tenant_id: [2; 16],
+                        server_instance_id: [3; 16],
+                        restore_epoch: 0,
+                        fleet_id: [fleet_id; 16],
+                        generation: 0,
+                        fkek_key_id: [fleet_id; 32],
+                    },
+                    required_device_grant_count: 1,
+                    required_device_grant_set_hash: [8; 32],
+                    recovery_grant_signed_container_hash: [9; 32],
+                    rotation: None,
+                },
+            }
+        };
+        let items = |list: &[&[u8]]| {
+            edit(&raw, |e| {
+                set(
+                    e,
+                    "activations",
+                    Value::Array(list.iter().map(|b| c::b(b)).collect()),
+                )
+            })
+        };
+        let (root, f1, f2) = (activate(1).encode(), fleet(1).encode(), fleet(2).encode());
+        let with = items(&[&root, &f1, &f2]);
+        let parsed = DeviceRevokeRequestV2::parse(&with).unwrap();
+        assert_eq!(
+            parsed.activations,
+            vec![
+                GenerationActivation::Root(activate(1)),
+                GenerationActivation::Fleet(fleet(1)),
+                GenerationActivation::Fleet(fleet(2)),
+            ]
+        );
+        assert_eq!(parsed.encode(), with);
+        let unknown = activated(1).encode();
+        let broken = edit(&f1, |e| drop_key(e, "generation"));
+        for list in [
+            vec![&f2[..], &f1[..]],
+            vec![&f1[..], &f1[..]],
+            vec![&f1[..], &root[..]],
+            vec![&unknown[..]],
+        ] {
+            assert_eq!(
+                DeviceRevokeRequestV2::parse(&items(&list)),
+                Err(RecordError::BadValue("activations"))
+            );
+        }
+        assert!(DeviceRevokeRequestV2::parse(&items(&[&broken])).is_err());
+
+        // At most 65535 activations: the limit itself parses, one more does not.
+        let many = |n: u32| {
+            let list: Vec<Vec<u8>> = (1..=n)
+                .map(|i| {
+                    let mut a = fleet(1);
+                    a.terms.generation.fleet_id[..4].copy_from_slice(&i.to_be_bytes());
+                    a.encode()
+                })
+                .collect();
+            items(&list.iter().map(Vec::as_slice).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            DeviceRevokeRequestV2::parse(&many(65535)).map(|r| r.activations.len()),
+            Ok(65535)
+        );
+        assert_eq!(
+            DeviceRevokeRequestV2::parse(&many(65536)),
+            Err(RecordError::BadValue("activations"))
+        );
+
         for (field, value, err) in [
             (
                 "signed_container_hash",

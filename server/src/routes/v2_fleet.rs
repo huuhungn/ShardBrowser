@@ -1494,14 +1494,60 @@ pub async fn activate_fleet_generation(
         return Ok(cbor(StatusCode::CREATED, response));
     }
 
+    apply_fleet_activation(&mut tx, v, &s, &activate, now).await?;
+    let activated_at_ms = u64::try_from(now).unwrap_or_default();
+    let payload = FleetKeyGenerationActivatedV2 {
+        terms: *t,
+        activated_at_ms,
+    }
+    .encode();
+    let response = stored_response(
+        &outer,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+        payload,
+        v,
+        activated_at_ms,
+    )?;
+    let retained_until = activated_at_ms
+        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
+        .ok_or(AppError::Forbidden)?;
+    store_response(
+        &mut tx,
+        v,
+        &s,
+        &outer,
+        &body,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+        &response,
+        retained_until,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(cbor(StatusCode::CREATED, response))
+}
+
+/// Checks a fleet activation against live state and applies it, with its
+/// audit row, inside the caller's transaction: the activate route, and a
+/// device revocation carrying it (ADR 0002 Q-13). The caller has checked its
+/// tenant, instance and epoch.
+pub(super) async fn apply_fleet_activation(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    s: &Session,
+    activate: &FleetKeyGenerationActivateV2,
+    now: i64,
+) -> Result<(), AppError> {
+    let t = &activate.terms;
+    let g = &t.generation;
+    let (fleet, generation) = (g.fleet_id, g.generation);
     let capability = match t.rotation {
         None => Capability::FleetManage,
         Some(_) => Capability::KeyRotate,
     };
-    if !holds_fleet_capability(&mut tx, v, &s, &fleet, capability, now).await? {
+    if !holds_fleet_capability(conn, v, s, &fleet, capability, now).await? {
         return Err(AppError::Forbidden);
     }
-    let row = generation_row(&mut tx, v, &s.tenant_id, &fleet, generation)
+    let row = generation_row(conn, v, &s.tenant_id, &fleet, generation)
         .await?
         .ok_or_else(|| {
             coded(
@@ -1524,8 +1570,7 @@ pub async fn activate_fleet_generation(
         ));
     }
     if let Some(r) = rotation {
-        let previous =
-            generation_row(&mut tx, v, &s.tenant_id, &fleet, r.previous_generation).await?;
+        let previous = generation_row(conn, v, &s.tenant_id, &fleet, r.previous_generation).await?;
         if !previous.is_some_and(|p| p.state == "ACTIVE" && p.fkek_key_id == r.previous_fkek_key_id)
         {
             return Err(conflict(
@@ -1537,9 +1582,9 @@ pub async fn activate_fleet_generation(
 
     // D-4: the acknowledged live device grants are exactly the required set.
     let devices = live_acked_grants(
-        &mut tx,
+        conn,
         v,
-        &s,
+        s,
         FleetGrantVariant::DeviceHpke,
         &fleet,
         generation,
@@ -1548,9 +1593,9 @@ pub async fn activate_fleet_generation(
     .await?;
     let hashes: Vec<[u8; 32]> = devices.iter().map(|d| d.signed_container_hash).collect();
     let recovery = live_acked_grants(
-        &mut tx,
+        conn,
         v,
-        &s,
+        s,
         FleetGrantVariant::Recovery,
         &fleet,
         generation,
@@ -1558,9 +1603,9 @@ pub async fn activate_fleet_generation(
     )
     .await?;
     let rotations = live_acked_grants(
-        &mut tx,
+        conn,
         v,
-        &s,
+        s,
         FleetGrantVariant::Rotation,
         &fleet,
         generation,
@@ -1578,7 +1623,7 @@ pub async fn activate_fleet_generation(
     // The recovery grant is under the root ACTIVE now, not one since retired.
     // Filing and root activation keep this true, so no request reaches it;
     // it stays as the invariant the fleet key depends on.
-    let active = active_root(&mut tx, v, &s.tenant_id).await?;
+    let active = active_root(conn, v, &s.tenant_id).await?;
     if !recovery.iter().any(|g| {
         g.signed_container_hash == t.recovery_grant_signed_container_hash
             && matches!(&g.payload, Payload::RecoveryGrant(p)
@@ -1616,7 +1661,7 @@ pub async fn activate_fleet_generation(
         .bind(s.tenant_id.as_slice())
         .bind(fleet.as_slice())
         .bind(int(r.previous_generation)?)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
     sqlx::query(
@@ -1629,38 +1674,10 @@ pub async fn activate_fleet_generation(
     .bind(s.tenant_id.as_slice())
     .bind(fleet.as_slice())
     .bind(int(generation)?)
-    .execute(&mut *tx)
-    .await?;
-
-    let activated_at_ms = u64::try_from(now).unwrap_or_default();
-    let payload = FleetKeyGenerationActivatedV2 {
-        terms: *t,
-        activated_at_ms,
-    }
-    .encode();
-    let response = stored_response(
-        &outer,
-        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
-        payload,
-        v,
-        activated_at_ms,
-    )?;
-    let retained_until = activated_at_ms
-        .checked_add(AUTHORIZATION_REPLAY_RETENTION_MS)
-        .ok_or(AppError::Forbidden)?;
-    store_response(
-        &mut tx,
-        v,
-        &s,
-        &outer,
-        &body,
-        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
-        &response,
-        retained_until,
-    )
+    .execute(&mut *conn)
     .await?;
     audit(
-        &mut tx,
+        conn,
         &s.tenant_id,
         &s.account_id,
         &s.device_id,
@@ -1668,9 +1685,7 @@ pub async fn activate_fleet_generation(
         "fleet_key_generation",
         &g.fkek_key_id,
     )
-    .await?;
-    tx.commit().await?;
-    Ok(cbor(StatusCode::CREATED, response))
+    .await
 }
 
 // ------------------------------------------------------- FLEET_GRANT_REVOKE ---

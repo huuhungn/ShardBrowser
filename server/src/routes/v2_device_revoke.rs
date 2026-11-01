@@ -3,10 +3,8 @@
 //! transaction the device is revoked, its sessions end, its leases are
 //! released and every approval and grant naming it is revoked, so it can
 //! neither sign in again nor be handed a key. Rotation follows later: the
-//! keys it already holds cannot be recalled (C-1).
-//!
-//! shortcut: the optional activations C-1 lets a revocation carry are
-//! refused by the request codec; accept them when the client sends any.
+//! keys it already holds cannot be recalled (C-1). The request may carry
+//! root and fleet generation activations, committed in the same transaction.
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -21,17 +19,21 @@ use shared::authz_record::{
     DOMAIN_DEVICE_REVOCATION,
 };
 use shared::mutation::{
-    DeviceRevokeRequestV2, DeviceRevokedV2, OperationKind, RECORD_TYPE_DEVICE_REVOKED,
+    DeviceRevokeRequestV2, DeviceRevokedV2, GenerationActivation, OperationKind,
+    RECORD_TYPE_DEVICE_REVOKED,
 };
 
 use super::v2_approval::{approvals_among, cbor, coded, column_mismatch, int};
 use super::v2_auth::{audit, reload_session, revoke_session, unhex, verified, Principal, Session};
 use super::v2_capability::stored_row_matches;
+use super::v2_fleet::apply_fleet_activation;
 use super::v2_root::{
     bind, ledger_row, mismatch, record_error, row_holds, same_request, stale, store_response,
     stored_payload, stored_response, Col,
 };
-use super::v2_root_grants::{at, custodian_besides, is_active_custodian, outer_request};
+use super::v2_root_grants::{
+    apply_root_activation, at, custodian_besides, is_active_custodian, outer_request,
+};
 use crate::error::AppError;
 use crate::identity::{hex, Verified};
 use crate::quarantine::{self, Kind, Mark};
@@ -681,6 +683,35 @@ pub async fn revoke_device(
             "REPLAY_DETECTED",
             "this replay ID is already spent",
         ));
+    }
+    // Each activation is checked as if sent alone, so against the state
+    // before the revocation; the custodian check below sees its result.
+    for activation in &request.activations {
+        let (tenant, instance, epoch) = match activation {
+            GenerationActivation::Root(a) => {
+                let t = &a.target;
+                (t.tenant_id, t.server_instance_id, t.restore_epoch)
+            }
+            GenerationActivation::Fleet(a) => {
+                let g = &a.terms.generation;
+                (g.tenant_id, g.server_instance_id, g.restore_epoch)
+            }
+        };
+        if instance != v.server_instance_id {
+            return Err(AppError::Forbidden);
+        }
+        if epoch != v.restore_epoch {
+            return Err(stale());
+        }
+        if tenant != s.tenant_id {
+            return Err(AppError::Forbidden);
+        }
+        match activation {
+            GenerationActivation::Root(a) => apply_root_activation(&mut tx, v, &s, a, now).await?,
+            GenerationActivation::Fleet(a) => {
+                apply_fleet_activation(&mut tx, v, &s, a, now).await?
+            }
+        }
     }
     // The ACTIVE root keeps a custodian, or no device could sign the
     // RotationGrant that rotates the revoked one out (C-1).
