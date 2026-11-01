@@ -622,6 +622,11 @@ mod tests {
         let info = root_grant_info(&scope_for(&pk));
         // Canonical encoding must round-trip through the strict decoder.
         c::assert_canonical_roundtrip(&info).expect("info is canonical");
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            Sha256::digest(&info).to_vec(),
+            h("620962718813f10b5300922863f97c7b663acb2e559446fd53ab07f23deceb8a")
+        );
     }
 
     #[test]
