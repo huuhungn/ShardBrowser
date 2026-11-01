@@ -22,9 +22,9 @@ use crate::recovery_bundle::{
 };
 
 pub const DOMAIN_FALLBACK_KEY_FILE: &str = "shardx.local.fallback-key-file.v2";
-const DOMAIN_PLAINTEXT: &str = "shardx.local.fallback-key-file-plaintext.v2";
+pub const DOMAIN_PLAINTEXT: &str = "shardx.local.fallback-key-file-plaintext.v2";
 const VERSION: u64 = 2;
-const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-FALLBACK-KEY-FILE-KDF-V2\0";
+pub const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-FALLBACK-KEY-FILE-KDF-V2\0";
 pub const MAX_ENTRIES: usize = 4096;
 const MAX_CREDENTIAL_REF_BYTES: usize = 255;
 

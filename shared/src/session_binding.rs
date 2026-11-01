@@ -31,9 +31,9 @@ pub const BINDING_VERSION: u16 = 2;
 /// Cap on either binding's canonical bytes, checked before decoding.
 pub const MAX_BINDING_BYTES: usize = 4096;
 
-const L_ENROLLMENT_BINDING: &str = "SHARDX-ENROLLMENT-BINDING-V2\0";
-const L_DEVICE_SESSION_POP: &str = "SHARDX-DEVICE-SESSION-POP-V2\0";
-const HPKE_POP_INFO: &[u8] = b"SHARDX-DEVICE-SESSION-HPKE-POP-V2\0";
+pub const L_ENROLLMENT_BINDING: &str = "SHARDX-ENROLLMENT-BINDING-V2\0";
+pub const L_DEVICE_SESSION_POP: &str = "SHARDX-DEVICE-SESSION-POP-V2\0";
+pub const HPKE_POP_INFO: &[u8] = b"SHARDX-DEVICE-SESSION-HPKE-POP-V2\0";
 
 pub const POP_SECRET_LEN: usize = 32;
 /// Suite 1: an X25519 encapsulated key, and the secret plus its 16-byte tag.

@@ -3,8 +3,9 @@
 //! Each module's golden vectors already pin its own bytes. What they cannot
 //! see is a collision across modules: two roles signing under one domain, or
 //! one domain label reused for two preimages, would let a record made for one
-//! purpose verify as the other. This test holds every published domain and
-//! label in one place and requires them to be distinct and well formed.
+//! purpose verify as the other. This test holds every domain and label
+//! `shared` declares in one place and requires them to be distinct and well
+//! formed (ADR 0002 D-8).
 //! The reviewed values are recorded in docs/security-review-g2.md.
 
 use shardx_core::{
@@ -83,6 +84,9 @@ const DOMAINS: &[&str] = &[
     pl::DOMAIN_LOCAL_UNBIND_RESPONSE,
     pl::DOMAIN_LOCAL_BINDING_TOMBSTONE,
     fp::DOMAIN_FLEET_PROFILE_PAGE,
+    fk::DOMAIN_PLAINTEXT,
+    rb::DOMAIN_PLAINTEXT,
+    rb::DOMAIN_READINESS_PROBE,
 ];
 
 const LABELS: &[&str] = &[
@@ -106,6 +110,26 @@ const LABELS: &[&str] = &[
     k::L_PROFILE_LABEL,
     k::L_PROFILE_LABEL_KEY,
     s2::L_SNAPSHOT_HEAD,
+    mu::L_REQUEST_HASH,
+    mu::L_RESPONSE_HASH,
+    mu::L_ROOT_CUSTODIAN_SET,
+    mu::L_FLEET_DEVICE_SET,
+    pl::L_LOCAL_BINDING_TOMBSTONE,
+    rb::L_RECOVERY_BUNDLE,
+    sb::L_ENROLLMENT_BINDING,
+    sb::L_DEVICE_SESSION_POP,
+];
+
+/// Labels held as bytes: hash prefixes, HPKE AAD and info strings, KDF salt
+/// contexts. The local backup context predates v2 and keeps its `-V1`.
+const BYTE_LABELS: &[&[u8]] = &[
+    ar::REQUEST_HASH_LABEL,
+    fk::KDF_SALT_CONTEXT,
+    gr::L_ROOT_GRANT_AAD,
+    gr::L_FLEET_GRANT_AAD,
+    rb::KDF_SALT_CONTEXT,
+    sb::HPKE_POP_INFO,
+    shardx_core::passphrase::BACKUP_KDF_CONTEXT,
 ];
 
 fn assert_distinct(what: &str, values: &[&str]) {
@@ -144,6 +168,24 @@ fn every_hash_label_is_distinct_and_nul_terminated() {
         // One NUL, at the end: a label can never be a prefix of another
         // label's preimage.
         assert!(!body.contains('\0'), "{l:?}");
+    }
+    for l in BYTE_LABELS {
+        let body = l
+            .strip_suffix(b"-V2\0")
+            .or_else(|| l.strip_suffix(b"-V1\0"))
+            .unwrap_or_else(|| panic!("{l:?} lacks -V1\\0 or -V2\\0"));
+        assert!(body.starts_with(b"SHARDX-") && !body.contains(&0), "{l:?}");
+    }
+    // Every label, string or bytes, is distinct from every other.
+    let all: Vec<&[u8]> = LABELS
+        .iter()
+        .map(|l| l.as_bytes())
+        .chain(BYTE_LABELS.iter().copied())
+        .collect();
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b, "two labels share one value");
+        }
     }
     // No label is also a domain, in any case.
     for l in LABELS {

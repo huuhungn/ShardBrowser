@@ -49,7 +49,7 @@ pub const HPKE_SUITE_ID_X25519_HKDF_SHA256_CHACHA20POLY1305: u16 = 1;
 pub const GRANT_CAPABILITY_ROOT_CUSTODY: &str = "root.custody";
 
 /// AAD label, per plan 5.6.4.
-const L_ROOT_GRANT_AAD: &[u8] = b"SHARDX-TENANT-ROOT-GRANT-AAD-V2\0";
+pub const L_ROOT_GRANT_AAD: &[u8] = b"SHARDX-TENANT-ROOT-GRANT-AAD-V2\0";
 
 /// Length of a tenant root key.
 pub const TRK_LEN: usize = 32;
@@ -340,7 +340,7 @@ pub fn open_trk(
 }
 
 /// AAD label of a `DeviceHpkeGrant` (ADR 0002 D-8).
-const L_FLEET_GRANT_AAD: &[u8] = b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0";
+pub const L_FLEET_GRANT_AAD: &[u8] = b"SHARDX-FLEET-KEY-GRANT-AAD-V2\0";
 
 /// Exact `DeviceHpkeGrant` AAD (ADR 0002 D-8), the root grant's pattern:
 /// label + u32be length + info bytes.
