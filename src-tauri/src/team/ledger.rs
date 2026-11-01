@@ -987,12 +987,10 @@ fn keep_key_state(
 }
 
 /// Rule 6: the signing key a usable `DeviceRevocationV2` revokes, when its
-/// issuer was a custodian holding a device-scoped `device.revoke` at its
-/// `issued_at_ms`, and is still a custodian when this device first saw it.
-// shortcut: only a tenant-scoped `device.revoke` counts, so a fleet-scoped
-// revocation of a fleet-approved device is not held; custodians are always
-// tenant-approved (Q-22), so fleet keys are covered; count fleet scope once
-// head acceptance needs non-custodian signers revoked (W6 manifests).
+/// issuer was a custodian holding a device-scoped `device.revoke` covering
+/// the subject's approval scope at its `issued_at_ms` (the fleet when every
+/// approval of the subject names it, else the tenant, as the server files
+/// it), and is still a custodian when this device first saw it.
 fn counted(
     chain: &TrustChain,
     binding: &Binding,
@@ -1009,7 +1007,12 @@ fn counted(
     (d.common.tenant_id == binding.tenant_id
         && d.common.server_instance_id == binding.server_instance_id
         && chain.custodian_at(&issuer, t)
-        && chain.capability_at(&issuer, Capability::DeviceRevoke, Scope::Tenant, t)
+        && chain.capability_at(
+            &issuer,
+            Capability::DeviceRevoke,
+            chain.revocation_scope(&d.subject_signing_key_id),
+            t,
+        )
         && chain.custodian_now(&issuer, first_seen_ms))
     .then_some(d.subject_signing_key_id)
 }

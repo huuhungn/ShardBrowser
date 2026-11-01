@@ -3534,9 +3534,10 @@ mod custody_tests {
         );
     }
 
-    /// Rule 6: a revocation counts only when its issuer was a custodian with
-    /// a tenant-scoped `device.revoke` when it was issued, is still one when
-    /// this device first sees it, and it names this tenant and instance.
+    /// Rule 6: a revocation of tenant-approved D counts only when its issuer
+    /// was a custodian with a tenant-scoped `device.revoke` when it was
+    /// issued, is still one when this device first sees it, and it names this
+    /// tenant and instance.
     #[test]
     fn a_revocation_counts_only_from_a_custodian_allowed_to_revoke() {
         let me = me();
@@ -3568,6 +3569,82 @@ mod custody_tests {
         assert!(!counts(until, |_| {}, T0 + 400 * DAY));
         assert!(!counts(until, |c| c.tenant_id = [9; 16], now));
         assert!(!counts(until, |c| c.server_instance_id = [9; 16], now));
+    }
+
+    /// G2-64 B4 (ADR 0002 Q-13 issuer rule, as `v2_device_revoke` accepts
+    /// it): a revocation of a member whose every approval names fleet F counts
+    /// from a custodian holding `device.revoke` scoped to F, not from one
+    /// scoped to another fleet; a member also approved for the tenant needs a
+    /// tenant-scoped `device.revoke`.
+    #[test]
+    fn a_fleet_scoped_device_revoke_counts_for_a_member_of_that_fleet() {
+        use shardx_core::authz_record::*;
+        let me = me();
+        let m_key = [0x6d; 32];
+        let mine = GrantSubject::Device {
+            account_id: me.to.account_id,
+            device_id: me.to.device_id,
+            signing_key_id: me.to.signing_key_id,
+            hpke_key_id: me.to.hpke_key_id,
+        };
+        let capability = |capability, scope_kind, scope_id, replay| {
+            let g = TenantCapabilityGrantV2 {
+                common: common(replay),
+                subject: mine.clone(),
+                scope_kind,
+                scope_id,
+                capability,
+            };
+            build_record(&me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let approval = |kind, scope_id, replay| {
+            let a = DeviceApprovalV2 {
+                common: common(replay),
+                subject_account_id: [6; 16],
+                subject_device_id: [0x6e; 16],
+                subject_signing_key_id: m_key,
+                subject_hpke_key_id: [0x6f; 32],
+                approval_scope_kind: kind,
+                approval_scope_id: scope_id,
+            };
+            build_record(&me.sk, DOMAIN_DEVICE_APPROVAL, &a.encode())
+        };
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x6e; 16],
+            subject_signing_key_id: m_key,
+            subject_hpke_key_id: [0x6f; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let revocation = build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        let other_fleet = [0x0f; 16];
+        let counts = |revoke_scope: (CapabilityScopeKind, [u8; 16]), tenant_approved: bool| {
+            let mut pages = evidence(&me, Vec::new());
+            let p = &mut pages[0];
+            p.containers.extend([
+                capability(
+                    Capability::DeviceApprove,
+                    CapabilityScopeKind::Tenant,
+                    TENANT,
+                    13,
+                ),
+                capability(Capability::DeviceRevoke, revoke_scope.0, revoke_scope.1, 14),
+                approval(ApprovalScopeKind::Fleet, FLEET, 20),
+                revocation.clone(),
+            ]);
+            if tenant_approved {
+                p.containers
+                    .push(approval(ApprovalScopeKind::Tenant, TENANT, 21));
+            }
+            let (_dir, path) = ledger_at();
+            collect_at(&path, &pages, &[], 1, T0 + DAY);
+            proven(&path) == [(hex(&m_key), "DEVICE_REVOCATION".into())]
+        };
+        assert!(counts((CapabilityScopeKind::Fleet, FLEET), false));
+        assert!(!counts((CapabilityScopeKind::Fleet, other_fleet), false));
+        assert!(!counts((CapabilityScopeKind::Fleet, FLEET), true));
+        assert!(counts((CapabilityScopeKind::Tenant, TENANT), true));
     }
 
     /// A server report is kept at its earliest time and reported again after

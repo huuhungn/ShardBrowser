@@ -514,6 +514,22 @@ impl TrustChain {
             })
     }
 
+    /// The scope a `device.revoke` must cover to revoke `key` (ADR 0002 Q-13
+    /// issuer rule, as the server files it): the fleet when every usable
+    /// approval of `key` names that one fleet, otherwise the tenant.
+    pub fn revocation_scope(&self, key: &KeyId) -> Scope {
+        let mut scopes = self
+            .approvals_by_subject
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&i| approval_scope(&self.evidence.approvals[i].payload));
+        match scopes.next() {
+            Some(Scope::Fleet(f)) if scopes.all(|s| s == Scope::Fleet(f)) => Scope::Fleet(f),
+            _ => Scope::Tenant,
+        }
+    }
+
     /// Rule 4: `key` holds `capability` over `scope` at `t`, through a usable
     /// device-scoped grant whose issuer was a custodian when it was issued.
     /// Custody itself is never a capability grant: only root grants carry it
