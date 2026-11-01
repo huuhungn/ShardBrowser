@@ -5679,8 +5679,9 @@ mod tests {
 
     /// Q-18: a counted `compromised` revocation blocks commits under a
     /// generation it exposes (verified no later than the revocation was
-    /// counted, or granted to the revoked key); the lease is released. A
-    /// `retired` one, or a generation verified after it and never granted to
+    /// counted, granted to the revoked key, or without activation evidence);
+    /// the lease is released. A `retired` one, or a generation verified after
+    /// it, activated under a root the key never held and never granted to
     /// that key, does not block.
     #[test]
     fn a_compromised_revocation_blocks_commits_under_an_exposed_generation() {
@@ -5690,11 +5691,17 @@ mod tests {
             signing_key_id: [0x77; 32],
             ..me().to
         };
-        let to_revoked = vec![grant_to(&me(), &revoked, GEN, &FKEK, 41)];
+        // The generation's activation evidence under root 0, which the
+        // revoked key never held (C-1's root clause).
+        let mut activated = vec![key_rotate(&me())];
+        activated.extend(activation(&me(), GEN, &FKEK, 0, 61, None));
+        let mut to_revoked = activated.clone();
+        to_revoked.push(grant_to(&me(), &revoked, GEN, &FKEK, 41));
         for (reason, counted, extra, blocked) in [
             (DeviceRevocationReason::Compromised, 1, vec![], true),
             (DeviceRevocationReason::Retired, 1, vec![], false),
-            (DeviceRevocationReason::Compromised, 0, vec![], false),
+            (DeviceRevocationReason::Compromised, 0, vec![], true),
+            (DeviceRevocationReason::Compromised, 0, activated, false),
             (DeviceRevocationReason::Compromised, 0, to_revoked, true),
         ] {
             let w = world_with(extra);
@@ -5731,6 +5738,243 @@ mod tests {
                 assert_eq!(pushed.unwrap().version, 1, "{reason:?} {counted}");
             }
         }
+    }
+
+    /// The revoked custodian or member of the Q-18 tests, by its key alone.
+    const REVOKED: [u8; 32] = [0x77; 32];
+
+    /// This device's `key.rotate` over the tenant.
+    fn key_rotate(me: &Me) -> Vec<u8> {
+        let g = TenantCapabilityGrantV2 {
+            common: common(14),
+            subject: device_subject(me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::KeyRotate,
+        };
+        build_record(&me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+    }
+
+    /// The activation evidence of `generation` of `FLEET` (key `fkek`), by
+    /// this device: its `RecoveryGrant` under root `root_generation` and the
+    /// `RotationGrant` that binds it, or names `bound` instead when given.
+    fn activation(
+        me: &Me,
+        generation: u64,
+        fkek: &[u8; 32],
+        root_generation: u64,
+        replay: u8,
+        bound: Option<[u8; 32]>,
+    ) -> Vec<Vec<u8>> {
+        let fkek_key_id = shardx_core::fleet_grants::fkek_key_id(fkek);
+        let recovery = RecoveryGrantV2 {
+            common: common(replay),
+            fleet_id: FLEET,
+            fkek_key_id,
+            generation,
+            recipient_root_key_id: [8; 32],
+            recipient_root_generation: root_generation,
+            root_wrap_nonce_bytes: [1; 12],
+            wrapped_fleet_key_bytes: [2; 48],
+        };
+        let recovery = build_record(&me.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &recovery.encode());
+        let hash = *AuthorizationRecord::parse(&recovery)
+            .unwrap()
+            .signed_container_hash();
+        let rotation = RotationGrantV2 {
+            common: common(replay + 1),
+            fleet_id: FLEET,
+            fkek_key_id,
+            generation,
+            previous_fkek_key_id: [generation as u8; 32],
+            previous_generation: generation - 1,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: [0; 32],
+            recovery_grant_signed_container_hash: bound.unwrap_or(hash),
+            activation_not_before_ms: T0,
+        };
+        let rotation = build_record(&me.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &rotation.encode());
+        vec![recovery, rotation]
+    }
+
+    /// This device's root grant of `root_generation` to `subject`: an
+    /// existing-root grant, or a rotation grant from the generation before.
+    fn root_grant(me: &Me, subject: [u8; 32], root_generation: u64, replay: u8) -> Vec<u8> {
+        let g = TenantRootKeyGrantV2 {
+            common: common(replay),
+            variant: match root_generation {
+                0 => RootGrantVariant::ExistingRootGrant,
+                n => RootGrantVariant::RotationGrant {
+                    previous_root_key_id: [8 + n as u8 - 1; 32],
+                    previous_root_generation: n - 1,
+                },
+            },
+            root_key_id: [8 + root_generation as u8; 32],
+            root_generation,
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: subject,
+            recipient_hpke_key_id: [0x78; 32],
+            subject_device_approval_replay_id: [0x79; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        build_record(&me.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+    }
+
+    /// Counts a `compromised` revocation of `REVOKED` in evaluation `counted`.
+    fn count_compromise_in(w: &World, counted: i64) {
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: REVOKED,
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', ?4, 0, ?5)",
+                params![
+                    hex(&INSTANCE),
+                    hex(&TENANT),
+                    hex(&REVOKED),
+                    counted,
+                    container
+                ],
+            )
+            .unwrap();
+    }
+
+    impl World {
+        /// Collects `generation` of `FLEET` (key `fkek`) from evidence that
+        /// holds the base tenant and `extra`, as a later evaluation.
+        fn collect(&self, generation: u64, fkek: &[u8; 32], replay: u8, extra: Vec<Vec<u8>>) {
+            let grant = grant_to(&self.me, &self.me.to, generation, fkek, replay);
+            let ev = Ev {
+                extra,
+                ..Ev::default()
+            };
+            let mut pages = pages(&self.me, &self.grant, &ev);
+            pages[0].containers.push(grant.clone());
+            let mut db = self.db();
+            let opened = crate::open_fleet_grant(
+                &grant,
+                &pages,
+                &self.dev.pin,
+                &self.me.to,
+                &FLEET,
+                generation,
+                &self.me.hpke_sk,
+                NOW,
+                &mut db,
+                "https://fleet.test",
+            )
+            .unwrap();
+            assert!(opened.is_some(), "generation {generation} verifies");
+        }
+
+        fn blocked(&self, generation: u64) -> bool {
+            ledger::commit_blocked(
+                &self.db(),
+                &self.dev.pin.0,
+                &self.dev.pin.1,
+                &FLEET,
+                generation,
+            )
+            .unwrap()
+        }
+    }
+
+    /// B1, Q-18 through the root (ADR 0002 C-1, revision 10-14 vectors):
+    /// a compromised custodian D that knows root generation 0 but holds no
+    /// grant of the fleet still blocks it, until the root is rotated first
+    /// and the fleet after it. A fleet rotated before the root stays
+    /// blocked; a root generation above the bound one that D later holds,
+    /// PREPARING included, blocks again; missing or mismatched activation
+    /// evidence blocks; generation 0 is checked from the first root.
+    #[test]
+    fn a_compromised_custodian_blocks_every_fleet_through_the_root() {
+        let me = me();
+        let (k2, k3, k4) = ([0x52; 32], [0x53; 32], [0x54; 32]);
+        let base = |more: Vec<Vec<u8>>| {
+            let mut v = vec![key_rotate(&me), root_grant(&me, REVOKED, 0, 60)];
+            v.extend(activation(&me, GEN, &FKEK, 0, 61, None));
+            v.extend(more);
+            v
+        };
+        let w = world_with(base(vec![]));
+        count_compromise_in(&w, 0);
+        // The verifier's B1 case: D holds no grant of the fleet, which was
+        // collected after the revocation was counted under exposed root 0.
+        assert!(w.blocked(GEN), "generation 1 is under exposed root 0");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+
+        // The fleet rotated before the root: its RecoveryGrant is under
+        // root 0, so it stays blocked.
+        w.collect(2, &k2, 70, base(activation(&me, 2, &k2, 0, 71, None)));
+        assert!(w.blocked(2), "fleet rotated first");
+
+        // Root rotated to 1, then the fleet to 3 under root 1: released.
+        let rotated = |more: Vec<Vec<u8>>| {
+            let mut v = base(activation(&me, 2, &k2, 0, 71, None));
+            v.push(root_grant(&me, w.me.to.signing_key_id, 1, 80));
+            v.extend(more);
+            v
+        };
+        w.collect(3, &k3, 81, rotated(activation(&me, 3, &k3, 1, 82, None)));
+        assert!(!w.blocked(3), "root first, then the fleet");
+
+        // D later holds PREPARING root 2, above the bound root 1: blocked.
+        let mut preparing = activation(&me, 3, &k3, 1, 82, None);
+        preparing.push(root_grant(&me, REVOKED, 2, 85));
+        w.collect(3, &k3, 84, rotated(preparing));
+        assert!(w.blocked(3), "D holds a root above the bound one");
+
+        // Generation 3 whose RotationGrant names another RecoveryGrant: the
+        // evidence does not bind, so it is blocked; generation 4 has none.
+        // One world at a time: each holds the config root.
+        drop(w);
+        let w = world_with(base(vec![]));
+        count_compromise_in(&w, 0);
+        w.collect(2, &k2, 70, base(activation(&me, 2, &k2, 0, 71, None)));
+        w.collect(3, &k3, 81, {
+            let mut v = base(activation(&me, 2, &k2, 0, 71, None));
+            v.push(root_grant(&me, w.me.to.signing_key_id, 1, 80));
+            v.extend(activation(&me, 3, &k3, 1, 82, Some([0xee; 32])));
+            v
+        });
+        assert!(w.blocked(3), "mismatched activation evidence");
+        w.collect(4, &k4, 90, base(vec![]));
+        assert!(w.blocked(4), "missing activation evidence");
+    }
+
+    /// B2: an exposure this device saw stays, whatever a later collection of
+    /// the same generation leaves out.
+    #[test]
+    fn an_exposure_survives_a_recollection_that_omits_its_grant() {
+        let me = me();
+        let revoked = Recipient {
+            device_id: [0x77; 16],
+            signing_key_id: REVOKED,
+            ..me.to
+        };
+        let mut evidence = vec![key_rotate(&me)];
+        evidence.extend(activation(&me, GEN, &FKEK, 0, 61, None));
+        let mut with_grant = evidence.clone();
+        with_grant.push(grant_to(&me, &revoked, GEN, &FKEK, 41));
+        let w = world_with(with_grant);
+        count_compromise_in(&w, 1);
+        assert!(w.blocked(GEN));
+        // A hostile server serves the same generation again without the
+        // revoked member's grant: the grant evaluation moves past the one
+        // that counted the revocation.
+        w.collect(GEN, &FKEK, 42, evidence);
+        assert!(w.blocked(GEN), "the exposure is never forgotten");
     }
 
     /// Probe 10 (L2045, G2-42), the wire side of the sync tables: the
