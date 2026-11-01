@@ -11,8 +11,8 @@ STREAM) and ADR 0004 (credential store), all on `main`.
 `shared/tests/registry_pins.rs` enforces this page: it fails if a pinned value
 changes, if two signing domains or two hash labels share a value, or if one
 is malformed. Each module's golden vectors pin its own bytes on top of that.
-The test lists 70 domain and label constants (`DOMAINS` at L17, `LABELS` at
-L71); "Domains and labels" below says which constants it does not list.
+The test lists 87 domain and label constants (`DOMAINS` at L18, `LABELS` at
+L88); "Domains and labels" below says which constants it does not list.
 
 What changed since 2026-10-26: HKDF-SHA256 and `sha2` 0.11 became direct
 dependencies of `shared` for the profile label (ADR Q-41); the two label
@@ -216,16 +216,14 @@ them; each has its own golden vector or codec test:
   (`session_binding.rs`, `golden_vectors` at `:533`)
 - `shardx.authorization.fleet-key-grant.v2` (server, legacy v2 fleet grants)
 
-Sixteen `pub` domains are in neither list nor the inline list above: the
-request and response maps of checkout, create-upload, finalize-upload,
+The request and response maps of checkout, create-upload, finalize-upload,
 publish-create, lease renewal and release, the unbind request, response and
 tombstone, and the fleet profile page (`DOMAIN_CHECKOUT_REQUEST` and its
 siblings in `profile_lease.rs`, `DOMAIN_FINALIZE_UPLOAD_REQUEST` in
-`snapshot_v2.rs`, `DOMAIN_FLEET_PROFILE_PAGE` in `fleet_profiles.rs`). Each is
-checked by its codec (`exact_version(.., DOMAIN_..)` refuses any other domain)
-and by the codec's tests, but the registry test does not assert that they are
-distinct from each other or from the other domains. That is listed as an open
-item below.
+`snapshot_v2.rs`, `DOMAIN_FLEET_PROFILE_PAGE` in `fleet_profiles.rs`) are in
+`DOMAINS` too, so the registry test holds them distinct from every other domain
+and in the `shardx.<area>.<name>.v2` shape; each codec also refuses any other
+domain (`exact_version(.., DOMAIN_..)`).
 
 ## Open items
 
@@ -233,9 +231,6 @@ item below.
   optional MySQL driver; see `dependency-review.md`.
 - The trust-boundary matrix (G2-61) and the fault-injection evidence for
   durable writes and SQLite (G2-49, G2-50) are separate rows.
-- The sixteen request and response domains named above are not in
-  `registry_pins.rs`. Adding them to `DOMAINS` is a test-only change; it was
-  not made in this refresh.
 - G2-48 (credential store persistence across restart, locked session and a
   logon with no store) is pending the owner's manual run; see
   `g2-evidence/README.md`.
