@@ -1,5 +1,5 @@
 8b9ef41a21e93d19b4e4fe4641aff06d96a123256cb00c0e8580f0fa70a5523e  .omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md
-7f537e2ad776b15feef977a6b38c96abf2e341deab0ff1a230aa4de12f0d8b54  docs/adr/0002-g2-contract-decisions.md
+73285eb0809cc64716460d53f2e31baf2f8787221972156c6d7d3416a5264da7  docs/adr/0002-g2-contract-decisions.md
 6f5f4a2b622004641b4e14e3491d0b2d2f2ad94516d47ae20277a2e0a7715894  docs/adr/0003-envelope-v2-stream.md
 b57bcac69f46d18a252cd735be09571efac6eb13990474decd084feac9f3cae0  docs/adr/0004-credential-store.md
 35d6caaefc0bf5d8019256ed96ef1dba8ef64a320c1049e6aa47d26f0cdec3b3  docs/dependency-review.md
@@ -112,7 +112,7 @@ ef3b50ee72dcdc9a8ea2d30870a0f6da28ba7793d7da21e7f4686cde9b004bcd  src-tauri/src/
 ff3505dd6b062408e2f2bfb5d7d9ec5dc1a8d931f4cb2f3f3e295783d376e6cc  src-tauri/src/team/db.rs
 ec0b156292043de6798b29e736486e9c3a18d53e11e7467bcfe9b5e633accbed  src-tauri/src/team/downgrade.rs
 aaea3d2c1013628a22ff2d0c827cb4d3a316883fa7402e5aaa2fbae286e01145  src-tauri/src/team/journal.rs
-8cd84b6d7997fc180bcfcedba74214a760d44afb3c9233c87c1b993f3a0c9050  src-tauri/src/team/ledger.rs
+86686cb061e0b7ac1df7eb538dad3f8cd355a4080d8c2d75ae9ae67d1c1ea949  src-tauri/src/team/ledger.rs
 ff05989a0f1dac9655ee4a12afb6b1fad18fa963f7df45e92ee0a29facc29f17  src-tauri/src/team/records.rs
-5d07d00effa4a09f5b64a6c6cdb5e876a82445d4fb2eb864b809df598a8d42a9  src-tauri/src/team/sync.rs
+5d7a7a4476b2fe990cb0abffa5258d8af99a0480866e71ae11b8d276f35e43a0  src-tauri/src/team/sync.rs
 e086eae874ba763f246672f1d5225dd0b6ac8711d0e0b44c6a8322ef26e4daa3  src-tauri/src/team_config.rs
