@@ -667,7 +667,8 @@ mod tests {
     /// either bound, 2^63 and 2^64 - 1, a fraction, and text or bytes that
     /// name no integer are refused with the value left as it was. SQLite
     /// STRICT converts text or a real naming an in-range integer losslessly,
-    /// so that is stored as that exact INTEGER, never as text. A record
+    /// so that is stored as that exact INTEGER, never as text (ADR 0002
+    /// Q-43: probe 10 refuses the coercions that would change the value). A record
     /// whose bytes carry an integer past i64::MAX is refused by the codec
     /// with `WIRE_INTEGER_OUT_OF_RANGE`, before any row is written.
     #[test]

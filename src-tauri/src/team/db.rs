@@ -2794,7 +2794,8 @@ mod tests {
     /// exactly across a reopen; one past either bound, 2^63, 2^64 - 1, a
     /// fraction, and text or bytes that name no integer are refused with the
     /// value left as it was. STRICT converts text or a real naming an in-range
-    /// integer losslessly, so that is stored as the exact INTEGER.
+    /// integer losslessly, so that is stored as the exact INTEGER (ADR 0002
+    /// Q-43: probe 10 refuses the coercions that would change the value).
     #[test]
     fn every_sync_integer_class_keeps_its_range_across_a_reopen() {
         let (_dir, path) = fresh();
