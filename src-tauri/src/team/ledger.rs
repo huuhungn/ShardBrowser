@@ -626,7 +626,8 @@ pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
 ///   generation's activation evidence binds, or any root generation above it,
 ///   PREPARING included. Generation 0 has no `RotationGrant`, so its range
 ///   starts at the first root generation. Missing activation evidence counts
-///   as flagged.
+///   as flagged, and so does a revoked key this device knows as a custodian
+///   but has no root holding filed for.
 ///
 /// A revocation whose reason this device cannot verify counts as
 /// `compromised`.
@@ -709,10 +710,17 @@ pub fn commit_blocked(
         let Some(bound) = bound else {
             return Ok(true);
         };
+        // A known custodian with no root holding filed (a version 6 file
+        // kept no holdings) holds every root generation: missing evidence.
         let held: bool = db.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM trust_key_holdings
                WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
-                 AND ((fleet_id = ?4 AND generation = ?5) OR (fleet_id = '' AND generation >= ?6)))",
+                 AND ((fleet_id = ?4 AND generation = ?5) OR (fleet_id = '' AND generation >= ?6)))
+             OR (EXISTS (SELECT 1 FROM trust_custodian_keys
+                   WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)
+                 AND NOT EXISTS (SELECT 1 FROM trust_key_holdings
+                   WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+                     AND fleet_id = ''))",
             params![
                 instance,
                 tenant,

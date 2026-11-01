@@ -5996,6 +5996,28 @@ mod tests {
         assert!(w.blocked(4), "missing activation evidence");
     }
 
+    /// A key this device knows as a custodian (`trust_custodian_keys`, as a
+    /// version 6 file kept it) with no root holding filed holds every root
+    /// generation: missing evidence counts as flagged.
+    #[test]
+    fn a_known_custodian_with_no_root_holding_blocks() {
+        let me = me();
+        let mut extra = vec![key_rotate(&me)];
+        extra.extend(activation(&me, GEN, &FKEK, 0, 61, None));
+        let w = world_with(extra);
+        count_compromise_in(&w, 0);
+        assert!(!w.blocked(GEN), "nothing shows REVOKED as a custodian yet");
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO trust_custodian_keys
+                 SELECT ?1, ?2, ?3, min(evaluation_id), 0, 0, NULL, NULL FROM trust_evaluations",
+                params![hex(&INSTANCE), hex(&TENANT), hex(&REVOKED)],
+            )
+            .unwrap();
+        assert!(w.blocked(GEN), "a custodian with no root holding");
+    }
+
     /// B3, Q-18 "In-flight commits": a COMMIT persisted while its upload is
     /// still OPEN, chunks unsent, when a compromise is counted, is aborted:
     /// no chunk, finalize or commit is sent, the upload is ABORTED, the
