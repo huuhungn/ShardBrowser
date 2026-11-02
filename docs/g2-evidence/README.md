@@ -45,10 +45,11 @@ On 6c5b6bdf both verifiers returned PASS (round 5, section 8).
   credential-store-persistence evidence means G2 is not a full PASS. The owner
   chose to release without waiting for it, so the release proceeds on an owner
   decision, not on a verifier-confirmed full PASS.
-- **G2-64 is FAIL.** Codex found seven blocking findings (B1 to B7); Hermes
-  produced no report. All seven are fixed and G2-14, G2-31, G2-42 and G2-61
-  are DONE again. The 2026-11-02 rerun found N1 and N2 (Codex) and the
-  skipped SMB branches (Hermes); they are fixed as well (section 8).
+- **G2-64 is DONE.** Both verifiers returned PASS on 6c5b6bdf (round 5). In
+  round 1 Codex found seven blocking findings (B1 to B7) and Hermes produced
+  no report; all seven are fixed and G2-14, G2-31, G2-42 and G2-61 are DONE
+  again. Later rounds found N1 and N2, the skipped SMB branches, F1, R1 and
+  R2; they are fixed as well (section 8).
 - Every other row is DONE in the sense the gap analyses use: a test or a
   recorded run exercises the row's PASS criterion. DONE is not a G2 gate PASS.
   Rows with a weaker form of evidence say so in their **Note**.
