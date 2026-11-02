@@ -524,6 +524,7 @@ function fakeTeamServer() {
       Object.assign(h, { version: h.version + 1, holder: null });
       return reply(String(remote_profile_id));
     },
+    // Not modelled: the caller's pin, the lease, and proven vs reported-only revocation.
     revert: (_device, { remote_profile_id }) => {
       const h = head(String(remote_profile_id));
       if (!h.revoked) throw new Error("nothing to revert");
@@ -608,6 +609,14 @@ test("two devices pass one team profile back and forth, then revert a revoked he
     await expect(rowB).toContainText("Available");
     await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@2"]);
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+  });
+
+  await test.step("A, still on version 1, is refused a check-in over B's version 2", async () => {
+    await click(a, rowA, "Check in");
+    await expect(a.getByText("The team server has a newer version of this profile. Pull it before pushing.")).toBeVisible();
+    await expect(rowA).toContainText("Available");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+    expect([...server.heads.values()]).toEqual([{ version: 2, label: "Beta Research", holder: null, revoked: false }]);
   });
 
   await test.step("checkout on A: A pull + check-in", async () => {

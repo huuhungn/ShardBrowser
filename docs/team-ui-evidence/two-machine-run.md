@@ -2,22 +2,29 @@
 
 **Status:** PENDING-MANUAL (owner decision 2026-11-03: the real two-machine run is done by the operator after release, like G2-48)
 
-The operator runs the two-machine gate (Plan:2388) on two real, disposable
-machines enrolled in one fleet, and fills in every field below. The automated
-counterpart is the e2e test "two devices pass one team profile back and forth,
-then revert a revoked head to available" in `tests/e2e/app.spec.ts`.
+The gate: one team profile is published on machine A, restored and used on
+machine B, checked in from B, and checked out again on A, with both machines
+ending on the same pinned version. The operator runs it on two real,
+disposable machines enrolled in one fleet, both on the same app build, and
+fills in every field below. The automated counterpart is the e2e test "two
+devices pass one team profile back and forth, then revert a revoked head to
+available" in `tests/e2e/app.spec.ts`.
+
+Do not paste tokens, hostnames, URLs or credentials; attach logs only after redaction.
 
 ## Machines
 
 | | Machine A | Machine B |
 |---|---|---|
-| Hostname | | |
+| Machine label (A/B, no hostname) | | |
 | OS and version | | |
 | Device ID (first 8) | | |
 | App version | | |
 | App build SHA | | |
 
-- **Team server URL and tenant (first 8):**
+Both machines must run the same build: the app version and build SHA above match.
+
+- **Tenant (first 8 characters at most):**
 - **Operator:**
 - **Date:**
 
@@ -43,8 +50,11 @@ what was seen). "Badge" and "pin" are what the Team page and
 | Pinned version | | |
 | Server head version | | |
 
-Both machines must end on the same pinned version as the server head.
+Read the server head version on the Team page: "Show fleet profiles" in the
+"Join from fleet" list shows "Version N" for the profile. Both machines must
+end on the same pinned version as the server head.
 
 ## Notes
 
-Anything unexpected: errors and their toasts, retries, timings, logs attached.
+Anything unexpected: errors and their toasts, retries, timings. Attach logs
+only after removing tokens, hostnames, URLs and credentials.
