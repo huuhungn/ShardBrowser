@@ -210,7 +210,7 @@ if (scenario === "folder-empty") {
 
 // "team-profiles": one binding per Team page badge (profile-beta stays local),
 // with a proven run, a reported-only quarantine, a revert in progress and a
-// custodian alert.
+// custodian alert. "team-profiles-quiet" keeps the bindings without the alert.
 const teamLease = "2099-01-01T00:00:00.000Z";
 const teamBinding = (
   profile_id: string,
@@ -221,13 +221,16 @@ const teamBinding = (
   last_error_code: null, lease_at_risk: false, revert_available: false, revert_in_progress: false,
   ...more,
 });
-const teamProfiles: TeamProfilesStatus = scenario === "team-profiles"
+const teamProfiles: TeamProfilesStatus = scenario === "team-profiles" || scenario === "team-profiles-quiet"
   ? {
     profiles: [
       teamBinding("profile-alpha", "AVAILABLE"),
       teamBinding("team-checked-out", "CHECKED_OUT", { dirty: true, lease_expires_at: teamLease }),
       teamBinding("team-lease-at-risk", "LEASE_AT_RISK", {
         dirty: true, lease_expires_at: teamLease, lease_at_risk: true,
+      }),
+      teamBinding("team-expired-lease", "CHECKED_OUT", {
+        dirty: true, lease_expires_at: "2000-01-01T00:00:00.000Z", lease_at_risk: true,
       }),
       teamBinding("team-uploading", "UPLOADING", { dirty: true, lease_expires_at: teamLease }),
       teamBinding("team-quarantined", "QUARANTINED", { last_error_code: "HEAD_ROLLBACK_DETECTED" }),
@@ -240,9 +243,9 @@ const teamProfiles: TeamProfilesStatus = scenario === "team-profiles"
         revert_available: true, revert_in_progress: true,
       }),
     ],
-    alerts: [{
+    alerts: scenario === "team-profiles-quiet" ? [] : [{
       kind: "custodian.renewed_after_revocation",
-      signing_key_id: "70".repeat(32),
+      signing_key_id: "a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdeffedcba9876543210f",
       raised_at_ms: 1_800_000_000_000,
     }],
   }

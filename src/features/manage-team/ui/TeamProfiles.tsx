@@ -3,10 +3,11 @@ import { Button } from "@proxyshard/shardx-ui-kit";
 import Badge, { type BadgeColor } from "../../../shared/ui/Badge";
 import { RefreshIcon, WarningIcon } from "../../../shared/icons";
 import { useProfile } from "../../../entities/profile";
-import { useTeamProfiles, type TeamProfileStatus } from "../../../entities/team";
+import { useTeamProfiles, type TeamProfileStatus, type TeamSyncState } from "../../../entities/team";
 import { useT } from "../../../shared/i18n";
 
-type BadgeKind = "local" | "available" | "checkedOutHere" | "leaseAtRisk" | "uploading" | "quarantined";
+type BadgeKind =
+  | "local" | "available" | "checkedOutHere" | "leaseAtRisk" | "uploading" | "quarantined" | "other";
 
 const BADGE_COLOR: Record<BadgeKind, BadgeColor> = {
   local: "gray",
@@ -15,17 +16,38 @@ const BADGE_COLOR: Record<BadgeKind, BadgeColor> = {
   leaseAtRisk: "warning",
   uploading: "information",
   quarantined: "error",
+  other: "gray",
 };
 
-/** The badge a profile shows; null for states no production code writes yet. */
-function badgeOf(b: TeamProfileStatus | undefined): BadgeKind | null {
-  if (!b || b.sync_state === "LOCAL") return "local";
-  if (b.sync_state === "QUARANTINED") return "quarantined";
-  if (b.lease_at_risk) return "leaseAtRisk";
-  if (b.sync_state === "UPLOADING") return "uploading";
-  if (b.sync_state === "CHECKED_OUT") return "checkedOutHere";
-  if (b.sync_state === "AVAILABLE") return "available";
-  return null;
+// No production code writes OFFLINE_FORK, RESTORE_REQUIRED or CONFLICT yet, so they share a neutral badge.
+const BADGE_OF_STATE: Record<TeamSyncState, BadgeKind> = {
+  LOCAL: "local",
+  AVAILABLE: "available",
+  CHECKED_OUT: "checkedOutHere",
+  LEASE_AT_RISK: "leaseAtRisk",
+  UPLOADING: "uploading",
+  QUARANTINED: "quarantined",
+  OFFLINE_FORK: "other",
+  RESTORE_REQUIRED: "other",
+  CONFLICT: "other",
+};
+
+/** The quarantine reasons team/sync.rs writes; any other code is shown as is. */
+const REASON_KEY: Record<string, string> = {
+  SIGNER_REVOKED: "team.reason.signerRevoked",
+  HEAD_ROLLBACK_DETECTED: "team.reason.headRollbackDetected",
+  RESTORE_EPOCH_TRANSITION_REQUIRED: "team.reason.restoreEpochTransitionRequired",
+  RESTORE_EPOCH_TRANSITION_INVALID: "team.reason.restoreEpochTransitionInvalid",
+  RESTORE_EPOCH_PROOF_MISSING: "team.reason.restoreEpochProofMissing",
+  RESTORE_EPOCH_CROSS_TENANT: "team.reason.restoreEpochCrossTenant",
+  STORED_REQUEST_MISMATCH: "team.reason.storedRequestMismatch",
+};
+
+/** The badge a profile shows once the statuses are loaded; no binding means local. */
+function badgeOf(b: TeamProfileStatus | undefined): BadgeKind {
+  if (!b) return "local";
+  if (b.sync_state !== "QUARANTINED" && b.lease_at_risk) return "leaseAtRisk";
+  return BADGE_OF_STATE[b.sync_state];
 }
 
 /** Each profile's binding state on this device, with the custodian alerts above it. */
@@ -75,7 +97,8 @@ export function TeamProfiles() {
         )}
         {profiles.map((p) => {
           const b = bindings.get(p.id);
-          const kind = badgeOf(b);
+          // Until the first read lands, a missing binding proves nothing.
+          const kind = status ? badgeOf(b) : null;
           return (
             <div
               key={p.id}
@@ -90,7 +113,9 @@ export function TeamProfiles() {
                 <div className="flex items-center gap-1.5">
                   <Badge color={BADGE_COLOR[kind]} variant="filled" size="small">{t(`team.badge.${kind}`)}</Badge>
                   {kind === "quarantined" && b?.last_error_code && (
-                    <span className="mono text-[11px] text-text-soft-400">{b.last_error_code}</span>
+                    <span className="text-[11px] text-text-soft-400">
+                      {REASON_KEY[b.last_error_code] ? t(REASON_KEY[b.last_error_code]) : b.last_error_code}
+                    </span>
                   )}
                 </div>
               )}

@@ -238,14 +238,16 @@ test("Team page shows one badge per binding state", async ({ page }) => {
     ["VN Automation 001", "Available"],
     ["team-checked-out", "Checked out here"],
     ["team-lease-at-risk", "Lease at risk"],
+    ["team-expired-lease", "Lease at risk"],
     ["team-uploading", "Uploading"],
     ["team-quarantined", "Quarantined"],
   ]) {
     await expect(row(text)).toContainText(badge);
   }
-  await expect(row("team-quarantined")).toContainText("HEAD_ROLLBACK_DETECTED");
+  await expect(row("team-quarantined")).toContainText("the server offered an older state");
   await expect(row("team-reported-only")).toContainText("Quarantined");
-  await expect(row("team-reported-only")).toContainText("SIGNER_REVOKED");
+  await expect(row("team-reported-only")).toContainText("signer revoked");
+  await expect(row("team-expired-lease")).not.toContainText("Checked out here");
   await expect(row("VN Automation 001")).not.toContainText("Quarantined");
   // Actions belong to a later story; this page only reads state.
   for (const name of [/publish/i, /check.?in/i, /pull/i, /revert/i, /unbind/i, /join/i]) {
@@ -261,15 +263,17 @@ test("Team page warns about a custodian renewed after revocation", async ({ page
   await expect(alert).toHaveCount(1);
   await expect(alert).toHaveAttribute("role", "alert");
   await expect(alert).toContainText("renewed after it was revoked");
-  await expect(alert).toContainText("key 70707070)");
-  await expect(alert).not.toContainText("70".repeat(5));
+  await expect(alert).toContainText("key a1b2c3d4)");
+  await expect(alert).not.toContainText("a1b2c3d4e");
+  await expect(alert).not.toContainText("3210f");
   await expect(alert.getByRole("button")).toHaveCount(0);
 });
 
 test("Team page shows no alert banner when there are no alerts", async ({ page }) => {
-  await gotoMocked(page);
+  await gotoMocked(page, "/?e2e=team-profiles-quiet");
   await page.getByRole("button", { name: "Team", exact: true }).click();
-  await expect(page.getByTestId("team-profile").first()).toContainText("Local only");
+  // A bound row's badge only appears once the statuses are loaded.
+  await expect(page.getByTestId("team-profile").filter({ hasText: "team-uploading" })).toContainText("Uploading");
   await expect(page.getByTestId("team-alert")).toHaveCount(0);
 });
 
