@@ -117,3 +117,13 @@ export type TeamProfilesStatus = {
   /** Newest first. */
   alerts: TeamCustodianAlert[];
 };
+
+/** One profile the fleet lists, as `team_fleet_profiles` reports it. */
+export type TeamFleetProfile = {
+  remote_profile_id: string;
+  current_version: number;
+  /** Null when no fleet key this device holds opens it. */
+  label: string | null;
+  /** The local profile bound to it on this device, if any. */
+  bound_to: string | null;
+};

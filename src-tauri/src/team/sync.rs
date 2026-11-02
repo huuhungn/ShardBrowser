@@ -963,6 +963,26 @@ async fn listing(
     access: &str,
     b: &Bound,
 ) -> Result<(u64, Option<FleetProfileHeadV2>)> {
+    let mut found = None;
+    let epoch = fleet_pages(client, access, b, |p| {
+        if p.profile_id == b.profile {
+            found = Some(p.clone());
+        }
+        found.is_none()
+    })
+    .await?;
+    Ok((epoch, found))
+}
+
+/// The server's restore epoch, from the fleet listing pages of `b`'s fleet,
+/// handing each listed profile to `more` until it returns `false`. Every
+/// page names `b`'s instance, tenant and fleet, at one epoch.
+async fn fleet_pages(
+    client: &FleetClient,
+    access: &str,
+    b: &Bound,
+    mut more: impl FnMut(&FleetProfileHeadV2) -> bool,
+) -> Result<u64> {
     let mut after: Option<[u8; 16]> = None;
     let mut epoch = None;
     loop {
@@ -978,13 +998,13 @@ async fn listing(
         if *epoch.get_or_insert(page.restore_epoch) != page.restore_epoch {
             return Err(bad("restore_epoch"));
         }
-        if let Some(p) = page.profiles.iter().find(|p| p.profile_id == b.profile) {
-            return Ok((page.restore_epoch, Some(p.clone())));
+        if !page.profiles.iter().all(&mut more) {
+            return Ok(page.restore_epoch);
         }
         match page.next_after {
             Some(a) if after.is_none_or(|x| a > x) => after = Some(a),
             Some(_) => return Err(bad("next_after")),
-            None => return Ok((page.restore_epoch, None)),
+            None => return Ok(page.restore_epoch),
         }
     }
 }
@@ -1174,7 +1194,11 @@ async fn accept_transitions(
             let version = if head == b.head {
                 b.version
             } else {
-                let top = b.version.min(listed.current_version);
+                // With no pin, from the listed head down.
+                let top = match b.head {
+                    Some(_) => b.version.min(listed.current_version),
+                    None => listed.current_version,
+                };
                 let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
                 let mut found = None;
                 for v in (low..=top).rev() {
@@ -1351,7 +1375,9 @@ fn verify_proof(
         InclusionError::Proof(_) => invalid("steps"),
     })?;
     let leaf = &proof.leaf;
-    if head != Some(leaf.previous_signed_head_hash) && head != Some(leaf.new_signed_head_hash) {
+    // No head yet (a device that joined at version 0) takes its leaf as its
+    // first head: ADR 0002 rule 6 extends the leaf exception to a new device.
+    if head.is_some_and(|h| h != leaf.previous_signed_head_hash && h != leaf.new_signed_head_hash) {
         return Err(invalid("previous_signed_head_hash"));
     }
     Ok((proof, body))
@@ -1516,7 +1542,8 @@ fn verified_key(
 /// and may lie past the pin (owner decision B) or be what a revert seals
 /// again under the lease's generation. Its grant still reverifies
 /// now (Q-26 drops a withdrawn issuer's). `P` skips the freshness check only
-/// when a `J` follows it; never for sealing, nor for any other head.
+/// when a `J` follows it; never for sealing, nor for any other head. A
+/// fleet listing's labels ([`labels`]) are opened through it too.
 fn readable_key(
     db: &Db,
     dev: &Device,
@@ -2049,6 +2076,182 @@ fn pending_publish(db: &Db, local: &str) -> Result<Option<Op>> {
         .optional()?)
 }
 
+/// `local` as it is before a binding to `fleet`'s `profile` under this
+/// device's pinned instance and tenant exists.
+fn unbound(local: &str, dev: &Device, fleet: [u8; 16], profile: [u8; 16]) -> Bound {
+    Bound {
+        local: local.to_string(),
+        server: String::new(),
+        instance: dev.pin.0.server_instance_id,
+        tenant: dev.pin.0.tenant_id,
+        fleet,
+        profile,
+        version: 0,
+        head: None,
+        epoch: 0,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    }
+}
+
+/// One profile a fleet lists, as `team_fleet_profiles` reports it.
+#[derive(Debug, serde::Serialize)]
+pub struct FleetProfile {
+    pub remote_profile_id: String,
+    pub current_version: u64,
+    /// Opened under this device's key of its generation; `None` when no key
+    /// this device holds opens it.
+    pub label: Option<String>,
+    /// The local profile bound to it here, if any.
+    pub bound_to: Option<String>,
+}
+
+/// Every profile `fleet` lists, with its label opened and its binding here,
+/// if any. Nothing is written, here or on the server.
+pub(crate) async fn labels(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    fleet: [u8; 16],
+    now: u64,
+) -> Result<Vec<FleetProfile>> {
+    let db = Db::open()?;
+    let b = unbound("", dev, fleet, [0; 16]);
+    let mut listed = Vec::new();
+    fleet_pages(client, access, &b, |p| {
+        listed.push(p.clone());
+        true
+    })
+    .await?;
+    let bound: std::collections::HashMap<String, String> = db
+        .conn
+        .prepare(
+            "SELECT remote_profile_id, local_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2",
+        )?
+        .query_map(params![hex(&b.instance), hex(&b.tenant)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // A label is read, never sealed: the key of its own generation, as `P`'s.
+    let mut keys = std::collections::HashMap::new();
+    Ok(listed
+        .into_iter()
+        .map(|p| {
+            let key = keys.entry(p.key_generation).or_insert_with(|| {
+                readable_key(&db, dev, &fleet, p.key_generation, None, now).ok()
+            });
+            let label = key.as_ref().and_then(|k| {
+                let l = shardx_core::keys::open_label(
+                    k,
+                    &b.tenant,
+                    &fleet,
+                    &p.profile_id,
+                    p.key_generation,
+                    &p.label_ciphertext,
+                )
+                .ok()?;
+                String::from_utf8(l.to_vec()).ok()
+            });
+            let id = hex(&p.profile_id);
+            FleetProfile {
+                bound_to: bound.get(&id).cloned(),
+                remote_profile_id: id,
+                current_version: p.current_version,
+                label,
+            }
+        })
+        .collect())
+}
+
+/// Binds the local profile `local`, which has no binding, to `fleet`'s
+/// listed `profile` on this device, then pulls it into `udd` (Team UI S3b).
+/// The binding starts at version 0 with no lease, `AVAILABLE` and clean,
+/// under the verified key `store_publish` would seal with. Its epoch is the
+/// server's, or the one before it when the profile's first snapshot predates
+/// it, so the pull accepts the restore transition whose leaf it then pins
+/// (ADR 0002 rule 6: the leaf exception covers a new device). A refusal
+/// before the insert leaves no binding; a failed pull keeps it at version 0,
+/// and pull can be retried.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn join(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    udd: &Path,
+    now: u64,
+) -> Result<u64> {
+    let db = Db::open()?;
+    if is_bound(&db, local)? {
+        bail!(code("sync.alreadyPublished"));
+    }
+    let mut b = unbound(local, dev, fleet, profile);
+    // Checked first, so the UNIQUE constraint is never the error shown.
+    let taken: bool = db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM profile_bindings
+           WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3)",
+        params![hex(&b.instance), hex(&b.tenant), hex(&profile)],
+        |r| r.get(0),
+    )?;
+    if taken {
+        bail!(code("sync.remoteAlreadyBound"));
+    }
+    let generation = ledger::highest_generation(&db, &dev.pin.0, &fleet)?
+        .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
+    let fkek = verified_key(&db, dev, &fleet, generation, None, now)?;
+    let fkek_key_id = shardx_core::fleet_grants::fkek_key_id(&fkek);
+    b.server = key_server(&db, &b, generation, &fkek_key_id)?;
+    let (epoch, listed) = listing(client, access, &b).await?;
+    let listed = listed.ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
+    let accepted: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT last_restore_epoch FROM server_origins WHERE server_instance_id = ?1",
+            [hex(&b.instance)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if accepted.is_some_and(|e| epoch < e as u64) {
+        bail!(code("sync.headRollback"));
+    }
+    // Only a start epoch: the pull verifies every manifest it accepts, so a
+    // server that misreports this one fails closed there.
+    let mut start = epoch;
+    if epoch > 0 && listed.current_version > 0 {
+        let first = manifest(client, access, &b, 1).await?;
+        let p = SnapshotManifestV2::parse(first.canonical_manifest_payload_bytes())
+            .map_err(|_| bad("manifest"))?;
+        if p.restore_epoch < epoch {
+            start = epoch - 1;
+        }
+    }
+    db.conn.execute(
+        "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
+           account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+           accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, 'AVAILABLE', 0)",
+        params![
+            b.local,
+            b.server,
+            hex(&b.instance),
+            hex(&b.tenant),
+            hex(&dev.me.account_id),
+            hex(&dev.me.device_id),
+            hex(&b.fleet),
+            hex(&b.profile),
+            wire(start)?,
+            hex(&fkek_key_id),
+            wire(generation)?
+        ],
+    )?;
+    drop(db);
+    pull(client, access, dev, local, udd, now).await
+}
+
 /// Builds the request of a new publish and stores it, PENDING, unsent.
 #[allow(clippy::too_many_arguments)]
 async fn store_publish(
@@ -2062,20 +2265,7 @@ async fn store_publish(
     profile: [u8; 16],
     now: u64,
 ) -> Result<Op> {
-    let mut b = Bound {
-        local: local.to_string(),
-        server: String::new(),
-        instance: dev.pin.0.server_instance_id,
-        tenant: dev.pin.0.tenant_id,
-        fleet,
-        profile,
-        version: 0,
-        head: None,
-        epoch: 0,
-        lease: None,
-        state: "LOCAL".into(),
-        error: None,
-    };
+    let mut b = unbound(local, dev, fleet, profile);
     // The listing names the server's instance and epoch (it must be the
     // pinned instance) and shows whether the ID is taken.
     let (epoch, listed) = listing(client, access, &b).await?;
@@ -4437,6 +4627,8 @@ mod tests {
         fresh: bool,
         /// The profiles publish-create made, in order.
         published: Vec<[u8; 16]>,
+        /// The label publish-create sealed for `PROFILE`, which the list reports.
+        label: Option<Vec<u8>>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -4568,7 +4760,7 @@ mod tests {
                                 current_version: version,
                                 current_signed_head_hash: head,
                                 key_generation: GEN,
-                                label_ciphertext: vec![1],
+                                label_ciphertext: self.label.clone().unwrap_or(vec![1]),
                             })
                             .into_iter()
                             .chain(self.others.iter().cloned())
@@ -4597,6 +4789,9 @@ mod tests {
                                 return Err(409);
                             }
                             f.fresh = false;
+                            if c.profile.profile_id == PROFILE {
+                                f.label = Some(c.label_ciphertext.clone());
+                            }
                             f.published.push(c.profile.profile_id);
                             f.fence = 1;
                             let lease = LeaseRef {
@@ -11653,5 +11848,224 @@ mod tests {
         let s = s.unwrap();
         assert!(s.profiles.is_empty() && s.alerts.is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    impl World {
+        fn join(&self, local: &str, profile: [u8; 16], udd: &Path) -> Result<u64> {
+            self.rt.block_on(join(
+                &self.client,
+                "t",
+                &self.dev,
+                local,
+                FLEET,
+                profile,
+                udd,
+                NOW,
+            ))
+        }
+
+        /// The fleet listing as (profile, version, label, bound to).
+        fn labels(&self) -> Vec<(String, u64, Option<String>, Option<String>)> {
+            self.rt
+                .block_on(labels(&self.client, "t", &self.dev, FLEET, NOW))
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.remote_profile_id, p.current_version, p.label, p.bound_to))
+                .collect()
+        }
+    }
+
+    /// `PROFILE` published and pushed at v1 here; then a second device,
+    /// enrolled with no binding, is the config root.
+    fn joinable() -> (World, tempfile::TempDir) {
+        let w = world_unbound();
+        w.publish().unwrap();
+        w.push().unwrap();
+        let d = second(&w);
+        (w, d)
+    }
+
+    fn noise(udd: &Path) -> Vec<u8> {
+        std::fs::read(udd.join("Default").join("noise.bin")).unwrap()
+    }
+
+    #[test]
+    fn join_lists_fleet_profiles_with_their_opened_labels_and_marks_bound_ones() {
+        let w = world_unbound();
+        w.publish().unwrap();
+        let sealed = |profile: [u8; 16], generation| {
+            shardx_core::keys::seal_label(
+                &FKEK,
+                &random().unwrap(),
+                &TENANT,
+                &FLEET,
+                &profile,
+                generation,
+                b"Shop",
+            )
+            .unwrap()
+        };
+        w.fake().others = vec![
+            FleetProfileHeadV2 {
+                label_ciphertext: sealed(PROFILE2, GEN),
+                ..other(PROFILE2, 2, [9; 32])
+            },
+            // Not a label any key opens, and one of a generation not held here.
+            other(PROFILE3, 1, [8; 32]),
+            FleetProfileHeadV2 {
+                key_generation: GEN + 1,
+                label_ciphertext: sealed([0xc4; 16], GEN + 1),
+                ..other([0xc4; 16], 1, [7; 32])
+            },
+        ];
+        let posts = w.sent("POST", "").len();
+        let row = |p: [u8; 16], v, label: Option<&str>, to: Option<&str>| {
+            (
+                hex(&p),
+                v,
+                label.map(str::to_string),
+                to.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            w.labels(),
+            [
+                row(PROFILE, 0, Some("Work profile"), Some(LOCAL)),
+                row(PROFILE2, 2, Some("Shop"), None),
+                row(PROFILE3, 1, None, None),
+                row([0xc4; 16], 1, None, None),
+            ]
+        );
+        let _d = second(&w);
+        assert_eq!(
+            w.labels()[0],
+            row(PROFILE, 0, Some("Work profile"), None),
+            "bound on the first device only"
+        );
+        assert_eq!(w.sent("POST", "").len(), posts, "nothing was written");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    #[test]
+    fn join_binds_and_pulls_a_remote_profile_on_a_new_device() {
+        let (w, d) = joinable();
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        let head = w.fake().head.unwrap();
+        available_at(&w, 1, head);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM profile_bindings WHERE accepted_restore_epoch = 0
+                   AND lease_id IS NULL AND dirty = 0"
+            ),
+            1
+        );
+    }
+
+    /// ADR 0002 rule 6: a device that joins after a restore, before any
+    /// commit at the new epoch, pins the transition's leaf at its older epoch.
+    #[test]
+    fn join_after_a_restore_pins_the_transition_leaf_then_pulls() {
+        let w = world_unbound();
+        w.publish().unwrap();
+        let (h1, h2) = restored(&w);
+        let leaves = [
+            leaf(PROFILE, h2, h1),
+            leaf([0xc4; 16], [7; 32], [8; 32]),
+            leaf([0xc5; 16], [9; 32], [10; 32]),
+        ];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        let d = second(&w);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        assert_eq!(
+            w.state(LOCAL),
+            ("AVAILABLE".into(), None, 1, 1, Some(h1.to_vec()))
+        );
+        assert_eq!(w.filed(), 2, "the transition and this profile's proof");
+    }
+
+    #[test]
+    fn join_refuses_a_bound_or_running_local_profile() {
+        let w = world();
+        let before = (w.state(LOCAL), w.fake().log.len());
+        let err = w
+            .join(LOCAL, PROFILE2, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!((w.state(LOCAL), w.fake().log.len()), before);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        // `team_join_profile` takes this claim before anything else.
+        let _running = crate::profile::begin_profile_launch("join-running").unwrap();
+        let err = crate::profile::begin_user_mutation(["join-running"], "join").unwrap_err();
+        assert!(has(&err, "profile.busyOne"), "{err:#}");
+    }
+
+    #[test]
+    fn join_refuses_without_the_collected_fleet_key_and_creates_no_binding() {
+        let (w, d) = joinable();
+        w.db()
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM fleet_key_state")
+            .unwrap();
+        let before = w.fake().log.len();
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.fleetKeyRecollect"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(
+            w.fake().log.len(),
+            before,
+            "nothing was asked of the server"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn join_refuses_a_remote_profile_already_bound_here() {
+        let w = world();
+        let before = (w.state(LOCAL), w.fake().log.len());
+        let err = w
+            .join("another-local", PROFILE, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.remoteAlreadyBound"), "{err:#}");
+        assert!(!format!("{err:#}").contains("UNIQUE"), "{err:#}");
+        assert_eq!((w.state(LOCAL), w.fake().log.len()), before);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        for lang in ["en", "vi"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../src/shared/i18n/locales")
+                .join(format!("{lang}.json"));
+            let dict: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                dict["sync.remoteAlreadyBound"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "{lang}"
+            );
+        }
+    }
+
+    /// Two machines through the one server: the second joins and checks in a
+    /// change, and the first pulls it.
+    #[test]
+    fn join_then_check_in_then_pull_on_the_first_device() {
+        let (w, d) = joinable();
+        let out = d.path().join("joined");
+        w.join(LOCAL, PROFILE, &out).unwrap();
+        std::fs::write(out.join("Default").join("joined.txt"), b"second device").unwrap();
+        assert_eq!(w.push_from(&out).unwrap().version, 2);
+        crate::store::set_config_root(Some(w._dir.path().to_path_buf()));
+        assert!(w.pull(&w.udd).unwrap() > 0);
+        assert_eq!(
+            std::fs::read(w.udd.join("Default").join("joined.txt")).unwrap(),
+            b"second device"
+        );
+        let head = w.head_of(2);
+        available_at(&w, 2, head);
     }
 }

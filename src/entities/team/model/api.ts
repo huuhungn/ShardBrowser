@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus,
+  TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus, TeamFleetProfile,
 } from "./types";
 
 export const teamStatus = () => invoke<TeamStatus>("team_status");
@@ -66,3 +66,21 @@ export const teamBootstrapCustody = (
 
 /** Every bound profile's sync state and every custodian alert; no server is asked. */
 export const teamProfilesStatus = () => invoke<TeamProfilesStatus>("team_profiles_status");
+
+/** Every profile this device's fleet lists, with its label; nothing is written. */
+export const teamFleetProfiles = (username: string, password: string) =>
+  invoke<TeamFleetProfile[]>("team_fleet_profiles", { username, password });
+
+/**
+ * Bind the stopped, unbound local profile to a fleet profile and pull it.
+ * Returns the bytes restored. The password is used for one login and never stored.
+ */
+export const teamJoinProfile = (
+  remoteProfileId: string,
+  localProfileId: string,
+  username: string,
+  password: string,
+) =>
+  invoke<number>("team_join_profile", {
+    remoteProfileId, localProfileId, username, password,
+  });
