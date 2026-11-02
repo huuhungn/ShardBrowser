@@ -57,6 +57,12 @@ function badgeOf(b: TeamProfileStatus | undefined): BadgeKind {
   return BADGE_OF_STATE[b.sync_state];
 }
 
+// The refusals a publish meets on its stored request, which only a cancel clears (team/sync.rs `send_publish`).
+const CANCELLABLE_PUBLISH = [
+  "sync.commitBlockedCompromised", "sync.noVerifiedFleetKey", "sync.fleetKeyRecollect",
+  "sync.publishPendingElsewhere", "sync.storedRequestMismatch",
+];
+
 const ask = (title: string, message: string, confirm: string) =>
   confirmModal({
     title,
@@ -91,10 +97,10 @@ export function TeamProfiles() {
   const signedIn = !!username.trim() && !!password;
 
   /** Run one action; status is refetched after every one, failed or not. */
-  const run = async (key: string, fn: (pw: string) => Promise<string | void>) => {
-    // Cleared before the call, so a failed attempt does not keep it either.
+  const run = async (key: string, fn: (pw: string) => Promise<string | void>, needsLogin = true) => {
+    // Cleared before a call that logs in, so a failed attempt does not keep it either.
     const typed = password;
-    setPassword("");
+    if (needsLogin) setPassword("");
     setActing(key);
     try {
       const done = await fn(typed);
@@ -111,7 +117,7 @@ export function TeamProfiles() {
     try {
       await teamPublishProfile(id, username.trim(), pw);
     } catch (e) {
-      setPublishRefused((s) => new Set(s).add(id));
+      if (CANCELLABLE_PUBLISH.some((c) => String(e).includes(c))) setPublishRefused((s) => new Set(s).add(id));
       throw e;
     }
     setPublishRefused((s) => { const n = new Set(s); n.delete(id); return n; });
@@ -122,7 +128,7 @@ export function TeamProfiles() {
     await teamCancelPublish(id);
     setPublishRefused((s) => { const n = new Set(s); n.delete(id); return n; });
     return t("team.action.publishCancelled");
-  });
+  }, false);
 
   const checkIn = (id: string) => run(`checkIn:${id}`, async (pw) => {
     await teamCheckIn(id, username.trim(), pw);
@@ -148,7 +154,7 @@ export function TeamProfiles() {
       await teamUnbindProfile(id);
       setFleet((f) => f?.map((x) => (x.bound_to === id ? { ...x, bound_to: null } : x)) ?? null);
       return t("team.action.unbound");
-    });
+    }, false);
   };
 
   const listFleet = () => run("fleet", async (pw) => {
@@ -156,8 +162,12 @@ export function TeamProfiles() {
   });
 
   const join = (f: TeamFleetProfile) => run(`join:${f.remote_profile_id}`, async (pw) => {
-    const name = f.label ?? t("team.join.unnamed", { id: f.remote_profile_id.slice(0, 8) });
-    const created = await profileSave(toStored({ ...defaultForm(), name }, null));
+    const fallback = t("team.join.unnamed", { id: f.remote_profile_id.slice(0, 8) });
+    const create = (name: string) => profileSave(toStored({ ...defaultForm(), name }, null));
+    // A label the launcher refuses as a name (taken, say, after an unbind)
+    // falls back once to a name the remote id keeps unique.
+    const created = await create(f.label?.trim() || fallback)
+      .catch(() => create(t("team.join.unnamed", { id: f.remote_profile_id.slice(0, 16) })));
     try {
       await teamJoinProfile(f.remote_profile_id, created.id, username.trim(), pw);
     } catch (e) {
@@ -266,7 +276,7 @@ export function TeamProfiles() {
                   {!bound && action(`publish:${p.id}`, t("team.action.publish"), () => { void publish(p.id); })}
                   {!bound && publishRefused.has(p.id)
                     && action(`cancel:${p.id}`, t("team.action.cancelPublish"), () => { void cancelPublish(p.id); }, false)}
-                  {b?.revert_available && action(
+                  {(b?.revert_available || b?.revert_in_progress) && action(
                     `revert:${p.id}`,
                     b.revert_in_progress ? t("team.action.resumeRevert") : t("team.action.revert"),
                     () => { void revert(p.id); },

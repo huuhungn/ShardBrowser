@@ -421,6 +421,48 @@ test("a failed join removes the local profile it created", async ({ page }) => {
   await expect(page.getByText("[[shardx:")).toHaveCount(0);
 });
 
+test("a join whose first pull fails keeps the bound profile", async ({ page }) => {
+  const row = await teamPage(page, "&teamJoinFailAfterBind=1");
+  const rows = page.getByTestId("team-profile");
+  await expect(row("team-reverting")).toBeVisible();
+  const before = await rows.count();
+
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet-profile").filter({ hasText: "Shop" }).getByRole("button", { name: "Join" }).click();
+  await expect(page.getByText("The team server has a newer version of this profile.")).toBeVisible();
+  await expect(rows).toHaveCount(before + 1);
+  await expect(row("Shop")).toContainText("Available");
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-profile-saves", "1");
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-profile-deletes", /.+/);
+});
+
+test("joining under a label a local profile already uses falls back to a unique name", async ({ page }) => {
+  const row = await teamPage(page);
+  const rows = page.getByTestId("team-profile");
+  await expect(row("team-reverting")).toBeVisible();
+  const before = await rows.count();
+  const shop = page.getByTestId("team-fleet-profile").filter({ hasText: "Shop" });
+
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+  await teamSignIn(page);
+  await shop.getByRole("button", { name: "Join" }).click();
+  await expect(row("Shop")).toContainText("Available");
+  // Unbinding keeps the local "Shop", so joining again meets its name.
+  await row("Shop").getByRole("button", { name: "Unbind" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Unbind" }).click();
+  await expect(row("Shop")).toContainText("Local only");
+
+  await teamSignIn(page);
+  await shop.getByRole("button", { name: "Join" }).click();
+  await expect(row("Team profile c2c2c2c2c2c2c2c2")).toContainText("Available");
+  await expect(rows).toHaveCount(before + 2);
+  await expect(row("Shop")).toHaveCount(1);
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-profile-saves", "3");
+});
+
 test("a refused action shows the localized error and keeps the row", async ({ page }) => {
   const row = await teamPage(page, "&teamRefuse=profile_sync_publish,profile_sync_push");
   const checkedOut = row("team-checked-out");

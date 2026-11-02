@@ -436,6 +436,10 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       const stored = (payload as { payload?: Record<string, unknown> } | undefined)?.payload ?? {};
       document.documentElement.dataset.e2eSavedCustomFonts = JSON.stringify(stored.custom_fonts ?? null);
       const meta = (stored._meta ?? {}) as { id?: string; proxy_id?: string | null };
+      // As prepare_profile_name_for_save: no two profiles share a name, case aside.
+      if (typeof stored.name === "string" && profiles.some((p) => p.id !== meta.id && same(p.name, stored.name as string))) {
+        throw new Error(`[[shardx:profile.nameTaken|name=${stored.name}]]`);
+      }
       const saved = {
         ...fixtureProfiles[0],
         id: meta.id || `profile-created-${++createdProfiles}`,
@@ -712,6 +716,8 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       teamProfiles.profiles.push(teamBinding(local, "AVAILABLE", {
         remote_version: remote.current_version,
       }));
+      // The binding is filed, then the first pull fails: a retry pulls into it.
+      if (params.get("teamJoinFailAfterBind") === "1") throw new Error("[[shardx:sync.remoteAhead]]");
       return 4096;
     }
     case "profile_sync_publish": {

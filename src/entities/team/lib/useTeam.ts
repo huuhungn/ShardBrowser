@@ -62,17 +62,26 @@ type TeamProfilesState = {
   refresh: () => Promise<void>;
 };
 
+// A refresh asked for during a read (say, right after an action) reads again
+// once that read lands, since the read in flight may predate the change.
+let rerun = false;
+
 export const useTeamProfiles = create<TeamProfilesState>((set, get) => ({
   status: null,
   error: null,
   busy: false,
   refresh: async () => {
-    if (get().busy) return;
+    if (get().busy) { rerun = true; return; }
     set({ busy: true });
     try {
-      set({ status: await teamProfilesStatus(), error: null });
-    } catch (e) {
-      set({ error: safeUiError(e) });
+      do {
+        rerun = false;
+        try {
+          set({ status: await teamProfilesStatus(), error: null });
+        } catch (e) {
+          set({ error: safeUiError(e) });
+        }
+      } while (rerun);
     } finally {
       set({ busy: false });
     }
