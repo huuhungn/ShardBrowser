@@ -3619,29 +3619,63 @@ mod custody_tests {
         };
         let revocation = build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
         let other_fleet = [0x0f; 16];
-        let counts = |revoke_scope: (CapabilityScopeKind, [u8; 16]), tenant_approved: bool| {
-            let mut pages = evidence(&me, Vec::new());
-            let p = &mut pages[0];
-            p.containers.extend([
-                capability(
-                    Capability::DeviceApprove,
-                    CapabilityScopeKind::Tenant,
-                    TENANT,
-                    13,
-                ),
-                capability(Capability::DeviceRevoke, revoke_scope.0, revoke_scope.1, 14),
-                approval(ApprovalScopeKind::Fleet, FLEET, 20),
-                revocation.clone(),
-            ]);
-            if tenant_approved {
-                p.containers
-                    .push(approval(ApprovalScopeKind::Tenant, TENANT, 21));
-            }
-            let (_dir, path) = ledger_at();
-            collect_at(&path, &pages, &[], 1, T0 + DAY);
-            proven(&path) == [(hex(&m_key), "DEVICE_REVOCATION".into())]
+        // F1: an approval signed by an outsider that no custodian authorised;
+        // the server would never have filed it.
+        let outsider = shardx_core::signing::Ed25519SigningKey::from_bytes(&[0x5a; 32]);
+        let forged = |kind, scope_id| {
+            let a = DeviceApprovalV2 {
+                common: common(22),
+                subject_account_id: [6; 16],
+                subject_device_id: [0x6e; 16],
+                subject_signing_key_id: m_key,
+                subject_hpke_key_id: [0x6f; 32],
+                approval_scope_kind: kind,
+                approval_scope_id: scope_id,
+            };
+            build_record(&outsider, DOMAIN_DEVICE_APPROVAL, &a.encode())
         };
+        let counts_with =
+            |revoke_scope: (CapabilityScopeKind, [u8; 16]),
+             tenant_approved: bool,
+             outsider_approved: Option<(ApprovalScopeKind, [u8; 16])>| {
+                let mut pages = evidence(&me, Vec::new());
+                let p = &mut pages[0];
+                p.containers.extend([
+                    capability(
+                        Capability::DeviceApprove,
+                        CapabilityScopeKind::Tenant,
+                        TENANT,
+                        13,
+                    ),
+                    capability(Capability::DeviceRevoke, revoke_scope.0, revoke_scope.1, 14),
+                    approval(ApprovalScopeKind::Fleet, FLEET, 20),
+                    revocation.clone(),
+                ]);
+                if tenant_approved {
+                    p.containers
+                        .push(approval(ApprovalScopeKind::Tenant, TENANT, 21));
+                }
+                if let Some((kind, scope_id)) = outsider_approved {
+                    p.signing_public_keys
+                        .push(outsider.verifying_key().to_bytes());
+                    p.containers.push(forged(kind, scope_id));
+                }
+                let (_dir, path) = ledger_at();
+                collect_at(&path, &pages, &[], 1, T0 + DAY);
+                proven(&path) == [(hex(&m_key), "DEVICE_REVOCATION".into())]
+            };
+        let counts =
+            |revoke_scope, tenant_approved| counts_with(revoke_scope, tenant_approved, None);
         assert!(counts((CapabilityScopeKind::Fleet, FLEET), false));
+        for outsider in [
+            (ApprovalScopeKind::Tenant, TENANT),
+            (ApprovalScopeKind::Fleet, other_fleet),
+        ] {
+            assert!(
+                counts_with((CapabilityScopeKind::Fleet, FLEET), false, Some(outsider)),
+                "an outsider's approval must not widen the scope"
+            );
+        }
         assert!(!counts((CapabilityScopeKind::Fleet, other_fleet), false));
         assert!(!counts((CapabilityScopeKind::Fleet, FLEET), true));
         assert!(counts((CapabilityScopeKind::Tenant, TENANT), true));
