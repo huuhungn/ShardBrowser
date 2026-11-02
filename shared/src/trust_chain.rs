@@ -534,6 +534,24 @@ impl TrustChain {
         }
     }
 
+    /// Rule 6, reported revoked: the server reported revoked, at or before
+    /// `t`, a device that a usable approval of `key` names. Only approvals
+    /// from an allowed issuer count, as only those give `key` its windows.
+    pub fn reported_revoked_at(&self, key: &KeyId, t: u64) -> bool {
+        self.approvals_by_subject
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.evidence.approvals[i])
+            .filter(|a| self.approval_issuer_ok(a))
+            .filter_map(|a| {
+                self.evidence
+                    .revoked_devices
+                    .get(&a.payload.subject_device_id)
+            })
+            .any(|&at| at <= t)
+    }
+
     /// Rule 4: `key` holds `capability` over `scope` at `t`, through a usable
     /// device-scoped grant whose issuer was a custodian when it was issued.
     /// Custody itself is never a capability grant: only root grants carry it
@@ -1343,6 +1361,29 @@ mod tests {
         let c = chain(page(&[&a0, &b], evidence)).unwrap();
         assert!(c.custodian_at(&a0.key(), T0 + 1094 * DAY));
         assert!(!c.custodian_at(&a0.key(), T0 + 1095 * DAY));
+    }
+
+    /// Rule 6: a key is reported revoked from the reported time on, through
+    /// a device its approval from an allowed issuer names, and never through
+    /// one only an approval nobody could issue names.
+    #[test]
+    fn a_key_is_reported_revoked_only_through_an_allowed_approval() {
+        let (a0, b, m) = (Device::new(1), Device::new(2), Device::new(3));
+        let mut evidence = tenant(&a0, &b);
+        evidence.push(approval(&m, &m, 30, T0, T0 + 365 * DAY));
+        let mut p = page(&[&a0, &b, &m], evidence);
+        let c = chain(p.clone()).unwrap();
+        assert!(!c.reported_revoked_at(&b.key(), T0 + 50 * DAY), "no report");
+        for d in [&b, &m] {
+            p.device_revocations.push(RevokedDevice {
+                device_id: d.id,
+                revoked_at_ms: T0 + 20 * DAY,
+            });
+        }
+        let c = chain(p).unwrap();
+        assert!(!c.reported_revoked_at(&b.key(), T0 + 20 * DAY - 1));
+        assert!(c.reported_revoked_at(&b.key(), T0 + 20 * DAY));
+        assert!(!c.reported_revoked_at(&m.key(), T0 + 50 * DAY));
     }
 
     /// D-6 (c): a cached `first_not_before` earlier than every root grant the
