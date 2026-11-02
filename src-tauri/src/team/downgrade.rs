@@ -1242,6 +1242,11 @@ pub(crate) fn unbind_profile(local: &str, server_url: &str, now: u64) -> Result<
     if Db::path()?.exists() && journal::flow_taken(&Db::open()?, local)? {
         bail!(code("downgrade.flowTaken"));
     }
+    // A revert's `R` lands in the profile first; a staging dir left over is
+    // decrypted data the unbind would orphan.
+    let udd = crate::store::user_data_root()?.join(local);
+    super::sync::settle_revert_swap(local, &udd)?;
+    super::sync::discard_revert_staging(local, &udd)?;
     let response = super::sync::unbind(local, server_url, now)?;
     if super::sync::is_published(local)? {
         bail!(code("downgrade.unbindReadback"));

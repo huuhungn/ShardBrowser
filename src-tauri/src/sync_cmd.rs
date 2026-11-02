@@ -197,6 +197,45 @@ pub async fn profile_sync_push(
     })
 }
 
+/// Reverts the published `profile_id` over the run of heads whose signers are
+/// proven revoked (`team::sync::revert`, ADR 0002 rule 6): the newest valid
+/// snapshot below them is committed on top, in a device session the account
+/// `username` and `password` open for this call only.
+#[tauri::command]
+pub async fn profile_sync_revert(
+    profile_id: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<PushResult, String> {
+    let _claim = profile::begin_user_mutation(
+        [&profile_id],
+        &crate::errcode::code("profile.actionRevertTeam"),
+    )
+    .map_err(|error| error.to_string())?;
+    let c = ready_config()?;
+    profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
+    let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let started = std::time::Instant::now();
+    let reverted = team::sync::revert(
+        &client,
+        &session.access_token,
+        &dev,
+        &profile_id,
+        &udd,
+        now_ms(),
+        &|| started.elapsed(),
+    )
+    .await;
+    client.end_session(&session.access_token).await;
+    let p = reverted.map_err(|e| format!("{e:#}"))?;
+    Ok(PushResult {
+        version: p.version as i64,
+        container_bytes: p.ciphertext_size,
+        sha256: fleet_client::hex(&p.ciphertext_sha256),
+    })
+}
+
 /// Publish `profile_id` as a new profile of this device's fleet (`team::sync`),
 /// in a device session the account `username` and `password` open for this
 /// call only. The server holds the profile at version 0 with the first lease
