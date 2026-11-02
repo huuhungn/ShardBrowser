@@ -2,7 +2,7 @@
 1c5c1e2cbabe2d3010a6e27c37f4a6e898e7a3508428de9fa59ffb243cad8ed8  docs/adr/0002-g2-contract-decisions.md
 6f5f4a2b622004641b4e14e3491d0b2d2f2ad94516d47ae20277a2e0a7715894  docs/adr/0003-envelope-v2-stream.md
 b57bcac69f46d18a252cd735be09571efac6eb13990474decd084feac9f3cae0  docs/adr/0004-credential-store.md
-267f752c39fcc141499116cafb04ea5d14affc2c376e0ecbfe14365f8864777f  docs/dependency-review.md
+dd533a3ab160a18710c44adfa7c8c70d8269653baff8588fc03df22145ae883c  docs/dependency-review.md
 1411a14b5533bcd8e22963480a5c2f60a058571d413fcdb7fbe678cd60dd2b30  docs/g2-48-manual-check.md
 e77ffd79b91b4973e93fdf85e30cd3867e92948ee1f98c0d3c0dee803874fc61  docs/g2-evidence/verifier-codex-2026-11-01.md
 c4f01d08c779a9198ae35f605fe907560201530b56cf33e65174e929573e1762  docs/g2-evidence/verifier-codex-2026-11-02.md

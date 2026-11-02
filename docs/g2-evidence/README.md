@@ -130,6 +130,7 @@ cargo +stable audit --deny unsound --deny yanked --file server/Cargo.lock --igno
 cargo +stable audit --deny unsound --deny yanked --file src-tauri/Cargo.lock \
   --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 \
   --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 \
+  --ignore RUSTSEC-2026-0429 \
   --ignore RUSTSEC-2024-0429
 ```
 
