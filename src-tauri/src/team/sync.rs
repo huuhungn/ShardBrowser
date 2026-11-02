@@ -1491,7 +1491,10 @@ async fn pin_withdrawn(
     let any: bool = db.conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM trust_proven_revocations
            WHERE server_instance_id = ?1 AND tenant_id = ?2)",
-        params![hex(&b.instance), hex(&b.tenant)],
+        params![
+            hex(&dev.pin.0.server_instance_id),
+            hex(&dev.pin.0.tenant_id)
+        ],
         |r| r.get(0),
     )?;
     if b.version == 0 || !any {
@@ -1575,6 +1578,13 @@ async fn push_inner(
         };
         let Some(commit_op) = find(&db, local, "COMMIT", Some(&lease), None)? else {
             match find(&db, local, "UPLOAD", Some(&lease), None)? {
+                // A revocation recorded since the checkout: never sealed on that pin.
+                None if revert.is_none()
+                    && pin_withdrawn(client, access, &mut db, dev, &b).await? =>
+                {
+                    let e = signer_revoked(&db, &b);
+                    return Err(abandon(client, access, &mut db, &b, lease, e).await);
+                }
                 None => seal_snapshot(client, access, &mut db, dev, &b, lease, udd, now).await?,
                 Some(op) if op.state == "PENDING" => {
                     create_upload(client, access, &mut db, &b, lease, &op).await?
@@ -1634,7 +1644,7 @@ async fn push_inner(
 
 /// `udd` with `suffix` appended to its name: a sibling, so a rename between
 /// the two stays on one volume.
-fn beside(udd: &Path, suffix: &str) -> std::path::PathBuf {
+pub(crate) fn beside(udd: &Path, suffix: &str) -> std::path::PathBuf {
     let mut p = udd.as_os_str().to_owned();
     p.push(suffix);
     p.into()
@@ -1752,10 +1762,20 @@ async fn revert_inner(
     clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
-    let b = bound(&db, local)?;
+    let mut b = bound(&db, local)?;
     let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
     if !revoked {
         refuse_quarantined(&b)?;
+    }
+    // G2-34: with nothing uploaded, a revert lease's lost release is
+    // replayed first, never resumed over a run another device closed.
+    if let Some(lease) = b.lease.filter(|_| revoked) {
+        if find(&db, local, "UPLOAD", Some(&lease), None)?.is_none() {
+            if let Some(op) = find(&db, local, "RELEASE", None, Some("PENDING"))? {
+                release_reply(client, access, &mut db, &b, &op).await?;
+                b = bound(&db, local)?;
+            }
+        }
     }
     // A revert lease resumes on the base its checkout took; any other
     // lease is an ordinary push's, which a revert never continues.
@@ -1778,16 +1798,35 @@ async fn revert_inner(
     let base = match base {
         Some(base) if uploaded => base,
         _ => {
-            let head = listed(client, access, &mut db, &b).await?;
-            let w = walked(client, access, &mut db, dev, &b, &head, now).await?;
-            let Some(jn) = w.open.last() else {
-                bail!(code("sync.revertUnavailable"));
+            let walk = async {
+                let head = listed(client, access, &mut db, &b).await?;
+                let w = walked(client, access, &mut db, dev, &b, &head, now).await?;
+                if w.open.is_empty() {
+                    bail!(code("sync.revertUnavailable"));
+                }
+                if !matches!(w.anchor, Some((_, Some(_)))) {
+                    bail!(code("sync.revertNoValidSnapshot"));
+                }
+                Ok(w)
             };
-            let Some((_, Some(p))) = &w.anchor else {
-                bail!(code("sync.revertNoValidSnapshot"));
+            // A revert lease with nothing uploaded whose run is gone (another
+            // device committed over it) is released; the quarantine stays.
+            // One the walk quarantined for another reason is kept, as the
+            // release would mark it available.
+            let w = match (walk.await, b.lease) {
+                (Ok(w), _) => w,
+                (Err(e), Some(lease))
+                    if bound(&db, local)?.error.as_deref() == Some("SIGNER_REVOKED") =>
+                {
+                    return Err(abandon(client, access, &mut db, &b, lease, e).await)
+                }
+                (Err(e), _) => return Err(e),
+            };
+            let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
+                unreachable!("the walk above checked both");
             };
             if b.lease.is_none() {
-                hold_open(&mut db, &b, &w, now)?;
+                hold_open(&mut db, &b, &w, &w.accepted, now)?;
                 // Q-18: a compromised revocation waits for rotation, and the
                 // quarantine keeps its code (no `mark_blocked`).
                 if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
@@ -3695,8 +3734,9 @@ async fn walked(
 }
 
 /// Files the run `w` left open at the listed head, unresolved above its
-/// `P`, and quarantines `b` with `SIGNER_REVOKED`, in one transaction.
-fn hold_open(db: &mut Db, b: &Bound, w: &Walked, now: u64) -> Result<()> {
+/// `P`, with the runs `accepted` below it (a revert pins past them), and
+/// quarantines `b` with `SIGNER_REVOKED`, in one transaction.
+fn hold_open(db: &mut Db, b: &Bound, w: &Walked, accepted: &[Run], now: u64) -> Result<()> {
     let open = Run {
         anchor: w.anchor.as_ref().map(|(l, _)| (l.version, l.hash)),
         heads: w.open.clone(),
@@ -3705,6 +3745,9 @@ fn hold_open(db: &mut Db, b: &Bound, w: &Walked, now: u64) -> Result<()> {
     let tx = db
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for run in accepted {
+        skip(&tx, b, run, now)?;
+    }
     skip(&tx, b, &open, now)?;
     supersede(&tx, b, Some(&w.read), now)?;
     tx.execute(
@@ -3977,7 +4020,8 @@ pub(crate) async fn pull(
         // then a `P` past the pin is pulled as any valid head is (rule 6:
         // advance over valid heads first). `P` may be of a generation a
         // rotation since replaced, so its key is read through `readable_key`.
-        hold_open(&mut db, &b, &w, now)?;
+        // `pin` files the accepted runs, with `P`.
+        hold_open(&mut db, &b, &w, &[], now)?;
         if let Some((at, Some(p))) = &w.anchor {
             if at.version > b.version {
                 let fkek = readable_key(
@@ -11001,9 +11045,166 @@ mod tests {
         crate::team::downgrade::unbind_profile(&id, SERVER, NOW).unwrap();
         assert!(!staging.exists(), "discarded by the unbind");
 
+        // A held revert lease stays with the binding; the staged `P` goes
+        // with the profile.
+        let id = profile();
+        w.bind(&id, [0xc3; 16], 1, [9; 32]);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET lease_id = ?2, fencing_token = 1,
+                   lease_expires_at = '2099-01-01T00:00:00.000Z', sync_state = 'QUARANTINED',
+                   last_error_code = 'SIGNER_REVOKED'
+                 WHERE local_profile_id = ?1",
+                params![id, hex(&[7; 16])],
+            )
+            .unwrap();
+        let staging = leftover(&id);
+        crate::profile_delete(id).unwrap();
+        assert!(!staging.exists(), "deleted under a held lease");
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            1
+        );
+
         let id = profile();
         crate::profile_delete(id.clone()).unwrap();
         assert!(!beside(&root.join(&id), ".revert-staging").exists(), "none");
+    }
+
+    /// Architect blocking 1: a revert lease held with nothing uploaded (a
+    /// crash before seal, or a release whose reply was lost) while another
+    /// device commits `R'` over the run. The next revert finds no run, so it
+    /// releases the lease and keeps the quarantine; the next pull accepts
+    /// `R'` and lifts it.
+    #[test]
+    fn a_revert_lease_whose_run_was_closed_elsewhere_is_released() {
+        for case in ["crash before seal", "release lost"] {
+            let w = world();
+            let (heads, d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+            let crash = "CREATE TRIGGER crash BEFORE INSERT ON operations
+                 WHEN NEW.kind = 'UPLOAD' BEGIN SELECT RAISE(ABORT, 'crash'); END";
+            if case == "crash before seal" {
+                w.db().conn.execute(crash, []).unwrap();
+            } else {
+                let mut f = w.fake();
+                f.generation = Some(2);
+                f.lose.push("release");
+            }
+            w.revert(&udd).unwrap_err();
+            w.db()
+                .conn
+                .execute("DROP TRIGGER IF EXISTS crash", [])
+                .unwrap();
+            w.fake().generation = None;
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+                1,
+                "{case}"
+            );
+
+            // Another device commits `R'` once the lease is free.
+            let e = second(&w);
+            w.pull(&e.path().join("pulled")).unwrap_err();
+            let other = e.path().join("profile");
+            std::fs::create_dir_all(&other).unwrap();
+            assert_eq!(w.revert(&other).unwrap().version, 3);
+            let r = r_on(&w, heads[1]);
+
+            crate::store::set_config_root(Some(d.path().to_path_buf()));
+            let err = w.revert(&udd).unwrap_err();
+            assert!(has(&err, "sync.revertUnavailable"), "{case}: {err:#}");
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+                0,
+                "{case}"
+            );
+            revoked_at(&w, 1);
+            assert!(!beside(&udd, ".revert-staging").exists(), "{case}");
+            w.pull(&d.path().join("out")).unwrap();
+            available_at(&w, 3, r);
+            assert_eq!(skipped(&w), [accepted_by(2, r, 1)], "{case}");
+        }
+    }
+
+    /// Architect blocking 2: a pull whose `P` failed to restore left the pin
+    /// below an accepted run (`J1` accepted by `R1`); the revert over the
+    /// open `J2` audits `J1` as accepted by `R1`, and `J2` by its own `R`.
+    #[test]
+    fn a_revert_audits_the_accepted_runs_it_crosses() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &w.me.sk, &author()]);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let d = second(&w);
+        w.fake().refuse.push(("3", 500));
+        let err = w.pull(&d.path().join("out")).unwrap_err();
+        assert!(!has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 0);
+        assert_eq!(skipped(&w), [(4, None, None, 3)]);
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        assert_eq!(w.revert(&udd).unwrap().version, 5);
+        let r = SignedSnapshotManifestV2::parse(&w.fake().manifests[&5])
+            .unwrap()
+            .head_hash();
+        available_at(&w, 5, r);
+        assert_eq!(
+            skipped(&w),
+            [accepted_by(2, heads[2], 1), accepted_by(4, r, 3)]
+        );
+        assert_eq!(marker(&udd), "v3");
+    }
+
+    /// Architect non-blocking 2: a revocation of the pin's signer recorded
+    /// between an ordinary checkout and its seal releases the lease instead
+    /// of committing on top of that pin.
+    #[test]
+    fn a_revocation_recorded_after_checkout_abandons_an_ordinary_push() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let (instance, tenant) = (hex(&INSTANCE), hex(&TENANT));
+        w.fake().on_checkout = Some(format!(
+            "INSERT INTO trust_proven_revocations
+             SELECT '{instance}', '{tenant}', '{}', 'LOCAL_DISTRUST',
+               coalesce(max(evaluation_id), 0), 0, NULL
+             FROM trust_evaluations WHERE server_instance_id = '{instance}'
+               AND tenant_id = '{tenant}'",
+            hex(&key_id_of(&author()))
+        ));
+        let uploads = w.sent("POST", "/uploads").len();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.sent("POST", "/release").len(), 1);
+        assert_eq!(w.sent("POST", "/uploads").len(), uploads);
+        assert_eq!(w.fake().commits, 2);
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            0
+        );
+        revoked_at(&w, 2);
+    }
+
+    /// Architect non-blocking 4: the launch-time settle reads nothing
+    /// without a team database, and refuses with the ledger's own code when
+    /// one exists that this binary cannot read.
+    #[test]
+    fn the_launch_settle_needs_a_team_database_only_when_one_exists() {
+        let w = world();
+        let udd = w.udd.clone();
+        w.db()
+            .conn
+            .execute("UPDATE schema_meta SET schema_version = 99", [])
+            .unwrap();
+        let err = settle_revert_swap(LOCAL, &udd).unwrap_err();
+        assert!(has(&err, "team.trustLedgerUnsupported"), "{err:#}");
+        let fresh = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(fresh.path().to_path_buf()));
+        settle_revert_swap(LOCAL, &udd).unwrap();
+        assert!(!Db::path().unwrap().exists());
     }
 
     #[test]

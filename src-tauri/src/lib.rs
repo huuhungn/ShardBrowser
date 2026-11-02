@@ -868,7 +868,12 @@ fn profile_delete(id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .join(&id);
     team::sync::settle_revert_swap(&id, &udd).map_err(|e| format!("{e:#}"))?;
-    team::sync::discard_revert_staging(&id, &udd).map_err(|e| format!("{e:#}"))?;
+    // Even under a held revert lease: the profile goes, and a revert that
+    // still has to seal stages `P` again.
+    let staging = team::sync::beside(&udd, ".revert-staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| e.to_string())?;
+    }
     trash::move_to_trash(&id)
         .map(|_| ())
         .map_err(|e| e.to_string())
