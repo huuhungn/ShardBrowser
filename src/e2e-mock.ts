@@ -303,6 +303,23 @@ const teamStatusFixture = () => (firstDevice
     has_key_file: false,
     keys_locked: false,
   });
+// `teamRefuse=<command>[,<command>]` makes those team commands refuse the way
+// the backend does, before anything changes.
+const teamRefusals = new Set((params.get("teamRefuse") ?? "").split(",").filter(Boolean));
+const TEAM_REFUSAL: Record<string, string> = {
+  profile_sync_publish: "sync.commitBlockedCompromised",
+  profile_sync_push: "sync.remoteAhead",
+  team_join_profile: "sync.fleetKeyRecollect",
+};
+let createdProfiles = 0;
+const teamPushResult = (version: number) => ({ version, container_bytes: 4096, sha256: "ab".repeat(32) });
+const teamBound = (payload?: InvokeArgs) => {
+  const id = String((payload as { profileId?: string } | undefined)?.profileId ?? "");
+  const b = teamProfiles.profiles.find((p) => p.profile_id === id);
+  if (!b) throw new Error("[[shardx:sync.unbindNotBound]]");
+  return b;
+};
+
 let custodyBootstrap = scenario === "team-first-device-resume"
   ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
   : { started: false, activated: false, recovery_path: "", anchor: "" };
@@ -313,6 +330,9 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     && cmd !== "plugin:dialog|open" && cmd !== "plugin:dialog|save"
   ) {
     return null;
+  }
+  if (teamRefusals.has(cmd)) {
+    throw new Error(`[[shardx:${TEAM_REFUSAL[cmd] ?? "sync.remoteAhead"}]]`);
   }
   switch (cmd) {
     case "host_platform":
@@ -341,7 +361,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       try {
         if (Number(params.get("profilesDelay") ?? 0) > 0) await wait(Number(params.get("profilesDelay")));
         if (profileFailures-- > 0) throw new Error("fixture profile list failed");
-        return profiles;
+        return [...profiles];
       } finally {
         profileListsInFlight -= 1;
       }
@@ -416,13 +436,22 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       const stored = (payload as { payload?: Record<string, unknown> } | undefined)?.payload ?? {};
       document.documentElement.dataset.e2eSavedCustomFonts = JSON.stringify(stored.custom_fonts ?? null);
       const meta = (stored._meta ?? {}) as { id?: string; proxy_id?: string | null };
-      return {
+      const saved = {
         ...fixtureProfiles[0],
-        id: meta.id || "profile-created",
+        id: meta.id || `profile-created-${++createdProfiles}`,
         name: typeof stored.name === "string" ? stored.name : "untitled",
         notes: typeof stored.notes === "string" ? stored.notes : "",
         proxy_id: meta.proxy_id ?? null,
       };
+      // A new profile is listed from now on, as the launcher's would be.
+      if (!meta.id) profiles.push({ ...saved, pinned: false, folder: "", tags: [] });
+      return saved;
+    }
+    case "profile_delete": {
+      count("ProfileDeletes");
+      const at = profiles.findIndex((p) => p.id === (payload as { id?: string } | undefined)?.id);
+      if (at >= 0) profiles.splice(at, 1);
+      return null;
     }
     case "profile_validate_name": {
       count("ProfileNameValidations");
@@ -663,10 +692,12 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return null;
     case "team_status":
       return teamStatusFixture();
+    // Copies, as IPC would: a later change must not reach the UI unless it refetches.
     case "team_profiles_status":
-      return teamProfiles;
+      if (Number(params.get("teamStatusDelay") ?? 0) > 0) await wait(Number(params.get("teamStatusDelay")));
+      return structuredClone(teamProfiles);
     case "team_fleet_profiles":
-      return teamFleet;
+      return structuredClone(teamFleet);
     case "team_join_profile": {
       count("Joins");
       const args = payload as { remoteProfileId?: string; localProfileId?: string };
@@ -682,6 +713,46 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         remote_version: remote.current_version,
       }));
       return 4096;
+    }
+    case "profile_sync_publish": {
+      count("Publishes");
+      const id = String((payload as { profileId?: string } | undefined)?.profileId ?? "");
+      if (teamProfiles.profiles.some((p) => p.profile_id === id)) throw new Error("[[shardx:sync.alreadyPublished]]");
+      // The server holds it at version 0 with the first lease this device owns.
+      teamProfiles.profiles.push(teamBinding(id, "CHECKED_OUT", { remote_version: 0, lease_expires_at: teamLease }));
+      return { profile_id: "d1".repeat(16), fencing_token: 1, lease_expires_at_ms: 4_070_908_800_000 };
+    }
+    case "profile_sync_cancel_publish":
+      count("CancelPublishes");
+      return null;
+    case "profile_sync_push": {
+      count("CheckIns");
+      const b = teamBound(payload);
+      Object.assign(b, {
+        sync_state: "AVAILABLE", remote_version: b.remote_version + 1, dirty: false,
+        lease_expires_at: null, lease_at_risk: false,
+      });
+      return teamPushResult(b.remote_version);
+    }
+    case "profile_sync_pull":
+      count("Pulls");
+      teamBound(payload);
+      return 4096;
+    case "profile_sync_revert": {
+      count("Reverts");
+      const b = teamBound(payload);
+      Object.assign(b, {
+        sync_state: "AVAILABLE", remote_version: b.remote_version + 1, dirty: false, lease_expires_at: null,
+        last_error_code: null, revert_available: false, revert_in_progress: false,
+      });
+      return teamPushResult(b.remote_version);
+    }
+    case "team_unbind_profile": {
+      count("Unbinds");
+      const b = teamBound(payload);
+      teamProfiles.profiles.splice(teamProfiles.profiles.indexOf(b), 1);
+      for (const f of teamFleet) if (f.bound_to === b.profile_id) f.bound_to = null;
+      return { local_profile_id: b.profile_id, response_sha256: "ef".repeat(32), discoverable: true };
     }
     case "team_keys_create_file":
       count("KeyFiles");

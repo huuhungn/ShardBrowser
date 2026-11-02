@@ -249,10 +249,6 @@ test("Team page shows one badge per binding state", async ({ page }) => {
   await expect(row("team-reported-only")).toContainText("signer revoked");
   await expect(row("team-expired-lease")).not.toContainText("Checked out here");
   await expect(row("VN Automation 001")).not.toContainText("Quarantined");
-  // Actions belong to a later story; this page only reads state.
-  for (const name of [/publish/i, /check.?in/i, /pull/i, /revert/i, /unbind/i, /join/i]) {
-    await expect(page.getByTestId("team-profile").getByRole("button", { name })).toHaveCount(0);
-  }
 });
 
 test("Team page warns about a custodian renewed after revocation", async ({ page }) => {
@@ -275,6 +271,176 @@ test("Team page shows no alert banner when there are no alerts", async ({ page }
   // A bound row's badge only appears once the statuses are loaded.
   await expect(page.getByTestId("team-profile").filter({ hasText: "team-uploading" })).toContainText("Uploading");
   await expect(page.getByTestId("team-alert")).toHaveCount(0);
+});
+
+async function teamPage(page: Page, query = "") {
+  await gotoMocked(page, `/?e2e=team-profiles${query}`);
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  return (text: string) => page.getByTestId("team-profile").filter({ hasText: text });
+}
+
+// Each call that reaches the server clears the password first, as TeamCard does.
+async function teamSignIn(page: Page) {
+  const account = page.getByTestId("team-account");
+  await account.getByLabel("Account username").fill("owner");
+  await account.getByLabel("Account password").fill("pw");
+}
+
+test("no team action is offered before the statuses load", async ({ page }) => {
+  const row = await teamPage(page, "&teamStatusDelay=1500");
+  await expect(row("Beta Research")).toBeVisible();
+  await expect(page.getByTestId("team-profile").getByRole("button")).toHaveCount(0);
+  await expect(row("Beta Research").getByRole("button", { name: "Publish" })).toBeVisible();
+  await expect(row("team-checked-out").getByRole("button", { name: "Check in" })).toBeVisible();
+});
+
+test("revert is offered only for a proven run and asks for confirmation", async ({ page }) => {
+  const row = await teamPage(page);
+  for (const text of [
+    "VN Automation 001", "Beta Research", "team-checked-out", "team-lease-at-risk",
+    "team-expired-lease", "team-uploading", "team-quarantined", "team-reported-only",
+  ]) {
+    await expect(row(text)).toBeVisible();
+    await expect(row(text).getByRole("button", { name: /revert/i })).toHaveCount(0);
+  }
+  const proven = row("team-proven-run");
+  await expect(proven.getByRole("button", { name: "Check in" })).toHaveCount(0);
+  await teamSignIn(page);
+
+  await proven.getByRole("button", { name: "Revert", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText(
+    "Local unsynced changes will be replaced by the last valid snapshot, after the server accepts the revert.",
+  );
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-reverts", /.+/);
+  await expect(proven).toContainText("Quarantined");
+
+  await proven.getByRole("button", { name: "Revert", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Revert" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-reverts", "1");
+  await expect(proven).toContainText("Available");
+  await expect(proven.getByRole("button", { name: /revert/i })).toHaveCount(0);
+  await expect(page.getByText("Profile reverted to its last valid snapshot.")).toBeVisible();
+});
+
+test("a reported-only quarantine offers no revert", async ({ page }) => {
+  const row = await teamPage(page);
+  const reported = row("team-reported-only");
+  await expect(reported).toContainText("signer revoked");
+  await expect(reported.getByRole("button", { name: /revert/i })).toHaveCount(0);
+  await expect(reported.getByRole("button", { name: "Check in" })).toHaveCount(0);
+  // A signer-revoked quarantine still pulls: pull accepts a later valid head.
+  await expect(reported.getByRole("button")).toHaveText(["Pull", "Unbind"]);
+  await expect(row("team-quarantined").getByRole("button")).toHaveText(["Unbind"]);
+});
+
+test("a revert in progress hides check-in and offers resume", async ({ page }) => {
+  const row = await teamPage(page);
+  const reverting = row("team-reverting");
+  await expect(reverting.getByRole("button", { name: "Resume revert" })).toBeVisible();
+  await expect(reverting.getByRole("button", { name: "Check in" })).toHaveCount(0);
+  await expect(row("team-checked-out").getByRole("button", { name: "Check in" })).toBeVisible();
+
+  await teamSignIn(page);
+  await reverting.getByRole("button", { name: "Resume revert" }).click();
+  await expect(page.getByRole("dialog")).toContainText("replaced by the last valid snapshot");
+  await page.getByRole("dialog").getByRole("button", { name: "Revert" }).click();
+  await expect(reverting).toContainText("Available");
+  await expect(reverting.getByRole("button", { name: /revert/i })).toHaveCount(0);
+  await expect(reverting.getByRole("button", { name: "Check in" })).toBeVisible();
+});
+
+test("publish then unbind refresh badges", async ({ page }) => {
+  const row = await teamPage(page);
+  const beta = row("Beta Research");
+  await expect(beta).toContainText("Local only");
+  await expect(beta.getByRole("button")).toHaveText(["Publish"]);
+  await expect(beta.getByRole("button", { name: "Publish" })).toBeDisabled();
+
+  await teamSignIn(page);
+  await beta.getByRole("button", { name: "Publish" }).click();
+  await expect(beta).toContainText("Checked out here");
+  await expect(page.getByText("Profile published to the team.")).toBeVisible();
+  await expect(beta.getByRole("button")).toHaveText(["Check in", "Pull", "Unbind"]);
+  await expect(page.getByTestId("team-account").getByLabel("Account password")).toHaveValue("");
+
+  await teamSignIn(page);
+  await beta.getByRole("button", { name: "Check in" }).click();
+  await expect(beta).toContainText("Available");
+  await expect(page.getByText("Profile checked in.")).toBeVisible();
+  await teamSignIn(page);
+  await beta.getByRole("button", { name: "Pull" }).click();
+  await expect(page.getByText("Profile pulled from the team.")).toBeVisible();
+
+  await beta.getByRole("button", { name: "Unbind" }).click();
+  await expect(page.getByRole("dialog")).toContainText("stays on this device as a local profile");
+  await page.getByRole("dialog").getByRole("button", { name: "Unbind" }).click();
+  await expect(beta).toContainText("Local only");
+  await expect(beta.getByRole("button")).toHaveText(["Publish"]);
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-unbinds", "1");
+});
+
+test("join creates a local profile and shows it available", async ({ page }) => {
+  const row = await teamPage(page);
+  const rows = page.getByTestId("team-profile");
+  await expect(row("team-reverting")).toBeVisible();
+  const before = await rows.count();
+
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+  const fleet = page.getByTestId("team-fleet-profile");
+  await expect(fleet).toHaveCount(3);
+  await expect(fleet.filter({ hasText: "Alpha" })).toContainText("Joined");
+  await expect(fleet.filter({ hasText: "Team profile c3c3c3c3" })).toBeVisible();
+
+  await teamSignIn(page);
+  await fleet.filter({ hasText: "Shop" }).getByRole("button", { name: "Join" }).click();
+  await expect(rows).toHaveCount(before + 1);
+  await expect(row("Shop")).toContainText("Available");
+  await expect(fleet.filter({ hasText: "Shop" })).toContainText("Joined");
+  await expect(page.getByText("Joined Shop.")).toBeVisible();
+});
+
+test("a failed join removes the local profile it created", async ({ page }) => {
+  const row = await teamPage(page, "&teamRefuse=team_join_profile");
+  const rows = page.getByTestId("team-profile");
+  await expect(row("team-reverting")).toBeVisible();
+  const before = await rows.count();
+
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+  await teamSignIn(page);
+  await page.getByTestId("team-fleet-profile").filter({ hasText: "Shop" }).getByRole("button", { name: "Join" }).click();
+  await expect(page.getByText("This device's fleet key was collected by an earlier version")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-profile-saves", "1");
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-profile-deletes", "1");
+  await expect(rows).toHaveCount(before);
+  await expect(row("Shop")).toHaveCount(0);
+  await expect(page.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("a refused action shows the localized error and keeps the row", async ({ page }) => {
+  const row = await teamPage(page, "&teamRefuse=profile_sync_publish,profile_sync_push");
+  const checkedOut = row("team-checked-out");
+  await teamSignIn(page);
+  await checkedOut.getByRole("button", { name: "Check in" }).click();
+  await expect(page.getByText("The team server has a newer version of this profile. Pull it before pushing.")).toBeVisible();
+  await expect(checkedOut).toContainText("Checked out here");
+  await expect(checkedOut.getByRole("button", { name: "Check in" })).toBeVisible();
+
+  // A refused publish may leave its stored request behind: Cancel ends it.
+  const beta = row("Beta Research");
+  await teamSignIn(page);
+  await beta.getByRole("button", { name: "Publish" }).click();
+  await expect(page.getByText("Pushing is blocked: a device that may hold this fleet's key was revoked")).toBeVisible();
+  await expect(beta).toContainText("Local only");
+  await expect(page.getByText("[[shardx:")).toHaveCount(0);
+  await beta.getByRole("button", { name: "Cancel publish" }).click();
+  await expect(page.getByText("The unfinished publish was cancelled.")).toBeVisible();
+  await expect(page.locator("html")).toHaveAttribute("data-e2e-cancel-publishes", "1");
+  await expect(beta.getByRole("button")).toHaveText(["Publish"]);
 });
 
 test("the first device sets up root custody once its passphrases agree", async ({ page }) => {

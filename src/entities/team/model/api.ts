@@ -84,3 +84,32 @@ export const teamJoinProfile = (
   invoke<number>("team_join_profile", {
     remoteProfileId, localProfileId, username, password,
   });
+
+/**
+ * Publish the local profile as a new fleet profile, listed under its name.
+ * The password is used for one login and never stored.
+ */
+export const teamPublishProfile = (profileId: string, username: string, password: string) =>
+  invoke<unknown>("profile_sync_publish", { profileId, label: null, username, password });
+
+/** End an unfinished publish that keeps being refused; nothing is sent. */
+export const teamCancelPublish = (profileId: string) =>
+  invoke<void>("profile_sync_cancel_publish", { profileId });
+
+// A published profile ignores the passphrase and base version: it seals under
+// the fleet key and takes its base from the binding (sync_cmd.rs).
+/** Check in (push) a published profile. */
+export const teamCheckIn = (profileId: string, username: string, password: string) =>
+  invoke<unknown>("profile_sync_push", { profileId, passphrase: "", baseVersion: 0, username, password });
+
+/** Pull a published profile's current snapshot over the local one. */
+export const teamPull = (profileId: string, username: string, password: string) =>
+  invoke<number>("profile_sync_pull", { profileId, passphrase: "", username, password });
+
+/** Commit the last valid snapshot over a run of heads whose signers are proven revoked. */
+export const teamRevert = (profileId: string, username: string, password: string) =>
+  invoke<unknown>("profile_sync_revert", { profileId, username, password });
+
+/** Unbind the stopped profile from its fleet profile; it stays a local profile. */
+export const teamUnbindProfile = (profileId: string) =>
+  invoke<unknown>("team_unbind_profile", { profileId });
