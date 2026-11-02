@@ -11,8 +11,9 @@ STREAM) and ADR 0004 (credential store), all on `main`.
 `shared/tests/registry_pins.rs` enforces this page: it fails if a pinned value
 changes, if two signing domains or two hash labels share a value, or if one
 is malformed. Each module's golden vectors pin its own bytes on top of that.
-The test lists 87 domain and label constants (`DOMAINS` at L18, `LABELS` at
-L88); "Domains and labels" below says which constants it does not list.
+The test lists 105 domain and label constants (`DOMAINS` at L19, `LABELS` at
+L92, `BYTE_LABELS` at L125); "Domains and labels" below says which values it
+does not list.
 
 What changed since 2026-10-26: HKDF-SHA256 and `sha2` 0.11 became direct
 dependencies of `shared` for the profile label (ADR Q-41); the two label
@@ -186,34 +187,22 @@ The detail is in `key-custody.md`; this is what the review checked.
 
 Signed and encrypted records carry a domain, `shardx.<area>.<name>.v2`.
 Hash preimages start with a label, `SHARDX-<NAME>-V2` and a NUL byte. The
-registry test lists every constant in its two lists (L17, L71), including the
-two profile label constants `keys::L_PROFILE_LABEL` and
-`keys::L_PROFILE_LABEL_KEY` (L89-90). They are not hash preimages: the first
+registry test lists every domain and label constant `shared` declares in its
+three lists (L19, L92, L125), including the two profile label constants
+`keys::L_PROFILE_LABEL` and `keys::L_PROFILE_LABEL_KEY` (L110-111). They are
+not hash preimages: the first
 prefixes the AAD of a sealed label and the second the HKDF `info` of its
 subkey. The label test applies all the same, so each ends in `-V2\0`, has one
 NUL, is distinct from every other label and is not also a domain.
 
-The rest are used inline or are not in the lists, so the test cannot see
-them; each has its own golden vector or codec test:
+The rest are written inline rather than as constants, or live in the server,
+so the test cannot see them; each has its own golden vector or codec test:
 
 - `shardx.keys.fleet-key-grant.device-hpke.aad.v2` and
   `shardx.keys.fleet-key-id.v2` (`fleet_grants.rs`)
 - `shardx.keys.tenant-root-key-grant.hpke-info.v2` (`grants.rs`)
-- `shardx.envelope.dek-slot.v2`, `shardx.envelope.intent.v2`,
-  `shardx.restore-epoch.profile-head-leaf.v2` (`envelope.rs`)
+- `shardx.envelope.dek-slot.v2`, `shardx.envelope.intent.v2` (`envelope.rs`)
 - `shardx.backup.head.v2` (`backup.rs`)
-- `shardx.local.fallback-key-file-plaintext.v2` (`fallback_key_file.rs`)
-- `shardx.recovery.bundle-plaintext.v2`, `shardx.recovery.readiness-probe.v2`
-  (`recovery_bundle.rs`)
-- `SHARDX-ROOT-CUSTODIAN-GRANT-SET-V2`, `SHARDX-FLEET-DEVICE-GRANT-SET-V2`,
-  `SHARDX-IDEMPOTENT-MUTATION-REQUEST-V2`,
-  `SHARDX-IDEMPOTENT-STORED-RESPONSE-V2` (`mutation.rs`, ADR 0002 D-4;
-  `golden_vectors` at `mutation.rs:1783`)
-- `SHARDX-LOCAL-BINDING-TOMBSTONE-V2` (`profile_lease.rs`, pinned by
-  `the_unbind_maps_round_trip_and_pin_the_tombstone`)
-- `SHARDX-RECOVERY-BUNDLE-V2` (`recovery_bundle.rs`, pinned by `GOLDEN_PIN` at `:572`)
-- `SHARDX-ENROLLMENT-BINDING-V2`, `SHARDX-DEVICE-SESSION-POP-V2`
-  (`session_binding.rs`, `golden_vectors` at `:533`)
 - `shardx.authorization.fleet-key-grant.v2` (server, legacy v2 fleet grants)
 
 The request and response maps of checkout, create-upload, finalize-upload,

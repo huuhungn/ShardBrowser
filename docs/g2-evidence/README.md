@@ -790,8 +790,10 @@ directory, on `main` at 9e29a2c6. Hermes used `cx/gpt-6-astra`.
     revocation of a key, so a later `compromised` revocation after a `lost`
     one was dropped and never blocked commits. Fixed: local schema 8 lets a
     counted compromised revocation replace a kept non-compromised container
-    by an explicit `UPDATE`; its trigger refuses any other change, and the
-    earliest count stays. Test:
+    by an explicit `UPDATE`. The launcher allows that `UPDATE` only for a
+    compromised revocation; the schema 8 trigger refuses any change other
+    than the container of a `DEVICE_REVOCATION` row, and the earliest count
+    stays. Test:
     `a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks`.
   - **N2 (medium).** With a FINALIZE stored but never processed, a resumed
     push skipped the OPEN-upload check and sent finalize and commit. Fixed:

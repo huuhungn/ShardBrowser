@@ -516,14 +516,18 @@ impl TrustChain {
 
     /// The scope a `device.revoke` must cover to revoke `key` (ADR 0002 Q-13
     /// issuer rule, as the server files it): the fleet when every usable
-    /// approval of `key` names that one fleet, otherwise the tenant.
+    /// approval of `key` from an allowed issuer names that one fleet,
+    /// otherwise the tenant. An approval no custodian could issue never
+    /// changes the scope: the server never accepted it.
     pub fn revocation_scope(&self, key: &KeyId) -> Scope {
         let mut scopes = self
             .approvals_by_subject
             .get(key)
             .into_iter()
             .flatten()
-            .map(|&i| approval_scope(&self.evidence.approvals[i].payload));
+            .map(|&i| &self.evidence.approvals[i])
+            .filter(|a| self.approval_issuer_ok(a))
+            .map(|a| approval_scope(&a.payload));
         match scopes.next() {
             Some(Scope::Fleet(f)) if scopes.all(|s| s == Scope::Fleet(f)) => Scope::Fleet(f),
             _ => Scope::Tenant,
