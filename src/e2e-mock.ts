@@ -1,5 +1,6 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
+import type { TeamProfileStatus, TeamProfilesStatus } from "./entities/team/model/types";
 
 type Profile = {
   id: string;
@@ -203,6 +204,51 @@ mockWindows("main");
 localStorage.setItem("shardx-star-prompt", "done");
 if (scenario === "folder-empty") {
   localStorage.setItem("shardx-folders", JSON.stringify(["Empty QA"]));
+}
+
+// "team-profiles": one binding per Team page badge (profile-beta stays local),
+// with a proven run, a reported-only quarantine, a revert in progress and a
+// custodian alert.
+const teamLease = "2099-01-01T00:00:00.000Z";
+const teamBinding = (
+  profile_id: string,
+  sync_state: TeamProfileStatus["sync_state"],
+  more: Partial<TeamProfileStatus> = {},
+): TeamProfileStatus => ({
+  profile_id, sync_state, remote_version: 3, dirty: false, lease_expires_at: null,
+  last_error_code: null, lease_at_risk: false, revert_available: false, revert_in_progress: false,
+  ...more,
+});
+const teamProfiles: TeamProfilesStatus = scenario === "team-profiles"
+  ? {
+    profiles: [
+      teamBinding("profile-alpha", "AVAILABLE"),
+      teamBinding("team-checked-out", "CHECKED_OUT", { dirty: true, lease_expires_at: teamLease }),
+      teamBinding("team-lease-at-risk", "LEASE_AT_RISK", {
+        dirty: true, lease_expires_at: teamLease, lease_at_risk: true,
+      }),
+      teamBinding("team-uploading", "UPLOADING", { dirty: true, lease_expires_at: teamLease }),
+      teamBinding("team-quarantined", "QUARANTINED", { last_error_code: "HEAD_ROLLBACK_DETECTED" }),
+      teamBinding("team-proven-run", "QUARANTINED", {
+        last_error_code: "SIGNER_REVOKED", revert_available: true,
+      }),
+      teamBinding("team-reported-only", "QUARANTINED", { last_error_code: "SIGNER_REVOKED" }),
+      teamBinding("team-reverting", "CHECKED_OUT", {
+        lease_expires_at: teamLease, last_error_code: "SIGNER_REVOKED",
+        revert_available: true, revert_in_progress: true,
+      }),
+    ],
+    alerts: [{
+      kind: "custodian.renewed_after_revocation",
+      signing_key_id: "70".repeat(32),
+      raised_at_ms: 1_800_000_000_000,
+    }],
+  }
+  : { profiles: [], alerts: [] };
+for (const { profile_id } of teamProfiles.profiles) {
+  if (!profiles.some((p) => p.id === profile_id)) {
+    profiles.push({ ...fixtureProfiles[1], id: profile_id, name: profile_id, tags: [] });
+  }
 }
 
 // A device enrolled as a tenant's first, before or part-way through custody
@@ -603,6 +649,8 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return null;
     case "team_status":
       return teamStatusFixture();
+    case "team_profiles_status":
+      return teamProfiles;
     case "team_keys_create_file":
       count("KeyFiles");
       keyState = { keys_protected: true, has_key_file: true, keys_locked: false };

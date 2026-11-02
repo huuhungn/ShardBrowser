@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { TeamStatus, CustodyResult, CustodyBootstrapStatus } from "./types";
+import type {
+  TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus,
+} from "./types";
 
 export const teamStatus = () => invoke<TeamStatus>("team_status");
 
@@ -61,3 +63,6 @@ export const teamBootstrapCustody = (
   invoke<CustodyBootstrapStatus>("team_bootstrap_custody", {
     username, password, recoveryPath, passphrase,
   });
+
+/** Every bound profile's sync state and every custodian alert; no server is asked. */
+export const teamProfilesStatus = () => invoke<TeamProfilesStatus>("team_profiles_status");

@@ -504,6 +504,13 @@ fn profile_ref(profile_id: &str) -> String {
     full[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Every bound profile's sync state and every custodian alert, read from the
+/// Launcher database alone: no server is asked.
+#[tauri::command]
+pub async fn team_profiles_status() -> Result<team::sync::Statuses, String> {
+    team::sync::statuses(now_ms()).map_err(|e| format!("{e:#}"))
+}
+
 /// Unbinds the stopped profile `profile_id` from its team profile in the
 /// Launcher database alone (plan L2239): the exact `UNBIND` receipt is stored
 /// before the binding is deleted, and the profile stays a local one.

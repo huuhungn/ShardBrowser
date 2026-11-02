@@ -5321,6 +5321,7 @@ pub fn run() {
             sync_cmd::profile_sync_revert,
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
+            sync_cmd::team_profiles_status,
             sync_cmd::team_unbind_profile,
             sync_cmd::team_downgrade_status,
             sync_cmd::team_downgrade_clone,

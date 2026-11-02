@@ -74,3 +74,46 @@ export type CustodyResult = {
   /** Always false, for the same reason. */
   can_sync_without_passphrase: boolean;
 };
+
+/** A `profile_bindings` sync state. */
+export type TeamSyncState =
+  | "LOCAL"
+  | "AVAILABLE"
+  | "CHECKED_OUT"
+  | "LEASE_AT_RISK"
+  | "OFFLINE_FORK"
+  | "UPLOADING"
+  | "RESTORE_REQUIRED"
+  | "CONFLICT"
+  | "QUARANTINED";
+
+/** One bound profile, as `team_profiles_status` reports it. A profile with no entry is local. */
+export type TeamProfileStatus = {
+  profile_id: string;
+  sync_state: TeamSyncState;
+  remote_version: number;
+  dirty: boolean;
+  lease_expires_at: string | null;
+  /** Why a quarantined binding is quarantined. */
+  last_error_code: string | null;
+  /** `LEASE_AT_RISK`, or a lease whose expiry has passed. */
+  lease_at_risk: boolean;
+  /** An unresolved proven-revoked run can be reverted. */
+  revert_available: boolean;
+  /** A revert holds the lease. */
+  revert_in_progress: boolean;
+};
+
+/** A tenant-wide custodian alert. */
+export type TeamCustodianAlert = {
+  kind: "custodian.renewed_after_revocation";
+  signing_key_id: string;
+  raised_at_ms: number;
+};
+
+/** What `team_profiles_status` reads from this device's team database. */
+export type TeamProfilesStatus = {
+  profiles: TeamProfileStatus[];
+  /** Newest first. */
+  alerts: TeamCustodianAlert[];
+};
