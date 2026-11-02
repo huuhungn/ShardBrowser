@@ -861,6 +861,14 @@ fn profile_delete(id: String) -> Result<(), String> {
     let _claim =
         profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionDeleteProfile"))
             .map_err(|error| error.to_string())?;
+    // A revert's `R` lands first, so the trash keeps it; a staging dir left
+    // over is decrypted data nothing would ever remove.
+    profile::load_raw(&id).map_err(|e| e.to_string())?;
+    let udd = store::user_data_root()
+        .map_err(|e| e.to_string())?
+        .join(&id);
+    team::sync::settle_revert_swap(&id, &udd).map_err(|e| format!("{e:#}"))?;
+    team::sync::discard_revert_staging(&id, &udd).map_err(|e| format!("{e:#}"))?;
     trash::move_to_trash(&id)
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -5232,6 +5240,11 @@ mod profile_mutation_boundary_tests {
         assert_running_blocked(rt.block_on(sync_cmd::profile_sync_cancel_publish(
             profile_id.to_string(),
         )));
+        assert_running_blocked(rt.block_on(sync_cmd::profile_sync_revert(
+            profile_id.to_string(),
+            None,
+            None,
+        )));
 
         tracker.set_running_for_test(profile_id, false);
     }
@@ -5300,6 +5313,7 @@ pub fn run() {
             sync_cmd::profile_sync_push,
             sync_cmd::profile_sync_publish,
             sync_cmd::profile_sync_cancel_publish,
+            sync_cmd::profile_sync_revert,
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
             sync_cmd::team_unbind_profile,

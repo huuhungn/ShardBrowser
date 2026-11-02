@@ -1427,7 +1427,8 @@ fn verified_key(
 
 /// [`verified_key`] without "Fleet generation freshness", only to read rule
 /// 6's anchor `P`, which may be of a generation a rotation since replaced,
-/// and may lie past the pin (owner decision B). Its grant still reverifies
+/// and may lie past the pin (owner decision B) or be what a revert seals
+/// again under the lease's generation. Its grant still reverifies
 /// now (Q-26 drops a withdrawn issuer's). `P` skips the freshness check only
 /// when a `J` follows it; never for sealing, nor for any other head.
 fn readable_key(
@@ -1473,21 +1474,83 @@ pub(crate) async fn push(
     now: u64,
     clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
+    settle_revert_swap(local, udd)?;
+    push_inner(client, access, dev, local, udd, now, clock, None).await
+}
+
+/// Whether the signer of `b`'s pinned head is proven revoked (rule 6): a
+/// commit on top of it is a revert, never an ordinary push. The manifest is
+/// read only once this tenant holds any proven revocation.
+async fn pin_withdrawn(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    b: &Bound,
+) -> Result<bool> {
+    let any: bool = db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM trust_proven_revocations
+           WHERE server_instance_id = ?1 AND tenant_id = ?2)",
+        params![hex(&b.instance), hex(&b.tenant)],
+        |r| r.get(0),
+    )?;
+    if b.version == 0 || !any {
+        return Ok(false);
+    }
+    let m = manifest(client, access, b, b.version).await?;
+    if Some(m.head_hash()) != b.head {
+        return Err(bad("current_signed_head_hash"));
+    }
+    ledger::withdrawn(db, &dev.pin.0, m.signer_signing_key_id())
+}
+
+/// [`push`], or with `revert` the commit of `R` on that base (`Jn`'s version
+/// and head) from the staged `P` in `udd`: only then may a `SIGNER_REVOKED`
+/// quarantine check out, and only then is a revert lease continued.
+#[allow(clippy::too_many_arguments)]
+async fn push_inner(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    udd: &Path,
+    now: u64,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
+    revert: Option<(u64, [u8; 32])>,
+) -> Result<Pushed> {
     let mut db = Db::open()?;
     retry_unbound_releases(client, access, &mut db).await;
     loop {
-        let b = bound(&db, local)?;
+        let mut b = bound(&db, local)?;
         if awaits_transition(&b) {
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             continue;
         }
-        refuse_quarantined(&b)?;
+        let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+        if revert.is_none() || !revoked {
+            refuse_quarantined(&b)?;
+        }
+        // A revert lease: any lease held under `SIGNER_REVOKED`. Only
+        // `revert` continues it, a lost release of it included.
+        if revert.is_none() && revoked && b.lease.is_some() {
+            bail!(code("sync.revertInProgress"));
+        }
+        if let Some((version, head)) = revert {
+            b.version = version;
+            b.head = Some(head);
+            if let Some(l) = b.lease.as_mut() {
+                l.base_version = version;
+            }
+        }
         // G2-34: a release whose reply was lost is replayed first.
         if let Some(op) = find(&db, local, "RELEASE", None, Some("PENDING"))? {
             release_reply(client, access, &mut db, &b, &op).await?;
             continue;
         }
         let Some(lease) = b.lease else {
+            if revert.is_none() && pin_withdrawn(client, access, &mut db, dev, &b).await? {
+                return Err(signer_revoked(&db, &b));
+            }
             // Q-18: refused before checkout, under the highest generation
             // this device verified; the checkout re-checks the one it names.
             if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
@@ -1521,7 +1584,16 @@ pub(crate) async fn push(
             continue;
         };
         if commit_op.state == "COMPLETED" {
-            return finish(client, access, &mut db, &b, &commit_op).await;
+            return finish(
+                client,
+                access,
+                &mut db,
+                &b,
+                &commit_op,
+                revert.is_some(),
+                now,
+            )
+            .await;
         }
         let s = session(&db, &commit_op.op_id)?;
         match s.state.as_str() {
@@ -1556,6 +1628,190 @@ pub(crate) async fn push(
             _ => return Err(bad("upload_sessions.state")),
         }
     }
+}
+
+// -------------------------------------------------------------- revert ----
+
+/// `udd` with `suffix` appended to its name: a sibling, so a rename between
+/// the two stays on one volume.
+fn beside(udd: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut p = udd.as_os_str().to_owned();
+    p.push(suffix);
+    p.into()
+}
+
+/// Completes the swap a revert's `finish` left in `revert_swaps`: the `P`
+/// staged in `<udd>.revert-staging` replaces the user's data in `udd`, which
+/// goes through `<udd>.revert-old`. Each step checks the disk first, so a
+/// crash anywhere resumes; a row whose profile is gone from the disk is
+/// dropped and nothing is created. Without a row nothing happens, so a
+/// staging dir a revert left before `finish` is never swapped in.
+pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
+    if !Db::path()?.exists() {
+        return Ok(());
+    }
+    let db = Db::open()?;
+    let pending: bool = db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM revert_swaps WHERE local_profile_id = ?1)",
+        [local],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let (staging, old) = (beside(udd, ".revert-staging"), beside(udd, ".revert-old"));
+    let swapped = (|| -> std::io::Result<()> {
+        if staging.exists() {
+            if udd.exists() {
+                if old.exists() {
+                    std::fs::remove_dir_all(&old)?;
+                }
+                std::fs::rename(udd, &old)?;
+            }
+            std::fs::rename(&staging, udd)?;
+        }
+        if old.exists() {
+            std::fs::remove_dir_all(&old)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = swapped {
+        // A running browser holds the profile directory on Windows.
+        eprintln!("[sync] revert swap: {e}");
+        bail!(code("sync.revertSwapPending"));
+    }
+    db.conn.execute(
+        "DELETE FROM revert_swaps WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    Ok(())
+}
+
+/// Deletes the `P` a revert staged in `<udd>.revert-staging`, unless a held
+/// lease (a revert to resume) or a pending swap still needs it.
+pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
+    let staging = beside(udd, ".revert-staging");
+    if !staging.exists() {
+        return Ok(());
+    }
+    if Db::path()?.exists() {
+        let needed: bool = Db::open()?.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM profile_bindings
+               WHERE local_profile_id = ?1 AND lease_id IS NOT NULL)
+             OR EXISTS (SELECT 1 FROM revert_swaps WHERE local_profile_id = ?1)",
+            [local],
+            |r| r.get(0),
+        )?;
+        if needed {
+            return Ok(());
+        }
+    }
+    std::fs::remove_dir_all(&staging)?;
+    Ok(())
+}
+
+/// ADR 0002 rule 6, "Committer side": commits `R` on top of `Jn`, the last
+/// head of the run of proven-revoked heads open at the listed head, with
+/// the content of `P`, the newest head below it whose signer is valid and
+/// not proven revoked. `P` is restored into `<udd>.revert-staging` under its
+/// own generation's key and sealed from there; only once `R` is pinned does
+/// it replace the user's data. A refused or abandoned revert discards the
+/// staging dir and leaves the user's data as it was.
+pub(crate) async fn revert(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    udd: &Path,
+    now: u64,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
+) -> Result<Pushed> {
+    settle_revert_swap(local, udd)?;
+    match revert_inner(client, access, dev, local, udd, now, clock).await {
+        Ok(pushed) => {
+            settle_revert_swap(local, udd)?;
+            Ok(pushed)
+        }
+        Err(e) => {
+            if let Err(d) = discard_revert_staging(local, udd) {
+                eprintln!("[sync] revert staging: {d:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// [`revert`] up to and including `finish`, the swap still pending.
+async fn revert_inner(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    udd: &Path,
+    now: u64,
+    clock: &(dyn Fn() -> std::time::Duration + Sync),
+) -> Result<Pushed> {
+    let mut db = Db::open()?;
+    let b = bound(&db, local)?;
+    let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+    if !revoked {
+        refuse_quarantined(&b)?;
+    }
+    // A revert lease resumes on the base its checkout took; any other
+    // lease is an ordinary push's, which a revert never continues.
+    let base = match b.lease {
+        Some(_) if !revoked => bail!(code("sync.pushPending")),
+        Some(lease) => {
+            let g = granted(&db, &b, &lease)?;
+            let head = g
+                .current_signed_head_hash
+                .ok_or_else(|| bad("current_signed_head_hash"))?;
+            Some((g.lease.base_version, head))
+        }
+        None => None,
+    };
+    let uploaded = match b.lease {
+        Some(lease) => find(&db, local, "UPLOAD", Some(&lease), None)?.is_some(),
+        None => false,
+    };
+    let staging = beside(udd, ".revert-staging");
+    let base = match base {
+        Some(base) if uploaded => base,
+        _ => {
+            let head = listed(client, access, &mut db, &b).await?;
+            let w = walked(client, access, &mut db, dev, &b, &head, now).await?;
+            let Some(jn) = w.open.last() else {
+                bail!(code("sync.revertUnavailable"));
+            };
+            let Some((_, Some(p))) = &w.anchor else {
+                bail!(code("sync.revertNoValidSnapshot"));
+            };
+            if b.lease.is_none() {
+                hold_open(&mut db, &b, &w, now)?;
+                // Q-18: a compromised revocation waits for rotation, and the
+                // quarantine keeps its code (no `mark_blocked`).
+                if let Some(g) = ledger::highest_generation(&db, &dev.pin.0, &b.fleet)? {
+                    if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &b.fleet, g)? {
+                        bail!(code("sync.commitBlockedCompromised"));
+                    }
+                }
+            }
+            let fkek = readable_key(
+                &db,
+                dev,
+                &b.fleet,
+                p.key_generation,
+                Some(&p.fkek_key_id),
+                now,
+            )?;
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging)?;
+            }
+            restore(client, access, &b, p, fkek, &staging).await?;
+            base.unwrap_or((jn.version, jn.hash))
+        }
+    };
+    push_inner(client, access, dev, local, &staging, now, clock, Some(base)).await
 }
 
 // ------------------------------------------------------------- publish ----
@@ -2476,10 +2732,15 @@ async fn fail_upload(
 const COMPROMISED: &str = "ROTATION_REQUIRED_COMPROMISED";
 
 /// Marks `local` blocked; `dirty` when its lease goes without a commit, so
-/// the binding ends AVAILABLE with `dirty = 1` once the release lands.
+/// the binding ends AVAILABLE with `dirty = 1` once the release lands. A
+/// `SIGNER_REVOKED` quarantine keeps its code, and a revert lease, which
+/// seals from staging and never the user's data, leaves `dirty` as it was.
 fn mark_blocked(db: &Db, local: &str, dirty: bool) -> Result<()> {
     db.conn.execute(
-        "UPDATE profile_bindings SET last_error_code = ?2, dirty = max(dirty, ?3)
+        "UPDATE profile_bindings SET
+           last_error_code = CASE WHEN last_error_code = 'SIGNER_REVOKED'
+             THEN last_error_code ELSE ?2 END,
+           dirty = CASE WHEN last_error_code = 'SIGNER_REVOKED' THEN dirty ELSE max(dirty, ?3) END
          WHERE local_profile_id = ?1",
         params![local, COMPROMISED, dirty],
     )?;
@@ -2735,13 +2996,17 @@ async fn commit(
 
 /// Reads the committed snapshot back (G2-38): the exact manifest, the
 /// object's hash, and the listed head the receipt names. Then the binding
-/// pins that head and drops the lease the commit released.
+/// pins that head and drops the lease the commit released. A `revert`
+/// commit is `R` in the same transaction: the open run below it is accepted
+/// and the staged `P` waits in `revert_swaps` to replace the user's data.
 async fn finish(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
     b: &Bound,
     op: &Op,
+    revert: bool,
+    now: u64,
 ) -> Result<Pushed> {
     let request = CommitRequestV2::parse(&op.exact).map_err(|_| bad("CommitRequestV2"))?;
     let receipt = op
@@ -2779,7 +3044,9 @@ async fn finish(
         return Err(mismatch("head"));
     }
     let s = session(db, &op.op_id)?;
-    db.conn.execute(
+    let r = receipt.resulting_head_hash.to_vec();
+    let tx = db.conn.transaction()?;
+    tx.execute(
         "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
            last_observed_head_hash = ?3, fkek_key_id = ?4, key_generation = ?5,
            lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL, sync_state = 'AVAILABLE',
@@ -2788,11 +3055,33 @@ async fn finish(
         params![
             b.local,
             wire(version)?,
-            receipt.resulting_head_hash.to_vec(),
+            r,
             s.fkek_key_id,
             wire(s.key_generation)?
         ],
     )?;
+    if revert {
+        tx.execute(
+            "UPDATE skipped_heads SET resolution = 'ACCEPTED', accepted_head_hash = ?5,
+               resolved_at_ms = ?6
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
+               AND resolution IS NULL AND target_version <= ?4",
+            params![
+                hex(&b.instance),
+                hex(&b.tenant),
+                hex(&b.profile),
+                wire(p.base_version)?,
+                r,
+                wire(now)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO revert_swaps(local_profile_id, accepted_version, accepted_head_hash,
+               recorded_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![b.local, wire(version)?, r, wire(now)?],
+        )?;
+    }
+    tx.commit()?;
     let _ = std::fs::remove_file(spool(&s.spool)?);
     Ok(Pushed {
         version,
@@ -2902,9 +3191,12 @@ async fn release_reply(
            AND commit_op_id IN (SELECT op_id FROM operations WHERE lease_id = ?2)",
         params![b.local, lease],
     )?;
+    // A revert lease released without its `R` keeps the quarantine (rule 6:
+    // only a revert commits on top of `Jn`).
     tx.execute(
         "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL,
-           sync_state = 'AVAILABLE'
+           sync_state = CASE WHEN last_error_code = 'SIGNER_REVOKED'
+             THEN 'QUARANTINED' ELSE 'AVAILABLE' END
          WHERE local_profile_id = ?1 AND lease_id = ?2",
         params![b.local, lease],
     )?;
@@ -3171,8 +3463,8 @@ struct Run {
 #[derive(Default)]
 struct Walked {
     /// `P`: the newest head accepted, or the pin while its signer is not
-    /// withdrawn, with the payload a restore needs; or the head below a
-    /// withdrawn pin, which is never restored.
+    /// withdrawn, or the head below a withdrawn pin (which only a revert
+    /// restores), with the payload a restore needs.
     anchor: Option<(Link, Option<SnapshotManifestV2>)>,
     /// The run open at the listed head, if any.
     open: Vec<Link>,
@@ -3285,7 +3577,7 @@ async fn walk(
                 } else if chain.reported_revoked_at(&signer, now) {
                     return Err(signer_revoked(db, b));
                 } else {
-                    w.anchor = Some((link, None));
+                    w.anchor = Some((link, Some(p)));
                     break;
                 }
             }
@@ -3376,6 +3668,52 @@ async fn walk(
         return Err(refused_in_walk(db, b, &w, bad("current_signed_head_hash")));
     }
     Ok(w)
+}
+
+/// [`walk`] from `b`'s pin to `head` under the trust evidence of `b`'s
+/// tenant, recorded first so a revocation it carries counts in the walk.
+async fn walked(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    b: &Bound,
+    head: &FleetProfileHeadV2,
+    now: u64,
+) -> Result<Walked> {
+    let untrusted = || anyhow!(code("sync.signerUntrusted"));
+    let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
+    let (seen, chain) =
+        ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
+    ledger::record(db, &dev.pin.0, &seen, &chain, None, now)?;
+    let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
+        .iter()
+        .flat_map(|p| &p.signing_public_keys)
+        .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
+        .collect();
+    walk(client, access, db, dev, &chain, &keys, b, head, now).await
+}
+
+/// Files the run `w` left open at the listed head, unresolved above its
+/// `P`, and quarantines `b` with `SIGNER_REVOKED`, in one transaction.
+fn hold_open(db: &mut Db, b: &Bound, w: &Walked, now: u64) -> Result<()> {
+    let open = Run {
+        anchor: w.anchor.as_ref().map(|(l, _)| (l.version, l.hash)),
+        heads: w.open.clone(),
+        by: None,
+    };
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    skip(&tx, b, &open, now)?;
+    supersede(&tx, b, Some(&w.read), now)?;
+    tx.execute(
+        "UPDATE profile_bindings SET sync_state = 'QUARANTINED', last_error_code = 'SIGNER_REVOKED'
+         WHERE local_profile_id = ?1",
+        [&b.local],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Files each head of `run` in the skip audit (ADR 0002 rule 6): open, or
@@ -3598,6 +3936,7 @@ pub(crate) async fn pull(
     udd: &Path,
     now: u64,
 ) -> Result<u64> {
+    settle_revert_swap(local, udd)?;
     let mut db = Db::open()?;
     retry_unbound_releases(client, access, &mut db).await;
     let mut b = bound(&db, local)?;
@@ -3632,42 +3971,13 @@ pub(crate) async fn pull(
     if head.current_version == 0 {
         bail!(code("profile.theTeamServerHasNoSnapshotForThisProfi"));
     }
-    let untrusted = || anyhow!(code("sync.signerUntrusted"));
-    let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
-    let (seen, chain) =
-        ledger::evaluate(&db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
-    // Recorded first, so a revocation this evidence carries counts below.
-    ledger::record(&mut db, &dev.pin.0, &seen, &chain, None, now)?;
-    let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
-        .iter()
-        .flat_map(|p| &p.signing_public_keys)
-        .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
-        .collect();
-    let mut w = walk(client, access, &mut db, dev, &chain, &keys, &b, &head, now).await?;
+    let w = walked(client, access, &mut db, dev, &b, &head, now).await?;
     if !w.open.is_empty() {
         // Owner decision B: the open run and the quarantine are kept first;
         // then a `P` past the pin is pulled as any valid head is (rule 6:
         // advance over valid heads first). `P` may be of a generation a
         // rotation since replaced, so its key is read through `readable_key`.
-        let open = Run {
-            anchor: w.anchor.as_ref().map(|(l, _)| (l.version, l.hash)),
-            heads: std::mem::take(&mut w.open),
-            by: None,
-        };
-        {
-            let tx = db
-                .conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            skip(&tx, &b, &open, now)?;
-            supersede(&tx, &b, Some(&w.read), now)?;
-            tx.execute(
-                "UPDATE profile_bindings SET sync_state = 'QUARANTINED',
-                   last_error_code = 'SIGNER_REVOKED'
-                 WHERE local_profile_id = ?1",
-                [&b.local],
-            )?;
-            tx.commit()?;
-        }
+        hold_open(&mut db, &b, &w, now)?;
         if let Some((at, Some(p))) = &w.anchor {
             if at.version > b.version {
                 let fkek = readable_key(
@@ -3975,6 +4285,9 @@ mod tests {
         /// SQL another writer runs on the launcher's database when the next
         /// PATCH is served.
         on_patch: Option<String>,
+        /// SQL another writer runs on the launcher's database when the next
+        /// checkout is served.
+        on_checkout: Option<String>,
         /// `PROFILE` is not yet published: the listing omits it until a
         /// publish-create makes it.
         fresh: bool,
@@ -4486,6 +4799,12 @@ mod tests {
                 *n -= 1;
             }
             if let Some(sql) = f.on_patch.take() {
+                let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
+            }
+        }
+        if tag == "checkout" {
+            if let Some(sql) = f.on_checkout.take() {
                 let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
                 assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
             }
@@ -6139,18 +6458,27 @@ mod tests {
     /// Pull uses only a key whose grant reverifies now: none held refuses
     /// with no passphrase fallback; a head whose signer this device
     /// distrusts is refused as revoked (rule 6) and quarantines. Push then
-    /// releases its lease and uploads nothing.
+    /// releases its lease and uploads nothing; over a pinned head that key
+    /// signed it refuses before any request (owner decision 2026-11-02).
     #[test]
     fn a_missing_or_withdrawn_fleet_key_is_refused() {
+        {
+            let w = world();
+            ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+            assert_eq!(w.sent("POST", "/release").len(), 1);
+            assert!(w.sent("POST", "/uploads").is_empty());
+        }
         let w = world();
         w.push().unwrap();
         let distrust =
             || ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
         distrust();
         let err = w.push().unwrap_err();
-        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
-        assert_eq!(w.sent("POST", "/release").len(), 1);
-        assert_eq!(w.sent("POST", "/uploads").len(), 1, "only the first push");
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(w.sent("POST", "/release").is_empty());
+        assert_eq!(w.sent("POST", "/checkout").len(), 1, "only the first push");
 
         let other = tempfile::tempdir().unwrap();
         w.enroll(other.path());
@@ -6994,6 +7322,17 @@ mod tests {
         revoked: bool,
         reported: bool,
     ) -> Vec<TenantTrustEvidencePageV2> {
+        let reason = revoked.then_some(DeviceRevocationReason::Compromised);
+        author_pages_for(w, ends, reason, reported)
+    }
+
+    /// [`author_pages`], with `A`'s revocation for `reason` when given.
+    fn author_pages_for(
+        w: &World,
+        ends: u64,
+        reason: Option<DeviceRevocationReason>,
+        reported: bool,
+    ) -> Vec<TenantTrustEvidencePageV2> {
         let k = author();
         let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
         let until = |replay| CommonFields {
@@ -7037,14 +7376,14 @@ mod tests {
             ),
             build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &commit.encode()),
         ];
-        if revoked {
+        if let Some(reason_code) = reason {
             let revocation = DeviceRevocationV2 {
                 common: common(0x74),
                 subject_account_id: [0x70; 16],
                 subject_device_id: [0x71; 16],
                 subject_signing_key_id: kid,
                 subject_hpke_key_id: [0x70; 32],
-                reason_code: DeviceRevocationReason::Compromised,
+                reason_code,
             };
             extra.push(build_record(
                 &w.me.sk,
@@ -9222,11 +9561,12 @@ mod tests {
         shardx_core::keys::signing_key_id(sk.verifying_key().as_bytes())
     }
 
-    /// Pushes one version per signer, then re-signs version `v` by
-    /// `signers[v - 1]`, each on the head below it, and lists the last. The
-    /// heads, by version from 1.
+    /// Pushes one version per signer, the profile's `marker` file reading
+    /// `v1`, `v2`, ..., then re-signs version `v` by `signers[v - 1]`, each
+    /// on the head below it, and lists the last. The heads, by version from 1.
     fn chain_of(w: &World, signers: &[&Ed25519SigningKey]) -> Vec<[u8; 32]> {
-        for _ in signers {
+        for v in 1..=signers.len() {
+            std::fs::write(w.udd.join("marker"), format!("v{v}")).unwrap();
             w.push().unwrap();
         }
         let mut f = w.fake();
@@ -10124,5 +10464,584 @@ mod tests {
         w.pull(&w.udd.with_file_name("out")).unwrap();
         assert_eq!(w.state(LOCAL).2, 1);
         assert_eq!(superseded(&w), [Some(NOW as i64)]);
+    }
+
+    // ----------------------------------------------------- revert commit ----
+    // ADR 0002 rule 6, "Committer side".
+
+    impl World {
+        fn revert(&self, udd: &Path) -> Result<Pushed> {
+            self.rt.block_on(revert(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                udd,
+                NOW,
+                &|| std::time::Duration::ZERO,
+            ))
+        }
+
+        /// [`revert`] stopped right after `finish`'s transaction.
+        fn revert_to_finish(&self, udd: &Path) -> Result<Pushed> {
+            self.rt.block_on(revert_inner(
+                &self.client,
+                "t",
+                &self.dev,
+                LOCAL,
+                udd,
+                NOW,
+                &|| std::time::Duration::ZERO,
+            ))
+        }
+
+        fn push_from(&self, udd: &Path) -> Result<Pushed> {
+            self.rt
+                .block_on(push(&self.client, "t", &self.dev, LOCAL, udd, NOW, &|| {
+                    std::time::Duration::ZERO
+                }))
+        }
+
+        fn dirty(&self) -> i64 {
+            self.count("SELECT dirty FROM profile_bindings")
+        }
+    }
+
+    /// A revert's starting point: v1 (`P`) by this device, v2 (`J`) by `A`,
+    /// whose revocation for `reason` a second device counted in a pull that
+    /// pinned v1 and left v2 open. The heads, that device's root, and its
+    /// profile, whose `marker` reads `local`.
+    fn reverting(
+        w: &World,
+        reason: DeviceRevocationReason,
+    ) -> (Vec<[u8; 32]>, tempfile::TempDir, std::path::PathBuf) {
+        let heads = chain_of(w, &[&w.me.sk, &author()]);
+        serve(w, &author_pages_for(w, T0 + 300 * DAY, Some(reason), false));
+        let d = second(w);
+        let err = w.pull(&d.path().join("pulled")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(w, 1);
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        (heads, d, udd)
+    }
+
+    fn marker(udd: &Path) -> String {
+        std::fs::read_to_string(udd.join("marker")).unwrap()
+    }
+
+    /// Every file under `dir` with its bytes.
+    fn tree(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                out.extend(tree(&p));
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// No staging dir, no moved-aside data and no pending swap.
+    fn settled(w: &World, udd: &Path) {
+        assert!(!beside(udd, ".revert-staging").exists());
+        assert!(!beside(udd, ".revert-old").exists());
+        assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 0);
+    }
+
+    /// `R` at version 3: on top of `J` with this device as signer.
+    fn r_on(w: &World, j: [u8; 32]) -> [u8; 32] {
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&3]).unwrap();
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        assert_eq!(
+            (
+                p.base_version,
+                p.previous_signed_head_hash,
+                p.signer_signing_key_id
+            ),
+            (2, Some(j), w.me.to.signing_key_id)
+        );
+        m.head_hash()
+    }
+
+    #[test]
+    fn revert_commits_the_newest_valid_snapshot_on_top_of_the_rejected_head() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&udd), "v1", "P's content, swapped in");
+        settled(&w, &udd);
+    }
+
+    /// Blocking 1: `Jn` is the pin, so the checkout's base is the pinned
+    /// version. The run is offered (an open row) and, once checked out, the
+    /// lease held under `SIGNER_REVOKED` is the revert in progress.
+    #[test]
+    fn revert_commits_over_a_head_pinned_before_its_signer_was_proven_revoked() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let err = w.pull(&d.path().join("out")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 2);
+        assert_eq!(skipped(&w), [(2, None, None, 1)], "offered");
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL
+                   AND last_error_code = 'SIGNER_REVOKED' AND remote_version = 2"
+            ),
+            1,
+            "in progress"
+        );
+        assert!(beside(&udd, ".revert-staging").exists(), "kept to resume");
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&udd), "v1");
+        settled(&w, &udd);
+    }
+
+    #[test]
+    fn an_ordinary_push_refuses_a_revert_lease_on_the_pinned_head() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        let sent = w.fake().log.len();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.revertInProgress"), "{err:#}");
+        assert_eq!(w.fake().log.len(), sent, "nothing was sent");
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+    }
+
+    /// Blocking 2: whichever path releases a revert lease, the binding ends
+    /// quarantined with `SIGNER_REVOKED` and `dirty` as it was, so an
+    /// ordinary push cannot then commit over `Jn`.
+    #[test]
+    fn an_abandoned_revert_keeps_the_binding_quarantined() {
+        for case in [
+            "seal blocked",
+            "seal key",
+            "upload aborted",
+            "checkout replay",
+        ] {
+            let w = world();
+            let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+            match case {
+                "seal blocked" => w.fake().on_checkout = Some(a_compromise(&w)),
+                "seal key" => w.fake().generation = Some(2),
+                "upload aborted" => w.fake().on_patch = Some(a_compromise(&w)),
+                _ => {
+                    {
+                        let mut f = w.fake();
+                        f.expires = Some(T0);
+                        f.lose.push("checkout");
+                    }
+                    w.revert(&udd).unwrap_err();
+                    // The replay is released; the checkout after it refused.
+                    let mut f = w.fake();
+                    f.expires = None;
+                    f.listed = Some((2, Some(heads[1])));
+                    f.version = 5;
+                }
+            }
+            w.revert(&udd).unwrap_err();
+            if case == "checkout replay" {
+                assert_eq!(w.sent("POST", "/release").len(), 1, "{case}");
+                w.fake().version = 2;
+            }
+            revoked_at(&w, 1);
+            assert_eq!(w.dirty(), 0, "{case}");
+            let checkouts = w.sent("POST", "/checkout").len();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.bindingQuarantined"), "{case}: {err:#}");
+            assert_eq!(w.sent("POST", "/checkout").len(), checkouts, "{case}");
+        }
+    }
+
+    #[test]
+    fn revert_committed_here_is_accepted_by_a_second_device() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.revert(&udd).unwrap();
+        let r = r_on(&w, heads[1]);
+        let e = second(&w);
+        let out = e.path().join("out");
+        w.pull(&out).unwrap();
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&out), "v1");
+    }
+
+    #[test]
+    fn revert_is_refused_for_a_reported_only_revocation() {
+        let w = world();
+        chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, true));
+        let d = second(&w);
+        w.pull(&d.path().join("out")).unwrap_err();
+        revoked_at(&w, 0);
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        let before = tree(&udd);
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.sent("POST", "/checkout").len(), 2, "only the chain's own");
+        assert_eq!(tree(&udd), before);
+        assert!(!beside(&udd, ".revert-staging").exists());
+        assert!(skipped(&w).is_empty());
+    }
+
+    /// Q-18: a `compromised` revocation holds the revert until the fleet is
+    /// rotated; the quarantine keeps `SIGNER_REVOKED`. Then `P` is read at
+    /// its own generation and `R` sealed under the new one.
+    #[test]
+    fn revert_waits_for_rotation_after_a_compromised_revocation() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Compromised);
+        let checkouts = w.sent("POST", "/checkout").len();
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        revoked_at(&w, 1);
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        assert_eq!(marker(&udd), "local");
+
+        let k2 = [0x52; 32];
+        let mut extra = vec![key_rotate(&w.me)];
+        extra.extend(activation(&w.me, 2, &k2, 0, 71, None));
+        w.collect(2, &k2, 70, extra);
+        assert!(crate::fleet_keys::collect(&hex(&FLEET), 2, &k2).unwrap());
+        {
+            let mut f = w.fake();
+            f.generation = Some(2);
+            f.fkek_key_id = Some(shardx_core::fleet_grants::fkek_key_id(&k2));
+        }
+        assert!(!w.blocked(2), "rotated");
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&3]).unwrap();
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        assert_eq!(p.key_generation, 2, "sealed under the new generation");
+        assert_eq!(marker(&udd), "v1", "read under generation 1");
+    }
+
+    #[test]
+    fn revert_refuses_without_a_valid_earlier_snapshot() {
+        let w = world();
+        chain_of(&w, &[&author()]);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let d = second(&w);
+        w.pull(&d.path().join("out")).unwrap_err();
+        revoked_at(&w, 0);
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        let checkouts = w.sent("POST", "/checkout").len();
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.revertNoValidSnapshot"), "{err:#}");
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        assert!(!beside(&udd, ".revert-staging").exists());
+        assert_eq!(skipped(&w), [(1, None, None, 0)]);
+    }
+
+    /// The commit's reply is lost: the next revert resumes the stored
+    /// operations on the base the checkout took (a walk would now find `R`
+    /// and no run): one checkout, one commit, one version.
+    #[test]
+    fn revert_resumes_after_a_lost_commit_reply() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let (checkouts, commits) = (w.sent("POST", "/checkout").len(), w.fake().commits);
+        w.fake().lose.push("commit");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(w.fake().version, 3, "committed, the reply lost");
+        assert_eq!(marker(&udd), "local");
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts + 1);
+        assert_eq!(w.fake().commits, commits + 1);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&udd), "v1");
+        settled(&w, &udd);
+    }
+
+    /// A refused checkout, after `P` was staged: the user's data as it was,
+    /// and the staging dir gone.
+    fn refused_checkout(w: &World, udd: &Path) {
+        let before = tree(udd);
+        w.fake().refuse.push(("checkout", 409));
+        w.revert(udd).unwrap_err();
+        assert_eq!(tree(udd), before);
+        assert!(!beside(udd, ".revert-staging").exists());
+        revoked_at(w, 1);
+    }
+
+    #[test]
+    fn a_refused_revert_checkout_keeps_the_local_profile() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        refused_checkout(&w, &udd);
+    }
+
+    #[test]
+    fn a_refused_revert_discards_its_staging() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        std::fs::create_dir_all(beside(&udd, ".revert-staging")).unwrap();
+        refused_checkout(&w, &udd);
+    }
+
+    /// Blocking 3: with `R` pinned and the swap pending, every entry point
+    /// completes the swap before it reads or writes the profile.
+    #[test]
+    fn a_crash_after_finish_completes_the_staging_swap() {
+        for entry in ["revert", "push", "pull", "launch"] {
+            let w = world();
+            let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+            w.revert_to_finish(&udd).unwrap();
+            let r = r_on(&w, heads[1]);
+            available_at(&w, 3, r);
+            assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 1);
+            assert_eq!(marker(&udd), "local", "{entry}: not swapped yet");
+            match entry {
+                "revert" => {
+                    let err = w.revert(&udd).unwrap_err();
+                    assert!(has(&err, "sync.revertUnavailable"), "{err:#}");
+                }
+                "push" => assert_eq!(w.push_from(&udd).unwrap().version, 4),
+                "pull" => {
+                    w.pull(&udd).unwrap();
+                }
+                _ => settle_revert_swap(LOCAL, &udd).unwrap(),
+            }
+            assert_eq!(marker(&udd), "v1", "{entry}");
+            settled(&w, &udd);
+        }
+    }
+
+    /// Each state the swap can stop in resumes to the same end.
+    #[test]
+    fn a_crash_inside_the_staging_swap_resumes() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.revert_to_finish(&udd).unwrap();
+        let (staging, old) = (beside(&udd, ".revert-staging"), beside(&udd, ".revert-old"));
+        let row = "INSERT INTO revert_swaps VALUES ('local-profile', 3, zeroblob(32), 0)";
+        for state in ["udd moved aside", "staging moved in", "old deleted"] {
+            if w.count("SELECT count(*) FROM revert_swaps") == 0 {
+                w.db().conn.execute(row, []).unwrap();
+                std::fs::rename(&udd, &staging).unwrap();
+                std::fs::create_dir_all(&udd).unwrap();
+                std::fs::write(udd.join("marker"), b"local").unwrap();
+            }
+            std::fs::rename(&udd, &old).unwrap();
+            if state != "udd moved aside" {
+                std::fs::rename(&staging, &udd).unwrap();
+            }
+            if state == "old deleted" {
+                std::fs::remove_dir_all(&old).unwrap();
+            }
+            settle_revert_swap(LOCAL, &udd).unwrap();
+            assert_eq!(marker(&udd), "v1", "{state}");
+            settled(&w, &udd);
+        }
+    }
+
+    /// A staging dir with no swap row (a revert cut off before `finish`)
+    /// never replaces the profile, and the next revert unpacks afresh.
+    #[test]
+    fn a_staging_dir_without_a_swap_row_is_never_swapped_in() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let staging = beside(&udd, ".revert-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("stale"), b"stale").unwrap();
+        settle_revert_swap(LOCAL, &udd).unwrap();
+        w.pull(&udd).unwrap_err();
+        assert_eq!(marker(&udd), "local");
+        assert!(staging.join("stale").exists(), "never swapped in");
+        w.revert(&udd).unwrap();
+        assert_eq!(marker(&udd), "v1");
+        assert!(!udd.join("stale").exists(), "unpacked afresh");
+        settled(&w, &udd);
+    }
+
+    #[test]
+    fn a_swap_row_for_a_deleted_profile_is_cleared() {
+        let w = world();
+        let row = "INSERT INTO revert_swaps VALUES ('local-profile', 3, zeroblob(32), 0)";
+        let udd = w.udd.with_file_name("gone");
+        w.db().conn.execute(row, []).unwrap();
+        settle_revert_swap(LOCAL, &udd).unwrap();
+        assert!(!udd.exists(), "nothing created");
+        settled(&w, &udd);
+
+        // Cut off between the renames: the data aside and `P` staged.
+        w.db().conn.execute(row, []).unwrap();
+        for (dir, text) in [(".revert-old", "old"), (".revert-staging", "new")] {
+            std::fs::create_dir_all(beside(&udd, dir)).unwrap();
+            std::fs::write(beside(&udd, dir).join("marker"), text).unwrap();
+        }
+        settle_revert_swap(LOCAL, &udd).unwrap();
+        assert_eq!(marker(&udd), "new");
+        settled(&w, &udd);
+    }
+
+    /// Critic S1: a revert abandoned at seal whose release reply was lost
+    /// holds the lease; an ordinary push leaves it alone, and the next revert
+    /// replays the release, checks out again on `Jn` and commits `R`.
+    #[test]
+    fn revert_resumes_after_a_lost_release_of_an_abandoned_lease() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        {
+            let mut f = w.fake();
+            f.generation = Some(2);
+            f.lose.push("release");
+        }
+        w.revert(&udd).unwrap_err();
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'RELEASE' AND state = 'PENDING'"),
+            1
+        );
+        let (releases, checkouts) = (
+            w.sent("POST", "/release").len(),
+            w.sent("POST", "/checkout").len(),
+        );
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.revertInProgress"), "{err:#}");
+        assert_eq!(w.sent("POST", "/release").len(), releases);
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        w.fake().generation = None;
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        assert_eq!(w.sent("POST", "/release").len(), releases + 1, "replayed");
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts + 1);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&udd), "v1");
+    }
+
+    /// Architect should 2: a revert lease abandoned at seal (Q-18) takes its
+    /// staging dir with it; with the release reply lost the lease is still
+    /// held, so the staging dir stays for the revert that resumes it.
+    #[test]
+    fn an_abandoned_revert_lease_discards_its_staging() {
+        for lost in [false, true] {
+            let w = world();
+            let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+            let before = tree(&udd);
+            {
+                let mut f = w.fake();
+                f.on_checkout = Some(a_compromise(&w));
+                if lost {
+                    f.lose.push("release");
+                }
+            }
+            let err = w.revert(&udd).unwrap_err();
+            assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+            assert_eq!(tree(&udd), before);
+            assert_eq!(beside(&udd, ".revert-staging").exists(), lost, "{lost}");
+        }
+    }
+
+    /// Architect should 2: deleting or unbinding a profile settles a pending
+    /// swap and discards a staging dir left over; with none it does nothing.
+    #[test]
+    fn deleting_or_unbinding_a_profile_discards_its_revert_staging() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let root = crate::store::user_data_root().unwrap();
+        let profile = || {
+            let mut s = crate::profile::StoredProfile::default();
+            crate::profile::save_raw(&mut s).unwrap();
+            s.meta.id
+        };
+        let leftover = |id: &str| {
+            let staging = beside(&root.join(id), ".revert-staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("marker"), b"P").unwrap();
+            staging
+        };
+        let id = profile();
+        let staging = leftover(&id);
+        crate::profile_delete(id).unwrap();
+        assert!(!staging.exists(), "deleted with the profile");
+
+        // Unbinding takes a canonical profile ID.
+        let id = profile();
+        w.bind(&id, [0xc2; 16], 1, [9; 32]);
+        let staging = leftover(&id);
+        crate::team::downgrade::unbind_profile(&id, SERVER, NOW).unwrap();
+        assert!(!staging.exists(), "discarded by the unbind");
+
+        let id = profile();
+        crate::profile_delete(id.clone()).unwrap();
+        assert!(!beside(&root.join(&id), ".revert-staging").exists(), "none");
+    }
+
+    #[test]
+    fn a_normal_push_still_refuses_a_quarantined_binding() {
+        for reason in ["SIGNER_REVOKED", "HEAD_ROLLBACK_DETECTED"] {
+            let w = world();
+            let (_, _d, _udd) = reverting(&w, DeviceRevocationReason::Retired);
+            w.db()
+                .conn
+                .execute("UPDATE profile_bindings SET last_error_code = ?1", [reason])
+                .unwrap();
+            let sent = w.fake().log.len();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.bindingQuarantined"), "{reason}: {err:#}");
+            assert_eq!(w.fake().log.len(), sent, "{reason}");
+        }
+    }
+
+    /// Owner decision 2026-11-02: a refusal below a withdrawn pin leaves the
+    /// binding available, but an ordinary push still never commits on top of
+    /// that pin: it quarantines and sends no request that writes.
+    #[test]
+    fn an_ordinary_push_refuses_over_a_pinned_head_whose_signer_is_proven_revoked() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        forge(&w, &Ed25519SigningKey::from_bytes(&[0x33; 32]), |_| {});
+        w.pull(&d.path().join("out")).unwrap_err();
+        available_at(&w, 2, heads[1]);
+        let checkouts = w.sent("POST", "/checkout").len();
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        assert_eq!(w.fake().commits, 2);
+        revoked_at(&w, 2);
     }
 }

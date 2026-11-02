@@ -146,6 +146,8 @@ pub async fn launch_profile_synced(
     bus_token: &str,
 ) -> Result<LaunchOutcome> {
     let launch_claim = profile::begin_profile_launch(profile_id)?;
+    // A revert committed but not yet swapped in: `R`'s content first (offline).
+    crate::team::sync::settle_revert_swap(profile_id, &profile::user_data_dir(profile_id)?)?;
     let _cancel_scope = CancelScope::start(profile_id);
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
