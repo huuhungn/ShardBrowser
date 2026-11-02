@@ -212,6 +212,92 @@ pub(crate) fn is_published(local: &str) -> Result<bool> {
         .is_some())
 }
 
+/// One binding as `team_profiles_status` reports it. A profile with none is
+/// local.
+#[derive(Debug, serde::Serialize)]
+pub struct ProfileStatus {
+    pub profile_id: String,
+    pub sync_state: String,
+    pub remote_version: i64,
+    pub dirty: bool,
+    pub lease_expires_at: Option<String>,
+    pub last_error_code: Option<String>,
+    /// `LEASE_AT_RISK`, or a lease whose expiry has passed.
+    pub lease_at_risk: bool,
+    /// Any unresolved proven-revoked run: `revert()` re-walks to decide.
+    pub revert_available: bool,
+    /// A lease held while the binding is quarantined `SIGNER_REVOKED`, which
+    /// only `revert()` checks out.
+    pub revert_in_progress: bool,
+}
+
+/// A `trust_custodian_alerts` row.
+#[derive(Debug, serde::Serialize)]
+pub struct CustodianAlert {
+    pub kind: String,
+    pub signing_key_id: String,
+    pub raised_at_ms: i64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Statuses {
+    pub profiles: Vec<ProfileStatus>,
+    /// Tenant-wide, newest first.
+    pub alerts: Vec<CustodianAlert>,
+}
+
+/// Every binding's state and every custodian alert, read from the team
+/// database alone: no network, and no pending revert swap is settled here
+/// (one shows as the pinned head, `AVAILABLE`). No team database means none.
+pub(crate) fn statuses(now: u64) -> Result<Statuses> {
+    if !Db::path()?.exists() {
+        return Ok(Statuses::default());
+    }
+    let db = Db::open()?;
+    let profiles = db
+        .conn
+        .prepare(
+            "SELECT b.local_profile_id, b.sync_state, b.remote_version, b.dirty,
+               b.lease_expires_at, b.last_error_code,
+               b.sync_state = 'LEASE_AT_RISK' OR (b.lease_expires_at IS NOT NULL
+                 AND b.lease_expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?1 / 1000.0, 'unixepoch')),
+               EXISTS (SELECT 1 FROM skipped_heads s
+                 WHERE s.server_instance_id = b.server_instance_id AND s.tenant_id = b.tenant_id
+                   AND s.remote_profile_id = b.remote_profile_id AND s.resolution IS NULL),
+               b.lease_id IS NOT NULL AND b.last_error_code IS 'SIGNER_REVOKED'
+             FROM profile_bindings b ORDER BY b.local_profile_id",
+        )?
+        .query_map([wire(now)?], |r| {
+            Ok(ProfileStatus {
+                profile_id: r.get(0)?,
+                sync_state: r.get(1)?,
+                remote_version: r.get(2)?,
+                dirty: r.get(3)?,
+                lease_expires_at: r.get(4)?,
+                last_error_code: r.get(5)?,
+                lease_at_risk: r.get(6)?,
+                revert_available: r.get(7)?,
+                revert_in_progress: r.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let alerts = db
+        .conn
+        .prepare(
+            "SELECT kind, signing_key_id, raised_at_ms FROM trust_custodian_alerts
+             ORDER BY raised_at_ms DESC, signing_key_id",
+        )?
+        .query_map([], |r| {
+            Ok(CustodianAlert {
+                kind: r.get(0)?,
+                signing_key_id: r.get(1)?,
+                raised_at_ms: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Statuses { profiles, alerts })
+}
+
 fn bound(db: &Db, local: &str) -> Result<Bound> {
     let row = db
         .conn
@@ -11363,5 +11449,209 @@ mod tests {
         assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
         assert_eq!(w.fake().commits, 2);
         revoked_at(&w, 2);
+    }
+
+    // ---------------------------------------------------------- statuses ----
+
+    /// `LOCAL`'s status, the only binding `_w` has.
+    fn status(_w: &World) -> ProfileStatus {
+        let mut s = statuses(NOW).unwrap().profiles;
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].profile_id, LOCAL);
+        s.remove(0)
+    }
+
+    #[test]
+    fn statuses_map_each_binding_state() {
+        {
+            let _w = world_unbound();
+            assert!(statuses(NOW).unwrap().profiles.is_empty(), "local");
+        }
+        let (future, past) = ("'2099-01-01T00:00:00.000Z'", "'2000-01-01T00:00:00.000Z'");
+        for (state, expires, dirty, reason, at_risk) in [
+            ("AVAILABLE", None, false, None, false),
+            ("CHECKED_OUT", Some(future), true, None, false),
+            ("CHECKED_OUT", Some(past), true, None, true),
+            ("LEASE_AT_RISK", Some(future), true, None, true),
+            ("UPLOADING", Some(future), true, None, false),
+            (
+                "QUARANTINED",
+                None,
+                false,
+                Some("HEAD_ROLLBACK_DETECTED"),
+                false,
+            ),
+        ] {
+            let w = world();
+            let lease = match expires {
+                Some(at) => format!("lease_id = 'x', fencing_token = 1, lease_expires_at = {at}"),
+                None => "lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL".into(),
+            };
+            w.db()
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE profile_bindings SET {lease}, sync_state = ?1, dirty = ?2,
+                           last_error_code = ?3"
+                    ),
+                    params![state, dirty, reason],
+                )
+                .unwrap();
+            let s = status(&w);
+            let case = format!("{state} {expires:?}");
+            assert_eq!(s.sync_state, state, "{case}");
+            assert_eq!(s.remote_version, 0, "{case}");
+            assert_eq!(s.dirty, dirty, "{case}");
+            assert_eq!(
+                s.lease_expires_at.as_deref(),
+                expires.map(|e| e.trim_matches('\'')),
+                "{case}"
+            );
+            assert_eq!(s.last_error_code.as_deref(), reason, "{case}");
+            assert_eq!(s.lease_at_risk, at_risk, "{case}");
+            assert!(!s.revert_available && !s.revert_in_progress, "{case}");
+        }
+    }
+
+    #[test]
+    fn statuses_offer_revert_for_any_unresolved_proven_run() {
+        // A run above the pin.
+        let w = world();
+        let (_, d, _) = reverting(&w, DeviceRevocationReason::Retired);
+        assert_eq!(skipped(&w), [(2, None, None, 1)]);
+        let s = status(&w);
+        assert_eq!(
+            (s.sync_state.as_str(), s.last_error_code.as_deref()),
+            ("QUARANTINED", Some("SIGNER_REVOKED"))
+        );
+        assert!(s.revert_available && !s.revert_in_progress, "above the pin");
+
+        // The same run once superseded is no longer offered.
+        w.db()
+            .conn
+            .execute(
+                "UPDATE skipped_heads SET resolution = 'SUPERSEDED', resolved_at_ms = ?1",
+                [NOW as i64],
+            )
+            .unwrap();
+        assert!(!status(&w).revert_available, "superseded");
+        drop((d, w));
+
+        // A run pinned before its signer was proven revoked: rows at the pin.
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        w.pull(&d.path().join("out")).unwrap_err();
+        revoked_at(&w, 2);
+        assert_eq!(skipped(&w), [(2, None, None, 1)]);
+        assert!(status(&w).revert_available, "at the pin");
+        drop((d, w));
+
+        // A reported-only quarantine: no rows, no offer.
+        let w = world();
+        chain_of(&w, &[&w.me.sk, &author(), &w.me.sk]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, true));
+        let d = second(&w);
+        w.pull(&d.path().join("out")).unwrap_err();
+        revoked_at(&w, 0);
+        assert!(skipped(&w).is_empty());
+        assert!(!status(&w).revert_available, "reported only");
+    }
+
+    #[test]
+    fn statuses_flag_a_revert_in_progress() {
+        // Checked out above the pin.
+        let w = world();
+        let (_, d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        let s = status(&w);
+        assert!(s.lease_expires_at.is_some(), "held");
+        assert!(s.revert_in_progress && s.revert_available, "above the pin");
+        drop((d, w));
+
+        // Checked out with its base equal to the pinned `remote_version`.
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        let s = status(&w);
+        assert_eq!(s.remote_version, 2);
+        assert!(s.lease_expires_at.is_some(), "held");
+        assert!(s.revert_in_progress, "base at the pin");
+        drop((d, w));
+
+        // An ordinary held lease is not a revert.
+        let w = world();
+        w.fake().skip.push("upload");
+        w.push().unwrap_err();
+        let s = status(&w);
+        assert!(s.lease_expires_at.is_some(), "held");
+        assert!(!s.revert_in_progress, "ordinary");
+    }
+
+    #[test]
+    fn statuses_report_renewed_after_revocation_alerts() {
+        let w = world();
+        assert!(statuses(NOW).unwrap().alerts.is_empty(), "none");
+        let raise = |key: &str, at: u64| {
+            w.db()
+                .conn
+                .execute(
+                    "INSERT INTO trust_custodian_alerts
+                     SELECT server_instance_id, tenant_id, 'custodian.renewed_after_revocation',
+                       ?1, ?2, ?3 FROM trust_anchors",
+                    params![key, "ab".repeat(32), at as i64],
+                )
+                .unwrap();
+        };
+        raise(&"70".repeat(32), NOW);
+        let alerts = statuses(NOW).unwrap().alerts;
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            (
+                alerts[0].kind.as_str(),
+                alerts[0].signing_key_id.as_str(),
+                alerts[0].raised_at_ms
+            ),
+            (
+                "custodian.renewed_after_revocation",
+                "70".repeat(32).as_str(),
+                NOW as i64
+            )
+        );
+        raise(&"71".repeat(32), NOW + 1);
+        let keys: Vec<_> = statuses(NOW)
+            .unwrap()
+            .alerts
+            .into_iter()
+            .map(|a| a.signing_key_id)
+            .collect();
+        assert_eq!(keys, ["71".repeat(32), "70".repeat(32)], "newest first");
+    }
+
+    #[test]
+    fn statuses_without_a_database_are_empty_and_create_nothing() {
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let s = statuses(NOW);
+        crate::store::set_config_root(None);
+        let s = s.unwrap();
+        assert!(s.profiles.is_empty() && s.alerts.is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
