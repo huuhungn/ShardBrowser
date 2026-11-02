@@ -62,7 +62,8 @@ const fixtureProfiles: Profile[] = [
     tags: [],
   },
 ];
-const profiles = scenario === "profiles-empty" ? [] : fixtureProfiles;
+// A second team device starts with nothing but what it joins.
+const profiles = scenario === "profiles-empty" || scenario === "team-device-b" ? [] : fixtureProfiles;
 
 // Tags behave like the launcher's: names on each profile, colors on the side,
 // kept in sessionStorage so a reload shows what was saved.
@@ -324,6 +325,61 @@ let custodyBootstrap = scenario === "team-first-device-resume"
   ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
   : { started: false, activated: false, recovery_path: "", anchor: "" };
 
+// "team-device-a" and "team-device-b": two devices of one fleet. Each page keeps
+// its own bindings; the server they share is the `e2eTeamServer` binding the
+// two-device journey in tests/e2e exposes, so a pin is the version a device accepted.
+const teamDevice = scenario === "team-device-a" || scenario === "team-device-b" ? scenario.slice(-1) : null;
+type TeamServerHead = {
+  remote_profile_id: string; version: number; label: string | null; quarantine: string | null; revert_available: boolean;
+};
+const teamServer = <T = TeamServerHead>(op: string, args: object) =>
+  (window as unknown as { e2eTeamServer: (op: string, device: string, args: object) => Promise<T> })
+    .e2eTeamServer(op, String(teamDevice), args);
+const teamRemoteOf = new Map<string, string>();
+/** Apply a head the server answered with: a quarantine keeps the pin, anything else is accepted. */
+const teamSettle = (b: TeamProfileStatus, head: TeamServerHead) => {
+  const patch: Partial<TeamProfileStatus> = head.quarantine
+    ? { sync_state: "QUARANTINED", last_error_code: head.quarantine, revert_available: head.revert_available }
+    : {
+      sync_state: "AVAILABLE", remote_version: head.version, dirty: false, lease_expires_at: null,
+      lease_at_risk: false, last_error_code: null, revert_available: false, revert_in_progress: false,
+    };
+  return Object.assign(b, patch);
+};
+async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
+  const args = (payload ?? {}) as { profileId?: string; remoteProfileId?: string; localProfileId?: string };
+  const id = String(args.profileId ?? args.localProfileId ?? "");
+  const head = () => ({ remote_profile_id: teamRemoteOf.get(id), pin: teamBound(payload).remote_version });
+  switch (cmd) {
+    case "team_fleet_profiles":
+      return (await teamServer<TeamServerHead[]>("list", {})).map((h): TeamFleetProfile => ({
+        remote_profile_id: h.remote_profile_id, current_version: h.version, label: h.label,
+        bound_to: [...teamRemoteOf].find(([, r]) => r === h.remote_profile_id)?.[0] ?? null,
+      }));
+    case "profile_sync_publish": {
+      const h = await teamServer("publish", { label: profiles.find((p) => p.id === id)?.name ?? null });
+      teamRemoteOf.set(id, h.remote_profile_id);
+      teamProfiles.profiles.push(teamBinding(id, "CHECKED_OUT", { remote_version: h.version, lease_expires_at: teamLease }));
+      return { profile_id: h.remote_profile_id, fencing_token: 1, lease_expires_at_ms: 4_070_908_800_000 };
+    }
+    case "team_join_profile": {
+      const h = await teamServer("pull", { remote_profile_id: args.remoteProfileId, pin: null });
+      teamRemoteOf.set(id, h.remote_profile_id);
+      teamProfiles.profiles.push(teamSettle(teamBinding(id, "AVAILABLE"), h));
+      return 4096;
+    }
+    case "profile_sync_pull":
+      teamSettle(teamBound(payload), await teamServer("pull", head()));
+      return 4096;
+    case "profile_sync_push":
+    case "profile_sync_revert": {
+      const h = await teamServer(cmd === "profile_sync_push" ? "push" : "revert", head());
+      return teamPushResult(teamSettle(teamBound(payload), h).remote_version);
+    }
+  }
+  return undefined;
+}
+
 mockIPC(async (cmd: string, payload?: InvokeArgs) => {
   if (
     (cmd.startsWith("plugin:") || cmd.startsWith("tauri:"))
@@ -333,6 +389,10 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
   }
   if (teamRefusals.has(cmd)) {
     throw new Error(`[[shardx:${TEAM_REFUSAL[cmd] ?? "sync.remoteAhead"}]]`);
+  }
+  if (teamDevice) {
+    const answer = await teamDeviceCommand(cmd, payload);
+    if (answer !== undefined) return answer;
   }
   switch (cmd) {
     case "host_platform":

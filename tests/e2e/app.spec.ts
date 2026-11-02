@@ -485,6 +485,169 @@ test("a refused action shows the localized error and keeps the row", async ({ pa
   await expect(beta.getByRole("button")).toHaveText(["Publish"]);
 });
 
+type TeamHead = { version: number; label: string | null; holder: string | null; revoked: boolean };
+
+/**
+ * The one team server both devices of the journey talk to, through the
+ * `e2eTeamServer` binding the `team-device-*` mocks call. Each op answers with
+ * the head a device would accept; a head signed by a key later proven revoked
+ * quarantines whoever pulls it until a revert seals a valid one over it.
+ */
+function fakeTeamServer() {
+  const heads = new Map<string, TeamHead>();
+  const head = (id: string) => {
+    const h = heads.get(id);
+    if (!h) throw new Error(`no team profile ${id}`);
+    return h;
+  };
+  const reply = (id: string) => {
+    const h = head(id);
+    return {
+      remote_profile_id: id, version: h.version, label: h.label,
+      quarantine: h.revoked ? "SIGNER_REVOKED" : null, revert_available: h.revoked,
+    };
+  };
+  type Args = { label?: string | null; remote_profile_id?: string; pin?: number | null };
+  const ops: Record<string, (device: string, args: Args) => unknown> = {
+    list: () => [...heads.keys()].map(reply),
+    publish: (device, { label }) => {
+      const id = `d${heads.size + 1}`.repeat(16);
+      heads.set(id, { version: 0, label: label ?? null, holder: device, revoked: false });
+      return reply(id);
+    },
+    pull: (_device, { remote_profile_id }) => reply(String(remote_profile_id)),
+    // Check-in is the checkout inside push: it takes the lease when free and releases it.
+    push: (device, { remote_profile_id, pin }) => {
+      const h = head(String(remote_profile_id));
+      if (h.holder && h.holder !== device) throw new Error(`lease held by device ${h.holder}`);
+      if (h.revoked || pin !== h.version) throw new Error("[[shardx:sync.remoteAhead]]");
+      Object.assign(h, { version: h.version + 1, holder: null });
+      return reply(String(remote_profile_id));
+    },
+    revert: (_device, { remote_profile_id }) => {
+      const h = head(String(remote_profile_id));
+      if (!h.revoked) throw new Error("nothing to revert");
+      Object.assign(h, { version: h.version + 1, revoked: false });
+      return reply(String(remote_profile_id));
+    },
+  };
+  return {
+    heads,
+    call: (op: string, device: string, args: Args) => ops[op](device, args),
+    /** A device whose key is later proven revoked checks in a new head. */
+    revokedCheckIn: (id: string) => Object.assign(head(id), { version: head(id).version + 1, revoked: true }),
+  };
+}
+
+/** What a device's own team database reports for each binding, as `state@pin`. */
+const teamPins = (page: Page) => page.evaluate(async () => {
+  const ipc = (window as unknown as {
+    __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<{ profiles: { sync_state: string; remote_version: number }[] }> };
+  }).__TAURI_INTERNALS__;
+  return (await ipc.invoke("team_profiles_status")).profiles.map((p) => `${p.sync_state}@${p.remote_version}`);
+});
+
+// The two-machine gate (Plan:2388), each step a test.step below:
+//   publish               = S5 publish on A
+//   checkout/restore on B = S3b join + pull on B
+//   use                   = an ordinary launch; the mock launch is not team-aware, so only the real run covers it
+//   check-in on B         = S5 check-in on B (the checkout inside push)
+//   checkout on A         = A pull + check-in
+// The real two-machine run is recorded in docs/team-ui-evidence/two-machine-run.md.
+test("two devices pass one team profile back and forth, then revert a revoked head to available", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  // Two pages and about twenty actions: under the full parallel run it can pass 30s.
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  for (const [page, device] of [[a, "a"], [b, "b"]] as const) {
+    await page.exposeFunction("e2eTeamServer", server.call);
+    await gotoMocked(page, `/?e2e=team-device-${device}`);
+    await page.getByRole("button", { name: "Team", exact: true }).click();
+  }
+  const rowA = a.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const rowB = b.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const click = async (page: Page, row: ReturnType<Page["getByTestId"]>, name: string) => {
+    await teamSignIn(page);
+    await row.getByRole("button", { name, exact: true }).click();
+  };
+
+  await test.step("publish: S5 publish on A", async () => {
+    await expect(rowA).toContainText("Local only");
+    await click(a, rowA, "Publish");
+    await expect(rowA).toContainText("Checked out here");
+    await expect.poll(() => teamPins(a)).toEqual(["CHECKED_OUT@0"]);
+  });
+
+  await test.step("A checks in its first version", async () => {
+    await click(a, rowA, "Check in");
+    await expect(rowA).toContainText("Available");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+  });
+
+  await test.step("checkout/restore on B: S3b join + pull", async () => {
+    await expect(rowB).toHaveCount(0);
+    await teamSignIn(b);
+    await b.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+    const fleet = b.getByTestId("team-fleet-profile").filter({ hasText: "Beta Research" });
+    await expect(fleet).toContainText("Version 1");
+    await teamSignIn(b);
+    await fleet.getByRole("button", { name: "Join" }).click();
+    await expect(rowB).toContainText("Available");
+    await expect(fleet).toContainText("Joined");
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@1"]);
+    await click(b, rowB, "Pull");
+    await expect(b.getByText("Profile pulled from the team.")).toBeVisible();
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@1"]);
+  });
+
+  await test.step("check-in on B: S5 check-in", async () => {
+    await click(b, rowB, "Check in");
+    await expect(b.getByText("Profile checked in.")).toBeVisible();
+    await expect(rowB).toContainText("Available");
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@2"]);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+  });
+
+  await test.step("checkout on A: A pull + check-in", async () => {
+    await click(a, rowA, "Pull");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@2"]);
+    await click(a, rowA, "Check in");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@3"]);
+    await expect(rowA).toContainText("Available");
+  });
+
+  const id = [...server.heads.keys()][0];
+  await test.step("a head signed by a key later proven revoked quarantines both devices", async () => {
+    server.revokedCheckIn(id);
+    for (const [page, row, pin] of [[a, rowA, 3], [b, rowB, 2]] as const) {
+      await click(page, row, "Pull");
+      await expect(row).toContainText("Quarantined");
+      await expect(row).toContainText("signer revoked");
+      await expect(row.getByRole("button")).toHaveText(["Revert", "Pull", "Unbind"]);
+      await expect.poll(() => teamPins(page)).toEqual([`QUARANTINED@${pin}`]);
+    }
+  });
+
+  await test.step("B reverts, A pulls the revert, and both are available", async () => {
+    await click(b, rowB, "Revert");
+    await b.getByRole("dialog").getByRole("button", { name: "Revert" }).click();
+    await expect(b.getByText("Profile reverted to its last valid snapshot.")).toBeVisible();
+    await expect(rowB).toContainText("Available");
+    await click(a, rowA, "Pull");
+    await expect(rowA).toContainText("Available");
+    for (const row of [rowA, rowB]) {
+      await expect(row.getByRole("button")).toHaveText(["Check in", "Pull", "Unbind"]);
+    }
+    // Final pins: both devices on the revert head the server holds.
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@5"]);
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@5"]);
+    expect(server.heads.get(id)).toEqual({ version: 5, label: "Beta Research", holder: null, revoked: false });
+  });
+  await b.context().close();
+});
+
 test("the first device sets up root custody once its passphrases agree", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-first-device");
   await page.getByRole("button", { name: "Team", exact: true }).click();
