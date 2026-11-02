@@ -21,6 +21,7 @@ import { BookmarksPage } from "../pages/bookmarks";
 import { TrashPage } from "../pages/trash";
 import { SettingsPage } from "../pages/settings";
 import { PatchLogPage } from "../pages/patchlog";
+import { TeamPage } from "../pages/team";
 import { useNav } from "../shared/model/navigation";
 
 import { useTeam } from "../entities/team";
@@ -69,6 +70,7 @@ export function App() {
             {section === "bookmarks" && <BookmarksPage />}
             {section === "trash" && <TrashPage />}
             {section === "patchlog" && <PatchLogPage />}
+            {section === "team" && <TeamPage />}
             {section === "settings" && <SettingsPage />}
           </main>
           <ToastHost />

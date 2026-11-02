@@ -14,6 +14,7 @@ import {
   NavAutomationIcon,
   NavBookmarksIcon,
   NavTrashIcon,
+  NavTeamIcon,
   CopyIcon,
   DocsIcon,
   ShardLogo,
@@ -56,6 +57,7 @@ export function Sidebar() {
       items: [
         { id: "trash", label: t("sidebar.trash"), svg: <NavTrashIcon className="size-[18px]" /> },
         { id: "patchlog", label: t("sidebar.patchLog"), svg: <NavPatchLogIcon className="size-[18px]" /> },
+        { id: "team", label: t("sidebar.team"), svg: <NavTeamIcon className="size-[18px]" /> },
         { id: "settings", label: t("sidebar.settings"), svg: <NavSettingsIcon className="size-[18px]" /> },
       ],
     },

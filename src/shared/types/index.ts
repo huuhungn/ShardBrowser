@@ -9,6 +9,7 @@ export type Section =
   | "bookmarks"
   | "trash"
   | "patchlog"
+  | "team"
   | "settings";
 
 export type ToastItem = { id: number; kind: "ok" | "err" | "info"; text: string };
