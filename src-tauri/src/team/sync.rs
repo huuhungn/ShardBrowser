@@ -1634,9 +1634,16 @@ async fn push_inner(
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
-            // A revocation recorded since the seal: no COMMIT on that pin.
+            // A revocation recorded since the seal: no COMMIT on that pin. A
+            // head past the pin may be this COMMIT landed with its reply lost,
+            // so the stored request is replayed (G2-37, G2-38).
             "READY"
-                if revert.is_none() && pin_withdrawn(client, access, &mut db, dev, &b).await? =>
+                if revert.is_none()
+                    && pin_withdrawn(client, access, &mut db, dev, &b).await?
+                    && {
+                        let head = listed(client, access, &mut db, &b).await?;
+                        head.current_version == b.version && head.current_signed_head_hash == b.head
+                    } =>
             {
                 let e = signer_revoked(&db, &b);
                 return Err(fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await);
@@ -11259,6 +11266,45 @@ mod tests {
             );
             revoked_at(&w, 2);
         }
+    }
+
+    /// An ordinary commit that landed, its reply lost, then a revocation of
+    /// the pin's signer: the head is no longer the pin, so the stored request
+    /// is replayed byte for byte and its exact receipt kept (G2-37, G2-38).
+    #[test]
+    fn a_landed_commit_whose_reply_was_lost_replays_after_its_pin_signer_is_revoked() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        let completed =
+            "SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'COMPLETED'";
+        let (sent, done) = (w.sent("POST", "/commit").len(), w.count(completed));
+        w.fake().lose.push("commit");
+        w.push().unwrap_err();
+        assert_eq!(w.fake().version, 3, "committed, the reply lost");
+        w.db().conn.execute(&distrust_author(), []).unwrap();
+        assert_eq!(w.push().unwrap().version, 3);
+        let replays = &w.sent("POST", "/commit")[sent..];
+        assert_eq!(replays.len(), 2);
+        assert_eq!(replays[0], replays[1]);
+        assert_eq!(w.fake().commits, 3);
+        assert_eq!(w.count(completed), done + 1);
+        let request = CommitRequestV2::parse(&replays[0]).unwrap();
+        let kept: i64 = w
+            .db()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM upload_sessions WHERE state = 'COMMITTED'
+                   AND exact_commit_receipt_binding_bytes = ?1",
+                [&w.fake().stored[request.idempotency_key()].2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
+        let (state, reason, _, v, _) = w.state(LOCAL);
+        assert_eq!((state.as_str(), reason, v), ("AVAILABLE", None, 3));
     }
 
     /// Architect non-blocking 4: the launch-time settle reads nothing
