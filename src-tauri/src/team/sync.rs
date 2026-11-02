@@ -1054,6 +1054,10 @@ fn awaits_transition(b: &Bound) -> bool {
 /// How many versions at or below the pinned one the leaf's new head is
 /// looked for; past it the server is not believed (fails closed).
 const LEAF_SEARCH: u64 = 64;
+/// How many heads above the leaf a binding with no pin follows back. Each
+/// one is verified, so this only stops a server that lists an endless chain
+/// from holding the pull forever.
+const LEAF_WALK: u64 = 1 << 20;
 
 /// One verified `E -> E+1` step of a binding: the signed transition and its
 /// inclusion proof, as exact bytes.
@@ -1221,7 +1225,7 @@ async fn accept_transitions(
                         let (mut v, mut next) =
                             (listed.current_version, listed.current_signed_head_hash);
                         loop {
-                            if v == 0 {
+                            if v == 0 || listed.current_version - v >= LEAF_WALK {
                                 break Err(missing());
                             }
                             let m = manifest(client, access, b, v).await?;
@@ -1708,6 +1712,18 @@ async fn push_inner(
         if awaits_transition(&b) {
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             continue;
+        }
+        // Only a transition moves the pin and not `base_version`, which a
+        // restore or a commit sets: a joined binding whose first pull did not
+        // restore the leaf it pinned holds none of that data yet.
+        let behind: bool = db.conn.query_row(
+            "SELECT base_version < remote_version FROM profile_bindings
+             WHERE local_profile_id = ?1",
+            [local],
+            |r| r.get(0),
+        )?;
+        if revert.is_none() && behind {
+            bail!(code("sync.remoteAhead"));
         }
         let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
         if revert.is_none() || !revoked {
@@ -2239,8 +2255,10 @@ pub(crate) async fn labels(
 /// server's, or the one before it when the profile's first snapshot predates
 /// it, so the pull accepts the restore transition whose leaf it then pins
 /// (ADR 0002 rule 6: the leaf exception covers a new device). A refusal
-/// before the insert leaves no binding; a failed pull keeps it at version 0,
-/// and pull can be retried.
+/// before the insert leaves no binding. A failed pull keeps the binding,
+/// possibly quarantined awaiting the transition or pinned at the leaf, and
+/// pull can be retried; until one restores its pin, push refuses it
+/// (`base_version` stays below `remote_version`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn join(
     client: &FleetClient,
@@ -12300,6 +12318,38 @@ mod tests {
             "nothing was asked of the server"
         );
         assert!(!out.exists());
+    }
+
+    /// A join whose first pull did not restore the team's data leaves a
+    /// binding no push may seal from: after a lost transition fetch (the
+    /// push accepts the transition and pins the leaf itself), or after a
+    /// restore that failed once the leaf was pinned. A pull restores it, and
+    /// pushes go on from there.
+    #[test]
+    fn join_then_a_push_before_the_first_pull_restores_is_refused() {
+        for case in ["transition lost", "restore failed"] {
+            let (w, d, h1, _) = joinable_after_restore(0);
+            let good = w.fake().objects[&1].clone();
+            if case == "transition lost" {
+                w.fake().skip.push("1");
+            } else {
+                *w.fake().objects.get_mut(&1).unwrap().last_mut().unwrap() ^= 1;
+            }
+            let out = d.path().join("joined");
+            w.join(LOCAL, PROFILE, &out).unwrap_err();
+            w.fake().objects.insert(1, good);
+            let mine = d.path().join("mine");
+            std::fs::create_dir_all(mine.join("Default")).unwrap();
+            std::fs::write(mine.join("Default").join("noise.bin"), b"never pulled").unwrap();
+            let err = w.push_from(&mine).unwrap_err();
+            assert!(has(&err, "sync.remoteAhead"), "{case}: {err:#}");
+            assert_eq!(w.fake().version, 1, "{case}: nothing committed");
+            assert!(w.sent("POST", "/checkout").is_empty(), "{case}");
+            assert!(w.pull_of(LOCAL, &out).unwrap() > 0, "{case}");
+            assert_eq!(noise(&out), noise(&w.udd), "{case}");
+            available_at(&w, 1, h1);
+            assert_eq!(w.push_from(&out).unwrap().version, 2, "{case}");
+        }
     }
 
     #[test]
