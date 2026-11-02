@@ -8177,7 +8177,9 @@ mod tests {
         w.db()
             .conn
             .execute(
-                "UPDATE profile_bindings SET remote_version = 1, last_observed_head_hash = ?1",
+                // As a pull pins a head: version, data and head together.
+                "UPDATE profile_bindings SET remote_version = 1, base_version = 1,
+                   last_observed_head_hash = ?1",
                 [head.to_vec()],
             )
             .unwrap();
