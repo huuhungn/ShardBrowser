@@ -1189,36 +1189,61 @@ async fn accept_transitions(
             }
             // An unchanged pin keeps its version. Otherwise the leaf's new head is a
             // committed manifest whose exact bytes hash to it, at most `LEAF_SEARCH`
-            // versions at or below the pinned one (a restore only goes back), and
+            // versions at or below the pinned one (a restore only goes back) or,
+            // with no pin, on the chain below the listed head, and
             // accepted as a new head is (rule 6) except for its earlier epoch.
             let version = if head == b.head {
                 b.version
             } else {
-                // With no pin, from the listed head down.
-                let top = match b.head {
-                    Some(_) => b.version.min(listed.current_version),
-                    None => listed.current_version,
-                };
-                let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
-                let mut found = None;
-                for v in (low..=top).rev() {
-                    let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
-                    let m = SignedSnapshotManifestV2::parse(&reply.body)
-                        .map_err(|_| bad("SignedSnapshotManifestV2"))?;
-                    if Some(m.head_hash()) == head {
-                        found = Some((v, m));
-                        break;
+                let missing =
+                    || refusal("RESTORE_EPOCH_TRANSITION_INVALID", "new_signed_head_hash");
+                let found = match b.head {
+                    Some(_) => {
+                        let top = b.version.min(listed.current_version);
+                        let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
+                        let mut found = None;
+                        for v in (low..=top).rev() {
+                            let reply =
+                                ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
+                            let m = SignedSnapshotManifestV2::parse(&reply.body)
+                                .map_err(|_| bad("SignedSnapshotManifestV2"))?;
+                            if Some(m.head_hash()) == head {
+                                found = Some((v, m));
+                                break;
+                            }
+                        }
+                        found.ok_or_else(missing)
                     }
-                }
-                let checked = match found {
-                    Some((v, m)) => {
-                        verify_leaf_head(db, dev, b, chain, &keys, m, (v, epoch), now).map(|()| v)
+                    // No pin (a binding that joined at version 0): back from the
+                    // listed head along the chain to the leaf, each head above it
+                    // verified ([`above_leaf`]), so no bound is needed.
+                    None => {
+                        let (mut v, mut next) =
+                            (listed.current_version, listed.current_signed_head_hash);
+                        loop {
+                            if v == 0 {
+                                break Err(missing());
+                            }
+                            let m = manifest(client, access, b, v).await?;
+                            if Some(m.head_hash()) != next {
+                                break Err(refusal(
+                                    "RESTORE_EPOCH_TRANSITION_INVALID",
+                                    "previous_signed_head_hash",
+                                ));
+                            }
+                            if next == head {
+                                break Ok((v, m));
+                            }
+                            match above_leaf(b, &keys, m, (v, epoch)) {
+                                Ok(previous) => (v, next) = (v - 1, previous),
+                                Err(r) => break Err(r),
+                            }
+                        }
                     }
-                    None => Err(refusal(
-                        "RESTORE_EPOCH_TRANSITION_INVALID",
-                        "new_signed_head_hash",
-                    )),
                 };
+                let checked = found.and_then(|(v, m)| {
+                    verify_leaf_head(db, dev, b, chain, &keys, m, (v, epoch), now).map(|()| v)
+                });
                 match checked {
                     Ok(v) => v,
                     Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
@@ -1356,6 +1381,48 @@ fn verify_leaf_head(
         return Err(invalid("signer_signing_key_id"));
     }
     Ok(())
+}
+
+/// A head above the leaf that a binding with no pin follows back to: its
+/// signature verifies under a key the evidence holds, it names `b`'s tenant,
+/// fleet, profile and instance at `version`, and it was committed at the new
+/// `epoch` (an older one, as the leaf's rolled-back child, is a rollback).
+/// Its previous head. Its signer is judged by the pull's walk over it.
+fn above_leaf(
+    b: &Bound,
+    keys: &std::collections::BTreeMap<[u8; 32], [u8; 32]>,
+    m: SignedSnapshotManifestV2,
+    (version, epoch): (u64, u64),
+) -> std::result::Result<Option<[u8; 32]>, Refused> {
+    let invalid = |field| refusal("RESTORE_EPOCH_TRANSITION_INVALID", field);
+    let pk = keys
+        .get(m.signer_signing_key_id())
+        .ok_or_else(|| invalid("signer_signing_key_id"))?;
+    let p = m
+        .verify_signature(pk)
+        .map_err(|_| invalid("signature_bytes"))?
+        .payload()
+        .clone();
+    let checks = [
+        ("tenant_id", p.tenant_id == b.tenant),
+        ("fleet_id", p.fleet_id == b.fleet),
+        ("profile_id", p.profile_id == b.profile),
+        ("server_instance_id", p.server_instance_id == b.instance),
+        (
+            "target_version",
+            p.target_version == version && p.base_version + 1 == version,
+        ),
+    ];
+    if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
+        return Err(invalid(field));
+    }
+    if p.restore_epoch < epoch {
+        return Err(("HEAD_ROLLBACK_DETECTED", anyhow!(code("sync.headRollback"))));
+    }
+    if p.restore_epoch != epoch {
+        return Err(invalid("restore_epoch"));
+    }
+    Ok(p.previous_signed_head_hash)
 }
 
 /// `b`'s served proof under `t`, once it proves `b`'s own leaf against the
@@ -2185,21 +2252,31 @@ pub(crate) async fn join(
     udd: &Path,
     now: u64,
 ) -> Result<u64> {
-    let db = Db::open()?;
-    if is_bound(&db, local)? {
+    let mut db = Db::open()?;
+    // A local profile with an unfinished publish is bound by finishing it.
+    if is_bound(&db, local)? || pending_publish(&db, local)?.is_some() {
         bail!(code("sync.alreadyPublished"));
     }
     let mut b = unbound(local, dev, fleet, profile);
-    // Checked first, so the UNIQUE constraint is never the error shown.
-    let taken: bool = db.conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM profile_bindings
-           WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3)",
-        params![hex(&b.instance), hex(&b.tenant), hex(&profile)],
-        |r| r.get(0),
-    )?;
-    if taken {
-        bail!(code("sync.remoteAlreadyBound"));
-    }
+    // Checked before the server is asked, and again with the insert, so the
+    // UNIQUE constraint is never the error shown.
+    let taken = |c: &rusqlite::Connection| -> Result<()> {
+        let taken: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM profile_bindings
+               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3)",
+            params![
+                hex(&dev.pin.0.server_instance_id),
+                hex(&dev.pin.0.tenant_id),
+                hex(&profile)
+            ],
+            |r| r.get(0),
+        )?;
+        if taken {
+            bail!(code("sync.remoteAlreadyBound"));
+        }
+        Ok(())
+    };
+    taken(&db.conn)?;
     let generation = ledger::highest_generation(&db, &dev.pin.0, &fleet)?
         .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
     let fkek = verified_key(&db, dev, &fleet, generation, None, now)?;
@@ -2229,25 +2306,32 @@ pub(crate) async fn join(
             start = epoch - 1;
         }
     }
-    db.conn.execute(
-        "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
-           account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
-           accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, 'AVAILABLE', 0)",
-        params![
-            b.local,
-            b.server,
-            hex(&b.instance),
-            hex(&b.tenant),
-            hex(&dev.me.account_id),
-            hex(&dev.me.device_id),
-            hex(&b.fleet),
-            hex(&b.profile),
-            wire(start)?,
-            hex(&fkek_key_id),
-            wire(generation)?
-        ],
-    )?;
+    {
+        let tx = db
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        taken(&tx)?;
+        tx.execute(
+            "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
+               account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+               accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, 'AVAILABLE', 0)",
+            params![
+                b.local,
+                b.server,
+                hex(&b.instance),
+                hex(&b.tenant),
+                hex(&dev.me.account_id),
+                hex(&dev.me.device_id),
+                hex(&b.fleet),
+                hex(&b.profile),
+                wire(start)?,
+                hex(&fkek_key_id),
+                wire(generation)?
+            ],
+        )?;
+        tx.commit()?;
+    }
     drop(db);
     pull(client, access, dev, local, udd, now).await
 }
@@ -4629,6 +4713,9 @@ mod tests {
         published: Vec<[u8; 16]>,
         /// The label publish-create sealed for `PROFILE`, which the list reports.
         label: Option<Vec<u8>>,
+        /// SQL another writer runs on the launcher's database when the next
+        /// fleet listing is served.
+        on_list: Option<String>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -5138,6 +5225,12 @@ mod tests {
                 *n -= 1;
             }
             if let Some(sql) = f.on_patch.take() {
+                let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
+            }
+        }
+        if tag == "profiles" && method == Method::GET {
+            if let Some(sql) = f.on_list.take() {
                 let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
                 assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
             }
@@ -11963,13 +12056,17 @@ mod tests {
         );
     }
 
-    /// ADR 0002 rule 6: a device that joins after a restore, before any
-    /// commit at the new epoch, pins the transition's leaf at its older epoch.
-    #[test]
-    fn join_after_a_restore_pins_the_transition_leaf_then_pulls() {
+    /// `PROFILE` pushed at v1 and v2 here, restored to v1 (epoch 1) with
+    /// its transition filed; `old` is v2's manifest. Then `post` commits at
+    /// epoch 1 from here, and a second device is the root. The leaf's head.
+    fn joinable_after_restore(post: u64) -> (World, tempfile::TempDir, [u8; 32], Vec<u8>) {
         let w = world_unbound();
         w.publish().unwrap();
-        let (h1, h2) = restored(&w);
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        let old = w.fake().manifests[&2].clone();
+        w.fake().restore(1);
         let leaves = [
             leaf(PROFILE, h2, h1),
             leaf([0xc4; 16], [7; 32], [8; 32]),
@@ -11977,7 +12074,23 @@ mod tests {
         ];
         let t = transition(&w.me, 0, &leaves);
         w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        if post > 0 {
+            w.pull(&w.udd.with_file_name("accepted")).unwrap();
+            for _ in 0..post {
+                w.fake().log.clear();
+                w.push().unwrap();
+            }
+        }
+        w.fake().log.clear();
         let d = second(&w);
+        (w, d, h1, old)
+    }
+
+    /// ADR 0002 rule 6: a device that joins after a restore, before any
+    /// commit at the new epoch, pins the transition's leaf at its older epoch.
+    #[test]
+    fn join_after_a_restore_pins_the_transition_leaf_then_pulls() {
+        let (w, d, h1, _) = joinable_after_restore(0);
         let out = d.path().join("joined");
         assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
         assert_eq!(noise(&out), noise(&w.udd));
@@ -11986,6 +12099,171 @@ mod tests {
             ("AVAILABLE".into(), None, 1, 1, Some(h1.to_vec()))
         );
         assert_eq!(w.filed(), 2, "the transition and this profile's proof");
+    }
+
+    /// A joining device has no pin to search below: it follows the chain
+    /// back from the listed head to the leaf, however many commits followed
+    /// the restore, then pulls to the head.
+    #[test]
+    fn join_after_more_post_restore_commits_than_the_leaf_search_pins_the_leaf() {
+        let post = LEAF_SEARCH + 1;
+        let (w, d, _, _) = joinable_after_restore(post);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0, "joined");
+        assert_eq!(noise(&out), noise(&w.udd));
+        let head = w.head_of(1 + post);
+        available_at(&w, (1 + post) as i64, head);
+        assert_eq!(w.state(LOCAL).2, 1, "the new epoch");
+    }
+
+    /// The rolled-back child of the leaf (ADR 0002 rule 6, "Head epoch"):
+    /// v2 at the old epoch, chained onto the leaf, listed as the head.
+    #[test]
+    fn join_refuses_the_rolled_back_child_of_the_leaf() {
+        let (w, d, _, old) = joinable_after_restore(0);
+        let m_old = SignedSnapshotManifestV2::parse(&old).unwrap().head_hash();
+        {
+            let mut f = w.fake();
+            f.manifests.insert(2, old);
+            f.listed = Some((2, Some(m_old)));
+        }
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.headRollback"), "{err:#}");
+        assert_eq!(
+            w.state(LOCAL),
+            (
+                "QUARANTINED".into(),
+                Some("HEAD_ROLLBACK_DETECTED".into()),
+                0,
+                0,
+                None
+            )
+        );
+        assert!(!out.exists());
+    }
+
+    /// A profile first committed after the restore starts at the server's
+    /// epoch: no transition is asked for.
+    #[test]
+    fn join_of_a_profile_created_after_a_restore_starts_at_that_epoch() {
+        let w = world_unbound();
+        w.fake().epoch = 1;
+        w.publish().unwrap();
+        w.push().unwrap();
+        let d = second(&w);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        let head = w.head_of(1);
+        assert_eq!(
+            w.state(LOCAL),
+            ("AVAILABLE".into(), None, 1, 1, Some(head.to_vec()))
+        );
+        assert_eq!(w.filed(), 0);
+        assert!(!w
+            .fake()
+            .log
+            .iter()
+            .any(|(m, _)| m.contains("restore-epoch-transitions")));
+    }
+
+    /// v1 served with another `restore_epoch`, re-signed by a key the
+    /// evidence does not hold: the server cannot sign such a lie.
+    fn lying_first(w: &World, epoch: u64) {
+        let mut f = w.fake();
+        let m = SignedSnapshotManifestV2::parse(&f.manifests[&1]).unwrap();
+        let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        p.restore_epoch = epoch;
+        p.signer_signing_key_id = key_id_of(&author());
+        let lie = SignedSnapshotManifestV2::sign(&author(), &p).unwrap();
+        f.manifests.insert(1, lie.exact_bytes().to_vec());
+    }
+
+    /// The start epoch is read from v1 unverified; a lie either way ends in
+    /// a refusal or a quarantine, with nothing pinned or restored.
+    #[test]
+    fn join_with_a_lying_first_snapshot_pins_nothing() {
+        // Older than it is: the transition it asks for does not exist.
+        let w = world_unbound();
+        w.fake().epoch = 1;
+        w.publish().unwrap();
+        w.push().unwrap();
+        lying_first(&w, 0);
+        let d = second(&w);
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionMissing"), "{err:#}");
+        assert_eq!(
+            w.state(LOCAL),
+            (
+                "QUARANTINED".into(),
+                Some(TRANSITION_REQUIRED.into()),
+                0,
+                0,
+                None
+            )
+        );
+        assert!(!out.exists());
+        drop((d, w));
+
+        // Newer than it is: the pull refuses v1 itself.
+        let (w, d, _, _) = joinable_after_restore(0);
+        lying_first(&w, 1);
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
+        let (_, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!((epoch, version, head), (1, 0, None));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn join_refuses_a_local_profile_with_an_unfinished_publish() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'"),
+            1
+        );
+        let before = w.fake().log.len();
+        let err = w
+            .join(LOCAL, PROFILE, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(w.fake().log.len(), before);
+    }
+
+    /// Another join binds the same remote profile while this one waits on
+    /// the server: the answer is still the localized one.
+    #[test]
+    fn join_refuses_a_remote_profile_bound_here_meanwhile() {
+        let (w, d) = joinable();
+        w.fake().on_list = Some(format!(
+            "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+               tenant_id, account_id, device_id, fleet_id, remote_profile_id, remote_version,
+               base_version, accepted_restore_epoch, fkek_key_id, key_generation, sync_state,
+               dirty)
+             SELECT 'racer', k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+               k.device_id, k.fleet_id, '{}', 0, 0, 0, k.fkek_key_id, k.generation,
+               'AVAILABLE', 0
+             FROM fleet_key_state k
+             JOIN device_state d USING (server_id, tenant_id, device_id)
+             WHERE k.state = 'ACTIVE'",
+            hex(&PROFILE)
+        ));
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(w.fake().on_list.is_none(), "it ran");
+        assert!(has(&err, "sync.remoteAlreadyBound"), "{err:#}");
+        assert!(!format!("{err:#}").contains("UNIQUE"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE local_profile_id = 'racer'"),
+            1
+        );
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        assert!(!out.exists());
     }
 
     #[test]
