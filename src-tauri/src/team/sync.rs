@@ -1713,18 +1713,6 @@ async fn push_inner(
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             continue;
         }
-        // Only a transition moves the pin and not `base_version`, which a
-        // restore or a commit sets: a joined binding whose first pull did not
-        // restore the leaf it pinned holds none of that data yet.
-        let behind: bool = db.conn.query_row(
-            "SELECT base_version < remote_version FROM profile_bindings
-             WHERE local_profile_id = ?1",
-            [local],
-            |r| r.get(0),
-        )?;
-        if revert.is_none() && behind {
-            bail!(code("sync.remoteAhead"));
-        }
         let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
         if revert.is_none() || !revoked {
             refuse_quarantined(&b)?;
@@ -1764,8 +1752,19 @@ async fn push_inner(
                  WHERE local_profile_id = ?1 AND last_error_code = ?2",
                 params![local, COMPROMISED],
             )?;
+            // Only a transition moves the pin and not `base_version`, which a
+            // restore or a commit sets: a joined binding whose first pull did
+            // not restore the leaf it pinned holds none of that data yet. A
+            // revert seals from its staging, not from `udd`.
+            let behind: bool = revert.is_none()
+                && db.conn.query_row(
+                    "SELECT base_version < remote_version FROM profile_bindings
+                     WHERE local_profile_id = ?1",
+                    [local],
+                    |r| r.get(0),
+                )?;
             // A listing that shows a restore quarantines; the loop accepts it.
-            if let Err(e) = checkout(client, access, &mut db, &b, now).await {
+            if let Err(e) = checkout(client, access, &mut db, &b, behind, now).await {
                 if !awaits_transition(&bound(&db, local)?) {
                     return Err(e);
                 }
@@ -2715,11 +2714,14 @@ pub(crate) fn cancel_publish(local: &str) -> Result<()> {
 }
 
 /// `PROFILE_CHECKOUT` at the pinned head, or the replay of a stored one.
+/// `behind`: the local data never received the pinned head, so nothing is
+/// checked out until a pull restores it (a replayed lease is released).
 async fn checkout(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
     b: &Bound,
+    behind: bool,
     now: u64,
 ) -> Result<()> {
     let replay = find(db, &b.local, "CHECKOUT", None, Some("PENDING"))?;
@@ -2732,7 +2734,7 @@ async fn checkout(
         }
         None => {
             let head = listed(client, access, db, b).await?;
-            if head.current_version > b.version {
+            if behind || head.current_version > b.version {
                 bail!(code("sync.remoteAhead"));
             }
             let payload = ProfileCheckoutV2 {
@@ -2775,10 +2777,11 @@ async fn checkout(
     // A replayed checkout from before the binding moved on holds a lease on an
     // old head or epoch, and one replayed after its stored expiry a lease that
     // ended (probe 11, L2046): it is released as stored, and the next one
-    // starts afresh under a new key.
+    // starts afresh under a new key. So is one over data that is `behind`.
     if (g.lease.base_version, g.current_signed_head_hash) != (b.version, b.head)
         || op.epoch != b.epoch
         || (replayed && g.expires_at_ms <= now)
+        || behind
     {
         let release = {
             let tx = db.conn.transaction()?;
@@ -8161,38 +8164,58 @@ mod tests {
     }
 
     /// A checkout replayed after the binding moved on to a newer head holds a
-    /// lease on the old one: it is released as stored, the checkout is
-    /// failed, and the push takes a fresh lease at the new head.
+    /// lease on the old one: it is released as stored and the checkout is
+    /// failed. Moved by a restore transition (`base_version` stays 0: the
+    /// data never followed), the push then stops for a pull; moved by a
+    /// pull (data and head together), it takes a fresh lease at the new head.
     #[test]
     fn a_replayed_checkout_on_an_old_head_is_released_and_taken_again() {
-        let w = world();
-        w.fake().lose.push("checkout");
-        w.push().unwrap_err();
-        let head = [9u8; 32];
-        {
-            let mut f = w.fake();
-            f.version = 1;
-            f.head = Some(head);
+        for base in [0, 1] {
+            let w = world();
+            w.fake().lose.push("checkout");
+            w.push().unwrap_err();
+            let head = [9u8; 32];
+            {
+                let mut f = w.fake();
+                f.version = 1;
+                f.head = Some(head);
+            }
+            w.db()
+                .conn
+                .execute(
+                    "UPDATE profile_bindings SET remote_version = 1, base_version = ?2,
+                       last_observed_head_hash = ?1",
+                    params![head.to_vec(), base],
+                )
+                .unwrap();
+            let checkouts = if base == 0 {
+                let err = w.push().unwrap_err();
+                assert!(has(&err, "sync.remoteAhead"), "{err:#}");
+                assert_eq!(
+                    w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+                    1
+                );
+                2
+            } else {
+                assert_eq!(w.push().unwrap().version, 2);
+                3
+            };
+            let sent = w.sent("POST", "/checkout");
+            assert_eq!(sent.len(), checkouts, "base {base}");
+            assert_eq!(sent[0], sent[1]);
+            assert!(sent.get(2).is_none_or(|c| c != &sent[1]));
+            assert_eq!(w.sent("POST", "/release").len(), 1, "base {base}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"
+                ),
+                1
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE state = 'PENDING'"),
+                0
+            );
         }
-        w.db()
-            .conn
-            .execute(
-                // As a pull pins a head: version, data and head together.
-                "UPDATE profile_bindings SET remote_version = 1, base_version = 1,
-                   last_observed_head_hash = ?1",
-                [head.to_vec()],
-            )
-            .unwrap();
-        assert_eq!(w.push().unwrap().version, 2);
-        let checkouts = w.sent("POST", "/checkout");
-        assert_eq!(checkouts.len(), 3);
-        assert_eq!(checkouts[0], checkouts[1]);
-        assert_ne!(checkouts[1], checkouts[2]);
-        assert_eq!(w.sent("POST", "/release").len(), 1);
-        assert_eq!(
-            w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
-            1
-        );
     }
 
     /// A pull never writes over a profile whose push is in flight: one with
@@ -12352,6 +12375,70 @@ mod tests {
             available_at(&w, 1, h1);
             assert_eq!(w.push_from(&out).unwrap().version, 2, "{case}");
         }
+    }
+
+    /// Joined while the profile was at version 0, a push whose checkout was
+    /// lost, then commits elsewhere and a restore: the replay pins the leaf
+    /// and its lease is released, the push stops for a pull, and the pull
+    /// and every later push go through. Nothing is left pending.
+    #[test]
+    fn join_then_a_lost_checkout_and_a_restore_still_pulls_and_pushes() {
+        let w = world_unbound();
+        w.publish().unwrap();
+        let d = second(&w);
+        let out = d.path().join("joined");
+        w.join(LOCAL, PROFILE, &out).unwrap_err();
+        let mine = d.path().join("mine");
+        std::fs::create_dir_all(mine.join("Default")).unwrap();
+        std::fs::write(mine.join("Default").join("noise.bin"), b"never pulled").unwrap();
+        w.fake().skip.push("checkout");
+        w.push_from(&mine).unwrap_err();
+        let pending = "SELECT count(*) FROM operations WHERE state = 'PENDING'";
+        assert_eq!(w.count(pending), 1, "the stored checkout");
+        // The first device commits v1 and v2; the owner restores v1.
+        crate::store::set_config_root(Some(w._dir.path().to_path_buf()));
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        w.fake().restore(1);
+        let leaves = [
+            leaf(PROFILE, h2, h1),
+            leaf([0xc4; 16], [7; 32], [8; 32]),
+            leaf([0xc5; 16], [9; 32], [10; 32]),
+        ];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        crate::store::set_config_root(Some(d.path().to_path_buf()));
+
+        // The stored checkout, never processed, meets the new epoch: the
+        // server refuses it for good, so it closes with no lease granted.
+        let err = w.push_from(&mine).unwrap_err();
+        assert!(has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(w.count(pending), 0);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
+            1
+        );
+        let (state, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), epoch, version, head),
+            ("AVAILABLE", 1, 1, Some(h1.to_vec())),
+            "the leaf pinned, its data not pulled"
+        );
+        let err = w.push_from(&mine).unwrap_err();
+        assert!(has(&err, "sync.remoteAhead"), "{err:#}");
+        assert_eq!(w.fake().version, 1, "nothing committed");
+        assert!(w.fake().lease.is_none());
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
+        );
+        assert_eq!(w.count(pending), 0);
+        assert!(w.pull_of(LOCAL, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        available_at(&w, 1, h1);
+        assert_eq!(w.count(pending), 0);
+        assert_eq!(w.push_from(&out).unwrap().version, 2);
     }
 
     #[test]
