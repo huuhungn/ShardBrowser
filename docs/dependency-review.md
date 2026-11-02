@@ -78,16 +78,18 @@ They clear when the upstream crates move, so they are tracked, not pinned.
 
 ## Licenses
 
-From `cargo metadata --locked`, counting only crates in the resolved graph:
+From `cargo metadata --locked`, counting the third-party crates (those with a
+registry or git source) in the resolved graph, as of 2026-11-02:
 
 | Lockfile | Packages | Result |
 | --- | --- | --- |
-| shared | 118 | All permissive (MIT, Apache-2.0, BSD, Zlib, Unicode-3.0, 0BSD, CC0). |
-| server | 335 | All permissive; also `Unlicense OR MIT`. |
-| src-tauri | 687 | Permissive, except five `MPL-2.0` crates: the Servo CSS crates `dom_query` pulls into `tauri-utils` and `wry` (`cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`) and `option-ext` (via `dirs`). MPL-2.0 is file-level copyleft; we ship them unmodified, so it asks only that their source stays available, which crates.io provides. |
+| shared | 119 | All permissive (MIT, Apache-2.0, BSD, Zlib, Unicode-3.0, 0BSD, CC0). |
+| server | 336 | All permissive; also `Unlicense OR MIT`. |
+| src-tauri | 688 | Permissive, except five `MPL-2.0` crates: the Servo CSS crates `dom_query` pulls into `tauri-utils` and `wry` (`cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`) and `option-ext` (via `dirs`). MPL-2.0 is file-level copyleft; we ship them unmodified, so it asks only that their source stays available, which crates.io provides. |
 
 No crate is GPL or LGPL only (`r-efi` offers LGPL-2.1 as a third choice next
-to MIT and Apache-2.0), and every crate declares a license.
+to MIT and Apache-2.0), and every third-party crate declares a license; only
+the local ShardBrowser crates have no Cargo `license` field.
 
 ## MSRV
 
