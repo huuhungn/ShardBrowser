@@ -1300,7 +1300,7 @@ const MIGRATE_V9: &str = r#"
 -- again after its row was superseded (a re-bind, a restore), so only one
 -- open row per head is unique.
 CREATE TABLE skipped_heads (
-  id                    INTEGER PRIMARY KEY,
+  id                    INTEGER PRIMARY KEY CHECK (id > 0),
   server_instance_id    TEXT NOT NULL CHECK (length(server_instance_id) = 32 AND server_instance_id NOT GLOB '*[^0-9a-f]*'),
   tenant_id             TEXT NOT NULL CHECK (length(tenant_id) = 32 AND tenant_id NOT GLOB '*[^0-9a-f]*'),
   remote_profile_id     TEXT NOT NULL CHECK (length(remote_profile_id) = 32 AND remote_profile_id NOT GLOB '*[^0-9a-f]*'),
@@ -2228,6 +2228,15 @@ mod tests {
             )
             .replacen("VALUES (", "VALUES (1, ", 1);
         refused(&db.conn, &by_id, once);
+        refused(
+            &db.conn,
+            &by_id.replacen("VALUES (1, ", "VALUES (0, ", 1).replacen(
+                "'local', 2,",
+                "'local', 3,",
+                1,
+            ),
+            "CHECK constraint failed",
+        );
         refused(
             &db.conn,
             "UPDATE skipped_heads SET id = 9 WHERE id = 2",

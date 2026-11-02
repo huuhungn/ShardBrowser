@@ -4939,7 +4939,8 @@ mod custody_tests {
     }
 
     /// Local distrust alone raises nothing; a key both distrusted and
-    /// revoked by a counted `DeviceRevocationV2` does.
+    /// revoked by a counted `DeviceRevocationV2` does, only for a renewal
+    /// first seen after that revocation counted.
     #[test]
     fn renewed_after_revocation_is_not_raised_for_a_distrusted_key() {
         let me = me();
@@ -4950,10 +4951,16 @@ mod custody_tests {
             team::ledger::distrust_key(&db, &BINDING, &d_id(), T0 + DAY).unwrap();
         }
         let first = d_root(&d_key(), 0x93, T0 + 10 * DAY, LONG);
-        collect(&path, &omitting(&me, vec![first]), &[], 1);
+        collect(&path, &omitting(&me, vec![first.clone()]), &[], 1);
         assert!(alerts(&path).is_empty(), "distrusted only");
-        collect(&path, &omitting(&me, vec![revoke_d(&me, |_| {})]), &[], 1);
+        collect(
+            &path,
+            &omitting(&me, vec![first, revoke_d(&me, |_| {})]),
+            &[],
+            1,
+        );
         assert_eq!(proven(&path).len(), 2, "distrusted and revoked");
+        assert!(alerts(&path).is_empty(), "served before the count");
         let second = d_root(&d_key(), 0x94, T0 + 11 * DAY, LONG);
         collect(&path, &omitting(&me, vec![second.clone()]), &[], 1);
         assert_eq!(

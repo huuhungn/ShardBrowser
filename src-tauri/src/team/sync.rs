@@ -292,6 +292,17 @@ fn signer_revoked(db: &Db, b: &Bound) -> anyhow::Error {
     quarantine(db, &b.local, "SIGNER_REVOKED", err)
 }
 
+/// `err` for a head [`walk`] refuses; once the walk met a proven-revoked
+/// head, [`signer_revoked`] instead, as that head alone did before the revert
+/// rule. No audit row either way.
+fn refused_in_walk(db: &Db, b: &Bound, w: &Walked, err: anyhow::Error) -> anyhow::Error {
+    if w.open.is_empty() && w.accepted.is_empty() {
+        err
+    } else {
+        signer_revoked(db, b)
+    }
+}
+
 fn refuse_quarantined(b: &Bound) -> Result<()> {
     if b.state == "QUARANTINED" {
         bail!(code_with(
@@ -1415,9 +1426,10 @@ fn verified_key(
 }
 
 /// [`verified_key`] without "Fleet generation freshness", only to read rule
-/// 6's anchor `P`, which may be of a generation a rotation since replaced.
-/// Its grant still reverifies now (Q-26 drops a withdrawn issuer's). Never
-/// for sealing, nor for a head newly accepted past the pin.
+/// 6's anchor `P`, which may be of a generation a rotation since replaced,
+/// and may lie past the pin (owner decision B). Its grant still reverifies
+/// now (Q-26 drops a withdrawn issuer's). `P` skips the freshness check only
+/// when a `J` follows it; never for sealing, nor for any other head.
 fn readable_key(
     db: &Db,
     dev: &Device,
@@ -3255,6 +3267,9 @@ async fn walk(
                 w.read.push((u, m.head_hash()));
                 let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
                     .map_err(|_| bad("manifest"))?;
+                if p.target_version != u {
+                    return Err(bad("target_version"));
+                }
                 let signer = *m.signer_signing_key_id();
                 let mut link = Link {
                     version: u,
@@ -3279,10 +3294,12 @@ async fn walk(
             }
             continue;
         }
-        let pk = keys.get(&signer).ok_or_else(untrusted)?;
+        let pk = keys
+            .get(&signer)
+            .ok_or_else(|| refused_in_walk(db, b, &w, untrusted()))?;
         let p = m
             .verify_signature(pk)
-            .map_err(|_| untrusted())?
+            .map_err(|_| refused_in_walk(db, b, &w, untrusted()))?
             .payload()
             .clone();
         let checks = [
@@ -3300,7 +3317,7 @@ async fn walk(
             ),
         ];
         if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
-            return Err(bad(field));
+            return Err(refused_in_walk(db, b, &w, bad(field)));
         }
         if p.restore_epoch != b.epoch {
             let (reason, key) = if p.restore_epoch < b.epoch {
@@ -3346,13 +3363,17 @@ async fn walk(
                 w.anchor = Some((link, Some(p)));
             }
             Rule::Refuse(Refusal::Revoked) => return Err(signer_revoked(db, b)),
-            Rule::Refuse(Refusal::Untrusted) => return Err(untrusted()),
-            Rule::Refuse(Refusal::Gap) => return Err(bad("previous_signed_head_hash")),
+            Rule::Refuse(Refusal::Untrusted) => {
+                return Err(refused_in_walk(db, b, &w, untrusted()))
+            }
+            Rule::Refuse(Refusal::Gap) => {
+                return Err(refused_in_walk(db, b, &w, bad("previous_signed_head_hash")))
+            }
         }
         prev = Some(hash);
     }
     if prev != head.current_signed_head_hash {
-        return Err(bad("current_signed_head_hash"));
+        return Err(refused_in_walk(db, b, &w, bad("current_signed_head_hash")));
     }
     Ok(w)
 }
@@ -3367,7 +3388,7 @@ fn skip(tx: &rusqlite::Connection, b: &Bound, run: &Run, now: u64) -> Result<()>
     };
     let by = run.by.map(|h| h.to_vec());
     for j in &run.heads {
-        tx.execute(
+        let resolved = tx.execute(
             "UPDATE skipped_heads SET resolution = 'ACCEPTED', accepted_head_hash = ?6,
                resolved_at_ms = ?7
              WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
@@ -3383,7 +3404,11 @@ fn skip(tx: &rusqlite::Connection, b: &Bound, run: &Run, now: u64) -> Result<()>
                 wire(now)?
             ],
         )?;
-        // Not ON CONFLICT: the insert-once trigger refuses an existing key.
+        if resolved == 1 {
+            continue;
+        }
+        // Not ON CONFLICT: the insert-once trigger refuses an open head. A
+        // head whose earlier row was resolved opens a new one.
         tx.execute(
             "INSERT INTO skipped_heads(server_instance_id, tenant_id, remote_profile_id,
                local_profile_id, target_version, head_hash, signer_signing_key_id,
@@ -3394,7 +3419,7 @@ fn skip(tx: &rusqlite::Connection, b: &Bound, run: &Run, now: u64) -> Result<()>
                CASE WHEN ?10 IS NULL THEN NULL ELSE ?11 END
              WHERE NOT EXISTS (SELECT 1 FROM skipped_heads
                WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
-                 AND target_version = ?5 AND head_hash = ?6)",
+                 AND target_version = ?5 AND head_hash = ?6 AND resolution IS NULL)",
             params![
                 instance,
                 tenant,
@@ -3452,7 +3477,8 @@ fn supersede(
 /// Pins `p` (head `hash`) over the version `b` pinned, with the runs
 /// `accepted` filed as skipped and stale open rows superseded, in one
 /// transaction. `lift` ends a `SIGNER_REVOKED` quarantine: a run was
-/// accepted and the walk ended on an accepted head.
+/// accepted and the walk ended on an accepted head. A binding no longer at
+/// `b`'s version refuses with `sync.bindingChanged`.
 #[allow(clippy::too_many_arguments)]
 fn pin(
     db: &mut Db,
@@ -3485,12 +3511,13 @@ fn pin(
             lift
         ],
     )?;
-    if moved == 1 {
-        for run in accepted {
-            skip(&tx, b, run, now)?;
-        }
-        supersede(&tx, b, Some(read), now)?;
+    if moved == 0 {
+        bail!(code("sync.bindingChanged"));
     }
+    for run in accepted {
+        skip(&tx, b, run, now)?;
+    }
+    supersede(&tx, b, Some(read), now)?;
     tx.commit()?;
     Ok(())
 }
@@ -3655,6 +3682,16 @@ pub(crate) async fn pull(
                 pin(&mut db, &b, at.hash, p, &w.accepted, &w.read, false, now)?;
             }
         }
+        bail!(code("sync.signerRevoked"));
+    }
+    if b.error.as_deref() == Some("SIGNER_REVOKED") && w.accepted.is_empty() {
+        // Only an accepted `R` lifts the quarantine (ADR 0002 rule 6: a
+        // reported-only revocation has no acceptance path); nothing moves.
+        let tx = db
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        supersede(&tx, &b, Some(&w.read), now)?;
+        tx.commit()?;
         bail!(code("sync.signerRevoked"));
     }
     let Some((at, Some(p))) = w.anchor else {
@@ -9572,45 +9609,133 @@ mod tests {
         let d = second(&w);
         pin_at(&w, &d, &heads, 1);
         let err = w.pull(&d.path().join("out")).unwrap_err();
-        assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
-        available_at(&w, 1, heads[0]);
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 1);
         assert!(skipped(&w).is_empty());
     }
 
-    /// A refusal inside a run writes no audit row: a lapsed head after a
-    /// proven one leaves the binding as it was, a reported-only one
-    /// quarantines it exactly as before.
+    /// A refusal inside a run writes no audit row and quarantines as the
+    /// proven-revoked head alone did before: a lapsed, reported-only or
+    /// unchained head after it leaves `SIGNER_REVOKED`. A lapsed head with
+    /// no run below it still refuses as untrusted, the binding unchanged.
     #[test]
     fn a_failure_inside_a_run_writes_no_unresolved_rows() {
-        for reported in [false, true] {
+        for case in ["lapsed", "reported", "gap", "lapsed alone"] {
             let w = world();
             let mut p = author_pages(&w, T0 + 300 * DAY, true, false);
-            let ends = if reported {
+            let ends = if case == "reported" {
                 T0 + 300 * DAY
             } else {
                 T0 + DAY / 2
             };
             let x = committer(&w, &mut p, 0x20, ends);
-            if reported {
+            if case == "reported" {
                 p[0].device_revocations.push(RevokedDevice {
                     device_id: [0x21; 16],
                     revoked_at_ms: T0 + DAY / 2,
                 });
             }
-            let heads = chain_of(&w, &[&w.me.sk, &author(), &x]);
+            let middle = if case == "lapsed alone" {
+                w.me.sk.clone()
+            } else {
+                author()
+            };
+            let last = if case == "gap" { w.me.sk.clone() } else { x };
+            let heads = chain_of(&w, &[&w.me.sk, &middle, &last]);
+            if case == "gap" {
+                let mut f = w.fake();
+                let m = SignedSnapshotManifestV2::parse(&f.manifests[&3]).unwrap();
+                let mut q =
+                    SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+                q.previous_signed_head_hash = Some([0x55; 32]);
+                let signed = SignedSnapshotManifestV2::sign(&w.me.sk, &q).unwrap();
+                f.manifests.insert(3, signed.exact_bytes().to_vec());
+                f.head = Some(signed.head_hash());
+            }
             serve(&w, &p);
             let d = second(&w);
             pin_at(&w, &d, &heads, 1);
             let err = w.pull(&d.path().join("out")).unwrap_err();
-            if reported {
-                assert!(has(&err, "sync.signerRevoked"), "{err:#}");
-                revoked_at(&w, 1);
-            } else {
+            if case == "lapsed alone" {
                 assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
                 available_at(&w, 1, heads[0]);
+            } else {
+                assert!(has(&err, "sync.signerRevoked"), "{case}: {err:#}");
+                revoked_at(&w, 1);
             }
-            assert!(skipped(&w).is_empty(), "{reported}");
+            assert!(skipped(&w).is_empty(), "{case}");
         }
+    }
+
+    /// Architect blocking 1: a head met again after its row was superseded
+    /// (an unbind, then the same remote profile bound again) opens a new
+    /// row, which the `R` that follows accepts.
+    #[test]
+    fn a_head_met_again_after_an_unbind_reopens_its_row() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &w.me.sk]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let d = second(&w);
+        w.fake().listed = Some((2, Some(heads[1])));
+        let err = w.pull(&d.path().join("out")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        w.bind(LOCAL, PROFILE, 1, heads[0]);
+        let err = w.pull(&d.path().join("again")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 1);
+        let rows = || -> Vec<(i64, Option<String>, Option<Vec<u8>>)> {
+            let db = w.db();
+            let mut s = db
+                .conn
+                .prepare(
+                    "SELECT target_version, resolution, accepted_head_hash
+                     FROM skipped_heads ORDER BY id",
+                )
+                .unwrap();
+            let rows = s
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        let superseded = (2, Some("SUPERSEDED".to_string()), None);
+        assert_eq!(rows(), [superseded.clone(), (2, None, None)]);
+        w.fake().listed = None;
+        w.pull(&d.path().join("last")).unwrap();
+        available_at(&w, 3, heads[2]);
+        assert_eq!(
+            rows(),
+            [
+                superseded,
+                (2, Some("ACCEPTED".to_string()), Some(heads[2].to_vec()))
+            ]
+        );
+    }
+
+    /// Architect blocking 2: a reported-only quarantine of the pinned head
+    /// stays once the server hides its signer's approval, so the report no
+    /// longer applies: no acceptance path, the pin never advances.
+    #[test]
+    fn a_reported_only_quarantine_stays_once_the_approval_is_hidden() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &w.me.sk]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 2);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, true));
+        let err = w.pull(&d.path().join("out")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 2);
+        serve(&w, &pages(&w.me, &w.grant, &Ev::default()));
+        let out = d.path().join("again");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 2);
+        assert_eq!(w.state(LOCAL).4, Some(heads[1].to_vec()));
+        assert!(!out.exists());
+        assert!(skipped(&w).is_empty());
     }
 
     /// The run must chain onto `P`: a manifest below a withdrawn pin that
@@ -9942,12 +10067,12 @@ mod tests {
         // Another head served at the row's version.
         {
             let w = world();
-            chain_of(&w, &[&w.me.sk, &author()]);
+            let pinned = chain_of(&w, &[&w.me.sk, &author()])[0];
             serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
             let d = second(&w);
             w.pull(&d.path().join("out")).unwrap_err();
             assert_eq!(superseded(&w), [None]);
-            let heads = {
+            {
                 let mut f = w.fake();
                 let m = SignedSnapshotManifestV2::parse(&f.manifests[&2]).unwrap();
                 let mut p =
@@ -9956,11 +10081,15 @@ mod tests {
                 let signed = SignedSnapshotManifestV2::sign(&w.me.sk, &p).unwrap();
                 f.manifests.insert(2, signed.exact_bytes().to_vec());
                 f.head = Some(signed.head_hash());
-                signed.head_hash()
-            };
-            w.pull(&d.path().join("again")).unwrap();
+            }
+            // No `R` was accepted: the quarantine and the pin stay.
+            let again = d.path().join("again");
+            let err = w.pull(&again).unwrap_err();
+            assert!(has(&err, "sync.signerRevoked"), "{err:#}");
             assert_eq!(superseded(&w), [Some(NOW as i64)]);
-            assert_eq!(w.state(LOCAL).4, Some(heads.to_vec()));
+            revoked_at(&w, 1);
+            assert_eq!(w.state(LOCAL).4, Some(pinned.to_vec()));
+            assert!(!again.exists());
         }
 
         // An accepted restore epoch transition.

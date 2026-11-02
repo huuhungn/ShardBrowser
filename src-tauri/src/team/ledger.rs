@@ -283,14 +283,15 @@ fn prepare(
         }
     }
     // `cutoffs` has no source: only a counted revocation, not local distrust,
-    // raises an alert.
-    let revoked: std::collections::BTreeSet<String> = db
+    // raises an alert, for a container first seen after it counted.
+    let revoked: BTreeMap<String, i64> = db
         .conn
         .prepare(
-            "SELECT DISTINCT signing_key_id FROM trust_proven_revocations
-             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND source = 'DEVICE_REVOCATION'",
+            "SELECT signing_key_id, min(counted_evaluation) FROM trust_proven_revocations
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND source = 'DEVICE_REVOCATION'
+             GROUP BY signing_key_id",
         )?
-        .query_map(params![instance, tenant], |r| r.get(0))?
+        .query_map(params![instance, tenant], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut lapses = BTreeMap::new();
     {
@@ -324,7 +325,10 @@ fn prepare(
                 let issuer = hex(r.issuer_signing_key_id());
                 if let Some(&cutoff) = cutoffs.get(&issuer) {
                     if !seen.is_some_and(|s| s <= cutoff) {
-                        if revoked.contains(&issuer) {
+                        if revoked
+                            .get(&issuer)
+                            .is_some_and(|&at| !seen.is_some_and(|s| s <= at))
+                        {
                             renewed_after_revocation(db, binding, &keys, r, now)?;
                         }
                         continue;
