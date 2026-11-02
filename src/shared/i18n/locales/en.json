@@ -1297,6 +1297,7 @@
   "sync.restoreTaskFailed": "The restore did not finish: {error}",
   "sync.resume": "Resume",
   "sync.sealTaskFailed": "Packing the profile did not finish: {error}",
+  "sync.signerRevoked": "The snapshot's signer has been revoked, so it was not restored. The profile is quarantined.",
   "sync.signerUntrusted": "The snapshot's signer is not trusted to commit this profile, so it was not restored.",
   "sync.starting": "starting…",
   "sync.storedRequestMismatch": "A saved team request no longer matches its stored bytes ({field}), so it was not sent. The profile is quarantined.",

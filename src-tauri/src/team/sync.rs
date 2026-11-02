@@ -286,6 +286,23 @@ fn quarantine(db: &Db, local: &str, reason: &str, err: anyhow::Error) -> anyhow:
     }
 }
 
+/// Rule 6, "Revoked signer": `signer` proven revoked here (or distrusted), or
+/// reported revoked by the server, quarantines `b` with `SIGNER_REVOKED`.
+fn refuse_revoked(
+    db: &Db,
+    dev: &Device,
+    chain: &shardx_core::trust_chain::TrustChain,
+    b: &Bound,
+    signer: &[u8; 32],
+    now: u64,
+) -> Result<()> {
+    if ledger::withdrawn(db, &dev.pin.0, signer)? || chain.reported_revoked_at(signer, now) {
+        let err = anyhow!(code("sync.signerRevoked"));
+        return Err(quarantine(db, &b.local, "SIGNER_REVOKED", err));
+    }
+    Ok(())
+}
+
 fn refuse_quarantined(b: &Bound) -> Result<()> {
     if b.state == "QUARANTINED" {
         bail!(code_with(
@@ -3099,8 +3116,10 @@ pub(crate) async fn pull(
     }
     let untrusted = || anyhow!(code("sync.signerUntrusted"));
     let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
-    let (_, chain) =
+    let (seen, chain) =
         ledger::evaluate(&db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
+    // Recorded first, so a revocation this evidence carries counts below.
+    ledger::record(&mut db, &dev.pin.0, &seen, &chain, None, now)?;
     let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
         .iter()
         .flat_map(|p| &p.signing_public_keys)
@@ -3114,11 +3133,13 @@ pub(crate) async fn pull(
             .map_err(|_| bad("SignedSnapshotManifestV2"))?;
         if v == b.version {
             // The pinned head: its bytes were verified when they were
-            // pinned (rule 6, "Pinning"), so neither its signer nor its epoch
-            // is re-checked; it must still be this binding's at `v`.
+            // pinned (rule 6, "Pinning"), so neither its signer's grants nor
+            // its epoch are re-checked, only a revocation of its signer; it
+            // must still be this binding's at `v`.
             if Some(m.head_hash()) != b.head {
                 return Err(bad("current_signed_head_hash"));
             }
+            refuse_revoked(&db, dev, &chain, &b, m.signer_signing_key_id(), now)?;
             let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
                 .map_err(|_| bad("manifest"))?;
             let checks = [
@@ -3170,10 +3191,10 @@ pub(crate) async fn pull(
             };
             return Err(quarantine(&db, &b.local, reason, anyhow!(code(key))));
         }
+        refuse_revoked(&db, dev, &chain, &b, &signer, now)?;
         let commits = |scope| chain.capability_at(&signer, Capability::ProfileCommit, scope, now);
         if !chain.approval_valid_at(&signer, Scope::Fleet(b.fleet), now)
             || !(commits(Scope::Profile(b.profile)) || commits(Scope::Fleet(b.fleet)))
-            || ledger::withdrawn(&db, &dev.pin.0, &signer)?
         {
             return Err(untrusted());
         }
@@ -3275,7 +3296,7 @@ mod tests {
         RestoreReason,
     };
     use shardx_core::snapshot_v2::LeaseReleaseOutcome;
-    use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
+    use shardx_core::trust_evidence::{RevokedDevice, TenantTrustEvidencePageV2};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -5682,9 +5703,10 @@ mod tests {
         assert_eq!(kept, w.fake().stored[request.idempotency_key()].2);
     }
 
-    /// Pull uses only a key whose grant reverifies now: none held, or one
-    /// whose issuer this device distrusts, refuses with no passphrase
-    /// fallback; push then releases its lease and uploads nothing.
+    /// Pull uses only a key whose grant reverifies now: none held refuses
+    /// with no passphrase fallback; a head whose signer this device
+    /// distrusts is refused as revoked (rule 6) and quarantines. Push then
+    /// releases its lease and uploads nothing.
     #[test]
     fn a_missing_or_withdrawn_fleet_key_is_refused() {
         let w = world();
@@ -5707,7 +5729,8 @@ mod tests {
         crate::fleet_keys::save(&keys).unwrap();
         distrust();
         let err = w.pull(&out).unwrap_err();
-        assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
         assert!(!out.exists());
     }
 
@@ -6521,6 +6544,197 @@ mod tests {
                 assert!(!out.exists() && pinned == 0);
             }
         }
+    }
+
+    /// Author `A`: another device, by its key.
+    fn author() -> Ed25519SigningKey {
+        Ed25519SigningKey::from_bytes(&[0x70; 32])
+    }
+
+    /// Evidence where this device approved `A` and granted it `profile.commit`
+    /// over the fleet, both until `ends`; with `revoked`, it also holds
+    /// `device.revoke` and signed a revocation of `A`, and with `reported`,
+    /// the server reports `A`'s device revoked.
+    fn author_pages(
+        w: &World,
+        ends: u64,
+        revoked: bool,
+        reported: bool,
+    ) -> Vec<TenantTrustEvidencePageV2> {
+        let k = author();
+        let kid = shardx_core::keys::signing_key_id(k.verifying_key().as_bytes());
+        let until = |replay| CommonFields {
+            not_after_ms: ends,
+            ..common(replay)
+        };
+        let own = |replay, capability| TenantCapabilityGrantV2 {
+            common: common(replay),
+            subject: device_subject(&w.me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability,
+        };
+        let approval = DeviceApprovalV2 {
+            common: until(0x70),
+            subject_account_id: [0x70; 16],
+            subject_device_id: [0x71; 16],
+            subject_signing_key_id: kid,
+            subject_hpke_key_id: [0x70; 32],
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let commit = TenantCapabilityGrantV2 {
+            common: until(0x72),
+            subject: GrantSubject::Device {
+                account_id: [0x70; 16],
+                device_id: [0x71; 16],
+                signing_key_id: kid,
+                hpke_key_id: [0x70; 32],
+            },
+            scope_kind: CapabilityScopeKind::Fleet,
+            scope_id: FLEET,
+            capability: Capability::ProfileCommit,
+        };
+        let mut extra = vec![
+            build_record(&w.me.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(
+                &w.me.sk,
+                DOMAIN_TENANT_CAPABILITY_GRANT,
+                &own(0x71, Capability::DeviceApprove).encode(),
+            ),
+            build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &commit.encode()),
+        ];
+        if revoked {
+            let revocation = DeviceRevocationV2 {
+                common: common(0x74),
+                subject_account_id: [0x70; 16],
+                subject_device_id: [0x71; 16],
+                subject_signing_key_id: kid,
+                subject_hpke_key_id: [0x70; 32],
+                reason_code: DeviceRevocationReason::Compromised,
+            };
+            extra.push(build_record(
+                &w.me.sk,
+                DOMAIN_TENANT_CAPABILITY_GRANT,
+                &own(0x73, Capability::DeviceRevoke).encode(),
+            ));
+            extra.push(build_record(
+                &w.me.sk,
+                DOMAIN_DEVICE_REVOCATION,
+                &revocation.encode(),
+            ));
+        }
+        let ev = Ev {
+            extra,
+            ..Ev::default()
+        };
+        let mut p = pages(&w.me, &w.grant, &ev);
+        p[0].signing_public_keys.push(k.verifying_key().to_bytes());
+        if reported {
+            p[0].device_revocations.push(RevokedDevice {
+                device_id: [0x71; 16],
+                revoked_at_ms: T0 + DAY / 2,
+            });
+        }
+        p
+    }
+
+    /// `w` with `A`'s head pinned on a second binding, enrolled under `root`,
+    /// that accepted it as a new head while `A` held grants until `ends`.
+    fn pinned_by_author(w: &World, root: &Path, ends: u64) {
+        w.push().unwrap();
+        w.fake().pages = author_pages(w, ends, false, false)[0].encode();
+        let head = forge(w, &author(), |_| {});
+        w.fake().head = Some(head);
+        w.enroll(root);
+        w.pull(&root.join("first")).unwrap();
+        assert_eq!(w.state(LOCAL).4, Some(head.to_vec()));
+    }
+
+    /// Rule 6, "Revoked signer": a pinned head whose signer is since proven
+    /// revoked (a signed revocation in this pull's evidence) or reported
+    /// revoked (the server's unsigned report alone) is not restored again;
+    /// the binding quarantines with `SIGNER_REVOKED`.
+    #[test]
+    fn a_pinned_head_of_a_since_revoked_signer_is_not_restored() {
+        for (revoked, reported) in [(true, false), (false, true)] {
+            let w = world();
+            let other = tempfile::tempdir().unwrap();
+            pinned_by_author(&w, other.path(), T0 + 300 * DAY);
+            w.fake().pages = author_pages(&w, T0 + 300 * DAY, revoked, reported)[0].encode();
+            let out = other.path().join("out");
+            let err = w.pull(&out).unwrap_err();
+            assert!(has(&err, "sync.signerRevoked"), "{revoked}: {err:#}");
+            let (state, reason, ..) = w.state(LOCAL);
+            assert_eq!(
+                (state.as_str(), reason.as_deref()),
+                ("QUARANTINED", Some("SIGNER_REVOKED")),
+                "{revoked}"
+            );
+            assert!(!out.exists(), "{revoked}");
+        }
+    }
+
+    /// Rule 6, "Pinning": a pinned head stays readable after its signer's
+    /// approval and `profile.commit` expire.
+    #[test]
+    fn a_pinned_head_stays_readable_after_its_signers_grants_expire() {
+        let w = world();
+        let other = tempfile::tempdir().unwrap();
+        pinned_by_author(&w, other.path(), T0 + 2 * DAY);
+        let out = other.path().join("out");
+        assert!(w.pull_at(&out, T0 + 3 * DAY).unwrap() > 0);
+        assert!(out.join("Preferences").exists());
+        assert_eq!(w.state(LOCAL).0, "AVAILABLE");
+    }
+
+    /// Rule 6 and its ledger update: a signed revocation of the signer in this
+    /// pull's own evidence is counted, with no unsigned report, so its new
+    /// head is refused and the binding quarantines.
+    #[test]
+    fn a_new_head_of_a_signer_revoked_in_this_pulls_evidence_is_refused() {
+        let w = world();
+        w.push().unwrap();
+        w.fake().pages = author_pages(&w, T0 + 300 * DAY, true, false)[0].encode();
+        let head = forge(&w, &author(), |_| {});
+        w.fake().head = Some(head);
+        let other = tempfile::tempdir().unwrap();
+        w.enroll(other.path());
+        let out = other.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        let (state, reason, _, version, _) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), reason.as_deref(), version),
+            ("QUARANTINED", Some("SIGNER_REVOKED"), 0)
+        );
+        assert!(!out.exists());
+        let kid = shardx_core::keys::signing_key_id(author().verifying_key().as_bytes());
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &kid).unwrap());
+    }
+
+    /// Rule 6 and its ledger update: an unsigned report of the signer that a
+    /// pull saw is kept, so a later evaluation whose evidence omits it still
+    /// holds the signer reported revoked.
+    #[test]
+    fn a_report_of_a_revoked_signer_a_pull_saw_is_kept() {
+        let w = world();
+        w.push().unwrap();
+        w.fake().pages = author_pages(&w, T0 + 300 * DAY, false, true)[0].encode();
+        let head = forge(&w, &author(), |_| {});
+        w.fake().head = Some(head);
+        let other = tempfile::tempdir().unwrap();
+        w.enroll(other.path());
+        let out = other.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(!out.exists());
+        let omitted = author_pages(&w, T0 + 300 * DAY, false, false);
+        let (_, chain) = ledger::evaluate(&w.db(), &w.dev.pin.0, &w.dev.pin.1, &omitted, NOW)
+            .unwrap()
+            .unwrap();
+        let kid = shardx_core::keys::signing_key_id(author().verifying_key().as_bytes());
+        assert!(chain.reported_revoked_at(&kid, NOW), "the report was kept");
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
     }
 
     /// A push from behind the listed head is refused before any lease is
@@ -8465,7 +8679,7 @@ mod tests {
     /// Q-25: a lapse refuses only what is dated at or before it. A custodian
     /// held lapsed and re-appointed after the lapse signs a transition this
     /// device accepts, and the evaluation accepting it is recorded once,
-    /// with it.
+    /// with it; the pull then records its own.
     #[test]
     fn a_custodian_reappointed_after_its_lapse_signs_again() {
         let w = world();
@@ -8477,7 +8691,7 @@ mod tests {
         w.pull_at(&w.udd.with_file_name("out"), NOW + 4 * DAY)
             .unwrap();
         assert_eq!(w.state(LOCAL).2, 1);
-        assert_eq!(evaluations(), before + 1);
+        assert_eq!(evaluations(), before + 2);
     }
 
     /// A refused acceptance whose evaluation cannot be recorded leaves no
