@@ -23,14 +23,19 @@
 //! fill. Version 5 lets a restore epoch binding proof outlive its binding.
 //! Version 6 brings the three sync tables to the plan's columns and foreign
 //! keys: each names its `server_origins` row, a binding its account and its
-//! fleet key.
+//! fleet key. Version 7 keeps the holdings and activations of the Q-18
+//! commit block, and version 8 lets a counted revocation change its
+//! container. Version 9 adds the reader-side revert audit `skipped_heads`
+//! (ADR 0002 rule 6), the custodian alerts the ledger raises
+//! (`trust_custodian_alerts`, D-6 (a)) and `revert_swaps`, which the
+//! committer-side revert fills.
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, TransactionBehavior};
 use std::path::Path;
 
 /// The schema this binary writes, and the newest one it reads.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Version 1, as #188 shipped it.
 const SCHEMA_V1: &str = r#"
@@ -1285,6 +1290,92 @@ UPDATE schema_meta SET schema_version = 8, min_reader_version = 7,
   applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
 "#;
 
+/// Version 8 to 9 (ADR 0002 rule 6, "Revert acceptance rule"; D-6 (a)). A
+/// version 8 reader would neither audit a skipped head nor see an open run
+/// or a pending revert swap, so 9 is also the minimum reader.
+const MIGRATE_V9: &str = r#"
+-- Each head a pull skipped (resolution ACCEPTED, with the R it accepted), or
+-- holds as an open proven-revoked run (resolution NULL). No foreign key: the
+-- audit outlives an unbind, as the version 5 proofs do.
+CREATE TABLE skipped_heads (
+  server_instance_id    TEXT NOT NULL CHECK (length(server_instance_id) = 32 AND server_instance_id NOT GLOB '*[^0-9a-f]*'),
+  tenant_id             TEXT NOT NULL CHECK (length(tenant_id) = 32 AND tenant_id NOT GLOB '*[^0-9a-f]*'),
+  remote_profile_id     TEXT NOT NULL CHECK (length(remote_profile_id) = 32 AND remote_profile_id NOT GLOB '*[^0-9a-f]*'),
+  local_profile_id      TEXT NOT NULL,
+  target_version        INTEGER NOT NULL CHECK (target_version BETWEEN 1 AND 9223372036854775807),
+  head_hash             BLOB NOT NULL CHECK (length(head_hash) = 32),
+  signer_signing_key_id TEXT NOT NULL CHECK (length(signer_signing_key_id) = 64 AND signer_signing_key_id NOT GLOB '*[^0-9a-f]*'),
+  anchor_version        INTEGER NOT NULL CHECK (anchor_version BETWEEN 0 AND 9223372036854775807 AND anchor_version < target_version),
+  anchor_head_hash      BLOB CHECK (anchor_head_hash IS NULL OR length(anchor_head_hash) = 32),
+  resolution            TEXT CHECK (resolution IN ('ACCEPTED','SUPERSEDED')),
+  accepted_head_hash    BLOB CHECK (accepted_head_hash IS NULL OR length(accepted_head_hash) = 32),
+  recorded_at_ms        INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 9223372036854775807),
+  resolved_at_ms        INTEGER CHECK (resolved_at_ms BETWEEN 0 AND 9223372036854775807),
+  PRIMARY KEY(server_instance_id, tenant_id, remote_profile_id, target_version, head_hash),
+  CHECK ((anchor_version = 0) = (anchor_head_hash IS NULL)),
+  CHECK ((resolution IS 'ACCEPTED') = (accepted_head_hash IS NOT NULL)),
+  CHECK ((resolution IS NULL) = (resolved_at_ms IS NULL))
+) STRICT;
+
+-- D-6 (a): the first refused self-renewal of a key with a counted
+-- DeviceRevocationV2, one row per key whatever a server sends.
+CREATE TABLE trust_custodian_alerts (
+  server_instance_id    TEXT NOT NULL,
+  tenant_id             TEXT NOT NULL,
+  kind                  TEXT NOT NULL CHECK (kind IN ('custodian.renewed_after_revocation')),
+  signing_key_id        TEXT NOT NULL CHECK (length(signing_key_id) = 64 AND signing_key_id NOT GLOB '*[^0-9a-f]*'),
+  signed_container_hash TEXT NOT NULL CHECK (length(signed_container_hash) = 64 AND signed_container_hash NOT GLOB '*[^0-9a-f]*'),
+  raised_at_ms          INTEGER NOT NULL CHECK (raised_at_ms BETWEEN 0 AND 9223372036854775807),
+  PRIMARY KEY(server_instance_id, tenant_id, kind, signing_key_id),
+  FOREIGN KEY(server_instance_id, tenant_id)
+    REFERENCES trust_anchors(server_instance_id, tenant_id) ON DELETE RESTRICT
+) STRICT;
+
+-- A committed revert whose staged snapshot must replace the profile's user
+-- data before anything else touches it. No foreign key: an unbind cannot
+-- strand it.
+CREATE TABLE revert_swaps (
+  local_profile_id   TEXT NOT NULL PRIMARY KEY,
+  accepted_version   INTEGER NOT NULL CHECK (accepted_version BETWEEN 1 AND 9223372036854775807),
+  accepted_head_hash BLOB NOT NULL CHECK (length(accepted_head_hash) = 32),
+  recorded_at_ms     INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 9223372036854775807)
+) STRICT;
+
+-- An insert never meets an existing key, so REPLACE cannot rewrite a row.
+CREATE TRIGGER skipped_heads_once BEFORE INSERT ON skipped_heads
+WHEN EXISTS (SELECT 1 FROM skipped_heads
+             WHERE server_instance_id = NEW.server_instance_id AND tenant_id = NEW.tenant_id
+               AND remote_profile_id = NEW.remote_profile_id
+               AND target_version = NEW.target_version AND head_hash = NEW.head_hash)
+BEGIN SELECT RAISE(ABORT, 'a skipped head is recorded once'); END;
+CREATE TRIGGER skipped_heads_kept BEFORE DELETE ON skipped_heads
+BEGIN SELECT RAISE(ABORT, 'a skipped head is never forgotten'); END;
+CREATE TRIGGER skipped_heads_resolved_once BEFORE UPDATE ON skipped_heads
+WHEN OLD.resolution IS NOT NULL
+  OR NEW.server_instance_id IS NOT OLD.server_instance_id
+  OR NEW.tenant_id IS NOT OLD.tenant_id
+  OR NEW.remote_profile_id IS NOT OLD.remote_profile_id
+  OR NEW.local_profile_id IS NOT OLD.local_profile_id
+  OR NEW.target_version IS NOT OLD.target_version
+  OR NEW.head_hash IS NOT OLD.head_hash
+  OR NEW.signer_signing_key_id IS NOT OLD.signer_signing_key_id
+  OR NEW.anchor_version IS NOT OLD.anchor_version
+  OR NEW.anchor_head_hash IS NOT OLD.anchor_head_hash
+  OR NEW.recorded_at_ms IS NOT OLD.recorded_at_ms
+BEGIN SELECT RAISE(ABORT, 'a skipped head is resolved once'); END;
+CREATE TRIGGER trust_custodian_alerts_once BEFORE INSERT ON trust_custodian_alerts
+WHEN EXISTS (SELECT 1 FROM trust_custodian_alerts
+             WHERE server_instance_id = NEW.server_instance_id AND tenant_id = NEW.tenant_id
+               AND kind = NEW.kind AND signing_key_id = NEW.signing_key_id)
+BEGIN SELECT RAISE(ABORT, 'an alert is raised once'); END;
+CREATE TRIGGER trust_custodian_alerts_kept BEFORE DELETE ON trust_custodian_alerts
+BEGIN SELECT RAISE(ABORT, 'an alert is never forgotten'); END;
+CREATE TRIGGER trust_custodian_alerts_fixed BEFORE UPDATE ON trust_custodian_alerts
+BEGIN SELECT RAISE(ABORT, 'an alert never changes'); END;
+UPDATE schema_meta SET schema_version = 9, min_reader_version = 9,
+  applied_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now');
+"#;
+
 /// An open `team-sync.db` whose schema this binary reads.
 pub struct Db {
     pub(crate) conn: Connection,
@@ -1358,6 +1449,9 @@ impl Db {
         if matches!(meta(&tx).as_deref(), Ok([(7, 7, state)]) if state == "CLEAN") {
             tx.execute_batch(MIGRATE_V8).with_context(unreadable)?;
         }
+        if matches!(meta(&tx).as_deref(), Ok([(8, 7, state)]) if state == "CLEAN") {
+            tx.execute_batch(MIGRATE_V9).with_context(unreadable)?;
+        }
         if from.is_some_and(|v| v < SCHEMA_VERSION) {
             let broken: i64 = tx
                 .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
@@ -1379,12 +1473,13 @@ impl Db {
 }
 
 /// The startup compatibility query (plan L2032): exactly one row, clean, of a
-/// version this binary reads and whose minimum reader it meets.
+/// version this binary reads and whose minimum reader it meets. An older
+/// version left unmigrated lacks tables this binary writes, so it is refused.
 fn compatible(conn: &Connection) -> bool {
     matches!(
         meta(conn).as_deref(),
         Ok([(version, min_reader, state)])
-            if *version <= SCHEMA_VERSION && *min_reader <= SCHEMA_VERSION && state == "CLEAN"
+            if *version == SCHEMA_VERSION && *min_reader <= SCHEMA_VERSION && state == "CLEAN"
     )
 }
 
@@ -1519,7 +1614,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(meta, (8, 7, "CLEAN".into()));
+        assert_eq!(meta, (9, 9, "CLEAN".into()));
         let pragma = |name: &str| -> String {
             db.conn
                 .query_row(&format!("SELECT * FROM pragma_{name}"), [], |r| {
@@ -1539,8 +1634,8 @@ mod tests {
     #[test]
     fn an_unknown_schema_fails_closed_and_is_left_as_it_was() {
         let mutations = [
-            "UPDATE schema_meta SET schema_version = 9",
-            "UPDATE schema_meta SET min_reader_version = 9",
+            "UPDATE schema_meta SET schema_version = 10",
+            "UPDATE schema_meta SET min_reader_version = 10",
             "UPDATE schema_meta SET migration_state = 'MIGRATING'",
             "UPDATE schema_meta SET migration_state = 'RECOVERY_REQUIRED'",
             "DELETE FROM schema_meta",
@@ -1592,7 +1687,7 @@ mod tests {
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
             let rows = meta(&db.conn).unwrap();
-            assert_eq!(rows, [(8, 7, "CLEAN".to_string())]);
+            assert_eq!(rows, [(9, 9, "CLEAN".to_string())]);
             let count = |table: &str| -> i64 {
                 let sql = format!("SELECT count(*) FROM {table}");
                 db.conn.query_row(&sql, [], |r| r.get(0)).unwrap()
@@ -1625,7 +1720,7 @@ mod tests {
         drop(v2(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(9, 9, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("trust_anchors", 1),
                 ("profile_bindings", 0),
@@ -1675,7 +1770,7 @@ mod tests {
         drop(v3(&path));
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(9, 9, "CLEAN".to_string())]);
             for (table, rows) in [
                 ("profile_bindings", 0),
                 ("server_origins", 0),
@@ -1900,7 +1995,7 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(9, 9, "CLEAN".to_string())]);
             let kept: Vec<u8> = db
                 .conn
                 .query_row(
@@ -1982,6 +2077,204 @@ mod tests {
             }
             assert_eq!(std::fs::read(&path).unwrap(), before, "{sql}");
         }
+    }
+
+    /// A clean version 8 file, as version 8 wrote it, holding one pin.
+    fn v8(path: &Path) -> Connection {
+        let c = Connection::open(path).unwrap();
+        // As `open_at` migrates: a table rebuild must not fire key actions.
+        c.pragma_update(None, "foreign_keys", false).unwrap();
+        for sql in [
+            SCHEMA_V1, MIGRATE_V2, MIGRATE_V3, MIGRATE_V4, MIGRATE_V5, MIGRATE_V6, MIGRATE_V7,
+            MIGRATE_V8,
+        ] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute_batch(&format!(
+            "INSERT INTO trust_anchors VALUES ('{}', '{}', '{}', 'BOOTSTRAP', 0);",
+            "11".repeat(16),
+            "22".repeat(16),
+            "33".repeat(32)
+        ))
+        .unwrap();
+        c
+    }
+
+    /// A clean version 8 file gains the revert audit, the custodian alerts
+    /// and the swap marker, keeps its rows and reopens as version 9.
+    #[test]
+    fn a_version_8_file_migrates_to_version_9_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("team-sync.db");
+        assert_eq!(meta(&v8(&path)).unwrap(), [(8, 7, "CLEAN".to_string())]);
+        for _ in 0..2 {
+            let db = Db::open_at(&path).unwrap();
+            assert_eq!(meta(&db.conn).unwrap(), [(9, 9, "CLEAN".to_string())]);
+            for (table, rows) in [
+                ("trust_anchors", 1),
+                ("skipped_heads", 0),
+                ("trust_custodian_alerts", 0),
+                ("revert_swaps", 0),
+            ] {
+                let sql = format!("SELECT count(*) FROM {table}");
+                let n: i64 = db.conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+                assert_eq!(n, rows, "{table}");
+            }
+        }
+    }
+
+    /// Version 8 always wrote minimum reader 7: a version 8 file with another
+    /// one is not migrated, and is refused as it was.
+    #[test]
+    fn a_version_8_file_with_another_min_reader_is_not_migrated() {
+        for min in [6, 8, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("team-sync.db");
+            v8(&path)
+                .execute_batch(&format!(
+                    "UPDATE schema_meta SET min_reader_version = {min}"
+                ))
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            for _ in 0..2 {
+                let err = Db::open_at(&path).err().expect("refused").to_string();
+                assert!(
+                    crate::errcode::has_code(&err, "team.trustLedgerUnsupported"),
+                    "{min}: {err}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{min}");
+        }
+    }
+
+    /// Runs `sql` on `c` and expects the abort that names `why`.
+    fn refused(c: &Connection, sql: &str, why: &str) {
+        let err = c.execute_batch(sql).unwrap_err().to_string();
+        assert!(err.contains(why), "{sql}: {err}");
+    }
+
+    /// A skipped head is written once, never deleted or replaced, and only
+    /// its resolution columns change, once.
+    #[test]
+    fn skipped_heads_refuse_delete_replace_and_a_second_resolution() {
+        let (_dir, path) = fresh();
+        let db = Db::open_at(&path).unwrap();
+        let insert = format!(
+            "INSERT INTO skipped_heads(server_instance_id, tenant_id, remote_profile_id,
+               local_profile_id, target_version, head_hash, signer_signing_key_id,
+               anchor_version, anchor_head_hash, recorded_at_ms)
+             VALUES ('{}', '{}', '{}', 'local', 2, zeroblob(32), '{}', 1, zeroblob(32), 0)",
+            "11".repeat(16),
+            "22".repeat(16),
+            "c1".repeat(16),
+            "70".repeat(32)
+        );
+        db.conn.execute_batch(&insert).unwrap();
+        let once = "a skipped head is recorded once";
+        refused(&db.conn, &insert, once);
+        refused(
+            &db.conn,
+            &insert.replacen("INSERT", "INSERT OR REPLACE", 1),
+            once,
+        );
+        refused(&db.conn, &insert.replacen("INSERT", "REPLACE", 1), once);
+        refused(&db.conn, "DELETE FROM skipped_heads", "never forgotten");
+        let resolved = "a skipped head is resolved once";
+        refused(
+            &db.conn,
+            "UPDATE skipped_heads SET local_profile_id = 'other'",
+            resolved,
+        );
+        refused(
+            &db.conn,
+            "UPDATE skipped_heads SET resolution = 'SUPERSEDED', resolved_at_ms = 1,
+               anchor_version = 0, anchor_head_hash = NULL",
+            resolved,
+        );
+        assert!(db
+            .conn
+            .execute_batch("UPDATE skipped_heads SET resolution = 'ACCEPTED', resolved_at_ms = 1")
+            .is_err());
+        db.conn
+            .execute_batch(
+                "UPDATE skipped_heads SET resolution = 'ACCEPTED', resolved_at_ms = 1,
+                   accepted_head_hash = zeroblob(32)",
+            )
+            .unwrap();
+        refused(
+            &db.conn,
+            "UPDATE skipped_heads SET resolution = 'SUPERSEDED', resolved_at_ms = 2,
+               accepted_head_hash = NULL",
+            resolved,
+        );
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let kept: (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT resolution, resolved_at_ms FROM skipped_heads",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("ACCEPTED".into(), 1));
+    }
+
+    /// A custodian alert is raised once per key: never deleted, replaced or
+    /// changed.
+    #[test]
+    fn renewed_after_revocation_alerts_refuse_delete_and_replace() {
+        let (_dir, path) = fresh();
+        let db = Db::open_at(&path).unwrap();
+        let (i, t) = ("11".repeat(16), "22".repeat(16));
+        db.conn
+            .execute_batch(&format!(
+                "INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{}', 'BOOTSTRAP', 0);",
+                "33".repeat(32)
+            ))
+            .unwrap();
+        let alert = |container: &str| {
+            format!(
+                "INSERT INTO trust_custodian_alerts VALUES ('{i}', '{t}',
+                   'custodian.renewed_after_revocation', '{}', '{container}', 1)",
+                "70".repeat(32)
+            )
+        };
+        db.conn.execute_batch(&alert(&"ab".repeat(32))).unwrap();
+        let once = "an alert is raised once";
+        let another = alert(&"cd".repeat(32));
+        refused(&db.conn, &another, once);
+        refused(
+            &db.conn,
+            &another.replacen("INSERT", "INSERT OR REPLACE", 1),
+            once,
+        );
+        refused(&db.conn, &another.replacen("INSERT", "REPLACE", 1), once);
+        refused(
+            &db.conn,
+            "DELETE FROM trust_custodian_alerts",
+            "never forgotten",
+        );
+        refused(
+            &db.conn,
+            "UPDATE trust_custodian_alerts SET raised_at_ms = 2",
+            "never changes",
+        );
+        assert!(db
+            .conn
+            .execute_batch(&another.replace("custodian.renewed_after_revocation", "other"))
+            .is_err());
+        drop(db);
+        let db = Db::open_at(&path).unwrap();
+        let kept: (String, i64) = db
+            .conn
+            .query_row(
+                "SELECT signed_container_hash, raised_at_ms FROM trust_custodian_alerts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, ("ab".repeat(32), 1));
     }
 
     /// A file another connection holds in WAL mode cannot leave it, and is
@@ -2307,7 +2600,7 @@ mod tests {
         }
         for round in 0..2 {
             let db = Db::open_at(&path).unwrap();
-            assert_eq!(meta(&db.conn).unwrap(), [(8, 7, "CLEAN".to_string())]);
+            assert_eq!(meta(&db.conn).unwrap(), [(9, 9, "CLEAN".to_string())]);
             for (table, cols, rows) in &had {
                 assert_eq!(&dump(&db.conn, table, cols), rows, "{table} round {round}");
             }
