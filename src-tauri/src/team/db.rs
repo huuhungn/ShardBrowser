@@ -1296,8 +1296,11 @@ UPDATE schema_meta SET schema_version = 8, min_reader_version = 7,
 const MIGRATE_V9: &str = r#"
 -- Each head a pull skipped (resolution ACCEPTED, with the R it accepted), or
 -- holds as an open proven-revoked run (resolution NULL). No foreign key: the
--- audit outlives an unbind, as the version 5 proofs do.
+-- audit outlives an unbind, as the version 5 proofs do. A head may be met
+-- again after its row was superseded (a re-bind, a restore), so only one
+-- open row per head is unique.
 CREATE TABLE skipped_heads (
+  id                    INTEGER PRIMARY KEY,
   server_instance_id    TEXT NOT NULL CHECK (length(server_instance_id) = 32 AND server_instance_id NOT GLOB '*[^0-9a-f]*'),
   tenant_id             TEXT NOT NULL CHECK (length(tenant_id) = 32 AND tenant_id NOT GLOB '*[^0-9a-f]*'),
   remote_profile_id     TEXT NOT NULL CHECK (length(remote_profile_id) = 32 AND remote_profile_id NOT GLOB '*[^0-9a-f]*'),
@@ -1311,7 +1314,6 @@ CREATE TABLE skipped_heads (
   accepted_head_hash    BLOB CHECK (accepted_head_hash IS NULL OR length(accepted_head_hash) = 32),
   recorded_at_ms        INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 9223372036854775807),
   resolved_at_ms        INTEGER CHECK (resolved_at_ms BETWEEN 0 AND 9223372036854775807),
-  PRIMARY KEY(server_instance_id, tenant_id, remote_profile_id, target_version, head_hash),
   CHECK ((anchor_version = 0) = (anchor_head_hash IS NULL)),
   CHECK ((resolution IS 'ACCEPTED') = (accepted_head_hash IS NOT NULL)),
   CHECK ((resolution IS NULL) = (resolved_at_ms IS NULL))
@@ -1341,17 +1343,24 @@ CREATE TABLE revert_swaps (
   recorded_at_ms     INTEGER NOT NULL CHECK (recorded_at_ms BETWEEN 0 AND 9223372036854775807)
 ) STRICT;
 
--- An insert never meets an existing key, so REPLACE cannot rewrite a row.
+CREATE UNIQUE INDEX skipped_heads_open ON skipped_heads(
+  server_instance_id, tenant_id, remote_profile_id, target_version, head_hash)
+WHERE resolution IS NULL;
+-- An insert never meets an existing row or open head, so REPLACE cannot
+-- rewrite a row.
 CREATE TRIGGER skipped_heads_once BEFORE INSERT ON skipped_heads
-WHEN EXISTS (SELECT 1 FROM skipped_heads
+WHEN EXISTS (SELECT 1 FROM skipped_heads WHERE id = NEW.id)
+  OR EXISTS (SELECT 1 FROM skipped_heads
              WHERE server_instance_id = NEW.server_instance_id AND tenant_id = NEW.tenant_id
                AND remote_profile_id = NEW.remote_profile_id
-               AND target_version = NEW.target_version AND head_hash = NEW.head_hash)
+               AND target_version = NEW.target_version AND head_hash = NEW.head_hash
+               AND resolution IS NULL)
 BEGIN SELECT RAISE(ABORT, 'a skipped head is recorded once'); END;
 CREATE TRIGGER skipped_heads_kept BEFORE DELETE ON skipped_heads
 BEGIN SELECT RAISE(ABORT, 'a skipped head is never forgotten'); END;
 CREATE TRIGGER skipped_heads_resolved_once BEFORE UPDATE ON skipped_heads
 WHEN OLD.resolution IS NOT NULL
+  OR NEW.id IS NOT OLD.id
   OR NEW.server_instance_id IS NOT OLD.server_instance_id
   OR NEW.tenant_id IS NOT OLD.tenant_id
   OR NEW.remote_profile_id IS NOT OLD.remote_profile_id
@@ -2207,12 +2216,38 @@ mod tests {
                accepted_head_hash = NULL",
             resolved,
         );
+        // Once resolved, the head may be met again as a new open row, but
+        // no row is ever replaced or renumbered.
+        db.conn.execute_batch(&insert).unwrap();
+        refused(&db.conn, &insert, once);
+        let by_id = insert
+            .replacen(
+                "INSERT INTO skipped_heads(",
+                "INSERT OR REPLACE INTO skipped_heads(id, ",
+                1,
+            )
+            .replacen("VALUES (", "VALUES (1, ", 1);
+        refused(&db.conn, &by_id, once);
+        refused(
+            &db.conn,
+            "UPDATE skipped_heads SET id = 9 WHERE id = 2",
+            resolved,
+        );
         drop(db);
         let db = Db::open_at(&path).unwrap();
+        let open: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM skipped_heads WHERE id = 2 AND resolution IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1);
         let kept: (String, i64) = db
             .conn
             .query_row(
-                "SELECT resolution, resolved_at_ms FROM skipped_heads",
+                "SELECT resolution, resolved_at_ms FROM skipped_heads WHERE id = 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
