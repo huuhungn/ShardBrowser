@@ -37,8 +37,14 @@
 //!   generation each verified fleet activation binds, so the commit block
 //!   never forgets an exposure ([`holdings`], [`commit_blocked`]).
 //!
-//! Not here yet: the custodian change events of D-6 (a), whose wording and
-//! acknowledgement follow the Q-17 UX review.
+//! - **Renewed after revocation** (D-6 (a), rule 1 "Sticky proven
+//!   revocation"): a self-renewal of a key with a counted
+//!   `DeviceRevocationV2`, signed by that key and dropped as first seen after
+//!   the count, is kept once per key in `trust_custodian_alerts`
+//!   (`custodian.renewed_after_revocation`).
+//!
+//! Not here yet: the other custodian change events of D-6 (a), and the
+//! acknowledgement of any, whose wording follows the Q-17 UX review.
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, OptionalExtension};
@@ -46,7 +52,7 @@ use std::collections::BTreeMap;
 
 use shardx_core::authz_record::{
     AuthorizationRecord, Capability, DeviceRevocationReason, DeviceRevocationV2, Payload,
-    DOMAIN_DEVICE_REVOCATION, DOMAIN_TENANT_ROOT_KEY_GRANT,
+    RootGrantVariant, DOMAIN_DEVICE_REVOCATION, DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shardx_core::canonical::{decode, encode, Value};
 use shardx_core::trust_chain::{
@@ -150,7 +156,7 @@ pub fn evaluate(
     now: u64,
 ) -> Result<Option<(Vec<TenantTrustEvidencePageV2>, TrustChain)>> {
     observe_lapses(db, binding, now)?;
-    let seen = prepare(db, binding, pages)?;
+    let seen = prepare(db, binding, pages, now)?;
     let Ok(mut evidence) = Evidence::collect(binding, &seen) else {
         return Ok(None);
     };
@@ -256,11 +262,13 @@ pub fn lapsed_at(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<Option<u6
 /// proven-revoked or distrusted key and not seen by the evaluation that
 /// counted it are dropped, so are those sticky lapse refuses
 /// ([`lapse_allows`]), and every revocation the server ever reported is
-/// reported again.
+/// reported again. A dropped self-renewal of a revoked key raises its alert
+/// at `now` ([`renewed_after_revocation`]).
 fn prepare(
     db: &Db,
     binding: &Binding,
     pages: &[TenantTrustEvidencePageV2],
+    now: u64,
 ) -> Result<Vec<TenantTrustEvidencePageV2>> {
     let (instance, tenant) = ids(binding);
     let mut cutoffs = BTreeMap::new();
@@ -274,6 +282,17 @@ fn prepare(
             cutoffs.insert(r.get::<_, String>(0)?, r.get::<_, i64>(1)?);
         }
     }
+    // `cutoffs` has no source: only a counted revocation, not local distrust,
+    // raises an alert, for a container first seen after it counted.
+    let revoked: BTreeMap<String, i64> = db
+        .conn
+        .prepare(
+            "SELECT signing_key_id, min(counted_evaluation) FROM trust_proven_revocations
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND source = 'DEVICE_REVOCATION'
+             GROUP BY signing_key_id",
+        )?
+        .query_map(params![instance, tenant], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut lapses = BTreeMap::new();
     {
         let mut s = db.conn.prepare(
@@ -303,8 +322,15 @@ fn prepare(
                         |row| row.get(0),
                     )
                     .optional()?;
-                if let Some(&cutoff) = cutoffs.get(&hex(r.issuer_signing_key_id())) {
+                let issuer = hex(r.issuer_signing_key_id());
+                if let Some(&cutoff) = cutoffs.get(&issuer) {
                     if !seen.is_some_and(|s| s <= cutoff) {
+                        if revoked
+                            .get(&issuer)
+                            .is_some_and(|&at| !seen.is_some_and(|s| s <= at))
+                        {
+                            renewed_after_revocation(db, binding, &keys, r, now)?;
+                        }
                         continue;
                     }
                 }
@@ -343,6 +369,42 @@ fn prepare(
         });
     }
     Ok(out)
+}
+
+/// D-6 (a) and rule 1, "Sticky proven revocation": `r`, dropped because its
+/// issuer `D` has a counted `DeviceRevocationV2`, raises
+/// `custodian.renewed_after_revocation` when it verifies under D's key from
+/// `keys` and is a root grant renewing D itself. One row per key, keeping
+/// the first container, so a server cannot grow or rewrite the table.
+fn renewed_after_revocation(
+    db: &Db,
+    binding: &Binding,
+    keys: &Keys,
+    r: AuthorizationRecord,
+    now: u64,
+) -> Result<()> {
+    let issuer = *r.issuer_signing_key_id();
+    let container = hex(r.signed_container_hash());
+    let Some(Ok(verified)) = keys.get(&issuer).map(|pk| r.verify_signature(pk)) else {
+        return Ok(());
+    };
+    let Payload::TenantRootKeyGrant(g) = verified.payload() else {
+        return Ok(());
+    };
+    if g.variant == RootGrantVariant::FirstRootSelfGrant || g.subject_signing_key_id != issuer {
+        return Ok(());
+    }
+    let (instance, tenant) = ids(binding);
+    db.conn.execute(
+        "INSERT INTO trust_custodian_alerts(server_instance_id, tenant_id, kind, signing_key_id,
+           signed_container_hash, raised_at_ms)
+         SELECT ?1, ?2, 'custodian.renewed_after_revocation', ?3, ?4, ?5
+         WHERE NOT EXISTS (SELECT 1 FROM trust_custodian_alerts
+           WHERE server_instance_id = ?1 AND tenant_id = ?2
+             AND kind = 'custodian.renewed_after_revocation' AND signing_key_id = ?3)",
+        params![instance, tenant, hex(&issuer), container, wire(now)?],
+    )?;
+    Ok(())
 }
 
 /// D-6 (b), sticky lapse, for `record` first seen in evaluation `seen`. Once
@@ -1195,12 +1257,12 @@ mod tests {
             (extending(&x, &x, 9, L - 1), true),
         ];
         let all: Vec<Vec<u8>> = cases.iter().map(|(c, _)| c.clone()).collect();
-        let kept = prepare(&db, &B, &[page(&[&d, &x], all)]).unwrap();
+        let kept = prepare(&db, &B, &[page(&[&d, &x], all)], 0).unwrap();
         for (c, expected) in &cases {
             assert_eq!(kept[0].containers.contains(c), *expected, "{}", hash(c));
         }
         let unverifiable = signed_by(&d, 10, L - 1);
-        let kept = prepare(&db, &B, &[page(&[&x], vec![unverifiable.clone()])]).unwrap();
+        let kept = prepare(&db, &B, &[page(&[&x], vec![unverifiable.clone()])], 0).unwrap();
         assert_eq!(kept[0].containers, [unverifiable]);
     }
 
@@ -1303,6 +1365,9 @@ mod tests {
             .execute_batch(&format!(
                 "DROP TABLE trust_key_holdings;
                  DROP TABLE trust_fleet_activations;
+                 DROP TABLE skipped_heads;
+                 DROP TABLE trust_custodian_alerts;
+                 DROP TABLE revert_swaps;
                  UPDATE schema_meta SET schema_version = 6, min_reader_version = 6;
                  INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{a}', 'BOOTSTRAP', 0);
                  INSERT INTO trust_evaluations VALUES (4, '{i}', '{t}', 0);",
@@ -1353,6 +1418,9 @@ mod tests {
             .execute_batch(&format!(
                 "DROP TABLE trust_key_holdings;
                  DROP TABLE trust_fleet_activations;
+                 DROP TABLE skipped_heads;
+                 DROP TABLE trust_custodian_alerts;
+                 DROP TABLE revert_swaps;
                  UPDATE schema_meta SET schema_version = 6, min_reader_version = 6;
                  INSERT INTO trust_anchors VALUES ('{i}', '{t}', '{a}', 'BOOTSTRAP', 0);
                  INSERT INTO trust_evaluations VALUES (4, '{i}', '{t}', 0);",
