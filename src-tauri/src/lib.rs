@@ -4439,6 +4439,534 @@ mod custody_tests {
             .unwrap()
     }
 
+    // ADR 0002 rule 6 and rule 1 "Sticky proven revocation" (critic r7 M23,
+    // r8 minor 4) at the ledger, and D-6 (a)'s `renewed_after_revocation`.
+
+    fn d_subject() -> shardx_core::authz_record::GrantSubject {
+        shardx_core::authz_record::GrantSubject::Device {
+            account_id: [6; 16],
+            device_id: D_DEVICE,
+            signing_key_id: d_id(),
+            hpke_key_id: [13; 32],
+        }
+    }
+
+    /// This device's tenant-scoped grant of `capability` to `subject`.
+    fn granted(
+        me: &Me,
+        subject: shardx_core::authz_record::GrantSubject,
+        capability: shardx_core::authz_record::Capability,
+        replay: u8,
+    ) -> Vec<u8> {
+        use shardx_core::authz_record::*;
+        let g = TenantCapabilityGrantV2 {
+            common: common(replay),
+            subject,
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability,
+        };
+        build_record(&me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+    }
+
+    /// Device `seed`, approved for the tenant by `issuer`: its subject, key
+    /// and the approval; with `custodian`, also appointed by this device and
+    /// holding `device.revoke`.
+    fn member(
+        me: &Me,
+        issuer: &shardx_core::signing::Ed25519SigningKey,
+        seed: u8,
+        custodian: bool,
+    ) -> (
+        shardx_core::authz_record::GrantSubject,
+        [u8; 32],
+        Vec<Vec<u8>>,
+    ) {
+        use shardx_core::authz_record::*;
+        let sk = shardx_core::signing::Ed25519SigningKey::from_bytes(&[seed; 32]);
+        let key = shardx_core::keys::signing_key_id(sk.verifying_key().as_bytes());
+        let subject = GrantSubject::Device {
+            account_id: [seed; 16],
+            device_id: [seed + 1; 16],
+            signing_key_id: key,
+            hpke_key_id: [seed; 32],
+        };
+        let approval = DeviceApprovalV2 {
+            common: common(seed),
+            subject_account_id: [seed; 16],
+            subject_device_id: [seed + 1; 16],
+            subject_signing_key_id: key,
+            subject_hpke_key_id: [seed; 32],
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let mut records = vec![build_record(
+            issuer,
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        )];
+        if custodian {
+            let root = TenantRootKeyGrantV2 {
+                common: common(seed + 2),
+                variant: RootGrantVariant::ExistingRootGrant,
+                root_key_id: [8; 32],
+                root_generation: 0,
+                subject_account_id: [seed; 16],
+                subject_device_id: [seed + 1; 16],
+                subject_signing_key_id: key,
+                recipient_hpke_key_id: [seed; 32],
+                subject_device_approval_replay_id: [seed; 16],
+                hpke_encapped_key_bytes: [3; 32],
+                hpke_wrapped_trk_bytes: [4; 48],
+            };
+            records.push(build_record(
+                &me.sk,
+                DOMAIN_TENANT_ROOT_KEY_GRANT,
+                &root.encode(),
+            ));
+            records.push(granted(
+                me,
+                subject.clone(),
+                Capability::DeviceRevoke,
+                seed + 3,
+            ));
+        }
+        (subject, key, records)
+    }
+
+    /// `issuer`'s signed revocation of the device `subject`, issued at `T0`.
+    fn revocation_of(
+        issuer: &shardx_core::signing::Ed25519SigningKey,
+        subject: &shardx_core::authz_record::GrantSubject,
+        replay: u8,
+    ) -> Vec<u8> {
+        use shardx_core::authz_record::*;
+        let GrantSubject::Device {
+            account_id,
+            device_id,
+            signing_key_id,
+            hpke_key_id,
+        } = subject
+        else {
+            panic!("a device")
+        };
+        let r = DeviceRevocationV2 {
+            common: common(replay),
+            subject_account_id: *account_id,
+            subject_device_id: *device_id,
+            subject_signing_key_id: *signing_key_id,
+            subject_hpke_key_id: *hpke_key_id,
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        build_record(issuer, DOMAIN_DEVICE_REVOCATION, &r.encode())
+    }
+
+    /// D custodian with `device.revoke`, plus `extra`.
+    fn with_d_revoking(me: &Me, extra: &[Vec<u8>]) -> Vec<Page> {
+        let mut all = vec![granted(
+            me,
+            d_subject(),
+            shardx_core::authz_record::Capability::DeviceRevoke,
+            0x8f,
+        )];
+        all.extend_from_slice(extra);
+        with_d(me, evidence(me, Vec::new()), Some(T0 + 300 * DAY), all)
+    }
+
+    fn proven_keys(path: &std::path::Path) -> Vec<String> {
+        let mut keys: Vec<String> = proven(path).into_iter().map(|(k, _)| k).collect();
+        keys.sort();
+        keys
+    }
+
+    /// The chain the ledger at `path` evaluates `pages` to at `T0 + DAY`.
+    fn chain_at(path: &std::path::Path, pages: &[Page]) -> shardx_core::trust_chain::TrustChain {
+        let db = team::db::Db::open_at(path).unwrap();
+        let me = me();
+        team::ledger::evaluate(&db, &BINDING, &me.to.signing_key_id, pages, T0 + DAY)
+            .unwrap()
+            .expect("the evidence verifies")
+            .1
+    }
+
+    /// M23 refused: once this device counts D's revocation, a revocation of
+    /// honest device H signed by D's key, dated inside D's window and first
+    /// seen afterwards, is not counted: H is not withdrawn, so no revert
+    /// skips H's heads.
+    #[test]
+    fn revert_refuses_a_backdated_revocation_by_a_sticky_revoked_key() {
+        let me = me();
+        let (h, h_key, h_approval) = member(&me, &me.sk, 0x48, false);
+        let backdated = revocation_of(&d_key(), &h, 0x90);
+        let (_dir, path) = ledger_at();
+        collect(
+            &path,
+            &with_d_revoking(
+                &me,
+                &[h_approval.clone(), vec![revoke_d(&me, |_| {})]].concat(),
+            ),
+            &[],
+            1,
+        );
+        assert_eq!(proven_keys(&path), [hex(&d_id())]);
+        collect(
+            &path,
+            &with_d_revoking(&me, &[h_approval, vec![backdated]].concat()),
+            &[],
+            1,
+        );
+        assert_eq!(proven_keys(&path), [hex(&d_id())], "H is not counted");
+        let db = team::db::Db::open_at(&path).unwrap();
+        assert!(!team::ledger::withdrawn(&db, &BINDING, &h_key).unwrap());
+    }
+
+    /// D's approval and `profile.commit` of a fake committer F, signed by D's
+    /// key and first seen after D's revocation was counted.
+    fn appointed_by_d(me: &Me) -> ([u8; 32], Vec<Vec<u8>>) {
+        use shardx_core::authz_record::*;
+        let (f, f_key, mut records) = member(me, &d_key(), 0x68, false);
+        let commit = TenantCapabilityGrantV2 {
+            common: common(0x6a),
+            subject: f,
+            scope_kind: CapabilityScopeKind::Fleet,
+            scope_id: FLEET,
+            capability: Capability::ProfileCommit,
+        };
+        records.push(build_record(
+            &d_key(),
+            DOMAIN_TENANT_CAPABILITY_GRANT,
+            &commit.encode(),
+        ));
+        records.push(granted(me, d_subject(), Capability::DeviceApprove, 0x8e));
+        (f_key, records)
+    }
+
+    /// Whether `key` may commit to `FLEET` now: what a pull asks of a new
+    /// head's signer (rule 6, first acceptance).
+    fn commits(chain: &shardx_core::trust_chain::TrustChain, key: &[u8; 32]) -> bool {
+        use shardx_core::trust_chain::Scope;
+        let now = T0 + DAY;
+        chain.approval_valid_at(key, Scope::Fleet(FLEET), now)
+            && chain.capability_at(
+                key,
+                shardx_core::authz_record::Capability::ProfileCommit,
+                Scope::Fleet(FLEET),
+                now,
+            )
+    }
+
+    /// M23 refused: an approval and `profile.commit` of fake committer F,
+    /// signed by D's key and first seen after D's revocation was counted, do
+    /// not count, so F's head is refused. Without that history they do.
+    #[test]
+    fn a_head_by_a_committer_a_sticky_revoked_key_appointed_is_refused() {
+        let me = me();
+        let (f, by_d) = appointed_by_d(&me);
+        let (_fresh, fresh) = ledger_at();
+        assert!(commits(&chain_at(&fresh, &with_d_revoking(&me, &by_d)), &f));
+        let (_dir, path) = ledger_at();
+        collect(
+            &path,
+            &with_d_revoking(&me, &[revoke_d(&me, |_| {})]),
+            &[],
+            1,
+        );
+        assert_eq!(proven_keys(&path), [hex(&d_id())]);
+        let later = with_d_revoking(&me, &by_d);
+        collect(&path, &later, &[], 1);
+        assert!(!commits(&chain_at(&path, &later), &f));
+    }
+
+    /// M23 accepted ("Order"): what D issued and this device first saw before
+    /// counting D's revocation keeps its standing: F may still commit.
+    #[test]
+    fn records_first_seen_before_a_count_keep_their_standing() {
+        let me = me();
+        let (f, by_d) = appointed_by_d(&me);
+        let (_dir, path) = ledger_at();
+        collect(&path, &with_d_revoking(&me, &by_d), &[], 1);
+        let counting = [by_d.clone(), vec![revoke_d(&me, |_| {})]].concat();
+        collect(&path, &with_d_revoking(&me, &counting), &[], 1);
+        assert_eq!(proven_keys(&path), [hex(&d_id())]);
+        let later = with_d_revoking(&me, &by_d);
+        collect(&path, &later, &[], 1);
+        assert!(commits(&chain_at(&path, &later), &f));
+    }
+
+    /// Documented limit, mutual revocation (critic r8 minor 4): a new device
+    /// that sees, in one evaluation, custodian E's revocation of D and D's
+    /// revocation of E counts both, so it holds E revoked too.
+    #[test]
+    fn limit_mutual_revocation_counts_both_on_a_new_device() {
+        let me = me();
+        let (e, e_key, mut extra) = member(&me, &me.sk, 0x58, true);
+        let e_sk = shardx_core::signing::Ed25519SigningKey::from_bytes(&[0x58; 32]);
+        extra.push(revocation_of(&e_sk, &d_subject(), 0x91));
+        extra.push(revocation_of(&d_key(), &e, 0x92));
+        let mut pages = with_d_revoking(&me, &extra);
+        pages[0]
+            .signing_public_keys
+            .push(e_sk.verifying_key().to_bytes());
+        let (_dir, path) = ledger_at();
+        collect(&path, &pages, &[], 1);
+        let mut both = vec![hex(&d_id()), hex(&e_key)];
+        both.sort();
+        assert_eq!(proven_keys(&path), both);
+    }
+
+    /// Documented limit: a new device that fetches D's revocation and D's
+    /// backdated revocation of H in one evaluation counts the backdated one.
+    #[test]
+    fn limit_a_new_device_counts_a_backdated_revocation_with_its_revoker() {
+        let me = me();
+        let (h, h_key, mut extra) = member(&me, &me.sk, 0x48, false);
+        extra.push(revoke_d(&me, |_| {}));
+        extra.push(revocation_of(&d_key(), &h, 0x90));
+        let (_dir, path) = ledger_at();
+        collect(&path, &with_d_revoking(&me, &extra), &[], 1);
+        let mut both = vec![hex(&d_id()), hex(&h_key)];
+        both.sort();
+        assert_eq!(proven_keys(&path), both);
+    }
+
+    /// Every custodian alert at `path`: kind, key, container and time.
+    fn alerts(path: &std::path::Path) -> Vec<(String, String, String, i64)> {
+        let db = team::db::Db::open_at(path).unwrap();
+        let mut s = db
+            .conn
+            .prepare(
+                "SELECT kind, signing_key_id, signed_container_hash, raised_at_ms
+                 FROM trust_custodian_alerts ORDER BY signing_key_id",
+            )
+            .unwrap();
+        let rows = s
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        rows
+    }
+
+    fn hash_of(container: &[u8]) -> String {
+        hex(
+            shardx_core::authz_record::AuthorizationRecord::parse(container)
+                .unwrap()
+                .signed_container_hash(),
+        )
+    }
+
+    /// A ledger that counted this device's revocation of D, at `T0 + DAY`.
+    fn counted_d(me: &Me) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = ledger_at();
+        collect(
+            &path,
+            &with_d(
+                me,
+                evidence(me, Vec::new()),
+                Some(T0 + 300 * DAY),
+                vec![revoke_d(me, |_| {})],
+            ),
+            &[],
+            1,
+        );
+        assert_eq!(proven_keys(&path), [hex(&d_id())]);
+        (dir, path)
+    }
+
+    /// `extra` with D's custody but not its revocation (the server omits it).
+    fn omitting(me: &Me, extra: Vec<Vec<u8>>) -> Vec<Page> {
+        with_d(me, evidence(me, Vec::new()), Some(T0 + 300 * DAY), extra)
+    }
+
+    /// M23 refused (D-6 (a)): after D's revocation is counted, a backdated
+    /// self-renewal of D does not count and raises exactly one
+    /// `custodian.renewed_after_revocation`, naming D and the renewal.
+    #[test]
+    fn a_backdated_self_renewal_after_a_count_is_refused() {
+        let me = me();
+        let (_dir, path) = counted_d(&me);
+        let before = custodian(&path, &d_id());
+        let renewal = d_root(&d_key(), 0x93, T0 + 10 * DAY, LONG);
+        collect(&path, &omitting(&me, vec![renewal.clone()]), &[], 1);
+        assert_eq!(
+            custodian(&path, &d_id()),
+            before,
+            "the renewal does not count"
+        );
+        assert_eq!(
+            alerts(&path),
+            [(
+                "custodian.renewed_after_revocation".to_string(),
+                hex(&d_id()),
+                hash_of(&renewal),
+                (T0 + DAY) as i64
+            )]
+        );
+    }
+
+    /// Critic B1: a container that names D as its issuer and renews D, but is
+    /// signed by another key, or whose pages omit D's public key, is dropped
+    /// as before and raises nothing.
+    #[test]
+    fn renewed_after_revocation_is_not_raised_for_a_forged_container() {
+        let me = me();
+        let (_dir, path) = counted_d(&me);
+        let before = custodian(&path, &d_id());
+        let other = shardx_core::signing::Ed25519SigningKey::from_bytes(&[0x33; 32]);
+        let renewal = d_root(&d_key(), 0x93, T0 + 10 * DAY, LONG);
+        let payload = shardx_core::authz_record::AuthorizationRecord::parse(&renewal)
+            .unwrap()
+            .canonical_payload_bytes()
+            .to_vec();
+        let forged = {
+            use shardx_core::authz_record::*;
+            use shardx_core::canonical as c;
+            use shardx_core::signing::{SIGNATURE_SUITE_ID_ED25519, SIGNATURE_VERSION};
+            let tbs = vec![
+                ("container_domain", c::t(CONTAINER_DOMAIN)),
+                ("container_version", c::u(CONTAINER_VERSION.into())),
+                ("payload_domain", c::t(DOMAIN_TENANT_ROOT_KEY_GRANT)),
+                ("payload_version", c::u(PAYLOAD_VERSION.into())),
+                ("canonical_payload_bytes", c::b(&payload)),
+                ("payload_sha256", c::b(&c::sha256(&payload))),
+                (
+                    "signature_suite_id",
+                    c::u(SIGNATURE_SUITE_ID_ED25519.into()),
+                ),
+                ("signature_version", c::u(SIGNATURE_VERSION.into())),
+                ("issuer_signing_key_id", c::b(&d_id())),
+            ];
+            shardx_core::signing::build_signed_container(&other, tbs).exact_bytes
+        };
+        let record = shardx_core::authz_record::AuthorizationRecord::parse(&forged).unwrap();
+        assert_eq!(record.issuer_signing_key_id(), &d_id());
+        let mut pages = omitting(&me, vec![forged]);
+        pages[0]
+            .signing_public_keys
+            .push(other.verifying_key().to_bytes());
+        collect(&path, &pages, &[], 1);
+        let genuine = d_root(&d_key(), 0x94, T0 + 10 * DAY, LONG);
+        let mut keyless = omitting(&me, vec![genuine]);
+        let d_pk = d_key().verifying_key().to_bytes();
+        keyless[0].signing_public_keys.retain(|pk| *pk != d_pk);
+        collect(&path, &keyless, &[], 1);
+        assert_eq!(custodian(&path, &d_id()), before);
+        assert!(alerts(&path).is_empty());
+    }
+
+    /// Critic B1: one row per revoked key, whatever a server sends: two
+    /// genuine renewals in one pull, a third in another, then the same
+    /// evidence again leave one row naming the first and its time.
+    #[test]
+    fn renewed_after_revocation_is_bounded_per_key() {
+        let me = me();
+        let (_dir, path) = counted_d(&me);
+        let r = |replay, from| d_root(&d_key(), replay, from, LONG);
+        let (first, second, third) = (
+            r(0x93, T0 + 10 * DAY),
+            r(0x94, T0 + 11 * DAY),
+            r(0x95, T0 + 12 * DAY),
+        );
+        collect_at(
+            &path,
+            &omitting(&me, vec![first.clone(), second]),
+            &[],
+            1,
+            T0 + DAY,
+        );
+        collect_at(
+            &path,
+            &omitting(&me, vec![third.clone()]),
+            &[],
+            1,
+            T0 + 2 * DAY,
+        );
+        collect_at(&path, &omitting(&me, vec![third]), &[], 1, T0 + 3 * DAY);
+        assert_eq!(
+            alerts(&path),
+            [(
+                "custodian.renewed_after_revocation".to_string(),
+                hex(&d_id()),
+                hash_of(&first),
+                (T0 + DAY) as i64
+            )]
+        );
+    }
+
+    /// "Order": a renewal first seen no later than the counting evaluation
+    /// keeps its standing and is never refused, so it raises nothing.
+    #[test]
+    fn renewed_after_revocation_is_not_raised_for_a_renewal_first_seen_before_the_count() {
+        let me = me();
+        let renewal = d_root(&d_key(), 0x93, T0 + 10 * DAY, LONG);
+        let (_dir, path) = ledger_at();
+        collect(
+            &path,
+            &omitting(&me, vec![renewal.clone(), revoke_d(&me, |_| {})]),
+            &[],
+            1,
+        );
+        assert_eq!(proven_keys(&path), [hex(&d_id())]);
+        collect(&path, &omitting(&me, vec![renewal]), &[], 1);
+        assert!(alerts(&path).is_empty());
+    }
+
+    /// Only D renewing itself raises: a renewal of D by another custodian is
+    /// not refused, and a root grant D signs for another key is refused
+    /// without an alert.
+    #[test]
+    fn renewed_after_revocation_is_not_raised_for_a_renewal_by_another_custodian() {
+        use shardx_core::authz_record::*;
+        let me = me();
+        let (_dir, path) = counted_d(&me);
+        let by_me = d_root(&me.sk, 0x93, T0 + 10 * DAY, LONG);
+        let for_other = TenantRootKeyGrantV2 {
+            common: common(0x94),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: [0x58; 16],
+            subject_device_id: [0x59; 16],
+            subject_signing_key_id: [0x5a; 32],
+            recipient_hpke_key_id: [0x58; 32],
+            subject_device_approval_replay_id: [0x58; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let for_other = build_record(&d_key(), DOMAIN_TENANT_ROOT_KEY_GRANT, &for_other.encode());
+        collect(&path, &omitting(&me, vec![by_me, for_other]), &[], 1);
+        assert!(alerts(&path).is_empty());
+    }
+
+    /// Local distrust alone raises nothing; a key both distrusted and
+    /// revoked by a counted `DeviceRevocationV2` does.
+    #[test]
+    fn renewed_after_revocation_is_not_raised_for_a_distrusted_key() {
+        let me = me();
+        let (_dir, path) = ledger_at();
+        collect(&path, &omitting(&me, Vec::new()), &[], 1);
+        {
+            let db = team::db::Db::open_at(&path).unwrap();
+            team::ledger::distrust_key(&db, &BINDING, &d_id(), T0 + DAY).unwrap();
+        }
+        let first = d_root(&d_key(), 0x93, T0 + 10 * DAY, LONG);
+        collect(&path, &omitting(&me, vec![first]), &[], 1);
+        assert!(alerts(&path).is_empty(), "distrusted only");
+        collect(&path, &omitting(&me, vec![revoke_d(&me, |_| {})]), &[], 1);
+        assert_eq!(proven(&path).len(), 2, "distrusted and revoked");
+        let second = d_root(&d_key(), 0x94, T0 + 11 * DAY, LONG);
+        collect(&path, &omitting(&me, vec![second.clone()]), &[], 1);
+        assert_eq!(
+            alerts(&path),
+            [(
+                "custodian.renewed_after_revocation".to_string(),
+                hex(&d_id()),
+                hash_of(&second),
+                (T0 + DAY) as i64
+            )]
+        );
+    }
+
     /// A server cannot make D's lapse or key age worse for good: leaving out
     /// every root grant of D records no lapse while D's known custody runs,
     /// and a root grant for D from a key with no custody, dated 1094 days
