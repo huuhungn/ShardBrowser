@@ -1634,6 +1634,13 @@ async fn push_inner(
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
+            // A revocation recorded since the seal: no COMMIT on that pin.
+            "READY"
+                if revert.is_none() && pin_withdrawn(client, access, &mut db, dev, &b).await? =>
+            {
+                let e = signer_revoked(&db, &b);
+                return Err(fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await);
+            }
             "READY" => commit(client, access, &mut db, &b, lease, &commit_op).await?,
             _ => return Err(bad("upload_sessions.state")),
         }
@@ -1810,17 +1817,14 @@ async fn revert_inner(
                 Ok(w)
             };
             // A revert lease with nothing uploaded whose run is gone (another
-            // device committed over it) is released; the quarantine stays.
-            // One the walk quarantined for another reason is kept, as the
-            // release would mark it available.
+            // device committed over it, or the walk quarantined it) is
+            // released; the quarantine stays.
             let w = match (walk.await, b.lease) {
                 (Ok(w), _) => w,
-                (Err(e), Some(lease))
-                    if bound(&db, local)?.error.as_deref() == Some("SIGNER_REVOKED") =>
-                {
+                (Err(e), Some(lease)) => {
                     return Err(abandon(client, access, &mut db, &b, lease, e).await)
                 }
-                (Err(e), _) => return Err(e),
+                (Err(e), None) => return Err(e),
             };
             let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
                 unreachable!("the walk above checked both");
@@ -3231,11 +3235,11 @@ async fn release_reply(
         params![b.local, lease],
     )?;
     // A revert lease released without its `R` keeps the quarantine (rule 6:
-    // only a revert commits on top of `Jn`).
+    // only a revert commits on top of `Jn`), as does any quarantined binding.
     tx.execute(
         "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL, lease_expires_at = NULL,
            sync_state = CASE WHEN last_error_code = 'SIGNER_REVOKED'
-             THEN 'QUARANTINED' ELSE 'AVAILABLE' END
+             OR sync_state = 'QUARANTINED' THEN 'QUARANTINED' ELSE 'AVAILABLE' END
          WHERE local_profile_id = ?1 AND lease_id = ?2",
         params![b.local, lease],
     )?;
@@ -3789,7 +3793,8 @@ fn skip(tx: &rusqlite::Connection, b: &Bound, run: &Run, now: u64) -> Result<()>
             continue;
         }
         // Not ON CONFLICT: the insert-once trigger refuses an open head. A
-        // head whose earlier row was resolved opens a new one.
+        // head whose earlier row was resolved opens a new one, unless it was
+        // accepted by this same `R` (a retried revert crosses it again).
         tx.execute(
             "INSERT INTO skipped_heads(server_instance_id, tenant_id, remote_profile_id,
                local_profile_id, target_version, head_hash, signer_signing_key_id,
@@ -3800,7 +3805,9 @@ fn skip(tx: &rusqlite::Connection, b: &Bound, run: &Run, now: u64) -> Result<()>
                CASE WHEN ?10 IS NULL THEN NULL ELSE ?11 END
              WHERE NOT EXISTS (SELECT 1 FROM skipped_heads
                WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
-                 AND target_version = ?5 AND head_hash = ?6 AND resolution IS NULL)",
+                 AND target_version = ?5 AND head_hash = ?6 AND (resolution IS NULL
+                   OR (?10 IS NOT NULL AND resolution = 'ACCEPTED'
+                     AND accepted_head_hash = ?10)))",
             params![
                 instance,
                 tenant,
@@ -11156,36 +11163,102 @@ mod tests {
         assert_eq!(marker(&udd), "v3");
     }
 
-    /// Architect non-blocking 2: a revocation of the pin's signer recorded
-    /// between an ordinary checkout and its seal releases the lease instead
-    /// of committing on top of that pin.
+    /// Re-review blocking: a revert that fails after filing the accepted
+    /// runs, retried, files each of them once.
     #[test]
-    fn a_revocation_recorded_after_checkout_abandons_an_ordinary_push() {
+    fn a_retried_revert_files_each_accepted_run_once() {
         let w = world();
-        let heads = chain_of(&w, &[&w.me.sk, &author()]);
-        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &w.me.sk, &author()]);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
         let d = second(&w);
-        pin_at(&w, &d, &heads, 2);
+        w.fake().refuse.push(("3", 500));
+        w.pull(&d.path().join("out")).unwrap_err();
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        w.fake().refuse.push(("3", 500));
+        w.revert(&udd).unwrap_err();
+        assert_eq!(w.revert(&udd).unwrap().version, 5);
+        let r = SignedSnapshotManifestV2::parse(&w.fake().manifests[&5])
+            .unwrap()
+            .head_hash();
+        assert_eq!(
+            skipped(&w),
+            [accepted_by(2, heads[2], 1), accepted_by(4, r, 3)]
+        );
+    }
+
+    /// Re-review non-blocking 1: a held revert lease with nothing uploaded
+    /// whose walk finds a rollback is released; the binding keeps the
+    /// rollback quarantine and can then be unbound.
+    #[test]
+    fn a_revert_lease_held_over_a_rollback_is_released() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let crash = "CREATE TRIGGER crash BEFORE INSERT ON operations
+             WHEN NEW.kind = 'UPLOAD' BEGIN SELECT RAISE(ABORT, 'crash'); END";
+        w.db().conn.execute(crash, []).unwrap();
+        w.revert(&udd).unwrap_err();
+        w.db().conn.execute("DROP TRIGGER crash", []).unwrap();
+        w.fake().listed = Some((0, None));
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.headRollback"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            0
+        );
+        let (state, reason, _, _, _) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("QUARANTINED", Some("HEAD_ROLLBACK_DETECTED"))
+        );
+        unbind(LOCAL, SERVER, NOW).unwrap();
+    }
+
+    /// The SQL that records `A`'s key as distrusted, as another writer would.
+    fn distrust_author() -> String {
         let (instance, tenant) = (hex(&INSTANCE), hex(&TENANT));
-        w.fake().on_checkout = Some(format!(
+        format!(
             "INSERT INTO trust_proven_revocations
              SELECT '{instance}', '{tenant}', '{}', 'LOCAL_DISTRUST',
                coalesce(max(evaluation_id), 0), 0, NULL
              FROM trust_evaluations WHERE server_instance_id = '{instance}'
                AND tenant_id = '{tenant}'",
             hex(&key_id_of(&author()))
-        ));
-        let uploads = w.sent("POST", "/uploads").len();
-        let err = w.push().unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
-        assert_eq!(w.sent("POST", "/release").len(), 1);
-        assert_eq!(w.sent("POST", "/uploads").len(), uploads);
-        assert_eq!(w.fake().commits, 2);
-        assert_eq!(
-            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
-            0
-        );
-        revoked_at(&w, 2);
+        )
+    }
+
+    /// Architect non-blocking 2: a revocation of the pin's signer recorded
+    /// after an ordinary checkout (before its seal, or during its upload)
+    /// releases the lease instead of committing on top of that pin.
+    #[test]
+    fn a_revocation_recorded_after_checkout_abandons_an_ordinary_push() {
+        for during_upload in [false, true] {
+            let w = world();
+            let heads = chain_of(&w, &[&w.me.sk, &author()]);
+            serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+            let d = second(&w);
+            pin_at(&w, &d, &heads, 2);
+            if during_upload {
+                w.fake().on_patch = Some(distrust_author());
+            } else {
+                w.fake().on_checkout = Some(distrust_author());
+            }
+            let uploads = w.sent("POST", "/uploads").len();
+            let sent = w.sent("POST", "/commit").len();
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.signerRevoked"), "{during_upload}: {err:#}");
+            assert_eq!(w.sent("POST", "/release").len(), 1, "{during_upload}");
+            let uploaded = w.sent("POST", "/uploads").len() - uploads;
+            assert_eq!(uploaded, usize::from(during_upload));
+            assert_eq!(w.sent("POST", "/commit").len(), sent, "{during_upload}");
+            assert_eq!(w.fake().commits, 2);
+            assert_eq!(
+                w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+                0
+            );
+            revoked_at(&w, 2);
+        }
     }
 
     /// Architect non-blocking 4: the launch-time settle reads nothing
