@@ -26,3 +26,7 @@ on the first, plus the blind verifier round.
   left the decrypted revert staging behind, and a device whose own key was
   withdrawn still sent a prepared revert commit that had not landed. Fixed with
   regression tests in the same change; round 5 runs on the fixed main.
+- [codex-revert-round-5.md](codex-revert-round-5.md): the Codex blind verifier,
+  round 5, at bf09f512. VERDICT: FAIL with one defect: a custodian-signed
+  revocation naming the right signing key but another device was counted.
+  Fixed with regression tests in the same change; round 6 runs on the fixed main.

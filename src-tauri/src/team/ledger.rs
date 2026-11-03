@@ -1108,7 +1108,10 @@ fn keep_key_state(
 /// issuer was a custodian holding a device-scoped `device.revoke` covering
 /// the subject's approval scope at its `issued_at_ms` (the fleet when every
 /// approval of the subject names it, else the tenant, as the server files
-/// it), and is still a custodian when this device first saw it.
+/// it), and is still a custodian when this device first saw it. Its subject
+/// device must be one a usable approval of its subject key names, so the
+/// record revokes that key's own device; until such an approval is seen, it
+/// does not count.
 fn counted(
     chain: &TrustChain,
     binding: &Binding,
@@ -1124,6 +1127,7 @@ fn counted(
     let t = d.common.issued_at_ms;
     (d.common.tenant_id == binding.tenant_id
         && d.common.server_instance_id == binding.server_instance_id
+        && chain.approves_device(&d.subject_signing_key_id, &d.subject_device_id)
         && chain.custodian_at(&issuer, t)
         && chain.capability_at(
             &issuer,

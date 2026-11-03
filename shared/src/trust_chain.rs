@@ -534,6 +534,18 @@ impl TrustChain {
         }
     }
 
+    /// Rule 6: a usable approval of `key` from an allowed issuer names
+    /// `device`, so a revocation of `device` and `key` is one of `key`'s own
+    /// device. The same approvals as [`Self::revocation_scope`].
+    pub fn approves_device(&self, key: &KeyId, device: &[u8; 16]) -> bool {
+        self.approvals_by_subject
+            .get(key)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.evidence.approvals[i])
+            .any(|a| a.payload.subject_device_id == *device && self.approval_issuer_ok(a))
+    }
+
     /// Rule 6, reported revoked: the server reported revoked, at or before
     /// `t`, a device that a usable approval of `key` names. Only approvals
     /// from an allowed issuer count, as only those give `key` its windows.
@@ -1384,6 +1396,19 @@ mod tests {
         assert!(!c.reported_revoked_at(&b.key(), T0 + 20 * DAY - 1));
         assert!(c.reported_revoked_at(&b.key(), T0 + 20 * DAY));
         assert!(!c.reported_revoked_at(&m.key(), T0 + 50 * DAY));
+    }
+
+    /// Rule 6: a key's device is the one its approval from an allowed issuer
+    /// names, never another device nor one only a self-approval names.
+    #[test]
+    fn a_key_approves_only_the_device_an_allowed_approval_names() {
+        let (a0, b, m) = (Device::new(1), Device::new(2), Device::new(3));
+        let mut evidence = tenant(&a0, &b);
+        evidence.push(approval(&m, &m, 30, T0, T0 + 365 * DAY));
+        let c = chain(page(&[&a0, &b, &m], evidence)).unwrap();
+        assert!(c.approves_device(&b.key(), &b.id));
+        assert!(!c.approves_device(&b.key(), &m.id));
+        assert!(!c.approves_device(&m.key(), &m.id));
     }
 
     /// D-6 (c): a cached `first_not_before` earlier than every root grant the
