@@ -2030,6 +2030,13 @@ pub(crate) fn discard_revert_for_deletion(local: &str, udd: &Path) -> Result<()>
     remove_beside(udd, &UNPACK_LEFTOVERS)
 }
 
+/// A profile deleted for good keeps no staging, and needs no team database
+/// for it: with the profile gone, a swap still pending no longer matters.
+pub(crate) fn discard_revert_for_removal(udd: &Path) -> Result<()> {
+    remove_beside(udd, &SWAP_DIRS)?;
+    remove_beside(udd, &UNPACK_LEFTOVERS)
+}
+
 /// ADR 0002 rule 6, "Committer side": commits `R` on top of `Jn`, the last
 /// head of the run of proven-revoked heads open at the listed head, with
 /// the content of `P`, the newest head below it whose signer is valid and

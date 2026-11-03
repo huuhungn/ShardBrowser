@@ -762,8 +762,9 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
 pub fn delete(id: &str) -> Result<()> {
     let path = path_for(id)?;
     let udd = store::user_data_root()?.join(id);
-    // Also reached without the trash (a folder delete's fallback).
-    crate::team::sync::discard_revert_for_deletion(id, &udd)?;
+    // The trash settles a pending swap first and fails closed; reached
+    // without it (a folder delete's fallback) the profile is gone for good.
+    crate::team::sync::discard_revert_for_removal(&udd)?;
     let mut config_deleted = false;
     if path.exists() {
         fs::remove_file(&path)?;
@@ -1694,6 +1695,35 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    #[test]
+    fn a_delete_for_good_removes_revert_staging_without_the_team_database() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let db = crate::team::db::Db::path().unwrap();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"not a database").unwrap();
+        let id = new_profile("Staged", &[]);
+        let udd = store::user_data_root().unwrap().join(&id);
+        let dirs = [
+            ".revert-staging",
+            ".revert-old",
+            ".revert-staging.incoming",
+            ".revert-staging.backup",
+        ]
+        .map(|suffix| {
+            let dir = crate::team::sync::beside(&udd, suffix);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        // The trash keeps a restorable profile, so it still fails closed.
+        crate::trash::move_to_trash(&id).unwrap_err();
+        assert!(load_raw(&id).is_ok());
+        assert!(dirs.iter().all(|d| d.exists()));
+
+        delete(&id).unwrap();
+        assert!(load_raw(&id).is_err());
+        assert!(dirs.iter().all(|d| !d.exists()), "removed with the profile");
     }
 
     #[test]
