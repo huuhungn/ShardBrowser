@@ -9,6 +9,11 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
   carries the fixes for verifier findings B1 to B7, N1, N2, F1, R1 and R2
   (section 8). The first packet reviewed the head of PR #212
   (`g2/trk-at-rest`, 5c1cd7b8).
+- **Hashes refreshed:** 2026-11-03, at `main` a4332d76. The Team UI phase
+  (PRs #229 to #243) changed cited files: the rule-6 revert, schema 9, the
+  Team page and the device check on a counted revocation. The G2-wide verifiers
+  did not rerun on those changes; the rule-6 Codex verifier did, and round 6
+  returned PASS on a4332d76 (`docs/team-ui-evidence/codex-revert-round-6.md`).
 - **Plan:** `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md`.
   The G2 rows are cited by plan line; lines after about L900 are 2 lower in
   older citations (test names such as `l2259_g2_54_...` keep the old numbers).

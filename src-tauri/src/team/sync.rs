@@ -13641,4 +13641,91 @@ mod tests {
         assert!(skipped(&w)[0].1.is_none(), "the run is still open");
         settled(&w, &udd);
     }
+
+    // Independent round-6 probe: inspect every committed pin update, not
+    // just the final binding, while accepting a stacked revoked run.
+    #[test]
+    fn a_stacked_run_never_temporarily_pins_a_rejected_head() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &author(), &w.me.sk]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        w.db()
+            .conn
+            .execute_batch(
+                "CREATE TABLE revert_pin_log(version INTEGER NOT NULL);
+             CREATE TRIGGER revert_pin_observer AFTER UPDATE OF remote_version ON profile_bindings
+             WHEN NEW.remote_version != OLD.remote_version
+             BEGIN INSERT INTO revert_pin_log VALUES (NEW.remote_version); END;",
+            )
+            .unwrap();
+
+        w.pull(&d.path().join("profile")).unwrap();
+        let db = w.db();
+        let pins: Vec<i64> = db
+            .conn
+            .prepare("SELECT version FROM revert_pin_log ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(pins, [4], "neither rejected version may ever become a pin");
+        available_at(&w, 4, heads[3]);
+        assert_eq!(
+            skipped(&w),
+            [accepted_by(2, heads[3], 1), accepted_by(3, heads[3], 1)]
+        );
+    }
+
+    // Independent round-6 probe: a server-side commit is not permission to
+    // replace local data before the pin and swap-marker transaction commits.
+    #[test]
+    fn a_revert_pin_failure_preserves_local_data_and_retries() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        std::fs::create_dir_all(udd.join("Default")).unwrap();
+        std::fs::write(udd.join("Default/local-only"), b"unsynced edit").unwrap();
+        let before = tree(&udd);
+        fail_the_pin_write(&w);
+
+        let err = w.revert(&udd).unwrap_err();
+        assert!(format!("{err:#}").contains("injected pin write failure"));
+        assert_eq!(w.fake().version, 3, "R committed on the server");
+        assert!(
+            tree(&udd) == before,
+            "the failed pin must preserve every local file"
+        );
+        let (state, reason, _, version, head) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), reason.as_deref(), version, head),
+            (
+                "UPLOADING",
+                Some("SIGNER_REVOKED"),
+                1,
+                Some(heads[0].to_vec())
+            )
+        );
+        assert!(has(
+            &w.push_from(&udd).unwrap_err(),
+            "sync.revertInProgress"
+        ));
+        assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 0);
+        assert_eq!(skipped(&w), [(2, None, None, 1)]);
+        assert_eq!(marker(&beside(&udd, ".revert-staging")), "v1");
+
+        w.db()
+            .conn
+            .execute_batch("DROP TRIGGER pin_failure")
+            .unwrap();
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        assert_eq!(w.fake().version, 3, "retry does not create another commit");
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
+        assert_eq!(marker(&udd), "v1");
+        assert!(!udd.join("Default/local-only").exists());
+        settled(&w, &udd);
+    }
 }
