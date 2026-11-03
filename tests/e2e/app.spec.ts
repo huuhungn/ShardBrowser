@@ -212,9 +212,74 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
   await expect(page.getByRole("button", { name: /Save settings/ })).toBeEnabled();
 });
 
+test("Team section shows the team card and Settings no longer does", async ({ page }) => {
+  await gotoMocked(page);
+  const intro = page.getByText("Enrol this device with a team server to sync encrypted profiles.");
+
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Team");
+  await expect(page.getByRole("button", { name: "Team", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(intro).toBeVisible();
+  await expect(page.getByLabel("Server URL")).toBeVisible();
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Settings");
+  await expect(intro).toHaveCount(0);
+  await expect(page.getByLabel("Server URL")).toHaveCount(0);
+});
+
+test("Team page shows one badge per binding state", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-profiles");
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+
+  const row = (text: string) => page.getByTestId("team-profile").filter({ hasText: text });
+  for (const [text, badge] of [
+    ["Beta Research", "Local only"],
+    ["VN Automation 001", "Available"],
+    ["team-checked-out", "Checked out here"],
+    ["team-lease-at-risk", "Lease at risk"],
+    ["team-expired-lease", "Lease at risk"],
+    ["team-uploading", "Uploading"],
+    ["team-quarantined", "Quarantined"],
+  ]) {
+    await expect(row(text)).toContainText(badge);
+  }
+  await expect(row("team-quarantined")).toContainText("the server offered an older state");
+  await expect(row("team-reported-only")).toContainText("Quarantined");
+  await expect(row("team-reported-only")).toContainText("signer revoked");
+  await expect(row("team-expired-lease")).not.toContainText("Checked out here");
+  await expect(row("VN Automation 001")).not.toContainText("Quarantined");
+  // Actions belong to a later story; this page only reads state.
+  for (const name of [/publish/i, /check.?in/i, /pull/i, /revert/i, /unbind/i, /join/i]) {
+    await expect(page.getByTestId("team-profile").getByRole("button", { name })).toHaveCount(0);
+  }
+});
+
+test("Team page warns about a custodian renewed after revocation", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-profiles");
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+
+  const alert = page.getByTestId("team-alert");
+  await expect(alert).toHaveCount(1);
+  await expect(alert).toHaveAttribute("role", "alert");
+  await expect(alert).toContainText("renewed after it was revoked");
+  await expect(alert).toContainText("key a1b2c3d4)");
+  await expect(alert).not.toContainText("a1b2c3d4e");
+  await expect(alert).not.toContainText("3210f");
+  await expect(alert.getByRole("button")).toHaveCount(0);
+});
+
+test("Team page shows no alert banner when there are no alerts", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-profiles-quiet");
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  // A bound row's badge only appears once the statuses are loaded.
+  await expect(page.getByTestId("team-profile").filter({ hasText: "team-uploading" })).toContainText("Uploading");
+  await expect(page.getByTestId("team-alert")).toHaveCount(0);
+});
+
 test("the first device sets up root custody once its passphrases agree", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-first-device");
-  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
 
   const card = page.getByTestId("custody-bootstrap");
   await expect(card).toContainText("First device of a new tenant");
@@ -238,7 +303,7 @@ test("the first device sets up root custody once its passphrases agree", async (
 
 test("an interrupted custody setup resumes at its saved bundle without asking for a path", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-first-device-resume");
-  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(page.getByTestId("keys-unprotected")).toContainText("not protected by the OS credential store");
 
   const card = page.getByTestId("custody-bootstrap");
@@ -255,7 +320,7 @@ test("an interrupted custody setup resumes at its saved bundle without asking fo
 
 test("keys the credential store refused move into a key file once both passphrases agree", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-first-device-resume");
-  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
 
   const card = page.getByTestId("keys-unprotected");
   await card.getByLabel("Key file passphrase", { exact: true }).fill("correct horse");
@@ -273,7 +338,7 @@ test("keys the credential store refused move into a key file once both passphras
 
 test("locked keys open with the key file passphrase and stay locked with a wrong one", async ({ page }) => {
   await gotoMocked(page, "/?e2e=team-keys-locked");
-  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
 
   const card = page.getByTestId("keys-locked");
   await expect(card).toContainText("locked in its key file");

@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { t } from "../../../shared/i18n";
-import { teamStatus } from "../model/api";
-import type { TeamStatus } from "../model/types";
+import { safeUiError } from "../../../shared/lib/utils";
+import { teamProfilesStatus, teamStatus } from "../model/api";
+import type { TeamProfilesStatus, TeamStatus } from "../model/types";
 
 /**
  * Fleet status, fetched once and shared.
@@ -47,3 +48,33 @@ export const syncBlockedReason = (s: TeamState): string | undefined => {
   }
   return undefined;
 };
+
+/**
+ * Every binding's sync state and every custodian alert, for the Team page.
+ *
+ * Read on mount and on a manual refresh only: the backend opens the team
+ * database inline for each call, so this is never polled.
+ */
+type TeamProfilesState = {
+  status: TeamProfilesStatus | null;
+  error: string | null;
+  busy: boolean;
+  refresh: () => Promise<void>;
+};
+
+export const useTeamProfiles = create<TeamProfilesState>((set, get) => ({
+  status: null,
+  error: null,
+  busy: false,
+  refresh: async () => {
+    if (get().busy) return;
+    set({ busy: true });
+    try {
+      set({ status: await teamProfilesStatus(), error: null });
+    } catch (e) {
+      set({ error: safeUiError(e) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+}));

@@ -16,7 +16,6 @@ import { StartupCard, McpCard, TagsCard } from "../../features/manage-settings";
 import { DataRootCard } from "../../features/manage-profiles/ui/DataRootCard";
 import { LANG_OPTIONS, useLang, useT } from "../../shared/i18n";
 import { Rich } from "../../shared/i18n/Rich";
-import { TeamCard } from "../../features/manage-team/ui/TeamCard";
 
 function SettingsCard({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -190,10 +189,6 @@ export function SettingsPage() {
 
       <SettingsCard title={t("settings.tags.title")}>
         <TagsCard />
-      </SettingsCard>
-
-      <SettingsCard title={t("settings.team.title")}>
-        <TeamCard />
       </SettingsCard>
 
       <SettingsCard title={t("settings.language.title")}>
