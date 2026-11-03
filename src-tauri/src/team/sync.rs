@@ -1974,13 +1974,15 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Deletes the `P` a revert staged in `<udd>.revert-staging`, unless a
-/// pending swap or a resumable upload (`R` sealed under the held lease, no
-/// release pending) still needs it. An abandoned lease keeps no plaintext,
-/// its lost release included: the revert that resumes it restores `P` again.
+/// Deletes the `P` a revert staged in `<udd>.revert-staging` (and a swap's
+/// `<udd>.revert-old`), unless a pending swap or a resumable upload (`R`
+/// sealed under the held lease, no release pending) still needs it; the
+/// `unpack` leftovers beside the staging always go. An abandoned lease keeps
+/// no plaintext, its lost release included: the revert that resumes it
+/// restores `P` again.
 pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
-    let staging = beside(udd, ".revert-staging");
-    if !staging.exists() {
+    remove_beside(udd, &UNPACK_LEFTOVERS)?;
+    if !SWAP_DIRS.iter().any(|suffix| beside(udd, suffix).exists()) {
         return Ok(());
     }
     if Db::path()?.exists() {
@@ -1999,7 +2001,23 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    std::fs::remove_dir_all(&staging)?;
+    remove_beside(udd, &SWAP_DIRS)
+}
+
+/// The staged `P` and the data a swap replaces, both beside `udd`.
+const SWAP_DIRS: [&str; 2] = [".revert-staging", ".revert-old"];
+
+/// `unpack`'s crash leftovers beside the staging: a partial `.incoming`, and
+/// a `.backup` of a staging that is always built afresh, so nothing needs them.
+const UNPACK_LEFTOVERS: [&str; 2] = [".revert-staging.incoming", ".revert-staging.backup"];
+
+fn remove_beside(udd: &Path, suffixes: &[&str]) -> Result<()> {
+    for suffix in suffixes {
+        let dir = beside(udd, suffix);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+    }
     Ok(())
 }
 
@@ -2008,11 +2026,8 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
 /// a held revert lease (a revert that still has to seal stages `P` again).
 pub(crate) fn discard_revert_for_deletion(local: &str, udd: &Path) -> Result<()> {
     settle_revert_swap(local, udd)?;
-    let staging = beside(udd, ".revert-staging");
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
-    }
-    Ok(())
+    remove_beside(udd, &SWAP_DIRS)?;
+    remove_beside(udd, &UNPACK_LEFTOVERS)
 }
 
 /// ADR 0002 rule 6, "Committer side": commits `R` on top of `Jn`, the last
@@ -11766,6 +11781,61 @@ mod tests {
             !staging.exists(),
             "folder deletion must remove the deleted profile's decrypted revert staging"
         );
+    }
+
+    #[test]
+    fn deletion_unbind_and_discard_remove_the_unpack_leftovers_beside_the_staging() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let root = crate::store::user_data_root().unwrap();
+        let profile = || {
+            let mut s = crate::profile::StoredProfile::default();
+            crate::profile::save_raw(&mut s).unwrap();
+            s.meta.id
+        };
+        // The staging, `unpack`'s two siblings of it, and the swap's old data.
+        let leftovers = |id: &str| {
+            [
+                ".revert-staging",
+                ".revert-staging.incoming",
+                ".revert-staging.backup",
+                ".revert-old",
+            ]
+            .map(|suffix| {
+                let dir = beside(&root.join(id), suffix);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("marker"), b"decrypted P").unwrap();
+                dir
+            })
+        };
+        let id = profile();
+        let dirs = leftovers(&id);
+        crate::profile_delete(id).unwrap();
+        assert!(dirs.iter().all(|d| !d.exists()), "deleted with the profile");
+
+        let id = profile();
+        w.bind(&id, [0xc5; 16], 1, [9; 32]);
+        let dirs = leftovers(&id);
+        crate::team::downgrade::unbind_profile(&id, SERVER, NOW).unwrap();
+        assert!(dirs.iter().all(|d| !d.exists()), "discarded by the unbind");
+
+        // A pending swap keeps the staged `P` and the data it replaces; the
+        // `unpack` leftovers, which nothing resumes, still go.
+        let id = profile();
+        let dirs = leftovers(&id);
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO revert_swaps VALUES (?1, 3, zeroblob(32), 0)",
+                [&id],
+            )
+            .unwrap();
+        discard_revert_staging(&id, &root.join(&id)).unwrap();
+        assert!(
+            dirs[0].exists() && dirs[3].exists(),
+            "the swap still needs them"
+        );
+        assert!(!dirs[1].exists() && !dirs[2].exists(), "never needed");
     }
 
     /// Architect blocking 1: a revert lease held with nothing uploaded (a
