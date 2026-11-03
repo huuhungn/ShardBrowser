@@ -16,3 +16,8 @@ on the first, plus the blind verifier round.
   the local profile, contradicts the ADR's advance-to-P rule; an ordinary pull
   replaces unsynced local edits the same way, so the behavior stays and the
   probe was dropped. Round 3 runs on the fixed main.
+- [codex-revert-round-3.md](codex-revert-round-3.md): the Codex blind verifier,
+  round 3, at 8be4e6a6. VERDICT: FAIL with one defect: a revert could commit the
+  content of a source snapshot whose signer was withdrawn during its download
+  or before a retry. Fixed with regression tests in the same change; round 4
+  runs on the fixed main.

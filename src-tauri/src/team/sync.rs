@@ -1706,6 +1706,39 @@ async fn pin_withdrawn(
     ledger::withdrawn(db, &dev.pin.0, m.signer_signing_key_id())
 }
 
+/// Rule 6: whether the signer of a revert's `P` is now withdrawn, `P` being
+/// the anchor the walk filed with the lowest open audit row of `b`'s run,
+/// so a resumed upload is judged by the `P` it was sealed from. Without such
+/// a row nothing names that `P`, so it counts as withdrawn and the next
+/// revert walks again.
+async fn source_withdrawn(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    b: &Bound,
+) -> Result<bool> {
+    let anchor: Option<(i64, Option<Vec<u8>>)> = db
+        .conn
+        .query_row(
+            "SELECT anchor_version, anchor_head_hash FROM skipped_heads
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
+               AND resolution IS NULL
+             ORDER BY target_version LIMIT 1",
+            params![hex(&b.instance), hex(&b.tenant), hex(&b.profile)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((v, Some(head))) = anchor else {
+        return Ok(true);
+    };
+    let m = manifest(client, access, b, v as u64).await?;
+    if m.head_hash().as_slice() != head.as_slice() {
+        return Err(bad("anchor_head_hash"));
+    }
+    ledger::withdrawn(db, &dev.pin.0, m.signer_signing_key_id())
+}
+
 /// [`push`], or with `revert` the commit of `R` on that base (`Jn`'s version
 /// and head) from the staged `P` in `udd`: only then may a `SIGNER_REVOKED`
 /// quarantine check out, and only then is a revert lease continued.
@@ -1852,16 +1885,18 @@ async fn push_inner(
                 }
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
-            // A revocation recorded since the seal: no COMMIT on that pin. A
-            // head past the pin may be this COMMIT landed with its reply lost,
-            // so the stored request is replayed (G2-37, G2-38).
+            // A revocation recorded since the seal: no COMMIT on that pin, nor
+            // a revert's `R` with the content of a withdrawn `P`. A head past
+            // the pin may be this COMMIT landed with its reply lost, so the
+            // stored request is replayed (G2-37, G2-38).
             "READY"
-                if revert.is_none()
-                    && pin_withdrawn(client, access, &mut db, dev, &b).await?
-                    && {
-                        let head = listed(client, access, &mut db, &b).await?;
-                        head.current_version == b.version && head.current_signed_head_hash == b.head
-                    } =>
+                if match revert {
+                    None => pin_withdrawn(client, access, &mut db, dev, &b).await?,
+                    Some(_) => source_withdrawn(client, access, &mut db, dev, &b).await?,
+                } && {
+                    let head = listed(client, access, &mut db, &b).await?;
+                    head.current_version == b.version && head.current_signed_head_hash == b.head
+                } =>
             {
                 let e = signer_revoked(&db, &b);
                 return Err(fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await);
@@ -13028,6 +13063,148 @@ mod tests {
         assert!(has(&result.unwrap_err(), "sync.signerRevoked"));
         assert_eq!(local_leases(&w), 0, "the lease R's commit used is dropped");
         settled(&w, &udd);
+    }
+
+    // The ADR's open-run exception, compared
+    // with an ordinary successful pull of the exact same snapshot.
+    #[test]
+    fn an_open_run_restore_keeps_what_an_ordinary_pull_keeps() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        let ordinary = d.path().join("ordinary");
+        let open_run = d.path().join("open-run");
+        for out in [&ordinary, &open_run] {
+            std::fs::create_dir_all(out.join("Default")).unwrap();
+            std::fs::write(out.join("Local State"), LOCAL_STATE).unwrap();
+            std::fs::write(out.join("marker"), b"unsynced").unwrap();
+            std::fs::write(out.join("Default/local-only"), b"unsynced edit").unwrap();
+        }
+        // Start both restores with the same complete device state. Windows
+        // otherwise generates independent random os_crypt keys on first use.
+        shardx_core::LocalCrypt::open(&ordinary).unwrap();
+        std::fs::copy(ordinary.join("Local State"), open_run.join("Local State")).unwrap();
+        w.fake().listed = Some((1, Some(heads[0])));
+        w.pull(&ordinary).unwrap();
+        w.db()
+            .conn
+            .execute_batch(
+                "UPDATE profile_bindings SET remote_version = 0, base_version = 0,
+             last_observed_head_hash = NULL",
+            )
+            .unwrap();
+        w.fake().listed = None;
+        serve(
+            &w,
+            &author_pages_for(
+                &w,
+                T0 + 300 * DAY,
+                Some(DeviceRevocationReason::Retired),
+                false,
+            ),
+        );
+        let err = w.pull(&open_run).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"));
+        revoked_at(&w, 1);
+        assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+        let relative = |root: &Path| {
+            tree(root)
+                .into_iter()
+                .map(|(p, bytes)| (p.strip_prefix(root).unwrap().to_path_buf(), bytes))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            relative(&ordinary) == relative(&open_run),
+            "the open-run exception must keep exactly what an ordinary pull keeps"
+        );
+        assert_eq!(marker(&open_run), "v1");
+        assert!(local_state_kept(&open_run));
+        settled(&w, &open_run);
+    }
+
+    // A source snapshot that becomes proven revoked during its download
+    // must not supply a newly committed revert's content.
+    #[test]
+    fn a_revert_never_commits_a_source_withdrawn_during_its_download() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        w.fake().on_snapshot = Some(distrust_author());
+        let result = w.revert(&out);
+        assert!(
+            w.fake().on_snapshot.is_none(),
+            "source download hook executed"
+        );
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
+        match result {
+            Ok(pushed) => {
+                assert_eq!(pushed.version, 4);
+                assert_eq!(
+                    marker(&out),
+                    "v1",
+                    "only v1 remains valid after the v2 source signer is withdrawn"
+                );
+            }
+            Err(_) => {
+                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+                assert!(
+                    tree(&out) == before,
+                    "a refusal preserves the local profile"
+                );
+                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+            }
+        }
+        settled(&w, &out);
+    }
+
+    #[test]
+    fn a_resumed_revert_never_commits_a_source_withdrawn_before_its_retry() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        w.fake().skip.push("upload");
+        w.revert(&out).unwrap_err();
+        assert_eq!(w.fake().version, 3, "no R has landed");
+        assert_eq!(marker(&beside(&out, ".revert-staging")), "v2");
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&author()), NOW).unwrap();
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
+        match w.revert(&out) {
+            Ok(pushed) => {
+                assert_eq!(pushed.version, 4);
+                let readback = d.path().join("readback");
+                w.pull(&readback).unwrap();
+                assert_eq!(
+                    marker(&readback),
+                    "v1",
+                    "a resumed R must not publish a source already proven revoked before retry"
+                );
+                assert_eq!(marker(&out), "v1");
+            }
+            Err(_) => {
+                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+                assert!(tree(&out) == before);
+                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+            }
+        }
     }
 
     // Regressions found by the architect review, round 2.
