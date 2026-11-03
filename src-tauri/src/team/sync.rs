@@ -13484,6 +13484,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("marker"), b"local").unwrap();
         let before = tree(&out);
+        let commits = w.fake().commits;
         w.fake().on_snapshot = Some(distrust_author());
         let result = w.revert(&out);
         assert!(
@@ -13491,24 +13492,16 @@ mod tests {
             "source download hook executed"
         );
         assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
-        match result {
-            Ok(pushed) => {
-                assert_eq!(pushed.version, 4);
-                assert_eq!(
-                    marker(&out),
-                    "v1",
-                    "only v1 remains valid after the v2 source signer is withdrawn"
-                );
-            }
-            Err(_) => {
-                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
-                assert!(
-                    tree(&out) == before,
-                    "a refusal preserves the local profile"
-                );
-                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
-            }
-        }
+        let err = result.unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+        assert_eq!(w.fake().commits, commits);
+        assert!(
+            tree(&out) == before,
+            "a refusal preserves the local profile"
+        );
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        assert!(!beside(&out, ".revert-staging").exists());
         settled(&w, &out);
     }
 
@@ -13532,24 +13525,14 @@ mod tests {
         assert_eq!(marker(&beside(&out, ".revert-staging")), "v2");
         ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&author()), NOW).unwrap();
         assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
-        match w.revert(&out) {
-            Ok(pushed) => {
-                assert_eq!(pushed.version, 4);
-                let readback = d.path().join("readback");
-                w.pull(&readback).unwrap();
-                assert_eq!(
-                    marker(&readback),
-                    "v1",
-                    "a resumed R must not publish a source already proven revoked before retry"
-                );
-                assert_eq!(marker(&out), "v1");
-            }
-            Err(_) => {
-                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
-                assert!(tree(&out) == before);
-                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
-            }
-        }
+        let commits = w.fake().commits;
+        let err = w.revert(&out).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+        assert_eq!(w.fake().commits, commits);
+        assert!(tree(&out) == before);
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        assert!(!beside(&out, ".revert-staging").exists());
     }
 
     // Regressions found by the architect review, round 2.
