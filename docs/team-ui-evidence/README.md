@@ -34,3 +34,8 @@ on the first, plus the blind verifier round.
   round 6, at a4332d76. VERDICT: PASS: all ten properties hold. Its two new
   probes (a stacked run never pins a rejected head, even for a moment; a failed
   revert pin keeps local data and can be retried) are kept as regression tests.
+- [codex-revert-round-7.md](codex-revert-round-7.md): the Codex blind verifier,
+  round 7, at 3e98af0c (after the v2.6.1 fixes in #245). VERDICT: PASS: all ten
+  properties hold. Its two new probes (a damaged revert source keeps local data
+  and can be retried; a join past an untrusted child keeps local data and can be
+  unbound) are kept as regression tests without the `round7_` prefix.

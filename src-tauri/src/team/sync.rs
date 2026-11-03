@@ -13945,6 +13945,90 @@ mod tests {
         settled(&w, &udd);
     }
 
+    // Independent round-7 probe: a damaged P must leave the complete local
+    // tree intact, remove plaintext staging, and permit a clean retry.
+    #[test]
+    fn a_corrupt_revert_source_preserves_data_and_retries() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        std::fs::create_dir_all(udd.join("Default")).unwrap();
+        std::fs::write(udd.join("Default/local-only"), b"unsynced edit").unwrap();
+        std::fs::write(udd.join("Local State"), LOCAL_STATE).unwrap();
+        let before = tree(&udd);
+        let good = w.fake().objects[&1].clone();
+        *w.fake().objects.get_mut(&1).unwrap().last_mut().unwrap() ^= 1;
+        let commits = w.fake().commits;
+        let checkouts = w.sent("POST", "/checkout").len();
+
+        let err = w.revert(&udd).unwrap_err();
+        // The fixture derives ETag from the damaged object, so the response
+        // is rejected at the range check before envelope authentication.
+        assert!(has(&err, "sync.badReplySync"), "{err:#}");
+        assert!(format!("{err:#}").contains("field=range"), "{err:#}");
+        assert!(tree(&udd) == before, "every local file remains unchanged");
+        assert_eq!(w.fake().commits, commits);
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        revoked_at(&w, 1);
+        assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+        for suffix in SWAP_DIRS.iter().chain(UNPACK_LEFTOVERS.iter()) {
+            assert!(
+                !beside(&udd, suffix).exists(),
+                "plaintext leftover: {suffix}"
+            );
+        }
+        assert_eq!(local_leases(&w), 0);
+
+        w.fake().objects.insert(1, good);
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        assert_eq!(marker(&udd), "v1");
+        assert!(local_state_kept(&udd));
+        assert!(!udd.join("Default/local-only").exists());
+        settled(&w, &udd);
+    }
+
+    // Independent round-7 probe: the leaf search may follow a child signed
+    // by a server-listed key, but that key's missing authority must stop the
+    // subsequent pull and any check-in of the untouched local profile.
+    #[test]
+    fn a_join_past_an_untrusted_child_keeps_data_and_can_unbind() {
+        let (w, d, leaf_head, _) = joinable_after_restore(1);
+        let key = author();
+        {
+            let mut f = w.fake();
+            let m = SignedSnapshotManifestV2::parse(&f.manifests[&2]).unwrap();
+            let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+            p.signer_signing_key_id = key_id_of(&key);
+            let child = SignedSnapshotManifestV2::sign(&key, &p).unwrap();
+            f.manifests.insert(2, child.exact_bytes().to_vec());
+            f.head = Some(child.head_hash());
+        }
+        let mut evidence = pages(&w.me, &w.grant, &Ev::default());
+        evidence[0]
+            .signing_public_keys
+            .push(key.verifying_key().to_bytes());
+        serve(&w, &evidence);
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(out.join("Default")).unwrap();
+        std::fs::write(out.join("Default/local-only"), b"unsynced edit").unwrap();
+        std::fs::write(out.join("Local State"), LOCAL_STATE).unwrap();
+        let before = tree(&out);
+
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
+        assert_eq!(w.state(LOCAL).4, Some(leaf_head.to_vec()));
+        assert_eq!(w.state(LOCAL).3, 1, "only the proven leaf was pinned");
+        assert_eq!(w.count("SELECT base_version FROM profile_bindings"), 0);
+        assert!(tree(&out) == before);
+        assert!(has(&w.push_from(&out).unwrap_err(), "sync.remoteAhead"));
+        assert!(w.sent("POST", "/checkout").is_empty());
+        assert!(has(&w.pull(&out).unwrap_err(), "sync.signerUntrusted"));
+        assert!(tree(&out) == before);
+        settled(&w, &out);
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert!(tree(&out) == before);
+    }
+
     // Independent round-6 probe: inspect every committed pin update, not
     // just the final binding, while accepting a stacked revoked run.
     #[test]
