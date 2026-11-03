@@ -12045,6 +12045,10 @@ mod tests {
             let mut e: crate::trash::TrashEntry =
                 serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
             e.expires_at = 0;
+            if id == &kept {
+                // Listed first, so emptying the trash meets the refusal first.
+                e.deleted_at = u64::from(u32::MAX);
+            }
             std::fs::write(&meta, serde_json::to_vec(&e).unwrap()).unwrap();
         }
         w.db()
@@ -12067,6 +12071,22 @@ mod tests {
             .collect();
         assert_eq!(left, [kept.as_str()]);
         assert!(is_published(&kept).unwrap() && !is_published(&gone).unwrap());
+
+        // Emptying the trash goes past a refusal too, then reports it.
+        let more = profile(0xcb);
+        crate::profile_delete(more.clone()).unwrap();
+        let err = crate::trash_empty().unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "downgrade.flowTaken"),
+            "{err}"
+        );
+        let left: Vec<_> = crate::trash::list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(left, [kept.as_str()]);
+        assert!(!is_published(&more).unwrap());
     }
 
     /// A profile removed for good under a held lease with nothing pending
