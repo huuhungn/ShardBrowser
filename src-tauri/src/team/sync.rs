@@ -3920,6 +3920,85 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
     Ok(reply)
 }
 
+/// The [`unbind`] of a profile removed for good (a trash purge, a delete
+/// that bypasses the trash; a move to the trash keeps the binding). A flow or
+/// a pending operation refuses it, as it refuses an unbind, so nothing is
+/// removed. A held lease, which no session is open to release, is stored as
+/// a release that names no binding (with any release already pending), sent
+/// best effort by the next publish, push or pull, and lapses at its TTL
+/// otherwise; the binding then drops it as a sent release would. No team
+/// database, or one that does not open, has no binding this could drop.
+pub(crate) fn unbind_removed(local: &str) -> Result<()> {
+    if !Db::path()?.exists() {
+        return Ok(());
+    }
+    let mut db = match Db::open() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[sync] binding of a removed profile: {e:#}");
+            return Ok(());
+        }
+    };
+    if !is_published(local)? {
+        return Ok(());
+    }
+    if super::journal::flow_taken(&db, local)? {
+        bail!(code("downgrade.flowTaken"));
+    }
+    let b = bound(&db, local)?;
+    // The base its checkout or publish took, as `abandon` releases it.
+    let lease = b.lease.map(|l| granted(&db, &b, &l).map_or(l, |g| g.lease));
+    let release_pending = match &lease {
+        Some(l) => find(&db, local, "RELEASE", Some(l), Some("PENDING"))?.is_some(),
+        None => true,
+    };
+    let server_url: String = db.conn.query_row(
+        "SELECT origin FROM server_origins WHERE server_id = ?1",
+        [&b.server],
+        |r| r.get(0),
+    )?;
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM operations WHERE local_profile_id = ?1
+           AND state IN ('PENDING', 'RUNNING', 'AWAITING_RETRY')
+           AND NOT (kind = 'RELEASE' AND state = 'PENDING'))",
+        [local],
+        |r| r.get(0),
+    )?;
+    if pending {
+        bail!(code("sync.unbindPending"));
+    }
+    if let (Some(lease), false) = (lease, release_pending) {
+        release_op(&tx, &b, lease, ReleaseReason::UserRelease)?;
+    }
+    tx.execute(
+        "UPDATE operations SET local_profile_id = NULL
+         WHERE local_profile_id = ?1 AND kind = 'RELEASE' AND state = 'PENDING'",
+        [local],
+    )?;
+    tx.execute(
+        "UPDATE upload_sessions SET state = 'ABORTED' WHERE local_profile_id = ?1
+           AND state IN ('OPEN', 'READY')",
+        [local],
+    )?;
+    tx.execute(
+        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+           lease_expires_at = NULL WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    tx.execute(
+        "DELETE FROM revert_swaps WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    tx.commit()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    unbind(local, &server_url, now).map(|_| ())
+}
+
 /// The exact stored response of the newest completed unbind of `local`, once
 /// its columns match its request and its tombstone recomputes from the
 /// stored request and response (ADR 0002 D-7); otherwise nothing is trusted.
@@ -11863,6 +11942,121 @@ mod tests {
             "the swap still needs them"
         );
         assert!(!dirs[1].exists() && !dirs[2].exists(), "never needed");
+    }
+
+    /// A profile removed for good (a trash purge, a delete with no trash)
+    /// drops its binding as an unbind does; one in the trash, or restored
+    /// from it, keeps it.
+    #[test]
+    fn a_profile_removed_for_good_drops_its_binding() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let profile = |remote: u8| {
+            let mut s = crate::profile::StoredProfile::default();
+            crate::profile::save_raw(&mut s).unwrap();
+            w.bind(&s.meta.id, [remote; 16], 1, [9; 32]);
+            s.meta.id
+        };
+        let tombstones = |id: &str| {
+            w.db()
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM operations WHERE kind = 'UNBIND'
+                       AND state = 'COMPLETED' AND local_profile_id_at_request = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let id = profile(0xc6);
+        crate::profile_delete(id.clone()).unwrap();
+        assert!(is_published(&id).unwrap(), "the trash keeps the binding");
+        crate::trash::purge(&id).unwrap();
+        assert!(!is_published(&id).unwrap(), "purged");
+        assert_eq!(tombstones(&id), 1);
+
+        let id = profile(0xc7);
+        crate::profile_delete(id.clone()).unwrap();
+        crate::trash::restore(&id).unwrap();
+        crate::trash::purge(&id).unwrap();
+        assert!(is_published(&id).unwrap(), "restored, so still bound");
+
+        crate::profile::delete(&id).unwrap();
+        assert!(!is_published(&id).unwrap(), "deleted with no trash");
+        assert_eq!(tombstones(&id), 1);
+
+        // A refused purge keeps the archive; the expiry sweep goes on.
+        let (kept, gone) = (profile(0xc8), profile(0xc9));
+        for id in [&kept, &gone] {
+            crate::profile_delete(id.clone()).unwrap();
+            let meta = crate::store::trash_dir()
+                .unwrap()
+                .join(format!("{id}.json"));
+            let mut e: crate::trash::TrashEntry =
+                serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+            e.expires_at = 0;
+            std::fs::write(&meta, serde_json::to_vec(&e).unwrap()).unwrap();
+        }
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO restore_journals(local_profile_id, journal_id, phase, staged_path,
+                   backup_path, old_binding_json, target_version, target_head_hash,
+                   created_at, updated_at)
+                 VALUES (?1, 'j', 'CREATED', 's', 'b', '{}', 1, zeroblob(32), 'now', 'now')",
+                [&kept],
+            )
+            .unwrap();
+        let err = crate::trash::purge(&kept).unwrap_err();
+        assert!(has(&err, "downgrade.flowTaken"), "{err:#}");
+        assert_eq!(crate::trash::purge_expired().unwrap(), 1);
+        let left: Vec<_> = crate::trash::list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(left, [kept.as_str()]);
+        assert!(is_published(&kept).unwrap() && !is_published(&gone).unwrap());
+    }
+
+    /// A profile removed for good under a held lease with nothing pending
+    /// (a crash after checkout) stores the release with no binding, and the
+    /// next pull sends it; pending work refuses the removal, as it refuses
+    /// an unbind, and leaves the binding whole.
+    #[test]
+    fn a_profile_removed_for_good_releases_its_lease_unless_work_is_pending() {
+        {
+            let w = world();
+            let _lifecycle = crate::profile::lifecycle_test_guard();
+            w.fake().skip.push("upload");
+            w.push().unwrap_err();
+            let err = crate::profile::delete(LOCAL).unwrap_err();
+            assert!(has(&err, "sync.unbindPending"), "{err:#}");
+            assert!(is_published(LOCAL).unwrap());
+            assert_eq!(local_leases(&w), 1);
+        }
+
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let crash = "CREATE TRIGGER crash BEFORE INSERT ON operations
+             WHEN NEW.kind = 'UPLOAD' BEGIN SELECT RAISE(ABORT, 'crash'); END";
+        w.db().conn.execute(crash, []).unwrap();
+        w.push().unwrap_err();
+        w.db().conn.execute("DROP TRIGGER crash", []).unwrap();
+        assert_eq!(local_leases(&w), 1, "held with nothing pending");
+        let sent = w.fake().log.len();
+        crate::profile::delete(LOCAL).unwrap();
+        assert_eq!(w.fake().log.len(), sent, "no server call");
+        assert!(!is_published(LOCAL).unwrap());
+        let release = "SELECT count(*) FROM operations WHERE kind = 'RELEASE'
+             AND local_profile_id IS NULL AND local_profile_id_at_request = 'local-profile'
+             AND state = ";
+        assert_eq!(w.count(&format!("{release} 'PENDING'")), 1);
+        assert!(w.fake().lease.is_some());
+        let err = w.pull(&w._dir.path().join("pulled")).unwrap_err();
+        assert!(has(&err, "sync.profileNotListed"), "{err:#}");
+        assert!(w.fake().lease.is_none(), "the server released the lease");
+        assert_eq!(w.count(&format!("{release} 'COMPLETED'")), 1);
     }
 
     /// Architect blocking 1: a revert lease held with nothing uploaded (a

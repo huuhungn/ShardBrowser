@@ -759,7 +759,16 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     Ok(())
 }
 
+/// Deletes `id` for good, with no trash: its Team binding goes first, or
+/// nothing does.
 pub fn delete(id: &str) -> Result<()> {
+    crate::team::sync::unbind_removed(id)?;
+    remove(id)
+}
+
+/// The record and data of `id`, once the trash has archived them, or for
+/// good through [`delete`].
+pub(crate) fn remove(id: &str) -> Result<()> {
     let path = path_for(id)?;
     let udd = store::user_data_root()?.join(id);
     // The trash settles a pending swap first and fails closed; reached

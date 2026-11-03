@@ -106,7 +106,8 @@ pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
     };
     fs::write(&meta_path, serde_json::to_string_pretty(&entry)?)?;
 
-    profile::delete(id)?;
+    // Restorable, so the Team binding stays.
+    profile::remove(id)?;
     Ok(entry)
 }
 
@@ -233,9 +234,13 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
     })
 }
 
-/// Delete one archive for good.
+/// Delete one archive for good, and the Team binding of a profile that was
+/// not restored; a refused unbind keeps the archive.
 pub fn purge(id: &str) -> Result<()> {
     let (zip_path, meta_path) = paths_for(id)?;
+    if profile::load_raw(id).is_err() {
+        crate::team::sync::unbind_removed(id)?;
+    }
     let _ = fs::remove_file(zip_path);
     let _ = fs::remove_file(meta_path);
     Ok(())
@@ -247,8 +252,11 @@ pub fn purge_expired() -> Result<usize> {
     let mut n = 0;
     for e in list()? {
         if e.expires_at <= now {
-            purge(&e.id)?;
-            n += 1;
+            // One refused (its Team binding has pending work) waits; the rest go.
+            match purge(&e.id) {
+                Ok(()) => n += 1,
+                Err(err) => eprintln!("[trash] {} kept: {err:#}", e.id),
+            }
         }
     }
     Ok(n)
