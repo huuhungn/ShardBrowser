@@ -1,5 +1,81 @@
 # Changelog
 
+## v2.6.0
+
+A Team release: the launcher gets a Team page, and a profile whose latest
+pushed snapshot was signed by a revoked device can be rolled back to the last
+valid one. The team server hardens how it counts compromises. The browser
+engine is unchanged (Chromium 156.0.8078.48, engine build 1).
+
+### Upgrade notes
+
+- Update the team server before the launchers. This release changes the
+  server's device-revocation, fleet and root-grant routes, and launcher 2.6.0
+  expects the new behavior.
+- The launcher's local Team database moves to schema version 9 on first start.
+  The migration keeps every row. Because the new schema cannot be read by
+  earlier launchers, back up the Team database before upgrading if you may
+  need to go back to 2.5.x.
+- The Team card is no longer in Settings; it is the first part of the new Team
+  page in the sidebar.
+
+### Team page
+
+- Team is now its own section in the sidebar. Each profile shows a binding
+  badge and its sync state, and custodian alerts appear on the page instead
+  of being buried in Settings.
+- From the page you can publish a profile, check it in, pull the latest
+  snapshot and unbind it.
+- The page lists the profiles of a fleet, so you can join one of them from
+  another device.
+
+### Security
+
+- Rule-6 revert: when the signer of a pushed head is proven revoked, the
+  profile is quarantined instead of being restored. A device can then revert
+  it to the last valid earlier snapshot, and other devices accept that revert
+  when they pull.
+- A new `custodian.renewed_after_revocation` alert shows when a custodian was
+  renewed after a revocation, so the owner can review it.
+- Pull and join replace the profile's data only after the new pin is
+  committed, so a failed or interrupted pull leaves the profile as it was.
+- A restore never pins a leaf whose signer is revoked.
+- A head whose signer is withdrawn while its snapshot downloads, or while a
+  revert is read back, is never pinned.
+- A revert never commits the content of an earlier snapshot whose signer was
+  withdrawn while it was downloaded or before the revert was retried.
+- Deleting a profile or a folder (from the app or the local API) and cloning
+  a Team profile into a local one remove any decrypted revert staging, and a
+  device whose own key is withdrawn sends no prepared revert.
+- A device revocation counts only when the device it names is one its signing
+  key was approved for.
+- A revert leaves no decrypted staging data on disk, and the device keeps its
+  own `Local State` instead of taking the snapshot's.
+
+### Team server
+
+- A compromise that exposes a key through the tenant root now blocks every
+  fleet it can reach, an exposure that was seen is never forgotten, and open
+  uploads are aborted so nothing more is sent under an exposed key.
+- A device revocation filed under a fleet-scoped `device.revoke` is counted
+  when it covers every approval of the revoked device.
+- A device revocation can carry generation activations, and they commit
+  together with it in one step.
+- After a server restart, a repeat of any closed operation returns the same
+  bytes as the first time and creates no second resource.
+- A pulled or pinned head whose signer is revoked is quarantined, and each
+  pull records the evidence it evaluated.
+
+### Changed
+
+- Dependencies: `async-executor` is updated from 1.14.0, which was yanked, to
+  1.14.1.
+- Local Team database schema 9 adds `skipped_heads`, `trust_custodian_alerts`
+  and `revert_swaps`.
+- The release workflow ignores RUSTSEC-2026-0429 for the `zip` 4 that the
+  updater plugin pulls, for the same reason as the other `zip` 4 advisories:
+  the plugin extracts nothing before it verifies the payload's signature.
+
 ## v2.5.0
 
 A Team sync release: the team server gains the v2 control plane for root

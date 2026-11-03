@@ -3,6 +3,33 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.6.0",
+      "date": "2026-11-03",
+      "entries": [
+        {
+          "id": "team-page-and-revert",
+          "title": "A Team page, and a way back from a revoked signer",
+          "lead": "Team now has its own page in the sidebar, and a profile can be rolled back when the device that signed its latest snapshot was revoked.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The Team card has moved out of Settings into a Team page. Each profile shows whether it is bound to the team and whether it is in sync, and alerts for the team's custodian show up there. You can publish a profile, check it in, pull the latest snapshot or unbind it, and you can list a fleet's profiles to join one from another device."
+            },
+            {
+              "type": "p",
+              "text": "If the device that signed the latest pushed snapshot is later proven revoked, the profile is set aside instead of being restored. A device can then revert it to the last valid earlier snapshot, and other devices accept that revert when they pull. Pulling and joining now replace the profile's data only once the new snapshot is safely recorded."
+            },
+            {
+              "type": "note",
+              "text": "Update your team server before the launchers. This version also moves the local Team database to a new format that launchers older than 2.6.0 cannot read, so back it up first if you may go back."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.5.0",
       "date": "2026-11-01",
       "entries": [

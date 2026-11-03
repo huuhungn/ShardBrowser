@@ -1,6 +1,33 @@
 {
   "releases": [
     {
+      "version": "2.6.0",
+      "date": "2026-11-03",
+      "entries": [
+        {
+          "id": "team-page-and-revert",
+          "title": "Trang Team riêng, và đường lui khi người ký bị thu hồi",
+          "lead": "Team giờ có trang riêng trên thanh bên, và hồ sơ có thể được hoàn về bản trước khi thiết bị đã ký bản mới nhất bị thu hồi.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thẻ Team đã chuyển từ Cài đặt sang trang Team. Mỗi hồ sơ cho biết nó có gắn với team không và có đồng bộ không, và các cảnh báo về custodian của team hiện ở đó. Bạn có thể publish hồ sơ, check-in, kéo bản mới nhất hoặc gỡ gắn, và có thể xem danh sách hồ sơ của một fleet để tham gia một hồ sơ từ thiết bị khác."
+            },
+            {
+              "type": "p",
+              "text": "Nếu thiết bị đã ký bản đẩy lên mới nhất sau đó bị chứng minh là đã bị thu hồi, hồ sơ được tách riêng thay vì khôi phục. Khi đó một thiết bị có thể hoàn nó về bản hợp lệ trước đó, và các thiết bị khác chấp nhận bản hoàn này khi kéo về. Việc kéo và tham gia giờ chỉ thay dữ liệu hồ sơ sau khi bản mới đã được ghi nhận an toàn."
+            },
+            {
+              "type": "note",
+              "text": "Hãy cập nhật team server trước các launcher. Bản này cũng chuyển cơ sở dữ liệu Team trên máy sang định dạng mới mà launcher cũ hơn 2.6.0 không đọc được, nên hãy sao lưu trước nếu bạn có thể quay lại bản cũ."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.5.0",
       "date": "2026-11-01",
       "entries": [
