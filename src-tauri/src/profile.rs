@@ -759,8 +759,9 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     Ok(())
 }
 
-/// Deletes `id` for good, with no trash: its Team binding goes first, or
-/// nothing does.
+/// Deletes `id` for good, with no trash. Its Team binding goes first: a
+/// refused unbind removes nothing, and a removal that then fails leaves an
+/// unbound local profile, which a retry deletes.
 pub fn delete(id: &str) -> Result<()> {
     crate::team::sync::unbind_removed(id)?;
     remove(id)
