@@ -1306,6 +1306,7 @@
   "sync.revertUnavailable": "Không có gì để hoàn nguyên: không bản chụp nào của hồ sơ này đến từ người ký đã được xác nhận là bị thu hồi.",
   "sync.sealTaskFailed": "Đóng gói hồ sơ chưa hoàn tất: {error}",
   "sync.signerRevoked": "Người ký bản chụp đã bị thu hồi, nên bản chụp không được khôi phục. Hồ sơ đã bị cách ly.",
+  "sync.signerRevokedAtP": "Người ký bản chụp mới nhất đã bị thu hồi, nên bản chụp đó không được khôi phục. Hồ sơ hiện giữ bản chụp gần nhất trước đó có người ký hợp lệ và đã bị cách ly.",
   "sync.signerUntrusted": "Người ký bản chụp không được tin cậy để ghi hồ sơ này, nên bản chụp không được khôi phục.",
   "sync.starting": "đang khởi động…",
   "sync.storedRequestMismatch": "Một yêu cầu nhóm đã lưu không còn khớp với dữ liệu đã lưu ({field}), nên không được gửi. Hồ sơ đã bị cách ly.",

@@ -4753,6 +4753,8 @@ pub(crate) async fn pull(
                     pin(db, dev, &b, head, p, &w.accepted, &w.read, false, now)
                 })
                 .await?;
+                // The user is told the profile now holds `P`.
+                bail!(code("sync.signerRevokedAtP"));
             }
         }
         bail!(code("sync.signerRevoked"));
@@ -8281,7 +8283,7 @@ mod tests {
         w.enroll(other.path());
         let out = other.path().join("out");
         let err = w.pull(&out).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         let (state, reason, _, version, head) = w.state(LOCAL);
         assert_eq!(
             (state.as_str(), reason.as_deref(), version, head),
@@ -10847,7 +10849,7 @@ mod tests {
         let d = second(&w);
         w.fake().listed = Some((2, Some(heads[1])));
         let err = w.pull(&d.path().join("out")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         unbind(LOCAL, SERVER, NOW).unwrap();
         w.bind(LOCAL, PROFILE, 1, heads[0]);
         let err = w.pull(&d.path().join("again")).unwrap_err();
@@ -11106,7 +11108,7 @@ mod tests {
         let d = second(&w);
         w.fake().listed = Some((2, Some(heads[1])));
         let err = w.pull(&d.path().join("first")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         w.fake().listed = None;
         w.pull(&d.path().join("out")).unwrap();
@@ -11138,7 +11140,7 @@ mod tests {
         revoked_at(&w, 0);
         assert_eq!(skipped(&w), [(2, None, None, 1)]);
         let err = w.pull(&d.path().join("out")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         assert_eq!(skipped(&w), [(2, None, None, 1)]);
@@ -11158,7 +11160,7 @@ mod tests {
         assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
         let out = d.path().join("out");
         let err = w.pull(&out).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         assert!(out.join("Preferences").exists());
@@ -11182,7 +11184,7 @@ mod tests {
             let pulled = w.pull(&d.path().join("out"));
             if second_run {
                 let err = pulled.unwrap_err();
-                assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+                assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
                 revoked_at(&w, 3);
                 assert_eq!(w.state(LOCAL).4, Some(heads[2].to_vec()));
                 assert_eq!(
@@ -11348,7 +11350,7 @@ mod tests {
         serve(w, &author_pages_for(w, T0 + 300 * DAY, Some(reason), false));
         let d = second(w);
         let err = w.pull(&d.path().join("pulled")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(w, 1);
         let udd = d.path().join("profile");
         std::fs::create_dir_all(&udd).unwrap();
@@ -13450,7 +13452,7 @@ mod tests {
             ),
         );
         let err = w.pull(&open_run).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"));
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         let relative = |root: &Path| {
