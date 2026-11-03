@@ -7582,28 +7582,48 @@ mod tests {
             };
             build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &r.encode())
         };
+        // Rule 6 counts a revocation only of the device its key's approval names.
+        let device_approve = TenantCapabilityGrantV2 {
+            common: common(16),
+            subject: device_subject(&me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceApprove,
+        };
+        let approval = DeviceApprovalV2 {
+            common: common(0x79),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: REVOKED,
+            subject_hpke_key_id: [0x78; 32],
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let approved = |more: Vec<Vec<u8>>| {
+            let mut v = vec![
+                device_revoke.clone(),
+                build_record(
+                    &me.sk,
+                    DOMAIN_TENANT_CAPABILITY_GRANT,
+                    &device_approve.encode(),
+                ),
+                build_record(&me.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            ];
+            v.extend(more);
+            v
+        };
         let lost = revocation(30, DeviceRevocationReason::Lost);
         let compromised = revocation(31, DeviceRevocationReason::Compromised);
         let retired = revocation(32, DeviceRevocationReason::Retired);
         let w = world();
         let counted = || w.count("SELECT counted_evaluation FROM trust_proven_revocations");
-        w.collect(2, &[0x52; 32], 70, vec![device_revoke.clone(), lost]);
+        w.collect(2, &[0x52; 32], 70, approved(vec![lost]));
         assert!(!w.blocked(GEN), "lost stays advisory");
         let first = counted();
-        w.collect(
-            3,
-            &[0x53; 32],
-            71,
-            vec![device_revoke.clone(), compromised.clone()],
-        );
+        w.collect(3, &[0x53; 32], 71, approved(vec![compromised.clone()]));
         assert!(w.blocked(GEN), "the compromise replaces the kept lost one");
         assert_eq!(counted(), first, "the earliest count stays");
-        w.collect(
-            4,
-            &[0x54; 32],
-            72,
-            vec![device_revoke, compromised, retired],
-        );
+        w.collect(4, &[0x54; 32], 72, approved(vec![compromised, retired]));
         assert!(w.blocked(GEN), "retired never replaces compromised");
     }
 
@@ -13506,5 +13526,119 @@ mod tests {
             w.count("SELECT count(*) FROM skipped_heads WHERE resolution IS NULL"),
             0
         );
+    }
+    #[test]
+    fn a_revocation_naming_another_device_never_enables_a_skip() {
+        let w = world();
+        chain_of(&w, &[&w.me.sk, &author(), &w.me.sk]);
+        let mut evidence = author_pages_for(
+            &w,
+            T0 + 300 * DAY,
+            Some(DeviceRevocationReason::Retired),
+            true,
+        );
+        let mut changed = false;
+        for container in &mut evidence[0].containers {
+            let record = AuthorizationRecord::parse(container).unwrap();
+            if record.payload_domain() != DOMAIN_DEVICE_REVOCATION {
+                continue;
+            }
+            let verified = record
+                .verify_signature(&w.me.sk.verifying_key().to_bytes())
+                .unwrap();
+            let Payload::DeviceRevocation(revocation) = verified.payload() else {
+                panic!("expected a device revocation");
+            };
+            let mut wrong_device = revocation.clone();
+            assert_eq!(wrong_device.subject_device_id, [0x71; 16]);
+            wrong_device.subject_device_id = [0x99; 16];
+            *container = build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &wrong_device.encode());
+            changed = true;
+        }
+        assert!(changed, "the mismatched record was actually installed");
+        let d = second(&w);
+        // Establish the reported-only quarantine before supplying the bad proof.
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, true));
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"unsynced local").unwrap();
+        let before = tree(&out);
+        assert!(has(&w.pull(&out).unwrap_err(), "sync.signerRevoked"));
+        revoked_at(&w, 0);
+        serve(&w, &evidence);
+        let result = w.pull(&out);
+        let (state, reason, _, version, _) = w.state(LOCAL);
+        assert_eq!(
+            (
+                result.is_err(),
+                ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap(),
+                state,
+                reason,
+                version,
+                skipped(&w).len(),
+                tree(&out) == before,
+            ),
+            (
+                true,
+                false,
+                "QUARANTINED".into(),
+                Some("SIGNER_REVOKED".into()),
+                0,
+                0,
+                true
+            ),
+            "a signed revocation for a different device is not proof against this signer"
+        );
+        assert!(has(&result.unwrap_err(), "sync.signerRevoked"));
+        settled(&w, &out);
+    }
+
+    #[test]
+    fn join_never_pins_a_leaf_withdrawn_during_the_proof_fetch() {
+        let (w, d, _, _) = joinable_after_restore(0);
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"unsynced local").unwrap();
+        let before = tree(&out);
+        w.fake().on_proof = Some(
+            distrust_author().replace(&hex(&key_id_of(&author())), &hex(&w.me.to.signing_key_id)),
+        );
+        let result = w.join(LOCAL, PROFILE, &out);
+        assert!(w.fake().on_proof.is_none(), "withdrawal hook ran");
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id).unwrap());
+        assert!(has(&result.unwrap_err(), "sync.epochTransitionInvalid"));
+        assert_eq!(w.state(LOCAL).3, 0);
+        assert!(tree(&out) == before);
+        assert!(w.sent("POST", "/checkout").is_empty());
+        settled(&w, &out);
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert!(tree(&out) == before);
+    }
+
+    #[test]
+    fn revert_never_pins_an_r_withdrawn_during_the_readback() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().skip.push("commit");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(w.fake().version, 2, "no R has landed yet");
+        let before = tree(&udd);
+        w.fake().on_snapshot = Some(
+            distrust_author().replace(&hex(&key_id_of(&author())), &hex(&w.me.to.signing_key_id)),
+        );
+        let result = w.revert(&udd);
+        assert!(
+            w.fake().on_snapshot.is_none(),
+            "readback withdrawal hook ran"
+        );
+        assert_eq!(w.fake().version, 3, "R landed before the readback");
+        assert!(has(&result.unwrap_err(), "sync.signerRevoked"));
+        revoked_at(&w, 1);
+        assert!(tree(&udd) == before);
+        assert_eq!(local_leases(&w), 0);
+        assert_eq!(skipped(&w).len(), 1);
+        assert!(skipped(&w)[0].1.is_none(), "the run is still open");
+        settled(&w, &udd);
     }
 }

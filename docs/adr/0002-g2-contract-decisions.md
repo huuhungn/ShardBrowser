@@ -1535,7 +1535,7 @@ A container is **usable** if all of the following hold:
      - **Proven revoked:** a usable signed `DeviceRevocationV2` (Q-13), or the client's own local distrust (D-6 (d)). A `DeviceRevocationV2` counts only if all of these hold (round-6 minor 2):
        - its issuer was, at the record's `issued_at_ms`, a custodian (rule 1) holding a device-scoped `device.revoke` (L1067) that covered the subject device's approval scope (rule 4; D-2 issuer rule for Q-13);
        - its issuer **is still a custodian** (rule 2) at the time this client first sees the record (local clock, 300 s tolerance). This replaces revision 7's 30-day first-seen window, which would have locked out devices that were offline for more than 30 days. Under the sticky rule of rule 1, an issuer that this client already holds as proven revoked is not a custodian here, whatever window a backdated renewal claims (critic r7 M23);
-       - its subject device and signing key equal the signer of the rejected head;
+       - its subject device and signing key equal the signer of the rejected head; the client counts it only when a usable approval of its subject signing key, from an allowed issuer (rule 3), names its subject device, and until the client sees such an approval the record does not count;
        - once counted, it stays counted: a filed revocation is permanent (Q-13).
 
        **What this stops and does not stop.**
