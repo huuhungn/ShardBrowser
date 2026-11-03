@@ -14,6 +14,9 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
   Team page and the device check on a counted revocation. The G2-wide verifiers
   did not rerun on those changes; the rule-6 Codex verifier did, and round 6
   returned PASS on a4332d76 (`docs/team-ui-evidence/codex-revert-round-6.md`).
+- **Hashes refreshed again:** 2026-11-04, after the v2.6.1 fixes (#245) changed
+  cited files. The rule-6 Codex verifier reran on them: round 7 returned PASS
+  on 3e98af0c (`docs/team-ui-evidence/codex-revert-round-7.md`).
 - **Plan:** `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md`.
   The G2 rows are cited by plan line; lines after about L900 are 2 lower in
   older citations (test names such as `l2259_g2_54_...` keep the old numbers).
