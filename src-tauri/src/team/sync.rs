@@ -2100,14 +2100,14 @@ async fn revert_inner(
                 }
                 (Err(e), None) => return Err(e),
             };
+            let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
+                unreachable!("the walk above checked both");
+            };
             // The walk records the evidence it fetched: a withdrawal of this
             // device it showed for the first time stops the revert as well.
             if let Some(e) = withdrawn_device(client, access, &mut db, dev, &b, revoked).await? {
                 return Err(e);
             }
-            let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
-                unreachable!("the walk above checked both");
-            };
             if b.lease.is_none() {
                 hold_open(&mut db, &b, &w, &w.accepted, now)?;
                 // Q-18: a compromised revocation waits for rotation, and the
