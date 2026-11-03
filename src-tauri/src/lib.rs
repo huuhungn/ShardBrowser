@@ -861,19 +861,6 @@ fn profile_delete(id: String) -> Result<(), String> {
     let _claim =
         profile::begin_user_mutation([&id], &crate::errcode::code("profile.actionDeleteProfile"))
             .map_err(|error| error.to_string())?;
-    // A revert's `R` lands first, so the trash keeps it; a staging dir left
-    // over is decrypted data nothing would ever remove.
-    profile::load_raw(&id).map_err(|e| e.to_string())?;
-    let udd = store::user_data_root()
-        .map_err(|e| e.to_string())?
-        .join(&id);
-    team::sync::settle_revert_swap(&id, &udd).map_err(|e| format!("{e:#}"))?;
-    // Even under a held revert lease: the profile goes, and a revert that
-    // still has to seal stages `P` again.
-    let staging = team::sync::beside(&udd, ".revert-staging");
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging).map_err(|e| e.to_string())?;
-    }
     trash::move_to_trash(&id)
         .map(|_| ())
         .map_err(|e| e.to_string())

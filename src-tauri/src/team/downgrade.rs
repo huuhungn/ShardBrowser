@@ -543,6 +543,10 @@ pub(crate) fn start_clone(local: &str) -> Result<CloneDone> {
     // a move exists: another disk, a link in its data, a browser holding it.
     // The disk comes first: on another disk a move fails whatever holds it.
     let data = store::user_data_root()?.join(local);
+    // A revert's `R` lands in the data first; a staging dir left over is
+    // decrypted data nothing would clean once the original is archived.
+    super::sync::settle_revert_swap(local, &data)?;
+    super::sync::discard_revert_staging(local, &data)?;
     let archive = archive_root()?;
     make_dir(&archive)?;
     store::require_local_ntfs(&archive)?;
@@ -1679,6 +1683,48 @@ mod tests {
         assert_eq!(std::fs::read(&w.metadata_dst).unwrap(), before.metadata);
         assert!(w.data_dst.is_dir() && w.clone_data.is_dir());
         assert!(listing(&w.clone_data, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_clone_lands_a_pending_revert_swap_and_leaves_no_staging() {
+        let (_e, _) = seeded();
+        let staged = |id: &str| {
+            let data = store::user_data_root().unwrap().join(id);
+            let staging = super::super::sync::beside(&data, ".revert-staging");
+            std::fs::create_dir_all(staging.join("Default")).unwrap();
+            std::fs::write(staging.join("Default").join("Cookies"), b"decrypted P").unwrap();
+            staging
+        };
+        // A revert committed `R`; its swap waits because a browser held the
+        // data then.
+        let staging = staged(LOCAL);
+        let db = Db::open().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO revert_swaps VALUES (?1, 3, zeroblob(32), 0)",
+                [LOCAL],
+            )
+            .unwrap();
+        start_clone(LOCAL).unwrap();
+        let w = places(&the_journal()).unwrap();
+        assert_eq!(
+            std::fs::read(w.clone_data.join("Default").join("Cookies")).unwrap(),
+            b"decrypted P",
+            "the clone carries R's content"
+        );
+        assert!(!staging.exists(), "no staging beside the archived original");
+        let swaps: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM revert_swaps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(swaps, 0);
+
+        // A pull's crash leftover, no swap pending.
+        seed(OTHER, true);
+        bind(OTHER);
+        let staging = staged(OTHER);
+        start_clone(OTHER).unwrap();
+        assert!(!staging.exists(), "the leftover is discarded");
     }
 
     /// Where the flow stands when each crash point fires: the journal phase

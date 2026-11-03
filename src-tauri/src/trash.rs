@@ -64,6 +64,8 @@ fn paths_for(id: &str) -> Result<(PathBuf, PathBuf)> {
 /// profile JSON verbatim plus the kept user-data files under `user-data/`.
 pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
     let stored = profile::load_raw(id)?;
+    let udd = store::user_data_root()?.join(id);
+    crate::team::sync::discard_revert_for_deletion(id, &udd)?;
     let (zip_path, meta_path) = paths_for(id)?;
 
     let file =
@@ -75,7 +77,6 @@ pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
     zip.start_file("profile.json", opts)?;
     zip.write_all(serde_json::to_string_pretty(&stored)?.as_bytes())?;
 
-    let udd = store::user_data_root()?.join(id);
     if udd.exists() {
         for rel in KEEP {
             let src = udd.join(rel);

@@ -1857,6 +1857,9 @@ async fn push_inner(
             .await;
         }
         let s = session(&db, &commit_op.op_id)?;
+        // Rule 6: a device whose own key is withdrawn commits no `R`.
+        let own_withdrawn =
+            revert.is_some() && ledger::withdrawn(&db, &dev.pin.0, &dev.me.signing_key_id)?;
         match s.state.as_str() {
             "OPEN" => {
                 // Q-18 "In-flight commits": an upload still OPEN here never
@@ -1886,19 +1889,26 @@ async fn push_inner(
                 finalize(client, access, &mut db, &b, lease, &commit_op).await?;
             }
             // A revocation recorded since the seal: no COMMIT on that pin, nor
-            // a revert's `R` with the content of a withdrawn `P`. A head past
-            // the pin may be this COMMIT landed with its reply lost, so the
-            // stored request is replayed (G2-37, G2-38).
+            // a revert's `R` signed by a withdrawn device or with the content
+            // of a withdrawn `P`. A head past the pin may be this COMMIT
+            // landed with its reply lost, so the stored request is replayed
+            // (G2-37, G2-38).
             "READY"
                 if match revert {
                     None => pin_withdrawn(client, access, &mut db, dev, &b).await?,
-                    Some(_) => source_withdrawn(client, access, &mut db, dev, &b).await?,
+                    Some(_) => {
+                        own_withdrawn || source_withdrawn(client, access, &mut db, dev, &b).await?
+                    }
                 } && {
                     let head = listed(client, access, &mut db, &b).await?;
                     head.current_version == b.version && head.current_signed_head_hash == b.head
                 } =>
             {
-                let e = signer_revoked(&db, &b);
+                let e = if own_withdrawn {
+                    anyhow!(code("sync.revertDeviceWithdrawn"))
+                } else {
+                    signer_revoked(&db, &b)
+                };
                 return Err(fail_upload(client, access, &mut db, &b, lease, &commit_op, e).await);
             }
             "READY" => commit(client, access, &mut db, &b, lease, &commit_op).await?,
@@ -1964,13 +1974,15 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Deletes the `P` a revert staged in `<udd>.revert-staging`, unless a
-/// pending swap or a resumable upload (`R` sealed under the held lease, no
-/// release pending) still needs it. An abandoned lease keeps no plaintext,
-/// its lost release included: the revert that resumes it restores `P` again.
+/// Deletes the `P` a revert staged in `<udd>.revert-staging` (and a swap's
+/// `<udd>.revert-old`), unless a pending swap or a resumable upload (`R`
+/// sealed under the held lease, no release pending) still needs it; the
+/// `unpack` leftovers beside the staging always go. An abandoned lease keeps
+/// no plaintext, its lost release included: the revert that resumes it
+/// restores `P` again.
 pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
-    let staging = beside(udd, ".revert-staging");
-    if !staging.exists() {
+    remove_beside(udd, &UNPACK_LEFTOVERS)?;
+    if !SWAP_DIRS.iter().any(|suffix| beside(udd, suffix).exists()) {
         return Ok(());
     }
     if Db::path()?.exists() {
@@ -1989,8 +2001,33 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    std::fs::remove_dir_all(&staging)?;
+    remove_beside(udd, &SWAP_DIRS)
+}
+
+/// The staged `P` and the data a swap replaces, both beside `udd`.
+const SWAP_DIRS: [&str; 2] = [".revert-staging", ".revert-old"];
+
+/// `unpack`'s crash leftovers beside the staging: a partial `.incoming`, and
+/// a `.backup` of a staging that is always built afresh, so nothing needs them.
+const UNPACK_LEFTOVERS: [&str; 2] = [".revert-staging.incoming", ".revert-staging.backup"];
+
+fn remove_beside(udd: &Path, suffixes: &[&str]) -> Result<()> {
+    for suffix in suffixes {
+        let dir = beside(udd, suffix);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+    }
     Ok(())
+}
+
+/// Every profile deletion runs this first: a pending swap lands, so the
+/// trash keeps `R`, then the staged `P` is deleted, never trashed, even under
+/// a held revert lease (a revert that still has to seal stages `P` again).
+pub(crate) fn discard_revert_for_deletion(local: &str, udd: &Path) -> Result<()> {
+    settle_revert_swap(local, udd)?;
+    remove_beside(udd, &SWAP_DIRS)?;
+    remove_beside(udd, &UNPACK_LEFTOVERS)
 }
 
 /// ADR 0002 rule 6, "Committer side": commits `R` on top of `Jn`, the last
@@ -2028,8 +2065,9 @@ pub(crate) async fn revert(
 /// withdrawn, so a revert checks out and commits none and stops with
 /// `sync.revertDeviceWithdrawn`. A revert lease with no COMMIT is released
 /// on the base its checkout took (`granted`), so unbind stays a way out; a
-/// stored COMMIT may have landed, so it goes on (`None`) to be replayed,
-/// and `push_inner` refuses its `R`.
+/// stored COMMIT may have landed, so it goes on (`None`): `push_inner`
+/// abandons it while the listed head is still `Jn`, and otherwise replays
+/// it and refuses its `R`.
 async fn withdrawn_device(
     client: &FleetClient,
     access: &str,
@@ -11714,6 +11752,92 @@ mod tests {
         assert!(!beside(&root.join(&id), ".revert-staging").exists(), "none");
     }
 
+    #[test]
+    fn folder_delete_discards_decrypted_revert_staging() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let mut profile = crate::profile::StoredProfile::default();
+        profile.meta.folder = "staged-revert-folder".into();
+        crate::profile::save_raw(&mut profile).unwrap();
+        let id = profile.meta.id;
+        w.bind(&id, [0xc4; 16], 1, [9; 32]);
+        let udd = crate::store::user_data_root().unwrap().join(&id);
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        let staging = beside(&udd, ".revert-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("marker"), b"decrypted P").unwrap();
+
+        assert_eq!(
+            crate::folder_delete("staged-revert-folder".into(), true).unwrap(),
+            1
+        );
+        assert!(!udd.exists(), "the profile data was deleted");
+        assert!(
+            crate::profile::load_raw(&id).is_err(),
+            "the profile record was deleted"
+        );
+        assert!(
+            !staging.exists(),
+            "folder deletion must remove the deleted profile's decrypted revert staging"
+        );
+    }
+
+    #[test]
+    fn deletion_unbind_and_discard_remove_the_unpack_leftovers_beside_the_staging() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let root = crate::store::user_data_root().unwrap();
+        let profile = || {
+            let mut s = crate::profile::StoredProfile::default();
+            crate::profile::save_raw(&mut s).unwrap();
+            s.meta.id
+        };
+        // The staging, `unpack`'s two siblings of it, and the swap's old data.
+        let leftovers = |id: &str| {
+            [
+                ".revert-staging",
+                ".revert-staging.incoming",
+                ".revert-staging.backup",
+                ".revert-old",
+            ]
+            .map(|suffix| {
+                let dir = beside(&root.join(id), suffix);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("marker"), b"decrypted P").unwrap();
+                dir
+            })
+        };
+        let id = profile();
+        let dirs = leftovers(&id);
+        crate::profile_delete(id).unwrap();
+        assert!(dirs.iter().all(|d| !d.exists()), "deleted with the profile");
+
+        let id = profile();
+        w.bind(&id, [0xc5; 16], 1, [9; 32]);
+        let dirs = leftovers(&id);
+        crate::team::downgrade::unbind_profile(&id, SERVER, NOW).unwrap();
+        assert!(dirs.iter().all(|d| !d.exists()), "discarded by the unbind");
+
+        // A pending swap keeps the staged `P` and the data it replaces; the
+        // `unpack` leftovers, which nothing resumes, still go.
+        let id = profile();
+        let dirs = leftovers(&id);
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO revert_swaps VALUES (?1, 3, zeroblob(32), 0)",
+                [&id],
+            )
+            .unwrap();
+        discard_revert_staging(&id, &root.join(&id)).unwrap();
+        assert!(
+            dirs[0].exists() && dirs[3].exists(),
+            "the swap still needs them"
+        );
+        assert!(!dirs[1].exists() && !dirs[2].exists(), "never needed");
+    }
+
     /// Architect blocking 1: a revert lease held with nothing uploaded (a
     /// crash before seal, or a release whose reply was lost) while another
     /// device commits `R'` over the run. The next revert finds no run, so it
@@ -13208,6 +13332,111 @@ mod tests {
     }
 
     // Regressions found by the architect review, round 2.
+    #[test]
+    fn a_revert_uses_the_newest_valid_content_and_reads_back_remotely() {
+        let w = world();
+        let heads = chain_of(&w, &[&w.me.sk, &w.me.sk, &author()]);
+        serve(
+            &w,
+            &author_pages_for(
+                &w,
+                T0 + 300 * DAY,
+                Some(DeviceRevocationReason::Retired),
+                false,
+            ),
+        );
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"unsynced local").unwrap();
+        assert_eq!(w.revert(&out).unwrap().version, 4);
+        assert_eq!(
+            marker(&out),
+            "v2",
+            "P must be the newest valid earlier snapshot"
+        );
+        let other = second(&w);
+        let readback = other.path().join("readback");
+        w.pull(&readback).unwrap();
+        assert_eq!(
+            marker(&readback),
+            "v2",
+            "the encrypted committed R also carries P"
+        );
+        settled(&w, &readback);
+    }
+
+    #[test]
+    fn an_open_run_anchor_withdrawn_during_download_is_not_pinned() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&w.me.sk, &author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        w.fake().on_snapshot = Some(distrust_author());
+        let err = w.pull(&out).unwrap_err();
+        assert!(
+            w.fake().on_snapshot.is_none(),
+            "anchor download hook executed"
+        );
+        assert!(has(&err, "sync.signerRevoked"));
+        revoked_at(&w, 1);
+        assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+        assert_eq!(tree(&out), before);
+        settled(&w, &out);
+    }
+
+    #[test]
+    fn a_withdrawn_committer_sends_no_prepared_revert_commit() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        w.fake().skip.push("commit");
+        w.revert(&out).unwrap_err();
+        assert_eq!(w.fake().version, 2, "R has not landed");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'COMMIT' AND state = 'PENDING'"),
+            1
+        );
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+        let commits = w.fake().commits;
+        let result = w.revert(&out);
+        assert!(
+            result.is_err(),
+            "the withdrawn committer's revert is refused"
+        );
+        assert_eq!(tree(&out), before);
+        revoked_at(&w, 1);
+        assert_eq!(
+            w.fake().commits,
+            commits,
+            "a withdrawn device must commit no new R"
+        );
+        assert_eq!(w.fake().version, 2);
+        let err = result.unwrap_err();
+        assert!(has(&err, "sync.revertDeviceWithdrawn"), "{err:#}");
+        assert!(w.fake().lease.is_none(), "the server released the lease");
+        assert_eq!(local_leases(&w), 0);
+        assert!(!beside(&out, ".revert-staging").exists());
+    }
+
     fn local_leases(w: &World) -> i64 {
         w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL")
     }

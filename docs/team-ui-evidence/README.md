@@ -21,3 +21,8 @@ on the first, plus the blind verifier round.
   content of a source snapshot whose signer was withdrawn during its download
   or before a retry. Fixed with regression tests in the same change; round 4
   runs on the fixed main.
+- [codex-revert-round-4.md](codex-revert-round-4.md): the Codex blind verifier,
+  round 4, at 5ac2fd15. VERDICT: FAIL with two defects: folder and API deletion
+  left the decrypted revert staging behind, and a device whose own key was
+  withdrawn still sent a prepared revert commit that had not landed. Fixed with
+  regression tests in the same change; round 5 runs on the fixed main.
