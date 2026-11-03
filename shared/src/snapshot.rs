@@ -101,6 +101,14 @@ fn is_excluded(rel: &str) -> bool {
 
 /// Pack `udd` into compressed, portable snapshot bytes.
 pub fn pack(udd: &Path) -> Result<Vec<u8>> {
+    // A missing dir would pack as an empty profile (and `LocalCrypt::open`
+    // would mint a `Local State` in it) instead of failing.
+    if !udd.is_dir() {
+        bail!(
+            "user-data-dir {} is not a directory — refusing",
+            udd.display()
+        );
+    }
     let crypt = LocalCrypt::open(udd)?;
     // Fail the pack on a real read error rather than silently shipping empty
     // state — an empty cookie/secret set would clobber the shared environment's
@@ -1445,5 +1453,20 @@ mod tests {
         );
         assert!(!base.join("dst.incoming").exists());
         assert!(!base.join("dst.backup").exists());
+    }
+
+    #[test]
+    fn pack_refuses_a_missing_dir_and_creates_nothing() {
+        let base = std::env::temp_dir().join(format!("shardx-snap-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let missing = base.join("never-launched");
+        let err = pack(&missing).unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+        assert!(!missing.exists(), "no Local State minted");
+        let file = base.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(pack(&file).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

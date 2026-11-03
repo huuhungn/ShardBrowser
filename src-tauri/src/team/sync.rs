@@ -1999,6 +1999,34 @@ pub(crate) async fn revert(
     }
 }
 
+/// Rule 6: no `R` this device signs is accepted once its own key is
+/// withdrawn, so a revert checks out and commits none and stops with
+/// `sync.revertDeviceWithdrawn`. A revert lease with no COMMIT is released
+/// on the base its checkout took (`granted`), so unbind stays a way out; a
+/// stored COMMIT may have landed, so it goes on (`None`) to be replayed,
+/// and `push_inner` refuses its `R`.
+async fn withdrawn_device(
+    client: &FleetClient,
+    access: &str,
+    db: &mut Db,
+    dev: &Device,
+    b: &Bound,
+    revoked: bool,
+) -> Result<Option<anyhow::Error>> {
+    if !ledger::withdrawn(db, &dev.pin.0, &dev.me.signing_key_id)? {
+        return Ok(None);
+    }
+    let e = anyhow!(code("sync.revertDeviceWithdrawn"));
+    match b.lease {
+        None => Ok(Some(e)),
+        Some(lease) if revoked && find(db, &b.local, "COMMIT", Some(&lease), None)?.is_none() => {
+            let lease = granted(db, b, &lease)?.lease;
+            Ok(Some(abandon(client, access, db, b, lease, e).await))
+        }
+        Some(_) => Ok(None),
+    }
+}
+
 /// [`revert`] up to and including `finish`, the swap still pending.
 async fn revert_inner(
     client: &FleetClient,
@@ -2024,19 +2052,8 @@ async fn revert_inner(
             b = bound(&db, local)?;
         }
     }
-    // Rule 6: no `R` this device signs is accepted once its own key is
-    // withdrawn, so it checks out and commits none. A revert lease with no
-    // COMMIT is released, so unbind stays a way out; a stored COMMIT may
-    // have landed, so it is replayed and `push_inner` refuses its `R`.
-    if ledger::withdrawn(&db, &dev.pin.0, &dev.me.signing_key_id)? {
-        let e = anyhow!(code("sync.revertDeviceWithdrawn"));
-        match b.lease {
-            None => return Err(e),
-            Some(lease) if revoked && find(&db, local, "COMMIT", Some(&lease), None)?.is_none() => {
-                return Err(abandon(client, access, &mut db, &b, lease, e).await)
-            }
-            Some(_) => {}
-        }
+    if let Some(e) = withdrawn_device(client, access, &mut db, dev, &b, revoked).await? {
+        return Err(e);
     }
     // A revert lease resumes on the base its checkout took; any other
     // lease is an ordinary push's, which a revert never continues.
@@ -2078,10 +2095,16 @@ async fn revert_inner(
             let w = match (walk.await, b.lease) {
                 (Ok(w), _) => w,
                 (Err(e), Some(lease)) => {
-                    return Err(abandon(client, access, &mut db, &b, lease, e).await)
+                    let lease = granted(&db, &b, &lease)?.lease;
+                    return Err(abandon(client, access, &mut db, &b, lease, e).await);
                 }
                 (Err(e), None) => return Err(e),
             };
+            // The walk records the evidence it fetched: a withdrawal of this
+            // device it showed for the first time stops the revert as well.
+            if let Some(e) = withdrawn_device(client, access, &mut db, dev, &b, revoked).await? {
+                return Err(e);
+            }
             let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
                 unreachable!("the walk above checked both");
             };
@@ -12881,5 +12904,77 @@ mod tests {
             .unwrap();
         discard_revert_staging(LOCAL, &udd).unwrap();
         assert!(staging.exists(), "another lease's release abandons nothing");
+    }
+
+    // Regressions found by the architect review, round 2.
+    fn local_leases(w: &World) -> i64 {
+        w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL")
+    }
+
+    /// A revert lease with no COMMIT, abandoned because this device's own key
+    /// is withdrawn, is released on `Jn`, the base its checkout took, so the
+    /// server lets it go too.
+    #[test]
+    fn a_withdrawn_device_releases_its_revert_lease_on_the_server() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let before = tree(&udd);
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(local_leases(&w), 1, "in progress");
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id, NOW).unwrap();
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.revertDeviceWithdrawn"), "{err:#}");
+        assert!(w.fake().lease.is_none(), "the server released the lease");
+        assert_eq!(local_leases(&w), 0);
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        assert_eq!(tree(&udd), before);
+        assert!(!beside(&udd, ".revert-staging").exists());
+    }
+
+    /// A revert lease whose walk fails is released on its checkout's base.
+    #[test]
+    fn a_revert_lease_whose_walk_fails_is_released_on_the_server() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let crash = "CREATE TRIGGER crash BEFORE INSERT ON operations
+             WHEN NEW.kind = 'UPLOAD' BEGIN SELECT RAISE(ABORT, 'crash'); END";
+        w.db().conn.execute(crash, []).unwrap();
+        w.revert(&udd).unwrap_err();
+        w.db().conn.execute("DROP TRIGGER crash", []).unwrap();
+        assert_eq!(local_leases(&w), 1, "held with nothing uploaded");
+        w.fake().refuse.push(("profiles", 503));
+        w.revert(&udd).unwrap_err();
+        assert!(w.fake().lease.is_none(), "the server released the lease");
+        assert_eq!(local_leases(&w), 0);
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+    }
+
+    /// `R` landed with its reply lost and its staging gone: the next revert
+    /// finds no run to revert and gives the lease up with the user's data as
+    /// it was; the next pull accepts `R` and installs `P`.
+    #[test]
+    fn a_landed_r_whose_staging_is_gone_is_accepted_by_the_next_pull() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().lose.push("commit");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(w.fake().version, 3, "committed, the reply lost");
+        let staging = beside(&udd, ".revert-staging");
+        assert!(staging.exists(), "kept to resume");
+        std::fs::remove_dir_all(&staging).unwrap();
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.revertUnavailable"), "{err:#}");
+        assert_eq!(local_leases(&w), 0, "abandoned");
+        assert_eq!(marker(&udd), "local");
+        w.pull(&udd).unwrap();
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(marker(&udd), "v1");
+        settled(&w, &udd);
+        assert_eq!(
+            w.count("SELECT count(*) FROM skipped_heads WHERE resolution IS NULL"),
+            0
+        );
     }
 }
