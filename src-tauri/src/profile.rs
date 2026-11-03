@@ -761,13 +761,15 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
 
 pub fn delete(id: &str) -> Result<()> {
     let path = path_for(id)?;
+    let udd = store::user_data_root()?.join(id);
+    // Also reached without the trash (a folder delete's fallback).
+    crate::team::sync::discard_revert_for_deletion(id, &udd)?;
     let mut config_deleted = false;
     if path.exists() {
         fs::remove_file(&path)?;
         config_deleted = true;
     }
     // Also wipe per-profile user-data-dir.
-    let udd = store::user_data_root()?.join(id);
     if udd.exists() {
         fs::remove_dir_all(&udd).with_context(|| {
             if config_deleted {

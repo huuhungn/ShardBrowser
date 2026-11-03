@@ -1689,6 +1689,36 @@ mod automation_endpoint_tests {
             .expect("build the request")
     }
 
+    #[tokio::test]
+    async fn api_delete_discards_decrypted_revert_staging() {
+        let (_store, token, _lock) = scratch_store();
+        let mut profile = crate::profile::StoredProfile::default();
+        crate::profile::save_raw(&mut profile).unwrap();
+        let id = profile.meta.id;
+        let udd = crate::store::user_data_root().unwrap().join(&id);
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        let staging = crate::team::sync::beside(&udd, ".revert-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("marker"), b"decrypted P").unwrap();
+        let (status, body) = send(authed(
+            "DELETE",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        let record_deleted = crate::profile::load_raw(&id).is_err();
+        crate::store::set_config_root(None);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deleted"], json!(true));
+        assert!(record_deleted && !udd.exists(), "the profile was deleted");
+        assert!(
+            !staging.exists(),
+            "API deletion must remove the deleted profile's decrypted revert staging"
+        );
+    }
+
     /// Every automation endpoint sits behind the same auth as the rest of the
     /// API. This is the check that matters most: they drive real browsers.
     #[tokio::test]
