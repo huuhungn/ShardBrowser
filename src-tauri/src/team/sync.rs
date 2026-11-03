@@ -13666,6 +13666,55 @@ mod tests {
         assert!(!beside(&udd, ".revert-staging").exists());
     }
 
+    /// N2: this device's own key withdrawn only in the evidence the walk
+    /// fetches, with `P` signed by a third committer that stays valid, stops
+    /// the revert at the check after the walk: no checkout, nothing staged.
+    #[test]
+    fn a_device_withdrawn_in_the_walks_evidence_sends_no_revert() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let me = &w.me.to;
+        let revoke = TenantCapabilityGrantV2 {
+            common: common(0x40),
+            subject: device_subject(&w.me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceRevoke,
+        };
+        let revocation = DeviceRevocationV2 {
+            common: common(0x41),
+            subject_account_id: me.account_id,
+            subject_device_id: me.device_id,
+            subject_signing_key_id: me.signing_key_id,
+            subject_hpke_key_id: me.hpke_key_id,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        evidence[0].containers.extend([
+            build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &revoke.encode()),
+            build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ]);
+        serve(&w, &evidence);
+        assert!(!ledger::withdrawn(&w.db(), &w.dev.pin.0, &me.signing_key_id).unwrap());
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        let (checkouts, commits) = (w.sent("POST", "/checkout").len(), w.fake().commits);
+        let err = w.revert(&out).unwrap_err();
+        assert!(has(&err, "sync.revertDeviceWithdrawn"), "{err:#}");
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &me.signing_key_id).unwrap());
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        assert_eq!(w.fake().commits, commits);
+        assert_eq!(tree(&out), before);
+        assert!(!beside(&out, ".revert-staging").exists());
+    }
+
     /// A revert lease whose walk fails is released on its checkout's base.
     #[test]
     fn a_revert_lease_whose_walk_fails_is_released_on_the_server() {
