@@ -11860,6 +11860,43 @@ mod tests {
         assert!(!beside(&root.join(&id), ".revert-staging").exists(), "none");
     }
 
+    /// The folder-delete fallback fails closed as the trash does: a pending
+    /// swap that cannot land keeps the profile, its binding and the swap.
+    #[test]
+    fn a_folder_delete_keeps_a_profile_whose_pending_swap_cannot_land() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let mut profile = crate::profile::StoredProfile::default();
+        profile.meta.folder = "swap-pending-folder".into();
+        crate::profile::save_raw(&mut profile).unwrap();
+        let id = profile.meta.id;
+        w.bind(&id, [0xca; 16], 1, [9; 32]);
+        let udd = crate::store::user_data_root().unwrap().join(&id);
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        let staging = beside(&udd, ".revert-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        // A file where the swap moves the old data aside: the swap cannot land.
+        std::fs::write(beside(&udd, ".revert-old"), b"in the way").unwrap();
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO revert_swaps VALUES (?1, 3, zeroblob(32), 0)",
+                [&id],
+            )
+            .unwrap();
+
+        let err = crate::folder_delete("swap-pending-folder".into(), true).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "profile.folderDeletePartial"),
+            "{err}"
+        );
+        assert!(crate::profile::load_raw(&id).is_ok() && udd.exists());
+        assert!(staging.exists());
+        assert!(is_published(&id).unwrap(), "still bound");
+        assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 1);
+    }
+
     #[test]
     fn folder_delete_discards_decrypted_revert_staging() {
         let w = world();

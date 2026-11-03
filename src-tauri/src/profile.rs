@@ -978,9 +978,15 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
         } else {
             // Through the trash, like every other delete — a folder wiped by
             // mistake is exactly the case the week of retention is there for.
+            // The fallback fails closed as the trash does on a swap that
+            // cannot land or a team database that does not open.
             match crate::trash::move_to_trash(&id) {
                 Ok(_) => Ok(()),
-                Err(_) => delete(&id),
+                Err(_) => store::user_data_root()
+                    .and_then(|root| {
+                        crate::team::sync::discard_revert_for_deletion(&id, &root.join(&id))
+                    })
+                    .and_then(|()| delete(&id)),
             }
         };
         result.with_context(|| {
@@ -1704,6 +1710,30 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    #[test]
+    fn a_folder_delete_never_bypasses_the_trash_without_the_team_database() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let db = crate::team::db::Db::path().unwrap();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"not a database").unwrap();
+        let mut stored = StoredProfile::default();
+        stored.meta.folder = "Unreadable ledger".into();
+        save_raw(&mut stored).unwrap();
+        let id = stored.meta.id;
+        let udd = store::user_data_root().unwrap().join(&id);
+        fs::create_dir_all(&udd).unwrap();
+        fs::write(udd.join("marker"), b"local").unwrap();
+
+        let err = delete_folder("Unreadable ledger", true).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            crate::errcode::has_code(&text, "team.trustLedgerUnreadable"),
+            "{text}"
+        );
+        assert!(load_raw(&id).is_ok() && udd.exists(), "nothing deleted");
+        assert!(crate::trash::list().unwrap().is_empty(), "nothing trashed");
     }
 
     #[test]
