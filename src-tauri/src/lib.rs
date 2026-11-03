@@ -5549,13 +5549,12 @@ pub fn run() {
                 runtime::ensure_profiles_migrated().await;
             });
 
-            // Trash older than its week; off the setup thread, since each
-            // purge may wait on the team database.
-            tauri::async_runtime::spawn_blocking(|| match trash::purge_expired() {
+            // Trash older than its week.
+            match trash::purge_expired() {
                 Ok(n) if n > 0 => eprintln!("[launcher] trash: {n} expired profile(s) removed"),
                 Ok(_) => {}
                 Err(e) => eprintln!("[launcher] trash sweep failed: {e}"),
-            });
+            }
 
             // Finish, or undo, a downgrade a crash cut off (plan L2240).
             tauri::async_runtime::spawn_blocking(|| match team::downgrade::resume_open() {
