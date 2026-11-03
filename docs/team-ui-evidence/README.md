@@ -9,3 +9,10 @@ on the first, plus the blind verifier round.
 - [codex-revert-round-1.md](codex-revert-round-1.md): the Codex blind verifier,
   round 1, at 33e431ae. VERDICT: FAIL with four defects (D1 to D4), fixed with
   regression tests in the same change; round 2 runs on the fixed main.
+- [codex-revert-round-2.md](codex-revert-round-2.md): the Codex blind verifier,
+  round 2, at a1d90593. VERDICT: FAIL with two race defects (a signer withdrawn
+  between the walk and the pin, for pull and for a replayed revert), fixed with
+  regression tests in the same change. Its third probe, a refused pull keeping
+  the local profile, contradicts the ADR's advance-to-P rule; an ordinary pull
+  replaces unsynced local edits the same way, so the behavior stays and the
+  probe was dropped. Round 3 runs on the fixed main.

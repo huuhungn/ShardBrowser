@@ -1808,24 +1808,14 @@ async fn push_inner(
             // only while its signer stands. Otherwise nothing is pinned and
             // the quarantine stays; the lease its commit used is dropped, so
             // a later revert walks over `R` as one more proven-revoked head.
-            if revert.is_some() {
-                let request =
-                    CommitRequestV2::parse(&commit_op.exact).map_err(|_| bad("CommitRequestV2"))?;
-                let signer = request.manifest().signer_signing_key_id();
-                if ledger::withdrawn(&db, &dev.pin.0, signer)? {
-                    db.conn.execute(
-                        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
-                           lease_expires_at = NULL
-                         WHERE local_profile_id = ?1",
-                        [local],
-                    )?;
-                    return Err(signer_revoked(&db, &b));
-                }
+            if revert.is_some() && dropped_withdrawn_r(&db.conn, dev, local, &commit_op)? {
+                return Err(signer_revoked(&db, &b));
             }
             return finish(
                 client,
                 access,
                 &mut db,
+                dev,
                 &b,
                 &commit_op,
                 revert.is_some(),
@@ -3500,15 +3490,39 @@ async fn commit(
     Ok(())
 }
 
+/// Rule 6: whether the signer of the `R` that `op` commits is withdrawn, in
+/// which case the lease that commit used is dropped, so a later revert walks
+/// over `R` as one more proven-revoked head.
+fn dropped_withdrawn_r(
+    conn: &rusqlite::Connection,
+    dev: &Device,
+    local: &str,
+    op: &Op,
+) -> Result<bool> {
+    let request = CommitRequestV2::parse(&op.exact).map_err(|_| bad("CommitRequestV2"))?;
+    if !ledger::withdrawn_in(conn, &dev.pin.0, request.manifest().signer_signing_key_id())? {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+           lease_expires_at = NULL
+         WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    Ok(true)
+}
+
 /// Reads the committed snapshot back (G2-38): the exact manifest, the
 /// object's hash, and the listed head the receipt names. Then the binding
 /// pins that head and drops the lease the commit released. A `revert`
 /// commit is `R` in the same transaction: the open run below it is accepted
 /// and the staged `P` waits in `revert_swaps` to replace the user's data.
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
+    dev: &Device,
     b: &Bound,
     op: &Op,
     revert: bool,
@@ -3551,7 +3565,14 @@ async fn finish(
     }
     let s = session(db, &op.op_id)?;
     let r = receipt.resulting_head_hash.to_vec();
-    let tx = db.conn.transaction()?;
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Judged again under the pin: the readback above awaited the network.
+    if revert && dropped_withdrawn_r(&tx, dev, &b.local, op)? {
+        tx.commit()?;
+        return Err(signer_revoked(db, b));
+    }
     tx.execute(
         "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
            last_observed_head_hash = ?3, fkek_key_id = ?4, key_generation = ?5,
@@ -4330,12 +4351,14 @@ fn supersede(
 /// the staged `p` in `revert_swaps`, in one transaction. `lift` ends a
 /// `SIGNER_REVOKED` quarantine: a run was accepted and the walk ended on an
 /// accepted head. A binding no longer at `b`'s version refuses with
-/// `sync.bindingChanged`.
+/// `sync.bindingChanged`; a `signer` withdrawn since the walk pins nothing
+/// and quarantines with `SIGNER_REVOKED`.
 #[allow(clippy::too_many_arguments)]
 fn pin(
     db: &mut Db,
+    dev: &Device,
     b: &Bound,
-    hash: [u8; 32],
+    (hash, signer): ([u8; 32], [u8; 32]),
     p: &SnapshotManifestV2,
     accepted: &[Run],
     read: &[(u64, [u8; 32])],
@@ -4345,6 +4368,12 @@ fn pin(
     let tx = db
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Rule 6: the head's signer is judged again under the pin, since another
+    // ledger writer may have withdrawn it while the snapshot downloaded.
+    if ledger::withdrawn_in(&tx, &dev.pin.0, &signer)? {
+        drop(tx);
+        return Err(signer_revoked(db, b));
+    }
     let moved = tx.execute(
         "UPDATE profile_bindings SET remote_version = ?2, base_version = ?2, dirty = 0,
            last_observed_head_hash = ?3, fkek_key_id = ?5, key_generation = ?6,
@@ -4561,7 +4590,8 @@ pub(crate) async fn pull(
                     now,
                 )?;
                 restore_then_pin(client, access, &mut db, &b, p, fkek, udd, |db| {
-                    pin(db, &b, at.hash, p, &w.accepted, &w.read, false, now)
+                    let head = (at.hash, at.signer);
+                    pin(db, dev, &b, head, p, &w.accepted, &w.read, false, now)
                 })
                 .await?;
             }
@@ -4591,7 +4621,8 @@ pub(crate) async fn pull(
     )?;
     let lift = !w.accepted.is_empty();
     restore_then_pin(client, access, &mut db, &b, &p, fkek, udd, |db| {
-        pin(db, &b, at.hash, &p, &w.accepted, &w.read, lift, now)
+        let head = (at.hash, at.signer);
+        pin(db, dev, &b, head, &p, &w.accepted, &w.read, lift, now)
     })
     .await
 }
@@ -4873,6 +4904,8 @@ mod tests {
         /// SQL another writer runs on the launcher's database when the next
         /// fleet listing is served.
         on_list: Option<String>,
+        /// SQL another ledger writer runs when a snapshot object is served.
+        on_snapshot: Option<String>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -5396,6 +5429,12 @@ mod tests {
             if let Some(sql) = f.on_checkout.take() {
                 let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
                 assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
+            }
+        }
+        if method == Method::GET && parts.len() == 5 && parts[3] == "snapshots" {
+            if let Some(sql) = f.on_snapshot.take() {
+                let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                assert_eq!(c.execute(&sql, []).unwrap(), 1);
             }
         }
         if take(&mut f.skip, tag) {
@@ -12904,6 +12943,91 @@ mod tests {
             .unwrap();
         discard_revert_staging(LOCAL, &udd).unwrap();
         assert!(staging.exists(), "another lease's release abandons nothing");
+    }
+
+    // Rule 6 at the pin: a withdrawal recorded after the walk, and a join
+    // refused on an invalid transition.
+    #[test]
+    fn a_join_refused_on_an_invalid_transition_pins_nothing_and_can_unbind() {
+        let (w, d, _, _) = joinable_after_restore(0);
+        *w.fake()
+            .epoch_files
+            .get_mut(&epoch_path(0))
+            .unwrap()
+            .last_mut()
+            .unwrap() ^= 1;
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionInvalid"));
+        assert_eq!(w.state(LOCAL).3, 0, "no unproven leaf pinned");
+        assert!(tree(&out) == before);
+        assert!(w.push_from(&out).is_err());
+        assert!(w.sent("POST", "/checkout").is_empty());
+        unbind(LOCAL, SERVER, NOW).unwrap();
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert!(tree(&out) == before, "unbind remains a way forward");
+        assert!(!beside(&out, ".revert-staging").exists());
+    }
+
+    #[test]
+    fn a_pull_never_pins_a_head_whose_signer_is_withdrawn_during_its_download() {
+        let w = world();
+        chain_of(&w, &[&w.me.sk, &author()]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let d = second(&w);
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        w.fake().on_snapshot = Some(distrust_author());
+        let result = w.pull(&out);
+        assert!(w.fake().on_snapshot.is_none(), "download hook executed");
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
+        assert_eq!(
+            (result.is_err(), w.state(LOCAL).3, tree(&out) == before),
+            (true, 0, true),
+            "a signer withdrawn before the pin transaction must not be pinned"
+        );
+        assert!(has(&result.unwrap_err(), "sync.signerRevoked"));
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        settled(&w, &out);
+    }
+
+    #[test]
+    fn a_replayed_r_whose_signer_is_withdrawn_during_readback_is_never_pinned() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().lose.push("commit");
+        w.revert(&udd).unwrap_err();
+        assert_eq!(w.fake().version, 3);
+        assert_eq!(w.state(LOCAL).3, 1);
+        let before = tree(&udd);
+        // Another local ledger writer withdraws R's signer while finish awaits
+        // its final readback. Reuse the fixture's existing concurrent-writer hook.
+        w.fake().on_list = Some(
+            distrust_author().replace(&hex(&key_id_of(&author())), &hex(&w.me.to.signing_key_id)),
+        );
+        let result = w.revert(&udd);
+        assert!(w.fake().on_list.is_none(), "readback hook executed");
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &w.me.to.signing_key_id).unwrap());
+        let (state, reason, _, version, _) = w.state(LOCAL);
+        assert_eq!(
+            (
+                result.is_err(),
+                state.as_str(),
+                reason.as_deref(),
+                version,
+                tree(&udd) == before,
+            ),
+            (true, "QUARANTINED", Some("SIGNER_REVOKED"), 1, true),
+            "withdrawn R must not pin, lift quarantine, or replace local data"
+        );
+        assert!(has(&result.unwrap_err(), "sync.signerRevoked"));
+        assert_eq!(local_leases(&w), 0, "the lease R's commit used is dropped");
+        settled(&w, &udd);
     }
 
     // Regressions found by the architect review, round 2.
