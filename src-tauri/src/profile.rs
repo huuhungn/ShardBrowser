@@ -478,7 +478,7 @@ fn begin_bulk_mutation(
     Ok(guard)
 }
 
-fn path_for(id: &str) -> Result<PathBuf> {
+pub(crate) fn path_for(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
         anyhow::bail!(crate::errcode::code("profile.invalidId"));
     }

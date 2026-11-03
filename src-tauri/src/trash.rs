@@ -238,7 +238,7 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
 /// not restored; a refused unbind keeps the archive.
 pub fn purge(id: &str) -> Result<()> {
     let (zip_path, meta_path) = paths_for(id)?;
-    if profile::load_raw(id).is_err() {
+    if !profile::path_for(id).is_ok_and(|record| record.exists()) {
         crate::team::sync::unbind_removed(id)?;
     }
     let _ = fs::remove_file(zip_path);

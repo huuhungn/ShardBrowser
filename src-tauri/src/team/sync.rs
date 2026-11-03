@@ -12019,6 +12019,17 @@ mod tests {
         crate::trash::restore(&id).unwrap();
         crate::trash::purge(&id).unwrap();
         assert!(is_published(&id).unwrap(), "restored, so still bound");
+        let record = crate::store::profiles_dir()
+            .unwrap()
+            .join(format!("{id}.json"));
+        let body = std::fs::read(&record).unwrap();
+        std::fs::write(&record, b"unreadable").unwrap();
+        crate::trash::purge(&id).unwrap();
+        assert!(
+            is_published(&id).unwrap(),
+            "an unreadable record still binds"
+        );
+        std::fs::write(&record, body).unwrap();
 
         crate::profile::delete(&id).unwrap();
         assert!(!is_published(&id).unwrap(), "deleted with no trash");
