@@ -30,3 +30,7 @@ on the first, plus the blind verifier round.
   round 5, at bf09f512. VERDICT: FAIL with one defect: a custodian-signed
   revocation naming the right signing key but another device was counted.
   Fixed with regression tests in the same change; round 6 runs on the fixed main.
+- [codex-revert-round-6.md](codex-revert-round-6.md): the Codex blind verifier,
+  round 6, at a4332d76. VERDICT: PASS: all ten properties hold. Its two new
+  probes (a stacked run never pins a rejected head, even for a moment; a failed
+  revert pin keeps local data and can be retried) are kept as regression tests.

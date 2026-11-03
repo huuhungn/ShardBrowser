@@ -42,6 +42,7 @@ ARTIFACTS = [
     "docs/g2-evidence/verifier-hermes-2026-11-02-round5.md",
     "docs/key-custody.md",
     "docs/security-review-g2.md",
+    "docs/team-ui-evidence/codex-revert-round-6.md",
     "docs/trust-boundaries.md",
     "package.json",
     "scripts/backend-error-locale.test.mjs",
