@@ -231,8 +231,14 @@ fn hold_lapses(
 /// Q-26: whether `key` is now proven revoked (rule 6) or locally distrusted,
 /// whenever that was learned.
 pub fn withdrawn(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
+    withdrawn_in(&db.conn, binding, key)
+}
+
+/// [`withdrawn`] inside the caller's transaction `tx`, so it sees what
+/// [`record_in`] counted there.
+pub fn withdrawn_in(tx: &rusqlite::Connection, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
     let (instance, tenant) = ids(binding);
-    Ok(db.conn.query_row(
+    Ok(tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM trust_proven_revocations
          WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)",
         params![instance, tenant, hex(key)],
