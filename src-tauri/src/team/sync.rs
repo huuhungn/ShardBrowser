@@ -2030,6 +2030,13 @@ pub(crate) fn discard_revert_for_deletion(local: &str, udd: &Path) -> Result<()>
     remove_beside(udd, &UNPACK_LEFTOVERS)
 }
 
+/// A profile deleted for good keeps no staging, and needs no team database
+/// for it: with the profile gone, a swap still pending no longer matters.
+pub(crate) fn discard_revert_for_removal(udd: &Path) -> Result<()> {
+    remove_beside(udd, &SWAP_DIRS)?;
+    remove_beside(udd, &UNPACK_LEFTOVERS)
+}
+
 /// ADR 0002 rule 6, "Committer side": commits `R` on top of `Jn`, the last
 /// head of the run of proven-revoked heads open at the listed head, with
 /// the content of `P`, the newest head below it whose signer is valid and
@@ -3913,6 +3920,85 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
     Ok(reply)
 }
 
+/// The [`unbind`] of a profile removed for good (a trash purge, a delete
+/// that bypasses the trash; a move to the trash keeps the binding). A flow or
+/// a pending operation refuses it, as it refuses an unbind, so nothing is
+/// removed. A held lease, which no session is open to release, is stored as
+/// a release that names no binding (with any release already pending), sent
+/// best effort by the next publish, push or pull, and lapses at its TTL
+/// otherwise; the binding then drops it as a sent release would. No team
+/// database, or one that does not open, has no binding this could drop.
+pub(crate) fn unbind_removed(local: &str) -> Result<()> {
+    if !Db::path()?.exists() {
+        return Ok(());
+    }
+    let mut db = match Db::open() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[sync] binding of a removed profile: {e:#}");
+            return Ok(());
+        }
+    };
+    if !is_published(local)? {
+        return Ok(());
+    }
+    if super::journal::flow_taken(&db, local)? {
+        bail!(code("downgrade.flowTaken"));
+    }
+    let b = bound(&db, local)?;
+    // The base its checkout or publish took, as `abandon` releases it.
+    let lease = b.lease.map(|l| granted(&db, &b, &l).map_or(l, |g| g.lease));
+    let release_pending = match &lease {
+        Some(l) => find(&db, local, "RELEASE", Some(l), Some("PENDING"))?.is_some(),
+        None => true,
+    };
+    let server_url: String = db.conn.query_row(
+        "SELECT origin FROM server_origins WHERE server_id = ?1",
+        [&b.server],
+        |r| r.get(0),
+    )?;
+    let tx = db
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM operations WHERE local_profile_id = ?1
+           AND state IN ('PENDING', 'RUNNING', 'AWAITING_RETRY')
+           AND NOT (kind = 'RELEASE' AND state = 'PENDING'))",
+        [local],
+        |r| r.get(0),
+    )?;
+    if pending {
+        bail!(code("sync.unbindPending"));
+    }
+    if let (Some(lease), false) = (lease, release_pending) {
+        release_op(&tx, &b, lease, ReleaseReason::UserRelease)?;
+    }
+    tx.execute(
+        "UPDATE operations SET local_profile_id = NULL
+         WHERE local_profile_id = ?1 AND kind = 'RELEASE' AND state = 'PENDING'",
+        [local],
+    )?;
+    tx.execute(
+        "UPDATE upload_sessions SET state = 'ABORTED' WHERE local_profile_id = ?1
+           AND state IN ('OPEN', 'READY')",
+        [local],
+    )?;
+    tx.execute(
+        "UPDATE profile_bindings SET lease_id = NULL, fencing_token = NULL,
+           lease_expires_at = NULL WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    tx.execute(
+        "DELETE FROM revert_swaps WHERE local_profile_id = ?1",
+        [local],
+    )?;
+    tx.commit()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    unbind(local, &server_url, now).map(|_| ())
+}
+
 /// The exact stored response of the newest completed unbind of `local`, once
 /// its columns match its request and its tombstone recomputes from the
 /// stored request and response (ADR 0002 D-7); otherwise nothing is trusted.
@@ -4667,6 +4753,8 @@ pub(crate) async fn pull(
                     pin(db, dev, &b, head, p, &w.accepted, &w.read, false, now)
                 })
                 .await?;
+                // The user is told the profile now holds `P`.
+                bail!(code("sync.signerRevokedAtP"));
             }
         }
         bail!(code("sync.signerRevoked"));
@@ -8195,7 +8283,7 @@ mod tests {
         w.enroll(other.path());
         let out = other.path().join("out");
         let err = w.pull(&out).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         let (state, reason, _, version, head) = w.state(LOCAL);
         assert_eq!(
             (state.as_str(), reason.as_deref(), version, head),
@@ -10761,7 +10849,7 @@ mod tests {
         let d = second(&w);
         w.fake().listed = Some((2, Some(heads[1])));
         let err = w.pull(&d.path().join("out")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         unbind(LOCAL, SERVER, NOW).unwrap();
         w.bind(LOCAL, PROFILE, 1, heads[0]);
         let err = w.pull(&d.path().join("again")).unwrap_err();
@@ -11020,7 +11108,7 @@ mod tests {
         let d = second(&w);
         w.fake().listed = Some((2, Some(heads[1])));
         let err = w.pull(&d.path().join("first")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         w.fake().listed = None;
         w.pull(&d.path().join("out")).unwrap();
@@ -11052,7 +11140,7 @@ mod tests {
         revoked_at(&w, 0);
         assert_eq!(skipped(&w), [(2, None, None, 1)]);
         let err = w.pull(&d.path().join("out")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         assert_eq!(skipped(&w), [(2, None, None, 1)]);
@@ -11072,7 +11160,7 @@ mod tests {
         assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
         let out = d.path().join("out");
         let err = w.pull(&out).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         assert!(out.join("Preferences").exists());
@@ -11096,7 +11184,7 @@ mod tests {
             let pulled = w.pull(&d.path().join("out"));
             if second_run {
                 let err = pulled.unwrap_err();
-                assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+                assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
                 revoked_at(&w, 3);
                 assert_eq!(w.state(LOCAL).4, Some(heads[2].to_vec()));
                 assert_eq!(
@@ -11262,7 +11350,7 @@ mod tests {
         serve(w, &author_pages_for(w, T0 + 300 * DAY, Some(reason), false));
         let d = second(w);
         let err = w.pull(&d.path().join("pulled")).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(w, 1);
         let udd = d.path().join("profile");
         std::fs::create_dir_all(&udd).unwrap();
@@ -11772,6 +11860,43 @@ mod tests {
         assert!(!beside(&root.join(&id), ".revert-staging").exists(), "none");
     }
 
+    /// The folder-delete fallback fails closed as the trash does: a pending
+    /// swap that cannot land keeps the profile, its binding and the swap.
+    #[test]
+    fn a_folder_delete_keeps_a_profile_whose_pending_swap_cannot_land() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let mut profile = crate::profile::StoredProfile::default();
+        profile.meta.folder = "swap-pending-folder".into();
+        crate::profile::save_raw(&mut profile).unwrap();
+        let id = profile.meta.id;
+        w.bind(&id, [0xca; 16], 1, [9; 32]);
+        let udd = crate::store::user_data_root().unwrap().join(&id);
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        let staging = beside(&udd, ".revert-staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        // A file where the swap moves the old data aside: the swap cannot land.
+        std::fs::write(beside(&udd, ".revert-old"), b"in the way").unwrap();
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO revert_swaps VALUES (?1, 3, zeroblob(32), 0)",
+                [&id],
+            )
+            .unwrap();
+
+        let err = crate::folder_delete("swap-pending-folder".into(), true).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "profile.folderDeletePartial"),
+            "{err}"
+        );
+        assert!(crate::profile::load_raw(&id).is_ok() && udd.exists());
+        assert!(staging.exists());
+        assert!(is_published(&id).unwrap(), "still bound");
+        assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 1);
+    }
+
     #[test]
     fn folder_delete_discards_decrypted_revert_staging() {
         let w = world();
@@ -11856,6 +11981,152 @@ mod tests {
             "the swap still needs them"
         );
         assert!(!dirs[1].exists() && !dirs[2].exists(), "never needed");
+    }
+
+    /// A profile removed for good (a trash purge, a delete with no trash)
+    /// drops its binding as an unbind does; one in the trash, or restored
+    /// from it, keeps it.
+    #[test]
+    fn a_profile_removed_for_good_drops_its_binding() {
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let profile = |remote: u8| {
+            let mut s = crate::profile::StoredProfile::default();
+            crate::profile::save_raw(&mut s).unwrap();
+            w.bind(&s.meta.id, [remote; 16], 1, [9; 32]);
+            s.meta.id
+        };
+        let tombstones = |id: &str| {
+            w.db()
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM operations WHERE kind = 'UNBIND'
+                       AND state = 'COMPLETED' AND local_profile_id_at_request = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let id = profile(0xc6);
+        crate::profile_delete(id.clone()).unwrap();
+        assert!(is_published(&id).unwrap(), "the trash keeps the binding");
+        crate::trash::purge(&id).unwrap();
+        assert!(!is_published(&id).unwrap(), "purged");
+        assert_eq!(tombstones(&id), 1);
+
+        let id = profile(0xc7);
+        crate::profile_delete(id.clone()).unwrap();
+        crate::trash::restore(&id).unwrap();
+        crate::trash::purge(&id).unwrap();
+        assert!(is_published(&id).unwrap(), "restored, so still bound");
+        let record = crate::store::profiles_dir()
+            .unwrap()
+            .join(format!("{id}.json"));
+        let body = std::fs::read(&record).unwrap();
+        std::fs::write(&record, b"unreadable").unwrap();
+        crate::trash::purge(&id).unwrap();
+        assert!(
+            is_published(&id).unwrap(),
+            "an unreadable record still binds"
+        );
+        std::fs::write(&record, body).unwrap();
+
+        crate::profile::delete(&id).unwrap();
+        assert!(!is_published(&id).unwrap(), "deleted with no trash");
+        assert_eq!(tombstones(&id), 1);
+
+        // A refused purge keeps the archive; the expiry sweep goes on.
+        let (kept, gone) = (profile(0xc8), profile(0xc9));
+        for id in [&kept, &gone] {
+            crate::profile_delete(id.clone()).unwrap();
+            let meta = crate::store::trash_dir()
+                .unwrap()
+                .join(format!("{id}.json"));
+            let mut e: crate::trash::TrashEntry =
+                serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+            e.expires_at = 0;
+            if id == &kept {
+                // Listed first, so emptying the trash meets the refusal first.
+                e.deleted_at = u64::from(u32::MAX);
+            }
+            std::fs::write(&meta, serde_json::to_vec(&e).unwrap()).unwrap();
+        }
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO restore_journals(local_profile_id, journal_id, phase, staged_path,
+                   backup_path, old_binding_json, target_version, target_head_hash,
+                   created_at, updated_at)
+                 VALUES (?1, 'j', 'CREATED', 's', 'b', '{}', 1, zeroblob(32), 'now', 'now')",
+                [&kept],
+            )
+            .unwrap();
+        let err = crate::trash::purge(&kept).unwrap_err();
+        assert!(has(&err, "downgrade.flowTaken"), "{err:#}");
+        assert_eq!(crate::trash::purge_expired().unwrap(), 1);
+        let left: Vec<_> = crate::trash::list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(left, [kept.as_str()]);
+        assert!(is_published(&kept).unwrap() && !is_published(&gone).unwrap());
+
+        // Emptying the trash goes past a refusal too, then reports it.
+        let more = profile(0xcb);
+        crate::profile_delete(more.clone()).unwrap();
+        let err = crate::trash_empty().unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "downgrade.flowTaken"),
+            "{err}"
+        );
+        let left: Vec<_> = crate::trash::list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(left, [kept.as_str()]);
+        assert!(!is_published(&more).unwrap());
+    }
+
+    /// A profile removed for good under a held lease with nothing pending
+    /// (a crash after checkout) stores the release with no binding, and the
+    /// next pull sends it; pending work refuses the removal, as it refuses
+    /// an unbind, and leaves the binding whole.
+    #[test]
+    fn a_profile_removed_for_good_releases_its_lease_unless_work_is_pending() {
+        {
+            let w = world();
+            let _lifecycle = crate::profile::lifecycle_test_guard();
+            w.fake().skip.push("upload");
+            w.push().unwrap_err();
+            let err = crate::profile::delete(LOCAL).unwrap_err();
+            assert!(has(&err, "sync.unbindPending"), "{err:#}");
+            assert!(is_published(LOCAL).unwrap());
+            assert_eq!(local_leases(&w), 1);
+        }
+
+        let w = world();
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let crash = "CREATE TRIGGER crash BEFORE INSERT ON operations
+             WHEN NEW.kind = 'UPLOAD' BEGIN SELECT RAISE(ABORT, 'crash'); END";
+        w.db().conn.execute(crash, []).unwrap();
+        w.push().unwrap_err();
+        w.db().conn.execute("DROP TRIGGER crash", []).unwrap();
+        assert_eq!(local_leases(&w), 1, "held with nothing pending");
+        let sent = w.fake().log.len();
+        crate::profile::delete(LOCAL).unwrap();
+        assert_eq!(w.fake().log.len(), sent, "no server call");
+        assert!(!is_published(LOCAL).unwrap());
+        let release = "SELECT count(*) FROM operations WHERE kind = 'RELEASE'
+             AND local_profile_id IS NULL AND local_profile_id_at_request = 'local-profile'
+             AND state = ";
+        assert_eq!(w.count(&format!("{release} 'PENDING'")), 1);
+        assert!(w.fake().lease.is_some());
+        let err = w.pull(&w._dir.path().join("pulled")).unwrap_err();
+        assert!(has(&err, "sync.profileNotListed"), "{err:#}");
+        assert!(w.fake().lease.is_none(), "the server released the lease");
+        assert_eq!(w.count(&format!("{release} 'COMPLETED'")), 1);
     }
 
     /// Architect blocking 1: a revert lease held with nothing uploaded (a
@@ -13249,7 +13520,7 @@ mod tests {
             ),
         );
         let err = w.pull(&open_run).unwrap_err();
-        assert!(has(&err, "sync.signerRevoked"));
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         let relative = |root: &Path| {
@@ -13283,6 +13554,7 @@ mod tests {
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("marker"), b"local").unwrap();
         let before = tree(&out);
+        let commits = w.fake().commits;
         w.fake().on_snapshot = Some(distrust_author());
         let result = w.revert(&out);
         assert!(
@@ -13290,24 +13562,16 @@ mod tests {
             "source download hook executed"
         );
         assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
-        match result {
-            Ok(pushed) => {
-                assert_eq!(pushed.version, 4);
-                assert_eq!(
-                    marker(&out),
-                    "v1",
-                    "only v1 remains valid after the v2 source signer is withdrawn"
-                );
-            }
-            Err(_) => {
-                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
-                assert!(
-                    tree(&out) == before,
-                    "a refusal preserves the local profile"
-                );
-                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
-            }
-        }
+        let err = result.unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+        assert_eq!(w.fake().commits, commits);
+        assert!(
+            tree(&out) == before,
+            "a refusal preserves the local profile"
+        );
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        assert!(!beside(&out, ".revert-staging").exists());
         settled(&w, &out);
     }
 
@@ -13331,24 +13595,14 @@ mod tests {
         assert_eq!(marker(&beside(&out, ".revert-staging")), "v2");
         ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&author()), NOW).unwrap();
         assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&author())).unwrap());
-        match w.revert(&out) {
-            Ok(pushed) => {
-                assert_eq!(pushed.version, 4);
-                let readback = d.path().join("readback");
-                w.pull(&readback).unwrap();
-                assert_eq!(
-                    marker(&readback),
-                    "v1",
-                    "a resumed R must not publish a source already proven revoked before retry"
-                );
-                assert_eq!(marker(&out), "v1");
-            }
-            Err(_) => {
-                assert_eq!(w.fake().version, 3, "a refusal commits nothing");
-                assert!(tree(&out) == before);
-                assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
-            }
-        }
+        let commits = w.fake().commits;
+        let err = w.revert(&out).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        assert_eq!(w.fake().version, 3, "a refusal commits nothing");
+        assert_eq!(w.fake().commits, commits);
+        assert!(tree(&out) == before);
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        assert!(!beside(&out, ".revert-staging").exists());
     }
 
     // Regressions found by the architect review, round 2.
@@ -13480,6 +13734,55 @@ mod tests {
         assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
         assert_eq!(tree(&udd), before);
         assert!(!beside(&udd, ".revert-staging").exists());
+    }
+
+    /// N2: this device's own key withdrawn only in the evidence the walk
+    /// fetches, with `P` signed by a third committer that stays valid, stops
+    /// the revert at the check after the walk: no checkout, nothing staged.
+    #[test]
+    fn a_device_withdrawn_in_the_walks_evidence_sends_no_revert() {
+        let w = world();
+        let mut evidence = author_pages(&w, T0 + 300 * DAY, false, false);
+        let rejected = committer(&w, &mut evidence, 0x20, T0 + 300 * DAY);
+        let heads = chain_of(&w, &[&author(), &rejected]);
+        serve(&w, &evidence);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+        ledger::distrust_key(&w.db(), &w.dev.pin.0, &key_id_of(&rejected), NOW).unwrap();
+        let me = &w.me.to;
+        let revoke = TenantCapabilityGrantV2 {
+            common: common(0x40),
+            subject: device_subject(&w.me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceRevoke,
+        };
+        let revocation = DeviceRevocationV2 {
+            common: common(0x41),
+            subject_account_id: me.account_id,
+            subject_device_id: me.device_id,
+            subject_signing_key_id: me.signing_key_id,
+            subject_hpke_key_id: me.hpke_key_id,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        evidence[0].containers.extend([
+            build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &revoke.encode()),
+            build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ]);
+        serve(&w, &evidence);
+        assert!(!ledger::withdrawn(&w.db(), &w.dev.pin.0, &me.signing_key_id).unwrap());
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("marker"), b"local").unwrap();
+        let before = tree(&out);
+        let (checkouts, commits) = (w.sent("POST", "/checkout").len(), w.fake().commits);
+        let err = w.revert(&out).unwrap_err();
+        assert!(has(&err, "sync.revertDeviceWithdrawn"), "{err:#}");
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &me.signing_key_id).unwrap());
+        assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+        assert_eq!(w.fake().commits, commits);
+        assert_eq!(tree(&out), before);
+        assert!(!beside(&out, ".revert-staging").exists());
     }
 
     /// A revert lease whose walk fails is released on its checkout's base.

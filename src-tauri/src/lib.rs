@@ -888,10 +888,15 @@ fn trash_purge(id: String) -> Result<(), String> {
 fn trash_empty() -> Result<usize, String> {
     let entries = trash::list().map_err(|e| e.to_string())?;
     let n = entries.len();
+    // A refused purge (a Team binding with pending work) keeps its entry;
+    // the rest still go, then the first refusal is reported.
+    let mut first = None;
     for e in entries {
-        trash::purge(&e.id).map_err(|e| e.to_string())?;
+        if let Err(err) = trash::purge(&e.id) {
+            first.get_or_insert(err.to_string());
+        }
     }
-    Ok(n)
+    first.map_or(Ok(n), Err)
 }
 
 // ---- Extensions ----

@@ -478,7 +478,7 @@ fn begin_bulk_mutation(
     Ok(guard)
 }
 
-fn path_for(id: &str) -> Result<PathBuf> {
+pub(crate) fn path_for(id: &str) -> Result<PathBuf> {
     if id.contains(['/', '\\', '.']) {
         anyhow::bail!(crate::errcode::code("profile.invalidId"));
     }
@@ -759,11 +759,22 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
     Ok(())
 }
 
+/// Deletes `id` for good, with no trash. Its Team binding goes first: a
+/// refused unbind removes nothing, and a removal that then fails leaves an
+/// unbound local profile, which a retry deletes.
 pub fn delete(id: &str) -> Result<()> {
+    crate::team::sync::unbind_removed(id)?;
+    remove(id)
+}
+
+/// The record and data of `id`, once the trash has archived them, or for
+/// good through [`delete`].
+pub(crate) fn remove(id: &str) -> Result<()> {
     let path = path_for(id)?;
     let udd = store::user_data_root()?.join(id);
-    // Also reached without the trash (a folder delete's fallback).
-    crate::team::sync::discard_revert_for_deletion(id, &udd)?;
+    // The trash settles a pending swap first and fails closed; reached
+    // without it (a folder delete's fallback) the profile is gone for good.
+    crate::team::sync::discard_revert_for_removal(&udd)?;
     let mut config_deleted = false;
     if path.exists() {
         fs::remove_file(&path)?;
@@ -968,9 +979,15 @@ pub fn delete_folder(name: &str, delete_profiles: bool) -> Result<usize> {
         } else {
             // Through the trash, like every other delete — a folder wiped by
             // mistake is exactly the case the week of retention is there for.
+            // The fallback fails closed as the trash does on a swap that
+            // cannot land or a team database that does not open.
             match crate::trash::move_to_trash(&id) {
                 Ok(_) => Ok(()),
-                Err(_) => delete(&id),
+                Err(_) => store::user_data_root()
+                    .and_then(|root| {
+                        crate::team::sync::discard_revert_for_deletion(&id, &root.join(&id))
+                    })
+                    .and_then(|()| delete(&id)),
             }
         };
         result.with_context(|| {
@@ -1694,6 +1711,59 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    #[test]
+    fn a_folder_delete_never_bypasses_the_trash_without_the_team_database() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let db = crate::team::db::Db::path().unwrap();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"not a database").unwrap();
+        let mut stored = StoredProfile::default();
+        stored.meta.folder = "Unreadable ledger".into();
+        save_raw(&mut stored).unwrap();
+        let id = stored.meta.id;
+        let udd = store::user_data_root().unwrap().join(&id);
+        fs::create_dir_all(&udd).unwrap();
+        fs::write(udd.join("marker"), b"local").unwrap();
+
+        let err = delete_folder("Unreadable ledger", true).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            crate::errcode::has_code(&text, "team.trustLedgerUnreadable"),
+            "{text}"
+        );
+        assert!(load_raw(&id).is_ok() && udd.exists(), "nothing deleted");
+        assert!(crate::trash::list().unwrap().is_empty(), "nothing trashed");
+    }
+
+    #[test]
+    fn a_delete_for_good_removes_revert_staging_without_the_team_database() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let db = crate::team::db::Db::path().unwrap();
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"not a database").unwrap();
+        let id = new_profile("Staged", &[]);
+        let udd = store::user_data_root().unwrap().join(&id);
+        let dirs = [
+            ".revert-staging",
+            ".revert-old",
+            ".revert-staging.incoming",
+            ".revert-staging.backup",
+        ]
+        .map(|suffix| {
+            let dir = crate::team::sync::beside(&udd, suffix);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        // The trash keeps a restorable profile, so it still fails closed.
+        crate::trash::move_to_trash(&id).unwrap_err();
+        assert!(load_raw(&id).is_ok());
+        assert!(dirs.iter().all(|d| d.exists()));
+
+        delete(&id).unwrap();
+        assert!(load_raw(&id).is_err());
+        assert!(dirs.iter().all(|d| !d.exists()), "removed with the profile");
     }
 
     #[test]
