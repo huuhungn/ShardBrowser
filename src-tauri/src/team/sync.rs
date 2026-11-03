@@ -1332,6 +1332,9 @@ fn verify_transition(
     if (p.previous_epoch, p.new_epoch) != epochs {
         return Err(invalid("previous_epoch"));
     }
+    // A transition is first seen with this evaluation, so only revocations
+    // already held apply to its approver (rule 6 "Order"); the leaf, a head,
+    // is judged on acceptance, re-checked after `record_in` counts.
     let withdrawn = ledger::withdrawn(db, &dev.pin.0, &signer).unwrap_or(true);
     let lapsed = ledger::lapsed_at(db, &dev.pin.0, &signer)
         .map(|at| at.is_some_and(|at| p.issued_at_ms <= at))
@@ -1949,9 +1952,10 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
         let needed: bool = Db::open()?.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM profile_bindings b JOIN operations o
                ON o.local_profile_id = b.local_profile_id AND o.lease_id = b.lease_id
-               WHERE b.local_profile_id = ?1 AND o.kind = 'UPLOAD')
-             AND NOT EXISTS (SELECT 1 FROM operations
-               WHERE local_profile_id = ?1 AND kind = 'RELEASE' AND state = 'PENDING')
+               WHERE b.local_profile_id = ?1 AND o.kind = 'UPLOAD'
+                 AND NOT EXISTS (SELECT 1 FROM operations r
+                   WHERE r.local_profile_id = ?1 AND r.kind = 'RELEASE'
+                     AND r.state = 'PENDING' AND r.lease_id = b.lease_id))
              OR EXISTS (SELECT 1 FROM revert_swaps WHERE local_profile_id = ?1)",
             [local],
             |r| r.get(0),
@@ -2020,6 +2024,20 @@ async fn revert_inner(
             b = bound(&db, local)?;
         }
     }
+    // Rule 6: no `R` this device signs is accepted once its own key is
+    // withdrawn, so it checks out and commits none. A revert lease with no
+    // COMMIT is released, so unbind stays a way out; a stored COMMIT may
+    // have landed, so it is replayed and `push_inner` refuses its `R`.
+    if ledger::withdrawn(&db, &dev.pin.0, &dev.me.signing_key_id)? {
+        let e = anyhow!(code("sync.revertDeviceWithdrawn"));
+        match b.lease {
+            None => return Err(e),
+            Some(lease) if revoked && find(&db, local, "COMMIT", Some(&lease), None)?.is_none() => {
+                return Err(abandon(client, access, &mut db, &b, lease, e).await)
+            }
+            Some(_) => {}
+        }
+    }
     // A revert lease resumes on the base its checkout took; any other
     // lease is an ordinary push's, which a revert never continues.
     let base = match b.lease {
@@ -2038,8 +2056,10 @@ async fn revert_inner(
         None => false,
     };
     let staging = beside(udd, ".revert-staging");
+    // An upload resumes only over its staged `P`; one gone (a profile
+    // deleted under the lease) is restored again, byte for byte, by the walk.
     let base = match base {
-        Some(base) if uploaded => base,
+        Some(base) if uploaded && staging.exists() => base,
         _ => {
             let walk = async {
                 let head = listed(client, access, &mut db, &b).await?;
@@ -2083,9 +2103,7 @@ async fn revert_inner(
                 Some(&p.fkek_key_id),
                 now,
             )?;
-            if staging.exists() {
-                std::fs::remove_dir_all(&staging)?;
-            }
+            fresh_staging(udd, &staging)?;
             restore(client, access, &b, p, fkek, &staging).await?;
             base.unwrap_or((jn.version, jn.hash))
         }
@@ -4338,6 +4356,21 @@ fn pin(
     Ok(())
 }
 
+/// Empties `staging` and seeds it with `udd`'s `Local State`, which no
+/// snapshot carries: `unpack` keeps the os_crypt key and the browser-level
+/// state only from the directory it unpacks over, and the swap replaces `udd`.
+fn fresh_staging(udd: &Path, staging: &Path) -> Result<()> {
+    if staging.exists() {
+        std::fs::remove_dir_all(staging)?;
+    }
+    std::fs::create_dir_all(staging)?;
+    let live = udd.join("Local State");
+    if live.exists() {
+        std::fs::copy(&live, staging.join("Local State"))?;
+    }
+    Ok(())
+}
+
 /// Restores `p` into `<udd>.revert-staging`, then `pin`s it, then swaps it
 /// into `udd` as a revert does ([`settle_revert_swap`], also at launch): a
 /// restore or pin that fails leaves `udd` as it was and the staging gone.
@@ -4355,9 +4388,7 @@ async fn restore_then_pin(
     let staging = beside(udd, ".revert-staging");
     let staged = async {
         // No swap is pending (settled first) and no lease held: a leftover.
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
-        }
+        fresh_staging(udd, &staging)?;
         let restored = restore(client, access, b, p, fkek, &staging).await?;
         pin(db)?;
         Ok::<_, anyhow::Error>(restored)
@@ -12739,5 +12770,116 @@ mod tests {
         assert_eq!(skipped(&w), [accepted_by(2, r, 1)]);
         assert_eq!(marker(&out), "v1");
         settled(&w, &out);
+    }
+
+    // Regressions found by the architect review of the round 1 fix.
+    const LOCAL_STATE: &[u8] = br#"{"probe_marker":1}"#;
+
+    fn local_state_kept(udd: &Path) -> bool {
+        std::fs::read_to_string(udd.join("Local State"))
+            .unwrap()
+            .contains("probe_marker")
+    }
+
+    #[test]
+    fn a_pull_keeps_the_devices_local_state() {
+        let w = world();
+        chain_of(&w, &[&w.me.sk]);
+        let d = second(&w);
+        let out = d.path().join("profile");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("Local State"), LOCAL_STATE).unwrap();
+        w.pull(&out).unwrap();
+        assert_eq!(marker(&out), "v1");
+        assert!(
+            local_state_kept(&out),
+            "the os_crypt key and browser state stay"
+        );
+    }
+
+    #[test]
+    fn a_revert_keeps_the_devices_local_state() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        std::fs::write(udd.join("Local State"), LOCAL_STATE).unwrap();
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        assert_eq!(marker(&udd), "v1");
+        assert!(
+            local_state_kept(&udd),
+            "the os_crypt key and browser state stay"
+        );
+    }
+
+    /// A revert whose upload was under way when its staging went (a profile
+    /// deleted under the lease, then restored from the trash) restores `P`
+    /// again before `R` is accepted.
+    #[test]
+    fn a_resumed_revert_whose_staging_is_gone_restores_p_again() {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        let staging = beside(&udd, ".revert-staging");
+        assert!(staging.exists(), "kept to resume");
+        std::fs::remove_dir_all(&staging).unwrap();
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(marker(&udd), "v1", "R accepted only with P swapped in");
+        settled(&w, &udd);
+    }
+
+    /// Rule 6: a device whose own key is withdrawn commits no `R`, before a
+    /// checkout and after a replayed `R` was refused, and can still unbind.
+    #[test]
+    fn a_device_whose_own_key_is_withdrawn_sends_no_revert() {
+        for case in ["no lease", "after a refused replay"] {
+            let w = world();
+            let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+            let me = w.me.to.signing_key_id;
+            if case == "no lease" {
+                ledger::distrust_key(&w.db(), &w.dev.pin.0, &me, NOW).unwrap();
+            } else {
+                w.fake().lose.push("commit");
+                w.revert(&udd).unwrap_err();
+                ledger::distrust_key(&w.db(), &w.dev.pin.0, &me, NOW).unwrap();
+                w.revert(&udd).unwrap_err();
+            }
+            let sent = w.fake().log.len();
+            let version = w.fake().version;
+            let before = tree(&udd);
+            let err = w.revert(&udd).unwrap_err();
+            assert!(has(&err, "sync.revertDeviceWithdrawn"), "{case}: {err:#}");
+            assert_eq!(w.fake().log.len(), sent, "{case}: nothing was sent");
+            assert_eq!(w.fake().version, version, "{case}");
+            assert_eq!(tree(&udd), before, "{case}");
+            assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+            unbind(LOCAL, SERVER, NOW).unwrap();
+            assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        }
+    }
+
+    /// Only a release of the held lease abandons it: one pending for another
+    /// lease leaves the resumable upload's staged `P` in place.
+    #[test]
+    fn a_release_pending_for_another_lease_keeps_the_staging() {
+        let w = world();
+        let (_, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        w.fake().skip.push("upload");
+        w.revert(&udd).unwrap_err();
+        let staging = beside(&udd, ".revert-staging");
+        assert!(staging.exists(), "kept to resume");
+        w.db()
+            .conn
+            .execute_batch(
+                "CREATE TEMP TABLE other AS SELECT * FROM operations WHERE kind = 'UPLOAD';
+                 UPDATE other SET op_id = 'other-' || op_id, kind = 'RELEASE', state = 'PENDING',
+                   lease_id = '00000000000000000000000000000000',
+                   idempotency_key = 'other-' || idempotency_key;
+                 INSERT INTO operations SELECT * FROM other;",
+            )
+            .unwrap();
+        discard_revert_staging(LOCAL, &udd).unwrap();
+        assert!(staging.exists(), "another lease's release abandons nothing");
     }
 }

@@ -1299,6 +1299,7 @@
   "sync.remoteAlreadyBound": "Hồ sơ nhóm này đã được liên kết với một hồ sơ khác trên thiết bị này.",
   "sync.restoreTaskFailed": "Khôi phục chưa hoàn tất: {error}",
   "sync.resume": "Tiếp tục",
+  "sync.revertDeviceWithdrawn": "Khoá ký của thiết bị này đã bị thu hồi hoặc không còn được tin cậy ở đây, nên mọi bản hoàn nguyên nó ghi sẽ không được chấp nhận, và chưa có gì được gửi đi. Hãy hoàn nguyên hồ sơ này từ một thiết bị khác trong nhóm, hoặc huỷ liên kết hồ sơ ở đây.",
   "sync.revertInProgress": "Lần hoàn nguyên hồ sơ này chưa xong. Hãy chạy lại hoàn nguyên cho xong trước khi đẩy.",
   "sync.revertNoValidSnapshot": "Không có bản chụp nào trước đó của hồ sơ này có người ký hợp lệ, nên không có gì để hoàn nguyên về.",
   "sync.revertSwapPending": "Chưa thể chuyển bản chụp đã hoàn nguyên vào hồ sơ này. Hãy đóng mọi cửa sổ trình duyệt đang dùng hồ sơ này rồi thử lại.",

@@ -1299,6 +1299,7 @@
   "sync.remoteAlreadyBound": "This team profile is already bound to another profile on this device.",
   "sync.restoreTaskFailed": "The restore did not finish: {error}",
   "sync.resume": "Resume",
+  "sync.revertDeviceWithdrawn": "This device's signing key has been revoked or is distrusted here, so no revert it commits would be accepted, and nothing was sent. Revert this profile from another team device, or unbind it here.",
   "sync.revertInProgress": "A revert of this profile has not finished. Run the revert again to finish it before pushing.",
   "sync.revertNoValidSnapshot": "No earlier snapshot of this profile has a valid signer, so there is nothing to revert to.",
   "sync.revertSwapPending": "The reverted snapshot could not be moved into this profile yet. Close any browser window using this profile, then try again.",
