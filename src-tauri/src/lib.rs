@@ -4817,6 +4817,36 @@ mod custody_tests {
         );
     }
 
+    /// A renewal whose issuance actually predates the count,
+    /// with a no-history control proving it otherwise extends custody.
+    #[test]
+    fn a_renewal_issued_before_the_count_is_sticky_and_alerts_once() {
+        let me = me();
+        let (_dir, path) = counted_d(&me);
+        let before = custodian(&path, &d_id());
+        let renewal = d_root(&d_key(), 0x93, T0 + DAY / 2, LONG);
+        let later = omitting(&me, vec![renewal.clone()]);
+        let (_fresh_dir, fresh) = ledger_at();
+        collect_at(&fresh, &later, &[], 1, T0 + 20 * DAY);
+        assert!(
+            custodian(&fresh, &d_id()).1 > before.1,
+            "without revocation history this renewal extends the window"
+        );
+        for day in [20, 21] {
+            collect_at(&path, &later, &[], 1, T0 + day * DAY);
+            assert_eq!(custodian(&path, &d_id()), before);
+            assert_eq!(
+                alerts(&path),
+                [(
+                    "custodian.renewed_after_revocation".to_string(),
+                    hex(&d_id()),
+                    hash_of(&renewal),
+                    (T0 + 20 * DAY) as i64,
+                )]
+            );
+        }
+    }
+
     /// Critic B1: a container that names D as its issuer and renews D, but is
     /// signed by another key, or whose pages omit D's public key, is dropped
     /// as before and raises nothing.
