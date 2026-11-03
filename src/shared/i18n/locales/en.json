@@ -1295,6 +1295,7 @@
   "sync.pushPending": "A push of this profile has not finished. Push again to finish it before pulling, so nothing is written over the profile's data.",
   "sync.readbackMismatch": "The team server's copy of the pushed snapshot does not match what was sent ({field}).",
   "sync.remoteAhead": "The team server has a newer version of this profile. Pull it before pushing.",
+  "sync.remoteAlreadyBound": "This team profile is already bound to another profile on this device.",
   "sync.restoreTaskFailed": "The restore did not finish: {error}",
   "sync.resume": "Resume",
   "sync.revertInProgress": "A revert of this profile has not finished. Run the revert again to finish it before pushing.",

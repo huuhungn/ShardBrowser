@@ -1295,6 +1295,7 @@
   "sync.pushPending": "Lần đẩy hồ sơ này chưa xong. Hãy đẩy lại cho xong trước khi kéo về, để dữ liệu của hồ sơ không bị ghi đè.",
   "sync.readbackMismatch": "Bản sao trên máy chủ nhóm của bản chụp vừa đẩy không khớp với dữ liệu đã gửi ({field}).",
   "sync.remoteAhead": "Máy chủ nhóm có phiên bản mới hơn của hồ sơ này. Hãy kéo về trước khi đẩy lên.",
+  "sync.remoteAlreadyBound": "Hồ sơ nhóm này đã được liên kết với một hồ sơ khác trên thiết bị này.",
   "sync.restoreTaskFailed": "Khôi phục chưa hoàn tất: {error}",
   "sync.resume": "Tiếp tục",
   "sync.revertInProgress": "Lần hoàn nguyên hồ sơ này chưa xong. Hãy chạy lại hoàn nguyên cho xong trước khi đẩy.",

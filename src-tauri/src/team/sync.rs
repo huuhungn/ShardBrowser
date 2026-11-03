@@ -963,6 +963,26 @@ async fn listing(
     access: &str,
     b: &Bound,
 ) -> Result<(u64, Option<FleetProfileHeadV2>)> {
+    let mut found = None;
+    let epoch = fleet_pages(client, access, b, |p| {
+        if p.profile_id == b.profile {
+            found = Some(p.clone());
+        }
+        found.is_none()
+    })
+    .await?;
+    Ok((epoch, found))
+}
+
+/// The server's restore epoch, from the fleet listing pages of `b`'s fleet,
+/// handing each listed profile to `more` until it returns `false`. Every
+/// page names `b`'s instance, tenant and fleet, at one epoch.
+async fn fleet_pages(
+    client: &FleetClient,
+    access: &str,
+    b: &Bound,
+    mut more: impl FnMut(&FleetProfileHeadV2) -> bool,
+) -> Result<u64> {
     let mut after: Option<[u8; 16]> = None;
     let mut epoch = None;
     loop {
@@ -978,13 +998,13 @@ async fn listing(
         if *epoch.get_or_insert(page.restore_epoch) != page.restore_epoch {
             return Err(bad("restore_epoch"));
         }
-        if let Some(p) = page.profiles.iter().find(|p| p.profile_id == b.profile) {
-            return Ok((page.restore_epoch, Some(p.clone())));
+        if !page.profiles.iter().all(&mut more) {
+            return Ok(page.restore_epoch);
         }
         match page.next_after {
             Some(a) if after.is_none_or(|x| a > x) => after = Some(a),
             Some(_) => return Err(bad("next_after")),
-            None => return Ok((page.restore_epoch, None)),
+            None => return Ok(page.restore_epoch),
         }
     }
 }
@@ -1034,6 +1054,10 @@ fn awaits_transition(b: &Bound) -> bool {
 /// How many versions at or below the pinned one the leaf's new head is
 /// looked for; past it the server is not believed (fails closed).
 const LEAF_SEARCH: u64 = 64;
+/// How many heads above the leaf a binding with no pin follows back. Each
+/// one is verified, so this only stops a server that lists an endless chain
+/// from holding the pull forever.
+const LEAF_WALK: u64 = 1 << 20;
 
 /// One verified `E -> E+1` step of a binding: the signed transition and its
 /// inclusion proof, as exact bytes.
@@ -1169,32 +1193,61 @@ async fn accept_transitions(
             }
             // An unchanged pin keeps its version. Otherwise the leaf's new head is a
             // committed manifest whose exact bytes hash to it, at most `LEAF_SEARCH`
-            // versions at or below the pinned one (a restore only goes back), and
+            // versions at or below the pinned one (a restore only goes back) or,
+            // with no pin, on the chain below the listed head, and
             // accepted as a new head is (rule 6) except for its earlier epoch.
             let version = if head == b.head {
                 b.version
             } else {
-                let top = b.version.min(listed.current_version);
-                let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
-                let mut found = None;
-                for v in (low..=top).rev() {
-                    let reply = ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
-                    let m = SignedSnapshotManifestV2::parse(&reply.body)
-                        .map_err(|_| bad("SignedSnapshotManifestV2"))?;
-                    if Some(m.head_hash()) == head {
-                        found = Some((v, m));
-                        break;
+                let missing =
+                    || refusal("RESTORE_EPOCH_TRANSITION_INVALID", "new_signed_head_hash");
+                let found = match b.head {
+                    Some(_) => {
+                        let top = b.version.min(listed.current_version);
+                        let low = top.saturating_sub(LEAF_SEARCH - 1).max(1);
+                        let mut found = None;
+                        for v in (low..=top).rev() {
+                            let reply =
+                                ok(client.snapshot_manifest(access, &b.profile, v).await?)?;
+                            let m = SignedSnapshotManifestV2::parse(&reply.body)
+                                .map_err(|_| bad("SignedSnapshotManifestV2"))?;
+                            if Some(m.head_hash()) == head {
+                                found = Some((v, m));
+                                break;
+                            }
+                        }
+                        found.ok_or_else(missing)
                     }
-                }
-                let checked = match found {
-                    Some((v, m)) => {
-                        verify_leaf_head(db, dev, b, chain, &keys, m, (v, epoch), now).map(|()| v)
+                    // No pin (a binding that joined at version 0): back from the
+                    // listed head along the chain to the leaf, each head above it
+                    // verified ([`above_leaf`]), so no bound is needed.
+                    None => {
+                        let (mut v, mut next) =
+                            (listed.current_version, listed.current_signed_head_hash);
+                        loop {
+                            if v == 0 || listed.current_version - v >= LEAF_WALK {
+                                break Err(missing());
+                            }
+                            let m = manifest(client, access, b, v).await?;
+                            if Some(m.head_hash()) != next {
+                                break Err(refusal(
+                                    "RESTORE_EPOCH_TRANSITION_INVALID",
+                                    "previous_signed_head_hash",
+                                ));
+                            }
+                            if next == head {
+                                break Ok((v, m));
+                            }
+                            match above_leaf(b, &keys, m, (v, epoch)) {
+                                Ok(previous) => (v, next) = (v - 1, previous),
+                                Err(r) => break Err(r),
+                            }
+                        }
                     }
-                    None => Err(refusal(
-                        "RESTORE_EPOCH_TRANSITION_INVALID",
-                        "new_signed_head_hash",
-                    )),
                 };
+                let checked = found.and_then(|(v, m)| {
+                    verify_leaf_head(db, dev, b, chain, &keys, m, (v, epoch), now).map(|()| v)
+                });
                 match checked {
                     Ok(v) => v,
                     Err((reason, err)) => return Err(quarantine(db, &b.local, reason, err)),
@@ -1334,6 +1387,48 @@ fn verify_leaf_head(
     Ok(())
 }
 
+/// A head above the leaf that a binding with no pin follows back to: its
+/// signature verifies under a key the evidence holds, it names `b`'s tenant,
+/// fleet, profile and instance at `version`, and it was committed at the new
+/// `epoch` (an older one, as the leaf's rolled-back child, is a rollback).
+/// Its previous head. Its signer is judged by the pull's walk over it.
+fn above_leaf(
+    b: &Bound,
+    keys: &std::collections::BTreeMap<[u8; 32], [u8; 32]>,
+    m: SignedSnapshotManifestV2,
+    (version, epoch): (u64, u64),
+) -> std::result::Result<Option<[u8; 32]>, Refused> {
+    let invalid = |field| refusal("RESTORE_EPOCH_TRANSITION_INVALID", field);
+    let pk = keys
+        .get(m.signer_signing_key_id())
+        .ok_or_else(|| invalid("signer_signing_key_id"))?;
+    let p = m
+        .verify_signature(pk)
+        .map_err(|_| invalid("signature_bytes"))?
+        .payload()
+        .clone();
+    let checks = [
+        ("tenant_id", p.tenant_id == b.tenant),
+        ("fleet_id", p.fleet_id == b.fleet),
+        ("profile_id", p.profile_id == b.profile),
+        ("server_instance_id", p.server_instance_id == b.instance),
+        (
+            "target_version",
+            p.target_version == version && p.base_version + 1 == version,
+        ),
+    ];
+    if let Some((field, _)) = checks.iter().find(|(_, ok)| !ok) {
+        return Err(invalid(field));
+    }
+    if p.restore_epoch < epoch {
+        return Err(("HEAD_ROLLBACK_DETECTED", anyhow!(code("sync.headRollback"))));
+    }
+    if p.restore_epoch != epoch {
+        return Err(invalid("restore_epoch"));
+    }
+    Ok(p.previous_signed_head_hash)
+}
+
 /// `b`'s served proof under `t`, once it proves `b`'s own leaf against the
 /// signed root and that leaf starts or ends at `head`, the head `b` holds.
 fn verify_proof(
@@ -1351,7 +1446,9 @@ fn verify_proof(
         InclusionError::Proof(_) => invalid("steps"),
     })?;
     let leaf = &proof.leaf;
-    if head != Some(leaf.previous_signed_head_hash) && head != Some(leaf.new_signed_head_hash) {
+    // No head yet (a device that joined at version 0) takes its leaf as its
+    // first head: ADR 0002 rule 6 extends the leaf exception to a new device.
+    if head.is_some_and(|h| h != leaf.previous_signed_head_hash && h != leaf.new_signed_head_hash) {
         return Err(invalid("previous_signed_head_hash"));
     }
     Ok((proof, body))
@@ -1516,7 +1613,8 @@ fn verified_key(
 /// and may lie past the pin (owner decision B) or be what a revert seals
 /// again under the lease's generation. Its grant still reverifies
 /// now (Q-26 drops a withdrawn issuer's). `P` skips the freshness check only
-/// when a `J` follows it; never for sealing, nor for any other head.
+/// when a `J` follows it; never for sealing, nor for any other head. A
+/// fleet listing's labels ([`labels`]) are opened through it too.
 fn readable_key(
     db: &Db,
     dev: &Device,
@@ -1654,8 +1752,19 @@ async fn push_inner(
                  WHERE local_profile_id = ?1 AND last_error_code = ?2",
                 params![local, COMPROMISED],
             )?;
+            // Only a transition moves the pin and not `base_version`, which a
+            // restore or a commit sets: a joined binding whose first pull did
+            // not restore the leaf it pinned holds none of that data yet. A
+            // revert seals from its staging, not from `udd`.
+            let behind: bool = revert.is_none()
+                && db.conn.query_row(
+                    "SELECT base_version < remote_version FROM profile_bindings
+                     WHERE local_profile_id = ?1",
+                    [local],
+                    |r| r.get(0),
+                )?;
             // A listing that shows a restore quarantines; the loop accepts it.
-            if let Err(e) = checkout(client, access, &mut db, &b, now).await {
+            if let Err(e) = checkout(client, access, &mut db, &b, behind, now).await {
                 if !awaits_transition(&bound(&db, local)?) {
                     return Err(e);
                 }
@@ -2049,6 +2158,201 @@ fn pending_publish(db: &Db, local: &str) -> Result<Option<Op>> {
         .optional()?)
 }
 
+/// `local` as it is before a binding to `fleet`'s `profile` under this
+/// device's pinned instance and tenant exists.
+fn unbound(local: &str, dev: &Device, fleet: [u8; 16], profile: [u8; 16]) -> Bound {
+    Bound {
+        local: local.to_string(),
+        server: String::new(),
+        instance: dev.pin.0.server_instance_id,
+        tenant: dev.pin.0.tenant_id,
+        fleet,
+        profile,
+        version: 0,
+        head: None,
+        epoch: 0,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    }
+}
+
+/// One profile a fleet lists, as `team_fleet_profiles` reports it.
+#[derive(Debug, serde::Serialize)]
+pub struct FleetProfile {
+    pub remote_profile_id: String,
+    pub current_version: u64,
+    /// Opened under this device's key of its generation; `None` when no key
+    /// this device holds opens it.
+    pub label: Option<String>,
+    /// The local profile bound to it here, if any.
+    pub bound_to: Option<String>,
+}
+
+/// Every profile `fleet` lists, with its label opened and its binding here,
+/// if any. Nothing is written, here or on the server.
+pub(crate) async fn labels(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    fleet: [u8; 16],
+    now: u64,
+) -> Result<Vec<FleetProfile>> {
+    let db = Db::open()?;
+    let b = unbound("", dev, fleet, [0; 16]);
+    let mut listed = Vec::new();
+    fleet_pages(client, access, &b, |p| {
+        listed.push(p.clone());
+        true
+    })
+    .await?;
+    let bound: std::collections::HashMap<String, String> = db
+        .conn
+        .prepare(
+            "SELECT remote_profile_id, local_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2",
+        )?
+        .query_map(params![hex(&b.instance), hex(&b.tenant)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // A label is read, never sealed: the key of its own generation, as `P`'s.
+    let mut keys = std::collections::HashMap::new();
+    Ok(listed
+        .into_iter()
+        .map(|p| {
+            let key = keys.entry(p.key_generation).or_insert_with(|| {
+                readable_key(&db, dev, &fleet, p.key_generation, None, now).ok()
+            });
+            let label = key.as_ref().and_then(|k| {
+                let l = shardx_core::keys::open_label(
+                    k,
+                    &b.tenant,
+                    &fleet,
+                    &p.profile_id,
+                    p.key_generation,
+                    &p.label_ciphertext,
+                )
+                .ok()?;
+                String::from_utf8(l.to_vec()).ok()
+            });
+            let id = hex(&p.profile_id);
+            FleetProfile {
+                bound_to: bound.get(&id).cloned(),
+                remote_profile_id: id,
+                current_version: p.current_version,
+                label,
+            }
+        })
+        .collect())
+}
+
+/// Binds the local profile `local`, which has no binding, to `fleet`'s
+/// listed `profile` on this device, then pulls it into `udd` (Team UI S3b).
+/// The binding starts at version 0 with no lease, `AVAILABLE` and clean,
+/// under the verified key `store_publish` would seal with. Its epoch is the
+/// server's, or the one before it when the profile's first snapshot predates
+/// it, so the pull accepts the restore transition whose leaf it then pins
+/// (ADR 0002 rule 6: the leaf exception covers a new device). A refusal
+/// before the insert leaves no binding. A failed pull keeps the binding,
+/// possibly quarantined awaiting the transition or pinned at the leaf, and
+/// pull can be retried; until one restores its pin, push refuses it
+/// (`base_version` stays below `remote_version`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn join(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    local: &str,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    udd: &Path,
+    now: u64,
+) -> Result<u64> {
+    let mut db = Db::open()?;
+    // A local profile with an unfinished publish is bound by finishing it.
+    if is_bound(&db, local)? || pending_publish(&db, local)?.is_some() {
+        bail!(code("sync.alreadyPublished"));
+    }
+    let mut b = unbound(local, dev, fleet, profile);
+    // Checked before the server is asked, and again with the insert, so the
+    // UNIQUE constraint is never the error shown.
+    let taken = |c: &rusqlite::Connection| -> Result<()> {
+        let taken: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM profile_bindings
+               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3)",
+            params![
+                hex(&dev.pin.0.server_instance_id),
+                hex(&dev.pin.0.tenant_id),
+                hex(&profile)
+            ],
+            |r| r.get(0),
+        )?;
+        if taken {
+            bail!(code("sync.remoteAlreadyBound"));
+        }
+        Ok(())
+    };
+    taken(&db.conn)?;
+    let generation = ledger::highest_generation(&db, &dev.pin.0, &fleet)?
+        .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
+    let fkek = verified_key(&db, dev, &fleet, generation, None, now)?;
+    let fkek_key_id = shardx_core::fleet_grants::fkek_key_id(&fkek);
+    b.server = key_server(&db, &b, generation, &fkek_key_id)?;
+    let (epoch, listed) = listing(client, access, &b).await?;
+    let listed = listed.ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
+    let accepted: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT last_restore_epoch FROM server_origins WHERE server_instance_id = ?1",
+            [hex(&b.instance)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if accepted.is_some_and(|e| epoch < e as u64) {
+        bail!(code("sync.headRollback"));
+    }
+    // Only a start epoch: the pull verifies every manifest it accepts, so a
+    // server that misreports this one fails closed there.
+    let mut start = epoch;
+    if epoch > 0 && listed.current_version > 0 {
+        let first = manifest(client, access, &b, 1).await?;
+        let p = SnapshotManifestV2::parse(first.canonical_manifest_payload_bytes())
+            .map_err(|_| bad("manifest"))?;
+        if p.restore_epoch < epoch {
+            start = epoch - 1;
+        }
+    }
+    {
+        let tx = db
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        taken(&tx)?;
+        tx.execute(
+            "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id, tenant_id,
+               account_id, device_id, fleet_id, remote_profile_id, remote_version, base_version,
+               accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?10, ?11, 'AVAILABLE', 0)",
+            params![
+                b.local,
+                b.server,
+                hex(&b.instance),
+                hex(&b.tenant),
+                hex(&dev.me.account_id),
+                hex(&dev.me.device_id),
+                hex(&b.fleet),
+                hex(&b.profile),
+                wire(start)?,
+                hex(&fkek_key_id),
+                wire(generation)?
+            ],
+        )?;
+        tx.commit()?;
+    }
+    drop(db);
+    pull(client, access, dev, local, udd, now).await
+}
+
 /// Builds the request of a new publish and stores it, PENDING, unsent.
 #[allow(clippy::too_many_arguments)]
 async fn store_publish(
@@ -2062,20 +2366,7 @@ async fn store_publish(
     profile: [u8; 16],
     now: u64,
 ) -> Result<Op> {
-    let mut b = Bound {
-        local: local.to_string(),
-        server: String::new(),
-        instance: dev.pin.0.server_instance_id,
-        tenant: dev.pin.0.tenant_id,
-        fleet,
-        profile,
-        version: 0,
-        head: None,
-        epoch: 0,
-        lease: None,
-        state: "LOCAL".into(),
-        error: None,
-    };
+    let mut b = unbound(local, dev, fleet, profile);
     // The listing names the server's instance and epoch (it must be the
     // pinned instance) and shows whether the ID is taken.
     let (epoch, listed) = listing(client, access, &b).await?;
@@ -2423,11 +2714,14 @@ pub(crate) fn cancel_publish(local: &str) -> Result<()> {
 }
 
 /// `PROFILE_CHECKOUT` at the pinned head, or the replay of a stored one.
+/// `behind`: the local data never received the pinned head, so nothing is
+/// checked out until a pull restores it (a replayed lease is released).
 async fn checkout(
     client: &FleetClient,
     access: &str,
     db: &mut Db,
     b: &Bound,
+    behind: bool,
     now: u64,
 ) -> Result<()> {
     let replay = find(db, &b.local, "CHECKOUT", None, Some("PENDING"))?;
@@ -2440,7 +2734,7 @@ async fn checkout(
         }
         None => {
             let head = listed(client, access, db, b).await?;
-            if head.current_version > b.version {
+            if behind || head.current_version > b.version {
                 bail!(code("sync.remoteAhead"));
             }
             let payload = ProfileCheckoutV2 {
@@ -2483,10 +2777,11 @@ async fn checkout(
     // A replayed checkout from before the binding moved on holds a lease on an
     // old head or epoch, and one replayed after its stored expiry a lease that
     // ended (probe 11, L2046): it is released as stored, and the next one
-    // starts afresh under a new key.
+    // starts afresh under a new key. So is one over data that is `behind`.
     if (g.lease.base_version, g.current_signed_head_hash) != (b.version, b.head)
         || op.epoch != b.epoch
         || (replayed && g.expires_at_ms <= now)
+        || behind
     {
         let release = {
             let tx = db.conn.transaction()?;
@@ -4437,6 +4732,11 @@ mod tests {
         fresh: bool,
         /// The profiles publish-create made, in order.
         published: Vec<[u8; 16]>,
+        /// The label publish-create sealed for `PROFILE`, which the list reports.
+        label: Option<Vec<u8>>,
+        /// SQL another writer runs on the launcher's database when the next
+        /// fleet listing is served.
+        on_list: Option<String>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -4568,7 +4868,7 @@ mod tests {
                                 current_version: version,
                                 current_signed_head_hash: head,
                                 key_generation: GEN,
-                                label_ciphertext: vec![1],
+                                label_ciphertext: self.label.clone().unwrap_or(vec![1]),
                             })
                             .into_iter()
                             .chain(self.others.iter().cloned())
@@ -4597,6 +4897,9 @@ mod tests {
                                 return Err(409);
                             }
                             f.fresh = false;
+                            if c.profile.profile_id == PROFILE {
+                                f.label = Some(c.label_ciphertext.clone());
+                            }
                             f.published.push(c.profile.profile_id);
                             f.fence = 1;
                             let lease = LeaseRef {
@@ -4943,6 +5246,12 @@ mod tests {
                 *n -= 1;
             }
             if let Some(sql) = f.on_patch.take() {
+                let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
+                assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
+            }
+        }
+        if tag == "profiles" && method == Method::GET {
+            if let Some(sql) = f.on_list.take() {
                 let c = rusqlite::Connection::open(Db::path().unwrap()).unwrap();
                 assert_eq!(c.execute(&sql, []).unwrap(), 1, "{sql}");
             }
@@ -7855,36 +8164,58 @@ mod tests {
     }
 
     /// A checkout replayed after the binding moved on to a newer head holds a
-    /// lease on the old one: it is released as stored, the checkout is
-    /// failed, and the push takes a fresh lease at the new head.
+    /// lease on the old one: it is released as stored and the checkout is
+    /// failed. Moved by a restore transition (`base_version` stays 0: the
+    /// data never followed), the push then stops for a pull; moved by a
+    /// pull (data and head together), it takes a fresh lease at the new head.
     #[test]
     fn a_replayed_checkout_on_an_old_head_is_released_and_taken_again() {
-        let w = world();
-        w.fake().lose.push("checkout");
-        w.push().unwrap_err();
-        let head = [9u8; 32];
-        {
-            let mut f = w.fake();
-            f.version = 1;
-            f.head = Some(head);
+        for base in [0, 1] {
+            let w = world();
+            w.fake().lose.push("checkout");
+            w.push().unwrap_err();
+            let head = [9u8; 32];
+            {
+                let mut f = w.fake();
+                f.version = 1;
+                f.head = Some(head);
+            }
+            w.db()
+                .conn
+                .execute(
+                    "UPDATE profile_bindings SET remote_version = 1, base_version = ?2,
+                       last_observed_head_hash = ?1",
+                    params![head.to_vec(), base],
+                )
+                .unwrap();
+            let checkouts = if base == 0 {
+                let err = w.push().unwrap_err();
+                assert!(has(&err, "sync.remoteAhead"), "{err:#}");
+                assert_eq!(
+                    w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+                    1
+                );
+                2
+            } else {
+                assert_eq!(w.push().unwrap().version, 2);
+                3
+            };
+            let sent = w.sent("POST", "/checkout");
+            assert_eq!(sent.len(), checkouts, "base {base}");
+            assert_eq!(sent[0], sent[1]);
+            assert!(sent.get(2).is_none_or(|c| c != &sent[1]));
+            assert_eq!(w.sent("POST", "/release").len(), 1, "base {base}");
+            assert_eq!(
+                w.count(
+                    "SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"
+                ),
+                1
+            );
+            assert_eq!(
+                w.count("SELECT count(*) FROM operations WHERE state = 'PENDING'"),
+                0
+            );
         }
-        w.db()
-            .conn
-            .execute(
-                "UPDATE profile_bindings SET remote_version = 1, last_observed_head_hash = ?1",
-                [head.to_vec()],
-            )
-            .unwrap();
-        assert_eq!(w.push().unwrap().version, 2);
-        let checkouts = w.sent("POST", "/checkout");
-        assert_eq!(checkouts.len(), 3);
-        assert_eq!(checkouts[0], checkouts[1]);
-        assert_ne!(checkouts[1], checkouts[2]);
-        assert_eq!(w.sent("POST", "/release").len(), 1);
-        assert_eq!(
-            w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
-            1
-        );
     }
 
     /// A pull never writes over a profile whose push is in flight: one with
@@ -11653,5 +11984,505 @@ mod tests {
         let s = s.unwrap();
         assert!(s.profiles.is_empty() && s.alerts.is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    impl World {
+        fn join(&self, local: &str, profile: [u8; 16], udd: &Path) -> Result<u64> {
+            self.rt.block_on(join(
+                &self.client,
+                "t",
+                &self.dev,
+                local,
+                FLEET,
+                profile,
+                udd,
+                NOW,
+            ))
+        }
+
+        /// The fleet listing as (profile, version, label, bound to).
+        fn labels(&self) -> Vec<(String, u64, Option<String>, Option<String>)> {
+            self.rt
+                .block_on(labels(&self.client, "t", &self.dev, FLEET, NOW))
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.remote_profile_id, p.current_version, p.label, p.bound_to))
+                .collect()
+        }
+    }
+
+    /// `PROFILE` published and pushed at v1 here; then a second device,
+    /// enrolled with no binding, is the config root.
+    fn joinable() -> (World, tempfile::TempDir) {
+        let w = world_unbound();
+        w.publish().unwrap();
+        w.push().unwrap();
+        let d = second(&w);
+        (w, d)
+    }
+
+    fn noise(udd: &Path) -> Vec<u8> {
+        std::fs::read(udd.join("Default").join("noise.bin")).unwrap()
+    }
+
+    #[test]
+    fn join_lists_fleet_profiles_with_their_opened_labels_and_marks_bound_ones() {
+        let w = world_unbound();
+        w.publish().unwrap();
+        let sealed = |profile: [u8; 16], generation| {
+            shardx_core::keys::seal_label(
+                &FKEK,
+                &random().unwrap(),
+                &TENANT,
+                &FLEET,
+                &profile,
+                generation,
+                b"Shop",
+            )
+            .unwrap()
+        };
+        w.fake().others = vec![
+            FleetProfileHeadV2 {
+                label_ciphertext: sealed(PROFILE2, GEN),
+                ..other(PROFILE2, 2, [9; 32])
+            },
+            // Not a label any key opens, and one of a generation not held here.
+            other(PROFILE3, 1, [8; 32]),
+            FleetProfileHeadV2 {
+                key_generation: GEN + 1,
+                label_ciphertext: sealed([0xc4; 16], GEN + 1),
+                ..other([0xc4; 16], 1, [7; 32])
+            },
+        ];
+        let posts = w.sent("POST", "").len();
+        let row = |p: [u8; 16], v, label: Option<&str>, to: Option<&str>| {
+            (
+                hex(&p),
+                v,
+                label.map(str::to_string),
+                to.map(str::to_string),
+            )
+        };
+        assert_eq!(
+            w.labels(),
+            [
+                row(PROFILE, 0, Some("Work profile"), Some(LOCAL)),
+                row(PROFILE2, 2, Some("Shop"), None),
+                row(PROFILE3, 1, None, None),
+                row([0xc4; 16], 1, None, None),
+            ]
+        );
+        let _d = second(&w);
+        assert_eq!(
+            w.labels()[0],
+            row(PROFILE, 0, Some("Work profile"), None),
+            "bound on the first device only"
+        );
+        assert_eq!(w.sent("POST", "").len(), posts, "nothing was written");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    #[test]
+    fn join_binds_and_pulls_a_remote_profile_on_a_new_device() {
+        let (w, d) = joinable();
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        let head = w.fake().head.unwrap();
+        available_at(&w, 1, head);
+        assert_eq!(
+            w.count(
+                "SELECT count(*) FROM profile_bindings WHERE accepted_restore_epoch = 0
+                   AND lease_id IS NULL AND dirty = 0"
+            ),
+            1
+        );
+    }
+
+    /// `PROFILE` pushed at v1 and v2 here, restored to v1 (epoch 1) with
+    /// its transition filed; `old` is v2's manifest. Then `post` commits at
+    /// epoch 1 from here, and a second device is the root. The leaf's head.
+    fn joinable_after_restore(post: u64) -> (World, tempfile::TempDir, [u8; 32], Vec<u8>) {
+        let w = world_unbound();
+        w.publish().unwrap();
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        let old = w.fake().manifests[&2].clone();
+        w.fake().restore(1);
+        let leaves = [
+            leaf(PROFILE, h2, h1),
+            leaf([0xc4; 16], [7; 32], [8; 32]),
+            leaf([0xc5; 16], [9; 32], [10; 32]),
+        ];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        if post > 0 {
+            w.pull(&w.udd.with_file_name("accepted")).unwrap();
+            for _ in 0..post {
+                w.fake().log.clear();
+                w.push().unwrap();
+            }
+        }
+        w.fake().log.clear();
+        let d = second(&w);
+        (w, d, h1, old)
+    }
+
+    /// ADR 0002 rule 6: a device that joins after a restore, before any
+    /// commit at the new epoch, pins the transition's leaf at its older epoch.
+    #[test]
+    fn join_after_a_restore_pins_the_transition_leaf_then_pulls() {
+        let (w, d, h1, _) = joinable_after_restore(0);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        assert_eq!(
+            w.state(LOCAL),
+            ("AVAILABLE".into(), None, 1, 1, Some(h1.to_vec()))
+        );
+        assert_eq!(w.filed(), 2, "the transition and this profile's proof");
+    }
+
+    /// A joining device has no pin to search below: it follows the chain
+    /// back from the listed head to the leaf, however many commits followed
+    /// the restore, then pulls to the head.
+    #[test]
+    fn join_after_more_post_restore_commits_than_the_leaf_search_pins_the_leaf() {
+        let post = LEAF_SEARCH + 1;
+        let (w, d, _, _) = joinable_after_restore(post);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0, "joined");
+        assert_eq!(noise(&out), noise(&w.udd));
+        let head = w.head_of(1 + post);
+        available_at(&w, (1 + post) as i64, head);
+        assert_eq!(w.state(LOCAL).2, 1, "the new epoch");
+    }
+
+    /// The rolled-back child of the leaf (ADR 0002 rule 6, "Head epoch"):
+    /// v2 at the old epoch, chained onto the leaf, listed as the head.
+    #[test]
+    fn join_refuses_the_rolled_back_child_of_the_leaf() {
+        let (w, d, _, old) = joinable_after_restore(0);
+        let m_old = SignedSnapshotManifestV2::parse(&old).unwrap().head_hash();
+        {
+            let mut f = w.fake();
+            f.manifests.insert(2, old);
+            f.listed = Some((2, Some(m_old)));
+        }
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.headRollback"), "{err:#}");
+        assert_eq!(
+            w.state(LOCAL),
+            (
+                "QUARANTINED".into(),
+                Some("HEAD_ROLLBACK_DETECTED".into()),
+                0,
+                0,
+                None
+            )
+        );
+        assert!(!out.exists());
+    }
+
+    /// A profile first committed after the restore starts at the server's
+    /// epoch: no transition is asked for.
+    #[test]
+    fn join_of_a_profile_created_after_a_restore_starts_at_that_epoch() {
+        let w = world_unbound();
+        w.fake().epoch = 1;
+        w.publish().unwrap();
+        w.push().unwrap();
+        let d = second(&w);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        let head = w.head_of(1);
+        assert_eq!(
+            w.state(LOCAL),
+            ("AVAILABLE".into(), None, 1, 1, Some(head.to_vec()))
+        );
+        assert_eq!(w.filed(), 0);
+        assert!(!w
+            .fake()
+            .log
+            .iter()
+            .any(|(m, _)| m.contains("restore-epoch-transitions")));
+    }
+
+    /// v1 served with another `restore_epoch`, re-signed by a key the
+    /// evidence does not hold: the server cannot sign such a lie.
+    fn lying_first(w: &World, epoch: u64) {
+        let mut f = w.fake();
+        let m = SignedSnapshotManifestV2::parse(&f.manifests[&1]).unwrap();
+        let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        p.restore_epoch = epoch;
+        p.signer_signing_key_id = key_id_of(&author());
+        let lie = SignedSnapshotManifestV2::sign(&author(), &p).unwrap();
+        f.manifests.insert(1, lie.exact_bytes().to_vec());
+    }
+
+    /// The start epoch is read from v1 unverified; a lie either way ends in
+    /// a refusal or a quarantine, with nothing pinned or restored.
+    #[test]
+    fn join_with_a_lying_first_snapshot_pins_nothing() {
+        // Older than it is: the transition it asks for does not exist.
+        let w = world_unbound();
+        w.fake().epoch = 1;
+        w.publish().unwrap();
+        w.push().unwrap();
+        lying_first(&w, 0);
+        let d = second(&w);
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.epochTransitionMissing"), "{err:#}");
+        assert_eq!(
+            w.state(LOCAL),
+            (
+                "QUARANTINED".into(),
+                Some(TRANSITION_REQUIRED.into()),
+                0,
+                0,
+                None
+            )
+        );
+        assert!(!out.exists());
+        drop((d, w));
+
+        // Newer than it is: the pull refuses v1 itself.
+        let (w, d, _, _) = joinable_after_restore(0);
+        lying_first(&w, 1);
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.signerUntrusted"), "{err:#}");
+        let (_, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!((epoch, version, head), (1, 0, None));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn join_refuses_a_local_profile_with_an_unfinished_publish() {
+        let w = world_unbound();
+        w.fake().skip.push("publish");
+        w.publish().unwrap_err();
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'PENDING'"),
+            1
+        );
+        let before = w.fake().log.len();
+        let err = w
+            .join(LOCAL, PROFILE, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(w.fake().log.len(), before);
+    }
+
+    /// Another join binds the same remote profile while this one waits on
+    /// the server: the answer is still the localized one.
+    #[test]
+    fn join_refuses_a_remote_profile_bound_here_meanwhile() {
+        let (w, d) = joinable();
+        w.fake().on_list = Some(format!(
+            "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+               tenant_id, account_id, device_id, fleet_id, remote_profile_id, remote_version,
+               base_version, accepted_restore_epoch, fkek_key_id, key_generation, sync_state,
+               dirty)
+             SELECT 'racer', k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+               k.device_id, k.fleet_id, '{}', 0, 0, 0, k.fkek_key_id, k.generation,
+               'AVAILABLE', 0
+             FROM fleet_key_state k
+             JOIN device_state d USING (server_id, tenant_id, device_id)
+             WHERE k.state = 'ACTIVE'",
+            hex(&PROFILE)
+        ));
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(w.fake().on_list.is_none(), "it ran");
+        assert!(has(&err, "sync.remoteAlreadyBound"), "{err:#}");
+        assert!(!format!("{err:#}").contains("UNIQUE"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE local_profile_id = 'racer'"),
+            1
+        );
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn join_refuses_a_bound_or_running_local_profile() {
+        let w = world();
+        let before = (w.state(LOCAL), w.fake().log.len());
+        let err = w
+            .join(LOCAL, PROFILE2, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.alreadyPublished"), "{err:#}");
+        assert_eq!((w.state(LOCAL), w.fake().log.len()), before);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        // `team_join_profile` takes this claim before anything else.
+        let _running = crate::profile::begin_profile_launch("join-running").unwrap();
+        let err = crate::profile::begin_user_mutation(["join-running"], "join").unwrap_err();
+        assert!(has(&err, "profile.busyOne"), "{err:#}");
+    }
+
+    #[test]
+    fn join_refuses_without_the_collected_fleet_key_and_creates_no_binding() {
+        let (w, d) = joinable();
+        w.db()
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM fleet_key_state")
+            .unwrap();
+        let before = w.fake().log.len();
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.fleetKeyRecollect"), "{err:#}");
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(
+            w.fake().log.len(),
+            before,
+            "nothing was asked of the server"
+        );
+        assert!(!out.exists());
+    }
+
+    /// A join whose first pull did not restore the team's data leaves a
+    /// binding no push may seal from: after a lost transition fetch (the
+    /// push accepts the transition and pins the leaf itself), or after a
+    /// restore that failed once the leaf was pinned. A pull restores it, and
+    /// pushes go on from there.
+    #[test]
+    fn join_then_a_push_before_the_first_pull_restores_is_refused() {
+        for case in ["transition lost", "restore failed"] {
+            let (w, d, h1, _) = joinable_after_restore(0);
+            let good = w.fake().objects[&1].clone();
+            if case == "transition lost" {
+                w.fake().skip.push("1");
+            } else {
+                *w.fake().objects.get_mut(&1).unwrap().last_mut().unwrap() ^= 1;
+            }
+            let out = d.path().join("joined");
+            w.join(LOCAL, PROFILE, &out).unwrap_err();
+            w.fake().objects.insert(1, good);
+            let mine = d.path().join("mine");
+            std::fs::create_dir_all(mine.join("Default")).unwrap();
+            std::fs::write(mine.join("Default").join("noise.bin"), b"never pulled").unwrap();
+            let err = w.push_from(&mine).unwrap_err();
+            assert!(has(&err, "sync.remoteAhead"), "{case}: {err:#}");
+            assert_eq!(w.fake().version, 1, "{case}: nothing committed");
+            assert!(w.sent("POST", "/checkout").is_empty(), "{case}");
+            assert!(w.pull_of(LOCAL, &out).unwrap() > 0, "{case}");
+            assert_eq!(noise(&out), noise(&w.udd), "{case}");
+            available_at(&w, 1, h1);
+            assert_eq!(w.push_from(&out).unwrap().version, 2, "{case}");
+        }
+    }
+
+    /// Joined while the profile was at version 0, a push whose checkout was
+    /// lost, then commits elsewhere and a restore: the replay pins the leaf
+    /// and its lease is released, the push stops for a pull, and the pull
+    /// and every later push go through. Nothing is left pending.
+    #[test]
+    fn join_then_a_lost_checkout_and_a_restore_still_pulls_and_pushes() {
+        let w = world_unbound();
+        w.publish().unwrap();
+        let d = second(&w);
+        let out = d.path().join("joined");
+        w.join(LOCAL, PROFILE, &out).unwrap_err();
+        let mine = d.path().join("mine");
+        std::fs::create_dir_all(mine.join("Default")).unwrap();
+        std::fs::write(mine.join("Default").join("noise.bin"), b"never pulled").unwrap();
+        w.fake().skip.push("checkout");
+        w.push_from(&mine).unwrap_err();
+        let pending = "SELECT count(*) FROM operations WHERE state = 'PENDING'";
+        assert_eq!(w.count(pending), 1, "the stored checkout");
+        // The first device commits v1 and v2; the owner restores v1.
+        crate::store::set_config_root(Some(w._dir.path().to_path_buf()));
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        w.fake().restore(1);
+        let leaves = [
+            leaf(PROFILE, h2, h1),
+            leaf([0xc4; 16], [7; 32], [8; 32]),
+            leaf([0xc5; 16], [9; 32], [10; 32]),
+        ];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        crate::store::set_config_root(Some(d.path().to_path_buf()));
+
+        // The stored checkout, never processed, meets the new epoch: the
+        // server refuses it for good, so it closes with no lease granted.
+        let err = w.push_from(&mine).unwrap_err();
+        assert!(has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(w.count(pending), 0);
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'CHECKOUT' AND state = 'FAILED'"),
+            1
+        );
+        let (state, _, epoch, version, head) = w.state(LOCAL);
+        assert_eq!(
+            (state.as_str(), epoch, version, head),
+            ("AVAILABLE", 1, 1, Some(h1.to_vec())),
+            "the leaf pinned, its data not pulled"
+        );
+        let err = w.push_from(&mine).unwrap_err();
+        assert!(has(&err, "sync.remoteAhead"), "{err:#}");
+        assert_eq!(w.fake().version, 1, "nothing committed");
+        assert!(w.fake().lease.is_none());
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NULL"),
+            1
+        );
+        assert_eq!(w.count(pending), 0);
+        assert!(w.pull_of(LOCAL, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        available_at(&w, 1, h1);
+        assert_eq!(w.count(pending), 0);
+        assert_eq!(w.push_from(&out).unwrap().version, 2);
+    }
+
+    #[test]
+    fn join_refuses_a_remote_profile_already_bound_here() {
+        let w = world();
+        let before = (w.state(LOCAL), w.fake().log.len());
+        let err = w
+            .join("another-local", PROFILE, &w.udd.with_file_name("out"))
+            .unwrap_err();
+        assert!(has(&err, "sync.remoteAlreadyBound"), "{err:#}");
+        assert!(!format!("{err:#}").contains("UNIQUE"), "{err:#}");
+        assert_eq!((w.state(LOCAL), w.fake().log.len()), before);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 1);
+        for lang in ["en", "vi"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../src/shared/i18n/locales")
+                .join(format!("{lang}.json"));
+            let dict: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                dict["sync.remoteAlreadyBound"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty()),
+                "{lang}"
+            );
+        }
+    }
+
+    /// Two machines through the one server: the second joins and checks in a
+    /// change, and the first pulls it.
+    #[test]
+    fn join_then_check_in_then_pull_on_the_first_device() {
+        let (w, d) = joinable();
+        let out = d.path().join("joined");
+        w.join(LOCAL, PROFILE, &out).unwrap();
+        std::fs::write(out.join("Default").join("joined.txt"), b"second device").unwrap();
+        assert_eq!(w.push_from(&out).unwrap().version, 2);
+        crate::store::set_config_root(Some(w._dir.path().to_path_buf()));
+        assert!(w.pull(&w.udd).unwrap() > 0);
+        assert_eq!(
+            std::fs::read(w.udd.join("Default").join("joined.txt")).unwrap(),
+            b"second device"
+        );
+        let head = w.head_of(2);
+        available_at(&w, 2, head);
     }
 }

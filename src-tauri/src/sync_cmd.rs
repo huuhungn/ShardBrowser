@@ -511,6 +511,62 @@ pub async fn team_profiles_status() -> Result<team::sync::Statuses, String> {
     team::sync::statuses(now_ms()).map_err(|e| format!("{e:#}"))
 }
 
+/// Every profile this device's fleet lists, with its label opened and the
+/// local profile bound to it here, if any (`team::sync::labels`), in a device
+/// session the account `username` and `password` open for this call only.
+/// Nothing is written.
+#[tauri::command]
+pub async fn team_fleet_profiles(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Vec<team::sync::FleetProfile>, String> {
+    let c = ready_config()?;
+    let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let listed = team::sync::labels(&client, &session.access_token, &dev, fleet, now_ms()).await;
+    client.end_session(&session.access_token).await;
+    listed.map_err(|e| format!("{e:#}"))
+}
+
+/// Binds the stopped, unbound local profile `local_profile_id` to the fleet's
+/// `remote_profile_id` and pulls it (`team::sync::join`), in a device session
+/// the account `username` and `password` open for this call only. The UI
+/// creates the local profile first, named after the fleet's label.
+#[tauri::command]
+pub async fn team_join_profile(
+    remote_profile_id: String,
+    local_profile_id: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<u64, String> {
+    let _claim = profile::begin_user_mutation(
+        [&local_profile_id],
+        &crate::errcode::code("profile.actionPullFromTeam"),
+    )
+    .map_err(|error| error.to_string())?;
+    let c = ready_config()?;
+    profile::load_raw(&local_profile_id)
+        .map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
+    let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
+    let remote = fleet_client::decode_hex16(&remote_profile_id, "remote_profile_id")
+        .map_err(|e| e.to_string())?;
+    let udd = profile::user_data_dir(&local_profile_id).map_err(|e| e.to_string())?;
+    let (client, session, dev) = published_session(&c, username, password).await?;
+    let joined = team::sync::join(
+        &client,
+        &session.access_token,
+        &dev,
+        &local_profile_id,
+        fleet,
+        remote,
+        &udd,
+        now_ms(),
+    )
+    .await;
+    client.end_session(&session.access_token).await;
+    joined.map_err(|e| format!("{e:#}"))
+}
+
 /// Unbinds the stopped profile `profile_id` from its team profile in the
 /// Launcher database alone (plan L2239): the exact `UNBIND` receipt is stored
 /// before the binding is deleted, and the profile stays a local one.

@@ -1,6 +1,8 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
-import type { TeamProfileStatus, TeamProfilesStatus } from "./entities/team/model/types";
+import type {
+  TeamFleetProfile, TeamProfileStatus, TeamProfilesStatus,
+} from "./entities/team/model/types";
 
 type Profile = {
   id: string;
@@ -250,6 +252,15 @@ for (const { profile_id } of teamProfiles.profiles) {
     profiles.push({ ...fixtureProfiles[1], id: profile_id, name: profile_id, tags: [] });
   }
 }
+// What the fleet lists in "team-profiles": one profile bound here, one to
+// join, and one whose label no key this device holds opens.
+const teamFleet: TeamFleetProfile[] = scenario === "team-profiles"
+  ? [
+    { remote_profile_id: "c1".repeat(16), current_version: 3, label: "Alpha", bound_to: "profile-alpha" },
+    { remote_profile_id: "c2".repeat(16), current_version: 5, label: "Shop", bound_to: null },
+    { remote_profile_id: "c3".repeat(16), current_version: 1, label: null, bound_to: null },
+  ]
+  : [];
 
 // A device enrolled as a tenant's first, before or part-way through custody
 // setup. The bootstrap itself is the backend's; the card only drives it.
@@ -651,6 +662,24 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return teamStatusFixture();
     case "team_profiles_status":
       return teamProfiles;
+    case "team_fleet_profiles":
+      return teamFleet;
+    case "team_join_profile": {
+      count("Joins");
+      const args = payload as { remoteProfileId?: string; localProfileId?: string };
+      const remote = teamFleet.find((p) => p.remote_profile_id === args?.remoteProfileId);
+      if (!remote) throw new Error("[[shardx:sync.profileNotListed]]");
+      if (remote.bound_to) throw new Error("[[shardx:sync.remoteAlreadyBound]]");
+      const local = String(args?.localProfileId ?? "");
+      if (teamProfiles.profiles.some((p) => p.profile_id === local)) {
+        throw new Error("[[shardx:sync.alreadyPublished]]");
+      }
+      remote.bound_to = local;
+      teamProfiles.profiles.push(teamBinding(local, "AVAILABLE", {
+        remote_version: remote.current_version,
+      }));
+      return 4096;
+    }
     case "team_keys_create_file":
       count("KeyFiles");
       keyState = { keys_protected: true, has_key_file: true, keys_locked: false };
