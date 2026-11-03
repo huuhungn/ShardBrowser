@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.6.1",
+      "date": "2026-11-04",
+      "entries": [
+        {
+          "id": "team-profile-removal",
+          "title": "Xóa hẳn hồ sơ Team giờ sẽ gỡ liên kết của nó khỏi team",
+          "lead": "Xóa vĩnh viễn một hồ sơ Team giờ giải phóng liên kết của nó, và khi một lần kéo phải lùi về bản trước thì launcher sẽ báo cho bạn.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Dọn thùng rác, một mục trong thùng rác hết hạn, xóa thư mục khi không dùng được thùng rác và đóng hồ sơ tạm giờ đều gỡ liên kết của hồ sơ khỏi team. Hồ sơ nằm trong thùng rác vẫn giữ liên kết, và việc xóa bị từ chối khi hồ sơ còn công việc chưa gửi."
+            },
+            {
+              "type": "p",
+              "text": "Bản sao hoàn tác đã giải mã giờ được xóa cùng hồ sơ ngay cả khi không mở được cơ sở dữ liệu Team. Khi một lần kéo đưa hồ sơ về bản hợp lệ trước đó vì bản mới nhất do một thiết bị đã bị thu hồi ký, launcher giờ sẽ báo điều đó."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.6.0",
       "date": "2026-11-03",
       "entries": [

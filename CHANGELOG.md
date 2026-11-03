@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.6.1
+
+A Team fix release: removing a profile for good now unbinds it from the team,
+and the decrypted revert staging is removed with it. The browser engine is
+unchanged (Chromium 156.0.8078.48, engine build 1).
+
+### Upgrade notes
+
+- None beyond the 2.6.0 notes. The team server is unchanged.
+
+### Team
+
+- Removing a Team profile for good (emptying the trash, a trash entry
+  expiring, deleting a folder when the trash is unavailable, and temporary
+  profiles) now unbinds it: a held lease is released on the next sync or
+  lapses, and open uploads are aborted. A profile in the trash keeps its
+  binding. A removal is refused while the profile has unsent work, and
+  emptying the trash continues past a refused entry.
+- Deleting a profile for good removes its decrypted revert staging even when
+  the Team database cannot be opened. Moving a profile to the trash and the
+  folder-delete fallback still refuse in that case.
+- A pull that moved the profile to the last valid earlier snapshot, because
+  the newest one was signed by a revoked device, now says so.
+
 ## v2.6.0
 
 A Team release: the launcher gets a Team page, and a profile whose latest

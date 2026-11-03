@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.6.1",
+      "date": "2026-11-04",
+      "entries": [
+        {
+          "id": "team-profile-removal",
+          "title": "Removing a Team profile for good now unbinds it",
+          "lead": "Deleting a Team profile permanently now releases its binding, and a pull that fell back to an earlier snapshot tells you so.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Emptying the trash, an expired trash entry, deleting a folder when the trash is unavailable and closing a temporary profile now unbind the profile from the team. A profile in the trash keeps its binding, and a removal is refused while the profile has unsent work."
+            },
+            {
+              "type": "p",
+              "text": "The decrypted revert copy is now removed with the profile even when the Team database cannot be opened. When a pull moves a profile to the last valid earlier snapshot because the newest one was signed by a revoked device, the launcher now says so."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.6.0",
       "date": "2026-11-03",
       "entries": [
