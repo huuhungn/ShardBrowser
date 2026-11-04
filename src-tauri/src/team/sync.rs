@@ -14018,6 +14018,61 @@ mod tests {
         assert!(tree(&out) == before);
     }
 
+    // Independent round-8 probe: the committer must refuse a mixed run,
+    // preserve every local file, and keep the quarantine without a checkout.
+    #[test]
+    fn a_revert_refuses_a_mixed_run_without_touching_local_data() {
+        for reported in [false, true] {
+            let w = world();
+            let mut evidence = author_pages_for(
+                &w,
+                T0 + 300 * DAY,
+                Some(DeviceRevocationReason::Retired),
+                false,
+            );
+            let end = if reported {
+                T0 + 300 * DAY
+            } else {
+                T0 + DAY / 2
+            };
+            let other = committer(&w, &mut evidence, 0x20, end);
+            if reported {
+                evidence[0].device_revocations.push(RevokedDevice {
+                    device_id: [0x21; 16],
+                    revoked_at_ms: T0 + DAY / 2,
+                });
+            }
+            let heads = chain_of(&w, &[&w.me.sk, &author(), &other]);
+            serve(&w, &evidence);
+            let d = second(&w);
+            pin_at(&w, &d, &heads, 1);
+            let out = d.path().join("profile");
+            std::fs::create_dir_all(out.join("Default")).unwrap();
+            std::fs::write(out.join("marker"), b"unsynced local").unwrap();
+            std::fs::write(out.join("Default/local-only"), b"keep every byte").unwrap();
+            std::fs::write(out.join("Local State"), LOCAL_STATE).unwrap();
+            let before = tree(&out);
+            let checkouts = w.sent("POST", "/checkout").len();
+            let commits = w.fake().commits;
+
+            for _ in 0..2 {
+                let err = w.revert(&out).unwrap_err();
+                assert!(
+                    has(&err, "sync.signerRevoked"),
+                    "reported={reported}: {err:#}"
+                );
+                revoked_at(&w, 1);
+                assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+                assert!(tree(&out) == before, "reported={reported}");
+                assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+                assert_eq!(w.fake().commits, commits);
+                assert!(skipped(&w).is_empty());
+                assert_eq!(local_leases(&w), 0);
+                settled(&w, &out);
+            }
+        }
+    }
+
     // Independent round-6 probe: inspect every committed pin update, not
     // just the final binding, while accepting a stacked revoked run.
     #[test]
