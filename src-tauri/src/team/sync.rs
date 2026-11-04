@@ -201,16 +201,7 @@ pub(crate) fn is_published(local: &str) -> Result<bool> {
     if !Db::path()?.exists() {
         return Ok(false);
     }
-    let db = Db::open()?;
-    Ok(db
-        .conn
-        .query_row(
-            "SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1",
-            [local],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+    is_bound(&Db::open()?.conn, local)
 }
 
 /// One binding as `team_profiles_status` reports it. A profile with none is
@@ -2266,7 +2257,7 @@ pub(crate) async fn publish(
 ) -> Result<Published> {
     let mut db = Db::open()?;
     retry_unbound_releases(client, access, &mut db).await;
-    if is_bound(&db, local)? {
+    if is_bound(&db.conn, local)? {
         bail!(code("sync.alreadyPublished"));
     }
     let op = match pending_publish(&db, local)? {
@@ -2281,8 +2272,8 @@ pub(crate) async fn publish(
     send_publish(client, access, &mut db, dev, local, fleet, &op, now).await
 }
 
-fn is_bound(db: &Db, local: &str) -> Result<bool> {
-    Ok(db.conn.query_row(
+fn is_bound(conn: &rusqlite::Connection, local: &str) -> Result<bool> {
+    Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
         [local],
         |r| r.get(0),
@@ -2419,7 +2410,7 @@ pub(crate) async fn join(
 ) -> Result<u64> {
     let mut db = Db::open()?;
     // A local profile with an unfinished publish is bound by finishing it.
-    if is_bound(&db, local)? || pending_publish(&db, local)?.is_some() {
+    if is_bound(&db.conn, local)? || pending_publish(&db, local)?.is_some() {
         bail!(code("sync.alreadyPublished"));
     }
     let mut b = unbound(local, dev, fleet, profile);
@@ -3829,12 +3820,7 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
     let db = Db::open()?;
     let tx =
         rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?;
-    let is_bound: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
-        [local],
-        |r| r.get(0),
-    )?;
-    if !is_bound {
+    if !is_bound(&tx, local)? {
         return unbound_reply(&db, local);
     }
     let b = bound(&db, local)?;
