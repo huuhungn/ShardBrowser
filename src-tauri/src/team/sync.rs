@@ -4583,14 +4583,14 @@ async fn restore_then_pin(
     p: &SnapshotManifestV2,
     fkek: Zeroizing<[u8; 32]>,
     udd: &Path,
-    pin: impl FnOnce(&mut Db) -> Result<()>,
+    pin_to: impl FnOnce(&mut Db) -> Result<()>,
 ) -> Result<u64> {
     let staging = beside(udd, REVERT_STAGING);
     let staged = async {
         // No swap is pending (settled first) and no lease held: a leftover.
         fresh_staging(udd, &staging)?;
         let restored = restore(client, access, b, p, fkek, &staging).await?;
-        pin(db)?;
+        pin_to(db)?;
         Ok::<_, anyhow::Error>(restored)
     }
     .await;
