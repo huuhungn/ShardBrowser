@@ -2536,16 +2536,20 @@ async fn team_fleet_key_setup(
     let access = session.access_token.as_str();
     let result = async {
         let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
-        let mut save = |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
-        fleet_custody::bootstrap_fleet(&client, access, &device, &root, &mut state, &mut save)
-            .await
-            .map_err(|e| e.to_string())?;
+        fleet_custody::bootstrap_fleet(&client, access, &device, &root, &mut state, &mut |s| {
+            fleet_custody::save(s)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         // Step 9: only the verified collect keeps the key in `fleet_keys`.
         let (device_sk, _) = shardx_core::grants::derive_keypair(&hpke_seed);
-        if collect_fleet_grant(&client, &c, access, &device_sk).await? != FleetGrant::Opened(0) {
-            return Err(crate::errcode::code("fleet.trustEvidenceRefused"));
+        if let Some(error) =
+            setup_collect_error(collect_fleet_grant(&client, &c, access, &device_sk).await?)
+        {
+            return Err(error);
         }
-        fleet_custody::release_fkek(device.vault, &mut state, &mut save).map_err(|e| e.to_string())
+        // The collect may have saved an ack: release from the state on disk.
+        fleet_custody::release(device.vault).map_err(|e| e.to_string())
     }
     .await;
     client.end_session(access).await;
@@ -2575,6 +2579,8 @@ async fn team_collect_custody(
     if username.trim().is_empty() || password.is_empty() {
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
+    // A collect may save an ack to the state a running setup also writes.
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = c.hpke_seed().map_err(|e| e.to_string())?;
     let (device_sk, _pk) = shardx_core::grants::derive_keypair(&seed);
@@ -2607,7 +2613,7 @@ async fn team_collect_custody(
 
 /// What became of this device's D-9 `DeviceHpkeGrant` of the fleet's ACTIVE
 /// generation: the readback holds at most one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum FleetGrant {
     /// No ACTIVE generation, no grant filed, or a revoked one.
     None,
@@ -2615,9 +2621,10 @@ enum FleetGrant {
     Waiting,
     /// Verified, opened and in the fleet key store, for this generation.
     Opened(u64),
-    /// Filed, but the evidence could not be fetched, or the grant did not
-    /// verify or open.
+    /// Filed, but the grant did not verify or open.
     Failed,
+    /// Filed, but the evidence could not be fetched: this error.
+    Unfetched(String),
     /// Verified and opened, but the store holds another key, or one it
     /// cannot read, for its generation (rule 5, `KEY_SUBSTITUTION_DETECTED`).
     Substituted,
@@ -2664,8 +2671,9 @@ async fn collect_fleet_grant(
         return Ok(FleetGrant::Waiting);
     };
     // Root custody is still reported when only the evidence fetch failed.
-    let Ok(pages) = pages else {
-        return Ok(FleetGrant::Failed);
+    let pages = match pages {
+        Ok(pages) => pages,
+        Err(e) => return Ok(FleetGrant::Unfetched(e.to_string())),
     };
     let me = recipient(c).map_err(|e| e.to_string())?;
     let fleet = fleet_client::decode_hex16(&fleet_id, "fleet_id").map_err(|e| e.to_string())?;
@@ -2691,6 +2699,22 @@ async fn collect_fleet_grant(
             .map_err(|e| e.to_string())?;
     }
     Ok(kept)
+}
+
+/// Why Create fleet key stops when its verified collect did not keep
+/// generation 0; `None` once it did. Only a grant the evidence refused reads
+/// as refused evidence: an evidence fetch that failed keeps its own error.
+fn setup_collect_error(fleet: FleetGrant) -> Option<String> {
+    let code = |key| Some(crate::errcode::code(key));
+    match fleet {
+        FleetGrant::Opened(0) => None,
+        FleetGrant::Unfetched(error) => Some(error),
+        FleetGrant::Failed => code("fleet.trustEvidenceRefused"),
+        FleetGrant::Substituted => code("fleet.keySubstitutionDetected"),
+        // The root state was checked as activated, so its pin is readable.
+        FleetGrant::Waiting => code("fleet.custodyStateCorrupt"),
+        FleetGrant::None | FleetGrant::Opened(_) => code("fleet.custodyReplyMismatch"),
+    }
 }
 
 /// Keeps the FKEK `open_fleet_grant` accepted, unless the store holds
@@ -2991,12 +3015,15 @@ fn custody_report(
 
     let (fleet_opened, fleet_failed, newest_fleet_generation) = match fleet {
         FleetGrant::Opened(g) => (1, 0, Some(g)),
-        FleetGrant::Failed | FleetGrant::Substituted => (0, 1, None),
+        FleetGrant::Failed | FleetGrant::Unfetched(_) | FleetGrant::Substituted => (0, 1, None),
         FleetGrant::None | FleetGrant::Waiting => (0, 0, None),
     };
     let fleet_grants_waiting = usize::from(matches!(
         fleet,
-        FleetGrant::Waiting | FleetGrant::Failed | FleetGrant::Substituted
+        FleetGrant::Waiting
+            | FleetGrant::Failed
+            | FleetGrant::Unfetched(_)
+            | FleetGrant::Substituted
     ));
     let fleet_refusal = (fleet == FleetGrant::Substituted).then_some("KEY_SUBSTITUTION_DETECTED");
     Ok(serde_json::json!({

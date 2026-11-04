@@ -185,7 +185,7 @@ fn hold_fkek(
 
 /// Deletes the setup key, then drops its reference. The reference stays
 /// until the key is gone, so a store that refuses is retried.
-pub fn release_fkek(
+fn release_fkek(
     vault: &dyn FkekStore,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
@@ -637,6 +637,13 @@ pub struct FleetCustodyStatus {
     pub setup_key_held: bool,
     /// The public id of the fleet key, once it was made.
     pub fkek_key_id: String,
+}
+
+/// Releases the setup key of the state on disk, after the verified collect,
+/// which may itself have saved an ack there.
+pub fn release(vault: &dyn FkekStore) -> Result<()> {
+    let mut state = load()?;
+    release_fkek(vault, &mut state, &mut |s| save(s))
 }
 
 /// The saved progress.
@@ -1304,6 +1311,65 @@ mod tests {
             ack.grant.signed_container_hash,
             container_hash(&container).unwrap()
         );
+    }
+
+    /// Step 9 as `team_fleet_key_setup` runs it, with a server that still
+    /// reports the device grant PENDING_ACK after step 7: the collect saves
+    /// its ack, and releasing the setup key afterwards keeps that ack.
+    #[test]
+    fn a_setup_where_the_server_reports_pending_ack_keeps_the_saved_ack_after_release() {
+        let f = fixture();
+        let setup = f.prepared();
+        let container = unhex_vec(&setup.device_grant).unwrap();
+        let rt = runtime();
+        let (client, _) = rt.block_on(mock(Arc::new(|call: &str, body: &[u8]| {
+            if call.ends_with("/ack") {
+                (201, acked(body))
+            } else {
+                (500, Vec::new())
+            }
+        })));
+        rt.block_on(ack_device_grant(&client, "access", &container, false))
+            .unwrap();
+        release(&CredentialFkekStore).unwrap();
+
+        let after = load().unwrap();
+        assert_eq!(after.device_acks.len(), 1, "the collect's ack is kept");
+        assert!(
+            after.fkek_nonce.is_empty(),
+            "the setup reference is released"
+        );
+        let gone = CredentialFkekStore
+            .load(&setup_ref(&setup.tenant_id, &setup.fkek_nonce))
+            .unwrap_err();
+        assert!(is_missing(&gone), "{gone}");
+    }
+
+    #[test]
+    fn a_setup_collect_that_keeps_no_key_reports_its_own_error() {
+        use crate::FleetGrant as G;
+        let fetch = "[[shardx:fleet.unreachableCustody]]".to_string();
+        for (fleet, want) in [
+            (G::Opened(0), None),
+            (G::Unfetched(fetch.clone()), Some(fetch.as_str())),
+            (G::Failed, Some("fleet.trustEvidenceRefused")),
+            (G::Substituted, Some("fleet.keySubstitutionDetected")),
+            (G::Waiting, Some("fleet.custodyStateCorrupt")),
+            (G::None, Some("fleet.custodyReplyMismatch")),
+            (G::Opened(1), Some("fleet.custodyReplyMismatch")),
+        ] {
+            let got = crate::setup_collect_error(fleet.clone());
+            match want {
+                None => assert_eq!(got, None, "{fleet:?}"),
+                Some(want) => {
+                    let got = got.unwrap();
+                    assert!(got.contains(want), "{fleet:?}: {got}");
+                    if want != "fleet.trustEvidenceRefused" {
+                        assert!(!got.contains("trustEvidenceRefused"), "{fleet:?}: {got}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
