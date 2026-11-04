@@ -612,15 +612,16 @@ fn tenant_create(d: &Dirs, slug: &str, extra: &[&str], input: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
-async fn tenant_rows(d: &Dirs) -> [i64; 5] {
+async fn tenant_rows(d: &Dirs) -> [i64; 6] {
     let pool = db(d).await;
-    let mut out = [0; 5];
+    let mut out = [0; 6];
     for (i, t) in [
         "v2_tenants",
         "v2_accounts",
         "v2_tenant_memberships",
         "v2_audit_events",
         "v2_bootstrap_guards",
+        "v2_fleets",
     ]
     .iter()
     .enumerate()
@@ -688,6 +689,23 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
     .unwrap();
     assert_eq!(role, "owner");
 
+    // The tenant's one default fleet, whose id is the tenant id.
+    let fleet: (String, String, String) = sqlx::query_as(
+        "SELECT hex(id), name, status FROM v2_fleets WHERE hex(tenant_id) = upper(?)",
+    )
+    .bind(&tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fleet,
+        (
+            tenant_id.to_uppercase(),
+            "default".to_string(),
+            "active".to_string()
+        )
+    );
+
     type AuditRow = (
         Option<Vec<u8>>,
         Option<Vec<u8>>,
@@ -695,28 +713,33 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
         String,
         String,
         String,
+        String,
         i64,
     );
-    let audit: AuditRow = sqlx::query_as(
-        "SELECT actor_account_id, actor_device_id, action, hex(target_id), outcome, \
-                reason_code, length(request_id) \
-         FROM v2_audit_events WHERE hex(tenant_id) = upper(?)",
+    let audit: Vec<AuditRow> = sqlx::query_as(
+        "SELECT actor_account_id, actor_device_id, action, target_type, hex(target_id), \
+                outcome, reason_code, length(request_id) \
+         FROM v2_audit_events WHERE hex(tenant_id) = upper(?) ORDER BY action",
     )
     .bind(&tenant_id)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        audit,
+    let row = |action: &str, target_type: &str| {
         (
             None,
             None,
-            "tenant.create".to_string(),
+            action.to_string(),
+            target_type.to_string(),
             tenant_id.to_uppercase(),
             "success".to_string(),
             "offline_operator_cli".to_string(),
-            16
+            16,
         )
+    };
+    assert_eq!(
+        audit,
+        vec![row("fleet.create", "fleet"), row("tenant.create", "tenant")]
     );
 
     // The tenant's one first-device opportunity, bound to this instance (R1).
@@ -743,7 +766,7 @@ async fn tenant_create_writes_tenant_owner_membership_and_offline_audit_together
 
     let again = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!again.status.success());
-    assert_eq!(tenant_rows(&d).await, [1, 1, 1, 1, 1]);
+    assert_eq!(tenant_rows(&d).await, [1, 1, 1, 2, 1, 1]);
 }
 
 #[tokio::test]
@@ -768,7 +791,7 @@ async fn tenant_create_refuses_before_identity_init() {
     migrated(&d).await.close().await;
     let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!out.status.success());
-    assert_eq!(tenant_rows(&d).await, [0; 5]);
+    assert_eq!(tenant_rows(&d).await, [0; 6]);
 }
 
 #[tokio::test]
@@ -783,7 +806,7 @@ async fn tenant_create_refuses_a_weak_password() {
             stderr(&out)
         );
     }
-    assert_eq!(tenant_rows(&d).await, [0; 5]);
+    assert_eq!(tenant_rows(&d).await, [0; 6]);
 }
 
 /// The password never comes from argv or the environment, and without a
@@ -830,7 +853,7 @@ async fn tenant_create_takes_no_password_from_argv_or_env_and_never_blocks() {
     let mut err = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
     assert!(err.contains("--password-stdin"), "{err}");
-    assert_eq!(tenant_rows(&d).await, [0; 5]);
+    assert_eq!(tenant_rows(&d).await, [0; 6]);
 }
 
 /// The audit row is part of the transaction: if it cannot be written, the
@@ -851,7 +874,7 @@ async fn tenant_create_rolls_back_everything_when_the_audit_insert_fails() {
     let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
     assert!(!out.status.success());
     assert!(stderr(&out).contains("audit"), "{}", stderr(&out));
-    assert_eq!(tenant_rows(&d).await, [0; 5]);
+    assert_eq!(tenant_rows(&d).await, [0; 6]);
 }
 
 // ------------------------------------------------- first-device confirmation ---
@@ -969,7 +992,14 @@ async fn confirm_first_device_records_the_operator_match_once() {
         confirmations,
         vec![(confirmation_id.to_uppercase(), "pending".to_string())]
     );
-    assert_eq!(audit, vec!["tenant.create", "tenant.first_device_confirm"]);
+    assert_eq!(
+        audit,
+        vec![
+            "fleet.create",
+            "tenant.create",
+            "tenant.first_device_confirm"
+        ]
+    );
     let pool = db(&d).await;
     type Tuple = (String, String, String, Option<Vec<u8>>, Option<Vec<u8>>);
     let tuple: Tuple = sqlx::query_as(

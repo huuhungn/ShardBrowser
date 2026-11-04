@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 use sqlx::Row;
 
+use super::v2_auth::{Caller, Principal};
 use crate::auth::AuthUser;
 use crate::authz::{self, VerificationContext};
 use crate::error::AppError;
@@ -108,10 +109,11 @@ fn verified_instance(app: &AppState) -> Result<[u8; 16], AppError> {
 /// a client that guesses them produces records the server refuses. Read-only
 /// and derived from the same singleton row the verifier reads. Until the
 /// external record verifies, the mirror is not something a client may pin, so
-/// this reports the reason instead.
+/// this reports the reason instead. A ticket or any live device session reads
+/// it, a pending one included, as does a v1 user.
 pub async fn server_identity(
     State(app): State<AppState>,
-    _user: AuthUser,
+    _who: Caller,
 ) -> Result<impl IntoResponse, AppError> {
     verified_instance(&app)?;
     let row = sqlx::query(
@@ -257,6 +259,22 @@ async fn require_tenant_member(
     user: &AuthUser,
 ) -> Result<[u8; 16], AppError> {
     account_id_for(app, tenant_id, &user.id).await
+}
+
+/// A v1 member of `tenant_id`, or a live device session of it. Returns the
+/// session's device, or `None` for a v1 caller.
+async fn require_tenant_caller(
+    app: &AppState,
+    tenant_id: [u8; 16],
+    who: &Caller,
+) -> Result<Option<[u8; 16]>, AppError> {
+    match who {
+        Caller::V1(user) => require_tenant_member(app, tenant_id, user)
+            .await
+            .map(|_| None),
+        Caller::V2(Principal::Session(s)) if s.tenant_id == tenant_id => Ok(Some(s.device_id)),
+        Caller::V2(_) => Err(AppError::Forbidden),
+    }
 }
 
 /// Map a v1 session user to a v2 account within a tenant.
@@ -730,15 +748,21 @@ pub async fn get_active_root_generation(
 /// private key. The server returns ciphertext it cannot read.
 pub async fn list_tenant_root_key_grants(
     State(app): State<AppState>,
-    user: AuthUser,
+    who: Caller,
     axum::extract::Path((tenant_hex, device_hex)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     let device_id = parse_id16(&device_hex, "device_id")?;
 
     // Membership is checked against the authenticated user rather than the path,
-    // so a caller cannot read another tenant's grants by naming that tenant.
-    require_tenant_member(&app, tenant_id, &user).await?;
+    // so a caller cannot read another tenant's grants by naming that tenant. A
+    // device session reads only its own device's grants.
+    if require_tenant_caller(&app, tenant_id, &who)
+        .await?
+        .is_some_and(|own| own != device_id)
+    {
+        return Err(AppError::Forbidden);
+    }
 
     let grants = crate::grants::grants_for_device(&app.db, &tenant_id, &device_id).await?;
 
@@ -842,12 +866,12 @@ fn fleet_error(e: fleet::FleetError) -> AppError {
 /// back to some other key path.
 pub async fn get_active_fleet_generation(
     State(app): State<AppState>,
-    user: AuthUser,
+    who: Caller,
     axum::extract::Path((tenant_hex, fleet_hex)): axum::extract::Path<(String, String)>,
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     let fleet_id = parse_id16(&fleet_hex, "fleet_id")?;
-    require_tenant_member(&app, tenant_id, &user).await?;
+    require_tenant_caller(&app, tenant_id, &who).await?;
 
     let active = crate::fleet_generations::active_generation(
         &app.db,

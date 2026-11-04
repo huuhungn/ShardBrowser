@@ -10974,3 +10974,210 @@ async fn every_custody_operation_replays_its_lost_response_after_a_restart() {
         assert_eq!(replayed.contains(&kind), here, "{}", kind.as_str());
     }
 }
+
+// ------------------------------------------------- custodian slice (S1) ---
+
+fn devices_path(tenant: &[u8; 16]) -> String {
+    format!("/v2/tenants/{}/devices", hex(tenant))
+}
+
+#[tokio::test]
+async fn a_custodian_lists_the_tenant_devices_with_their_public_keys() {
+    let mut server = start("s1-devices", 28235).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    let joiner = device(&server, OWNER, 0x5b, "pending").await;
+    let gone = device(&server, OTHER, 0x7d, "revoked").await;
+    let audit = "SELECT count(*) FROM v2_audit_events";
+    let before = server.count(audit).await;
+
+    let (status, body) = server.call(&devices_path(&TENANT), &access, None).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let listed: Value = serde_json::from_slice(&body).unwrap();
+    // The devices and nothing else: no server time rides along.
+    assert_eq!(listed.as_object().unwrap().len(), 1, "{listed}");
+    let devices = listed["devices"].as_array().unwrap();
+    let ids: Vec<&str> = devices
+        .iter()
+        .map(|r| r["device_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [hex(&joiner.id), hex(&dev.id), hex(&gone.id)]);
+
+    let pending = &devices[0];
+    assert_eq!(pending.as_object().unwrap().len(), 8, "{pending}");
+    assert_eq!(
+        (
+            &pending["status"],
+            &pending["account_id"],
+            &pending["label_hex"]
+        ),
+        (&json!("pending"), &json!(hex(&OWNER)), &json!("aa"))
+    );
+    // The ids rederive from the listed keys, which are the joiner's own.
+    let spk: [u8; 32] = unhex(pending["signing_public_key"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let hpk = unhex(pending["hpke_public_key"].as_str().unwrap());
+    assert_eq!(spk, joiner.sk.verifying_key().to_bytes());
+    assert_eq!(hpk, joiner.hpke_pk);
+    assert_eq!(pending["signing_key_id"], hex(&signing_key_id(&spk)));
+    assert_eq!(pending["hpke_key_id"], hex(&hpke_key_id(&hpk)));
+    assert_eq!(pending["signing_key_id"], hex(&joiner.signing_key_id));
+    assert_eq!(pending["hpke_key_id"], hex(&joiner.hpke_key_id));
+    assert_eq!(devices[1]["status"], "active");
+    assert_eq!(
+        (&devices[2]["status"], &devices[2]["account_id"]),
+        (&json!("revoked"), &json!(hex(&OTHER)))
+    );
+    // A read writes no audit row.
+    assert_eq!(server.count(audit).await, before);
+}
+
+#[tokio::test]
+async fn only_an_active_custodian_session_lists_the_tenant_devices() {
+    let mut server = start("s1-devices-who", 28236).await;
+    let joiner = device(&server, OWNER, 0x5b, "pending").await;
+    let setup = session(&server, &joiner).await;
+    assert_eq!(setup["class"], "pending_setup");
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    let peer = device(&server, OWNER, 0x7d, "active").await;
+    file_approval(&server, &dev, &peer, 0x7d).await;
+    let ordinary = session(&server, &peer).await;
+    assert_eq!(ordinary["class"], "ordinary");
+    let ticket = server.login("owner").await;
+    let path = devices_path(&TENANT);
+
+    // A ticket proves only a password; an approved device is no custodian.
+    for bearer in [
+        &ticket["ticket"],
+        &setup["access_token"],
+        &ordinary["access_token"],
+    ] {
+        let (status, body) = server.call(&path, bearer.as_str().unwrap(), None).await;
+        assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    }
+    // Another tenant is not found, and no token is no caller.
+    let (status, body) = server.call(&devices_path(&TENANT2), &access, None).await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (404, "RESOURCE_NOT_FOUND")
+    );
+    assert_eq!(server.call(&path, "", None).await.0, 401);
+    assert_eq!(server.call(&path, &access, None).await.0, 200);
+}
+
+#[tokio::test]
+async fn a_device_session_reads_the_active_fleet_generation_and_its_own_root_grants() {
+    let mut server = start("s1-reads", 28237).await;
+    let reader = device(&server, OWNER, 0x5b, "pending").await;
+    let reader_access = session(&server, &reader).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fleet_path = |tenant: &[u8; 16]| {
+        format!(
+            "/v2/tenants/{}/fleets/{}/key-generation",
+            hex(tenant),
+            hex(&FLEET)
+        )
+    };
+    let active = fleet_path(&TENANT);
+    let (status, body) = server.call(&active, &reader_access, None).await;
+    assert_eq!((status, body.as_slice()), (200, b"null".as_slice()));
+
+    // `fleet_grants_filed` makes the custodian from seed 0x6e.
+    let (access, _) = fleet_grants_filed(&mut server).await;
+    let generation =
+        |body: Vec<u8>| serde_json::from_slice::<Value>(&body).unwrap()["generation"].clone();
+    for bearer in [&reader_access, &access] {
+        let (status, body) = server.call(&active, bearer, None).await;
+        assert_eq!((status, generation(body)), (200, json!(0)));
+    }
+    let own = format!(
+        "/v2/tenants/{}/devices/{}/root-key-grants",
+        hex(&TENANT),
+        hex(&[0x6e; 16])
+    );
+    let listed = |body: Vec<u8>| {
+        serde_json::from_slice::<Value>(&body).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let (status, body) = server.call(&own, &access, None).await;
+    assert_eq!((status, listed(body)), (200, 1));
+
+    // Another device's grants, a ticket, and another tenant are refused.
+    assert_eq!(server.call(&own, &reader_access, None).await.0, 403);
+    let ticket = server.login("owner").await["ticket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(server.call(&own, &ticket, None).await.0, 403);
+    assert_eq!(server.call(&active, &ticket, None).await.0, 403);
+    assert_eq!(
+        server.call(&fleet_path(&TENANT2), &access, None).await.0,
+        403
+    );
+    let foreign_grants = format!(
+        "/v2/tenants/{}/devices/{}/root-key-grants",
+        hex(&TENANT2),
+        hex(&[0x6e; 16])
+    );
+    assert_eq!(server.call(&foreign_grants, &access, None).await.0, 403);
+
+    // The v1 path is unchanged: refused until the user maps to an account.
+    let (_, login) = server
+        .post(
+            "/auth/login",
+            None,
+            json!({ "username": "admin", "password": "secret" }),
+        )
+        .await;
+    let v1 = login["token"].as_str().unwrap().to_string();
+    assert_eq!(server.call(&active, &v1, None).await.0, 403);
+    assert_eq!(server.call(&own, &v1, None).await.0, 403);
+    server
+        .sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin')
+              WHERE id = ?",
+            &[&OWNER],
+        )
+        .await;
+    let (status, body) = server.call(&active, &v1, None).await;
+    assert_eq!((status, generation(body)), (200, json!(0)));
+    let (status, body) = server.call(&own, &v1, None).await;
+    assert_eq!((status, listed(body)), (200, 1));
+}
+
+#[tokio::test]
+async fn server_identity_answers_a_ticket_and_a_session_without_a_v1_token() {
+    let mut server = start("s1-identity", 28238).await;
+    let joiner = device(&server, OWNER, 0x5b, "pending").await;
+    let setup = session(&server, &joiner).await;
+    assert_eq!(setup["class"], "pending_setup");
+    let (dev, _, _) = custodian(&mut server, 0x6c).await;
+    let peer = device(&server, OWNER, 0x7d, "active").await;
+    file_approval(&server, &dev, &peer, 0x7d).await;
+    let ordinary = session(&server, &peer).await;
+    assert_eq!(ordinary["class"], "ordinary");
+    let ticket = server.login("owner").await;
+
+    for bearer in [
+        &ticket["ticket"],
+        &setup["access_token"],
+        &ordinary["access_token"],
+    ] {
+        let (status, body) = server
+            .call("/v2/server-identity", bearer.as_str().unwrap(), None)
+            .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let identity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (&identity["server_instance_id"], &identity["restore_epoch"]),
+            (&json!(hex(&INSTANCE)), &json!(0))
+        );
+    }
+    // A v2 token that names nothing live is still refused.
+    let dead = format!("v2a.{}", hex(&[0; 32]));
+    assert_eq!(server.call("/v2/server-identity", &dead, None).await.0, 401);
+}

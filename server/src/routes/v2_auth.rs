@@ -507,6 +507,33 @@ where
     }
 }
 
+/// A v2 principal when the bearer token is a ticket or an access token, else
+/// the v1 user, so the v1 callers of a shared read route are unchanged.
+pub enum Caller {
+    V2(Principal),
+    V1(crate::auth::AuthUser),
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for Caller
+where
+    AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        if bearer(parts).is_some_and(|t| t.starts_with(TICKET) || t.starts_with(ACCESS)) {
+            return Principal::from_request_parts(parts, state)
+                .await
+                .map(Caller::V2);
+        }
+        crate::auth::AuthUser::from_request_parts(parts, state)
+            .await
+            .map(Caller::V1)
+    }
+}
+
 /// A structured audit row for an online v2 action by a device.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn audit(

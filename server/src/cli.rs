@@ -360,6 +360,26 @@ async fn tenant_create(
         &uuid::Uuid::new_v4().into_bytes(),
     )
     .await?;
+    // shortcut: one fleet per tenant, id = tenant id; upgrade with Plan L1128 fleet routes.
+    sqlx::query(
+        "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at) \
+         VALUES (?, ?, 'default', 'active', ?)",
+    )
+    .bind(tenant_id.as_slice())
+    .bind(tenant_id.as_slice())
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .context("inserting the default fleet")?;
+    audit::insert_offline(
+        &mut tx,
+        &tenant_id,
+        "fleet.create",
+        "fleet",
+        &tenant_id,
+        &uuid::Uuid::new_v4().into_bytes(),
+    )
+    .await?;
     tx.commit().await?;
     pool.close().await;
 
