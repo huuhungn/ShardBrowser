@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Known limitations
+
+- Team (v2.6.0, v2.6.1) cannot yet be used end to end against a real team
+  server. The launcher never creates a fleet key or files its grants, so
+  Publish is refused with "No fleet key this device verified opens this team
+  profile", and it cannot approve a second device. Both come with the custodian
+  work planned for v0.2.2. See `docs/team-ui-evidence/two-machine-run.md`.
+
 ## v2.6.1
 
 A Team fix release: removing a profile for good now unbinds it from the team,
