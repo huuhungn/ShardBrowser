@@ -585,6 +585,107 @@ impl FleetClient {
         .await
     }
 
+    /// Every device of the tenant with its public keys, for an ACTIVE
+    /// custodian's session. A 404 means a server without this route
+    /// (`fleet.serverTooOld`).
+    pub async fn list_tenant_devices(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<TenantDevice>> {
+        let res = self
+            .http
+            .get(self.url(&format!("/v2/tenants/{tenant_id}/devices")))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .context(crate::errcode::code("fleet.unreachableCustody"))?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!(crate::errcode::code("fleet.serverTooOld"));
+        }
+        let body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody")
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyCustody"))?;
+        Ok(body.devices)
+    }
+
+    /// Files a signed capability grant. The server answers with the exact
+    /// container it keeps.
+    pub async fn file_capability_grant(
+        &self,
+        access_token: &str,
+        container: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor("/v2/capability-grants", access_token, container)
+            .await
+    }
+
+    /// Creates a fleet key generation. Returns the exact stored response.
+    pub async fn create_fleet_generation(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/fleets/{fleet_id}/key-generations"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Files one grant of a fleet key generation. Returns the exact stored
+    /// response.
+    pub async fn file_fleet_grant(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/fleets/{fleet_id}/key-generations/{generation}/grants"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Acknowledges one fleet grant. Returns the exact stored response.
+    pub async fn ack_fleet_grant(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/fleets/{fleet_id}/key-generations/{generation}/ack"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
+    /// Activates a fleet key generation. Returns the exact stored response.
+    pub async fn activate_fleet_generation(
+        &self,
+        access_token: &str,
+        fleet_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/fleets/{fleet_id}/key-generations/{generation}/activate"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
     /// Rotates a device session's tokens. The old refresh token is spent:
     /// never retry with it, because a reused token revokes the session.
     pub async fn refresh_device_session(&self, refresh_token: &str) -> Result<DeviceSession> {
@@ -669,14 +770,40 @@ impl FleetClient {
             .context(crate::errcode::code("fleet.badReplyRegisterFinish"))
     }
 
-    pub async fn server_identity(&self) -> Result<ServerIdentity> {
-        let res = self
-            .http
+    /// The server's instance and restore epoch, read with `bearer`: a v2
+    /// ticket or device session, or the v1 token.
+    pub async fn server_identity(&self, bearer: &str) -> Result<ServerIdentity> {
+        let res = self.identity_reply(bearer).await?;
+        Self::identity_of(res).await
+    }
+
+    /// Logs `login` in for a ticket and reads the server identity with it. A
+    /// 401 for a ticket issued in this same call is no expired ticket: the
+    /// server predates ticket reads (`fleet.serverTooOld`).
+    pub async fn server_identity_with_login(
+        &self,
+        login: &AccountLogin<'_>,
+    ) -> Result<ServerIdentity> {
+        let ticket = self.login_ticket(login).await?;
+        let res = self.identity_reply(&ticket.ticket).await;
+        self.end_ticket(&ticket).await;
+        let res = res?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            bail!(crate::errcode::code("fleet.serverTooOld"));
+        }
+        Self::identity_of(res).await
+    }
+
+    async fn identity_reply(&self, bearer: &str) -> Result<reqwest::Response> {
+        self.http
             .get(self.url("/v2/server-identity"))
-            .bearer_auth(self.token.as_str())
+            .bearer_auth(bearer)
             .send()
             .await
-            .context(crate::errcode::code("fleet.unreachableIdentity"))?;
+            .context(crate::errcode::code("fleet.unreachableIdentity"))
+    }
+
+    async fn identity_of(res: reqwest::Response) -> Result<ServerIdentity> {
         Self::ok_or_err(res, "fleet.refusedIdentity")
             .await?
             .json()
@@ -813,6 +940,7 @@ impl FleetClient {
     /// but useless without the matching private half held locally.
     pub async fn root_key_grants(
         &self,
+        bearer: &str,
         tenant_id: &str,
         device_id: &str,
     ) -> Result<Vec<RootKeyGrant>> {
@@ -821,7 +949,7 @@ impl FleetClient {
             .get(self.url(&format!(
                 "/v2/tenants/{tenant_id}/devices/{device_id}/root-key-grants"
             )))
-            .bearer_auth(self.token.as_str())
+            .bearer_auth(bearer)
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
@@ -836,6 +964,7 @@ impl FleetClient {
     /// The fleet's ACTIVE key generation, if it has one.
     pub async fn active_fleet_generation(
         &self,
+        bearer: &str,
         tenant_id: &str,
         fleet_id: &str,
     ) -> Result<Option<u64>> {
@@ -844,7 +973,7 @@ impl FleetClient {
             .get(self.url(&format!(
                 "/v2/tenants/{tenant_id}/fleets/{fleet_id}/key-generation"
             )))
-            .bearer_auth(self.token.as_str())
+            .bearer_auth(bearer)
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
@@ -1143,7 +1272,7 @@ impl FleetClient {
         signer: &Ed25519SigningKey,
         ttl_seconds: i64,
     ) -> Result<i64> {
-        let identity = self.server_identity().await?;
+        let identity = self.server_identity(self.token.as_str()).await?;
         let lease_id = random_id_hex();
         let session_id = random_id_hex();
 
@@ -1385,6 +1514,24 @@ pub struct RootKeyGrant {
     pub hpke_info_hex: String,
     pub hpke_encapped_key_hex: String,
     pub hpke_wrapped_trk_hex: String,
+}
+
+/// One device of the tenant as the custodian listing reports it, hex-encoded.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TenantDevice {
+    pub device_id: String,
+    pub account_id: String,
+    pub status: String,
+    pub label_hex: String,
+    pub signing_public_key: String,
+    pub hpke_public_key: String,
+    pub signing_key_id: String,
+    pub hpke_key_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TenantDevices {
+    devices: Vec<TenantDevice>,
 }
 
 #[derive(Debug, serde::Deserialize)]

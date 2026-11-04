@@ -157,11 +157,11 @@ pub struct RecoveryExport<'a> {
     pub passphrase: &'a str,
 }
 
-fn mismatch() -> anyhow::Error {
+pub(crate) fn mismatch() -> anyhow::Error {
     anyhow!(crate::errcode::code("fleet.custodyReplyMismatch"))
 }
 
-fn corrupt() -> anyhow::Error {
+pub(crate) fn corrupt() -> anyhow::Error {
     anyhow!(crate::errcode::code("fleet.custodyStateCorrupt"))
 }
 
@@ -170,17 +170,17 @@ fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     unhex_vec(s)?.try_into().map_err(|_| corrupt())
 }
 
-fn unhex_vec(s: &str) -> Result<Vec<u8>> {
+pub(crate) fn unhex_vec(s: &str) -> Result<Vec<u8>> {
     decode_hex(s).ok_or_else(corrupt)
 }
 
-fn random<const N: usize>() -> Result<[u8; N]> {
+pub(crate) fn random<const N: usize>() -> Result<[u8; N]> {
     let mut out = [0u8; N];
     fill_random(&mut out).map_err(|_| anyhow!(crate::errcode::code("fleet.custodyEntropy")))?;
     Ok(out)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -188,18 +188,18 @@ fn now_ms() -> u64 {
 }
 
 /// The facts every built record and request names.
-struct Context16 {
-    tenant: [u8; 16],
-    instance: [u8; 16],
-    epoch: u64,
-    account: [u8; 16],
-    device: [u8; 16],
-    signing_key_id: [u8; 32],
-    hpke_key_id: [u8; 32],
+pub(crate) struct Context16 {
+    pub(crate) tenant: [u8; 16],
+    pub(crate) instance: [u8; 16],
+    pub(crate) epoch: u64,
+    pub(crate) account: [u8; 16],
+    pub(crate) device: [u8; 16],
+    pub(crate) signing_key_id: [u8; 32],
+    pub(crate) hpke_key_id: [u8; 32],
 }
 
 impl Context16 {
-    fn common(&self, replay_id: [u8; 16], now: u64) -> CommonFields {
+    pub(crate) fn common(&self, replay_id: [u8; 16], now: u64) -> CommonFields {
         let start = now.saturating_sub(CLOCK_SKEW_MS);
         CommonFields {
             replay_id,
@@ -212,7 +212,7 @@ impl Context16 {
         }
     }
 
-    fn request(&self, kind: OperationKind, payload: Vec<u8>) -> Result<Vec<u8>> {
+    pub(crate) fn request(&self, kind: OperationKind, payload: Vec<u8>) -> Result<Vec<u8>> {
         Ok(IdempotentMutationRequestV2 {
             operation_kind: kind,
             idempotency_key: random()?,
@@ -241,7 +241,7 @@ fn self_approval(cx: &Context16, signer: &Ed25519SigningKey, now: u64) -> Result
 }
 
 /// The first root self-grant of `trk`, sealed to this device's HPKE key.
-fn self_grant(
+pub(crate) fn self_grant(
     cx: &Context16,
     signer: &Ed25519SigningKey,
     hpke_public_key: &[u8],
@@ -280,7 +280,7 @@ fn self_grant(
 }
 
 /// The self-grant as this device filed it, verified under its own key.
-fn own_grant(
+pub(crate) fn own_grant(
     container: &[u8],
     signer: &Ed25519SigningKey,
 ) -> Result<(TenantRootKeyGrantV2, RootGrantRef)> {
@@ -338,7 +338,7 @@ fn check_receipt(
 
 /// The payload of a stored response, once it answers exactly `request` with
 /// a `record_type` record.
-fn stored_payload(
+pub(crate) fn stored_payload(
     stored: &[u8],
     request: &IdempotentMutationRequestV2,
     record_type: &str,
@@ -400,10 +400,10 @@ fn check_bundle(recovery: &RecoveryExport<'_>, pinned: &[u8; 32], trk: &[u8; 32]
 
 /// Applies `change` to a copy of `state`, saves the copy, and only then
 /// replaces `state`: what the caller holds is always what is on disk.
-fn commit(
-    state: &mut BootstrapState,
-    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
-    change: impl FnOnce(&mut BootstrapState),
+pub(crate) fn commit<S: Clone>(
+    state: &mut S,
+    save: &mut impl FnMut(&S) -> Result<()>,
+    change: impl FnOnce(&mut S),
 ) -> Result<()> {
     let mut next = state.clone();
     change(&mut next);
@@ -413,7 +413,7 @@ fn commit(
 }
 
 /// A run nonce: 16 random bytes, lower-case hex.
-fn nonce_ok(nonce: &str) -> bool {
+pub(crate) fn nonce_ok(nonce: &str) -> bool {
     nonce.len() == 32
         && nonce
             .bytes()
@@ -474,7 +474,7 @@ fn load_trk(vault: &dyn TrkStore, state: &BootstrapState) -> Result<Zeroizing<[u
     vault.load(&own_trk_ref(state)?)
 }
 
-fn is_missing(e: &anyhow::Error) -> bool {
+pub(crate) fn is_missing(e: &anyhow::Error) -> bool {
     crate::errcode::has_code(&e.to_string(), "credential.missing")
 }
 
@@ -609,34 +609,7 @@ pub async fn bootstrap_root(
     let account = decode_hex16(device.account_id, "account_id")?;
     let device_id = decode_hex16(device.device_id, "device_id")?;
 
-    let id = client.server_identity().await?;
-    let instance =
-        decode_hex16(&id.server_instance_id, "server_instance_id").map_err(|_| mismatch())?;
-    let epoch = u64::try_from(id.restore_epoch).map_err(|_| mismatch())?;
-    if state.server_instance_id.is_empty() {
-        commit(state, save, |s| {
-            s.tenant_id = tenant_hex.to_string();
-            s.device_id = device.device_id.to_string();
-            s.server_instance_id = hex(&instance);
-            s.restore_epoch = epoch;
-        })?;
-    } else if state.server_instance_id != hex(&instance) || state.restore_epoch != epoch {
-        // Every saved request names the old instance or epoch, so none can
-        // be replayed. Before the create nothing is pinned and the state may
-        // be discarded; after it, the tenant's custody needs recovery.
-        bail!(crate::errcode::code("fleet.custodyServerChanged"));
-    }
-
-    let (hpke_secret, hpke_public) = derive_keypair(device.hpke_seed);
-    let cx = Context16 {
-        tenant,
-        instance,
-        epoch,
-        account,
-        device: device_id,
-        signing_key_id: signing_key_id(device.signer.verifying_key().as_bytes()),
-        hpke_key_id: hpke_key_id(&hpke_public),
-    };
+    // A pending device's session reads the identity: no v1 token is needed.
     let session = client
         .open_device_session(
             &device.login,
@@ -646,16 +619,47 @@ pub async fn bootstrap_root(
         )
         .await?;
     let access = session.access_token.as_str();
-    let run = Run {
-        client,
-        device,
-        recovery,
-        cx: &cx,
-        access,
-        hpke_secret: &hpke_secret,
-        hpke_public: &hpke_public,
-    };
-    let result = run.steps(state, save).await;
+    let result = async {
+        let id = client.server_identity(access).await?;
+        let instance =
+            decode_hex16(&id.server_instance_id, "server_instance_id").map_err(|_| mismatch())?;
+        let epoch = u64::try_from(id.restore_epoch).map_err(|_| mismatch())?;
+        if state.server_instance_id.is_empty() {
+            commit(state, save, |s| {
+                s.tenant_id = tenant_hex.to_string();
+                s.device_id = device.device_id.to_string();
+                s.server_instance_id = hex(&instance);
+                s.restore_epoch = epoch;
+            })?;
+        } else if state.server_instance_id != hex(&instance) || state.restore_epoch != epoch {
+            // Every saved request names the old instance or epoch, so none can
+            // be replayed. Before the create nothing is pinned and the state may
+            // be discarded; after it, the tenant's custody needs recovery.
+            bail!(crate::errcode::code("fleet.custodyServerChanged"));
+        }
+
+        let (hpke_secret, hpke_public) = derive_keypair(device.hpke_seed);
+        let cx = Context16 {
+            tenant,
+            instance,
+            epoch,
+            account,
+            device: device_id,
+            signing_key_id: signing_key_id(device.signer.verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&hpke_public),
+        };
+        let run = Run {
+            client,
+            device,
+            recovery,
+            cx: &cx,
+            access,
+            hpke_secret: &hpke_secret,
+            hpke_public: &hpke_public,
+        };
+        run.steps(state, save).await
+    }
+    .await;
     client.end_session(access).await;
     result
 }

@@ -18,6 +18,7 @@ mod extensions;
 pub mod files;
 mod fingerprints;
 pub mod fleet_client;
+pub mod fleet_custody;
 mod fleet_keys;
 pub mod gpu_caps;
 mod hermes_mcp;
@@ -2042,16 +2043,31 @@ fn team_set_connection(
     team_config::status().map_err(|e| e.to_string())
 }
 
-/// Check the saved connection by asking the server who it is.
+/// Check the saved connection by asking the server who it is, with a ticket
+/// of `username`'s account. The password is used for one login and never
+/// stored.
 #[tauri::command]
-async fn team_test_connection() -> Result<String, String> {
+async fn team_test_connection(username: String, password: String) -> Result<String, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
-    if c.server_url.is_empty() || c.token.is_empty() {
-        return Err(crate::errcode::code("fleet.setServerAndTokenFirst"));
+    if c.server_url.is_empty() {
+        return Err(crate::errcode::code("fleet.setServerFirst"));
+    }
+    if c.tenant_id.is_empty() {
+        return Err(crate::errcode::code("fleet.setTenantFirst"));
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
-    let id = client.server_identity().await.map_err(|e| e.to_string())?;
+    let id = client
+        .server_identity_with_login(&fleet_client::AccountLogin {
+            tenant_id: &c.tenant_id,
+            username: username.trim(),
+            password: &password,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(id.server_instance_id)
 }
 
@@ -2071,8 +2087,8 @@ async fn team_enroll_device(
     password: String,
 ) -> Result<team_config::TeamStatus, String> {
     let mut c = team_config::load().map_err(|e| e.to_string())?;
-    if c.server_url.is_empty() || c.token.is_empty() {
-        return Err(crate::errcode::code("fleet.setServerAndTokenFirst"));
+    if c.server_url.is_empty() {
+        return Err(crate::errcode::code("fleet.setServerFirst"));
     }
     if c.tenant_id.is_empty() {
         return Err(crate::errcode::code("fleet.setTenantFirst"));
@@ -2466,6 +2482,75 @@ async fn team_bootstrap_custody(
     .map_err(|e| e.to_string())
 }
 
+/// How far this device's Create fleet key got.
+#[tauri::command]
+fn team_fleet_custody_status() -> Result<fleet_custody::FleetCustodyStatus, String> {
+    fleet_custody::status().map_err(|e| e.to_string())
+}
+
+/// Create the fleet key as the tenant's root custodian, or resume it (plan
+/// v0.2.2a section 4.F): generation 0 of the tenant's fleet, its device and
+/// recovery grants, acknowledged and activated, then the verified collect.
+/// Only once that collect keeps the key is the setup key released. The
+/// password is used for one login and never stored.
+#[tauri::command]
+async fn team_fleet_key_setup(
+    username: String,
+    password: String,
+) -> Result<fleet_custody::FleetCustodyStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if !c.can_receive_custody() {
+        return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let hpke_seed = c.hpke_seed().map_err(|e| e.to_string())?;
+    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let device = fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &hpke_seed,
+        vault: &fleet_custody::CredentialFkekStore,
+    };
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username: username.trim(),
+        password: &password,
+    };
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &hpke_seed)
+        .await
+        .map_err(|e| e.to_string())?;
+    let access = session.access_token.as_str();
+    let result = async {
+        let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+        let mut save = |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
+        fleet_custody::bootstrap_fleet(&client, access, &device, &root, &mut state, &mut save)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Step 9: only the verified collect keeps the key in `fleet_keys`.
+        let (device_sk, _) = shardx_core::grants::derive_keypair(&hpke_seed);
+        if collect_fleet_grant(&client, &c, access, &device_sk).await? != FleetGrant::Opened(0) {
+            return Err(crate::errcode::code("fleet.trustEvidenceRefused"));
+        }
+        fleet_custody::release_fkek(device.vault, &mut state, &mut save).map_err(|e| e.to_string())
+    }
+    .await;
+    client.end_session(access).await;
+    result?;
+    fleet_custody::status().map_err(|e| e.to_string())
+}
+
 /// Collect the root key grants issued to this device and report what opened.
 ///
 /// The tenant root key itself is never returned to the caller: this reports
@@ -2473,9 +2558,9 @@ async fn team_bootstrap_custody(
 /// reported rather than skipped, because silently ignoring it would hide a
 /// device that cannot actually decrypt anything.
 ///
-/// A fleet grant is read through this device's own session (ADR 0002 D-9), so
-/// a fleet with an ACTIVE generation needs the account login; the password is
-/// used for one login and never stored.
+/// Both reads go through this device's own session (ADR 0002 D-9), so they
+/// need the account login; the password is used for one login and never
+/// stored.
 #[tauri::command]
 async fn team_collect_custody(
     username: String,
@@ -2485,24 +2570,37 @@ async fn team_collect_custody(
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = c.hpke_seed().map_err(|e| e.to_string())?;
     let (device_sk, _pk) = shardx_core::grants::derive_keypair(&seed);
 
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
-    let grants = client
-        .root_key_grants(&c.tenant_id, &c.device_id)
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username: username.trim(),
+        password: &password,
+    };
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &seed)
         .await
         .map_err(|e| e.to_string())?;
-
-    // A fleet grant is opened only once it verifies: see `custody_report`.
-    let fleet = if c.fleet_id.is_empty() {
-        FleetGrant::None
-    } else {
-        collect_fleet_grant(&client, &c, username.trim(), &password, &device_sk).await?
-    };
-
-    custody_report(&device_sk, &grants, fleet)
+    let access = session.access_token.as_str();
+    let result = async {
+        let grants = client
+            .root_key_grants(access, &c.tenant_id, &c.device_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        // A fleet grant is opened only once it verifies: see `custody_report`.
+        let fleet = collect_fleet_grant(&client, &c, access, &device_sk).await?;
+        custody_report(&device_sk, &grants, fleet)
+    }
+    .await;
+    client.end_session(access).await;
+    result
 }
 
 /// What became of this device's D-9 `DeviceHpkeGrant` of the fleet's ACTIVE
@@ -2523,45 +2621,32 @@ enum FleetGrant {
     Substituted,
 }
 
-/// Reads this device's grant and, when this device pinned an anchor, the
-/// tenant trust evidence, and keeps the FKEK only if rule 5 accepts it.
+/// Reads, over the device session `access`, this device's grant of the
+/// fleet's ACTIVE generation and, when this device pinned an anchor, the
+/// tenant trust evidence, and keeps the FKEK only if rule 5 accepts it. A
+/// kept key's grant is then acknowledged once.
 async fn collect_fleet_grant(
     client: &fleet_client::FleetClient,
     c: &team_config::TeamConfig,
-    username: &str,
-    password: &str,
+    access: &str,
     device_sk: &[u8],
 ) -> Result<FleetGrant, String> {
+    let fleet_id = sync_cmd::fleet_id(c);
     let Some(generation) = client
-        .active_fleet_generation(&c.tenant_id, &c.fleet_id)
+        .active_fleet_generation(access, &c.tenant_id, &fleet_id)
         .await
         .map_err(|e| e.to_string())?
     else {
         return Ok(FleetGrant::None);
     };
-    if username.is_empty() || password.is_empty() {
-        return Err(crate::errcode::code("fleet.setAccountFirst"));
-    }
     // An unreadable or newer team database disables this before any key is
     // read (plan L2032).
     let mut ledger = team::db::Db::open().map_err(|e| e.to_string())?;
-    let signer = c.signing_key().map_err(|e| e.to_string())?;
-    let hpke_seed = c.hpke_seed().map_err(|e| e.to_string())?;
-    let login = fleet_client::AccountLogin {
-        tenant_id: &c.tenant_id,
-        username,
-        password,
-    };
-    let session = client
-        .open_device_session(&login, &c.device_id, &signer, &hpke_seed)
-        .await
-        .map_err(|e| e.to_string())?;
-    let access = session.access_token.as_str();
     let grant = match client
-        .read_fleet_device_grant(access, &c.fleet_id, generation, &c.device_id)
+        .read_fleet_device_grant(access, &fleet_id, generation, &c.device_id)
         .await
     {
-        Ok(Some(d)) => live_fleet_grant(&d, &c.fleet_id, generation, &c.device_id),
+        Ok(Some(d)) => live_fleet_grant(&d, &fleet_id, generation, &c.device_id),
         Ok(None) => Ok(None),
         Err(e) => Err(e.to_string()),
     };
@@ -2570,8 +2655,7 @@ async fn collect_fleet_grant(
         (Ok(Some(_)), Some(_)) => Some(client.trust_evidence(access, &c.tenant_id).await),
         _ => None,
     };
-    client.end_session(access).await;
-    let Some(container) = grant? else {
+    let Some((container, acknowledged)) = grant? else {
         return Ok(FleetGrant::None);
     };
     let (Some(pin), Some(pages)) = (pin, pages) else {
@@ -2582,7 +2666,7 @@ async fn collect_fleet_grant(
         return Ok(FleetGrant::Failed);
     };
     let me = recipient(c).map_err(|e| e.to_string())?;
-    let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id").map_err(|e| e.to_string())?;
+    let fleet = fleet_client::decode_hex16(&fleet_id, "fleet_id").map_err(|e| e.to_string())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -2598,7 +2682,13 @@ async fn collect_fleet_grant(
         &mut ledger,
         &c.server_url,
     )?;
-    keep_fleet_key(&c.fleet_id, generation, fkek)
+    let kept = keep_fleet_key(&fleet_id, generation, fkek)?;
+    if kept == FleetGrant::Opened(generation) {
+        fleet_custody::ack_device_grant(client, access, &container, acknowledged)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(kept)
 }
 
 /// Keeps the FKEK `open_fleet_grant` accepted, unless the store holds
@@ -2818,8 +2908,9 @@ fn fleet_key_usable(
 }
 
 /// The exact grant container of the descriptor when it is an unrevoked
-/// `DeviceHpkeGrant` of exactly this fleet, generation and device, `None`
-/// when it is revoked. A descriptor naming anything else is a bad reply.
+/// `DeviceHpkeGrant` of exactly this fleet, generation and device, with
+/// whether it is acknowledged; `None` when it is revoked. A descriptor naming
+/// anything else is a bad reply.
 /// Nothing here is trusted: the container is verified against the trust
 /// evidence (`open_fleet_grant`).
 fn live_fleet_grant(
@@ -2827,7 +2918,7 @@ fn live_fleet_grant(
     fleet_id: &str,
     generation: u64,
     device_id: &str,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<(Vec<u8>, bool)>, String> {
     use shardx_core::canonical::{decode, Value};
     let bad = || crate::errcode::code("fleet.badReplyTeamKeys");
     let Ok(Value::Map(fields)) = decode(descriptor) else {
@@ -2848,13 +2939,14 @@ fn live_fleet_grant(
     {
         return Err(bad());
     }
-    let live = match text("grant_state") {
-        Some("PENDING_ACK" | "ACKNOWLEDGED") => true,
-        Some("REVOKED") => false,
+    let (live, acknowledged) = match text("grant_state") {
+        Some("PENDING_ACK") => (true, false),
+        Some("ACKNOWLEDGED") => (true, true),
+        Some("REVOKED") => (false, false),
         _ => return Err(bad()),
     };
     match field("exact_signed_container_bytes") {
-        Some(Value::Bytes(container)) => Ok(live.then(|| container.clone())),
+        Some(Value::Bytes(container)) => Ok(live.then(|| (container.clone(), acknowledged))),
         _ => Err(bad()),
     }
 }
@@ -5167,11 +5259,15 @@ mod custody_tests {
         let live = descriptor(RootGrantState::Acknowledged);
         assert_eq!(
             live_fleet_grant(&live, &fleet, 1, &device),
-            Ok(Some(container.clone()))
+            Ok(Some((container.clone(), true)))
         );
         assert_eq!(
             live_fleet_grant(&live, &fleet.to_uppercase(), 1, &device),
-            Ok(Some(container.clone()))
+            Ok(Some((container.clone(), true)))
+        );
+        assert_eq!(
+            live_fleet_grant(&descriptor(RootGrantState::PendingAck), &fleet, 1, &device),
+            Ok(Some((container.clone(), false)))
         );
         let revoked = descriptor(RootGrantState::Revoked);
         assert_eq!(live_fleet_grant(&revoked, &fleet, 1, &device), Ok(None));
@@ -5333,6 +5429,8 @@ pub fn run() {
             team_collect_custody,
             team_custody_bootstrap_status,
             team_bootstrap_custody,
+            team_fleet_custody_status,
+            team_fleet_key_setup,
             team_set_connection,
             team_test_connection,
             team_enroll_device,

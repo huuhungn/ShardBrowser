@@ -278,7 +278,10 @@ async fn launcher_enrolls_a_device_against_a_real_server() {
     let base = format!("http://127.0.0.1:{}", server.port);
     let client = FleetClient::new(&base, &token).expect("construct client");
 
-    let identity = client.server_identity().await.expect("server identity");
+    let identity = client
+        .server_identity(&token)
+        .await
+        .expect("server identity");
     assert!(!identity.server_instance_id.is_empty());
 
     let signer = shardx_core::signing::Ed25519SigningKey::from_bytes(&[42u8; 32]);
@@ -369,7 +372,7 @@ async fn an_enrolled_device_collects_and_opens_its_root_key_grant() {
 
     // A device with no grants must get an empty list, not an error.
     let none = client
-        .root_key_grants(&tenant_hex, &device.device_id)
+        .root_key_grants(&token, &tenant_hex, &device.device_id)
         .await
         .expect("collecting with no grants must succeed");
     assert!(none.is_empty(), "a fresh device has no grants");
@@ -377,7 +380,10 @@ async fn an_enrolled_device_collects_and_opens_its_root_key_grant() {
     // The custodian seals the tenant root key to this device. The server never
     // sees the key itself, only the sealed bytes.
     let trk = [0xC7u8; 32];
-    let identity = client.server_identity().await.expect("server identity");
+    let identity = client
+        .server_identity(&token)
+        .await
+        .expect("server identity");
     let instance = hex_to_16(&identity.server_instance_id);
     let device_id = hex_to_16(&device.device_id);
     let account_id = hex_to_16(&device.account_id);

@@ -15,8 +15,12 @@ export const teamSetConnection = (
   tenantId: string,
 ) => invoke<TeamStatus>("team_set_connection", { serverUrl, token, tenantId });
 
-/** Ask the server who it is; returns its identity. */
-export const teamTestConnection = () => invoke<string>("team_test_connection");
+/**
+ * Ask the server who it is with a ticket of the given v2 account; returns its
+ * identity. The password is used for one login and never stored.
+ */
+export const teamTestConnection = (username: string, password: string) =>
+  invoke<string>("team_test_connection", { username, password });
 
 /**
  * Enrol this device as the given v2 account, keeping its signing and HPKE keys
