@@ -78,6 +78,7 @@ const CHUNK: usize = 4 << 20;
 #[cfg(test)]
 const CHUNK: usize = 64 << 10;
 const COMMIT_RECORD: &str = "CommitReceiptBindingV2";
+const SIGNER_REVOKED: &str = "SIGNER_REVOKED";
 
 /// This device, as sync needs it: its signing key, the identity a fleet key
 /// grant names, and the anchor it pinned.
@@ -200,16 +201,7 @@ pub(crate) fn is_published(local: &str) -> Result<bool> {
     if !Db::path()?.exists() {
         return Ok(false);
     }
-    let db = Db::open()?;
-    Ok(db
-        .conn
-        .query_row(
-            "SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1",
-            [local],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+    is_bound(&Db::open()?.conn, local)
 }
 
 /// One binding as `team_profiles_status` reports it. A profile with none is
@@ -375,7 +367,7 @@ fn quarantine(db: &Db, local: &str, reason: &str, err: anyhow::Error) -> anyhow:
 /// Rule 6, "Revoked signer": quarantines `b` with `SIGNER_REVOKED`.
 fn signer_revoked(db: &Db, b: &Bound) -> anyhow::Error {
     let err = anyhow!(code("sync.signerRevoked"));
-    quarantine(db, &b.local, "SIGNER_REVOKED", err)
+    quarantine(db, &b.local, SIGNER_REVOKED, err)
 }
 
 /// `err` for a head [`walk`] refuses; once the walk met a proven-revoked
@@ -1761,7 +1753,7 @@ async fn push_inner(
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             continue;
         }
-        let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+        let revoked = b.error.as_deref() == Some(SIGNER_REVOKED);
         if revert.is_none() || !revoked {
             refuse_quarantined(&b)?;
         }
@@ -1946,7 +1938,7 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
     if !pending {
         return Ok(());
     }
-    let (staging, old) = (beside(udd, ".revert-staging"), beside(udd, ".revert-old"));
+    let (staging, old) = (beside(udd, REVERT_STAGING), beside(udd, REVERT_OLD));
     let swapped = (|| -> std::io::Result<()> {
         if staging.exists() {
             if udd.exists() {
@@ -2004,8 +1996,10 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
     remove_beside(udd, &SWAP_DIRS)
 }
 
+const REVERT_STAGING: &str = ".revert-staging";
+const REVERT_OLD: &str = ".revert-old";
 /// The staged `P` and the data a swap replaces, both beside `udd`.
-const SWAP_DIRS: [&str; 2] = [".revert-staging", ".revert-old"];
+const SWAP_DIRS: [&str; 2] = [REVERT_STAGING, REVERT_OLD];
 
 /// `unpack`'s crash leftovers beside the staging: a partial `.incoming`, and
 /// a `.backup` of a staging that is always built afresh, so nothing needs them.
@@ -2109,7 +2103,7 @@ async fn revert_inner(
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
     let mut b = bound(&db, local)?;
-    let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+    let revoked = b.error.as_deref() == Some(SIGNER_REVOKED);
     if !revoked {
         refuse_quarantined(&b)?;
     }
@@ -2142,7 +2136,7 @@ async fn revert_inner(
         Some(lease) => find(&db, local, "UPLOAD", Some(&lease), None)?.is_some(),
         None => false,
     };
-    let staging = beside(udd, ".revert-staging");
+    let staging = beside(udd, REVERT_STAGING);
     // An upload resumes only over its staged `P`; one gone (a profile
     // deleted under the lease) is restored again, byte for byte, by the walk.
     let base = match base {
@@ -2154,7 +2148,7 @@ async fn revert_inner(
                 if w.open.is_empty() {
                     bail!(code("sync.revertUnavailable"));
                 }
-                if !matches!(w.anchor, Some((_, Some(_)))) {
+                if w.anchor.is_none() {
                     bail!(code("sync.revertNoValidSnapshot"));
                 }
                 Ok(w)
@@ -2170,7 +2164,7 @@ async fn revert_inner(
                 }
                 (Err(e), None) => return Err(e),
             };
-            let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
+            let (Some(jn), Some((_, p))) = (w.open.last(), &w.anchor) else {
                 unreachable!("the walk above checked both");
             };
             // The walk records the evidence it fetched: a withdrawal of this
@@ -2263,7 +2257,7 @@ pub(crate) async fn publish(
 ) -> Result<Published> {
     let mut db = Db::open()?;
     retry_unbound_releases(client, access, &mut db).await;
-    if is_bound(&db, local)? {
+    if is_bound(&db.conn, local)? {
         bail!(code("sync.alreadyPublished"));
     }
     let op = match pending_publish(&db, local)? {
@@ -2278,8 +2272,8 @@ pub(crate) async fn publish(
     send_publish(client, access, &mut db, dev, local, fleet, &op, now).await
 }
 
-fn is_bound(db: &Db, local: &str) -> Result<bool> {
-    Ok(db.conn.query_row(
+fn is_bound(conn: &rusqlite::Connection, local: &str) -> Result<bool> {
+    Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
         [local],
         |r| r.get(0),
@@ -2416,7 +2410,7 @@ pub(crate) async fn join(
 ) -> Result<u64> {
     let mut db = Db::open()?;
     // A local profile with an unfinished publish is bound by finishing it.
-    if is_bound(&db, local)? || pending_publish(&db, local)?.is_some() {
+    if is_bound(&db.conn, local)? || pending_publish(&db, local)?.is_some() {
         bail!(code("sync.alreadyPublished"));
     }
     let mut b = unbound(local, dev, fleet, profile);
@@ -3826,12 +3820,7 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
     let db = Db::open()?;
     let tx =
         rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?;
-    let is_bound: bool = tx.query_row(
-        "SELECT EXISTS (SELECT 1 FROM profile_bindings WHERE local_profile_id = ?1)",
-        [local],
-        |r| r.get(0),
-    )?;
-    if !is_bound {
+    if !is_bound(&tx, local)? {
         return unbound_reply(&db, local);
     }
     let b = bound(&db, local)?;
@@ -4151,7 +4140,7 @@ struct Walked {
     /// `P`: the newest head accepted, or the pin while its signer is not
     /// withdrawn, or the head below a withdrawn pin (which only a revert
     /// restores), with the payload a restore needs.
-    anchor: Option<(Link, Option<SnapshotManifestV2>)>,
+    anchor: Option<(Link, SnapshotManifestV2)>,
     /// The run open at the listed head, if any.
     open: Vec<Link>,
     /// Every run skipped, with its `R`.
@@ -4228,7 +4217,7 @@ async fn walk(
                 standing: Standing::Valid,
             };
             if !withdrawn {
-                w.anchor = Some((link, Some(p)));
+                w.anchor = Some((link, p));
                 continue;
             }
             w.open.push(Link {
@@ -4263,7 +4252,7 @@ async fn walk(
                 } else if chain.reported_revoked_at(&signer, now) {
                     return Err(signer_revoked(db, b));
                 } else {
-                    w.anchor = Some((link, Some(p)));
+                    w.anchor = Some((link, p));
                     break;
                 }
             }
@@ -4330,7 +4319,7 @@ async fn walk(
         };
         match revert_rule(w.anchor.as_ref().map(|(l, _)| l), &w.open, &link) {
             Rule::Join => w.open.push(link),
-            Rule::Advance => w.anchor = Some((link, Some(p))),
+            Rule::Advance => w.anchor = Some((link, p)),
             Rule::Accept(heads) => {
                 w.accepted.push(Run {
                     anchor: w.anchor.as_ref().map(|(l, _)| (l.version, l.hash)),
@@ -4338,7 +4327,7 @@ async fn walk(
                     by: Some(hash),
                 });
                 w.open.clear();
-                w.anchor = Some((link, Some(p)));
+                w.anchor = Some((link, p));
             }
             Rule::Refuse(Refusal::Revoked) => return Err(signer_revoked(db, b)),
             Rule::Refuse(Refusal::Untrusted) => {
@@ -4594,14 +4583,14 @@ async fn restore_then_pin(
     p: &SnapshotManifestV2,
     fkek: Zeroizing<[u8; 32]>,
     udd: &Path,
-    pin: impl FnOnce(&mut Db) -> Result<()>,
+    pin_to: impl FnOnce(&mut Db) -> Result<()>,
 ) -> Result<u64> {
-    let staging = beside(udd, ".revert-staging");
+    let staging = beside(udd, REVERT_STAGING);
     let staged = async {
         // No swap is pending (settled first) and no lease held: a leftover.
         fresh_staging(udd, &staging)?;
         let restored = restore(client, access, b, p, fkek, &staging).await?;
-        pin(db)?;
+        pin_to(db)?;
         Ok::<_, anyhow::Error>(restored)
     }
     .await;
@@ -4705,7 +4694,7 @@ pub(crate) async fn pull(
     }
     // A revoked signer's quarantine is walked again: rule 6 accepts a revert
     // over it, or advances the pin to `P`.
-    if b.error.as_deref() != Some("SIGNER_REVOKED") {
+    if b.error.as_deref() != Some(SIGNER_REVOKED) {
         refuse_quarantined(&b)?;
     }
     // A push in flight would seal what this pull wrote over the user's data.
@@ -4738,7 +4727,7 @@ pub(crate) async fn pull(
         // rotation since replaced, so its key is read through `readable_key`.
         // `pin` files the accepted runs, with `P`.
         hold_open(&mut db, &b, &w, &[], now)?;
-        if let Some((at, Some(p))) = &w.anchor {
+        if let Some((at, p)) = &w.anchor {
             if at.version > b.version {
                 let fkek = readable_key(
                     &db,
@@ -4759,7 +4748,7 @@ pub(crate) async fn pull(
         }
         bail!(code("sync.signerRevoked"));
     }
-    if b.error.as_deref() == Some("SIGNER_REVOKED") && w.accepted.is_empty() {
+    if b.error.as_deref() == Some(SIGNER_REVOKED) && w.accepted.is_empty() {
         // Only an accepted `R` lifts the quarantine (ADR 0002 rule 6: a
         // reported-only revocation has no acceptance path); nothing moves.
         let tx = db
@@ -4769,7 +4758,7 @@ pub(crate) async fn pull(
         tx.commit()?;
         bail!(code("sync.signerRevoked"));
     }
-    let Some((at, Some(p))) = w.anchor else {
+    let Some((at, p)) = w.anchor else {
         return Err(bad("manifest"));
     };
     let fkek = verified_key(
@@ -14027,6 +14016,61 @@ mod tests {
         unbind(LOCAL, SERVER, NOW).unwrap();
         assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
         assert!(tree(&out) == before);
+    }
+
+    // Independent round-8 probe: the committer must refuse a mixed run,
+    // preserve every local file, and keep the quarantine without a checkout.
+    #[test]
+    fn a_revert_refuses_a_mixed_run_without_touching_local_data() {
+        for reported in [false, true] {
+            let w = world();
+            let mut evidence = author_pages_for(
+                &w,
+                T0 + 300 * DAY,
+                Some(DeviceRevocationReason::Retired),
+                false,
+            );
+            let end = if reported {
+                T0 + 300 * DAY
+            } else {
+                T0 + DAY / 2
+            };
+            let other = committer(&w, &mut evidence, 0x20, end);
+            if reported {
+                evidence[0].device_revocations.push(RevokedDevice {
+                    device_id: [0x21; 16],
+                    revoked_at_ms: T0 + DAY / 2,
+                });
+            }
+            let heads = chain_of(&w, &[&w.me.sk, &author(), &other]);
+            serve(&w, &evidence);
+            let d = second(&w);
+            pin_at(&w, &d, &heads, 1);
+            let out = d.path().join("profile");
+            std::fs::create_dir_all(out.join("Default")).unwrap();
+            std::fs::write(out.join("marker"), b"unsynced local").unwrap();
+            std::fs::write(out.join("Default/local-only"), b"keep every byte").unwrap();
+            std::fs::write(out.join("Local State"), LOCAL_STATE).unwrap();
+            let before = tree(&out);
+            let checkouts = w.sent("POST", "/checkout").len();
+            let commits = w.fake().commits;
+
+            for _ in 0..2 {
+                let err = w.revert(&out).unwrap_err();
+                assert!(
+                    has(&err, "sync.signerRevoked"),
+                    "reported={reported}: {err:#}"
+                );
+                revoked_at(&w, 1);
+                assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+                assert!(tree(&out) == before, "reported={reported}");
+                assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
+                assert_eq!(w.fake().commits, commits);
+                assert!(skipped(&w).is_empty());
+                assert_eq!(local_leases(&w), 0);
+                settled(&w, &out);
+            }
+        }
     }
 
     // Independent round-6 probe: inspect every committed pin update, not

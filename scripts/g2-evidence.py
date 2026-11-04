@@ -44,6 +44,7 @@ ARTIFACTS = [
     "docs/security-review-g2.md",
     "docs/team-ui-evidence/codex-revert-round-6.md",
     "docs/team-ui-evidence/codex-revert-round-7.md",
+    "docs/team-ui-evidence/codex-revert-round-8.md",
     "docs/trust-boundaries.md",
     "package.json",
     "scripts/backend-error-locale.test.mjs",

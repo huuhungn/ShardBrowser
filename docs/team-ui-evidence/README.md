@@ -39,3 +39,8 @@ on the first, plus the blind verifier round.
   properties hold. Its two new probes (a damaged revert source keeps local data
   and can be retried; a join past an untrusted child keeps local data and can be
   unbound) are kept as regression tests without the `round7_` prefix.
+- [codex-revert-round-8.md](codex-revert-round-8.md): the Codex blind verifier,
+  round 8, at 8592d06d (the mechanical cleanup of five anti-slop review items).
+  VERDICT: PASS: all ten properties hold and every refactor hunk preserves
+  behavior. Its new probe (a revert refuses a mixed run without touching local
+  data) is kept as a regression test without the `round8_` prefix.
