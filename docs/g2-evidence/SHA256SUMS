@@ -3,7 +3,8 @@
 6f5f4a2b622004641b4e14e3491d0b2d2f2ad94516d47ae20277a2e0a7715894  docs/adr/0003-envelope-v2-stream.md
 b57bcac69f46d18a252cd735be09571efac6eb13990474decd084feac9f3cae0  docs/adr/0004-credential-store.md
 dd533a3ab160a18710c44adfa7c8c70d8269653baff8588fc03df22145ae883c  docs/dependency-review.md
-1411a14b5533bcd8e22963480a5c2f60a058571d413fcdb7fbe678cd60dd2b30  docs/g2-48-manual-check.md
+fcefaac94889cd06fe2f7158ab748f6d6bc024e85d947a23f390344c05b05504  docs/g2-48-manual-check.md
+16f1649127c24bc322bd61b5f39a95933163ee3c9e92f786ce20374d05d9094c  docs/g2-evidence/g2-48-run-2026-11-04.log
 e77ffd79b91b4973e93fdf85e30cd3867e92948ee1f98c0d3c0dee803874fc61  docs/g2-evidence/verifier-codex-2026-11-01.md
 c4f01d08c779a9198ae35f605fe907560201530b56cf33e65174e929573e1762  docs/g2-evidence/verifier-codex-2026-11-02.md
 b23f89d8febf5a37428636627ab82de2f4ad24f786f788d9857d64f6851bb3c3  docs/g2-evidence/verifier-hermes-2026-11-02.md
@@ -23,8 +24,8 @@ f2d5a11f5258c112b1e1d2928ddcff622796d12b779a612c591561e73b10ca81  docs/trust-bou
 a7fcd128ef3218d5aeab08aba883f0a8dc31eb1122c16c0956df413235e162ac  package.json
 2e6f3583e175fe8ee8cd5c07a05e4c3bbd9d4022a0d7231e453a372590576ad3  scripts/backend-error-locale.test.mjs
 5626e47ebb99bff53bbbc0368f3559dbe614701a23f8a0b2a1a072b493241cac  scripts/g2-44-migration-mutants.py
-d746b3388b5c22619e83364d2ac30be5a6ca0fd34f02f6470ede7aea41ef9ef9  scripts/g2-48-credential-check.ps1
-f27a1637845ad7a18062e9b14d93cfbbde730a014749cb5c43f6894b787ebec4  scripts/g2-evidence.py
+3b571548a5752c79aa3bd545fac1e578620ee32fe8ec52e5db89300eb4fe461e  scripts/g2-48-credential-check.ps1
+dd7b82aeaf8b2f7684b7dc4fdfd1570fbad771ebf07f319a457c4ae22449c87a  scripts/g2-evidence.py
 f5c785e19f147a03c0cbf72b035a07b5f84e6abb996b05738fe9851d1c4fdb57  scripts/g2-wp5-mutants.py
 73134016054c07db46b45601ac00296582094e4acb2102e77314629dbeedd0da  scripts/i18n-locale-parity.test.mjs
 ca33c963924704db3918f6bb4e10cc5437f54e4a4bdd9832f3b3334f0587aacd  scripts/rust-user-strings.baseline.json
