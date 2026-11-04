@@ -2154,7 +2154,7 @@ async fn revert_inner(
                 if w.open.is_empty() {
                     bail!(code("sync.revertUnavailable"));
                 }
-                if !matches!(w.anchor, Some((_, Some(_)))) {
+                if w.anchor.is_none() {
                     bail!(code("sync.revertNoValidSnapshot"));
                 }
                 Ok(w)
@@ -2170,7 +2170,7 @@ async fn revert_inner(
                 }
                 (Err(e), None) => return Err(e),
             };
-            let (Some(jn), Some((_, Some(p)))) = (w.open.last(), &w.anchor) else {
+            let (Some(jn), Some((_, p))) = (w.open.last(), &w.anchor) else {
                 unreachable!("the walk above checked both");
             };
             // The walk records the evidence it fetched: a withdrawal of this
@@ -4151,7 +4151,7 @@ struct Walked {
     /// `P`: the newest head accepted, or the pin while its signer is not
     /// withdrawn, or the head below a withdrawn pin (which only a revert
     /// restores), with the payload a restore needs.
-    anchor: Option<(Link, Option<SnapshotManifestV2>)>,
+    anchor: Option<(Link, SnapshotManifestV2)>,
     /// The run open at the listed head, if any.
     open: Vec<Link>,
     /// Every run skipped, with its `R`.
@@ -4228,7 +4228,7 @@ async fn walk(
                 standing: Standing::Valid,
             };
             if !withdrawn {
-                w.anchor = Some((link, Some(p)));
+                w.anchor = Some((link, p));
                 continue;
             }
             w.open.push(Link {
@@ -4263,7 +4263,7 @@ async fn walk(
                 } else if chain.reported_revoked_at(&signer, now) {
                     return Err(signer_revoked(db, b));
                 } else {
-                    w.anchor = Some((link, Some(p)));
+                    w.anchor = Some((link, p));
                     break;
                 }
             }
@@ -4330,7 +4330,7 @@ async fn walk(
         };
         match revert_rule(w.anchor.as_ref().map(|(l, _)| l), &w.open, &link) {
             Rule::Join => w.open.push(link),
-            Rule::Advance => w.anchor = Some((link, Some(p))),
+            Rule::Advance => w.anchor = Some((link, p)),
             Rule::Accept(heads) => {
                 w.accepted.push(Run {
                     anchor: w.anchor.as_ref().map(|(l, _)| (l.version, l.hash)),
@@ -4338,7 +4338,7 @@ async fn walk(
                     by: Some(hash),
                 });
                 w.open.clear();
-                w.anchor = Some((link, Some(p)));
+                w.anchor = Some((link, p));
             }
             Rule::Refuse(Refusal::Revoked) => return Err(signer_revoked(db, b)),
             Rule::Refuse(Refusal::Untrusted) => {
@@ -4738,7 +4738,7 @@ pub(crate) async fn pull(
         // rotation since replaced, so its key is read through `readable_key`.
         // `pin` files the accepted runs, with `P`.
         hold_open(&mut db, &b, &w, &[], now)?;
-        if let Some((at, Some(p))) = &w.anchor {
+        if let Some((at, p)) = &w.anchor {
             if at.version > b.version {
                 let fkek = readable_key(
                     &db,
@@ -4769,7 +4769,7 @@ pub(crate) async fn pull(
         tx.commit()?;
         bail!(code("sync.signerRevoked"));
     }
-    let Some((at, Some(p))) = w.anchor else {
+    let Some((at, p)) = w.anchor else {
         return Err(bad("manifest"));
     };
     let fkek = verified_key(
