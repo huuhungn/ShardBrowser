@@ -30,6 +30,7 @@ ARTIFACTS = [
     "docs/adr/0004-credential-store.md",
     "docs/dependency-review.md",
     "docs/g2-48-manual-check.md",
+    "docs/g2-evidence/g2-48-run-2026-11-04.log",
     "docs/g2-evidence/verifier-codex-2026-11-01.md",
     "docs/g2-evidence/verifier-codex-2026-11-02.md",
     "docs/g2-evidence/verifier-hermes-2026-11-02.md",

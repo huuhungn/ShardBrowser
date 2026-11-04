@@ -1,0 +1,49 @@
+2026-11-04T16:57:08.5313888+07:00 [Store] machine <machine> user User boot 639292063285003820
+2026-11-04T16:57:08.6141568+07:00 [Store] PASS stored g2-48-manual-f5afa69b805845e5a4aa332dee30ab8c.shardx-launcher, sha256 aa2b5c2aa6dcdd56c120801a671164d5b3ec5fc91cfef114a1708d43256409a8; read back: digest match True, persist 2 (2 = local machine)
+2026-11-04T16:57:08.6198846+07:00 [Store] next: restart Windows, sign in, run -Phase Verify
+2026-11-04T18:05:22.6202286+07:00 [Verify] PASS after restart True (boot 639293855985000000, at store 639292063285003820); digest match True, persist 2 (2 = local machine)
+2026-11-04T18:05:34.9493898+07:00 [Unavailable] SKIPPED the S4U probe could not be registered (Access is denied.
+); run this phase from an elevated PowerShell
+2026-11-04T18:06:31.9564882+07:00 [Locked] sampling for 90 s: lock the session now (Win+L), wait 30 s, unlock
+2026-11-04T18:06:32.0423994+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:06:37.0729057+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:06:42.1082756+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:06:47.1508014+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:06:52.1687492+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:06:57.1796690+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:02.2002268+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:07.2458048+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:12.2653732+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:17.2957933+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:22.3177286+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:27.3306394+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:32.3359279+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:37.3555389+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:42.3676548+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:47.3898898+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:52.4136889+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:07:57.4394950+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:08:02.4570253+07:00 [Locked] FAIL samples ok while locked 0, while unlocked 18, failed 0
+2026-11-04T18:13:07.6649354+07:00 [Locked] sampling for 90 s: lock the session now (Win+L), wait 30 s, unlock
+2026-11-04T18:13:07.7653178+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:12.7809497+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:17.8027673+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:22.8229175+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:27.8605191+07:00 [Locked] sample locked False: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:32.9093491+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:38.0175001+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:43.1831540+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:48.2043076+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:53.2182541+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:13:58.2359806+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:03.2509275+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:08.2704215+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:13.2803224+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:18.2875324+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:23.3204237+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:28.3360106+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:33.3458197+07:00 [Locked] sample locked True: ok digest match True, persist 2 (2 = local machine)
+2026-11-04T18:14:38.3610723+07:00 [Locked] PASS samples ok while locked 15, while unlocked 3, failed 0
+2026-11-04T18:19:27.1346004+07:00 [Unavailable] FAIL store unavailable to the probe: user User; read error 0 (value returned, digest match True); write error 0; own session afterwards: digest match True, persist 2 (2 = local machine)
+2026-11-04T19:00:41.8683985+07:00 [Cleanup] PASS deleted g2-48-manual-f5afa69b805845e5a4aa332dee30ab8c.shardx-launcher (CredDelete error 0); read afterwards error 1168
+2026-11-04T19:00:41.8916856+07:00 [Cleanup] log kept at %LOCALAPPDATA%\shardx-g2-48\g2-48-f5afa69b805845e5a4aa332dee30ab8c.log

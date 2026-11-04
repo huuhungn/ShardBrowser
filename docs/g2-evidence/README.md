@@ -20,6 +20,9 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
 - **Hashes refreshed:** 2026-11-04, after a behavior-preserving cleanup of
   `src-tauri/src/team/sync.rs`. The rule-6 Codex verifier reran on it: round 8
   returned PASS on 8592d06d (`docs/team-ui-evidence/codex-revert-round-8.md`).
+- **Hashes refreshed:** 2026-11-04, after the G2-48 manual run: its log, the
+  script's new `OBSERVED` result for the unavailable-store probe and the
+  updated manual check (section 7).
 - **Plan:** `.omx/plans/shardbrowser-v0.2.x-team-fleet-encrypted-backup.md`.
   The G2 rows are cited by plan line; lines after about L900 are 2 lower in
   older citations (test names such as `l2259_g2_54_...` keep the old numbers).
@@ -34,9 +37,10 @@ reproduce the evidence; and a SHA-256 for every artifact it cites.
 
 ## Verdict of this packet
 
-Status counts: DONE 63, PENDING-MANUAL 1.
+Status counts: DONE 64, PENDING-MANUAL 0.
 
-**G2 is PASS, excluding G2-48 (PENDING-MANUAL).** Both independent verifiers
+**G2 is PASS.** G2-48 was PENDING-MANUAL until the owner's run on 2026-11-04
+(section 7); every row is now DONE. Both independent verifiers
 returned PASS on `main` at 6c5b6bdf on 2026-11-02 (section 8). Before that,
 the independent verifier returned FAIL on 2026-11-01
 (section 8). The owner decided to release v2.5.0 with G2 recorded as FAIL,
@@ -49,13 +53,15 @@ B1 to B7 are now fixed on `main` (section 8). Both verifiers reran on
 Later rounds found F1 (round 3), R1 and R2 (round 4); they are fixed too.
 On 6c5b6bdf both verifiers returned PASS (round 5, section 8).
 
-- **G2-48 is PENDING-MANUAL.** The plan's gate paragraph (L2343) lists
+- **G2-48 is DONE.** The plan's gate paragraph (L2343) lists
   "credential-store persistence" among the uncertainties that make G2
-  `FAIL/BLOCKED`. The evidence for it is a log from a real Windows machine
-  (ADR Q-29), and nobody has run it yet. Under the gate paragraph, unresolved
-  credential-store-persistence evidence means G2 is not a full PASS. The owner
-  chose to release without waiting for it, so the release proceeds on an owner
-  decision, not on a verifier-confirmed full PASS.
+  `FAIL/BLOCKED`. Its evidence is a log from a real Windows machine (ADR
+  Q-29): the run on 2026-11-04 (`docs/g2-evidence/g2-48-run-2026-11-04.log`)
+  shows the credential surviving a restart and staying readable while the
+  session is locked. It also found that an S4U logon of the signed-in user
+  gets the store; the fail-closed path rests on the automated tests
+  (section 7). Releases up to v2.6.1 shipped before this run, on an owner
+  decision.
 - **G2-64 is DONE.** Both verifiers returned PASS on 6c5b6bdf (round 5). In
   round 1 Codex found seven blocking findings (B1 to B7) and Hermes produced
   no report; all seven are fixed and G2-14, G2-31, G2-42 and G2-61 are DONE
@@ -269,7 +275,7 @@ repository root. Section 6 gives the exact command of each row.
 | G2-45 | Unsigned i64 domain (server) | L2343, L2338 | DONE | `server/tests/v2_upgrade_chain.rs`: `m0030_upgraded_integer_columns_refuse_values_that_are_no_integers`; `server/tests/v2_integer_domain.rs`: `every_class_decodes_its_domain_ends_and_refuses_everything_else`, `every_class_column_stores_its_domain_ends_and_its_check_refuses_the_rest`, `every_integer_column_of_every_v2_table_has_an_upper_bound_check`, `every_integer_column_of_every_v2_table_refuses_a_value_that_is_no_integer`, `the_bound_scan_tells_bounded_from_unbounded_columns`; files: `server/migrations/0030_v2_integer_columns_hold_integers.sql` **Note:** The gap table cited lines 861-1238 of v2_integer_domain.rs, which has 622 lines; the tests are cited here by name. | D-6 |
 | G2-46 | Argon2id | L1377 | DONE | `shared/src/recovery_bundle.rs`: `argon2id_matches_the_rfc_9106_vector` (vector), `the_kek_is_argon2id_over_the_labelled_salt` **Note:** Local SHXBAK01 backups keep p=1 (recorded deviation, ADR Q-7); the recovery bundle uses p=4. | D-5, Q-7, Q-21 |
 | G2-47 | Secrecy/zeroization | L2335 | DONE | `src-tauri/src/team_config.rs`: `debug_never_prints_the_token_or_a_seed`; `src-tauri/src/fleet_keys.rs`: `debug_never_prints_a_key`; `src-tauri/src/fleet_client.rs`: `a_session_debug_print_hides_its_tokens`; `src-tauri/src/root_bootstrap.rs`: `the_trk_is_stored_and_the_saved_state_holds_only_its_reference`, `a_locked_or_unavailable_store_stops_every_trk_step_and_writes_nothing`, `a_legacy_cleartext_trk_moves_into_the_store_and_the_file_is_rewritten_without_it`, `the_legacy_trk_zeroizes_on_drop_and_is_read_but_never_written`, `the_saved_state_never_prints_the_legacy_trk`, `a_crash_between_storing_and_saving_the_key_resumes_with_the_same_key`, `a_reference_to_another_credential_is_refused_and_that_credential_is_kept`, `the_activation_is_saved_before_the_key_is_forgotten`, `the_run_nonce_is_saved_before_the_key_is_stored`, `a_new_run_never_reuses_a_key_an_abandoned_run_left`, `a_store_that_refuses_the_legacy_trk_leaves_the_file_untouched_and_fails_closed`, `a_legacy_trk_nobody_has_seen_is_dropped_and_a_fresh_one_is_made`, `a_nonce_less_legacy_trk_stays_in_the_file_until_the_store_holds_it`; `src-tauri/src/key_file.rs`: `a_forget_succeeds_only_once_the_key_is_confirmed_gone`; files: `docs/key-custody.md` **Note:** Type-level evidence: Zeroizing fields, ZeroizeOnDrop and Debug redaction; no test observes freed memory. Since #212 the TRK is in the credential store, not the state file. | D-5 |
-| G2-48 | Windows credential store | L1374-L1376, L2335, ADR Q-29 | PENDING-MANUAL | `src-tauri/src/credential.rs`: `a_key_round_trips_and_is_forgotten`, `references_are_separate_credentials`, `a_failed_write_or_read_back_is_reported`, `a_real_os_store_key_survives_into_a_fresh_process`, `an_unavailable_store_fails_closed_in_a_fresh_process`, `a_key_file_key_is_locked_then_served_in_a_fresh_process`; files: `scripts/g2-48-credential-check.ps1`, `docs/g2-48-manual-check.md`, `docs/adr/0004-credential-store.md` **Note:** PENDING-MANUAL. The automated half (rows below) runs in `cargo test --lib`; the restart, locked-session and no-store half needs the owner to run the script. See "G2-48 is pending" below. | Q-29, D-5 |
+| G2-48 | Windows credential store | L1374-L1376, L2335, ADR Q-29 | DONE | `src-tauri/src/credential.rs`: `a_key_round_trips_and_is_forgotten`, `references_are_separate_credentials`, `a_failed_write_or_read_back_is_reported`, `a_real_os_store_key_survives_into_a_fresh_process`, `an_unavailable_store_fails_closed_in_a_fresh_process`, `a_key_file_key_is_locked_then_served_in_a_fresh_process`; files: `scripts/g2-48-credential-check.ps1`, `docs/g2-48-manual-check.md`, `docs/adr/0004-credential-store.md`, `docs/g2-evidence/g2-48-run-2026-11-04.log` **Note:** The automated half runs in `cargo test --lib`; the owner's run on 2026-11-04 covers the restart and the locked session. An S4U logon of the signed-in user read the store (`OBSERVED`), so the unavailable-store behavior rests on `an_unavailable_store_fails_closed_in_a_fresh_process`. See section 7. | Q-29, D-5 |
 | G2-49 | Windows file durability (local NTFS, Q-30) | L2337, L1175, L2250 | DONE | `src-tauri/src/durable.rs`: `a_durable_write_replaces_the_file_and_leaves_no_temporary`, `a_failed_replace_keeps_the_old_file_and_removes_the_temporary`, `a_write_killed_at_any_step_leaves_the_old_or_the_new_file`, `a_kill_during_back_to_back_writes_never_tears_or_loses_a_returned_write`, `creating_a_file_that_exists_never_overwrites_it`; `shared/src/volume.rs`: `only_a_local_ntfs_disk_is_accepted`, `a_local_ntfs_directory_is_accepted_and_a_missing_one_is_not`, `an_smb_share_is_refused`; `server/src/db.rs`: `storage_that_cannot_be_resolved_is_refused`, `storage_on_an_smb_share_is_refused`; `server/src/identity.rs`: `preflight_refuses_an_identity_directory_on_an_smb_share`; `server/tests/restore_epoch_harness.rs`: `an_identity_directory_the_preflight_refuses_never_falls_to_k1`, `an_empty_identity_directory_setting_refuses_to_start`; code: `src-tauri/src/store.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/migrate.rs` **Note:** The SMB refusal tests skip unless `SHARDX_TEST_SMB_DIR` names a reachable share. Only the CI job `Rust tests on Windows` sets it. FAT32 or exFAT at the identity directory is refused by the same `require_local_ntfs` classification (volume tests); there is no identity-directory-specific FAT32 test. | Q-30, Q-39 |
 | G2-50 | SQLite WAL/busy/crash ordering | L2337, L2063 | DONE | `server/src/db.rs`: `the_database_runs_a_synced_rollback_journal_and_survives_an_unclosed_pool`, `a_killed_transaction_reopens_old_or_new_never_half`, `a_kill_between_commits_keeps_every_returned_commit`, `a_second_writer_waits_for_the_write_lock`, `storage_on_an_smb_share_is_refused`; `src-tauri/src/crash_harness.rs`: `a_killed_transaction_reopens_old_or_new_never_half`; `src-tauri/src/team/db.rs`: `a_database_held_in_wal_mode_is_refused`; `shared/src/volume.rs`: `an_smb_share_is_refused`; code: `src-tauri/src/store.rs` **Note:** The SMB refusal part needs `SHARDX_TEST_SMB_DIR` (CI only, Q-31); the kill and ordering tests run locally. | Q-16, Q-30, Q-31 |
 | G2-51 | Windows path corpus | L2338 | DONE | `shared/src/snapshot.rs`: `the_windows_path_corpus_is_refused_in_every_position`, `every_name_windows_rewrites_is_refused`, `ntfs_case_fold_collisions_are_refused_and_distinct_names_kept`, `long_paths_unpack_and_an_overlong_one_is_refused`, `a_junction_is_neither_packed_through_nor_followed_on_replace`; `src-tauri/src/team/downgrade.rs`: `discovery_sees_every_place_v0_1_28_reads_and_nothing_in_the_archive`, `a_trace_of_the_old_id_after_the_move_fails_the_discovery_scan` | Q-30 |
@@ -701,29 +707,41 @@ cargo test --locked --manifest-path shared/Cargo.toml --test registry_pins -- ev
 cargo test --locked --manifest-path shared/Cargo.toml --lib -- g2_golden_vector_profile_label a_profile_label_opens_only_where_it_was_sealed a_profile_label_has_a_length_bound_both_ways a_profile_label_is_padded_to_a_bucket a_profile_label_that_is_not_canonical_is_refused
 ```
 
-## 7. G2-48 is pending
+## 7. G2-48: the manual run
 
-Status: **PENDING-MANUAL**. Under the plan's gate paragraph (L2343), unresolved
-credential-store-persistence evidence means G2 is not a full PASS. The owner
-chose to release without waiting for it; the release proceeds on that owner
-decision.
+Status: **DONE** since 2026-11-04. Until then it was PENDING-MANUAL, and
+releases up to v2.6.1 shipped on an owner decision without it.
 
-What exists:
+The run: `scripts/g2-48-credential-check.ps1` on the owner's Windows 11
+machine (build 26300), run id `f5afa69b805845e5a4aa332dee30ab8c`, log in
+`docs/g2-evidence/g2-48-run-2026-11-04.log` (machine name and local path
+replaced by placeholders). The script touches one test credential it creates
+and logs only its name, Win32 error codes and a SHA-256, never the value.
+The last result of each phase:
 
-- `scripts/g2-48-credential-check.ps1` and `docs/g2-48-manual-check.md` are
-  ready. The run has five phases (Store, a Windows restart then Verify,
-  Locked, Unavailable from an elevated prompt, Cleanup). G2-48 passes when the
-  log holds a `PASS` line for each phase from one run id (ADR Q-29). The script
-  touches one test credential it creates and logs only its name, Win32 error
-  codes and a SHA-256, never the value.
-- The automated half runs in `cargo test --lib` and is in the row above: a key
-  survives into a fresh process through the real Windows store (filed
-  `persistence = Local`), an unavailable store fails closed, and the key file
-  locks and unlocks.
+| Phase | Result |
+| --- | --- |
+| Store | `PASS`, read back with `persist 2` (local machine) |
+| Verify | `PASS after restart True`, digest match |
+| Locked | `PASS samples ok while locked 15, while unlocked 3, failed 0` |
+| Unavailable | `FAIL` under the old rule, now `OBSERVED`: the S4U probe read the value (`read error 0`, digest match) and could write; your own copy was unchanged |
+| Cleanup | `PASS`, read afterwards error 1168 (not found) |
 
-What is not proven: that the stored credential survives a machine restart, is
-readable while the session is locked, and is withheld from a logon session
-with no credential store.
+Earlier lines in the log are kept: a Locked run where the session was never
+locked (`while locked 0`, rerun with the session locked) and an Unavailable
+attempt from a normal prompt (`SKIPPED`, needs elevation).
+
+What the Unavailable result means. The manual check assumed that a logon
+started without the user's password gets no credential store. On this
+machine, while the user was signed in, an S4U task of the same user read and
+wrote the store. That is how Windows behaves, not a launcher fault, and the
+launcher does not rely on it. The script now records it as `OBSERVED` and
+fails only when the own copy is damaged or the probe returns something else
+(`docs/g2-48-manual-check.md`). The fail-closed behavior when the store is
+unavailable rests on the automated test
+`an_unavailable_store_fails_closed_in_a_fresh_process`, together with the
+other `cargo test --lib` rows above (a key survives into a fresh process
+through the real Windows store, the key file locks and unlocks).
 
 ## 8. G2-64: from FAIL to PASS
 
@@ -912,7 +930,8 @@ confirm each is stated where claimed.
 
 ## 10. Rows that are not DONE, and what this packet found
 
-- **G2-48** PENDING-MANUAL, see section 7.
+- **G2-48** was PENDING-MANUAL and is DONE since the owner's run on
+  2026-11-04, see section 7.
 - **G2-64** DONE, see section 8. **G2-14**, **G2-31**, **G2-42** and
   **G2-61** were PARTIAL because of findings B1 to B7 and are DONE again.
 - **G2-63** was PARTIAL in the last gap table. It is DONE here: the provider

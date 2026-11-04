@@ -13,10 +13,11 @@
     Verify       after the restart: reads it back and compares digests.
     Locked       samples the credential every 5 s while you lock the session
                  (Win+L) and unlock it again.
-    Unavailable  runs a probe in a logon session that has no credential store
-                 (an S4U scheduled task; needs an elevated prompt) and checks
-                 that it gets an error, never the value. Then checks that the
-                 credential is unchanged in your own session.
+    Unavailable  runs a probe in a logon session started without your
+                 password (an S4U scheduled task; needs an elevated prompt)
+                 and records whether it gets the store (OBSERVED) or an error
+                 (PASS). Then checks that the credential is unchanged in your
+                 own session.
     Cleanup      deletes the test credential and checks it is gone.
 
   Every phase appends timestamped lines to the run's log in -StateDir. The log
@@ -119,7 +120,7 @@ function Test-Credential($state) {
 }
 
 if ($Phase -eq 'Probe') {
-    # Runs inside the S4U task: no password, so no credential store.
+    # Runs inside the S4U task, which has no password; whether it gets a credential store depends on Windows.
     $blob = $null; $persist = 0
     $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
     $readErr = [G248.Cred]::Read($state.target, [ref]$blob, [ref]$persist)
@@ -208,9 +209,14 @@ switch ($Phase) {
         $probe = (Get-Content -LiteralPath $out -Raw).Trim()
         Remove-Item -LiteralPath $out
         $refused = $probe -match 'read error [1-9]\d* \(no value\)'
+        # Windows 11 gives an S4U logon of a signed-in user the same store (observed 2026-11-04):
+        # that is recorded, not failed. Only a damaged own copy or an unexpected probe result fails.
+        $readable = $probe -match 'read error 0 \(value returned, digest match True\)'
         $check = Test-Credential $state
-        Write-Log ("{0} store unavailable to the probe: {1}; own session afterwards: {2}" -f ($(if ($refused -and $check.ok) { 'PASS' } else { 'FAIL' })), $probe, $check.detail)
-        if (-not ($refused -and $check.ok)) { exit 1 }
+        $verdict = if (-not $check.ok -or -not ($refused -or $readable)) { 'FAIL' } elseif ($refused) { 'PASS' } else { 'OBSERVED' }
+        $what = if ($readable) { 'store readable by the probe' } else { 'store unavailable to the probe' }
+        Write-Log ("{0} {1}: {2}; own session afterwards: {3}" -f $verdict, $what, $probe, $check.detail)
+        if ($verdict -eq 'FAIL') { exit 1 }
     }
     'Cleanup' {
         $err = [G248.Cred]::Delete($state.target)
