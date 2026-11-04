@@ -1946,7 +1946,7 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
     if !pending {
         return Ok(());
     }
-    let (staging, old) = (beside(udd, ".revert-staging"), beside(udd, ".revert-old"));
+    let (staging, old) = (beside(udd, REVERT_STAGING), beside(udd, REVERT_OLD));
     let swapped = (|| -> std::io::Result<()> {
         if staging.exists() {
             if udd.exists() {
@@ -2004,8 +2004,10 @@ pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
     remove_beside(udd, &SWAP_DIRS)
 }
 
+const REVERT_STAGING: &str = ".revert-staging";
+const REVERT_OLD: &str = ".revert-old";
 /// The staged `P` and the data a swap replaces, both beside `udd`.
-const SWAP_DIRS: [&str; 2] = [".revert-staging", ".revert-old"];
+const SWAP_DIRS: [&str; 2] = [REVERT_STAGING, REVERT_OLD];
 
 /// `unpack`'s crash leftovers beside the staging: a partial `.incoming`, and
 /// a `.backup` of a staging that is always built afresh, so nothing needs them.
@@ -2142,7 +2144,7 @@ async fn revert_inner(
         Some(lease) => find(&db, local, "UPLOAD", Some(&lease), None)?.is_some(),
         None => false,
     };
-    let staging = beside(udd, ".revert-staging");
+    let staging = beside(udd, REVERT_STAGING);
     // An upload resumes only over its staged `P`; one gone (a profile
     // deleted under the lease) is restored again, byte for byte, by the walk.
     let base = match base {
@@ -4596,7 +4598,7 @@ async fn restore_then_pin(
     udd: &Path,
     pin: impl FnOnce(&mut Db) -> Result<()>,
 ) -> Result<u64> {
-    let staging = beside(udd, ".revert-staging");
+    let staging = beside(udd, REVERT_STAGING);
     let staged = async {
         // No swap is pending (settled first) and no lease held: a leftover.
         fresh_staging(udd, &staging)?;
