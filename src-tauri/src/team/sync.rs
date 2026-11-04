@@ -78,6 +78,7 @@ const CHUNK: usize = 4 << 20;
 #[cfg(test)]
 const CHUNK: usize = 64 << 10;
 const COMMIT_RECORD: &str = "CommitReceiptBindingV2";
+const SIGNER_REVOKED: &str = "SIGNER_REVOKED";
 
 /// This device, as sync needs it: its signing key, the identity a fleet key
 /// grant names, and the anchor it pinned.
@@ -375,7 +376,7 @@ fn quarantine(db: &Db, local: &str, reason: &str, err: anyhow::Error) -> anyhow:
 /// Rule 6, "Revoked signer": quarantines `b` with `SIGNER_REVOKED`.
 fn signer_revoked(db: &Db, b: &Bound) -> anyhow::Error {
     let err = anyhow!(code("sync.signerRevoked"));
-    quarantine(db, &b.local, "SIGNER_REVOKED", err)
+    quarantine(db, &b.local, SIGNER_REVOKED, err)
 }
 
 /// `err` for a head [`walk`] refuses; once the walk met a proven-revoked
@@ -1761,7 +1762,7 @@ async fn push_inner(
             accept_transitions(client, access, dev, &mut db, &b, now).await?;
             continue;
         }
-        let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+        let revoked = b.error.as_deref() == Some(SIGNER_REVOKED);
         if revert.is_none() || !revoked {
             refuse_quarantined(&b)?;
         }
@@ -2111,7 +2112,7 @@ async fn revert_inner(
 ) -> Result<Pushed> {
     let mut db = Db::open()?;
     let mut b = bound(&db, local)?;
-    let revoked = b.error.as_deref() == Some("SIGNER_REVOKED");
+    let revoked = b.error.as_deref() == Some(SIGNER_REVOKED);
     if !revoked {
         refuse_quarantined(&b)?;
     }
@@ -4707,7 +4708,7 @@ pub(crate) async fn pull(
     }
     // A revoked signer's quarantine is walked again: rule 6 accepts a revert
     // over it, or advances the pin to `P`.
-    if b.error.as_deref() != Some("SIGNER_REVOKED") {
+    if b.error.as_deref() != Some(SIGNER_REVOKED) {
         refuse_quarantined(&b)?;
     }
     // A push in flight would seal what this pull wrote over the user's data.
@@ -4761,7 +4762,7 @@ pub(crate) async fn pull(
         }
         bail!(code("sync.signerRevoked"));
     }
-    if b.error.as_deref() == Some("SIGNER_REVOKED") && w.accepted.is_empty() {
+    if b.error.as_deref() == Some(SIGNER_REVOKED) && w.accepted.is_empty() {
         // Only an accepted `R` lifts the quarantine (ADR 0002 rule 6: a
         // reported-only revocation has no acceptance path); nothing moves.
         let tx = db
