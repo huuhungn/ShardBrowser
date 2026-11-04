@@ -877,6 +877,28 @@ async fn tenant_create_rolls_back_everything_when_the_audit_insert_fails() {
     assert_eq!(tenant_rows(&d).await, [0; 6]);
 }
 
+/// The default fleet commits with the tenant: when only its audit row fails,
+/// the tenant, its rows and the fleet are all rolled back.
+#[tokio::test]
+async fn tenant_create_rolls_back_everything_when_the_fleet_audit_insert_fails() {
+    let d = initialised("tenant-fleet-audit");
+    let pool = db(&d).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_fleet_audit BEFORE INSERT ON v2_audit_events \
+         WHEN NEW.action = 'fleet.create' \
+         BEGIN SELECT RAISE(ABORT, 'fleet audit unavailable'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let out = tenant_create(&d, "acme", &["--password-stdin"], &stdin_password());
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("audit"), "{}", stderr(&out));
+    assert_eq!(tenant_rows(&d).await, [0; 6]);
+}
+
 // ------------------------------------------------- first-device confirmation ---
 
 /// A tenant from `tenant create` with a device of its owner, seeded the way
