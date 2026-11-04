@@ -37,8 +37,9 @@ use super::v2_auth::{
 };
 use super::v2_fleet::holds_capability;
 use super::v2_root::{insert_row, row_holds, Col};
+use super::v2_root_grants::is_active_custodian;
 use crate::error::AppError;
-use crate::identity::Verified;
+use crate::identity::{hex, Verified};
 use crate::integrity::derive_device_key_ids;
 use crate::quarantine::{self, Kind, Mark};
 use crate::state::AppState;
@@ -1057,4 +1058,63 @@ async fn ordinary_approval(
     .await?;
     tx.commit().await?;
     Ok(cbor(StatusCode::CREATED, receipt))
+}
+
+/// `GET /v2/tenants/{t}/devices`: every device of the caller's tenant with
+/// both public keys, for an ACTIVE root custodian deciding whom to approve or
+/// revoke. It sends no server time, because approval windows run on client
+/// clocks, and writes no audit row: it is read-only, like trust evidence.
+pub async fn list_tenant_devices(
+    State(app): State<AppState>,
+    who: Principal,
+    Path(tenant): Path<String>,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    let v = verified(&app)?;
+    let Principal::Session(presented) = who else {
+        return Err(AppError::Forbidden);
+    };
+    let tenant = unhex::<16>(&tenant)
+        .ok_or_else(|| AppError::BadRequest("tenant id must be 32 hex digits".into()))?;
+
+    let mut tx = app.db.begin().await?;
+    let now = now_ms();
+    let s = reload_session(&mut tx, &presented, v, now)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    if s.tenant_id != tenant {
+        return Err(coded(
+            StatusCode::NOT_FOUND,
+            "RESOURCE_NOT_FOUND",
+            "no such tenant",
+        ));
+    }
+    if !is_active_custodian(&mut tx, v, &s, now).await? {
+        return Err(AppError::Forbidden);
+    }
+    // shortcut: 1024 rows, add a cursor when a tenant can exceed it.
+    let rows = sqlx::query(
+        "SELECT id, account_id, status, label_ciphertext, signing_public_key, hpke_public_key,
+                signing_key_id, hpke_key_id
+           FROM v2_devices WHERE tenant_id = ? ORDER BY created_at, id LIMIT 1024",
+    )
+    .bind(tenant.as_slice())
+    .fetch_all(&mut *tx)
+    .await?;
+    let hex_of = |r: &sqlx::sqlite::SqliteRow, col: &str| hex(&r.get::<Vec<u8>, _>(col));
+    let devices: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "device_id": hex_of(r, "id"),
+                "account_id": hex_of(r, "account_id"),
+                "status": r.get::<String, _>("status"),
+                "label_hex": hex_of(r, "label_ciphertext"),
+                "signing_public_key": hex_of(r, "signing_public_key"),
+                "hpke_public_key": hex_of(r, "hpke_public_key"),
+                "signing_key_id": hex_of(r, "signing_key_id"),
+                "hpke_key_id": hex_of(r, "hpke_key_id"),
+            })
+        })
+        .collect();
+    Ok(axum::Json(serde_json::json!({ "devices": devices })))
 }

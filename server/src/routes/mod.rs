@@ -215,6 +215,10 @@ pub fn router(state: AppState) -> Router {
             get(v2_trust::trust_evidence),
         )
         .route(
+            "/v2/tenants/:tenant_id/devices",
+            get(v2_approval::list_tenant_devices),
+        )
+        .route(
             "/v2/tenants/:tenant_id/root-key-generation",
             get(v2::get_active_root_generation),
         )
