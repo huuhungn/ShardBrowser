@@ -10,6 +10,8 @@ mod cookies;
 #[cfg(test)]
 mod crash_harness;
 mod credential;
+#[cfg(test)]
+mod custodian_it;
 pub mod db;
 mod dpapi;
 mod durable;
