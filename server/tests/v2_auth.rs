@@ -4011,10 +4011,15 @@ async fn the_trust_evidence_is_the_full_ancestry_of_the_root_subjects() {
         now_ms()
     ));
 
-    // Naming the other device's key adds its grant.
-    let named = containers(&evidence(&server, &access, &[other.signing_key_id]).await);
+    // Naming the other device's key adds its grant, and its public key, so
+    // what it signed, such as a profile head, can be verified.
+    let named_pages = evidence(&server, &access, &[other.signing_key_id]).await;
+    let named = containers(&named_pages);
     assert_eq!(named.len(), all.len() + 1);
     assert_eq!(named.last(), Some(&theirs));
+    assert!(named_pages[0]
+        .signing_public_keys
+        .contains(&other.sk.verifying_key().to_bytes()));
 
     // A revoked record is still evidence, and is reported revoked.
     server
