@@ -235,6 +235,13 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
     let mut out = text.to_string();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         out = out.replace(secret, "[redacted]");
+        // A token's body without its `v2a.` prefix is as good as the token.
+        // Only a long body: a short one would hide unrelated text.
+        if let Some((_, body)) = secret.split_once('.') {
+            if body.len() >= 16 {
+                out = out.replace(body, "[redacted]");
+            }
+        }
     }
     for marker in ["v2t.", "v2a.", "v2r.", "bearer "] {
         // ASCII lower-casing keeps every byte offset of `out`.
@@ -683,17 +690,29 @@ impl FleetClient {
             .json()
             .await
             .context(crate::errcode::code("fleet.badReplyCustody"))?;
-        // The free text a row carries reaches the UI: a hostile server must
-        // not hand the bearer it just received back through it. The key
-        // fields are hex the custodian decodes and checks.
+        // Ids and keys are fixed-size hex before anything keeps or shows them;
+        // the free text left reaches the UI, so a hostile server cannot hand
+        // back the bearer it just received through it.
+        let bad = || anyhow!(crate::errcode::code("fleet.badReplyCustody"));
+        for d in &body.devices {
+            for id in [&d.device_id, &d.account_id] {
+                decode_hex16(id, "device").map_err(|_| bad())?;
+            }
+            for key in [
+                &d.signing_key_id,
+                &d.hpke_key_id,
+                &d.signing_public_key,
+                &d.hpke_public_key,
+            ] {
+                decode_hex32(key, "key").map_err(|_| bad())?;
+            }
+        }
         let secrets = [access_token];
         Ok(body
             .devices
             .into_iter()
             .map(|mut d| {
-                for field in [&mut d.device_id, &mut d.account_id, &mut d.status] {
-                    *field = redact(field, &secrets);
-                }
+                d.status = redact(&d.status, &secrets);
                 // The label is shown decoded, so it is scrubbed decoded.
                 if let Some(label) = decode_hex(&d.label_hex) {
                     d.label_hex =
@@ -872,11 +891,18 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableRegisterFinish"))?;
 
-        Self::ok_or_err(res, "fleet.refusedRegisterFinish")
+        let enrolled: EnrolledDevice = Self::ok_or_err(res, "fleet.refusedRegisterFinish")
             .await?
             .json()
             .await
-            .context(crate::errcode::code("fleet.badReplyRegisterFinish"))
+            .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
+        // Both are stored and shown: an id, and the account the ticket named.
+        let bad = || anyhow!(crate::errcode::code("fleet.badReplyRegisterFinish"));
+        decode_hex16(&enrolled.device_id, "device_id").map_err(|_| bad())?;
+        if !enrolled.account_id.eq_ignore_ascii_case(&ticket.account_id) {
+            return Err(bad());
+        }
+        Ok(enrolled)
     }
 
     /// The server's instance and restore epoch, read with `bearer`: a v2
@@ -953,11 +979,15 @@ impl FleetClient {
     }
 
     async fn identity_of(res: reqwest::Response, bearer: &str) -> Result<ServerIdentity> {
-        Self::ok_or_err_hiding(res, "fleet.refusedIdentity", &[bearer])
+        let id: ServerIdentity = Self::ok_or_err_hiding(res, "fleet.refusedIdentity", &[bearer])
             .await?
             .json()
             .await
-            .context(crate::errcode::code("fleet.badReplyIdentity"))
+            .context(crate::errcode::code("fleet.badReplyIdentity"))?;
+        // Test connection shows it: only an id, never text a server picked.
+        decode_hex16(&id.server_instance_id, "server_instance_id")
+            .map_err(|_| anyhow!(crate::errcode::code("fleet.badReplyIdentity")))?;
+        Ok(id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1600,6 +1630,13 @@ pub(crate) fn decode_hex32(s: &str, field: &str) -> Result<[u8; 32]> {
             &[("field", field)]
         ));
     }
+    // Byte slicing below would panic inside a multibyte character.
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(crate::errcode::code_with(
+            "fleet.malformedHexDigits",
+            &[("field", field)]
+        ));
+    }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|_| {
@@ -2097,5 +2134,172 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// A loopback team server answering `answer(method and path, JSON body)`
+    /// with 200 and its JSON, on `rt`.
+    fn json_server(
+        rt: &tokio::runtime::Runtime,
+        answer: fn(&str, serde_json::Value) -> serde_json::Value,
+    ) -> String {
+        rt.block_on(async {
+            let app =
+                axum::Router::new().fallback(
+                    move |method: axum::http::Method,
+                          uri: axum::http::Uri,
+                          body: axum::body::Bytes| async move {
+                        let body = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                        axum::Json(answer(&format!("{method} {}", uri.path()), body))
+                    },
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            url
+        })
+    }
+
+    const TICKET: &str = "v2t.5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+
+    #[test]
+    fn a_server_identity_that_is_not_an_id_is_refused() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = json_server(
+            &rt,
+            |_, _| serde_json::json!({ "server_instance_id": TICKET, "restore_epoch": 0 }),
+        );
+        let client = FleetClient::new(&url, "").unwrap();
+        let error = rt
+            .block_on(client.server_identity(TICKET))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fleet.badReplyIdentity"), "{error}");
+        assert!(!error.contains(TICKET));
+    }
+
+    /// The enrollment a server finishes with `device_id` and `account_id`.
+    fn enroll_finishing_with(answer: fn(&str, serde_json::Value) -> serde_json::Value) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = json_server(&rt, answer);
+        let client = FleetClient::new(&url, "").unwrap();
+        let signer = shardx_core::signing::Ed25519SigningKey::from_bytes(&[3; 32]);
+        let hpke: [u8; 32] = shardx_core::grants::derive_keypair(&[8; 32])
+            .1
+            .try_into()
+            .unwrap();
+        let login = super::AccountLogin {
+            tenant_id: &super::hex(&[4; 16]),
+            username: "owner",
+            password: "pw",
+        };
+        match rt.block_on(client.enroll_device(&login, &signer, &hpke, b"label")) {
+            Ok(d) => format!("enrolled {} {}", d.device_id, d.account_id),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Login, challenge and proof as a v2 server answers them, the proof
+    /// finishing with `finish`.
+    fn enrollment(
+        call: &str,
+        body: serde_json::Value,
+        finish: serde_json::Value,
+    ) -> serde_json::Value {
+        use shardx_core::session_binding::EnrollmentBindingV2;
+        match call {
+            "POST /v2/auth/login" => serde_json::json!({
+                "ticket": TICKET, "ticket_id": super::hex(&[6; 16]),
+                "account_id": super::hex(&[5; 16]),
+                "server_instance_id": super::hex(&[2; 16]), "restore_epoch": 0,
+            }),
+            "POST /v2/devices/enrollment-challenges" => {
+                let key = |name: &str| -> [u8; 32] {
+                    decode_hex(body[name].as_str().unwrap())
+                        .unwrap()
+                        .try_into()
+                        .unwrap()
+                };
+                let (signing, hpke) = (key("signing_public_key"), key("hpke_public_key"));
+                let binding = EnrollmentBindingV2 {
+                    fields: BindingFields {
+                        server_instance_id: [2; 16],
+                        restore_epoch: 0,
+                        tenant_id: [4; 16],
+                        account_id: [5; 16],
+                        pre_device_session_id: [6; 16],
+                        challenge_id: [7; 16],
+                        nonce: [8; 16],
+                        signing_suite: 1,
+                        signing_public_key: signing,
+                        signing_key_id: shardx_core::keys::signing_key_id(&signing),
+                        hpke_suite: 1,
+                        hpke_public_key: hpke,
+                        hpke_key_id: shardx_core::keys::hpke_key_id(&hpke),
+                        expires_at_ms: u32::MAX.into(),
+                    },
+                };
+                serde_json::json!({
+                    "challenge_id": super::hex(&[7; 16]),
+                    "binding": super::hex(&binding.encode().unwrap()),
+                })
+            }
+            "POST /v2/devices/enrollment-proofs" => finish,
+            _ => serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn an_enrollment_reply_must_name_an_id_and_the_ticket_account() {
+        let good = enroll_finishing_with(|call, body| {
+            enrollment(
+                call,
+                body,
+                serde_json::json!({
+                    "device_id": super::hex(&[1; 16]), "account_id": super::hex(&[5; 16]),
+                    "signing_key_id": "",
+                }),
+            )
+        });
+        assert!(good.starts_with("enrolled"), "{good}");
+        // A ticket echoed as the device id, or as another account.
+        for error in [
+            enroll_finishing_with(|call, body| {
+                enrollment(
+                    call,
+                    body,
+                    serde_json::json!({
+                        "device_id": TICKET, "account_id": super::hex(&[5; 16]), "signing_key_id": "",
+                    }),
+                )
+            }),
+            enroll_finishing_with(|call, body| {
+                enrollment(
+                    call,
+                    body,
+                    serde_json::json!({
+                        "device_id": super::hex(&[1; 16]), "account_id": TICKET, "signing_key_id": "",
+                    }),
+                )
+            }),
+            enroll_finishing_with(|call, body| {
+                enrollment(
+                    call,
+                    body,
+                    serde_json::json!({
+                        "device_id": super::hex(&[1; 16]), "account_id": super::hex(&[9; 16]),
+                        "signing_key_id": "",
+                    }),
+                )
+            }),
+        ] {
+            assert!(error.contains("fleet.badReplyRegisterFinish"), "{error}");
+            assert!(!error.contains(TICKET), "{error}");
+        }
     }
 }

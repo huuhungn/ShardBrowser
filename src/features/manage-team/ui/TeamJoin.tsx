@@ -8,14 +8,15 @@ import {
 import { timeLeft, type TeamActionProps } from "./TeamDevices";
 
 const EXPIRED = "fleet.joinCodeExpired";
-// Expired on an active pinned device, which Enroll again refuses.
-const JOINED = "fleet.joinedCollectKey";
+// Expired where Enroll again would be refused: an active pinned device, or
+// one the server lists as neither waiting nor approved. Each is its notice.
+const REFUSALS = ["fleet.joinedCollectKey", "fleet.enrollAgainRefused"] as const;
 
 /**
  * A joining device's code: shown with the anchor and full key IDs while its
  * ten-minute window is open, then Codes match pins the anchor. An expired
- * code offers Enroll again, unless the device is active and pinned: then it
- * points at Collect key custody.
+ * code offers Enroll again, unless the backend would refuse it: then it says
+ * why, pointing an active pinned device at Collect key custody.
  */
 export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProps & {
   onEnrolledAgain: (status: TeamStatus) => void;
@@ -23,7 +24,7 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
   const t = useT();
   const [code, setCode] = useState<TeamJoinCode | null>(null);
   const [refusedExpired, setRefusedExpired] = useState(false);
-  const [joined, setJoined] = useState(false);
+  const [refusal, setRefusal] = useState<(typeof REFUSALS)[number] | null>(null);
   const [full, setFull] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -36,9 +37,10 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
   const login = () => [account.username.trim(), account.take()] as const;
   const noteExpired = (e: unknown) => {
     const s = String(e);
-    if (s.includes(JOINED) || s.includes(EXPIRED)) {
+    const why = REFUSALS.find((k) => s.includes(k)) ?? null;
+    if (why || s.includes(EXPIRED)) {
       setRefusedExpired(true);
-      setJoined(s.includes(JOINED));
+      setRefusal(why);
     }
     throw e;
   };
@@ -110,8 +112,8 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
       {expired && (
         <>
           <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.joinCode.expired")}</p>
-          {joined ? (
-            <p className="m-0 text-paragraph-xs text-text-sub-600">{t(JOINED)}</p>
+          {refusal ? (
+            <p className="m-0 text-paragraph-xs text-text-sub-600">{t(refusal)}</p>
           ) : (
             <div>
               <Button size="small" disabled={!!busy || !account.signedIn} onClick={again}>

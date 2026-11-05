@@ -1752,7 +1752,9 @@ mod tests {
             }
         })));
         let fleet = rt
-            .block_on(crate::collect_fleet_grant(&client, &c, "access", &[0; 32]))
+            .block_on(crate::collect_fleet_grant(
+                &client, &c, "access", &[0; 32], true,
+            ))
             .unwrap();
         assert_eq!(fleet, crate::FleetGrant::None);
         let calls: Vec<String> = seen
@@ -1841,11 +1843,10 @@ mod tests {
         );
     }
 
-    /// Step 9 as `team_fleet_key_setup` runs it, with a server that still
-    /// reports the device grant PENDING_ACK after step 7: the collect saves
-    /// its ack, and releasing the setup key afterwards keeps that ack.
+    /// An ack Collect key custody saved for a grant still PENDING_ACK is kept
+    /// when the setup key is released afterwards.
     #[test]
-    fn a_setup_where_the_server_reports_pending_ack_keeps_the_saved_ack_after_release() {
+    fn a_collected_ack_survives_a_later_release_of_the_setup_key() {
         let f = fixture();
         let setup = f.prepared();
         let container = unhex_vec(&setup.device_grant).unwrap();
@@ -2138,6 +2139,59 @@ mod tests {
         assert!(
             !reply.contains(&access),
             "the device-list IPC reply leaked the access token"
+        );
+    }
+
+    /// Lists `row` as the server answers it to the bearer `access`, then sees
+    /// it, saving into `saved`: the IPC reply, or the error.
+    fn list_and_see(access: &str, row: &TenantDevice, saved: &mut Vec<String>) -> Result<String> {
+        let f = fixture();
+        let rt = runtime();
+        let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+            "device_id": row.device_id, "account_id": row.account_id,
+            "status": row.status, "label_hex": row.label_hex,
+            "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+            "signing_public_key": row.signing_public_key,
+            "hpke_public_key": row.hpke_public_key,
+        }] }))
+        .unwrap();
+        let (client, _) = rt.block_on(mock(Arc::new(move |_, _| (200, body.clone()))));
+        let rows = rt.block_on(client.list_tenant_devices(access, &f.tenant))?;
+        let mut state = f.state();
+        let listed = see_devices(&rows, &f.pin(), now_ms(), &mut state, &mut |s| {
+            saved.push(serde_json::to_string(s).unwrap());
+            Ok(())
+        })?;
+        Ok(serde_json::to_string(&listed).unwrap())
+    }
+
+    #[test]
+    fn a_device_row_with_a_bad_key_id_is_refused_before_anything_is_saved() {
+        let access = format!("v2a.{}", "6e".repeat(32));
+        let (mut row, _) = joiner();
+        assert_eq!(row.status, "pending");
+        row.signing_key_id = access.clone();
+        let mut saved = Vec::new();
+        let err = list_and_see(&access, &row, &mut saved)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fleet.badReplyCustody"), "{err}");
+        assert!(
+            saved.iter().all(|s| !s.contains(&access)),
+            "the state kept the token"
+        );
+    }
+
+    #[test]
+    fn a_device_label_holding_the_token_body_is_not_echoed_to_ipc() {
+        let body = "6d".repeat(32);
+        let access = format!("v2a.{body}");
+        let (mut row, _) = joiner();
+        row.label_hex = hex(format!("label {body}").as_bytes());
+        let reply = list_and_see(&access, &row, &mut Vec::new()).unwrap();
+        assert!(
+            !reply.contains(&body),
+            "the IPC reply leaked the token body"
         );
     }
 

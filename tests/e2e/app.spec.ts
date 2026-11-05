@@ -929,7 +929,7 @@ test("an active pinned device is not offered reenrollment after reopening Team",
 });
 
 test("a custodian with no usable key is not shown Fleet key ready", async ({ page: a }) => {
-  const server = fakeTeamServer();
+  const server = fakeTeamServer(KEY_GATE_ROWS);
   await teamDevicePage(a, "a", server);
   await cardClick(a, "Create fleet key");
   await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toBeVisible();
@@ -949,7 +949,49 @@ test("a custodian with no usable key is not shown Fleet key ready", async ({ pag
   await a.getByRole("button", { name: "Team", exact: true }).click();
   await expect(a.getByTestId("team-devices")).toBeVisible();
   await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toHaveCount(0);
+  await expect(a.getByTestId("team-devices").getByText(/holds no usable fleet key/)).toBeVisible();
+  await expectKeyGates(a);
 });
+
+test("a custodian whose fleet key is blocked is shown the Q-18 notice", async ({ page: a }) => {
+  const server = fakeTeamServer(KEY_GATE_ROWS);
+  await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  // As a custodian whose key verifies, but a compromised revoke blocks sealing.
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_status"
+        ? { ...(result as object), has_fleet_key: false, fleet_key_blocked: true }
+        : result;
+    };
+  });
+  await a.getByRole("button", { name: "Settings", exact: true }).click();
+  await a.getByRole("button", { name: "Team", exact: true }).click();
+  const devices = a.getByTestId("team-devices");
+  await expect(devices.getByText(/pushing under it is blocked/)).toBeVisible();
+  await expect(devices.getByText("Fleet key ready", { exact: true })).toHaveCount(0);
+  await expect(devices.getByText(/holds no usable fleet key/)).toHaveCount(0);
+  await expectKeyGates(a);
+});
+
+/** An active row to revoke and a pending row to approve, beside A. */
+const KEY_GATE_ROWS: TeamDeviceRow[] = [
+  { device_id: "c3".repeat(16), label: "Gate Active", status: "active", granted: false },
+  { device_id: "d4".repeat(16), label: "Gate Pending", status: "pending", granted: false },
+];
+
+/** Without a usable key Approve stays off, while Revoke, which needs none, stays on. */
+async function expectKeyGates(a: Page) {
+  const pending = await listDevices(a, "Gate Pending");
+  await pending.getByLabel("The code on the other device matches").check();
+  await cardSignIn(a);
+  await expect(pending.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  const active = a.getByTestId("team-device").filter({ hasText: "Gate Active" });
+  await expect(active.getByRole("button", { name: "Revoke", exact: true })).toBeEnabled();
+}
 
 test("the custodian cannot approve a row it first saw more than ten minutes ago", async ({ page: a, browser, baseURL, viewport }) => {
   const server = fakeTeamServer();

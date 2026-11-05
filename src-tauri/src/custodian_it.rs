@@ -566,6 +566,129 @@ fn a_setup_whose_cleanup_fails_leaves_no_usable_verified_key() {
     assert!(crate::team_config::status().unwrap().has_fleet_key);
 }
 
+/// A loopback proxy in front of `upstream` that reports every device grant
+/// PENDING_ACK and answers 409 to any ack whose body is not in `allowed`,
+/// counting those refusals.
+fn pending_ack_proxy(
+    rt: &tokio::runtime::Runtime,
+    upstream: String,
+    allowed: Vec<Vec<u8>>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let refused = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = refused.clone();
+    let http = reqwest::Client::new();
+    let app = axum::Router::new().fallback(
+        move |method: axum::http::Method,
+              uri: axum::http::Uri,
+              headers: axum::http::HeaderMap,
+              body: axum::body::Bytes| {
+            let (http, upstream, allowed, count) = (
+                http.clone(),
+                upstream.clone(),
+                allowed.clone(),
+                count.clone(),
+            );
+            async move {
+                let path = uri.path_and_query().map_or("/", |p| p.as_str()).to_string();
+                if method == axum::http::Method::POST
+                    && uri.path().ends_with("/ack")
+                    && !allowed.iter().any(|a| a[..] == body[..])
+                {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    return (axum::http::StatusCode::CONFLICT, Vec::new()).into_response();
+                }
+                let mut req = http.request(method, format!("{upstream}{path}"));
+                for (name, value) in &headers {
+                    if name != axum::http::header::HOST {
+                        req = req.header(name, value);
+                    }
+                }
+                let res = req.body(body.to_vec()).send().await.unwrap();
+                let status = axum::http::StatusCode::from_u16(res.status().as_u16()).unwrap();
+                let content_type = res.headers().get("content-type").cloned();
+                let mut bytes = res.bytes().await.unwrap().to_vec();
+                if uri.path().contains("/grants/") {
+                    // CBOR text(12) "ACKNOWLEDGED" becomes text(11) "PENDING_ACK".
+                    let (from, to) = (b"\x6cACKNOWLEDGED", b"\x6bPENDING_ACK");
+                    if let Some(i) = bytes.windows(from.len()).position(|w| w == from) {
+                        bytes.splice(i..i + from.len(), to.iter().copied());
+                    }
+                }
+                let mut out = (status, bytes).into_response();
+                if let Some(ct) = content_type {
+                    out.headers_mut().insert("content-type", ct);
+                }
+                out
+            }
+        },
+    );
+    use axum::response::IntoResponse;
+    let url = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    });
+    (url, refused)
+}
+
+/// Step 7's ACKED receipt is the setup's ack: a server that then reports the
+/// grant PENDING_ACK and refuses a new ack cannot fail setup after the key
+/// is kept, so an error never comes with a usable key.
+#[test]
+fn a_setup_does_not_ack_again_after_its_acked_receipt() {
+    let rt = runtime();
+    let h = custodian(16, "pending-ack", &rt);
+    let c = crate::team_config::load().unwrap();
+    let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+    let device = crate::fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &crate::fleet_custody::CredentialFkekStore,
+    };
+    let root = crate::root_bootstrap::load().unwrap();
+    // Steps 1 to 8 against the real server: both grants acknowledged.
+    with_session(&rt, &h, async |client, access| {
+        let mut state = crate::fleet_custody::load().unwrap();
+        crate::fleet_custody::bootstrap_fleet(
+            client,
+            access,
+            &device,
+            &root,
+            &mut state,
+            &mut |s| crate::fleet_custody::save(s),
+        )
+        .await
+        .unwrap();
+    });
+    let state = crate::fleet_custody::load().unwrap();
+    // Only the replay of step 7's saved acks is let through.
+    let allowed = [&state.device_ack_request, &state.recovery_ack_request]
+        .map(|r| crate::fleet_client::decode_hex(r).unwrap())
+        .to_vec();
+    let (proxy, refused) = pending_ack_proxy(&rt, h.server.url(), allowed);
+    let mut c = crate::team_config::load().unwrap();
+    c.server_url = proxy;
+    crate::team_config::save(&c).unwrap();
+
+    let result = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    );
+    let usable = crate::team_config::status().unwrap().has_fleet_key;
+    assert_eq!(result.is_err(), !usable, "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        refused.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no new ack"
+    );
+}
+
 /// A second device B with config and data roots of its own, and its
 /// credentials in namespace `b`.
 struct Member {
