@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## v2.7.0
+
+A Team release: the root custodian creates the team's fleet key, approves a
+new device through its join code and revokes devices from the Team page,
+without an admin token, so Team profiles can be published and shared between
+devices through a real team server. The browser engine is unchanged (Chromium
+156.0.8078.48, engine build 1).
+
+### Upgrade notes
+
+- Update the launcher and the team server together. Launcher 2.7.0 needs the
+  2.7.0 team server, released as assets of the same tag: it uses the
+  custodian device listing, reads without a token, and rebuilds a saved
+  revocation only when the server answers `REVOCATION_OUTSIDE_WINDOW`, which
+  an older server never sends.
+- `tenant create` now also creates the tenant's default fleet. A tenant
+  created by an older server has no fleet and is not backfilled: recreate it
+  with the 2.7.0 server.
+- A refused login now shows only the server's error code, not the text of
+  its reply.
 
 ### Team
 
@@ -9,25 +28,43 @@
   fleet key yet; it stays recoverable through the server's recovery grant.
 - **Devices.** The root custodian lists the team's devices. A pending device
   shows its code, the time left on this computer's clock, and its full key IDs
-  on request; Approve needs the "code matches" box ticked and closes ten
-  minutes after this computer first saw the device. Rows that share a label
+  on request. Approve and Revoke are available once the fleet key is created.
+  Approve needs the "code matches" box ticked and closes ten minutes after
+  this computer first saw either of the device's keys. Rows that share a label
   tag the newest enrollment. Any other active device can be revoked as Retired
   or Lost, behind a confirmation that says what revoking does not protect.
 - **Join code.** A new device shows its join code for ten minutes after it
   enrolls; "Codes match" pins the team's anchor, then "Collect key custody"
-  keeps the fleet key. An expired code offers Enroll again.
+  keeps the fleet key. An expired code offers Enroll again. A device that has
+  joined says so instead of offering its code again, and a device whose fleet
+  key is blocked because a device that may hold it was revoked as compromised
+  shows a notice instead of the join code.
 - **No token needed.** Connecting needs only the server URL and the tenant ID.
   The API token is optional and serves legacy passphrase sync only.
-- **Root key grants.** A device's root key grants are served only to that
-  device's own v2 session; a v1 token now gets 403.
+- The approval window and the "code matches" tick belong to the device's keys
+  and code, and the window is checked again right before the approval is
+  signed.
+- A revocation is saved before it is sent, and a retry resends the same bytes.
+  It is rebuilt only when the server's top-level error code says the saved one
+  is outside its time window and the device is not yet revoked; any other
+  refusal keeps it as saved.
+- Passwords and session tokens that a team server echoes back are removed from
+  the error text, in the forms the launcher recognizes. A device listing with a
+  pending device whose key IDs do not hash from its keys is refused.
+- An expired join code offers Enroll again only after the server confirms the
+  device may enroll again; the local countdown alone shows only that the code
+  expired.
+- **Root key grants.** On the team server, a device's root key grants are
+  served only to that device's own v2 session; a legacy v1 token now gets 403.
 
 ### Known limitations
 
-- Team (v2.6.0, v2.6.1) cannot yet be used end to end against a real team
-  server. The launcher never creates a fleet key or files its grants, so
-  Publish is refused with "No fleet key this device verified opens this team
-  profile", and it cannot approve a second device. Both come with the custodian
-  work planned for v0.2.2. See `docs/team-ui-evidence/two-machine-run.md`.
+- Enrollment does not record the team's fleet id, so a legacy profile that was
+  never published cannot use a fleet key cached by 2.4.2 when it is pulled.
+  Published profiles are unaffected. This is planned for a later release.
+- Fleet key rotation is not available yet: a revoked device keeps the fleet
+  key it holds and can still decrypt snapshots sealed under it. The recovery
+  bundle does not include the fleet key yet.
 - A fleet key setup left unfinished for more than a year cannot be finished or
   discarded: its saved requests have expired and the generation stays
   `PREPARING`. Finishing or discarding it comes with fleet key rotation.
