@@ -20,10 +20,13 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use shardx_core::approval_receipt::MAX_FLEET_RECOVERY_GRANT_TTL_MS;
+use shardx_core::approval_receipt::{
+    device_approve_request_hash, DeviceApprovalReceiptV2, MAX_FLEET_RECOVERY_GRANT_TTL_MS,
+};
 use shardx_core::authz_record::{
-    build_record, AuthorizationRecord, Capability, CapabilityScopeKind, DeviceHpkeGrantV2,
-    GrantSubject, RecoveryGrantV2, TenantCapabilityGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+    build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
+    DeviceApprovalV2, DeviceHpkeGrantV2, GrantSubject, Payload, RecoveryGrantV2,
+    TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
     DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_TENANT_CAPABILITY_GRANT,
 };
 use shardx_core::fleet_grants::{fkek_key_id, generate_fkek};
@@ -40,8 +43,9 @@ use shardx_core::mutation::{
     fleet_device_grant_set_hash, IdempotentMutationRequestV2, OperationKind,
 };
 use shardx_core::signing::Ed25519SigningKey;
+use shardx_core::trust_chain::{join_sas, join_sas_display, Binding};
 
-use crate::fleet_client::{decode_hex16, hex, FleetClient};
+use crate::fleet_client::{decode_hex, decode_hex16, decode_hex32, hex, FleetClient, TenantDevice};
 use crate::root_bootstrap::{
     commit, corrupt, is_missing, mismatch, nonce_ok, now_ms, own_grant, random, stored_payload,
     unhex_vec, BootstrapState, Context16,
@@ -112,6 +116,9 @@ pub struct FleetCustodyState {
     /// as a collect sent it.
     #[serde(default)]
     pub device_acks: BTreeMap<String, String>,
+    /// Approve (section 4.A), per lower-case device id.
+    #[serde(default)]
+    pub members: BTreeMap<String, MemberApproval>,
 }
 
 impl std::fmt::Debug for FleetCustodyState {
@@ -200,12 +207,7 @@ fn release_fkek(
 /// This custodian's own operating grants (plan OQ5): `fleet.manage` and the
 /// profile capabilities on the fleet, device approval and revocation
 /// tenant-wide.
-fn capability_grants(
-    cx: &Context16,
-    signer: &Ed25519SigningKey,
-    fleet: [u8; 16],
-    now: u64,
-) -> Result<Vec<String>> {
+fn own_grants(cx: &Context16, fleet: [u8; 16]) -> [(Capability, CapabilityScopeKind, [u8; 16]); 6] {
     use CapabilityScopeKind::{Fleet, Tenant};
     [
         (Capability::FleetManage, Fleet, fleet),
@@ -215,27 +217,32 @@ fn capability_grants(
         (Capability::ProfileCheckout, Fleet, fleet),
         (Capability::ProfileCommit, Fleet, fleet),
     ]
-    .into_iter()
-    .map(|(capability, scope_kind, scope_id)| {
-        let g = TenantCapabilityGrantV2 {
-            common: cx.common(random()?, now),
-            subject: GrantSubject::Device {
-                account_id: cx.account,
-                device_id: cx.device,
-                signing_key_id: cx.signing_key_id,
-                hpke_key_id: cx.hpke_key_id,
-            },
-            scope_kind,
-            scope_id,
-            capability,
-        };
-        Ok(hex(&build_record(
-            signer,
-            DOMAIN_TENANT_CAPABILITY_GRANT,
-            &g.encode(),
-        )))
-    })
-    .collect()
+}
+
+/// The capability grants `list` names for `subject`, signed by `signer`.
+fn capability_grants(
+    cx: &Context16,
+    signer: &Ed25519SigningKey,
+    subject: &GrantSubject,
+    list: impl IntoIterator<Item = (Capability, CapabilityScopeKind, [u8; 16])>,
+    now: u64,
+) -> Result<Vec<String>> {
+    list.into_iter()
+        .map(|(capability, scope_kind, scope_id)| {
+            let g = TenantCapabilityGrantV2 {
+                common: cx.common(random()?, now),
+                subject: subject.clone(),
+                scope_kind,
+                scope_id,
+                capability,
+            };
+            Ok(hex(&build_record(
+                signer,
+                DOMAIN_TENANT_CAPABILITY_GRANT,
+                &g.encode(),
+            )))
+        })
+        .collect()
 }
 
 fn container_hash(container: &[u8]) -> Result<[u8; 32]> {
@@ -446,7 +453,19 @@ pub async fn bootstrap_fleet(
 
     // 2. The custodian's own capability grants, filed whole.
     if state.capability_grants.is_empty() {
-        let grants = capability_grants(&cx, device.signer, cx.tenant, now_ms())?;
+        let me = GrantSubject::Device {
+            account_id: cx.account,
+            device_id: cx.device,
+            signing_key_id: cx.signing_key_id,
+            hpke_key_id: cx.hpke_key_id,
+        };
+        let grants = capability_grants(
+            &cx,
+            device.signer,
+            &me,
+            own_grants(&cx, cx.tenant),
+            now_ms(),
+        )?;
         commit(state, save, |s| s.capability_grants = grants)?;
     }
     for grant in &state.capability_grants {
@@ -606,6 +625,351 @@ pub async fn ack_device_grant(
     Ok(())
 }
 
+/// How long an approval may be built after this custodian first saw the
+/// pending device, and a joiner may pin after its own enrollment (ADR "Join
+/// window rule").
+pub const JOIN_WINDOW_MS: u64 = 10 * 60_000;
+
+/// What Approve keeps for one device: when this custodian first saw it
+/// pending, by its own clock and never reset, and the exact requests that
+/// approve it, saved before the first is sent.
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct MemberApproval {
+    #[serde(default)]
+    pub first_seen_ms: u64,
+    #[serde(default)]
+    pub approval: String,
+    #[serde(default)]
+    pub capability_grants: Vec<String>,
+    #[serde(default)]
+    pub grant_request: String,
+}
+
+/// A device of the tenant as the Approve screen shows it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct ListedDevice {
+    pub device_id: String,
+    pub account_id: String,
+    pub status: String,
+    pub label: String,
+    pub signing_key_id: String,
+    pub hpke_key_id: String,
+    /// The code the joiner must show, from this custodian's pin and the
+    /// listed key IDs (ADR 0002 Q-12).
+    pub sas: String,
+    /// For a pending device: until when an approval may be built here.
+    pub approve_until_ms: Option<u64>,
+}
+
+fn code_of(
+    (binding, anchor): &(Binding, [u8; 32]),
+    signing_key_id: &[u8; 32],
+    hpke_key_id: &[u8; 32],
+) -> String {
+    join_sas_display(&join_sas(
+        &binding.server_instance_id,
+        &binding.tenant_id,
+        anchor,
+        signing_key_id,
+        hpke_key_id,
+    ))
+}
+
+/// Section 4.A step 1: notes the first sight of each pending device of
+/// `rows`, which is never reset, and lists every row with its code.
+pub fn see_devices(
+    rows: &[TenantDevice],
+    pin: &(Binding, [u8; 32]),
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<Vec<ListedDevice>> {
+    let new: Vec<String> = rows
+        .iter()
+        .filter(|r| r.status == "pending")
+        .map(|r| r.device_id.to_ascii_lowercase())
+        .filter(|id| !state.members.contains_key(id))
+        .collect();
+    if !new.is_empty() {
+        commit(state, save, |s| {
+            for id in new {
+                s.members.insert(
+                    id,
+                    MemberApproval {
+                        first_seen_ms: now,
+                        ..Default::default()
+                    },
+                );
+            }
+        })?;
+    }
+    rows.iter()
+        .map(|r| {
+            let bad = |_| anyhow::anyhow!(crate::errcode::code("fleet.badReplyCustody"));
+            let signing = decode_hex32(&r.signing_key_id, "signing_key_id").map_err(bad)?;
+            let hpke = decode_hex32(&r.hpke_key_id, "hpke_key_id").map_err(bad)?;
+            let first = state
+                .members
+                .get(&r.device_id.to_ascii_lowercase())
+                .filter(|_| r.status == "pending");
+            Ok(ListedDevice {
+                device_id: r.device_id.clone(),
+                account_id: r.account_id.clone(),
+                status: r.status.clone(),
+                label: decode_hex(&r.label_hex)
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default(),
+                signing_key_id: hex(&signing),
+                hpke_key_id: hex(&hpke),
+                sas: code_of(pin, &signing, &hpke),
+                approve_until_ms: first.map(|m| m.first_seen_ms + JOIN_WINDOW_MS),
+            })
+        })
+        .collect()
+}
+
+/// The listed device's key IDs and HPKE public key, once each listed ID
+/// hashes from its listed key.
+fn listed_keys(row: &TenantDevice) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let refused = || anyhow::anyhow!(crate::errcode::code("fleet.deviceKeysMismatch"));
+    let key = |s: &str| decode_hex32(s, "public_key").map_err(|_| refused());
+    let (signing_pk, hpke_pk) = (key(&row.signing_public_key)?, key(&row.hpke_public_key)?);
+    let ids = (signing_key_id(&signing_pk), hpke_key_id(&hpke_pk));
+    if hex(&ids.0) != row.signing_key_id.to_ascii_lowercase()
+        || hex(&ids.1) != row.hpke_key_id.to_ascii_lowercase()
+    {
+        return Err(refused());
+    }
+    Ok((ids.0, ids.1, hpke_pk))
+}
+
+/// Section 4.A step 2: the checks that gate building an approval of `row`.
+fn check_member(
+    row: &TenantDevice,
+    pin: &(Binding, [u8; 32]),
+    first_seen_ms: u64,
+    now: u64,
+    sas: &str,
+) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+    let keys = listed_keys(row)?;
+    if now.saturating_sub(first_seen_ms) > JOIN_WINDOW_MS {
+        bail!(crate::errcode::code("fleet.approvalWindowClosed"));
+    }
+    let typed: String = sas
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if typed != code_of(pin, &keys.0, &keys.1).replace(' ', "") {
+        bail!(crate::errcode::code("fleet.joinCodeMismatch"));
+    }
+    Ok(keys)
+}
+
+/// Section 4.A step 3: the fleet-scoped approval of `row`, its three
+/// profile capability grants, and the request filing its `DeviceHpkeGrant`
+/// of `generation`, sealed to the listed HPKE key.
+#[allow(clippy::too_many_arguments)]
+fn build_member(
+    cx: &Context16,
+    signer: &Ed25519SigningKey,
+    row: &TenantDevice,
+    (signing, hpke, hpke_pk): ([u8; 32], [u8; 32], [u8; 32]),
+    fkek: &[u8; 32],
+    generation: u64,
+    now: u64,
+    first_seen_ms: u64,
+) -> Result<MemberApproval> {
+    let account = decode_hex16(&row.account_id, "account_id")?;
+    let device = decode_hex16(&row.device_id, "device_id")?;
+    let fleet = cx.tenant;
+    let approval = DeviceApprovalV2 {
+        common: cx.common(random()?, now),
+        subject_account_id: account,
+        subject_device_id: device,
+        subject_signing_key_id: signing,
+        subject_hpke_key_id: hpke,
+        approval_scope_kind: ApprovalScopeKind::Fleet,
+        approval_scope_id: fleet,
+    };
+    let subject = GrantSubject::Device {
+        account_id: account,
+        device_id: device,
+        signing_key_id: signing,
+        hpke_key_id: hpke,
+    };
+    use CapabilityScopeKind::Fleet;
+    let grants = capability_grants(
+        cx,
+        signer,
+        &subject,
+        [
+            (Capability::ProfilePublish, Fleet, fleet),
+            (Capability::ProfileCheckout, Fleet, fleet),
+            (Capability::ProfileCommit, Fleet, fleet),
+        ],
+        now,
+    )?;
+    let generation = FleetGenerationRef {
+        tenant_id: cx.tenant,
+        server_instance_id: cx.instance,
+        restore_epoch: cx.epoch,
+        fleet_id: fleet,
+        generation,
+        fkek_key_id: fkek_key_id(fkek),
+    };
+    let mut grant = DeviceHpkeGrantV2 {
+        common: cx.common(random()?, now),
+        fleet_id: fleet,
+        fkek_key_id: generation.fkek_key_id,
+        generation: generation.generation,
+        subject_account_id: account,
+        subject_device_id: device,
+        subject_signing_key_id: signing,
+        recipient_hpke_key_id: hpke,
+        hpke_encapped_key_bytes: Vec::new(),
+        hpke_wrapped_fleet_key_bytes: Vec::new(),
+    };
+    seal_device_fkek(&hpke_pk, &mut grant, fkek).map_err(|_| corrupt())?;
+    let container = build_record(signer, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &grant.encode());
+    let filing = FleetKeyGrantCreateV2::new(
+        generation,
+        FleetGrantVariant::DeviceHpke,
+        grant.common.replay_id,
+        container_hash(&container)?,
+        container,
+    );
+    Ok(MemberApproval {
+        first_seen_ms,
+        approval: hex(&build_record(
+            signer,
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        )),
+        capability_grants: grants,
+        grant_request: hex(&cx.request(OperationKind::FleetGrantCreate, filing.encode())?),
+    })
+}
+
+/// Runs, or resumes, Approve of `row` (section 4.A) under the device session
+/// `access`. A device with saved requests gets exactly those resent: the
+/// window, code and key checks gate only building new ones. `fleet_key`
+/// gives the verified FKEK of the fleet's ACTIVE generation.
+#[allow(clippy::too_many_arguments)]
+pub async fn approve_member(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    pin: &(Binding, [u8; 32]),
+    row: &TenantDevice,
+    sas: &str,
+    fleet_key: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let ours = state.tenant_id.eq_ignore_ascii_case(me.tenant_id)
+        && state.device_id.eq_ignore_ascii_case(me.device_id);
+    if !ours || state.create_request.is_empty() {
+        bail!(crate::errcode::code("fleet.notCustodian"));
+    }
+    let (_, hpke_public) = derive_keypair(me.hpke_seed);
+    let cx = Context16 {
+        tenant: decode_hex16(me.tenant_id, "tenant_id")?,
+        instance: decode_hex16(&state.server_instance_id, "server_instance_id")?,
+        epoch: state.restore_epoch,
+        account: decode_hex16(me.account_id, "account_id")?,
+        device: decode_hex16(me.device_id, "device_id")?,
+        signing_key_id: signing_key_id(me.signer.verifying_key().as_bytes()),
+        hpke_key_id: hpke_key_id(&hpke_public),
+    };
+    let fleet = hex(&cx.tenant);
+    see_devices(std::slice::from_ref(row), pin, now, state, save)?;
+    let id = row.device_id.to_ascii_lowercase();
+    let first_seen = match state.members.get(&id) {
+        Some(m) if !m.approval.is_empty() => None,
+        Some(m) => Some(m.first_seen_ms),
+        None => bail!(crate::errcode::code("fleet.deviceNotPending")),
+    };
+    if let Some(first_seen) = first_seen {
+        let keys = check_member(row, pin, first_seen, now, sas)?;
+        let generation = client
+            .active_fleet_generation(access, me.tenant_id, &fleet)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))?;
+        let fkek = fleet_key(generation)?;
+        let built = build_member(
+            &cx, me.signer, row, keys, &fkek, generation, now, first_seen,
+        )?;
+        commit(state, save, |s| {
+            s.members.insert(id.clone(), built);
+        })?;
+    }
+    let m = state.members[&id].clone();
+
+    // 4. The approval, the three capability grants, then the fleet grant.
+    let approval = unhex_vec(&m.approval)?;
+    let replay = match AuthorizationRecord::parse(&approval)
+        .and_then(|r| r.verify_signature(me.signer.verifying_key().as_bytes()))
+        .map(|v| v.payload().clone())
+    {
+        Ok(Payload::DeviceApproval(a)) => a.common.replay_id,
+        _ => return Err(corrupt()),
+    };
+    let subject = decode_hex16(&id, "device_id")?;
+    let receipt =
+        DeviceApprovalReceiptV2::parse(&client.approve_device(access, &id, &approval).await?)
+            .map_err(|_| mismatch())?;
+    let hash = device_approve_request_hash(
+        &cx.instance,
+        cx.epoch,
+        &cx.tenant,
+        &cx.account,
+        &cx.device,
+        &subject,
+        &approval,
+    );
+    if receipt.request_hash != hash
+        || (
+            receipt.server_instance_id,
+            receipt.restore_epoch,
+            receipt.tenant_id,
+        ) != (cx.instance, cx.epoch, cx.tenant)
+        || (receipt.actor_account_id, receipt.actor_device_id) != (cx.account, cx.device)
+        || (receipt.subject_device_id, receipt.approval_replay_id) != (subject, replay)
+    {
+        return Err(mismatch());
+    }
+    for grant in &m.capability_grants {
+        let grant = unhex_vec(grant)?;
+        if client.file_capability_grant(access, &grant).await? != grant {
+            return Err(mismatch());
+        }
+    }
+    let filing = saved_request(&m.grant_request)?;
+    let grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
+        .map_err(|_| corrupt())?
+        .grant;
+    let stored = client
+        .file_fleet_grant(
+            access,
+            &fleet,
+            grant.generation.generation,
+            &filing.encode(),
+        )
+        .await?;
+    let created = FleetKeyGrantCreatedV2::parse(&stored_payload(
+        &stored,
+        &filing,
+        RECORD_TYPE_FLEET_GRANT_CREATED,
+    )?)
+    .map_err(|_| mismatch())?;
+    if created.grant != grant {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
 /// Set while Create fleet key runs in this process; the single-instance
 /// plugin keeps the launcher to one process.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -678,7 +1042,6 @@ pub fn save(state: &FleetCustodyState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::fleet_keys;
-    use shardx_core::authz_record::Payload;
     use shardx_core::mutation::IdempotentStoredResponseV2;
     use std::sync::atomic::{AtomicU16, AtomicUsize};
     use std::sync::{Arc, Mutex};
@@ -1463,5 +1826,325 @@ mod tests {
         for err in [test.unwrap_err(), enroll.map(drop).unwrap_err()] {
             assert!(err.contains("fleet.refusedLogin"), "{err}");
         }
+    }
+
+    // ---- Approve (section 4.A) ----
+
+    const MINUTE: u64 = 60_000;
+    const FKEK: [u8; 32] = [0x66; 32];
+
+    /// A pending joiner D as the listing reports it, with its HPKE secret.
+    fn joiner() -> (TenantDevice, Zeroizing<Vec<u8>>) {
+        let signer = Ed25519SigningKey::from_bytes(&[0x0d; 32]);
+        let (sk, pk) = derive_keypair(&[0x0e; 32]);
+        let vk = signer.verifying_key().to_bytes();
+        let row = TenantDevice {
+            device_id: hex(&[0x0d; 16]),
+            account_id: hex(&[4; 16]),
+            status: "pending".into(),
+            label_hex: hex(b"B"),
+            signing_public_key: hex(&vk),
+            hpke_public_key: hex(&pk),
+            signing_key_id: hex(&signing_key_id(&vk)),
+            hpke_key_id: hex(&hpke_key_id(&pk)),
+        };
+        (row, sk)
+    }
+
+    impl Fixture {
+        fn pin(&self) -> (Binding, [u8; 32]) {
+            (
+                Binding {
+                    server_instance_id: self.cx.instance,
+                    tenant_id: self.cx.tenant,
+                },
+                self.cx.signing_key_id,
+            )
+        }
+
+        fn code(&self, row: &TenantDevice) -> String {
+            let (s, h, _) = listed_keys(row).unwrap();
+            code_of(&self.pin(), &s, &h)
+        }
+    }
+
+    /// A server that reports generation 0 ACTIVE and refuses everything else.
+    fn approve_server() -> Arc<Reply> {
+        Arc::new(|call: &str, _: &[u8]| {
+            if call.ends_with("/key-generation") {
+                (200, b"{\"generation\":0}".to_vec())
+            } else {
+                (503, Vec::new())
+            }
+        })
+    }
+
+    fn approve(
+        rt: &tokio::runtime::Runtime,
+        f: &Fixture,
+        client: &FleetClient,
+        row: &TenantDevice,
+        sas: &str,
+        now: u64,
+    ) -> String {
+        let mut state = load().unwrap();
+        rt.block_on(approve_member(
+            client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            &f.pin(),
+            row,
+            sas,
+            |_| Ok(Zeroizing::new(FKEK)),
+            now,
+            &mut state,
+            &mut |s| save(s),
+        ))
+        .unwrap_err()
+        .to_string()
+    }
+
+    fn sent(seen: &Seen) -> Vec<(String, Vec<u8>)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(call, _)| call.starts_with("POST "))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn approval_is_refused_when_a_listed_key_does_not_hash_to_its_id() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let (row, _) = joiner();
+        let other = hex(&[0x77; 32]);
+        type Edit = fn(&mut TenantDevice, &str);
+        let edits: [Edit; 4] = [
+            |r, o| r.signing_key_id = o.into(),
+            |r, o| r.hpke_key_id = o.into(),
+            |r, o| r.signing_public_key = o.into(),
+            |r, o| r.hpke_public_key = o.into(),
+        ];
+        let now = now_ms();
+        for edit in edits {
+            let mut bad = row.clone();
+            edit(&mut bad, &other);
+            let err = approve(&rt, &f, &client, &bad, &f.code(&row), now);
+            assert!(err.contains("fleet.deviceKeysMismatch"), "{err}");
+        }
+        assert!(sent(&seen).is_empty(), "nothing is filed");
+        assert!(load()
+            .unwrap()
+            .members
+            .values()
+            .all(|m| m.approval.is_empty()));
+    }
+
+    #[test]
+    fn the_custodian_window_starts_when_it_first_sees_the_row_and_never_resets() {
+        let f = fixture();
+        let mut state = f.prepared();
+        let (row, _) = joiner();
+        let t0 = now_ms();
+        let active = TenantDevice {
+            device_id: hex(&[0x0a; 16]),
+            status: "active".into(),
+            ..row.clone()
+        };
+        let rows = [row.clone(), active];
+        let listed = see_devices(&rows, &f.pin(), t0, &mut state, &mut |s| save(s)).unwrap();
+        assert_eq!(listed[0].approve_until_ms, Some(t0 + 10 * MINUTE));
+        assert_eq!(listed[0].sas, f.code(&row));
+        assert_eq!(listed[0].label, "B");
+        assert_eq!(listed[1].approve_until_ms, None, "only a pending row");
+        assert_eq!(load().unwrap().members.len(), 1);
+
+        // Seen again later, by another listing or the approval itself.
+        let later = see_devices(&rows, &f.pin(), t0 + 5 * MINUTE, &mut state, &mut |s| {
+            save(s)
+        });
+        assert_eq!(later.unwrap()[0].approve_until_ms, Some(t0 + 10 * MINUTE));
+        let id = row.device_id.to_ascii_lowercase();
+        assert_eq!(load().unwrap().members[&id].first_seen_ms, t0);
+        let sas = f.code(&row);
+        assert!(check_member(&row, &f.pin(), t0, t0 + 10 * MINUTE, &sas).is_ok());
+        let err = check_member(&row, &f.pin(), t0, t0 + 10 * MINUTE + 1, &sas).unwrap_err();
+        assert!(
+            err.to_string().contains("fleet.approvalWindowClosed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn approval_is_refused_ten_minutes_after_first_sight() {
+        let f = fixture();
+        let mut state = f.prepared();
+        let (row, _) = joiner();
+        let t0 = now_ms() - 11 * MINUTE;
+        see_devices(
+            std::slice::from_ref(&row),
+            &f.pin(),
+            t0,
+            &mut state,
+            &mut |s| save(s),
+        )
+        .unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let err = approve(&rt, &f, &client, &row, &f.code(&row), t0 + 10 * MINUTE + 1);
+        assert!(err.contains("fleet.approvalWindowClosed"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "nothing is asked or filed");
+        let id = row.device_id.to_ascii_lowercase();
+        let kept = &load().unwrap().members[&id];
+        assert_eq!((kept.first_seen_ms, kept.approval.as_str()), (t0, ""));
+    }
+
+    #[test]
+    fn approval_is_refused_when_the_confirmed_code_differs() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let right = f.code(&row);
+        let wrong = format!("{}0", &right[..right.len() - 1]);
+        let wrong = if wrong == right {
+            right.replace('0', "1")
+        } else {
+            wrong
+        };
+        let now = now_ms();
+        for sas in [wrong.as_str(), "", &right[..right.len() - 5]] {
+            let err = approve(&rt, &f, &client, &row, sas, now);
+            assert!(err.contains("fleet.joinCodeMismatch"), "{err}");
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing is asked or filed");
+        // The code is read as shown, with or without its spaces.
+        for typed in [
+            right.clone(),
+            right.replace(' ', ""),
+            right.replace(' ', "-").to_uppercase(),
+        ] {
+            assert!(
+                check_member(&row, &f.pin(), now, now, &typed).is_ok(),
+                "{typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_saved_approval_is_resent_after_the_window_closes() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let t0 = now_ms();
+
+        // The first run builds and saves every request, then the approval's
+        // reply is lost.
+        let err = approve(&rt, &f, &client, &row, &f.code(&row), t0);
+        assert!(err.contains("fleet.refusedCustody"), "{err}");
+        let id = row.device_id.to_ascii_lowercase();
+        let saved = load().unwrap().members[&id].clone();
+        assert!(!saved.approval.is_empty() && !saved.grant_request.is_empty());
+        assert_eq!(saved.capability_grants.len(), 3);
+
+        // An hour later, with no code at all, the same bytes go out again.
+        let err = approve(&rt, &f, &client, &row, "", t0 + 60 * MINUTE);
+        assert!(err.contains("fleet.refusedCustody"), "{err}");
+        let path = format!("POST /v2/devices/{id}/approve");
+        let approvals = sent(&seen);
+        assert_eq!(approvals.len(), 2);
+        for (call, body) in &approvals {
+            assert_eq!((call, body), (&path, &unhex_vec(&saved.approval).unwrap()));
+        }
+        let again = load().unwrap().members[&id].clone();
+        assert_eq!(
+            (again.approval, again.capability_grants, again.grant_request),
+            (saved.approval, saved.capability_grants, saved.grant_request)
+        );
+    }
+
+    #[test]
+    fn the_member_grant_is_sealed_to_the_listed_hpke_key_and_opens_with_it() {
+        let f = fixture();
+        let (row, sk) = joiner();
+        let keys = listed_keys(&row).unwrap();
+        let now = now_ms();
+        let m = build_member(&f.cx, &f.signer, &row, keys, &FKEK, 0, now, now).unwrap();
+        let issuer = f.signer.verifying_key().to_bytes();
+        let verified = |container: &[u8]| {
+            AuthorizationRecord::parse(container)
+                .unwrap()
+                .verify_signature(&issuer)
+                .unwrap()
+                .payload()
+                .clone()
+        };
+        let d = (decode_hex16(&row.device_id, "d").unwrap(), [4; 16]);
+
+        let filing = payload(&m.grant_request, FleetKeyGrantCreateV2::parse);
+        let Payload::DeviceHpkeGrant(g) = verified(&filing.exact_signed_grant_container_bytes)
+        else {
+            panic!("a device grant")
+        };
+        assert_eq!(
+            *shardx_core::grants::open_device_fkek(&sk, &g).unwrap(),
+            FKEK
+        );
+        assert_eq!((g.subject_device_id, g.subject_account_id), (d.0, d.1));
+        assert_eq!(
+            (g.subject_signing_key_id, g.recipient_hpke_key_id),
+            (keys.0, keys.1)
+        );
+        assert_eq!(
+            (g.fleet_id, g.generation, g.fkek_key_id),
+            (f.cx.tenant, 0, fkek_key_id(&FKEK))
+        );
+        assert_eq!(filing.grant.grant_variant, FleetGrantVariant::DeviceHpke);
+        // Another device's HPKE key does not open it.
+        let (other, _) = derive_keypair(&f.seed);
+        assert!(shardx_core::grants::open_device_fkek(&other, &g).is_err());
+
+        let Payload::DeviceApproval(a) = verified(&unhex_vec(&m.approval).unwrap()) else {
+            panic!("an approval")
+        };
+        assert_eq!(
+            (a.approval_scope_kind, a.approval_scope_id),
+            (ApprovalScopeKind::Fleet, f.cx.tenant)
+        );
+        assert_eq!((a.subject_device_id, a.subject_hpke_key_id), (d.0, keys.1));
+        let caps: Vec<_> = m
+            .capability_grants
+            .iter()
+            .map(|c| match verified(&unhex_vec(c).unwrap()) {
+                Payload::TenantCapabilityGrant(g) => {
+                    assert_eq!(
+                        g.subject,
+                        GrantSubject::Device {
+                            account_id: d.1,
+                            device_id: d.0,
+                            signing_key_id: keys.0,
+                            hpke_key_id: keys.1,
+                        }
+                    );
+                    (g.capability, g.scope_kind, g.scope_id)
+                }
+                _ => panic!("a capability grant"),
+            })
+            .collect();
+        use CapabilityScopeKind::Fleet;
+        assert_eq!(
+            caps,
+            [
+                (Capability::ProfilePublish, Fleet, f.cx.tenant),
+                (Capability::ProfileCheckout, Fleet, f.cx.tenant),
+                (Capability::ProfileCommit, Fleet, f.cx.tenant),
+            ]
+        );
     }
 }

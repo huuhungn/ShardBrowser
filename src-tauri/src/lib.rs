@@ -2027,14 +2027,11 @@ fn team_set_connection(
     c.server_url = url;
     c.token = token.trim().to_string().into();
     c.tenant_id = tenant_id.trim().to_string();
-    let mut stale_refs = Vec::new();
-    if server_changed {
-        c.device_id.clear();
-        c.signing_key_seed.clear();
-        c.hpke_key_seed.clear();
-        stale_refs.push(std::mem::take(&mut c.signing_credential_ref));
-        stale_refs.push(std::mem::take(&mut c.hpke_credential_ref));
-    }
+    let stale_refs = if server_changed {
+        clear_identity(&mut c)
+    } else {
+        Default::default()
+    };
 
     team_config::save(&c).map_err(|e| e.to_string())?;
     // The identity is gone from the file; its keys go with it. Best effort:
@@ -2043,6 +2040,18 @@ fn team_set_connection(
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
+}
+
+/// Drops this device's id and seeds from `c`, returning the credential
+/// references that held its keys.
+fn clear_identity(c: &mut team_config::TeamConfig) -> [String; 2] {
+    c.device_id.clear();
+    c.signing_key_seed.clear();
+    c.hpke_key_seed.clear();
+    [
+        std::mem::take(&mut c.signing_credential_ref),
+        std::mem::take(&mut c.hpke_credential_ref),
+    ]
 }
 
 /// Check the saved connection by asking the server who it is, with a ticket
@@ -2144,6 +2153,8 @@ async fn team_enroll_device(
         .map_err(|e| e.to_string())?;
 
     c.device_id = enrolled.device_id;
+    // The join window runs from here, by this device's clock.
+    c.enrolled_at_ms = root_bootstrap::now_ms();
     // Fleet routes are account-scoped, and the server is the only source for
     // this id. Storing it here is what lets sync run without a second call.
     c.account_id = enrolled.account_id;
@@ -2557,6 +2568,332 @@ async fn team_fleet_key_setup(
     fleet_custody::status().map_err(|e| e.to_string())
 }
 
+/// Opens this device's session as `username` for one command; the password
+/// serves that one login and is never stored.
+async fn open_session(
+    c: &team_config::TeamConfig,
+    username: &str,
+    password: &str,
+) -> Result<(fleet_client::FleetClient, fleet_client::DeviceSession), String> {
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let login = fleet_client::AccountLogin {
+        tenant_id: &c.tenant_id,
+        username: username.trim(),
+        password,
+    };
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let session = client
+        .open_device_session(&login, &c.device_id, &signer, &seed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((client, session))
+}
+
+/// The tenant's devices with the code each must show, for the root
+/// custodian's Approve screen (v0.2.2a plan, section 4.A step 1). The first
+/// sight of each pending device is noted here, and never reset.
+#[tauri::command]
+async fn team_devices(
+    username: String,
+    password: String,
+) -> Result<Vec<fleet_custody::ListedDevice>, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let rows = client
+        .list_tenant_devices(&session.access_token, &c.tenant_id)
+        .await;
+    client.end_session(&session.access_token).await;
+    let rows = rows.map_err(|e| e.to_string())?;
+    let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+    fleet_custody::see_devices(
+        &rows,
+        &pin,
+        root_bootstrap::now_ms(),
+        &mut state,
+        &mut |s| fleet_custody::save(s),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Approves the pending device `device_id` once the user confirmed that it
+/// shows `sas` (section 4.A): its fleet-scoped approval, its three profile
+/// capability grants and its grant of the fleet key. A device with saved
+/// requests gets them resent as saved.
+#[tauri::command]
+async fn team_approve_device(
+    username: String,
+    password: String,
+    device_id: String,
+    sas: String,
+) -> Result<(), String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let me = recipient(&c).map_err(|e| e.to_string())?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let device = fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &fleet_custody::CredentialFkekStore,
+    };
+    let result = async {
+        let rows = client
+            .list_tenant_devices(access, &c.tenant_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let row = rows
+            .iter()
+            .find(|r| r.device_id.eq_ignore_ascii_case(device_id.trim()))
+            .ok_or_else(|| crate::errcode::code("fleet.deviceNotListed"))?;
+        let now = root_bootstrap::now_ms();
+        let fleet_hex = sync_cmd::fleet_id(&c);
+        // Only a key whose grant still verifies to this device's pin is
+        // handed on, as sync reads it (`team::sync::readable_key`).
+        let fleet_key = |generation: u64| {
+            let fleet = fleet_client::decode_hex16(&fleet_hex, "fleet_id")?;
+            let ledger = team::db::Db::open()?;
+            fleet_keys::load()?
+                .keys_newest_first(&fleet_hex, |_, _| true)
+                .into_iter()
+                .find(|(k, g)| {
+                    *g == generation
+                        && fleet_key_verifies(&ledger, &pin, &me, &fleet, *g, k, now)
+                            .unwrap_or(false)
+                })
+                .map(|(k, _)| zeroize::Zeroizing::new(k))
+                .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
+        };
+        let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+        fleet_custody::approve_member(
+            &client,
+            access,
+            &device,
+            &pin,
+            row,
+            &sas,
+            fleet_key,
+            now,
+            &mut state,
+            &mut |s| fleet_custody::save(s),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+    .await;
+    client.end_session(access).await;
+    result
+}
+
+/// What a joining device shows beside its code (section 4.J step 2): the
+/// full anchor and key IDs are one click away.
+#[derive(serde::Serialize, Debug)]
+struct JoinCode {
+    sas: String,
+    anchor: String,
+    signing_key_id: String,
+    hpke_key_id: String,
+    expires_at_ms: u64,
+}
+
+/// The end of this device's join window while it is open: ten minutes from
+/// its own enrollment, by its own clock, never relaxed (ADR "Join window
+/// rule"). An enrollment without a time has no window.
+fn join_window(c: &team_config::TeamConfig, now: u64) -> Result<u64, String> {
+    let end = c
+        .enrolled_at_ms
+        .saturating_add(fleet_custody::JOIN_WINDOW_MS);
+    if c.enrolled_at_ms == 0 || now > end {
+        return Err(crate::errcode::code("fleet.joinCodeExpired"));
+    }
+    Ok(end)
+}
+
+/// The binding and the anchor `A0` the tenant's trust evidence verifies to
+/// on its own, read over the session `access`: a joining device has no pin
+/// yet.
+async fn evidence_anchor(
+    client: &fleet_client::FleetClient,
+    access: &str,
+    c: &team_config::TeamConfig,
+) -> Result<(shardx_core::trust_chain::Binding, [u8; 32]), String> {
+    use shardx_core::trust_chain::{Binding, Evidence, TrustChain};
+    let refused = || crate::errcode::code("fleet.trustEvidenceRefused");
+    let id = client
+        .server_identity(access)
+        .await
+        .map_err(|e| e.to_string())?;
+    let binding = Binding {
+        server_instance_id: fleet_client::decode_hex16(
+            &id.server_instance_id,
+            "server_instance_id",
+        )
+        .map_err(|e| e.to_string())?,
+        tenant_id: fleet_client::decode_hex16(&c.tenant_id, "tenant_id")
+            .map_err(|e| e.to_string())?,
+    };
+    let pages = client
+        .trust_evidence(access, &c.tenant_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let evidence = Evidence::collect(&binding, &pages).map_err(|_| refused())?;
+    let chain = TrustChain::evaluate(evidence, None).map_err(|_| refused())?;
+    Ok((binding, *chain.anchor()))
+}
+
+/// This device's join code (section 4.J step 2), while its window is open.
+#[tauri::command]
+async fn team_join_code(username: String, password: String) -> Result<JoinCode, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let expires_at_ms = join_window(&c, root_bootstrap::now_ms())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let pin = evidence_anchor(&client, &session.access_token, &c).await;
+    client.end_session(&session.access_token).await;
+    let (binding, anchor) = pin?;
+    let me = recipient(&c).map_err(|e| e.to_string())?;
+    let sas = shardx_core::trust_chain::join_sas(
+        &binding.server_instance_id,
+        &binding.tenant_id,
+        &anchor,
+        &me.signing_key_id,
+        &me.hpke_key_id,
+    );
+    Ok(JoinCode {
+        sas: shardx_core::trust_chain::join_sas_display(&sas),
+        anchor: fleet_client::hex(&anchor),
+        signing_key_id: fleet_client::hex(&me.signing_key_id),
+        hpke_key_id: fleet_client::hex(&me.hpke_key_id),
+        expires_at_ms,
+    })
+}
+
+/// Section 4.J step 3: pins `evaluated` as this device's `JOIN` anchor when
+/// it is the `shown` one the user confirmed and the window is still open.
+fn pin_join(
+    c: &team_config::TeamConfig,
+    ledger: &team::db::Db,
+    binding: &shardx_core::trust_chain::Binding,
+    evaluated: &[u8; 32],
+    shown: &str,
+    now: u64,
+) -> Result<(), String> {
+    join_window(c, now)?;
+    let changed = || crate::errcode::code("fleet.joinAnchorChanged");
+    if !shown
+        .trim()
+        .eq_ignore_ascii_case(&fleet_client::hex(evaluated))
+    {
+        return Err(changed());
+    }
+    let pinned = team::ledger::pin_anchor(ledger, binding, evaluated, team::ledger::JOIN, now)
+        .map_err(|e| {
+            eprintln!("[fleet] trust ledger: {e:#}");
+            crate::errcode::code("team.trustLedgerUnreadable")
+        })?;
+    if !pinned {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+/// Pins the anchor `anchor` the user saw beside a matching code (section 4.J
+/// step 3), only inside this device's join window: a late confirm is never
+/// allowed, approved or not.
+#[tauri::command]
+async fn team_join_confirm(
+    username: String,
+    password: String,
+    anchor: String,
+) -> Result<(), String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    join_window(&c, root_bootstrap::now_ms())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let pin = evidence_anchor(&client, &session.access_token, &c).await;
+    client.end_session(&session.access_token).await;
+    let (binding, evaluated) = pin?;
+    let ledger = team::db::Db::open().map_err(|e| e.to_string())?;
+    pin_join(
+        &c,
+        &ledger,
+        &binding,
+        &evaluated,
+        &anchor,
+        root_bootstrap::now_ms(),
+    )
+}
+
+/// Clears this device's identity so it can enroll again (section 4.J step
+/// 4): only while the server lists it pending, or active without a pin here,
+/// as when an approval landed after its join window closed. A pinned device
+/// and the root custodian keep theirs. The old row stays on the server until
+/// a custodian revokes it.
+#[tauri::command]
+async fn team_enroll_again(
+    username: String,
+    password: String,
+) -> Result<team_config::TeamStatus, String> {
+    let mut c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.is_enrolled() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if username.trim().is_empty() || password.is_empty() {
+        return Err(crate::errcode::code("fleet.setAccountFirst"));
+    }
+    let refused = || crate::errcode::code("fleet.enrollAgainRefused");
+    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
+    let custodian = root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+        && root.device_id.eq_ignore_ascii_case(&c.device_id);
+    if custodian || pinned_anchor(&c).is_some() {
+        return Err(refused());
+    }
+    let client =
+        fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let status = client
+        .account_device_status(
+            &fleet_client::AccountLogin {
+                tenant_id: &c.tenant_id,
+                username: username.trim(),
+                password: &password,
+            },
+            &c.device_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    if !matches!(status.as_deref(), Some("pending" | "active")) {
+        return Err(refused());
+    }
+    let stale_refs = clear_identity(&mut c);
+    team_config::save(&c).map_err(|e| e.to_string())?;
+    for reference in stale_refs.iter().filter(|r| !r.is_empty()) {
+        let _ = credential::forget(reference);
+    }
+    team_config::status().map_err(|e| e.to_string())
+}
+
 /// Collect the root key grants issued to this device and report what opened.
 ///
 /// The tenant root key itself is never returned to the caller: this reports
@@ -2733,11 +3070,33 @@ fn keep_fleet_key(
     Ok(FleetGrant::Opened(generation))
 }
 
-/// The binding and anchor `A0` this device pinned: only the device that
-/// bootstrapped the tenant's custody has them, and `open_fleet_grant` keeps
-/// the first one in the W6 ledger. A joining device pins its own in the join
-/// ceremony (ADR 0002 Q-12), which has not shipped.
+/// The binding and anchor `A0` this device pinned: the device that
+/// bootstrapped the tenant's custody keeps them in its root state, and
+/// `open_fleet_grant` keeps the first one in the W6 ledger. Any other device
+/// has the one pin of its tenant in the ledger, from the join ceremony (ADR
+/// 0002 Q-12), or none.
 fn pinned_anchor(
+    c: &team_config::TeamConfig,
+) -> Option<(shardx_core::trust_chain::Binding, [u8; 32])> {
+    bootstrap_anchor(c).or_else(|| {
+        let tenant = fleet_client::decode_hex16(&c.tenant_id, "tenant_id").ok()?;
+        let (binding, anchor, _) = tenant_pin(&tenant).ok()??;
+        Some((binding, anchor))
+    })
+}
+
+/// The ledger's one pin of `tenant`, without creating a ledger that does not
+/// exist yet.
+fn tenant_pin(
+    tenant: &[u8; 16],
+) -> anyhow::Result<Option<(shardx_core::trust_chain::Binding, [u8; 32], String)>> {
+    if !team::db::Db::path()?.exists() {
+        return Ok(None);
+    }
+    team::ledger::tenant_pin(&team::db::Db::open()?, tenant)
+}
+
+fn bootstrap_anchor(
     c: &team_config::TeamConfig,
 ) -> Option<(shardx_core::trust_chain::Binding, [u8; 32])> {
     let s = root_bootstrap::load().ok()?;
@@ -2792,7 +3151,7 @@ fn open_fleet_grant(
     // L1311), so a grant below the highest verified generation, or past the
     // next one, is refused: one stolen key cannot poison the ledger forward.
     let highest = ledger::highest_generation(ledger, binding, fleet_id).map_err(failed)?;
-    if !ledger::pin_anchor(ledger, binding, anchor, now).map_err(failed)?
+    if !ledger::pin_anchor(ledger, binding, anchor, ledger::BOOTSTRAP, now).map_err(failed)?
         || highest.is_some_and(|h| generation < h || generation > h.saturating_add(1))
     {
         return Ok(None);
@@ -3931,7 +4290,14 @@ mod custody_tests {
         );
         let distrust = |path: &std::path::Path| {
             let db = team::db::Db::open_at(path).unwrap();
-            assert!(team::ledger::pin_anchor(&db, &BINDING, &me.to.signing_key_id, T0).unwrap());
+            assert!(team::ledger::pin_anchor(
+                &db,
+                &BINDING,
+                &me.to.signing_key_id,
+                team::ledger::BOOTSTRAP,
+                T0
+            )
+            .unwrap());
             team::ledger::distrust_key(&db, &BINDING, &d_id(), T0).unwrap();
         };
 
@@ -3968,7 +4334,7 @@ mod custody_tests {
         let (_dir, path) = ledger_at();
         let pin = |anchor: [u8; 32]| {
             let db = team::db::Db::open_at(&path).unwrap();
-            team::ledger::pin_anchor(&db, &BINDING, &anchor, T0).unwrap()
+            team::ledger::pin_anchor(&db, &BINDING, &anchor, team::ledger::BOOTSTRAP, T0).unwrap()
         };
         assert!(pin([1; 32]));
         assert!(!pin([9; 32]));
@@ -5309,6 +5675,306 @@ mod custody_tests {
         }
         assert!(live_fleet_grant(b"not cbor", &fleet, 1, &device).is_err());
     }
+
+    // ---- Join and Enroll again (v0.2.2a plan, section 4.J) ----
+
+    const MINUTE: u64 = 60_000;
+    const JOINER: [u8; 16] = [0x5a; 16];
+    const BINDING_J: shardx_core::trust_chain::Binding = shardx_core::trust_chain::Binding {
+        server_instance_id: INSTANCE,
+        tenant_id: TENANT,
+    };
+
+    /// A joining device's config in a config root of its own.
+    struct Joiner {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Drop for Joiner {
+        fn drop(&mut self) {
+            store::set_config_root(None);
+        }
+    }
+
+    fn joiner(server_url: &str, enrolled_at_ms: u64) -> Joiner {
+        let lock = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let mut c = team_config::TeamConfig {
+            server_url: server_url.into(),
+            tenant_id: hex(&TENANT),
+            device_id: hex(&JOINER),
+            account_id: hex(&[6; 16]),
+            signing_key_seed: hex(&[7; 32]).into(),
+            hpke_key_seed: hex(&[8; 32]).into(),
+            enrolled_at_ms,
+            ..Default::default()
+        };
+        team_config::save(&c).unwrap();
+        assert!(team_config::protect_keys(&mut c).unwrap());
+        Joiner {
+            _lock: lock,
+            _dir: dir,
+        }
+    }
+
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A server that logs a ticket in and lists this device with `status` in
+    /// `GET /v2/me`, recording every call.
+    fn me_server(rt: &tokio::runtime::Runtime, status: &'static str) -> (String, Calls) {
+        let calls: Calls = Default::default();
+        let log = calls.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let log = log.clone();
+                async move {
+                    let call = format!("{method} {}", uri.path());
+                    log.lock().unwrap().push(call.clone());
+                    let body = match call.as_str() {
+                        "POST /v2/auth/login" => serde_json::json!({
+                            "ticket": "v2t.fresh",
+                            "ticket_id": hex(&[1; 16]),
+                            "account_id": hex(&[6; 16]),
+                            "server_instance_id": hex(&INSTANCE),
+                            "restore_epoch": 0,
+                        }),
+                        "GET /v2/me" => serde_json::json!({
+                            "kind": "pre_device",
+                            "devices": [
+                                {"device_id": hex(&[9; 16]), "status": "active"},
+                                {"device_id": hex(&JOINER), "status": status},
+                            ],
+                        }),
+                        _ => serde_json::json!({}),
+                    };
+                    axum::Json(body)
+                }
+            },
+        );
+        let url = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        });
+        (url, calls)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn join_pin() -> Option<(shardx_core::trust_chain::Binding, [u8; 32], String)> {
+        tenant_pin(&TENANT).unwrap()
+    }
+
+    #[test]
+    fn the_join_code_expires_ten_minutes_after_this_device_enrolled() {
+        let rt = runtime();
+        let (url, calls) = me_server(&rt, "pending");
+        let now = root_bootstrap::now_ms();
+        let _j = joiner(&url, now - 10 * MINUTE - 1);
+        let c = team_config::load().unwrap();
+        let t0 = c.enrolled_at_ms;
+        assert_eq!(join_window(&c, t0), Ok(t0 + 10 * MINUTE));
+        assert_eq!(join_window(&c, t0 + 10 * MINUTE), Ok(t0 + 10 * MINUTE));
+        for (c, at) in [
+            (c.clone(), t0 + 10 * MINUTE + 1),
+            (
+                team_config::TeamConfig {
+                    enrolled_at_ms: 0,
+                    ..c.clone()
+                },
+                1,
+            ),
+        ] {
+            let err = join_window(&c, at).unwrap_err();
+            assert!(err.contains("fleet.joinCodeExpired"), "{err}");
+        }
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("fleet.joinCodeExpired"), "{err}");
+        assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+    }
+
+    #[test]
+    fn a_late_join_confirm_is_refused_even_after_approval() {
+        let rt = runtime();
+        let (url, calls) = me_server(&rt, "active");
+        let now = root_bootstrap::now_ms();
+        let _j = joiner(&url, now - 11 * MINUTE);
+        let anchor = [0x0a; 32];
+        let err = rt
+            .block_on(team_join_confirm("u".into(), "p".into(), hex(&anchor)))
+            .unwrap_err();
+        assert!(err.contains("fleet.joinCodeExpired"), "{err}");
+        assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+        assert!(!team::db::Db::path().unwrap().exists(), "nothing is pinned");
+
+        // The pin itself checks the window again, with the anchor shown.
+        let c = team_config::load().unwrap();
+        let ledger = team::db::Db::open().unwrap();
+        let err = pin_join(&c, &ledger, &BINDING_J, &anchor, &hex(&anchor), now).unwrap_err();
+        assert!(err.contains("fleet.joinCodeExpired"), "{err}");
+        assert_eq!(join_pin(), None);
+    }
+
+    #[test]
+    fn a_join_pin_is_refused_for_another_anchor_than_the_one_shown() {
+        let now = root_bootstrap::now_ms();
+        let _j = joiner("http://127.0.0.1:9", now);
+        let c = team_config::load().unwrap();
+        let ledger = team::db::Db::open().unwrap();
+        let (evaluated, shown) = ([0x0a; 32], [0x0b; 32]);
+        for shown in [hex(&shown), String::new()] {
+            let err = pin_join(&c, &ledger, &BINDING_J, &evaluated, &shown, now).unwrap_err();
+            assert!(err.contains("fleet.joinAnchorChanged"), "{err}");
+        }
+        assert_eq!(join_pin(), None);
+        pin_join(
+            &c,
+            &ledger,
+            &BINDING_J,
+            &evaluated,
+            &hex(&evaluated).to_uppercase(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(join_pin(), Some((BINDING_J, evaluated, "JOIN".to_string())));
+        // A later ceremony against another anchor never replaces it.
+        let err = pin_join(&c, &ledger, &BINDING_J, &shown, &hex(&shown), now).unwrap_err();
+        assert!(err.contains("fleet.joinAnchorChanged"), "{err}");
+        assert_eq!(join_pin(), Some((BINDING_J, evaluated, "JOIN".to_string())));
+    }
+
+    #[test]
+    fn a_joined_device_reads_its_anchor_from_the_join_pin() {
+        let _j = joiner("http://127.0.0.1:9", root_bootstrap::now_ms());
+        let c = team_config::load().unwrap();
+        assert_eq!(pinned_anchor(&c), None);
+        assert!(!team::db::Db::path().unwrap().exists(), "no ledger is made");
+        let ledger = team::db::Db::open().unwrap();
+        let other = shardx_core::trust_chain::Binding {
+            tenant_id: [0x0c; 16],
+            ..BINDING_J
+        };
+        assert!(team::ledger::pin_anchor(&ledger, &other, &[0x0c; 32], "JOIN", 1).unwrap());
+        assert_eq!(pinned_anchor(&c), None, "another tenant's pin");
+        assert!(team::ledger::pin_anchor(&ledger, &BINDING_J, &[0x0a; 32], "JOIN", 1).unwrap());
+        assert_eq!(pinned_anchor(&c), Some((BINDING_J, [0x0a; 32])));
+    }
+
+    /// What enrolling again leaves: no id, no seeds, no credentials.
+    fn assert_cleared(refs: [String; 2]) {
+        let c = team_config::load().unwrap();
+        assert!(c.device_id.is_empty() && !c.is_enrolled() && !c.blocks_enrollment());
+        assert!(c.signing_key_seed.is_empty() && c.hpke_key_seed.is_empty());
+        assert!(c.signing_credential_ref.is_empty() && c.hpke_credential_ref.is_empty());
+        assert_eq!(
+            (c.server_url.is_empty(), c.tenant_id.as_str()),
+            (false, hex(&TENANT).as_str())
+        );
+        for r in refs {
+            let gone = credential::load(&r).unwrap_err();
+            assert!(gone.to_string().contains("credential.missing"), "{gone}");
+        }
+    }
+
+    fn refs() -> [String; 2] {
+        let c = team_config::load().unwrap();
+        assert!(!c.signing_credential_ref.is_empty() && !c.hpke_credential_ref.is_empty());
+        [c.signing_credential_ref, c.hpke_credential_ref]
+    }
+
+    #[test]
+    fn enroll_again_clears_a_pending_identity() {
+        let rt = runtime();
+        let (url, calls) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        let refs = refs();
+        let status = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert!(status.device_id.is_empty());
+        assert_cleared(refs);
+        assert!(calls.lock().unwrap().contains(&"GET /v2/me".to_string()));
+    }
+
+    /// Architect 2: an approval that landed after this device's window
+    /// closed leaves it active but unpinned; it enrolls again.
+    #[test]
+    fn an_approved_device_whose_join_code_expired_can_enroll_again() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "active");
+        let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+        let refs = refs();
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("fleet.joinCodeExpired"), "{err}");
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert_cleared(refs);
+    }
+
+    #[test]
+    fn enroll_again_is_refused_for_a_pinned_or_custodian_device() {
+        let rt = runtime();
+        for status in ["active", "pending"] {
+            // A device that pinned its anchor.
+            let (url, calls) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms());
+            let before = format!("{:?}", team_config::load().unwrap());
+            let ledger = team::db::Db::open().unwrap();
+            assert!(team::ledger::pin_anchor(&ledger, &BINDING_J, &[0x0a; 32], "JOIN", 1).unwrap());
+            let refused = |calls: &Calls| {
+                let err = rt
+                    .block_on(team_enroll_again("u".into(), "p".into()))
+                    .unwrap_err();
+                assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+                assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+                assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
+            };
+            refused(&calls);
+            drop(_j);
+
+            // The root custodian, pinned or not.
+            let (url, calls) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms());
+            let before = format!("{:?}", team_config::load().unwrap());
+            let root = root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT),
+                device_id: hex(&JOINER).to_uppercase(),
+                ..Default::default()
+            };
+            root_bootstrap::save(&root).unwrap();
+            let err = rt
+                .block_on(team_enroll_again("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+            assert!(calls.lock().unwrap().is_empty());
+            assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
+        }
+
+        // A device the server no longer lists as waiting or approved.
+        for status in ["revoked", "retired"] {
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms());
+            let err = rt
+                .block_on(team_enroll_again("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+            assert!(team_config::load().unwrap().is_enrolled());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5460,6 +6126,11 @@ pub fn run() {
             team_bootstrap_custody,
             team_fleet_custody_status,
             team_fleet_key_setup,
+            team_devices,
+            team_approve_device,
+            team_join_code,
+            team_join_confirm,
+            team_enroll_again,
             team_set_connection,
             team_test_connection,
             team_enroll_device,

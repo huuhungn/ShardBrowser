@@ -4357,7 +4357,23 @@ async fn walked(
     now: u64,
 ) -> Result<Walked> {
     let untrusted = || anyhow!(code("sync.signerUntrusted"));
-    let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
+    // The evidence holds a device's approvals and capability grants only
+    // when it is a root grant subject or a signer asked for (`v2_trust`):
+    // ask for the signer of every head the walk reads.
+    // shortcut: each manifest is read twice; pass them to `walk` if a long
+    // walk shows up in profiling.
+    let mut signers = std::collections::BTreeSet::new();
+    for v in b.version.max(1)..=head.current_version {
+        signers.insert(
+            *manifest(client, access, b, v)
+                .await?
+                .signer_signing_key_id(),
+        );
+    }
+    let signers: Vec<[u8; 32]> = signers.into_iter().collect();
+    let pages = client
+        .trust_evidence_of(access, &hex(&b.tenant), &signers)
+        .await?;
     let (seen, chain) =
         ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
     ledger::record(db, &dev.pin.0, &seen, &chain, None, now)?;
