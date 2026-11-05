@@ -756,8 +756,20 @@ pub async fn list_tenant_root_key_grants(
 
     // Membership is checked against the authenticated user rather than the path,
     // so a caller cannot read another tenant's grants by naming that tenant. A
-    // device session reads only its own device's grants.
-    if require_tenant_caller(&app, tenant_id, &who)
+    // device session reads only its own device's grants, and a v1 member only
+    // those of its own account's devices.
+    if let Caller::V1(user) = &who {
+        let account = require_tenant_member(&app, tenant_id, user).await?;
+        let owner: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT account_id FROM v2_devices WHERE tenant_id = ? AND id = ?")
+                .bind(tenant_id.as_slice())
+                .bind(device_id.as_slice())
+                .fetch_optional(&app.db)
+                .await?;
+        if owner.as_deref() != Some(account.as_slice()) {
+            return Err(AppError::Forbidden);
+        }
+    } else if require_tenant_caller(&app, tenant_id, &who)
         .await?
         .is_some_and(|own| own != device_id)
     {

@@ -5959,6 +5959,41 @@ mod custody_tests {
     }
 
     #[test]
+    fn a_join_confirm_is_refused_for_another_tenant_than_the_one_shown() {
+        let now = root_bootstrap::now_ms();
+        let _j = joiner("http://127.0.0.1:9", now);
+        let c = team_config::load().unwrap();
+        let ledger = team::db::Db::open().unwrap();
+        let anchor = [0x0a; 32];
+        let shown = code_for(&c, &BINDING_J, &anchor);
+        let substituted = shardx_core::trust_chain::Binding {
+            tenant_id: [0x6f; 16],
+            ..BINDING_J
+        };
+        let result = pin_join(
+            &c,
+            &ledger,
+            &substituted,
+            &anchor,
+            &hex(&anchor),
+            &shown,
+            now,
+        );
+        assert!(
+            result.is_err(),
+            "a different tenant must not use the displayed code"
+        );
+        assert_eq!(
+            ledger
+                .conn
+                .query_row("SELECT count(*) FROM trust_anchors", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn a_join_pin_is_refused_for_another_anchor_than_the_one_shown() {
         let now = root_bootstrap::now_ms();
         let _j = joiner("http://127.0.0.1:9", now);

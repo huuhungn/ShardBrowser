@@ -415,6 +415,8 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     }
     case "team_approve_device": {
       teamCustodian();
+      // As the launcher: no saved Create fleet key, no approval.
+      if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
       const target = String(args.deviceId);
       const first = teamFirstSeen.get(target);
       if (first === undefined || Date.now() - first > TEAM_WINDOW_MS) teamRefuse("fleet.approvalWindowClosed");

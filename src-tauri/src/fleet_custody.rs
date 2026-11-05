@@ -642,12 +642,17 @@ pub async fn ack_device_grant(
 pub const JOIN_WINDOW_MS: u64 = 10 * 60_000;
 
 /// What Approve keeps for one device: when this custodian first saw it
-/// pending, by its own clock and never reset, and the exact requests that
-/// approve it, saved before the first is sent.
+/// pending, by its own clock and never reset, the key IDs it was first seen
+/// with, and the exact requests that approve it, saved before the first is
+/// sent.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct MemberApproval {
     #[serde(default)]
     pub first_seen_ms: u64,
+    #[serde(default)]
+    pub signing_key_id: String,
+    #[serde(default)]
+    pub hpke_key_id: String,
     #[serde(default)]
     pub approval: String,
     #[serde(default)]
@@ -687,7 +692,10 @@ fn code_of(
 }
 
 /// Section 4.A step 1: notes the first sight of each pending device of
-/// `rows`, which is never reset, and lists every row with its code.
+/// `rows`, which is never reset, and lists every row with its code. A row
+/// whose signing or HPKE key ID was already seen under another device ID
+/// keeps the earliest sight of those keys, so a new row ID never opens a
+/// fresh window for the same keys.
 pub fn see_devices(
     rows: &[TenantDevice],
     pin: &(Binding, [u8; 32]),
@@ -695,19 +703,37 @@ pub fn see_devices(
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<Vec<ListedDevice>> {
-    let new: Vec<String> = rows
+    let new: Vec<&TenantDevice> = rows
         .iter()
         .filter(|r| r.status == "pending")
-        .map(|r| r.device_id.to_ascii_lowercase())
-        .filter(|id| !state.members.contains_key(id))
+        .filter(|r| {
+            !state
+                .members
+                .contains_key(&r.device_id.to_ascii_lowercase())
+        })
         .collect();
     if !new.is_empty() {
         commit(state, save, |s| {
-            for id in new {
+            for r in new {
+                let (signing, hpke) = (
+                    r.signing_key_id.to_ascii_lowercase(),
+                    r.hpke_key_id.to_ascii_lowercase(),
+                );
+                let first_seen_ms = s
+                    .members
+                    .values()
+                    .filter(|m| {
+                        m.signing_key_id.eq_ignore_ascii_case(&signing)
+                            || m.hpke_key_id.eq_ignore_ascii_case(&hpke)
+                    })
+                    .map(|m| m.first_seen_ms)
+                    .fold(now, u64::min);
                 s.members.insert(
-                    id,
+                    r.device_id.to_ascii_lowercase(),
                     MemberApproval {
-                        first_seen_ms: now,
+                        first_seen_ms,
+                        signing_key_id: signing,
+                        hpke_key_id: hpke,
                         ..Default::default()
                     },
                 );
@@ -852,6 +878,8 @@ fn build_member(
     );
     Ok(MemberApproval {
         first_seen_ms,
+        signing_key_id: hex(&signing),
+        hpke_key_id: hex(&hpke),
         approval: hex(&build_record(
             signer,
             DOMAIN_DEVICE_APPROVAL,
@@ -1022,8 +1050,8 @@ pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
 
 /// Runs, or resumes, Revoke of `row` as `reason` (section 4.R) under the
 /// device session `access`. A saved revocation is resent as saved, whatever
-/// `reason` now says, unless the server can no longer file it. This device
-/// never revokes itself.
+/// `reason` now says, unless the server refuses it and can no longer file it.
+/// This device never revokes itself.
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_member(
     client: &FleetClient,
@@ -1041,60 +1069,73 @@ pub async fn revoke_member(
     let cx = custodian(me, state)?;
     let id = row.device_id.to_ascii_lowercase();
     let subject = decode_hex16(&id, "device_id")?;
-    // The server checks `issued_at_ms` within five minutes of its clock for a
-    // revocation it has not filed (`v2_device_revoke.rs`), and filing one
-    // revokes the row. So a saved one is built anew once it is that old while
-    // the row is still not revoked; otherwise it is resent as saved.
-    let stale = match state.revocations.get(&id) {
-        Some(saved) if row.status != "revoked" => {
-            issued_at(saved, me.signer)? + REVOCATION_ISSUED_AT_SKEW_MS <= now
+    let mut build = !state.revocations.contains_key(&id);
+    loop {
+        if build {
+            let (signing, hpke, _) = listed_keys(row)?;
+            let mut common = cx.common(random()?, now);
+            common.not_after_ms = common.not_before_ms + REVOCATION_VALIDITY_MS;
+            let revocation = DeviceRevocationV2 {
+                common,
+                subject_account_id: decode_hex16(&row.account_id, "account_id")?,
+                subject_device_id: subject,
+                subject_signing_key_id: signing,
+                subject_hpke_key_id: hpke,
+                reason_code: reason,
+            };
+            let container = build_record(me.signer, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+            let payload = DeviceRevokeRequestV2 {
+                signed_container_hash: container_hash(&container)?,
+                exact_signed_revocation_container_bytes: container,
+                activations: Vec::new(),
+            };
+            let request = hex(&cx.request(OperationKind::DeviceRevoke, payload.encode())?);
+            commit(state, save, |s| {
+                s.revocations.insert(id.clone(), request);
+            })?;
         }
-        Some(_) => false,
-        None => true,
-    };
-    if stale {
-        let (signing, hpke, _) = listed_keys(row)?;
-        let mut common = cx.common(random()?, now);
-        common.not_after_ms = common.not_before_ms + REVOCATION_VALIDITY_MS;
-        let revocation = DeviceRevocationV2 {
-            common,
-            subject_account_id: decode_hex16(&row.account_id, "account_id")?,
-            subject_device_id: subject,
-            subject_signing_key_id: signing,
-            subject_hpke_key_id: hpke,
-            reason_code: reason,
-        };
-        let container = build_record(me.signer, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
-        let payload = DeviceRevokeRequestV2 {
-            signed_container_hash: container_hash(&container)?,
-            exact_signed_revocation_container_bytes: container,
-            activations: Vec::new(),
-        };
-        let request = hex(&cx.request(OperationKind::DeviceRevoke, payload.encode())?);
-        commit(state, save, |s| {
-            s.revocations.insert(id.clone(), request);
-        })?;
+        let filed = async {
+            let exact = unhex_vec(&state.revocations[&id])?;
+            let request = IdempotentMutationRequestV2::parse(&exact).map_err(|_| corrupt())?;
+            let sent = DeviceRevokeRequestV2::parse(&request.canonical_payload_bytes)
+                .map_err(|_| corrupt())?;
+            let stored = client.revoke_device(access, &id, &exact).await?;
+            let revoked = DeviceRevokedV2::parse(&stored_payload(
+                &stored,
+                &request,
+                RECORD_TYPE_DEVICE_REVOKED,
+            )?)
+            .map_err(|_| mismatch())?;
+            if (
+                revoked.tenant_id,
+                revoked.subject_device_id,
+                revoked.signed_container_hash,
+            ) != (cx.tenant, subject, sent.signed_container_hash)
+            {
+                return Err(mismatch());
+            }
+            Ok(())
+        }
+        .await;
+        // The server refuses, with a bare 403, a revocation it has not filed
+        // whose `issued_at_ms` is over five minutes from its clock
+        // (`v2_device_revoke.rs`), and filing one revokes the row. So only a
+        // refused saved one, of a row still not revoked and that old here
+        // too, is built anew, once.
+        match filed {
+            Err(e)
+                if !build
+                    && row.status != "revoked"
+                    && e.to_string().contains("fleet.refusedCustody|status=403|")
+                    && issued_at(&state.revocations[&id], me.signer)?
+                        + REVOCATION_ISSUED_AT_SKEW_MS
+                        <= now =>
+            {
+                build = true;
+            }
+            filed => return filed,
+        }
     }
-    let exact = unhex_vec(&state.revocations[&id])?;
-    let request = IdempotentMutationRequestV2::parse(&exact).map_err(|_| corrupt())?;
-    let sent =
-        DeviceRevokeRequestV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
-    let stored = client.revoke_device(access, &id, &exact).await?;
-    let revoked = DeviceRevokedV2::parse(&stored_payload(
-        &stored,
-        &request,
-        RECORD_TYPE_DEVICE_REVOKED,
-    )?)
-    .map_err(|_| mismatch())?;
-    if (
-        revoked.tenant_id,
-        revoked.subject_device_id,
-        revoked.signed_container_hash,
-    ) != (cx.tenant, subject, sent.signed_container_hash)
-    {
-        return Err(mismatch());
-    }
-    Ok(())
 }
 
 /// Set while Create fleet key runs in this process; the single-instance
@@ -2442,29 +2483,104 @@ mod tests {
             ..active.clone()
         };
         let rt = runtime();
-        let (client, seen) = rt.block_on(mock(refuse_all()));
+        // Every request is refused as the server refuses an issue time it
+        // finds too far from its clock.
+        let (client, seen) = rt.block_on(mock(Arc::new(|_: &str, _: &[u8]| (403, Vec::new()))));
         let t0 = now_ms();
         let id = active.device_id.to_ascii_lowercase();
         let issued = || issued_at(&load().unwrap().revocations[&id], &f.signer).unwrap();
         let retired = DeviceRevocationReason::Retired;
 
-        // The first request never reaches the server.
+        // The first request is refused.
         revoke(&rt, &f, &client, &active, retired, t0);
         let first = load().unwrap().revocations[&id].clone();
+
+        // A minute on, still young by this clock: resent as saved.
+        revoke(&rt, &f, &client, &active, retired, t0 + MINUTE);
+        assert_eq!(load().unwrap().revocations[&id], first);
 
         // Ten minutes on, a row the server shows revoked filed it: resent.
         let later = t0 + 10 * MINUTE;
         revoke(&rt, &f, &client, &filed, retired, later);
         assert_eq!(load().unwrap().revocations[&id], first);
 
-        // A row still active means it was never filed, and the server would
-        // refuse it now: a fresh one is built, saved and sent.
+        // A row still active means it was never filed: the saved one is sent
+        // first, and once refused, a fresh one is built, saved and sent.
         revoke(&rt, &f, &client, &active, retired, later);
         let second = load().unwrap().revocations[&id].clone();
         assert_ne!(second, first);
         assert_eq!(issued(), later - MINUTE);
         let bodies: Vec<Vec<u8>> = sent(&seen).into_iter().map(|(_, b)| b).collect();
         let (first, second) = (unhex_vec(&first).unwrap(), unhex_vec(&second).unwrap());
-        assert_eq!(bodies, [first.clone(), first, second]);
+        assert_eq!(
+            bodies,
+            [first.clone(), first.clone(), first.clone(), first, second]
+        );
+    }
+
+    #[test]
+    fn a_new_row_id_for_the_same_keys_keeps_the_first_sight_window() {
+        let f = fixture();
+        let mut state = f.prepared();
+        let (row, _) = joiner();
+        let t0 = now_ms();
+        see_devices(
+            std::slice::from_ref(&row),
+            &f.pin(),
+            t0,
+            &mut state,
+            &mut |s| save(s),
+        )
+        .unwrap();
+        let alias = TenantDevice {
+            device_id: hex(&[0x6f; 16]),
+            ..row.clone()
+        };
+        assert!(
+            f.code(&row) == f.code(&alias),
+            "the ceremony inputs did not change"
+        );
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let _error = approve(&rt, &f, &client, &alias, &f.code(&row), t0 + 11 * MINUTE);
+        assert!(
+            sent(&seen).is_empty(),
+            "a row alias extended the approval window without new keys"
+        );
+    }
+
+    #[test]
+    fn a_retry_resends_a_saved_revocation_the_server_may_still_file() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let row = TenantDevice {
+            status: "active".into(),
+            ..row
+        };
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(refuse_all()));
+        let t0 = now_ms();
+        revoke(&rt, &f, &client, &row, DeviceRevocationReason::Retired, t0);
+        let saved = load().unwrap().revocations[&row.device_id].clone();
+        // The server clock is one minute behind this custodian's. At retry,
+        // the saved issued_at is only 270 seconds old on that server.
+        let retry = t0 + 270_000;
+        let server_now = retry - MINUTE;
+        assert!(server_now - issued_at(&saved, &f.signer).unwrap() < 300_000);
+        revoke(
+            &rt,
+            &f,
+            &client,
+            &row,
+            DeviceRevocationReason::Retired,
+            retry,
+        );
+        let posts = sent(&seen);
+        assert_eq!(posts.len(), 2);
+        assert!(
+            posts[0].1 == posts[1].1,
+            "a still-valid saved revocation was replaced"
+        );
     }
 }

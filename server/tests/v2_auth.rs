@@ -10987,6 +10987,188 @@ fn devices_path(tenant: &[u8; 16]) -> String {
 }
 
 #[tokio::test]
+async fn a_v1_member_cannot_read_another_accounts_root_grants() {
+    let mut server = start("verifier-root-reader", 28451).await;
+    let (custodian, access, _) = custodian(&mut server, 0x6c).await;
+    let path = format!(
+        "/v2/tenants/{}/devices/{}/root-key-grants",
+        hex(&TENANT),
+        hex(&custodian.id)
+    );
+    let (status, body) = server.call(&path, &access, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["grants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, login) = server
+        .post(
+            "/auth/login",
+            None,
+            json!({"username":"admin", "password":"secret"}),
+        )
+        .await;
+    let v1 = login["token"].as_str().unwrap();
+    // This v1 user maps to OTHER, not the custodian's OWNER account.
+    server.sql("UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?", &[&OTHER]).await;
+    let (status, body) = server.call(&path, v1, None).await;
+    let returned = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["grants"].as_array().map(Vec::len))
+        .unwrap_or(0);
+    assert!(
+        status == 403 && returned == 0,
+        "another account's root grant was readable (HTTP {status}, {returned} grants)"
+    );
+}
+
+#[tokio::test]
+async fn the_legacy_guarded_routes_still_require_v1_auth() {
+    let server = start("verifier-route-matrix", 28452).await;
+    let reader = device(&server, OWNER, 0x5b, "pending").await;
+    let s = session(&server, &reader).await;
+    let access = s["access_token"].as_str().unwrap();
+    let t = hex(&TENANT);
+    let id = hex(&reader.id);
+    let routes = [
+        ("GET", "/me".into()),
+        ("POST", "/me/password".into()),
+        ("GET", "/users".into()),
+        ("POST", "/users".into()),
+        ("DELETE", "/users/x".into()),
+        ("PATCH", "/users/x/role".into()),
+        ("PATCH", "/users/x/password".into()),
+        ("GET", "/audit".into()),
+        ("GET", "/folders".into()),
+        ("POST", "/folders".into()),
+        ("PATCH", "/folders/x".into()),
+        ("DELETE", "/folders/x".into()),
+        ("GET", "/envs".into()),
+        ("POST", "/envs".into()),
+        ("GET", "/envs/x".into()),
+        ("PATCH", "/envs/x".into()),
+        ("DELETE", "/envs/x".into()),
+        ("POST", "/envs/x/checkout".into()),
+        ("POST", "/envs/x/lease".into()),
+        ("POST", "/envs/x/release".into()),
+        ("POST", "/envs/x/force-unlock".into()),
+        ("GET", "/envs/x/lock".into()),
+        ("POST", "/envs/x/checkin".into()),
+        ("GET", "/envs/x/snapshot/1".into()),
+        ("POST", "/acl".into()),
+        ("DELETE", "/acl".into()),
+        ("GET", "/proxies".into()),
+        ("POST", "/proxies".into()),
+        ("DELETE", "/proxies/x".into()),
+        ("GET", format!("/v2/tenants/{t}/root-key-generation")),
+        ("POST", "/v2/operations".into()),
+        ("POST", "/v2/operations/complete".into()),
+        ("POST", "/v2/fleet/leases".into()),
+        ("POST", "/v2/fleet/leases/release".into()),
+        ("POST", "/v2/fleet/uploads".into()),
+        ("POST", format!("/v2/fleet/uploads/{t}/{id}/chunk")),
+        ("POST", "/v2/fleet/uploads/commit".into()),
+        ("POST", "/v2/fleet/uploads/abort".into()),
+        ("GET", format!("/v2/fleet/snapshots/{t}/{id}")),
+        ("GET", format!("/v2/fleet/snapshots/{t}/{id}/range")),
+    ];
+    let http = client();
+    for bearer in [None, Some(access)] {
+        for (method, path) in &routes {
+            let mut req = http.request(
+                method.parse().unwrap(),
+                format!("http://127.0.0.1:{}{path}", server.port),
+            );
+            if let Some(token) = bearer {
+                req = req.bearer_auth(token);
+            }
+            let res = req
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status().as_u16(), 401, "{method} {path}");
+        }
+    }
+    for path in [
+        "/v2/server-identity".to_string(),
+        format!("/v2/tenants/{t}/fleets/{t}/key-generation"),
+        format!("/v2/tenants/{t}/devices/{id}/root-key-grants"),
+    ] {
+        let res = http
+            .get(format!("http://127.0.0.1:{}{path}", server.port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 401, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_revocation_blocks_new_capabilities_and_inflight_session_proofs() {
+    let mut server = start("verifier-revoke-capability", 28453).await;
+    let (issuer, access, _) = custodian(&mut server, 0x6c).await;
+    let peer = device(&server, OWNER, 0x7d, "active").await;
+    file_approval(&server, &issuer, &peer, 0x7d).await;
+    let old_session = session(&server, &peer).await;
+    let ticket = server.login("owner").await;
+    let (status, pending_challenge) = challenge(&server, &ticket, &peer).await;
+    assert_eq!(status, 201);
+    let proof = answer(&ticket, &pending_challenge, &peer);
+    let duty = capability_grant(&issuer, &issuer.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let initial_capability =
+        capability_grant(&peer, &issuer.sk, |g| g.common.replay_id = [0xa9; 16]);
+    assert_eq!(
+        server
+            .call(GRANTS, &access, Some(&initial_capability))
+            .await
+            .0,
+        201
+    );
+    let signed = revocation(&issuer.sk, &peer, 0x90, 30);
+    assert_eq!(
+        server
+            .call(
+                &device_revoke_path(&peer.id),
+                &access,
+                Some(&revoke_request(0xa0, &signed))
+            )
+            .await
+            .0,
+        201
+    );
+    let new_capability = capability_grant(&peer, &issuer.sk, |g| g.common.replay_id = [0xaa; 16]);
+    let (status, body) = server.call(GRANTS, &access, Some(&new_capability)).await;
+    assert_eq!(status, 422);
+    assert!(String::from_utf8_lossy(&body)
+        .contains("the grant names no active subject under these keys"));
+    let (status, _) = server
+        .post(
+            "/v2/auth/device-session-proofs",
+            Some(ticket["ticket"].as_str().unwrap()),
+            proof,
+        )
+        .await;
+    assert_eq!(status, 409);
+    let (status, _) = server
+        .post(
+            "/v2/auth/refresh",
+            None,
+            json!({"refresh_token": old_session["refresh_token"]}),
+        )
+        .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
 async fn a_custodian_lists_the_tenant_devices_with_their_public_keys() {
     let mut server = start("s1-devices", 28235).await;
     let (dev, access, _) = custodian(&mut server, 0x6c).await;

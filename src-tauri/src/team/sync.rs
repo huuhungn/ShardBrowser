@@ -5664,6 +5664,20 @@ mod tests {
         world_with(Vec::new())
     }
 
+    #[test]
+    fn key_status_and_push_agree_after_the_fleet_key_is_lost() {
+        let w = world();
+        assert!(holds_verified_key(&w.dev, &FLEET, NOW).unwrap());
+        assert_eq!(w.push().unwrap().version, 1);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        assert!(!holds_verified_key(&w.dev, &FLEET, NOW).unwrap());
+        let error = w.push().unwrap_err();
+        assert!(
+            has(&error, "sync.noVerifiedFleetKey"),
+            "push must also reject the missing key"
+        );
+    }
+
     /// `world` with `extra` containers in its trust evidence.
     fn world_with(extra: Vec<Vec<u8>>) -> World {
         world_of(extra, true)
