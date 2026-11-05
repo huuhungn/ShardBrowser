@@ -2186,13 +2186,16 @@ mod tests {
     fn a_device_label_holding_the_token_body_is_not_echoed_to_ipc() {
         let body = "6d".repeat(32);
         let access = format!("v2a.{body}");
-        let (mut row, _) = joiner();
-        row.label_hex = hex(format!("label {body}").as_bytes());
-        let reply = list_and_see(&access, &row, &mut Vec::new()).unwrap();
-        assert!(
-            !reply.contains(&body),
-            "the IPC reply leaked the token body"
-        );
+        // The server reads hex in either case: so must the scrub.
+        for echoed in [body.clone(), body.to_ascii_uppercase()] {
+            let (mut row, _) = joiner();
+            row.label_hex = hex(format!("label {echoed}").as_bytes());
+            let reply = list_and_see(&access, &row, &mut Vec::new()).unwrap();
+            assert!(
+                !reply.to_ascii_lowercase().contains(&body),
+                "the IPC reply leaked the token body as {echoed}"
+            );
+        }
     }
 
     #[test]

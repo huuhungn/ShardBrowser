@@ -239,7 +239,17 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
         // Only a long body: a short one would hide unrelated text.
         if let Some((_, body)) = secret.split_once('.') {
             if body.len() >= 16 {
-                out = out.replace(body, "[redacted]");
+                // The server reads hex in either case, so match the body so.
+                // ASCII lower-casing keeps every byte offset of `out`.
+                let (needle, lower) = (body.to_ascii_lowercase(), out.to_ascii_lowercase());
+                let (mut done, mut at) = (String::new(), 0);
+                while let Some(i) = lower[at..].find(&needle) {
+                    done.push_str(&out[at..at + i]);
+                    done.push_str("[redacted]");
+                    at += i + needle.len();
+                }
+                done.push_str(&out[at..]);
+                out = done;
             }
         }
     }

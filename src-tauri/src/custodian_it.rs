@@ -567,16 +567,16 @@ fn a_setup_whose_cleanup_fails_leaves_no_usable_verified_key() {
 }
 
 /// A loopback proxy in front of `upstream` that reports every device grant
-/// PENDING_ACK and answers 409 to any ack whose body is not in `allowed`,
-/// counting those refusals.
+/// PENDING_ACK and answers 409 to any ack whose body is not in `allowed`.
+/// It counts `[refused acks, rewritten readbacks]`.
 fn pending_ack_proxy(
     rt: &tokio::runtime::Runtime,
     upstream: String,
     allowed: Vec<Vec<u8>>,
-) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+) -> (String, std::sync::Arc<[std::sync::atomic::AtomicUsize; 2]>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let refused = std::sync::Arc::new(AtomicUsize::new(0));
-    let count = refused.clone();
+    let counts = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let count = counts.clone();
     let http = reqwest::Client::new();
     let app = axum::Router::new().fallback(
         move |method: axum::http::Method,
@@ -595,7 +595,7 @@ fn pending_ack_proxy(
                     && uri.path().ends_with("/ack")
                     && !allowed.iter().any(|a| a[..] == body[..])
                 {
-                    count.fetch_add(1, Ordering::SeqCst);
+                    count[0].fetch_add(1, Ordering::SeqCst);
                     return (axum::http::StatusCode::CONFLICT, Vec::new()).into_response();
                 }
                 let mut req = http.request(method, format!("{upstream}{path}"));
@@ -613,6 +613,7 @@ fn pending_ack_proxy(
                     let (from, to) = (b"\x6cACKNOWLEDGED", b"\x6bPENDING_ACK");
                     if let Some(i) = bytes.windows(from.len()).position(|w| w == from) {
                         bytes.splice(i..i + from.len(), to.iter().copied());
+                        count[1].fetch_add(1, Ordering::SeqCst);
                     }
                 }
                 let mut out = (status, bytes).into_response();
@@ -630,7 +631,7 @@ fn pending_ack_proxy(
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
     });
-    (url, refused)
+    (url, counts)
 }
 
 /// Step 7's ACKED receipt is the setup's ack: a server that then reports the
@@ -670,7 +671,7 @@ fn a_setup_does_not_ack_again_after_its_acked_receipt() {
     let allowed = [&state.device_ack_request, &state.recovery_ack_request]
         .map(|r| crate::fleet_client::decode_hex(r).unwrap())
         .to_vec();
-    let (proxy, refused) = pending_ack_proxy(&rt, h.server.url(), allowed);
+    let (proxy, counts) = pending_ack_proxy(&rt, h.server.url(), allowed);
     let mut c = crate::team_config::load().unwrap();
     c.server_url = proxy;
     crate::team_config::save(&c).unwrap();
@@ -682,11 +683,14 @@ fn a_setup_does_not_ack_again_after_its_acked_receipt() {
     let usable = crate::team_config::status().unwrap().has_fleet_key;
     assert_eq!(result.is_err(), !usable, "{result:?}");
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(
-        refused.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "no new ack"
+    let [refused, rewritten] = counts
+        .each_ref()
+        .map(|n| n.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        rewritten >= 1,
+        "the readback was never reported PENDING_ACK"
     );
+    assert_eq!(refused, 0, "no new ack");
 }
 
 /// A second device B with config and data roots of its own, and its
