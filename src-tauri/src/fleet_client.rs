@@ -268,7 +268,7 @@ fn json_ascii_escaped(s: &str, upper: bool) -> String {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            ' '..='\u{7f}' => out.push(c),
+            ' '..='~' => out.push(c),
             _ => {
                 for unit in c.encode_utf16(&mut [0; 2]) {
                     out.push_str(&if upper {
@@ -2012,12 +2012,12 @@ mod tests {
     #[test]
     fn a_login_error_hides_a_non_ascii_password_echoed_as_ascii_escapes() {
         let suffix = random_id_hex();
-        let password = format!("q\"\u{1}\u{e9}\u{1f600}-{suffix}");
+        let password = format!("q\"\u{1}\u{7f}\u{e9}\u{1f600}-{suffix}");
         // Python's `json.dumps` default, then the same in upper-case hex.
         let u = "\x5cu";
         for echo in [
-            format!(r#"{{"password":"q\"{u}0001{u}00e9{u}d83d{u}de00-{suffix}"}}"#),
-            format!(r#"{{"password":"q\"{u}0001{u}00E9{u}D83D{u}DE00-{suffix}"}}"#),
+            format!(r#"{{"password":"q\"{u}0001{u}007f{u}00e9{u}d83d{u}de00-{suffix}"}}"#),
+            format!(r#"{{"password":"q\"{u}0001{u}007F{u}00E9{u}D83D{u}DE00-{suffix}"}}"#),
         ] {
             let error = login_error_echoing(&password, echo);
             assert!(
