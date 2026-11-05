@@ -92,7 +92,7 @@ cannot retract a TRK a device already copied. Excluding a device means rotating
 to a new generation and re-wrapping — the design says this explicitly, and it is
 the right model to keep.
 
-### What is missing
+### What ships
 
 | Piece | State |
 | --- | --- |
@@ -100,27 +100,24 @@ the right model to keep.
 | `v2_tenant_root_key_grants` table | The exact plan 7.2 shape since migration 0016; spike rows stay read-only in `v2_legacy_tenant_root_key_grants` |
 | `POST /v2/tenants/:tenant/root-key-generations` | S6 bootstrap: the D1 device's setup session files its signed `FirstRootSelfGrant` and generation 0 in `PREPARING`, as one exact idempotent mutation |
 | `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants of an `ACTIVE` generation only |
-| Root generation lifecycle | Bootstrap create only. Readback, acknowledgement, activation and rotation are not implemented; the spike `POST /v2/tenant-root-key-grants` and begin/activate routes were removed |
-| Grant issuance at enrollment | Not implemented — grants must be filed by an external custodian |
-| Recovery bundle | Not implemented |
+| Root custody setup | "Set up root custody" on the tenant's first device: root generation 0 and its self grant, acknowledged and activated, and the recovery bundle written locally. Rotation is not implemented |
+| Fleet key | "Create fleet key" on the root custodian: fleet generation 0, its device and recovery grants, acknowledged and activated. The key is kept only once a verified collect opens it |
+| Approving a device | The custodian's device list shows each pending device's code, computed from the custodian's pin and the listed key IDs, with both full key IDs and the anchor one click away. Approve needs the "code matches" box ticked and is refused more than ten minutes after this computer first saw the row. It files the device's fleet-scoped approval, its three profile capability grants and its fleet key grant |
+| Joining | The new device's "Show join code" works for ten minutes after its own enrollment, by its own clock. "Codes match" pins the anchor (A0), and "Collect key custody" keeps the fleet key once its grant verifies against that pin. An expired code offers "Enroll again"; the old row stays on the server until a custodian revokes it |
+| Revocation | Revoke on the device list, as retired or lost. `compromised` is not offered |
+| Fleet key rotation | Not implemented: a revoked device keeps generation 0 (see below) |
+| Recovery bundle | Holds the root key. It does not include the fleet key yet, which stays recoverable through the server's recovery grant |
+| Approvals and grants | Run one year, with no renewal |
 
-Storage and collection now exist: a grant sealed to a device's HPKE key can be
-filed, read back, and opened by that device, and `v2_e2e.rs` proves the round
-trip by recovering the key from what the server returned. The server stores
-ciphertext it cannot read.
+A grant has to name a generation that exists, and wrap the key that generation
+committed to. Before this, the generation number in a grant was decoration: a
+grant could name any number and seal any key, and the mismatch would only
+surface later as a backup nobody could open.
 
-A grant now has to name a generation that exists, and wrap the key that
-generation committed to. Before this, the generation number in a grant was
-decoration: a grant could name any number and seal any key, and the mismatch
-would only surface later as a backup nobody could open.
-
-The bootstrap creates generation 0 in `PREPARING` together with the first
-device's `FirstRootSelfGrant`, in one request that names only the root key's
-identifier — the key itself is generated on the device and never transmitted,
-which is what keeps the server unable to read anything sealed under it. It is
-accepted once per tenant, only on the setup session that D1 approved. The
-generation is to become `ACTIVE` only after the holder acknowledges that it can
-unwrap what it filed; that step is not built yet.
+Each key is generated on the device and never transmitted: a create request
+names only the key's identifier, which is what keeps the server unable to read
+anything sealed under it. A generation becomes `ACTIVE` only after its holder
+acknowledges that it can unwrap what it filed.
 
 Activation is deliberately separate from filing. Filing proves a grant was
 written; it does not prove anyone can open it. A tenant that activated on filing
@@ -128,10 +125,40 @@ could seal itself under a key it had already lost, and that failure is
 unrecoverable by construction — the server cannot help, because it never sees a
 key.
 
-What is still missing is everything that would *produce* grants automatically.
-Nothing seals a TRK to a newly enrolled device, and no rotation or recovery
-ceremony exists. So sync still falls back to a shared passphrase: the transport
-and the bootstrap for a root key exist, the issuance ceremony does not.
+Team profiles sync under the fleet key. The team passphrase and the v1 API
+token remain only for legacy passphrase sync; connecting and every device
+session work without a token.
+
+### Revocation: what it does and does not protect
+
+Revoking a device:
+
+- In one transaction, revokes the device, ends its sessions, releases its
+  leases, and revokes every approval, capability grant, root grant and fleet
+  device grant naming it (`server/src/routes/v2_device_revoke.rs`).
+- Stops new sign-ins as that device and new fleet grants to it.
+- Puts out a signed revocation that clients count. From then on they refuse
+  records signed by its key that they had not already seen.
+- Quarantines heads it signs afterwards (`SIGNER_REVOKED`).
+- Also quarantines, as `SIGNER_REVOKED`, a head it signed **before** the
+  revoke, if a device already pinned that head. The custodian (or another
+  device that can commit the profile) then has to run Revert on it to continue
+  (ADR 0002 rule 6).
+
+It does not:
+
+- **Recall the fleet key the device holds.** Until rotation ships, generation 0
+  stays `ACTIVE`. The device can decrypt every snapshot it downloaded and any
+  later snapshot ciphertext that leaks to it, because new snapshots still use
+  its key. It cannot fetch them through the server.
+- Delete profiles already pulled to its disk.
+- Rotate keys. The fleet becomes `rotation_required`, which is advisory for
+  `retired` and `lost`.
+- Survive a server that hides the revocation.
+- Change anything else that is still shared. Both machines use the one tenant
+  account, and its password is unchanged. The revoked machine can still sign
+  in and enroll a *new* pending device, which gets nothing without a fresh
+  approval. A shared legacy v1 token, if one was configured, also stays valid.
 
 ### A failure worth remembering
 

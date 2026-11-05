@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Team
+
+- **Create fleet key.** The root custodian creates the team's fleet key from
+  the Team page. A notice says that the recovery bundle does not include the
+  fleet key yet; it stays recoverable through the server's recovery grant.
+- **Devices.** The root custodian lists the team's devices. A pending device
+  shows its code, the time left on this computer's clock, and its full key IDs
+  on request; Approve needs the "code matches" box ticked and closes ten
+  minutes after this computer first saw the device. Rows that share a label
+  tag the newest enrollment. Any other active device can be revoked as Retired
+  or Lost, behind a confirmation that says what revoking does not protect.
+- **Join code.** A new device shows its join code for ten minutes after it
+  enrolls; "Codes match" pins the team's anchor, then "Collect key custody"
+  keeps the fleet key. An expired code offers Enroll again.
+- **No token needed.** Connecting needs only the server URL and the tenant ID.
+  The API token is optional and serves legacy passphrase sync only.
+
 ### Known limitations
 
 - Team (v2.6.0, v2.6.1) cannot yet be used end to end against a real team

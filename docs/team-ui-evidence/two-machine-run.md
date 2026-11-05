@@ -1,8 +1,31 @@
 # Team UI two-machine run
 
-**Status:** BLOCKED: the run cannot be done with v2.6.1 against a real team server; it waits for v0.2.2 (owner decision 2026-11-04). It was PENDING-MANUAL (owner decision 2026-11-03: the real two-machine run is done by the operator after release, like G2-48).
+**Status:** PENDING-MANUAL: the operator runs it after v2.7.0 is released, with the steps below (plan v0.2.2a section 6 M). It was BLOCKED from 2026-11-04 until the custodian work (Create fleet key, the device list with Approve and Revoke, the join code) shipped; the reason is kept below. Before that it was PENDING-MANUAL (owner decision 2026-11-03: the real two-machine run is done by the operator after release, like G2-48).
 
-## Why it is blocked
+## Setup steps (M.0a-0g)
+
+Use disposable credentials only, and record no hostnames, URLs or passwords.
+
+1. **0a.** Host: `identity init`, `tenant create`, then start the server.
+   Paste the printed 32-hex `tenant_id` exactly; the Team card's Generate
+   button makes a UUID and does not apply here.
+2. **0b.** Sandbox reachability, by the method the S0 spike proved: a
+   `portproxy` to loopback, or the HTTPS fallback. Plaintext `portproxy` is for
+   this test run only.
+3. **0c.** A (a temporary local Windows user): connect (server URL and tenant
+   ID, no token), enroll. The operator runs `tenant confirm-first-device`. A
+   runs Set up root custody.
+4. **0d.** A: Create fleet key.
+5. **0e.** B (Windows Sandbox): connect, enroll, Show join code.
+6. **0f.** A: Show devices. Compare the codes (and the full key IDs), tick
+   "The code on the other device matches", Approve. B: Codes match, then
+   Collect key custody.
+7. **0g.** Gate steps 1-5 below.
+8. **Optional.** A revokes B; record the refusal B gets on its next pull.
+
+Record the results in a separate "Record the two-machine run" PR, redacted.
+
+## Why it was blocked
 
 Found on 2026-11-04 while preparing the run (machine A as a separate local
 Windows user, machine B as Windows Sandbox, a fresh team server with a
@@ -23,11 +46,9 @@ fleet needs custodian steps that v2.6.1 has no client for:
 - `docs/key-custody.md` already says grants "must be filed by an external
   custodian"; no such tool ships.
 
-The e2e test "two devices pass one team profile back and forth" passes because
-its mock server hands both devices a fleet key; it does not exercise these
-steps. Approving and revoking devices was deferred to v0.2.2 on 2026-11-02;
-creating the fleet key generation and filing its grants belongs with it. The
-checklist below stays as is for that release.
+The e2e test "two devices pass one team profile back and forth" then passed
+because its mock server handed both devices a fleet key. Its mock now hands out
+none: B is refused until A creates the fleet key, approves B and B collects.
 
 The gate: one team profile is published on machine A, restored and used on
 machine B, checked in from B, and checked out again on A, with both machines
