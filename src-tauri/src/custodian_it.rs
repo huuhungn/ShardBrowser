@@ -505,6 +505,67 @@ fn a_fleet_setup_resumes_after_a_failed_save_and_a_replayed_run_against_the_real
     );
 }
 
+/// Setup reports failure if retiring its temporary credential fails; that
+/// failure must not leave a usable key, and a retry converges.
+#[test]
+fn a_setup_whose_cleanup_fails_leaves_no_usable_verified_key() {
+    let rt = runtime();
+    let h = custodian(15, "cleanup-fails", &rt);
+    let c = crate::team_config::load().unwrap();
+    let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+    let device = crate::fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &crate::fleet_custody::CredentialFkekStore,
+    };
+    let root = crate::root_bootstrap::load().unwrap();
+    // Model a crash after activation, before the first verified collect.
+    with_session(&rt, &h, async |client, access| {
+        let mut state = crate::fleet_custody::load().unwrap();
+        crate::fleet_custody::bootstrap_fleet(
+            client,
+            access,
+            &device,
+            &root,
+            &mut state,
+            &mut |s| crate::fleet_custody::save(s),
+        )
+        .await
+        .unwrap();
+    });
+    assert!(!crate::team_config::status().unwrap().has_fleet_key);
+    let state = crate::fleet_custody::load().unwrap();
+    let reference = format!(
+        "fleet-setup.{}.{}",
+        h.tenant.to_ascii_lowercase(),
+        state.fkek_nonce
+    );
+    crate::credential::fail_next_call(&reference);
+    let result = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    );
+    assert!(result.is_err(), "the cleanup failure must reach the caller");
+    assert!(crate::fleet_custody::status().unwrap().setup_key_held);
+    assert!(
+        !crate::team_config::status().unwrap().has_fleet_key,
+        "a failed setup left a verified key usable for sealing"
+    );
+    // The retry releases the key, replays the saved bytes and collects the
+    // same FKEK: nothing is generated again.
+    let done = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert!(done.created && !done.setup_key_held);
+    assert_eq!(done.fkek_key_id, state.fkek_key_id);
+    assert!(crate::team_config::status().unwrap().has_fleet_key);
+}
+
 /// A second device B with config and data roots of its own, and its
 /// credentials in namespace `b`.
 struct Member {

@@ -53,7 +53,8 @@ use crate::root_bootstrap::{
     unhex_vec, BootstrapState, Context16,
 };
 
-/// Where the fleet key lives from its creation until the verified collect,
+/// Where the fleet key lives from its creation until the generation is
+/// activated,
 /// under the reference [`setup_ref`] names.
 pub trait FkekStore: Sync {
     fn store(&self, credential_ref: &str, key: &[u8; 32]) -> Result<()>;
@@ -92,7 +93,7 @@ pub struct FleetCustodyState {
     #[serde(default)]
     pub capability_grants: Vec<String>,
     /// Names this run's setup key: saved before the key is stored, cleared
-    /// once the key is released after the verified collect.
+    /// once the key is released after activation, before the verified collect.
     #[serde(default)]
     pub fkek_nonce: String,
     /// The id of the setup key, saved once the store holds the key.
@@ -1167,8 +1168,8 @@ pub struct FleetCustodyStatus {
     pub fkek_key_id: String,
 }
 
-/// Releases the setup key of the state on disk, after the verified collect,
-/// which may itself have saved an ack there.
+/// Releases the setup key of the state on disk once generation 0 is active,
+/// before the verified collect: no later step reads it.
 pub fn release(vault: &dyn FkekStore) -> Result<()> {
     let mut state = load()?;
     release_fkek(vault, &mut state, &mut |s| save(s))
@@ -2105,6 +2106,39 @@ mod tests {
             .members
             .values()
             .all(|m| m.approval.is_empty()));
+    }
+
+    #[test]
+    fn a_successful_device_listing_does_not_echo_its_access_token_to_ipc() {
+        let f = fixture();
+        let rt = runtime();
+        let access = format!("v2a.{}", "6f".repeat(32));
+        let (mut row, _) = joiner();
+        // A hostile server knows the bearer it just received. Return it in
+        // the label encoding the client decodes before forming its IPC reply.
+        row.label_hex = hex(access.as_bytes());
+        let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+            "device_id": row.device_id, "account_id": row.account_id,
+            "status": row.status, "label_hex": row.label_hex,
+            "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+            "signing_public_key": row.signing_public_key,
+            "hpke_public_key": row.hpke_public_key,
+        }] }))
+        .unwrap();
+        let (client, _) = rt.block_on(mock(Arc::new(move |call, _| {
+            assert!(call.ends_with("/devices"));
+            (200, body.clone())
+        })));
+        let rows = rt
+            .block_on(client.list_tenant_devices(&access, &f.tenant))
+            .unwrap();
+        let mut state = f.state();
+        let listed = see_devices(&rows, &f.pin(), now_ms(), &mut state, &mut |_| Ok(())).unwrap();
+        let reply = serde_json::to_string(&listed).unwrap();
+        assert!(
+            !reply.contains(&access),
+            "the device-list IPC reply leaked the access token"
+        );
     }
 
     #[test]

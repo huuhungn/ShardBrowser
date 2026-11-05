@@ -8,11 +8,14 @@ import {
 import { timeLeft, type TeamActionProps } from "./TeamDevices";
 
 const EXPIRED = "fleet.joinCodeExpired";
+// Expired on an active pinned device, which Enroll again refuses.
+const JOINED = "fleet.joinedCollectKey";
 
 /**
  * A joining device's code: shown with the anchor and full key IDs while its
  * ten-minute window is open, then Codes match pins the anchor. An expired
- * code offers Enroll again.
+ * code offers Enroll again, unless the device is active and pinned: then it
+ * points at Collect key custody.
  */
 export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProps & {
   onEnrolledAgain: (status: TeamStatus) => void;
@@ -20,6 +23,7 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
   const t = useT();
   const [code, setCode] = useState<TeamJoinCode | null>(null);
   const [refusedExpired, setRefusedExpired] = useState(false);
+  const [joined, setJoined] = useState(false);
   const [full, setFull] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -31,7 +35,11 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
   const expired = refusedExpired || (!!code && !pinned && now > code.expires_at_ms);
   const login = () => [account.username.trim(), account.take()] as const;
   const noteExpired = (e: unknown) => {
-    if (String(e).includes(EXPIRED)) setRefusedExpired(true);
+    const s = String(e);
+    if (s.includes(JOINED) || s.includes(EXPIRED)) {
+      setRefusedExpired(true);
+      setJoined(s.includes(JOINED));
+    }
     throw e;
   };
 
@@ -102,11 +110,15 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
       {expired && (
         <>
           <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.joinCode.expired")}</p>
-          <div>
-            <Button size="small" disabled={!!busy || !account.signedIn} onClick={again}>
-              {t("team.joinCode.enrollAgain")}
-            </Button>
-          </div>
+          {joined ? (
+            <p className="m-0 text-paragraph-xs text-text-sub-600">{t(JOINED)}</p>
+          ) : (
+            <div>
+              <Button size="small" disabled={!!busy || !account.signedIn} onClick={again}>
+                {t("team.joinCode.enrollAgain")}
+              </Button>
+            </div>
+          )}
         </>
       )}
     </div>

@@ -2503,9 +2503,9 @@ fn team_fleet_custody_status() -> Result<fleet_custody::FleetCustodyStatus, Stri
 
 /// Create the fleet key as the tenant's root custodian, or resume it (plan
 /// v0.2.2a section 4.F): generation 0 of the tenant's fleet, its device and
-/// recovery grants, acknowledged and activated, then the verified collect.
-/// Only once that collect keeps the key is the setup key released. The
-/// password is used for one login and never stored.
+/// recovery grants, acknowledged and activated, then the setup key is
+/// released, then the verified collect. The password is used for one login
+/// and never stored.
 #[tauri::command]
 async fn team_fleet_key_setup(
     username: String,
@@ -2552,15 +2552,17 @@ async fn team_fleet_key_setup(
         })
         .await
         .map_err(|e| e.to_string())?;
+        // Generation 0 is ACTIVE with both grants acknowledged, and nothing
+        // after `prepare` reads the setup key. Release it before the collect,
+        // so a release that fails never leaves a usable key behind; a resumed
+        // run replays the saved requests and collects without it.
+        fleet_custody::release(device.vault).map_err(|e| e.to_string())?;
         // Step 9: only the verified collect keeps the key in `fleet_keys`.
         let (device_sk, _) = shardx_core::grants::derive_keypair(&hpke_seed);
-        if let Some(error) =
-            setup_collect_error(collect_fleet_grant(&client, &c, access, &device_sk).await?)
-        {
-            return Err(error);
+        match setup_collect_error(collect_fleet_grant(&client, &c, access, &device_sk).await?) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        // The collect may have saved an ack: release from the state on disk.
-        fleet_custody::release(device.vault).map_err(|e| e.to_string())
     }
     .await;
     client.end_session(access).await;
@@ -2822,7 +2824,26 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
-    let expires_at_ms = join_window(&c, root_bootstrap::now_ms())?;
+    let expires_at_ms = match join_window(&c, root_bootstrap::now_ms()) {
+        Ok(end) => end,
+        // Enroll again refuses an active device that pinned its anchor
+        // (`team_enroll_again`), so the UI must not offer it: point at the key.
+        Err(expired) if pinned_anchor(&c).is_some() && !password.is_empty() => {
+            let client = fleet_client::FleetClient::new(&c.server_url, &c.token)
+                .map_err(|e| e.to_string())?;
+            let login = fleet_client::AccountLogin {
+                tenant_id: &c.tenant_id,
+                username: username.trim(),
+                password: &password,
+            };
+            let status = client.account_device_status(&login, &c.device_id).await;
+            return Err(match status {
+                Ok(Some(s)) if s == "active" => crate::errcode::code("fleet.joinedCollectKey"),
+                _ => expired,
+            });
+        }
+        Err(expired) => return Err(expired),
+    };
     let (client, session) = open_session(&c, &username, &password).await?;
     let pin = evidence_anchor(&client, &session.access_token, &c).await;
     client.end_session(&session.access_token).await;
@@ -6092,6 +6113,26 @@ mod custody_tests {
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
         assert_cleared(refs);
+    }
+
+    /// An expired code on an active pinned device, which Enroll again
+    /// refuses, points at its key; a pending pinned one still reads as
+    /// expired, so it can enroll again.
+    #[test]
+    fn an_expired_code_on_an_active_pinned_device_points_at_its_key() {
+        let rt = runtime();
+        for (status, code) in [
+            ("active", "fleet.joinedCollectKey"),
+            ("pending", "fleet.joinCodeExpired"),
+        ] {
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            pin_here();
+            let err = rt
+                .block_on(team_join_code("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains(code), "{status}: {err}");
+        }
     }
 
     /// Pins the joiner's tenant to an anchor, as a confirmed join does.

@@ -683,7 +683,25 @@ impl FleetClient {
             .json()
             .await
             .context(crate::errcode::code("fleet.badReplyCustody"))?;
-        Ok(body.devices)
+        // The free text a row carries reaches the UI: a hostile server must
+        // not hand the bearer it just received back through it. The key
+        // fields are hex the custodian decodes and checks.
+        let secrets = [access_token];
+        Ok(body
+            .devices
+            .into_iter()
+            .map(|mut d| {
+                for field in [&mut d.device_id, &mut d.account_id, &mut d.status] {
+                    *field = redact(field, &secrets);
+                }
+                // The label is shown decoded, so it is scrubbed decoded.
+                if let Some(label) = decode_hex(&d.label_hex) {
+                    d.label_hex =
+                        hex(redact(&String::from_utf8_lossy(&label), &secrets).as_bytes());
+                }
+                d
+            })
+            .collect())
     }
 
     /// Files a signed capability grant. The server answers with the exact

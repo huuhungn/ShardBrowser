@@ -437,7 +437,11 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       await teamServer("revoke", { ...me, target: args.deviceId });
       return null;
     case "team_join_code":
-      teamWindowOpen();
+      try { teamWindowOpen(); } catch (e) {
+        // As the launcher: an active pinned device, which cannot enroll again, is pointed at its key.
+        if (teamMe.pinned && await teamServer<string | null>("status", me) === "active") teamRefuse("fleet.joinedCollectKey");
+        throw e;
+      }
       await teamServer("live", me);
       return {
         sas: teamSas(teamMe.device_id), anchor: TEAM_ANCHOR, ...teamKeyIds(teamMe.device_id),
