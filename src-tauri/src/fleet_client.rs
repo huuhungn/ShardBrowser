@@ -231,7 +231,7 @@ impl FleetClient {
 /// `text` with each of `secrets`, and the value after every `v2t.`, `v2a.`,
 /// `v2r.` token prefix and `Bearer `, replaced: a refusal's text is shown and
 /// logged, so it must not carry a credential back.
-fn redact(text: &str, secrets: &[&str]) -> String {
+pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
     let mut out = text.to_string();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         out = out.replace(secret, "[redacted]");
@@ -346,7 +346,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableLogin"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[login.password])
+        // A server may echo the password as sent, or as escaped in the JSON.
+        let quoted = serde_json::to_string(login.password).unwrap_or_default();
+        let escaped = quoted
+            .get(1..quoted.len().saturating_sub(1))
+            .unwrap_or_default();
+        Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[login.password, escaped])
             .await?
             .json()
             .await
@@ -1909,7 +1914,7 @@ mod tests {
             let url = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let client = FleetClient::new(&url, "").unwrap();
-            let password = format!("verifier-password-{}", random_id_hex());
+            let password = format!("account-password-{}", random_id_hex());
             let login = super::AccountLogin {
                 tenant_id: "11",
                 username: "owner",

@@ -121,6 +121,10 @@ pub struct FleetCustodyState {
     /// Approve (section 4.A), per lower-case device id.
     #[serde(default)]
     pub members: BTreeMap<String, MemberApproval>,
+    /// When this custodian first saw each signing and HPKE key ID on a
+    /// pending row, per lower-case key ID; never reset.
+    #[serde(default)]
+    pub key_first_seen: BTreeMap<String, u64>,
     /// Revoke (section 4.R): the exact request, per lower-case device id.
     #[serde(default)]
     pub revocations: BTreeMap<String, String>,
@@ -642,17 +646,12 @@ pub async fn ack_device_grant(
 pub const JOIN_WINDOW_MS: u64 = 10 * 60_000;
 
 /// What Approve keeps for one device: when this custodian first saw it
-/// pending, by its own clock and never reset, the key IDs it was first seen
-/// with, and the exact requests that approve it, saved before the first is
-/// sent.
+/// pending, by its own clock and never reset, and the exact requests that
+/// approve it, saved before the first is sent.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct MemberApproval {
     #[serde(default)]
     pub first_seen_ms: u64,
-    #[serde(default)]
-    pub signing_key_id: String,
-    #[serde(default)]
-    pub hpke_key_id: String,
     #[serde(default)]
     pub approval: String,
     #[serde(default)]
@@ -692,10 +691,8 @@ fn code_of(
 }
 
 /// Section 4.A step 1: notes the first sight of each pending device of
-/// `rows`, which is never reset, and lists every row with its code. A row
-/// whose signing or HPKE key ID was already seen under another device ID
-/// keeps the earliest sight of those keys, so a new row ID never opens a
-/// fresh window for the same keys.
+/// `rows`, and of each key ID it lists, which are never reset, and lists every
+/// row with its code.
 pub fn see_devices(
     rows: &[TenantDevice],
     pin: &(Binding, [u8; 32]),
@@ -703,40 +700,29 @@ pub fn see_devices(
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<Vec<ListedDevice>> {
-    let new: Vec<&TenantDevice> = rows
-        .iter()
-        .filter(|r| r.status == "pending")
-        .filter(|r| {
-            !state
-                .members
-                .contains_key(&r.device_id.to_ascii_lowercase())
-        })
-        .collect();
-    if !new.is_empty() {
+    let pending = || rows.iter().filter(|r| r.status == "pending");
+    let unseen = pending().any(|r| {
+        !state
+            .members
+            .contains_key(&r.device_id.to_ascii_lowercase())
+            || [&r.signing_key_id, &r.hpke_key_id]
+                .iter()
+                .any(|k| !state.key_first_seen.contains_key(&k.to_ascii_lowercase()))
+    });
+    if unseen {
         commit(state, save, |s| {
-            for r in new {
-                let (signing, hpke) = (
-                    r.signing_key_id.to_ascii_lowercase(),
-                    r.hpke_key_id.to_ascii_lowercase(),
-                );
-                let first_seen_ms = s
-                    .members
-                    .values()
-                    .filter(|m| {
-                        m.signing_key_id.eq_ignore_ascii_case(&signing)
-                            || m.hpke_key_id.eq_ignore_ascii_case(&hpke)
-                    })
-                    .map(|m| m.first_seen_ms)
-                    .fold(now, u64::min);
-                s.members.insert(
-                    r.device_id.to_ascii_lowercase(),
-                    MemberApproval {
-                        first_seen_ms,
-                        signing_key_id: signing,
-                        hpke_key_id: hpke,
+            for r in pending() {
+                s.members
+                    .entry(r.device_id.to_ascii_lowercase())
+                    .or_insert_with(|| MemberApproval {
+                        first_seen_ms: now,
                         ..Default::default()
-                    },
-                );
+                    });
+                for key in [&r.signing_key_id, &r.hpke_key_id] {
+                    s.key_first_seen
+                        .entry(key.to_ascii_lowercase())
+                        .or_insert(now);
+                }
             }
         })?;
     }
@@ -745,10 +731,7 @@ pub fn see_devices(
             let bad = |_| anyhow::anyhow!(crate::errcode::code("fleet.badReplyCustody"));
             let signing = decode_hex32(&r.signing_key_id, "signing_key_id").map_err(bad)?;
             let hpke = decode_hex32(&r.hpke_key_id, "hpke_key_id").map_err(bad)?;
-            let first = state
-                .members
-                .get(&r.device_id.to_ascii_lowercase())
-                .filter(|_| r.status == "pending");
+            let first = window_start(state, r).filter(|_| r.status == "pending");
             Ok(ListedDevice {
                 device_id: r.device_id.clone(),
                 account_id: r.account_id.clone(),
@@ -759,10 +742,24 @@ pub fn see_devices(
                 signing_key_id: hex(&signing),
                 hpke_key_id: hex(&hpke),
                 sas: code_of(pin, &signing, &hpke),
-                approve_until_ms: first.map(|m| m.first_seen_ms + JOIN_WINDOW_MS),
+                approve_until_ms: first.map(|m| m + JOIN_WINDOW_MS),
             })
         })
         .collect()
+}
+
+/// When the approval window of `row` started: the first sight of its device
+/// or of either key ID it lists, whichever came first, so neither a new row
+/// ID nor a swap of keys opens a fresh window for keys already seen.
+fn window_start(state: &FleetCustodyState, row: &TenantDevice) -> Option<u64> {
+    let first = state.members.get(&row.device_id.to_ascii_lowercase())?;
+    let key = |k: &str| state.key_first_seen.get(&k.to_ascii_lowercase()).copied();
+    Some(
+        [key(&row.signing_key_id), key(&row.hpke_key_id)]
+            .into_iter()
+            .flatten()
+            .fold(first.first_seen_ms, u64::min),
+    )
 }
 
 /// The listed device's key IDs and HPKE public key, once each listed ID
@@ -878,8 +875,6 @@ fn build_member(
     );
     Ok(MemberApproval {
         first_seen_ms,
-        signing_key_id: hex(&signing),
-        hpke_key_id: hex(&hpke),
         approval: hex(&build_record(
             signer,
             DOMAIN_DEVICE_APPROVAL,
@@ -933,7 +928,7 @@ pub async fn approve_member(
     let id = row.device_id.to_ascii_lowercase();
     let first_seen = match state.members.get(&id) {
         Some(m) if !m.approval.is_empty() => None,
-        Some(m) => Some(m.first_seen_ms),
+        Some(_) => window_start(state, row),
         None => bail!(crate::errcode::code("fleet.deviceNotPending")),
     };
     if let Some(first_seen) = first_seen {
@@ -2547,6 +2542,82 @@ mod tests {
             sent(&seen).is_empty(),
             "a row alias extended the approval window without new keys"
         );
+    }
+
+    /// `row` with fresh keys from `seed`, so its code differs.
+    fn rekeyed(row: &TenantDevice, seed: u8) -> TenantDevice {
+        let vk = Ed25519SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes();
+        let (_, pk) = derive_keypair(&[seed ^ 0xff; 32]);
+        TenantDevice {
+            signing_public_key: hex(&vk),
+            hpke_public_key: hex(&pk),
+            signing_key_id: hex(&signing_key_id(&vk)),
+            hpke_key_id: hex(&hpke_key_id(&pk)),
+            ..row.clone()
+        }
+    }
+
+    /// Lists `rows` at `now`, as Show devices does.
+    fn list(f: &Fixture, rows: &[TenantDevice], now: u64) {
+        let mut state = load().unwrap();
+        see_devices(rows, &f.pin(), now, &mut state, &mut |s| save(s)).unwrap();
+    }
+
+    #[test]
+    fn keys_moved_onto_a_row_seen_later_keep_their_first_sight_window() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (a, _) = joiner();
+        let b = TenantDevice {
+            device_id: hex(&[0x6f; 16]),
+            ..rekeyed(&a, 0x1d)
+        };
+        let t0 = now_ms();
+        list(&f, std::slice::from_ref(&a), t0);
+        list(&f, std::slice::from_ref(&b), t0 + 5 * MINUTE);
+        // B now lists A's keys, twelve minutes after they were first seen.
+        let moved = TenantDevice {
+            device_id: b.device_id.clone(),
+            ..a.clone()
+        };
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let err = approve(&rt, &f, &client, &moved, &f.code(&a), t0 + 12 * MINUTE);
+        assert!(err.contains("fleet.approvalWindowClosed"), "{err}");
+        assert!(sent(&seen).is_empty(), "nothing is asked or filed");
+        let listed = see_devices(
+            std::slice::from_ref(&moved),
+            &f.pin(),
+            t0 + 12 * MINUTE,
+            &mut load().unwrap(),
+            &mut |s| save(s),
+        )
+        .unwrap();
+        assert_eq!(listed[0].approve_until_ms, Some(t0 + 10 * MINUTE));
+    }
+
+    #[test]
+    fn keys_first_seen_after_a_swap_start_their_window_then() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (a, _) = joiner();
+        let t0 = now_ms();
+        list(&f, &[rekeyed(&a, 0x1d)], t0);
+        // A swaps to keys K, first seen now; B then lists K too.
+        let tk = t0 + MINUTE;
+        list(&f, std::slice::from_ref(&a), tk);
+        let b = TenantDevice {
+            device_id: hex(&[0x6f; 16]),
+            ..a.clone()
+        };
+        list(&f, std::slice::from_ref(&b), tk + 5 * MINUTE);
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(approve_server()));
+        let err = approve(&rt, &f, &client, &b, &f.code(&a), tk + 11 * MINUTE);
+        assert!(err.contains("fleet.approvalWindowClosed"), "{err}");
+        assert!(sent(&seen).is_empty(), "nothing is asked or filed");
     }
 
     #[test]

@@ -10988,7 +10988,7 @@ fn devices_path(tenant: &[u8; 16]) -> String {
 
 #[tokio::test]
 async fn a_v1_member_cannot_read_another_accounts_root_grants() {
-    let mut server = start("verifier-root-reader", 28451).await;
+    let mut server = start("v1-root-reader", 28451).await;
     let (custodian, access, _) = custodian(&mut server, 0x6c).await;
     let path = format!(
         "/v2/tenants/{}/devices/{}/root-key-grants",
@@ -11027,7 +11027,7 @@ async fn a_v1_member_cannot_read_another_accounts_root_grants() {
 
 #[tokio::test]
 async fn the_legacy_guarded_routes_still_require_v1_auth() {
-    let server = start("verifier-route-matrix", 28452).await;
+    let server = start("legacy-route-matrix", 28452).await;
     let reader = device(&server, OWNER, 0x5b, "pending").await;
     let s = session(&server, &reader).await;
     let access = s["access_token"].as_str().unwrap();
@@ -11110,7 +11110,7 @@ async fn the_legacy_guarded_routes_still_require_v1_auth() {
 
 #[tokio::test]
 async fn a_revocation_blocks_new_capabilities_and_inflight_session_proofs() {
-    let mut server = start("verifier-revoke-capability", 28453).await;
+    let mut server = start("revoke-capability", 28453).await;
     let (issuer, access, _) = custodian(&mut server, 0x6c).await;
     let peer = device(&server, OWNER, 0x7d, "active").await;
     file_approval(&server, &issuer, &peer, 0x7d).await;
