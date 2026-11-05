@@ -25,9 +25,10 @@ use shardx_core::approval_receipt::{
 };
 use shardx_core::authz_record::{
     build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
-    DeviceApprovalV2, DeviceHpkeGrantV2, GrantSubject, Payload, RecoveryGrantV2,
-    TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
-    DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_TENANT_CAPABILITY_GRANT,
+    DeviceApprovalV2, DeviceHpkeGrantV2, DeviceRevocationReason, DeviceRevocationV2, GrantSubject,
+    Payload, RecoveryGrantV2, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
+    DOMAIN_DEVICE_REVOCATION, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    DOMAIN_TENANT_CAPABILITY_GRANT,
 };
 use shardx_core::fleet_grants::{fkek_key_id, generate_fkek};
 use shardx_core::fleet_lifecycle::{
@@ -40,7 +41,8 @@ use shardx_core::fleet_lifecycle::{
 use shardx_core::grants::{derive_keypair, seal_device_fkek};
 use shardx_core::keys::{hpke_key_id, signing_key_id};
 use shardx_core::mutation::{
-    fleet_device_grant_set_hash, IdempotentMutationRequestV2, OperationKind,
+    fleet_device_grant_set_hash, DeviceRevokeRequestV2, DeviceRevokedV2,
+    IdempotentMutationRequestV2, OperationKind, RECORD_TYPE_DEVICE_REVOKED,
 };
 use shardx_core::signing::Ed25519SigningKey;
 use shardx_core::trust_chain::{join_sas, join_sas_display, Binding};
@@ -119,6 +121,9 @@ pub struct FleetCustodyState {
     /// Approve (section 4.A), per lower-case device id.
     #[serde(default)]
     pub members: BTreeMap<String, MemberApproval>,
+    /// Revoke (section 4.R): the exact request, per lower-case device id.
+    #[serde(default)]
+    pub revocations: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for FleetCustodyState {
@@ -851,6 +856,26 @@ fn build_member(
     })
 }
 
+/// The facts this custodian's records name, once `state` holds its own
+/// Create fleet key.
+fn custodian(me: &FleetDevice<'_>, state: &FleetCustodyState) -> Result<Context16> {
+    let ours = state.tenant_id.eq_ignore_ascii_case(me.tenant_id)
+        && state.device_id.eq_ignore_ascii_case(me.device_id);
+    if !ours || state.create_request.is_empty() {
+        bail!(crate::errcode::code("fleet.notCustodian"));
+    }
+    let (_, hpke_public) = derive_keypair(me.hpke_seed);
+    Ok(Context16 {
+        tenant: decode_hex16(me.tenant_id, "tenant_id")?,
+        instance: decode_hex16(&state.server_instance_id, "server_instance_id")?,
+        epoch: state.restore_epoch,
+        account: decode_hex16(me.account_id, "account_id")?,
+        device: decode_hex16(me.device_id, "device_id")?,
+        signing_key_id: signing_key_id(me.signer.verifying_key().as_bytes()),
+        hpke_key_id: hpke_key_id(&hpke_public),
+    })
+}
+
 /// Runs, or resumes, Approve of `row` (section 4.A) under the device session
 /// `access`. A device with saved requests gets exactly those resent: the
 /// window, code and key checks gate only building new ones. `fleet_key`
@@ -868,21 +893,7 @@ pub async fn approve_member(
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
-    let ours = state.tenant_id.eq_ignore_ascii_case(me.tenant_id)
-        && state.device_id.eq_ignore_ascii_case(me.device_id);
-    if !ours || state.create_request.is_empty() {
-        bail!(crate::errcode::code("fleet.notCustodian"));
-    }
-    let (_, hpke_public) = derive_keypair(me.hpke_seed);
-    let cx = Context16 {
-        tenant: decode_hex16(me.tenant_id, "tenant_id")?,
-        instance: decode_hex16(&state.server_instance_id, "server_instance_id")?,
-        epoch: state.restore_epoch,
-        account: decode_hex16(me.account_id, "account_id")?,
-        device: decode_hex16(me.device_id, "device_id")?,
-        signing_key_id: signing_key_id(me.signer.verifying_key().as_bytes()),
-        hpke_key_id: hpke_key_id(&hpke_public),
-    };
+    let cx = custodian(me, state)?;
     let fleet = hex(&cx.tenant);
     see_devices(std::slice::from_ref(row), pin, now, state, save)?;
     let id = row.device_id.to_ascii_lowercase();
@@ -965,6 +976,83 @@ pub async fn approve_member(
     )?)
     .map_err(|_| mismatch())?;
     if created.grant != grant {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+/// ADR 0002 D-6: a revocation runs at most the server's 30 days.
+const REVOCATION_VALIDITY_MS: u64 = 30 * 86_400_000;
+
+/// The reasons Revoke offers (section 4.R): `retired` and `lost` only.
+pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
+    match reason {
+        "retired" => Ok(DeviceRevocationReason::Retired),
+        "lost" => Ok(DeviceRevocationReason::Lost),
+        _ => bail!(crate::errcode::code("fleet.revokeReasonUnsupported")),
+    }
+}
+
+/// Runs, or resumes, Revoke of `row` as `reason` (section 4.R) under the
+/// device session `access`. A saved revocation is resent as saved, whatever
+/// `reason` now says. This device never revokes itself.
+#[allow(clippy::too_many_arguments)]
+pub async fn revoke_member(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    row: &TenantDevice,
+    reason: DeviceRevocationReason,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    if row.device_id.eq_ignore_ascii_case(me.device_id) {
+        bail!(crate::errcode::code("fleet.cannotRevokeSelf"));
+    }
+    let cx = custodian(me, state)?;
+    let id = row.device_id.to_ascii_lowercase();
+    let subject = decode_hex16(&id, "device_id")?;
+    if !state.revocations.contains_key(&id) {
+        let (signing, hpke, _) = listed_keys(row)?;
+        let mut common = cx.common(random()?, now);
+        common.not_after_ms = common.not_before_ms + REVOCATION_VALIDITY_MS;
+        let revocation = DeviceRevocationV2 {
+            common,
+            subject_account_id: decode_hex16(&row.account_id, "account_id")?,
+            subject_device_id: subject,
+            subject_signing_key_id: signing,
+            subject_hpke_key_id: hpke,
+            reason_code: reason,
+        };
+        let container = build_record(me.signer, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        let payload = DeviceRevokeRequestV2 {
+            signed_container_hash: container_hash(&container)?,
+            exact_signed_revocation_container_bytes: container,
+            activations: Vec::new(),
+        };
+        let request = hex(&cx.request(OperationKind::DeviceRevoke, payload.encode())?);
+        commit(state, save, |s| {
+            s.revocations.insert(id.clone(), request);
+        })?;
+    }
+    let exact = unhex_vec(&state.revocations[&id])?;
+    let request = IdempotentMutationRequestV2::parse(&exact).map_err(|_| corrupt())?;
+    let sent =
+        DeviceRevokeRequestV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
+    let stored = client.revoke_device(access, &id, &exact).await?;
+    let revoked = DeviceRevokedV2::parse(&stored_payload(
+        &stored,
+        &request,
+        RECORD_TYPE_DEVICE_REVOKED,
+    )?)
+    .map_err(|_| mismatch())?;
+    if (
+        revoked.tenant_id,
+        revoked.subject_device_id,
+        revoked.signed_container_hash,
+    ) != (cx.tenant, subject, sent.signed_container_hash)
+    {
         return Err(mismatch());
     }
     Ok(())
@@ -2146,5 +2234,158 @@ mod tests {
                 (Capability::ProfileCommit, Fleet, f.cx.tenant),
             ]
         );
+    }
+
+    // ---- Revoke (section 4.R) ----
+
+    fn refuse_all() -> Arc<Reply> {
+        Arc::new(|_: &str, _: &[u8]| (503, Vec::new()))
+    }
+
+    fn revoke(
+        rt: &tokio::runtime::Runtime,
+        f: &Fixture,
+        client: &FleetClient,
+        row: &TenantDevice,
+        reason: DeviceRevocationReason,
+        now: u64,
+    ) -> String {
+        let mut state = load().unwrap();
+        rt.block_on(revoke_member(
+            client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            row,
+            reason,
+            now,
+            &mut state,
+            &mut |s| save(s),
+        ))
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[test]
+    fn only_retired_and_lost_are_accepted() {
+        assert_eq!(
+            revoke_reason("retired").unwrap(),
+            DeviceRevocationReason::Retired
+        );
+        assert_eq!(revoke_reason("lost").unwrap(), DeviceRevocationReason::Lost);
+        for other in ["compromised", "rekeyed", "", "Retired", " lost"] {
+            let err = revoke_reason(other).unwrap_err().to_string();
+            assert!(
+                err.contains("fleet.revokeReasonUnsupported"),
+                "{other}: {err}"
+            );
+        }
+        // The command refuses it before anything else.
+        let err = runtime()
+            .block_on(crate::team_revoke_device(
+                "o".into(),
+                "p".into(),
+                hex(&[0x0d; 16]),
+                "compromised".into(),
+            ))
+            .unwrap_err();
+        assert!(err.contains("fleet.revokeReasonUnsupported"), "{err}");
+    }
+
+    #[test]
+    fn a_custodian_does_not_revoke_itself() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(refuse_all()));
+        let (_, pk) = derive_keypair(&f.seed);
+        let vk = f.signer.verifying_key().to_bytes();
+        let me = TenantDevice {
+            device_id: f.device.to_ascii_uppercase(),
+            account_id: f.account.clone(),
+            status: "active".into(),
+            label_hex: hex(b"A"),
+            signing_public_key: hex(&vk),
+            hpke_public_key: hex(&pk),
+            signing_key_id: hex(&f.cx.signing_key_id),
+            hpke_key_id: hex(&f.cx.hpke_key_id),
+        };
+        for reason in [
+            DeviceRevocationReason::Retired,
+            DeviceRevocationReason::Lost,
+        ] {
+            let err = revoke(&rt, &f, &client, &me, reason, now_ms());
+            assert!(err.contains("fleet.cannotRevokeSelf"), "{err}");
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing is asked or filed");
+        assert!(load().unwrap().revocations.is_empty());
+    }
+
+    #[test]
+    fn a_resumed_revocation_resends_the_same_bytes() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let row = TenantDevice {
+            status: "active".into(),
+            ..row
+        };
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(refuse_all()));
+        let t0 = now_ms();
+
+        // The first run builds and saves the request, then its reply is lost.
+        let err = revoke(&rt, &f, &client, &row, DeviceRevocationReason::Retired, t0);
+        assert!(err.contains("fleet.refusedCustody"), "{err}");
+        let id = row.device_id.to_ascii_lowercase();
+        let saved = load().unwrap().revocations[&id].clone();
+
+        // A day later, asked as lost, the same bytes go out again.
+        let err = revoke(
+            &rt,
+            &f,
+            &client,
+            &row,
+            DeviceRevocationReason::Lost,
+            t0 + DAY_MS,
+        );
+        assert!(err.contains("fleet.refusedCustody"), "{err}");
+        let path = format!("POST /v2/devices/{id}/revoke");
+        let revokes = sent(&seen);
+        assert_eq!(revokes.len(), 2);
+        for (call, body) in &revokes {
+            assert_eq!((call, body), (&path, &unhex_vec(&saved).unwrap()));
+        }
+        assert_eq!(load().unwrap().revocations[&id], saved);
+
+        // What was saved: the retired revocation of the listed keys, for 30
+        // days, with no activation.
+        assert_eq!(
+            saved_request(&saved).unwrap().operation_kind,
+            OperationKind::DeviceRevoke
+        );
+        let request = payload(&saved, DeviceRevokeRequestV2::parse);
+        assert!(request.activations.is_empty());
+        let issuer = f.signer.verifying_key().to_bytes();
+        let Payload::DeviceRevocation(r) =
+            AuthorizationRecord::parse(&request.exact_signed_revocation_container_bytes)
+                .unwrap()
+                .verify_signature(&issuer)
+                .unwrap()
+                .payload()
+                .clone()
+        else {
+            panic!("a revocation")
+        };
+        let (signing, hpke, _) = listed_keys(&row).unwrap();
+        assert_eq!(
+            (
+                r.subject_device_id,
+                r.subject_signing_key_id,
+                r.subject_hpke_key_id,
+                r.reason_code
+            ),
+            ([0x0d; 16], signing, hpke, DeviceRevocationReason::Retired)
+        );
+        assert_eq!(r.common.not_after_ms - r.common.not_before_ms, 30 * DAY_MS);
     }
 }
