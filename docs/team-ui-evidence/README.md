@@ -76,3 +76,8 @@ on the first, plus the blind verifier round.
   expired; both are documented in `docs/key-custody.md` and the round-6 brief
   scopes them. Its revoked-custodian probe is kept as a regression test.
   Round 6 runs on the fixed main.
+- [codex-custodian-round-6.md](codex-custodian-round-6.md): the Codex blind
+  verifier of the custodian flow, round 6, at 4dddfdb6. VERDICT: PASS: all
+  eleven goals hold and no new probe was needed. Its worktree had no
+  `node_modules`, so it read the Playwright custody cases instead of running
+  them; they run in CI and in the gate on the same main.
