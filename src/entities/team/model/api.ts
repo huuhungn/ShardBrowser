@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus, TeamFleetProfile,
+  FleetCustodyStatus, TeamDevice, TeamJoinCode, TeamRevokeReason,
 } from "./types";
 
 export const teamStatus = () => invoke<TeamStatus>("team_status");
@@ -67,6 +68,45 @@ export const teamBootstrapCustody = (
   invoke<CustodyBootstrapStatus>("team_bootstrap_custody", {
     username, password, recoveryPath, passphrase,
   });
+
+/** How far this device's Create fleet key got. */
+export const teamFleetCustodyStatus = () =>
+  invoke<FleetCustodyStatus>("team_fleet_custody_status");
+
+/**
+ * Create the fleet key as the tenant's root custodian, or resume it. The
+ * password is used for one login and never stored.
+ */
+export const teamFleetKeySetup = (username: string, password: string) =>
+  invoke<FleetCustodyStatus>("team_fleet_key_setup", { username, password });
+
+/** The tenant's devices with the code each must show, for the root custodian. */
+export const teamDevices = (username: string, password: string) =>
+  invoke<TeamDevice[]>("team_devices", { username, password });
+
+/** Approve the pending device once the user confirmed it shows `sas`. */
+export const teamApproveDevice = (username: string, password: string, deviceId: string, sas: string) =>
+  invoke<void>("team_approve_device", { username, password, deviceId, sas });
+
+/** Revoke the tenant's device as retired or lost. */
+export const teamRevokeDevice = (
+  username: string,
+  password: string,
+  deviceId: string,
+  reason: TeamRevokeReason,
+) => invoke<void>("team_revoke_device", { username, password, deviceId, reason });
+
+/** This device's join code, while its join window is open. */
+export const teamJoinCode = (username: string, password: string) =>
+  invoke<TeamJoinCode>("team_join_code", { username, password });
+
+/** Pin the anchor shown beside the code the user confirmed matches, inside the join window. */
+export const teamJoinConfirm = (username: string, password: string, anchor: string, sas: string) =>
+  invoke<void>("team_join_confirm", { username, password, anchor, sas });
+
+/** Clear this device's identity so it can enroll again, as the server allows. */
+export const teamEnrollAgain = (username: string, password: string) =>
+  invoke<TeamStatus>("team_enroll_again", { username, password });
 
 /** Every bound profile's sync state and every custodian alert; no server is asked. */
 export const teamProfilesStatus = () => invoke<TeamProfilesStatus>("team_profiles_status");

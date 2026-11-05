@@ -10,6 +10,8 @@ import {
   type TeamStatus, type CustodyBootstrapStatus,
 } from "../../../entities/team";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { TeamDevices, type TeamAccount } from "./TeamDevices";
+import { TeamJoin } from "./TeamJoin";
 
 /** The recovery bundle's passphrase floor, as the backend seals it. */
 const MIN_RECOVERY_PASSPHRASE = 8;
@@ -174,8 +176,13 @@ export function TeamCard() {
     const typed = password;
     setPassword("");
     const r = await teamCollectCustody(username, typed);
+    if (r.fleet_opened > 0) {
+      toast.ok(t("team.fleetKeyCollected", { n: r.newest_fleet_generation ?? 0 }));
+    }
     if (r.grants === 0) {
-      if (r.fleet_grants_waiting === 0) toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
+      if (r.fleet_grants_waiting === 0 && r.fleet_opened === 0) {
+        toast.info(t("team.noGrantsWaitingACustodianDeviceHasToIs"));
+      }
     } else if (r.failed > 0) {
       toast.err(t("team.grantsOpened", { opened: r.opened, grants: r.grants, failed: r.failed }));
     } else {
@@ -189,17 +196,23 @@ export function TeamCard() {
         toast.err(t("team.noGrantsAreWaitingForThisDeviceYet"));
       }
     }
-    // Fleet keys from the server are not accepted yet: say so, rather than
-    // leave the user expecting sync without a passphrase.
-    if (r.fleet_grants_waiting > 0) {
-      toast.info(t("team.fleetKeysNotAccepted", { n: r.fleet_grants_waiting }));
+    if (r.fleet_refusal) {
+      toast.err(t("team.fleetKeySubstituted"));
+    } else if (r.fleet_grants_waiting > 0) {
+      toast.info(t("team.fleetKeyWaiting"));
     }
   });
 
-  const connected = !!st && !!st.server_url && st.has_token;
+  // A device session needs no token: the token only serves legacy passphrase sync.
+  const connected = !!st && !!st.server_url && !!st.tenant_id;
+  const account: TeamAccount = {
+    username,
+    signedIn: !!username.trim() && !!password,
+    take: () => { setPassword(""); return password; },
+  };
 
   return (
-    <div className="flex flex-col gap-2">
+    <div data-testid="team-card" className="flex flex-col gap-2">
       <p className="m-0 text-paragraph-xs text-text-soft-400">
         {t("team.enrolThisDeviceWithATeamServerToSync")}
       </p>
@@ -295,7 +308,7 @@ export function TeamCard() {
               </div>
               {!connected && (
                 <p className="m-0 text-paragraph-xs text-text-soft-400">
-                  {t("team.saveAServerUrlAndTokenFirst")}
+                  {t("team.saveServerAndTenantFirst")}
                 </p>
               )}
             </>
@@ -438,6 +451,16 @@ export function TeamCard() {
                       />
                     </>
                   )}
+                  {st.can_sync && boot && (boot.activated ? (
+                    <TeamDevices account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id} />
+                  ) : (
+                    <TeamJoin
+                      account={account}
+                      busy={busy}
+                      run={run}
+                      onEnrolledAgain={(next) => { setSt(next); void shareStatus(); }}
+                    />
+                  ))}
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
                       {busy === "collect" ? t("busy.collecting") : t("team.collectKeyCustody")}
@@ -452,10 +475,6 @@ export function TeamCard() {
                   {t("team.thisDeviceWasEnrolledBeforeItsKeyMat")}
                 </p>
               )}
-
-              <p className="m-0 text-paragraph-xs text-text-soft-400">
-                {t("team.syncUsesPassphrase")}
-              </p>
 
               {!st.can_sync && (
                 <p className="m-0 text-paragraph-xs text-state-error-base">
