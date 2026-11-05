@@ -251,8 +251,12 @@ pub struct TeamStatus {
     /// never be opened. Such a device must re-enroll.
     pub can_receive_custody: bool,
     /// Whether this device holds a fleet key whose grant still verifies
-    /// against the anchor it pinned: the key published profiles sync under.
+    /// against the anchor it pinned: the key published profiles sync under,
+    /// and Q-18 lets push seal under it.
     pub has_fleet_key: bool,
+    /// Whether it holds that key but Q-18 blocks sealing under it, so push is
+    /// refused until a custodian rotates the fleet key.
+    pub fleet_key_blocked: bool,
     /// Whether every key this device holds is in the OS credential store.
     /// False while a seed or fleet key is still in plaintext on disk because
     /// no store was usable (ADR 0004, unavailable store).
@@ -315,6 +319,12 @@ fn write(path: &std::path::Path, c: &TeamConfig) -> Result<()> {
 
 pub fn status() -> Result<TeamStatus> {
     let c = load()?;
+    // The key a publish seals under, as push selects and checks it: fail closed.
+    let key = if c.can_sync() {
+        crate::sync_cmd::verified_fleet_key_blocked(&c, crate::root_bootstrap::now_ms())
+    } else {
+        None
+    };
     Ok(TeamStatus {
         server_url: c.server_url.clone(),
         tenant_id: c.tenant_id.clone(),
@@ -324,9 +334,8 @@ pub fn status() -> Result<TeamStatus> {
         keys_unreadable: c.keys_unreadable(),
         can_sync: c.can_sync(),
         can_receive_custody: c.can_receive_custody(),
-        // The key a publish seals under, as push selects it: fail closed.
-        has_fleet_key: c.can_sync()
-            && crate::sync_cmd::holds_verified_fleet_key(&c, crate::root_bootstrap::now_ms()),
+        has_fleet_key: key == Some(false),
+        fleet_key_blocked: key == Some(true),
         keys_protected: c.signing_key_seed.is_empty()
             && c.hpke_key_seed.is_empty()
             && crate::fleet_keys::load()

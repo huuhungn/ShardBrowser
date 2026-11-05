@@ -255,34 +255,6 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
     out
 }
 
-/// `s` escaped as inside a JSON string, with every non-ASCII char as its
-/// UTF-16 `\uXXXX` units (Python's `ensure_ascii`), hex in upper or lower case.
-fn json_ascii_escaped(s: &str, upper: bool) -> String {
-    let mut out = String::new();
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ' '..='~' => out.push(c),
-            _ => {
-                for unit in c.encode_utf16(&mut [0; 2]) {
-                    out.push_str(&if upper {
-                        format!("\\u{unit:04X}")
-                    } else {
-                        format!("\\u{unit:04x}")
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
 /// True for `https://`, or `http://` to this machine.
 fn sends_secrets_safely(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
@@ -374,23 +346,28 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableLogin"))?;
-        // A server may echo the password as sent, or as escaped in the JSON,
-        // non-ASCII kept or as `\uXXXX`.
-        let quoted = serde_json::to_string(login.password).unwrap_or_default();
-        let escaped = quoted
-            .get(1..quoted.len().saturating_sub(1))
-            .unwrap_or_default();
-        let lower = json_ascii_escaped(login.password, false);
-        let upper = json_ascii_escaped(login.password, true);
-        Self::ok_or_err_hiding(
-            res,
-            "fleet.refusedLogin",
-            &[login.password, escaped, &lower, &upper],
-        )
-        .await?
-        .json()
-        .await
-        .context(crate::errcode::code("fleet.badReplyLogin"))
+        let status = res.status();
+        if !status.is_success() {
+            // The server got the password and may echo it in any encoding,
+            // so none of its text is kept: only an error code it names.
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            let code = body["code"].as_str().filter(|c| {
+                c.len() <= 64
+                    && c.starts_with(|ch: char| ch.is_ascii_uppercase())
+                    && c.bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            });
+            bail!(crate::errcode::code_with(
+                "fleet.refusedLogin",
+                &[
+                    ("status", &status.as_u16().to_string()),
+                    ("detail", code.unwrap_or_default())
+                ],
+            ));
+        }
+        res.json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyLogin"))
     }
 
     /// Ends a device session. Best effort: it expires on its own.
@@ -2025,6 +2002,34 @@ mod tests {
                 "an ASCII-escaped password reached the launcher error string"
             );
         }
+    }
+
+    #[test]
+    fn a_login_error_hides_a_password_echoed_with_an_escaped_slash() {
+        let suffix = random_id_hex();
+        let password = format!("verifier/{suffix}");
+        let echo = format!(r#"{{"password":"verifier\/{suffix}"}}"#);
+        let decoded: serde_json::Value = serde_json::from_str(&echo).unwrap();
+        assert!(decoded["password"].as_str() == Some(password.as_str()));
+        let error = login_error_echoing(&password, echo);
+        assert!(
+            !error.contains(&suffix),
+            "a recoverable password reached the error string"
+        );
+    }
+
+    #[test]
+    fn a_login_error_keeps_only_an_error_code_the_server_names() {
+        let error = login_error_echoing(
+            "pw",
+            r#"{"code":"LOGIN_FAILED","error":"no such owner"}"#.into(),
+        );
+        assert_eq!(
+            error,
+            "[[shardx:fleet.refusedLogin|status=400|detail=LOGIN_FAILED]]"
+        );
+        let error = login_error_echoing("pw", r#"{"code":"Not a code","error":"x"}"#.into());
+        assert_eq!(error, "[[shardx:fleet.refusedLogin|status=400|detail=]]");
     }
 
     #[test]

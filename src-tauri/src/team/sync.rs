@@ -1619,15 +1619,33 @@ fn verified_key(
     readable_key(db, dev, fleet, generation, fkek_key_id, now)
 }
 
-/// Whether this device holds the key a publish would seal under: the
+/// Whether this device holds the key a publish would seal under, and Q-18
+/// lets it seal: [`verified_key_blocked`] is `Some(false)`, as `has_fleet_key`
+/// reads it (`team_config::status`).
+#[cfg(test)]
+pub(crate) fn holds_verified_key(dev: &Device, fleet: &[u8; 16], now: u64) -> Result<bool> {
+    Ok(verified_key_blocked(dev, fleet, now)? == Some(false))
+}
+
+/// `None` unless this device holds the key a publish would seal under: the
 /// highest generation it verified, from a grant that reverifies now
 /// ([`verified_key`]). A key cached by 2.4.2, never verified, does not count.
-pub(crate) fn holds_verified_key(dev: &Device, fleet: &[u8; 16], now: u64) -> Result<bool> {
+/// Else whether Q-18 blocks sealing under it, as push checks it.
+pub(crate) fn verified_key_blocked(
+    dev: &Device,
+    fleet: &[u8; 16],
+    now: u64,
+) -> Result<Option<bool>> {
     let db = Db::open()?;
     let Some(generation) = ledger::highest_generation(&db, &dev.pin.0, fleet)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(verified_key(&db, dev, fleet, generation, None, now).is_ok())
+    if verified_key(&db, dev, fleet, generation, None, now).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(ledger::commit_blocked(
+        &db, &dev.pin.0, &dev.pin.1, fleet, generation,
+    )?))
 }
 
 /// [`verified_key`] without "Fleet generation freshness", only to read rule
@@ -5688,6 +5706,19 @@ mod tests {
         assert!(
             has(&error, "sync.noVerifiedFleetKey"),
             "push must also reject the missing key"
+        );
+    }
+
+    #[test]
+    fn key_status_agrees_with_a_compromise_blocked_push() {
+        let w = world();
+        w.db().conn.execute_batch(&a_compromise(&w)).unwrap();
+        let error = w.push().unwrap_err();
+        assert!(has(&error, "sync.commitBlockedCompromised"));
+        assert!(w.sent("POST", "/uploads").is_empty());
+        assert!(
+            !holds_verified_key(&w.dev, &FLEET, NOW).unwrap(),
+            "the UI reports a usable fleet key while push is blocked"
         );
     }
 

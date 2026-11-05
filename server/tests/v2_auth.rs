@@ -6228,14 +6228,12 @@ async fn a_revoked_device_cannot_sign_in_again() {
     let path = device_revoke_path(&pending.id);
     let good = revocation(&dev.sk, &pending, 0x90, 30);
 
-    // Without `device.revoke` nothing is revoked (Q-13 issuer rule).
-    assert_eq!(
-        server
-            .call(&path, &access, Some(&revoke_request(0xa0, &good)))
-            .await
-            .0,
-        403
-    );
+    // Without `device.revoke` nothing is revoked (Q-13 issuer rule), with a
+    // plain 403: no client may take it for a window it can rebuild.
+    let (status, body) = server
+        .call(&path, &access, Some(&revoke_request(0xa0, &good)))
+        .await;
+    assert_eq!((status, code_of(&body).as_str()), (403, ""));
     // A fleet-scoped one covers only devices approved for that fleet alone.
     server
         .sql(
@@ -6295,22 +6293,23 @@ async fn a_revoked_device_cannot_sign_in_again() {
         (status, code_of(&body).as_str()),
         (422, "KEY_SUBSTITUTION_DETECTED")
     );
+    // A window the server refuses is named, so the custodian rebuilds it.
     let long = revocation(&dev.sk, &pending, 0x92, 31);
+    let (status, body) = server
+        .call(&path, &access, Some(&revoke_request(0xa2, &long)))
+        .await;
     assert_eq!(
-        server
-            .call(&path, &access, Some(&revoke_request(0xa2, &long)))
-            .await
-            .0,
-        403
+        (status, code_of(&body).as_str()),
+        (403, "REVOCATION_OUTSIDE_WINDOW")
     );
     // Issued long before it is filed: no client could tell custody held then.
     let stale_issue = revocation_issued(&dev.sk, &pending, 0x97, 30, 400_000);
+    let (status, body) = server
+        .call(&path, &access, Some(&revoke_request(0xab, &stale_issue)))
+        .await;
     assert_eq!(
-        server
-            .call(&path, &access, Some(&revoke_request(0xab, &stale_issue)))
-            .await
-            .0,
-        403
+        (status, code_of(&body).as_str()),
+        (403, "REVOCATION_OUTSIDE_WINDOW")
     );
     let other_path = device_revoke_path(&approved.id);
     assert_eq!(

@@ -462,13 +462,14 @@ async fn published_session(
     Ok((client, session, team::sync::Device { signer, me, pin }))
 }
 
-/// Whether a publish could seal now: this device pins an anchor and holds the
-/// verified key `team::sync` seals under. Any error reads as false, and no
+/// `Some(blocked)` once this device pins an anchor and holds the verified key
+/// `team::sync` seals under, `blocked` when Q-18 refuses sealing under it
+/// ([`team::sync::verified_key_blocked`]). Any error reads as `None`, and no
 /// team database is created for a device that pins nothing.
-pub(crate) fn holds_verified_fleet_key(c: &team_config::TeamConfig, now: u64) -> bool {
-    let check = || -> anyhow::Result<bool> {
+pub(crate) fn verified_fleet_key_blocked(c: &team_config::TeamConfig, now: u64) -> Option<bool> {
+    let check = || -> anyhow::Result<Option<bool>> {
         let Some(pin) = crate::pinned_anchor(c) else {
-            return Ok(false);
+            return Ok(None);
         };
         let dev = team::sync::Device {
             signer: c.signing_key()?,
@@ -476,9 +477,9 @@ pub(crate) fn holds_verified_fleet_key(c: &team_config::TeamConfig, now: u64) ->
             pin,
         };
         let fleet = fleet_client::decode_hex16(&fleet_id(c), "fleet_id")?;
-        team::sync::holds_verified_key(&dev, &fleet, now)
+        team::sync::verified_key_blocked(&dev, &fleet, now)
     };
-    check().unwrap_or(false)
+    check().unwrap_or(None)
 }
 
 /// What the server currently holds for `profile_id`, or `None` if nothing.

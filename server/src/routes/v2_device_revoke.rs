@@ -635,7 +635,13 @@ pub async fn revoke_device(
         || now >= int(c.not_after_ms)?
         || c.not_after_ms - c.not_before_ms > MAX_DEVICE_REVOCATION_TTL_MS
     {
-        return Err(AppError::Forbidden);
+        // Named, so the custodian rebuilds only a record refused for its
+        // window, and never on another 403.
+        return Err(coded(
+            StatusCode::FORBIDDEN,
+            "REVOCATION_OUTSIDE_WINDOW",
+            "the revocation's time window does not hold now",
+        ));
     }
     if !may_revoke(&mut tx, v, &s, &device, now).await? {
         return Err(AppError::Forbidden);

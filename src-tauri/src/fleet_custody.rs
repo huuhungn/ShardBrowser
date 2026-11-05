@@ -932,12 +932,17 @@ pub async fn approve_member(
         None => bail!(crate::errcode::code("fleet.deviceNotPending")),
     };
     if let Some(first_seen) = first_seen {
-        let keys = check_member(row, pin, first_seen, now, sas)?;
+        let started = std::time::Instant::now();
+        check_member(row, pin, first_seen, now, sas)?;
         let generation = client
             .active_fleet_generation(access, me.tenant_id, &fleet)
             .await?
             .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))?;
         let fkek = fleet_key(generation)?;
+        // The read may outlast the window: check it again at signing time,
+        // and sign at that time.
+        let now = now + started.elapsed().as_millis() as u64;
+        let keys = check_member(row, pin, first_seen, now, sas)?;
         let built = build_member(
             &cx, me.signer, row, keys, &fkek, generation, now, first_seen,
         )?;
@@ -1016,11 +1021,8 @@ pub async fn approve_member(
 
 /// ADR 0002 D-6: a revocation runs at most the server's 30 days.
 const REVOCATION_VALIDITY_MS: u64 = 30 * 86_400_000;
-/// How far the server lets a new revocation's `issued_at_ms` be from its
-/// clock (`ISSUED_AT_SKEW_MS`, `v2_device_revoke.rs`).
-const REVOCATION_ISSUED_AT_SKEW_MS: u64 = 300_000;
-
 /// The `issued_at_ms` of the saved revocation request `saved`, signed here.
+#[cfg(test)]
 fn issued_at(saved: &str, signer: &Ed25519SigningKey) -> Result<u64> {
     let request = saved_request(saved)?;
     let sent =
@@ -1112,19 +1114,18 @@ pub async fn revoke_member(
             Ok(())
         }
         .await;
-        // The server refuses, with a bare 403, a revocation it has not filed
-        // whose `issued_at_ms` is over five minutes from its clock
-        // (`v2_device_revoke.rs`), and filing one revokes the row. So only a
-        // refused saved one, of a row still not revoked and that old here
-        // too, is built anew, once.
+        // The server refuses, with a 403 coded `REVOCATION_OUTSIDE_WINDOW`, a
+        // revocation it has not filed whose time window no longer holds on
+        // its clock (`v2_device_revoke.rs`), and filing one revokes the row.
+        // So only a saved one refused so, of a row still not revoked, is
+        // built anew, once; any other 403 leaves the saved bytes as they are.
         match filed {
             Err(e)
                 if !build
                     && row.status != "revoked"
                     && e.to_string().contains("fleet.refusedCustody|status=403|")
-                    && issued_at(&state.revocations[&id], me.signer)?
-                        + REVOCATION_ISSUED_AT_SKEW_MS
-                        <= now =>
+                    && e.to_string()
+                        .contains(r#""code":"REVOCATION_OUTSIDE_WINDOW""#) =>
             {
                 build = true;
             }
@@ -2480,7 +2481,12 @@ mod tests {
         let rt = runtime();
         // Every request is refused as the server refuses an issue time it
         // finds too far from its clock.
-        let (client, seen) = rt.block_on(mock(Arc::new(|_: &str, _: &[u8]| (403, Vec::new()))));
+        let (client, seen) = rt.block_on(mock(Arc::new(|_: &str, _: &[u8]| {
+            (
+                403,
+                br#"{"code":"REVOCATION_OUTSIDE_WINDOW","error":"window"}"#.to_vec(),
+            )
+        })));
         let t0 = now_ms();
         let id = active.device_id.to_ascii_lowercase();
         let issued = || issued_at(&load().unwrap().revocations[&id], &f.signer).unwrap();
@@ -2489,10 +2495,6 @@ mod tests {
         // The first request is refused.
         revoke(&rt, &f, &client, &active, retired, t0);
         let first = load().unwrap().revocations[&id].clone();
-
-        // A minute on, still young by this clock: resent as saved.
-        revoke(&rt, &f, &client, &active, retired, t0 + MINUTE);
-        assert_eq!(load().unwrap().revocations[&id], first);
 
         // Ten minutes on, a row the server shows revoked filed it: resent.
         let later = t0 + 10 * MINUTE;
@@ -2507,10 +2509,7 @@ mod tests {
         assert_eq!(issued(), later - MINUTE);
         let bodies: Vec<Vec<u8>> = sent(&seen).into_iter().map(|(_, b)| b).collect();
         let (first, second) = (unhex_vec(&first).unwrap(), unhex_vec(&second).unwrap());
-        assert_eq!(
-            bodies,
-            [first.clone(), first.clone(), first.clone(), first, second]
-        );
+        assert_eq!(bodies, [first.clone(), first.clone(), first, second]);
     }
 
     #[test]
@@ -2652,6 +2651,66 @@ mod tests {
         assert!(
             posts[0].1 == posts[1].1,
             "a still-valid saved revocation was replaced"
+        );
+    }
+
+    #[test]
+    fn an_approval_is_not_signed_once_the_window_closes_during_the_generation_read() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let rt = runtime();
+        let t0 = now_ms();
+        let first_seen = t0 - JOIN_WINDOW_MS + 50;
+        list(&f, std::slice::from_ref(&row), first_seen);
+        let (client, seen) = rt.block_on(mock(Arc::new(move |call, _| {
+            if call.ends_with("/key-generation") {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                (200, b"{\"generation\":0}".to_vec())
+            } else {
+                (503, Vec::new())
+            }
+        })));
+        let _ = approve(&rt, &f, &client, &row, &f.code(&row), t0);
+        assert!(now_ms() > first_seen + JOIN_WINDOW_MS);
+        assert!(
+            sent(&seen).is_empty(),
+            "a new approval was sent after its local deadline"
+        );
+    }
+
+    #[test]
+    fn a_generic_403_does_not_replace_a_saved_revocation() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (mut row, _) = joiner();
+        row.status = "active".into();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(Arc::new(|_, _| (403, Vec::new()))));
+        let t0 = now_ms();
+        revoke(&rt, &f, &client, &row, DeviceRevocationReason::Retired, t0);
+        let saved = load().unwrap().revocations[&row.device_id].clone();
+        let retry = t0 + 270_000;
+        let server_now = retry - MINUTE;
+        assert!(server_now - issued_at(&saved, &f.signer).unwrap() < 300_000);
+        revoke(
+            &rt,
+            &f,
+            &client,
+            &row,
+            DeviceRevocationReason::Retired,
+            retry,
+        );
+        let posts = sent(&seen);
+        assert!(
+            posts.len() >= 2,
+            "both attempts must reach the loopback server"
+        );
+        assert!(
+            posts
+                .iter()
+                .all(|(_, body)| body == &unhex_vec(&saved).unwrap()),
+            "HTTP 403 replaced a request still valid on the server clock"
         );
     }
 }
