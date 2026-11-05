@@ -44,8 +44,10 @@ does not protect".
 Legacy passphrase sync remains for a profile that is not published. Its push
 (`src-tauri/src/sync_cmd.rs`, `seal_for_push`) uploads exactly the container
 `backup_file` produces, sealed under the shared team passphrase, and refuses an
-empty one. Its pull tries the cached fleet keys whose grant still verifies,
-newest first, then the passphrase. On this path the passphrase is a shared
+empty one. Its pull tries the cached fleet keys newest first, then the
+passphrase: a key collected from a verified grant only while that grant still
+verifies, and a key cached by 2.4.2, which no grant ever verified, without a
+check. On this path the passphrase is a shared
 secret between devices, communicated out of band:
 
 - Excluding a device means changing the passphrase and re-pushing.
@@ -325,6 +327,9 @@ What does not hold:
   on other platforms.
 - Integrity of a legacy passphrase snapshot: anyone with the passphrase can
   seal one that opens.
+- Integrity of a legacy snapshot pulled under a fleet key cached by 2.4.2:
+  that key was never verified, so a server that chose it can substitute a
+  snapshot that opens.
 - Recovery of local backups and legacy passphrase snapshots, if the passphrase
   is lost.
 

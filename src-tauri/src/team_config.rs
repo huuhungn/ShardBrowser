@@ -324,13 +324,9 @@ pub fn status() -> Result<TeamStatus> {
         keys_unreadable: c.keys_unreadable(),
         can_sync: c.can_sync(),
         can_receive_custody: c.can_receive_custody(),
-        // Only a key sync would read counts: one whose grant reverifies now.
-        has_fleet_key: c.can_sync() && {
-            // `fleet_id` is empty until a fleet is named: the tenant's own.
-            let mut named = c.clone();
-            named.fleet_id = crate::sync_cmd::fleet_id(&c);
-            !crate::sync_cmd::pull_candidates(&named, crate::root_bootstrap::now_ms()).is_empty()
-        },
+        // The key a publish seals under, as push selects it: fail closed.
+        has_fleet_key: c.can_sync()
+            && crate::sync_cmd::holds_verified_fleet_key(&c, crate::root_bootstrap::now_ms()),
         keys_protected: c.signing_key_seed.is_empty()
             && c.hpke_key_seed.is_empty()
             && crate::fleet_keys::load()
@@ -399,6 +395,37 @@ mod tests {
         // A reference whose credential is gone fails closed.
         crate::credential::forget(&saved.hpke_credential_ref).unwrap();
         assert!(saved.hpke_seed().is_err());
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn a_legacy_cached_fleet_key_alone_is_not_a_fleet_key() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let tenant = "ef".repeat(16);
+        save(&TeamConfig {
+            tenant_id: tenant.clone(),
+            account_id: "ac".repeat(16),
+            device_id: "ab".repeat(16),
+            signing_key_seed: "11".repeat(32).into(),
+            hpke_key_seed: "22".repeat(32).into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // As 2.4.2 cached it: no verified grant, so `verified` does not list it.
+        let mut keys = crate::fleet_keys::FleetKeyStore::default();
+        keys.insert(&tenant, 0, &[7; 32]);
+        crate::fleet_keys::save(&keys).unwrap();
+
+        let st = status().unwrap();
+        assert!(st.can_sync);
+        assert!(
+            !st.has_fleet_key,
+            "only a verified key a publish seals under counts"
+        );
         store::set_config_root(None);
     }
 
