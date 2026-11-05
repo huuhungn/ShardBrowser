@@ -808,6 +808,14 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
             .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.revoke'"),
         1
     );
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{b_id}' AND revoked_at IS NOT NULL"
+        )),
+        1,
+        "B's fleet grant is revoked with it"
+    );
 
     // 2. B is cut off from the server, but keeps generation 0.
     const REVOKED: &str = "the device is revoked and holds no live approval";
@@ -900,7 +908,12 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
         1
     );
 
-    // 5. A pushes version 3 after the revoke.
+    // 5. A pushes version 3 after the revoke. This comes before step 4: once
+    // A's ledger counts the revocation, A's pin, version 2, has a signer
+    // proven revoked, so it is quarantined SIGNER_REVOKED and an ordinary
+    // push refuses (ADR 0002 rule 6, L1552-1553; unit test
+    // `an_ordinary_push_refuses_over_a_pinned_head_whose_signer_is_proven_revoked`,
+    // `team/sync.rs`). Version 3 is A's own, so pushing on it is not refused.
     let udd = crate::profile::user_data_dir(&a_profile).unwrap();
     std::fs::write(udd.join("Preferences"), b"{\"from\":\"a, after\"}").unwrap();
     let push = |base: i64| {
@@ -916,9 +929,10 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     };
     assert_eq!(push(2), 3);
 
-    // 4. A's ledger counts the revocation. The evidence holds B's approval
-    // only when B's key is asked for, as a walk over B's heads asks; A's pin
-    // is A's own head now, so this reads it the way `team::sync` walks do.
+    // 4. A's ledger counts the revocation, after step 5 for the reason given
+    // there. The evidence holds B's approval only when B's key is asked for,
+    // as a walk over B's heads asks; A's pin is A's own head now, so this
+    // reads it the way `team::sync` walks do.
     let tenant = crate::fleet_client::decode_hex16(&h.tenant, "t").unwrap();
     let mut ledger = crate::team::db::Db::open().unwrap();
     let (binding, anchor, _) = crate::team::ledger::tenant_pin(&ledger, &tenant)

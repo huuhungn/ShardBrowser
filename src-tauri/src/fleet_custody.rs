@@ -395,6 +395,12 @@ fn saved_request(saved: &str) -> Result<IdempotentMutationRequestV2> {
 /// Runs, or resumes, Create fleet key through step 8 under the device
 /// session `access`. `save` persists `state`; every step that builds new
 /// bytes saves them before sending, and a failed save stops the run.
+///
+/// No request here has the server check its `issued_at_ms`, only its
+/// validity window (`v2_fleet.rs`, `v2_capability.rs`).
+/// shortcut: a saved request not filed within its window (365 days, the
+/// recovery grant 3650) is refused for good; rebuild it once a resume that
+/// late is seen.
 pub async fn bootstrap_fleet(
     client: &FleetClient,
     access: &str,
@@ -916,6 +922,10 @@ pub async fn approve_member(
             s.members.insert(id.clone(), built);
         })?;
     }
+    // No request here has the server check its `issued_at_ms`, only its
+    // validity window (`v2_approval.rs`, `v2_capability.rs`, `v2_fleet.rs`).
+    // shortcut: saved requests not filed within 365 days are refused for
+    // good; rebuild them once an approval resumed that late is seen.
     let m = state.members[&id].clone();
 
     // 4. The approval, the three capability grants, then the fleet grant.
@@ -983,6 +993,23 @@ pub async fn approve_member(
 
 /// ADR 0002 D-6: a revocation runs at most the server's 30 days.
 const REVOCATION_VALIDITY_MS: u64 = 30 * 86_400_000;
+/// How far the server lets a new revocation's `issued_at_ms` be from its
+/// clock (`ISSUED_AT_SKEW_MS`, `v2_device_revoke.rs`).
+const REVOCATION_ISSUED_AT_SKEW_MS: u64 = 300_000;
+
+/// The `issued_at_ms` of the saved revocation request `saved`, signed here.
+fn issued_at(saved: &str, signer: &Ed25519SigningKey) -> Result<u64> {
+    let request = saved_request(saved)?;
+    let sent =
+        DeviceRevokeRequestV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
+    match AuthorizationRecord::parse(&sent.exact_signed_revocation_container_bytes)
+        .and_then(|r| r.verify_signature(signer.verifying_key().as_bytes()))
+        .map(|v| v.payload().clone())
+    {
+        Ok(Payload::DeviceRevocation(r)) => Ok(r.common.issued_at_ms),
+        _ => Err(corrupt()),
+    }
+}
 
 /// The reasons Revoke offers (section 4.R): `retired` and `lost` only.
 pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
@@ -995,7 +1022,8 @@ pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
 
 /// Runs, or resumes, Revoke of `row` as `reason` (section 4.R) under the
 /// device session `access`. A saved revocation is resent as saved, whatever
-/// `reason` now says. This device never revokes itself.
+/// `reason` now says, unless the server can no longer file it. This device
+/// never revokes itself.
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_member(
     client: &FleetClient,
@@ -1013,7 +1041,18 @@ pub async fn revoke_member(
     let cx = custodian(me, state)?;
     let id = row.device_id.to_ascii_lowercase();
     let subject = decode_hex16(&id, "device_id")?;
-    if !state.revocations.contains_key(&id) {
+    // The server checks `issued_at_ms` within five minutes of its clock for a
+    // revocation it has not filed (`v2_device_revoke.rs`), and filing one
+    // revokes the row. So a saved one is built anew once it is that old while
+    // the row is still not revoked; otherwise it is resent as saved.
+    let stale = match state.revocations.get(&id) {
+        Some(saved) if row.status != "revoked" => {
+            issued_at(saved, me.signer)? + REVOCATION_ISSUED_AT_SKEW_MS <= now
+        }
+        Some(_) => false,
+        None => true,
+    };
+    if stale {
         let (signing, hpke, _) = listed_keys(row)?;
         let mut common = cx.common(random()?, now);
         common.not_after_ms = common.not_before_ms + REVOCATION_VALIDITY_MS;
@@ -2339,14 +2378,14 @@ mod tests {
         let id = row.device_id.to_ascii_lowercase();
         let saved = load().unwrap().revocations[&id].clone();
 
-        // A day later, asked as lost, the same bytes go out again.
+        // A minute later, asked as lost, the same bytes go out again.
         let err = revoke(
             &rt,
             &f,
             &client,
             &row,
             DeviceRevocationReason::Lost,
-            t0 + DAY_MS,
+            t0 + MINUTE,
         );
         assert!(err.contains("fleet.refusedCustody"), "{err}");
         let path = format!("POST /v2/devices/{id}/revoke");
@@ -2387,5 +2426,45 @@ mod tests {
             ([0x0d; 16], signing, hpke, DeviceRevocationReason::Retired)
         );
         assert_eq!(r.common.not_after_ms - r.common.not_before_ms, 30 * DAY_MS);
+    }
+
+    #[test]
+    fn a_stale_unfiled_revocation_is_rebuilt() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (row, _) = joiner();
+        let active = TenantDevice {
+            status: "active".into(),
+            ..row
+        };
+        let filed = TenantDevice {
+            status: "revoked".into(),
+            ..active.clone()
+        };
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(refuse_all()));
+        let t0 = now_ms();
+        let id = active.device_id.to_ascii_lowercase();
+        let issued = || issued_at(&load().unwrap().revocations[&id], &f.signer).unwrap();
+        let retired = DeviceRevocationReason::Retired;
+
+        // The first request never reaches the server.
+        revoke(&rt, &f, &client, &active, retired, t0);
+        let first = load().unwrap().revocations[&id].clone();
+
+        // Ten minutes on, a row the server shows revoked filed it: resent.
+        let later = t0 + 10 * MINUTE;
+        revoke(&rt, &f, &client, &filed, retired, later);
+        assert_eq!(load().unwrap().revocations[&id], first);
+
+        // A row still active means it was never filed, and the server would
+        // refuse it now: a fresh one is built, saved and sent.
+        revoke(&rt, &f, &client, &active, retired, later);
+        let second = load().unwrap().revocations[&id].clone();
+        assert_ne!(second, first);
+        assert_eq!(issued(), later - MINUTE);
+        let bodies: Vec<Vec<u8>> = sent(&seen).into_iter().map(|(_, b)| b).collect();
+        let (first, second) = (unhex_vec(&first).unwrap(), unhex_vec(&second).unwrap());
+        assert_eq!(bodies, [first.clone(), first, second]);
     }
 }
