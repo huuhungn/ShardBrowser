@@ -1,6 +1,46 @@
 {
   "releases": [
     {
+      "version": "2.7.0",
+      "date": "2026-11-05",
+      "entries": [
+        {
+          "id": "team-custodian",
+          "title": "Tạo khoá đội máy, duyệt và thu hồi thiết bị ngay trên trang Team",
+          "lead": "Người giữ khoá gốc giờ tự thiết lập khoá đội máy và đưa thiết bị mới vào qua mã tham gia, không cần token quản trị, nên các hồ sơ Team đã dùng chung được giữa các thiết bị.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Người giữ khoá gốc tạo khoá đội máy một lần trên trang Team, rồi xem danh sách thiết bị của nhóm. Thiết bị đang chờ hiện mã và thời gian còn lại; nút Duyệt chỉ dùng được khi đã tích ô mã khớp và đóng lại mười phút sau khi máy này thấy thiết bị lần đầu. Mọi thiết bị đang hoạt động khác đều có thể bị thu hồi với lý do Ngừng dùng hoặc Bị mất."
+            },
+            {
+              "type": "p",
+              "text": "Thiết bị mới hiện mã tham gia trong mười phút sau khi ghi danh. Khi mã khớp và người giữ khoá đã duyệt, thiết bị sẽ nhận khoá đội máy. Giờ chỉ cần địa chỉ máy chủ và mã tenant để kết nối; token API chỉ còn dùng cho đồng bộ cũ bằng cụm mật khẩu. Hãy cập nhật launcher và máy chủ nhóm cùng lúc, và tạo lại tenant đã tạo bằng máy chủ cũ."
+            }
+          ]
+        },
+        {
+          "id": "team-custodian-hardening",
+          "title": "Duyệt, thu hồi và thông báo lỗi an toàn hơn",
+          "lead": "Việc duyệt và thu hồi thiết bị vẫn đúng khi máy chủ trả lời chậm hay khi gửi lại, và thông tin đăng nhập mà máy chủ nhóm gửi ngược lại không còn hiện trong thông báo lỗi.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thời hạn duyệt và ô mã khớp gắn với khoá và mã của chính thiết bị đó, và thời hạn được kiểm lại ngay trước khi ký lệnh duyệt. Lệnh thu hồi đã lưu được gửi lại nguyên vẹn và chỉ được tạo lại khi máy chủ báo đã quá thời hạn của nó."
+            },
+            {
+              "type": "p",
+              "text": "Mật khẩu và token phiên mà máy chủ nhóm gửi ngược lại được xoá khỏi nội dung lỗi, và khi đăng nhập bị từ chối thì chỉ hiện mã lỗi của máy chủ. Thiết bị có khoá đội máy bị chặn do một lệnh thu hồi thiết bị bị lộ sẽ hiện thông báo thay cho mã tham gia."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.6.1",
       "date": "2026-11-04",
       "entries": [

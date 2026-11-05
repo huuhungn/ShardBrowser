@@ -3,6 +3,46 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.7.0",
+      "date": "2026-11-05",
+      "entries": [
+        {
+          "id": "team-custodian",
+          "title": "Create the fleet key, approve and revoke devices from the Team page",
+          "lead": "The root custodian now sets up the team's fleet key and brings in a new device through its join code, without an admin token, so Team profiles can be shared between devices.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The root custodian creates the team's fleet key once from the Team page, then lists the team's devices. A pending device shows its code and the time left; Approve needs the code-matches box ticked and closes ten minutes after this computer first saw the device. Any other active device can be revoked as Retired or Lost."
+            },
+            {
+              "type": "p",
+              "text": "A new device shows its join code for ten minutes after it enrolls. Once the codes match and the custodian approves it, the device collects the fleet key. Connecting now needs only the server URL and the tenant ID; the API token serves legacy passphrase sync only. Update the launcher and the team server together, and recreate a tenant created by an older server."
+            }
+          ]
+        },
+        {
+          "id": "team-custodian-hardening",
+          "title": "Safer approvals, revocations and error messages",
+          "lead": "Approving and revoking devices hold up against slow replies and retries, and credentials a team server echoes back no longer show in errors.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The approval window and the code-matches tick belong to the device's keys and code, and the window is checked again right before the approval is signed. A saved revocation is resent unchanged and rebuilt only when the server says its time window has passed."
+            },
+            {
+              "type": "p",
+              "text": "Passwords and session tokens echoed by a team server are removed from error text, and a refused login shows only the server's error code. A device whose fleet key is blocked by a compromised-device revocation shows a notice instead of its join code."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.6.1",
       "date": "2026-11-04",
       "entries": [
