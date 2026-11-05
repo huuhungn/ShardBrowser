@@ -516,6 +516,18 @@ impl FleetClient {
         access_token: &str,
         tenant_id: &str,
     ) -> Result<Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2>> {
+        self.trust_evidence_of(access_token, tenant_id, &[]).await
+    }
+
+    /// [`Self::trust_evidence`] with the approvals and capability grants of
+    /// the devices whose signing key IDs are `signers` as well: the server
+    /// serves those of root grant subjects only, unless asked.
+    pub async fn trust_evidence_of(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        signers: &[[u8; 32]],
+    ) -> Result<Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2>> {
         use shardx_core::trust_chain::MAX_EVIDENCE_PAGES;
         use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
         let mut pages = Vec::new();
@@ -524,9 +536,16 @@ impl FleetClient {
             if pages.len() >= MAX_EVIDENCE_PAGES {
                 bail!(crate::errcode::code("fleet.trustEvidenceRefused"));
             }
-            let mut url = self.url(&format!("/v2/tenants/{tenant_id}/trust-evidence"));
+            let mut query: Vec<String> = signers
+                .iter()
+                .map(|s| format!("signer={}", hex(s)))
+                .collect();
             if !cursor.is_empty() {
-                url = format!("{url}?cursor={cursor}");
+                query.push(format!("cursor={cursor}"));
+            }
+            let mut url = self.url(&format!("/v2/tenants/{tenant_id}/trust-evidence"));
+            if !query.is_empty() {
+                url = format!("{url}?{}", query.join("&"));
             }
             let res = self
                 .http
@@ -792,6 +811,46 @@ impl FleetClient {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
         Self::identity_of(res).await
+    }
+
+    /// The status `GET /v2/me` reports for `device_id` among the devices of
+    /// `login`'s account, read with a ticket; `None` when it is not listed.
+    pub async fn account_device_status(
+        &self,
+        login: &AccountLogin<'_>,
+        device_id: &str,
+    ) -> Result<Option<String>> {
+        #[derive(Deserialize)]
+        struct Listed {
+            device_id: String,
+            status: String,
+        }
+        #[derive(Deserialize)]
+        struct Me {
+            devices: Vec<Listed>,
+        }
+        let ticket = self.login_ticket(login).await?;
+        let res = self
+            .http
+            .get(self.url("/v2/me"))
+            .bearer_auth(&ticket.ticket)
+            .send()
+            .await;
+        let me = async {
+            let res = res.context(crate::errcode::code("fleet.unreachableLogin"))?;
+            Self::ok_or_err(res, "fleet.refusedLogin")
+                .await?
+                .json::<Me>()
+                .await
+                .context(crate::errcode::code("fleet.badReplyLogin"))
+        }
+        .await;
+        self.end_ticket(&ticket).await;
+        Ok(me?
+            .devices
+            .into_iter()
+            .find(|d| d.device_id.eq_ignore_ascii_case(device_id))
+            .map(|d| d.status))
     }
 
     async fn identity_reply(&self, bearer: &str) -> Result<reqwest::Response> {

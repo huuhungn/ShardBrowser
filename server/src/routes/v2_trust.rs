@@ -7,7 +7,8 @@
 //! names, every filed `DeviceRevocationV2` (Q-13) with an unsigned report
 //! of its subject device, and every fleet key grant of the tenant
 //! (`DeviceHpkeGrant`, `RecoveryGrant`, `RotationGrant`). Containers are served as their exact signed bytes
-//! with the issuers' public keys; the client verifies everything itself, so
+//! with the issuers' public keys, and the first page with the named signers'
+//! keys; the client verifies everything itself, so
 //! the server only has to leave nothing out. Pages are read from one snapshot
 //! each and ordered by kind, then by row, so a cursor names where the next
 //! page starts.
@@ -260,9 +261,15 @@ pub async fn trust_evidence(
         revocations: Vec::new(),
         device_revocations: Vec::new(),
     };
-    let mut issuers = BTreeSet::new();
+    // The first page also carries the named signers' keys: a reader verifies
+    // what they signed, such as a profile head, against them.
+    let mut issuers: BTreeSet<Vec<u8>> = if cursor.page_index == 0 {
+        signers.iter().map(|s| s.to_vec()).collect()
+    } else {
+        BTreeSet::new()
+    };
     let mut served = BTreeSet::new();
-    let mut bytes = PAGE_HEADER_BYTES;
+    let mut bytes = PAGE_HEADER_BYTES + issuers.len() * (32 + ENTRY_OVERHEAD_BYTES);
     let (mut kind, mut after) = (cursor.kind, cursor.after_rowid);
     'kinds: while usize::from(kind) < KINDS.len() {
         let room = MAX_PAGE_CONTAINERS - page.containers.len();

@@ -60,6 +60,10 @@ pub struct TeamConfig {
     /// The same for the HPKE seed.
     #[serde(default)]
     pub hpke_credential_ref: String,
+    /// When this device enrolled, by its own clock: its join window runs
+    /// from here (ADR "Join window rule"). 0 for an older enrollment.
+    #[serde(default)]
+    pub enrolled_at_ms: u64,
 }
 
 /// Never prints the token or a seed: a stray `{:?}` in a log must not leak
@@ -78,6 +82,7 @@ impl std::fmt::Debug for TeamConfig {
             .field("hpke_key_seed", &held(&self.hpke_key_seed))
             .field("signing_credential_ref", &self.signing_credential_ref)
             .field("hpke_credential_ref", &self.hpke_credential_ref)
+            .field("enrolled_at_ms", &self.enrolled_at_ms)
             .finish()
     }
 }
@@ -447,12 +452,43 @@ mod tests {
     fn secrets_zeroize_on_drop_and_the_file_format_is_unchanged() {
         let c = enrolled();
         let _: [&dyn zeroize::ZeroizeOnDrop; 3] = [&c.token, &c.signing_key_seed, &c.hpke_key_seed];
-        let golden = r#"{"server_url":"https://team.example.com","token":"secret-token","tenant_id":"aa","device_id":"bb","account_id":"cc","fleet_id":"dd","signing_key_seed":"S","hpke_key_seed":"H","signing_credential_ref":"","hpke_credential_ref":""}"#
+        let golden = r#"{"server_url":"https://team.example.com","token":"secret-token","tenant_id":"aa","device_id":"bb","account_id":"cc","fleet_id":"dd","signing_key_seed":"S","hpke_key_seed":"H","signing_credential_ref":"","hpke_credential_ref":"","enrolled_at_ms":0}"#
             .replace("\"S\"", &format!("\"{SIGNING}\""))
             .replace("\"H\"", &format!("\"{HPKE}\""));
         assert_eq!(serde_json::to_string(&c).unwrap(), golden);
         let back: TeamConfig = serde_json::from_str(&golden).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), golden);
+        assert_eq!(back.hpke_seed().unwrap(), [0x22; 32]);
+    }
+
+    #[test]
+    fn team_config_golden_includes_enrolled_at_ms() {
+        let c = TeamConfig {
+            enrolled_at_ms: 1_800_000_000_123,
+            ..enrolled()
+        };
+        let golden = r#"{"server_url":"https://team.example.com","token":"secret-token","tenant_id":"aa","device_id":"bb","account_id":"cc","fleet_id":"dd","signing_key_seed":"S","hpke_key_seed":"H","signing_credential_ref":"","hpke_credential_ref":"","enrolled_at_ms":1800000000123}"#
+            .replace("\"S\"", &format!("\"{SIGNING}\""))
+            .replace("\"H\"", &format!("\"{HPKE}\""));
+        assert_eq!(serde_json::to_string(&c).unwrap(), golden);
+        let back: TeamConfig = serde_json::from_str(&golden).unwrap();
+        assert_eq!(back.enrolled_at_ms, 1_800_000_000_123);
+        assert_eq!(serde_json::to_string(&back).unwrap(), golden);
+    }
+
+    /// C2: a team.json written before the field existed loads unchanged,
+    /// with no enroll time.
+    #[test]
+    fn an_old_team_config_without_enrolled_at_ms_still_loads() {
+        let old = r#"{"server_url":"https://team.example.com","token":"secret-token","tenant_id":"aa","device_id":"bb","account_id":"cc","fleet_id":"dd","signing_key_seed":"S","hpke_key_seed":"H","signing_credential_ref":"","hpke_credential_ref":""}"#
+            .replace("\"S\"", &format!("\"{SIGNING}\""))
+            .replace("\"H\"", &format!("\"{HPKE}\""));
+        let back: TeamConfig = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.enrolled_at_ms, 0);
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&enrolled()).unwrap()
+        );
         assert_eq!(back.hpke_seed().unwrap(), [0x22; 32]);
     }
 

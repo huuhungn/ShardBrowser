@@ -6,9 +6,9 @@
 //! evaluates through [`evaluate`], then runs [`record`]:
 //!
 //! - **Pinned anchor.** The bootstrap device pins `A0` once; a later
-//!   different anchor is refused ([`pin_anchor`]). A joining device pins in
-//!   the Q-12 join ceremony after the SAS comparison, which has not shipped,
-//!   so a joining device stays unpinned and verifies nothing.
+//!   different anchor is refused ([`pin_anchor`]). A joining device pins its
+//!   own in the Q-12 join ceremony after the SAS comparison; until then it
+//!   verifies nothing. A join pin never replaces an earlier pin.
 //! - **First sighting.** Each container's first evaluation and local time.
 //! - **Sticky proven revocation and local distrust** (D-6 (d), (e); rule 1).
 //!   Once a `DeviceRevocationV2` of device `D` is counted (rule 6), or the
@@ -96,14 +96,25 @@ fn wire(v: u64) -> Result<i64> {
     i64::try_from(v).map_err(|_| anyhow::anyhow!("WIRE_INTEGER_OUT_OF_RANGE"))
 }
 
-/// Pins `anchor` for `binding` as the bootstrap device's, or checks it
-/// against the one already pinned. False when another anchor is pinned: a
-/// server-supplied new anchor is never accepted ("Anchor loss").
-pub fn pin_anchor(db: &Db, binding: &Binding, anchor: &[u8; 32], now: u64) -> Result<bool> {
+/// How an anchor was pinned: by the device that bootstrapped custody, or in
+/// the Q-12 join ceremony.
+pub const BOOTSTRAP: &str = "BOOTSTRAP";
+pub const JOIN: &str = "JOIN";
+
+/// Pins `anchor` for `binding` with `source`, or checks it against the one
+/// already pinned, whose source stays. False when another anchor is pinned:
+/// a server-supplied new anchor is never accepted ("Anchor loss").
+pub fn pin_anchor(
+    db: &Db,
+    binding: &Binding,
+    anchor: &[u8; 32],
+    source: &str,
+    now: u64,
+) -> Result<bool> {
     let (instance, tenant) = ids(binding);
     db.conn.execute(
-        "INSERT INTO trust_anchors VALUES (?1, ?2, ?3, 'BOOTSTRAP', ?4) ON CONFLICT DO NOTHING",
-        params![instance, tenant, hex(anchor), wire(now)?],
+        "INSERT INTO trust_anchors VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+        params![instance, tenant, hex(anchor), source, wire(now)?],
     )?;
     let pinned: String = db.conn.query_row(
         "SELECT anchor_key_id FROM trust_anchors WHERE server_instance_id = ?1 AND tenant_id = ?2",
@@ -111,6 +122,37 @@ pub fn pin_anchor(db: &Db, binding: &Binding, anchor: &[u8; 32], now: u64) -> Re
         |r| r.get(0),
     )?;
     Ok(pinned == hex(anchor))
+}
+
+/// The binding, anchor and source of `tenant_id`'s pin, when this device
+/// keeps exactly one for the tenant.
+pub fn tenant_pin(db: &Db, tenant_id: &[u8; 16]) -> Result<Option<(Binding, [u8; 32], String)>> {
+    let rows = db
+        .conn
+        .prepare(
+            "SELECT server_instance_id, anchor_key_id, source FROM trust_anchors
+             WHERE tenant_id = ?1",
+        )?
+        .query_map([hex(tenant_id)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let [(instance, anchor, source)] = &rows[..] else {
+        return Ok(None);
+    };
+    let binding = Binding {
+        server_instance_id: decode_hex16(instance, "server_instance_id")?,
+        tenant_id: *tenant_id,
+    };
+    Ok(Some((
+        binding,
+        decode_hex32(anchor, "anchor_key_id")?,
+        source.clone(),
+    )))
 }
 
 /// The highest generation of `fleet_id` this device has verified.
@@ -1226,6 +1268,21 @@ mod tests {
     /// with no observed lapse is untouched, and a record whose signature
     /// cannot be checked is left to the chain.
     #[test]
+    fn a_join_pin_never_replaces_an_earlier_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let (first, other) = ([0x0a; 32], [0x0b; 32]);
+        assert_eq!(tenant_pin(&db, &B.tenant_id).unwrap(), None);
+        assert!(pin_anchor(&db, &B, &first, BOOTSTRAP, 1).unwrap());
+        assert!(!pin_anchor(&db, &B, &other, JOIN, 2).unwrap());
+        assert!(pin_anchor(&db, &B, &first, JOIN, 3).unwrap());
+        assert_eq!(
+            tenant_pin(&db, &B.tenant_id).unwrap(),
+            Some((B, first, BOOTSTRAP.to_string()))
+        );
+    }
+
+    #[test]
     fn a_lapsed_key_counts_only_after_its_observed_lapse() {
         let (d, x) = (
             Ed25519SigningKey::from_bytes(&[2; 32]),
@@ -1233,7 +1290,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join("t.db")).unwrap();
-        assert!(pin_anchor(&db, &B, &id(&x), 0).unwrap());
+        assert!(pin_anchor(&db, &B, &id(&x), BOOTSTRAP, 0).unwrap());
         let (i, t) = ids(&B);
         let (seen_then, seen_later) = (signed_by(&d, 3, L - 1), signed_by(&d, 4, L - 1));
         let hash = |c: &[u8]| {

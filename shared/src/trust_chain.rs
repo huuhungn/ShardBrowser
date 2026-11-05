@@ -668,6 +668,37 @@ fn covers(kind: CapabilityScopeKind, id: &[u8; 16], scope: Scope) -> bool {
     }
 }
 
+/// The join ceremony's short authentication string (ADR 0002 Q-12): the
+/// first 16 bytes of the domain hash over the binding, the anchor `A0` and
+/// the joiner's key IDs. Both screens compute it; only a match is signed or
+/// pinned.
+pub fn join_sas(
+    server_instance_id: &[u8; 16],
+    tenant_id: &[u8; 16],
+    anchor: &KeyId,
+    signing_key_id: &KeyId,
+    hpke_key_id: &KeyId,
+) -> [u8; 16] {
+    let preimage = [
+        &server_instance_id[..],
+        tenant_id,
+        anchor,
+        signing_key_id,
+        hpke_key_id,
+    ]
+    .concat();
+    let h = crate::canonical::domain_hash("SHARDX-JOIN-ANCHOR-SAS-V2\0", &preimage);
+    h[..16].try_into().expect("16 of 32 bytes")
+}
+
+/// `sas` as both screens show it: 32 lowercase hex digits in 8 groups of 4.
+pub fn join_sas_display(sas: &[u8; 16]) -> String {
+    sas.chunks(2)
+        .map(|g| format!("{:02x}{:02x}", g[0], g[1]))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,5 +1892,53 @@ mod tests {
             &foreign,
             &recipient(&d)
         ));
+    }
+
+    const SAS_INPUTS: ([u8; 16], [u8; 16], KeyId, KeyId, KeyId) =
+        ([0x11; 16], [0x22; 16], [0x33; 32], [0x44; 32], [0x55; 32]);
+
+    /// Computed outside this crate:
+    /// python -c "import hashlib,struct; b=bytes([0x11])*16+bytes([0x22])*16+bytes([0x33])*32+bytes([0x44])*32+bytes([0x55])*32; print(hashlib.sha256(b'SHARDX-JOIN-ANCHOR-SAS-V2\0'+struct.pack('>I',len(b))+b).hexdigest()[:32])"
+    /// 6b575c97b1a68ca508e5c5a818842892
+    #[test]
+    fn join_sas_matches_an_independent_sha256() {
+        let (i, t, a, s, h) = SAS_INPUTS;
+        let sas = join_sas(&i, &t, &a, &s, &h);
+        let hex: String = sas.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "6b575c97b1a68ca508e5c5a818842892");
+    }
+
+    #[test]
+    fn join_sas_changes_with_every_input() {
+        let (i, t, a, s, h) = SAS_INPUTS;
+        let base = join_sas(&i, &t, &a, &s, &h);
+        let flip16 = |mut x: [u8; 16]| {
+            x[15] ^= 1;
+            x
+        };
+        let flip32 = |mut x: KeyId| {
+            x[31] ^= 1;
+            x
+        };
+        for other in [
+            join_sas(&flip16(i), &t, &a, &s, &h),
+            join_sas(&i, &flip16(t), &a, &s, &h),
+            join_sas(&i, &t, &flip32(a), &s, &h),
+            join_sas(&i, &t, &a, &flip32(s), &h),
+            join_sas(&i, &t, &a, &s, &flip32(h)),
+            // The two key IDs swapped: the order is part of the preimage.
+            join_sas(&i, &t, &a, &h, &s),
+        ] {
+            assert_ne!(other, base);
+        }
+    }
+
+    #[test]
+    fn join_sas_displays_eight_groups_of_four() {
+        let sas: [u8; 16] = core::array::from_fn(|n| (n as u8) * 0x11);
+        assert_eq!(
+            join_sas_display(&sas),
+            "0011 2233 4455 6677 8899 aabb ccdd eeff"
+        );
     }
 }

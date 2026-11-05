@@ -1132,6 +1132,10 @@ async fn accept_transitions(
         ));
     }
     let listed = listed.ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
+    // shortcut: no `signer` is named here, so a leaf head signed by a device
+    // that is no root grant subject is refused, fail-closed, as
+    // RESTORE_EPOCH_TRANSITION_INVALID; name the leaf's signer when restore
+    // transitions come into scope after the v0.2.2a slice.
     let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
     let evaluated = ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?;
     let chain = evaluated.as_ref().map(|(_, c)| c);
@@ -4357,7 +4361,26 @@ async fn walked(
     now: u64,
 ) -> Result<Walked> {
     let untrusted = || anyhow!(code("sync.signerUntrusted"));
-    let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
+    // The evidence holds a device's approvals and capability grants only
+    // when it is a root grant subject or a signer asked for (`v2_trust`):
+    // ask for the signer of every head the walk reads.
+    // shortcut: each manifest is read twice; pass them to `walk` if a long
+    // walk shows up in profiling.
+    // shortcut: the server takes at most 64 signers (`MAX_SIGNERS`) and a
+    // page at most `MAX_PAGE_CONTAINERS` (1024) keys, both refused fail-closed;
+    // fetch the evidence in batches of signers once a walk can span more.
+    let mut signers = std::collections::BTreeSet::new();
+    for v in b.version.max(1)..=head.current_version {
+        signers.insert(
+            *manifest(client, access, b, v)
+                .await?
+                .signer_signing_key_id(),
+        );
+    }
+    let signers: Vec<[u8; 32]> = signers.into_iter().collect();
+    let pages = client
+        .trust_evidence_of(access, &hex(&b.tenant), &signers)
+        .await?;
     let (seen, chain) =
         ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
     ledger::record(db, &dev.pin.0, &seen, &chain, None, now)?;
