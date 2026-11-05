@@ -124,25 +124,26 @@ impl Server {
 
     /// One integer the server database answers to `query`.
     fn count(&self, query: &str) -> i64 {
+        use sqlx::Row;
+        self.row(query).get::<i64, _>(0)
+    }
+
+    /// The one row the server database answers to `query`.
+    fn row(&self, query: &str) -> sqlx::sqlite::SqliteRow {
         let db = self.data.path().join("shardx.db");
         let url = format!(
             "sqlite://{}?mode=ro",
             db.to_string_lossy().replace('\\', "/")
         );
         runtime().block_on(async {
-            use sqlx::Row;
             let pool = sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect(&url)
                 .await
                 .expect("open the server database");
-            let n = sqlx::query(query)
-                .fetch_one(&pool)
-                .await
-                .expect(query)
-                .get::<i64, _>(0);
+            let row = sqlx::query(query).fetch_one(&pool).await.expect(query);
             pool.close().await;
-            n
+            row
         })
     }
 }
@@ -542,10 +543,26 @@ fn pinned_version(profile: &str) -> i64 {
         .remote_version
 }
 
+/// Custodian A and member B after the S3 journey, with A acting: both hold
+/// generation 0 and share A's profile at version 2.
+struct Journey {
+    b: Member,
+    h: Harness,
+    b_id: String,
+    a_profile: String,
+    profile_id: String,
+}
+
 #[test]
 fn two_devices_share_a_profile_through_a_real_server_after_approval() {
     let rt = runtime();
-    let h = custodian(2, "cs3-join", &rt);
+    shared_profile(2, "cs3-join", &rt);
+}
+
+/// The S3 journey (plan section 5): B enrolls, A approves it, B joins and
+/// collects, and the two pass one profile back and forth.
+fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journey {
+    let h = custodian(slot, slug, rt);
     let (user, pass) = account();
     let fleet_ref = format!("fleet-key.{}.0", h.tenant);
     let held = |r: &str| crate::credential::load(r).map(|k| *k);
@@ -753,5 +770,227 @@ fn two_devices_share_a_profile_through_a_real_server_after_approval() {
     ));
     assert_eq!(head, 2);
     assert_eq!((pinned_version(&a_profile), b_pin), (head, head));
-    drop(b);
+    Journey {
+        b,
+        h,
+        b_id,
+        a_profile,
+        profile_id: published.profile_id,
+    }
+}
+
+#[test]
+fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real_server() {
+    let rt = runtime();
+    let Journey {
+        b,
+        h,
+        b_id,
+        a_profile,
+        profile_id,
+    } = shared_profile(3, "cs4-revoke", &rt);
+    let (user, pass) = account();
+
+    // 1. A revokes B as retired.
+    rt.block_on(crate::team_revoke_device(
+        OWNER.into(),
+        PASSWORD.into(),
+        b_id.clone(),
+        "retired".into(),
+    ))
+    .unwrap();
+    let revoked = h.server.count(&format!(
+        "SELECT count(*) FROM v2_devices WHERE lower(hex(id)) = '{b_id}' AND status = 'revoked'"
+    ));
+    assert_eq!(revoked, 1);
+    assert_eq!(
+        h.server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.revoke'"),
+        1
+    );
+
+    // 2. B is cut off from the server, but keeps generation 0.
+    const REVOKED: &str = "the device is revoked and holds no live approval";
+    b.act_as_b();
+    let listed = rt
+        .block_on(crate::sync_cmd::team_fleet_profiles(
+            user.clone(),
+            pass.clone(),
+        ))
+        .unwrap_err();
+    assert!(listed.contains(REVOKED), "{listed}");
+    let collected = rt
+        .block_on(crate::team_collect_custody(OWNER.into(), PASSWORD.into()))
+        .unwrap_err();
+    assert!(collected.contains(REVOKED), "{collected}");
+    let (b_key, generation) = crate::fleet_keys::load()
+        .unwrap()
+        .active_key(&h.tenant)
+        .expect("B still holds generation 0");
+    assert_eq!(generation, 0);
+    let b_signing = shardx_core::keys::signing_key_id(
+        crate::team_config::load()
+            .unwrap()
+            .signing_key()
+            .unwrap()
+            .verifying_key()
+            .as_bytes(),
+    );
+
+    // 3. A new grant from A to B is refused.
+    h.act_as_a();
+    let c = crate::team_config::load().unwrap();
+    let signer = c.signing_key().unwrap();
+    let state = crate::fleet_custody::load().unwrap();
+    let refused = with_session(&rt, &h, async |client, access| {
+        use shardx_core::authz_record::{
+            build_record, AuthorizationRecord, Payload, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        };
+        use shardx_core::fleet_lifecycle::{FleetGrantVariant, FleetKeyGrantCreateV2};
+        use shardx_core::mutation::{IdempotentMutationRequestV2, OperationKind};
+        let saved = crate::fleet_client::decode_hex(&state.members[&b_id].grant_request).unwrap();
+        let saved = IdempotentMutationRequestV2::parse(&saved).unwrap();
+        let filing = FleetKeyGrantCreateV2::parse(&saved.canonical_payload_bytes).unwrap();
+        let record = AuthorizationRecord::parse(&filing.exact_signed_grant_container_bytes)
+            .unwrap()
+            .verify_signature(signer.verifying_key().as_bytes())
+            .unwrap();
+        let Payload::DeviceHpkeGrant(mut grant) = record.payload().clone() else {
+            panic!("B's device grant")
+        };
+        grant.common.replay_id = *uuid::Uuid::new_v4().as_bytes();
+        let rows = client.list_tenant_devices(access, &h.tenant).await.unwrap();
+        let row = rows.iter().find(|r| r.device_id == b_id).unwrap();
+        let hpke = crate::fleet_client::decode_hex32(&row.hpke_public_key, "hpke").unwrap();
+        shardx_core::grants::seal_device_fkek(&hpke, &mut grant, &b_key).unwrap();
+        let container = build_record(&signer, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &grant.encode());
+        let hash = *AuthorizationRecord::parse(&container)
+            .unwrap()
+            .signed_container_hash();
+        let fresh = FleetKeyGrantCreateV2::new(
+            filing.grant.generation,
+            FleetGrantVariant::DeviceHpke,
+            grant.common.replay_id,
+            hash,
+            container,
+        );
+        let request = IdempotentMutationRequestV2 {
+            operation_kind: OperationKind::FleetGrantCreate,
+            idempotency_key: *uuid::Uuid::new_v4().as_bytes(),
+            canonical_payload_bytes: fresh.encode(),
+            client_request_nonce: *uuid::Uuid::new_v4().as_bytes(),
+            server_instance_id: saved.server_instance_id,
+            restore_epoch: saved.restore_epoch,
+        };
+        client
+            .file_fleet_grant(access, &h.tenant, 0, &request.encode())
+            .await
+            .unwrap_err()
+            .to_string()
+    });
+    assert!(
+        refused.contains("the grant names no active device"),
+        "{refused}"
+    );
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{b_id}'"
+        )),
+        1
+    );
+
+    // 5. A pushes version 3 after the revoke.
+    let udd = crate::profile::user_data_dir(&a_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"a, after\"}").unwrap();
+    let push = |base: i64| {
+        rt.block_on(crate::sync_cmd::profile_sync_push(
+            a_profile.clone(),
+            String::new(),
+            base,
+            user.clone(),
+            pass.clone(),
+        ))
+        .unwrap()
+        .version
+    };
+    assert_eq!(push(2), 3);
+
+    // 4. A's ledger counts the revocation. The evidence holds B's approval
+    // only when B's key is asked for, as a walk over B's heads asks; A's pin
+    // is A's own head now, so this reads it the way `team::sync` walks do.
+    let tenant = crate::fleet_client::decode_hex16(&h.tenant, "t").unwrap();
+    let mut ledger = crate::team::db::Db::open().unwrap();
+    let (binding, anchor, _) = crate::team::ledger::tenant_pin(&ledger, &tenant)
+        .unwrap()
+        .expect("A's pin");
+    assert!(!crate::team::ledger::withdrawn(&ledger, &binding, &b_signing).unwrap());
+    let pages = with_session(&rt, &h, async |client, access| {
+        client
+            .trust_evidence_of(access, &h.tenant, &[b_signing])
+            .await
+            .unwrap()
+    });
+    let now = crate::root_bootstrap::now_ms();
+    let (seen, chain) = crate::team::ledger::evaluate(&ledger, &binding, &anchor, &pages, now)
+        .unwrap()
+        .expect("the evidence verifies to A's anchor");
+    crate::team::ledger::record(&mut ledger, &binding, &seen, &chain, None, now).unwrap();
+    assert!(crate::team::ledger::withdrawn(&ledger, &binding, &b_signing).unwrap());
+
+    // 5, continued. Retired is advisory: generation 0 is not blocked, and A
+    // still commits under it once its ledger counts the revocation.
+    assert!(!crate::team::ledger::commit_blocked(&ledger, &binding, &anchor, &tenant, 0).unwrap());
+    drop(ledger);
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"a, counted\"}").unwrap();
+    assert_eq!(push(3), 4);
+
+    // 6. Section 7: version 3's ciphertext, leaked straight from the blob
+    // store, opens with the generation-0 key B kept.
+    let row = h.server.row(&format!(
+        "SELECT snapshot_id, tenant_id, fleet_id, profile_id, key_generation,
+                ciphertext_sha256, ciphertext_size, preamble_sha256, intent_hash,
+                dek_slot_sha256, immutable_blob_path
+           FROM v2_snapshots WHERE lower(hex(profile_id)) = '{profile_id}' AND version = 3"
+    ));
+    use sqlx::Row;
+    let id16 = |c: &str| -> [u8; 16] { row.get::<Vec<u8>, _>(c).try_into().unwrap() };
+    let id32 = |c: &str| -> [u8; 32] { row.get::<Vec<u8>, _>(c).try_into().unwrap() };
+    assert_eq!(row.get::<i64, _>("key_generation"), 0);
+    let blob = std::path::PathBuf::from(row.get::<String, _>("immutable_blob_path"));
+    assert!(blob.starts_with(h.server.data.path()), "{}", blob.display());
+    let scope = shardx_core::envelope_v2::Scope {
+        snapshot_id: id16("snapshot_id"),
+        tenant_id: id16("tenant_id"),
+        fleet_id: id16("fleet_id"),
+        profile_id: id16("profile_id"),
+        target_version: 3,
+        key_generation: 0,
+    };
+    let (sha, preamble, intent, slot) = (
+        id32("ciphertext_sha256"),
+        id32("preamble_sha256"),
+        id32("intent_hash"),
+        id32("dek_slot_sha256"),
+    );
+    let expected = shardx_core::envelope_v2::Expected {
+        ciphertext_sha256: &sha,
+        ciphertext_size: row.get::<i64, _>("ciphertext_size") as u64,
+        preamble_sha256: &preamble,
+        intent_hash: &intent,
+        dek_slot_sha256: &slot,
+        scope: &scope,
+    };
+    let open = |key: &[u8; 32]| {
+        let mut plain = Vec::new();
+        shardx_core::envelope_v2::open(
+            &mut std::fs::File::open(&blob).unwrap(),
+            &mut plain,
+            key,
+            &expected,
+        )
+        .map(|_| plain)
+    };
+    assert!(!open(&b_key).expect("B's key opens version 3").is_empty());
+    assert!(open(&[0x5a; 32]).is_err(), "another key does not");
 }
