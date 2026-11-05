@@ -28,6 +28,9 @@
   Publish is refused with "No fleet key this device verified opens this team
   profile", and it cannot approve a second device. Both come with the custodian
   work planned for v0.2.2. See `docs/team-ui-evidence/two-machine-run.md`.
+- A fleet key setup left unfinished for more than a year cannot be finished or
+  discarded: its saved requests have expired and the generation stays
+  `PREPARING`. Finishing or discarding it comes with fleet key rotation.
 
 ## v2.6.1
 

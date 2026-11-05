@@ -10987,6 +10987,87 @@ fn devices_path(tenant: &[u8; 16]) -> String {
     format!("/v2/tenants/{}/devices", hex(tenant))
 }
 
+/// A filed self-revocation at the protocol layer invalidates every newly
+/// shared read, including the custodian listing. The launcher separately
+/// disallows self-revocation.
+#[tokio::test]
+async fn a_revoked_custodian_loses_the_shared_reads_and_listing() {
+    let mut server = start("revoked-custodian-reads", 28454).await;
+    let (dev, access, _) = custodian(&mut server, 0x6c).await;
+    // Keep a second acknowledged custodian, so LAST_ROOT_CUSTODIAN is not
+    // the reason the attempted revocation is rejected.
+    let peer = device(&server, OWNER, 0x7b, "active").await;
+    file_approval(&server, &dev, &peer, 0x7b).await;
+    let existing = existing_root_grant(&dev, &peer, 0x7b, 0x91);
+    let request = root_grant_create_request(0xc4, &dev, &existing);
+    assert_eq!(
+        server
+            .call(&root_grants_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let peer_session = session(&server, &peer).await;
+    let peer_access = peer_session["access_token"].as_str().unwrap();
+    let ack = ack_request(0xc5, grant_ref(&dev, &existing));
+    assert_eq!(
+        server
+            .call(
+                &format!("{}/ack", grant_path("0", &[0x91; 16])),
+                peer_access,
+                Some(&ack)
+            )
+            .await
+            .0,
+        201
+    );
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xb1; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let paths = [
+        "/v2/server-identity".to_string(),
+        format!(
+            "/v2/tenants/{}/fleets/{}/key-generation",
+            hex(&TENANT),
+            hex(&TENANT)
+        ),
+        format!(
+            "/v2/tenants/{}/devices/{}/root-key-grants",
+            hex(&TENANT),
+            hex(&dev.id)
+        ),
+        devices_path(&TENANT),
+    ];
+    for path in &paths {
+        assert_eq!(
+            server.call(path, &access, None).await.0,
+            200,
+            "live read: {path}"
+        );
+    }
+    let signed = revocation(&dev.sk, &dev, 0xb2, 30);
+    assert_eq!(
+        server
+            .call(
+                &device_revoke_path(&dev.id),
+                &access,
+                Some(&revoke_request(0xb3, &signed))
+            )
+            .await
+            .0,
+        201
+    );
+    for path in &paths {
+        assert_eq!(
+            server.call(path, &access, None).await.0,
+            401,
+            "revoked read: {path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_same_account_v1_token_does_not_bypass_device_root_grant_isolation() {
     let mut server = start("same-account-v1-root", 28461).await;
