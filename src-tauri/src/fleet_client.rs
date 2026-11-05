@@ -732,6 +732,16 @@ impl FleetClient {
             ] {
                 decode_hex32(key, "key").map_err(|_| bad())?;
             }
+            // A key ID must hash from its listed key: a bearer body is hex of
+            // the same size but has no preimage, so it cannot pass as one.
+            let key = |s: &str| decode_hex32(s, "key").map_err(|_| bad());
+            let signing = shardx_core::keys::signing_key_id(&key(&d.signing_public_key)?);
+            let hpke = shardx_core::keys::hpke_key_id(&key(&d.hpke_public_key)?);
+            if hex(&signing) != d.signing_key_id.to_ascii_lowercase()
+                || hex(&hpke) != d.hpke_key_id.to_ascii_lowercase()
+            {
+                return Err(bad());
+            }
         }
         let secrets = [access_token];
         Ok(body

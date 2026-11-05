@@ -2207,6 +2207,39 @@ mod tests {
         }
     }
 
+    /// A bearer body is also a well-formed key ID, but no listed key hashes
+    /// to it: neither the IPC reply nor any saved state may carry it.
+    #[test]
+    fn device_key_ids_do_not_echo_the_session_token_body() {
+        let body = "9b".repeat(32);
+        let access = format!("v2a.{body}");
+        let mut ipc_leaks = 0;
+        let mut state_leaks = 0;
+        for hpke in [false, true] {
+            for echoed in [body.clone(), body.to_ascii_uppercase()] {
+                let (mut row, _) = joiner();
+                if hpke {
+                    row.hpke_key_id = echoed;
+                } else {
+                    row.signing_key_id = echoed;
+                }
+                let mut saved = Vec::new();
+                let result = list_and_see(&access, &row, &mut saved);
+                if let Ok(reply) = result {
+                    ipc_leaks += usize::from(reply.to_ascii_lowercase().contains(&body));
+                }
+                state_leaks +=
+                    usize::from(saved.iter().any(|s| s.to_ascii_lowercase().contains(&body)));
+            }
+        }
+        // Report counts only, never the token or captured output.
+        assert_eq!(
+            (ipc_leaks, state_leaks),
+            (0, 0),
+            "bearer body crossed a custody boundary"
+        );
+    }
+
     #[test]
     fn the_custodian_window_starts_when_it_first_sees_the_row_and_never_resets() {
         let f = fixture();
