@@ -67,3 +67,12 @@ on the first, plus the blind verifier round.
   defects (R4-1 to R4-4), fixed with regression tests in the same change; its
   tests are kept without the `round4` prefix, and its `round-4-*` logs beside
   it. Round 5 runs on the fixed main.
+- [codex-custodian-round-5.md](codex-custodian-round-5.md): the Codex blind
+  verifier of the custodian flow, round 5, at 2d444375. VERDICT: FAIL on goals
+  5, 6 and 9. Goal 6 (a listed key ID could carry a session-token body) is
+  fixed in the same change: listed key IDs must hash from their listed keys.
+  Goal 9's finding is the trust evidence, which serves every sealed root grant
+  by design (ADR 0002), and goal 5's is a setup resumed after its requests
+  expired; both are documented in `docs/key-custody.md` and the round-6 brief
+  scopes them. Its revoked-custodian probe is kept as a regression test.
+  Round 6 runs on the fixed main.
