@@ -161,7 +161,9 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
               {isNewest && <Badge color="information" variant="filled" size="small">{t("team.devices.newest")}</Badge>}
             </div>
             {isNewest && (
-              <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.newestHint")}</p>
+              <p className="m-0 text-paragraph-xs text-text-soft-400">
+                {t(r.status === "active" ? "team.devices.newestHintActive" : "team.devices.newestHint")}
+              </p>
             )}
 
             {r.status === "pending" && (

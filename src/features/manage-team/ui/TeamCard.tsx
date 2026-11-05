@@ -201,6 +201,8 @@ export function TeamCard() {
     } else if (r.fleet_grants_waiting > 0) {
       toast.info(t("team.fleetKeyWaiting"));
     }
+    // A kept fleet key turns has_fleet_key on, which ends the join steps.
+    if (r.fleet_opened > 0) teamStatus().then(setSt).catch(() => {});
   });
 
   // A device session needs no token: the token only serves legacy passphrase sync.
@@ -453,6 +455,10 @@ export function TeamCard() {
                   )}
                   {st.can_sync && boot && (boot.activated ? (
                     <TeamDevices account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id} />
+                  ) : st.has_fleet_key ? (
+                    <p data-testid="team-joined" className="m-0 text-paragraph-xs text-text-sub-600">
+                      {t("team.joinCode.joined")}
+                    </p>
                   ) : (
                     <TeamJoin
                       account={account}

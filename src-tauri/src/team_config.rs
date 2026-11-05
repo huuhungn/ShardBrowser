@@ -250,9 +250,8 @@ pub struct TeamStatus {
     /// key, but the private half was discarded, so grants sealed to it can
     /// never be opened. Such a device must re-enroll.
     pub can_receive_custody: bool,
-    /// Whether sync can run without a passphrase. Always false for now: push
-    /// never seals under a fleet key cached from the team server, because the
-    /// server cannot yet prove who issued it. Kept for the interface's shape.
+    /// Whether this device holds a fleet key whose grant still verifies
+    /// against the anchor it pinned: the key published profiles sync under.
     pub has_fleet_key: bool,
     /// Whether every key this device holds is in the OS credential store.
     /// False while a seed or fleet key is still in plaintext on disk because
@@ -325,9 +324,13 @@ pub fn status() -> Result<TeamStatus> {
         keys_unreadable: c.keys_unreadable(),
         can_sync: c.can_sync(),
         can_receive_custody: c.can_receive_custody(),
-        // A cached fleet key no longer lets sync skip the passphrase: push
-        // always seals under the passphrase (see `sync_cmd`).
-        has_fleet_key: false,
+        // Only a key sync would read counts: one whose grant reverifies now.
+        has_fleet_key: c.can_sync() && {
+            // `fleet_id` is empty until a fleet is named: the tenant's own.
+            let mut named = c.clone();
+            named.fleet_id = crate::sync_cmd::fleet_id(&c);
+            !crate::sync_cmd::pull_candidates(&named, crate::root_bootstrap::now_ms()).is_empty()
+        },
         keys_protected: c.signing_key_seed.is_empty()
             && c.hpke_key_seed.is_empty()
             && crate::fleet_keys::load()

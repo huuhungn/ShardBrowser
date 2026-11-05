@@ -693,6 +693,7 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     // 4. B pins A0, then collects generation 0 and acknowledges it once.
     b.act_as_b();
     assert!(held(&fleet_ref).is_err(), "B's namespace holds no key yet");
+    assert!(!crate::team_config::status().unwrap().has_fleet_key);
     call(
         rt,
         crate::team_join_confirm(
@@ -713,6 +714,10 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
         .active_key(&h.tenant)
         .expect("B holds generation 0");
     assert_eq!((b_key, generation), (a_key, 0));
+    assert!(
+        crate::team_config::status().unwrap().has_fleet_key,
+        "B has joined"
+    );
     assert_eq!(held(&fleet_ref).unwrap(), a_key, "now in B's namespace");
     assert_eq!(
         of_b("v2_fleet_device_hpke_grants", "AND acked_at IS NOT NULL"),

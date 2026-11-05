@@ -21,8 +21,8 @@ export type TeamStatus = {
    */
   can_receive_custody: boolean;
   /**
-   * Always false: push seals under the team passphrase, never a fleet key
-   * cached from the server, until verified key distribution ships.
+   * Whether this device holds a fleet key whose grant still verifies against
+   * the anchor it pinned, the key published profiles sync under.
    */
   has_fleet_key: boolean;
   /**

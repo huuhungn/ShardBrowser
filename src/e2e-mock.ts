@@ -424,6 +424,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return null;
     }
     case "team_revoke_device":
+      teamCustodian();
       if (args.reason !== "retired" && args.reason !== "lost") teamRefuse("fleet.revokeReasonUnsupported");
       if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
       await teamServer("revoke", { ...me, target: args.deviceId });

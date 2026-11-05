@@ -214,7 +214,7 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
 
 test("Team section shows the team card and Settings no longer does", async ({ page }) => {
   await gotoMocked(page);
-  const intro = page.getByText("Enrol this device with a team server to sync encrypted profiles.");
+  const intro = page.getByText("Enroll this device with a team server to sync encrypted profiles.");
 
   await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Team");
@@ -622,7 +622,7 @@ async function cardClick(page: Page, name: string) {
 async function teamEnroll(page: Page, label: string) {
   const card = page.getByTestId("team-card");
   await card.getByLabel("Device label").fill(label);
-  await cardClick(page, "Enrol this device");
+  await cardClick(page, "Enroll this device");
   await expect(card.getByTestId("team-join")).toBeVisible();
 }
 
@@ -683,6 +683,9 @@ async function admitB(a: Page, b: Page) {
     await expect(b.getByTestId("team-join")).toContainText("Codes confirmed.");
     await cardClick(b, "Collect key custody");
     await expect(b.getByText("Fleet key collected (generation 0).")).toBeVisible();
+    // Joined: status reports the kept key, so no join code or Enroll again is offered.
+    await expect(b.getByTestId("team-join")).toHaveCount(0);
+    await expect(b.getByTestId("team-joined")).toContainText("holds a verified fleet key");
   });
 }
 
@@ -852,7 +855,7 @@ test("an expired join code offers Enroll again and a new code", async ({ page: b
   await expect(card.getByRole("button", { name: "Codes match" })).toHaveCount(0);
 
   await cardClick(b, "Enroll again");
-  await expect(card.getByRole("button", { name: "Enrol this device" })).toBeVisible();
+  await expect(card.getByRole("button", { name: "Enroll this device" })).toBeVisible();
   await teamEnroll(b, "Machine B");
   await cardClick(b, "Show join code");
   await expect(sas).toHaveText(/^([0-9a-f]{4} ){7}[0-9a-f]{4}$/);
@@ -886,7 +889,7 @@ test("an approved device whose join code expired can enroll again", async ({ pag
   await expect(rows.nth(0)).not.toContainText("Newest");
   await expect(rows.nth(1)).toContainText("Pending");
   await expect(rows.nth(1)).toContainText("Newest");
-  await expect(rows.nth(1)).toContainText("revoke the older one");
+  await expect(rows.nth(1)).toContainText("approve this one if its code matches");
   await b.context().close();
 });
 
@@ -942,7 +945,7 @@ test("connecting needs no token", async ({ page }) => {
   await expect(card).not.toContainText("Save a server URL and tenant ID first.");
 
   await cardSignIn(page);
-  await expect(card.getByRole("button", { name: "Enrol this device" })).toBeEnabled();
+  await expect(card.getByRole("button", { name: "Enroll this device" })).toBeEnabled();
   await card.getByRole("button", { name: "Test connection" }).click();
   await expect(page.getByText(`Server identity: ${"5e".repeat(16)}`)).toBeVisible();
 });

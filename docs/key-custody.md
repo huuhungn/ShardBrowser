@@ -1,11 +1,12 @@
 # Key custody and recovery
 
-How profile encryption keys are held today, why fleet sync currently needs a
-shared passphrase, and what the frozen v2 design says should replace it.
+How profile encryption keys are held today: the verified fleet key that team
+profiles sync under, the passphrase that remains for local backups and legacy
+passphrase sync, and what the frozen v2 design still calls for.
 
-Written against `main` at the commit that added profile sync. Every claim here
-was checked against the code, not the plan: where the plan describes something
-that does not exist yet, this document says so.
+Updated for the v0.2.2a custodian slice. Every claim here was checked against
+the code, not the plan: where the plan describes something that does not exist
+yet, this document says so.
 
 ## What exists today
 
@@ -29,20 +30,27 @@ unattended is escrow an attacker with the same machine could also use.
 
 ### Fleet sync
 
-Profile sync (`src-tauri/src/sync_cmd.rs`) uploads exactly the container
-`backup_file` produces. The team server stores ciphertext, a SHA-256 and a
-version; it holds no key and cannot open what it stores.
+A team profile, one published to the fleet, syncs over the G2 wire
+(`src-tauri/src/team/sync.rs`). Each snapshot is sealed under the fleet's
+`ACTIVE` fleet key (FKEK), and only under a key whose grant still verifies now
+against the anchor this device pinned (`seal_snapshot`, `verified_key`); never
+under the passphrase. Without such a key, publish, push, pull and join refuse
+with `sync.noVerifiedFleetKey`, and a push releases the lease it took. The team
+server stores ciphertext, hashes and versions; it holds no key and cannot open
+what it stores. How the key reaches a device is in "What ships" below; what
+revoking a device does and does not protect is in "Revocation: what it does and
+does not protect".
 
-The consequence is honest but limited: **the passphrase is a shared secret
-between devices.** Whoever pulls a profile must know the passphrase used to
-push it, communicated out of band. There is no per-device key wrapping, so:
+Legacy passphrase sync remains for a profile that is not published. Its push
+(`src-tauri/src/sync_cmd.rs`, `seal_for_push`) uploads exactly the container
+`backup_file` produces, sealed under the shared team passphrase, and refuses an
+empty one. Its pull tries the cached fleet keys whose grant still verifies,
+newest first, then the passphrase. On this path the passphrase is a shared
+secret between devices, communicated out of band:
 
-- Revoking one device's access means changing the passphrase and re-pushing.
+- Excluding a device means changing the passphrase and re-pushing.
 - A leaked passphrase compromises every snapshot sealed under it.
-- Nothing binds a container to the tenant that stored it.
-
-That is the current state. It is usable for a small team that already shares
-credentials, and it is not what the v2 design calls for.
+- Nothing binds such a container to the tenant that stored it.
 
 ### Device keys
 
@@ -53,9 +61,11 @@ Enrollment (`server/src/enrollment.rs`) registers two keys per device:
 | Ed25519 signing | Proof of possession; signs snapshot manifests | OS credential store; else the key file or `team.json` |
 | X25519 HPKE recipient | Opens root key grants sealed to this device | OS credential store; else the key file or `team.json` |
 
-`team_collect_custody` uses the HPKE key to open root key grants. Fleet key
-grants are sealed to it too, but are not opened until verified key
-distribution ships (see the threat model below).
+`team_collect_custody` uses the HPKE key to open root key grants and this
+device's fleet key grant. The fleet key is kept only when its grant verifies
+against the anchor this device pinned: the root custodian's bootstrap anchor,
+or the anchor A0 a joining device confirmed with its join code (see "What
+ships" and the threat model below).
 
 Both seeds move into Windows Credential Manager (ADR 0004, `credential.rs`),
 and `team.json` keeps only their references. Without a usable store they go
@@ -190,69 +200,88 @@ root key should live is the storage question below, and handing it to the UI
 would answer it badly.
 
 Devices enrolled before the seed was persisted report
-`can_receive_custody: false` and are told to re-enrol, rather than silently
+`can_receive_custody: false` and are told to re-enroll, rather than silently
 failing to decrypt.
 
 ## Recovery
 
-The design's recovery path is a *recovery bundle*: the TRK wrapped under a
-root-held key, produced at bootstrap, verified by readback before a generation
-activates. It is not implemented.
+Root custody setup writes a *recovery bundle*: the TRK sealed under the
+recovery passphrase. The bundle is re-read and checked to open before root
+generation 0 is filed, and that generation pins the bundle's hash
+(`root_bootstrap.rs`).
 
-Until it is, recovery is exactly one thing: **someone remembers the
-passphrase.** Losing it loses the snapshots sealed under it. Backups of
-`team.json` preserve device identity — they do not preserve profile contents,
-because the device key never encrypted them.
+Create fleet key also files a *recovery grant*: the fleet key wrapped under the
+TRK, kept on the team server. The bundle does not yet hold the fleet key; the
+fleet key stays recoverable through that server recovery grant (the bundle's
+TRK opens it). No restore command ships yet, so this path is not automated.
 
-Operators should therefore treat the sync passphrase as a credential to be
-recorded in whatever the team already uses for shared secrets, and should not
-assume the server can help. It cannot; it never sees a key.
+The recovery passphrase is not stored anywhere: losing it and every device
+that holds the keys loses the team profiles. Backups of `team.json` preserve
+device identity, not profile contents.
+
+For local backups and legacy passphrase sync, recovery is still exactly one
+thing: **someone remembers the passphrase.** Operators should treat both
+passphrases as credentials to be recorded in whatever the team already uses
+for shared secrets, and should not assume the server can help. It cannot; it
+never sees a key.
 
 ## Ordering the remaining work
 
 Roughly the sequence the constraints force:
 
 1. ~~**Persist TRK grants.**~~ Done: grants are stored and collectable, and a
-   device can open its own grant. Issuance is still manual.
-2. **Root generation lifecycle.** Table plus create/activate/revoke, with the
-   `FirstRootSelfGrant` uniqueness constraint the plan specifies.
-3. **Grant TRK at enrollment.** A custodian device seals the TRK to the new
-   device's HPKE key — the key enrollment already registers.
-4. **Seal containers under the TRK.** Replace the passphrase-derived FKEK for
-   fleet containers, keeping it for local `.shxbak` files, which have no tenant
-   and should stay openable on a machine that has never enrolled.
-5. **Recovery bundle plus readback**, before any of this is called
-   production-ready.
+   device can open its own grant.
+2. ~~**Root generation lifecycle.**~~ Done for generation 0: root custody setup
+   creates, acknowledges and activates it, with the `FirstRootSelfGrant`
+   uniqueness the plan specifies. Rotation is not implemented.
+3. ~~**Grant keys at enrollment.**~~ Done as approval: the root custodian
+   approves a new device after comparing its join code, which files the
+   device's fleet key grant. The device receives the fleet key, not the TRK.
+4. ~~**Seal containers under a tenant key.**~~ Done for team profiles: they
+   seal under the verified fleet key. Local `.shxbak` files keep the
+   passphrase, since they have no tenant and should stay openable on a machine
+   that has never enrolled, and so does legacy passphrase sync.
+5. ~~**Recovery bundle plus readback.**~~ Done for the TRK. The fleet key is
+   recoverable through the server recovery grant; no restore command ships.
 6. **Move device keys into the OS credential store.** Done on Windows
    (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
    key file as the fallback. Keychain and kernel keyring are not wired up.
 
-Steps 1–3 are prerequisites for 4; shipping 4 first would mean inventing a
-distribution mechanism that the frozen design already specifies.
+Still to come: root and fleet key rotation (a revoked device keeps generation
+0), a restore command for the recovery bundle, and renewal of approvals and
+grants, which run one year.
 
 ## Threat model, stated plainly
 
 The team server is trusted for RBAC and coordination (who belongs to a
-tenant, leases, version fencing). It is **not** trusted for key distribution.
-Fleet key grants are not yet signed by an issuer the device can verify, so a
-compromised server could seal a key of its own choosing to a device. Earlier
-versions cached such keys and pushed under them; that let the server read
-every later push and forge snapshots that pull would accept. Until verified
-key distribution ships:
+tenant, leases, version fencing). It is **not** trusted for key distribution:
+a fleet key grant is accepted only when it verifies against the anchor this
+device pinned, so a key the server sealed of its own choosing is refused.
 
-- The Launcher does not accept fleet keys from the server.
-  `team_collect_custody` opens root key grants only; fleet key grants are
-  counted (`fleet_grants_waiting`) and never opened or cached.
-- Push always seals under the shared team passphrase, and refuses an empty
-  one. Pull still tries fleet keys cached by earlier versions, newest first,
-  then the passphrase, so snapshots already pushed under a fleet key restore.
+- **Pinning.** The root custodian pins its bootstrap anchor at root custody
+  setup. A joining device pins the anchor A0 by confirming its join code, a
+  code over the server instance id, the tenant id, A0 and its own key IDs. The
+  code is shown, and can be confirmed, only within ten minutes of that
+  device's own enrollment, by its own clock.
+- **Approving.** The custodian computes the same code from its pin and the
+  key IDs the server lists, recomputing each listed key ID from its key.
+  Approve needs the user to tick that the codes match, and is refused more than
+  ten minutes after this custodian first saw the pending device, by its own
+  clock; that first sight is never reset.
+- **Collecting.** `team_collect_custody` keeps a fleet key only once its grant
+  verifies against the pin, and refuses a different key for a generation it
+  already holds (`KEY_SUBSTITUTION_DETECTED`).
+- **Sealing.** A team profile's push seals under the verified `ACTIVE` fleet
+  key and never the passphrase; its pull opens with a key whose grant still
+  verifies. A legacy push seals under the shared passphrase and refuses an
+  empty one.
 
 What holds today:
 
-- The server cannot read what a device pushes: push seals under the shared
-  passphrase, which never leaves the devices. The server stores sealed
-  containers only.
-- A stolen container is useless without the passphrase.
+- The server cannot read what a device pushes: a team profile is sealed under
+  a fleet key the server never sees, a legacy push under the passphrase, which
+  never leaves the devices. The server stores sealed containers only.
+- A stolen container is useless without that key or passphrase.
 - Tenant boundaries are enforced on every `/v2/` route (`require_tenant_member`).
   Root key generations are created, acknowledged and activated through signed
   requests (`v2_root`, `v2_root_grants`), not by membership alone.
@@ -281,20 +310,22 @@ administrator resetting the account password, reinstalling Windows and copying
 `%APPDATA%` back, or moving the files to another account or machine leaves
 them unreadable. A backup of these files therefore no longer carries a device
 identity across machines: the device must enroll again, and the Launcher says
-so (`keyStore.otherWindowsAccount`) instead of reporting a corrupt key. Fleet
-keys cached by an earlier version are lost the same way, so profiles pushed
-under a fleet key should be pushed again now: the new push is sealed under the
-passphrase and no longer depends on that cached key.
+so (`keyStore.otherWindowsAccount`) instead of reporting a corrupt key. The
+fleet keys in `fleet-keys.json` are lost the same way: the device enrolls
+again, is approved again and collects the fleet key again.
 
 What does not hold:
 
-- Per-device revocation. Everyone shares one passphrase.
+- Recalling keys from a revoked device. Revocation cuts the device off the
+  server, but it keeps the fleet key it already holds; see "Revocation: what
+  it does and does not protect".
 - Forward secrecy across rotations. There are no rotations.
 - Device key confidentiality against code running as the same Windows user,
   which can ask Credential Manager and DPAPI too, or against local disk access
   on other platforms.
-- Integrity of snapshots pulled under a fleet key cached by an earlier
-  version: if the server chose that key, it can forge a snapshot that opens.
-- Recovery of anything, if the passphrase is lost.
+- Integrity of a legacy passphrase snapshot: anyone with the passphrase can
+  seal one that opens.
+- Recovery of local backups and legacy passphrase snapshots, if the passphrase
+  is lost.
 
 `P-OP` remains blocked, and this is one of the reasons.
