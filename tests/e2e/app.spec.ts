@@ -893,6 +893,106 @@ test("an approved device whose join code expired can enroll again", async ({ pag
   await b.context().close();
 });
 
+test("an active pinned device is not offered reenrollment after reopening Team", async ({ page: a, browser, baseURL, viewport }) => {
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  try {
+    await teamDevicePage(a, "a", server);
+    await teamDevicePage(b, "b", server, true);
+    await cardClick(a, "Create fleet key");
+    await teamEnroll(b, "Pinned B");
+    await cardClick(b, "Show join code");
+    const row = await listDevices(a, "Pinned B");
+    await row.getByLabel("The code on the other device matches").check();
+    await cardSignIn(a);
+    await row.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(row).toContainText("Active");
+    await cardClick(b, "Codes match");
+    await expect(b.getByTestId("team-join")).toContainText("Codes confirmed.");
+    // No collect yet. Remounting loses component state but preserves the pin.
+    await b.getByRole("button", { name: "Settings", exact: true }).click();
+    await b.clock.fastForward("10:01");
+    await b.getByRole("button", { name: "Team", exact: true }).click();
+    await cardClick(b, "Show join code");
+    await expect(b.getByTestId("team-join")).toContainText("This join code has expired.");
+    // Prove the actual mock command models the backend's refusal for this state.
+    const rejected = await b.evaluate(async () => {
+      const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__;
+      try {
+        await ipc.invoke("team_enroll_again", { username: "owner", password: "pw" });
+        return false;
+      } catch (e) { return String(e).includes("fleet.enrollAgainRefused"); }
+    });
+    expect(rejected).toBe(true);
+    await expect(b.getByTestId("team-card").getByRole("button", { name: "Enroll again", exact: true })).toHaveCount(0);
+  } finally { await b.context().close(); }
+});
+
+test("a custodian with no usable key is not shown Fleet key ready", async ({ page: a }) => {
+  const server = fakeTeamServer(KEY_GATE_ROWS);
+  await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toBeVisible();
+  // Model the real backend's tested lost-key state: the setup journal stays
+  // created/released, while team_status reports no key usable for sealing.
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_status"
+        ? { ...(result as object), has_fleet_key: false, fleet_key_blocked: false }
+        : result;
+    };
+  });
+  await a.getByRole("button", { name: "Settings", exact: true }).click();
+  await a.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(a.getByTestId("team-devices")).toBeVisible();
+  await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toHaveCount(0);
+  await expect(a.getByTestId("team-devices").getByText(/holds no usable fleet key/)).toBeVisible();
+  await expectKeyGates(a);
+});
+
+test("a custodian whose fleet key is blocked is shown the Q-18 notice", async ({ page: a }) => {
+  const server = fakeTeamServer(KEY_GATE_ROWS);
+  await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  // As a custodian whose key verifies, but a compromised revoke blocks sealing.
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_status"
+        ? { ...(result as object), has_fleet_key: false, fleet_key_blocked: true }
+        : result;
+    };
+  });
+  await a.getByRole("button", { name: "Settings", exact: true }).click();
+  await a.getByRole("button", { name: "Team", exact: true }).click();
+  const devices = a.getByTestId("team-devices");
+  await expect(devices.getByText(/pushing under it is blocked/)).toBeVisible();
+  await expect(devices.getByText("Fleet key ready", { exact: true })).toHaveCount(0);
+  await expect(devices.getByText(/holds no usable fleet key/)).toHaveCount(0);
+  await expectKeyGates(a);
+});
+
+/** An active row to revoke and a pending row to approve, beside A. */
+const KEY_GATE_ROWS: TeamDeviceRow[] = [
+  { device_id: "c3".repeat(16), label: "Gate Active", status: "active", granted: false },
+  { device_id: "d4".repeat(16), label: "Gate Pending", status: "pending", granted: false },
+];
+
+/** Without a usable key Approve stays off, while Revoke, which needs none, stays on. */
+async function expectKeyGates(a: Page) {
+  const pending = await listDevices(a, "Gate Pending");
+  await pending.getByLabel("The code on the other device matches").check();
+  await cardSignIn(a);
+  await expect(pending.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  const active = a.getByTestId("team-device").filter({ hasText: "Gate Active" });
+  await expect(active.getByRole("button", { name: "Revoke", exact: true })).toBeEnabled();
+}
+
 test("the custodian cannot approve a row it first saw more than ten minutes ago", async ({ page: a, browser, baseURL, viewport }) => {
   const server = fakeTeamServer();
   const b = await (await browser.newContext({ baseURL, viewport })).newPage();

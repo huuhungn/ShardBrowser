@@ -437,7 +437,14 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       await teamServer("revoke", { ...me, target: args.deviceId });
       return null;
     case "team_join_code":
-      teamWindowOpen();
+      try { teamWindowOpen(); } catch (e) {
+        // As the launcher: an expired code says when Enroll again would be refused.
+        const status = await teamServer<string | null>("status", me);
+        if (!(status === "pending" || (status === "active" && !teamMe.pinned))) {
+          teamRefuse(status === "active" ? "fleet.joinedCollectKey" : "fleet.enrollAgainRefused");
+        }
+        throw e;
+      }
       await teamServer("live", me);
       return {
         sas: teamSas(teamMe.device_id), anchor: TEAM_ANCHOR, ...teamKeyIds(teamMe.device_id),

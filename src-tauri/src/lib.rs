@@ -2503,9 +2503,9 @@ fn team_fleet_custody_status() -> Result<fleet_custody::FleetCustodyStatus, Stri
 
 /// Create the fleet key as the tenant's root custodian, or resume it (plan
 /// v0.2.2a section 4.F): generation 0 of the tenant's fleet, its device and
-/// recovery grants, acknowledged and activated, then the verified collect.
-/// Only once that collect keeps the key is the setup key released. The
-/// password is used for one login and never stored.
+/// recovery grants, acknowledged and activated, then the setup key is
+/// released, then the verified collect. The password is used for one login
+/// and never stored.
 #[tauri::command]
 async fn team_fleet_key_setup(
     username: String,
@@ -2552,15 +2552,20 @@ async fn team_fleet_key_setup(
         })
         .await
         .map_err(|e| e.to_string())?;
+        // Generation 0 is ACTIVE with both grants acknowledged, and nothing
+        // after `prepare` reads the setup key. Release it before the collect,
+        // so a release that fails never leaves a usable key behind; a resumed
+        // run replays the saved requests and collects without it.
+        fleet_custody::release(device.vault).map_err(|e| e.to_string())?;
         // Step 9: only the verified collect keeps the key in `fleet_keys`.
+        // Step 7's ACKED receipt already acknowledged the grant, so a server
+        // that still reports it PENDING_ACK cannot fail setup after the keep.
         let (device_sk, _) = shardx_core::grants::derive_keypair(&hpke_seed);
-        if let Some(error) =
-            setup_collect_error(collect_fleet_grant(&client, &c, access, &device_sk).await?)
-        {
-            return Err(error);
+        let fleet = collect_fleet_grant(&client, &c, access, &device_sk, false).await?;
+        match setup_collect_error(fleet) {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        // The collect may have saved an ack: release from the state on disk.
-        fleet_custody::release(device.vault).map_err(|e| e.to_string())
     }
     .await;
     client.end_session(access).await;
@@ -2822,7 +2827,33 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
-    let expires_at_ms = join_window(&c, root_bootstrap::now_ms())?;
+    let expires_at_ms = match join_window(&c, root_bootstrap::now_ms()) {
+        Ok(end) => end,
+        // The UI offers Enroll again for an expired code, so say when
+        // `team_enroll_again` would refuse it. Unasked or unanswered, the
+        // code just reads as expired.
+        Err(expired) if !username.trim().is_empty() && !password.is_empty() => {
+            let client = fleet_client::FleetClient::new(&c.server_url, &c.token)
+                .map_err(|e| e.to_string())?;
+            let login = fleet_client::AccountLogin {
+                tenant_id: &c.tenant_id,
+                username: username.trim(),
+                password: &password,
+            };
+            let Ok(status) = client.account_device_status(&login, &c.device_id).await else {
+                return Err(expired);
+            };
+            let pinned = pinned_anchor(&c).is_some();
+            return Err(if enroll_again_allowed(status.as_deref(), pinned) {
+                expired
+            } else if status.as_deref() == Some("active") {
+                crate::errcode::code("fleet.joinedCollectKey")
+            } else {
+                crate::errcode::code("fleet.enrollAgainRefused")
+            });
+        }
+        Err(expired) => return Err(expired),
+    };
     let (client, session) = open_session(&c, &username, &password).await?;
     let pin = evidence_anchor(&client, &session.access_token, &c).await;
     client.end_session(&session.access_token).await;
@@ -2963,12 +2994,7 @@ async fn team_enroll_again(
         )
         .await
         .map_err(|e| e.to_string())?;
-    let allowed = match status.as_deref() {
-        Some("pending") => true,
-        Some("active") => pinned_anchor(&c).is_none(),
-        _ => false,
-    };
-    if !allowed {
+    if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
     let stale_refs = clear_identity(&mut c);
@@ -2977,6 +3003,16 @@ async fn team_enroll_again(
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
+}
+
+/// Whether a device the server lists as `status` may enroll again: while
+/// pending, or active without a pin here.
+fn enroll_again_allowed(status: Option<&str>, pinned: bool) -> bool {
+    match status {
+        Some("pending") => true,
+        Some("active") => !pinned,
+        _ => false,
+    }
 }
 
 /// Collect the root key grants issued to this device and report what opened.
@@ -3025,7 +3061,7 @@ async fn team_collect_custody(
             .await
             .map_err(|e| e.to_string())?;
         // A fleet grant is opened only once it verifies: see `custody_report`.
-        let fleet = collect_fleet_grant(&client, &c, access, &device_sk).await?;
+        let fleet = collect_fleet_grant(&client, &c, access, &device_sk, true).await?;
         custody_report(&device_sk, &grants, fleet)
     }
     .await;
@@ -3054,13 +3090,14 @@ enum FleetGrant {
 
 /// Reads, over the device session `access`, this device's grant of the
 /// fleet's ACTIVE generation and, when this device pinned an anchor, the
-/// tenant trust evidence, and keeps the FKEK only if rule 5 accepts it. A
-/// kept key's grant is then acknowledged once.
+/// tenant trust evidence, and keeps the FKEK only if rule 5 accepts it. With
+/// `ack`, a kept key's grant is then acknowledged once.
 async fn collect_fleet_grant(
     client: &fleet_client::FleetClient,
     c: &team_config::TeamConfig,
     access: &str,
     device_sk: &[u8],
+    ack: bool,
 ) -> Result<FleetGrant, String> {
     let fleet_id = sync_cmd::fleet_id(c);
     let Some(generation) = client
@@ -3115,7 +3152,7 @@ async fn collect_fleet_grant(
         &c.server_url,
     )?;
     let kept = keep_fleet_key(&fleet_id, generation, fkek)?;
-    if kept == FleetGrant::Opened(generation) {
+    if ack && kept == FleetGrant::Opened(generation) {
         fleet_custody::ack_device_grant(client, access, &container, acknowledged)
             .await
             .map_err(|e| e.to_string())?;
@@ -5827,11 +5864,12 @@ mod custody_tests {
                             "server_instance_id": hex(&INSTANCE),
                             "restore_epoch": 0,
                         }),
+                        // `missing`: the server no longer lists the joiner.
                         "GET /v2/me" => serde_json::json!({
                             "kind": "pre_device",
                             "devices": [
                                 {"device_id": hex(&[9; 16]), "status": "active"},
-                                {"device_id": hex(&JOINER), "status": status},
+                                {"device_id": hex(if status == "missing" { &[9; 16] } else { &JOINER }), "status": status},
                             ],
                         }),
                         _ => serde_json::json!({}),
@@ -5887,7 +5925,12 @@ mod custody_tests {
             .block_on(team_join_code("u".into(), "p".into()))
             .unwrap_err();
         assert!(err.contains("fleet.joinCodeExpired"), "{err}");
-        assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+        // Only the device's status is read, to say whether Enroll again is
+        // allowed: no session opens and no evidence is fetched.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["POST /v2/auth/login", "GET /v2/me", "POST /v2/auth/logout"]
+        );
     }
 
     #[test]
@@ -6092,6 +6135,46 @@ mod custody_tests {
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
         assert_cleared(refs);
+    }
+
+    /// An expired code reads as expired only where Enroll again is allowed:
+    /// an active pinned device is pointed at its key, and a revoked or
+    /// unlisted one is told it cannot enroll again. Unasked, it is expired.
+    #[test]
+    fn an_expired_code_says_whether_enroll_again_is_allowed() {
+        let expired = "fleet.joinCodeExpired";
+        for (status, pinned, allowed, code) in [
+            ("active", true, false, "fleet.joinedCollectKey"),
+            ("active", false, true, expired),
+            ("pending", true, true, expired),
+            ("pending", false, true, expired),
+            ("revoked", true, false, "fleet.enrollAgainRefused"),
+            ("revoked", false, false, "fleet.enrollAgainRefused"),
+            ("missing", true, false, "fleet.enrollAgainRefused"),
+            ("missing", false, false, "fleet.enrollAgainRefused"),
+        ] {
+            let listed = Some(status).filter(|s| *s != "missing");
+            assert_eq!(
+                enroll_again_allowed(listed, pinned),
+                allowed,
+                "{status} {pinned}"
+            );
+            let rt = runtime();
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            if pinned {
+                pin_here();
+            }
+            let err = rt
+                .block_on(team_join_code("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains(code), "{status} {pinned}: {err}");
+            // No login to ask with: the code is just expired.
+            let err = rt
+                .block_on(team_join_code("u".into(), String::new()))
+                .unwrap_err();
+            assert!(err.contains(expired), "{status} {pinned}: {err}");
+        }
     }
 
     /// Pins the joiner's tenant to an anchor, as a confirmed join does.

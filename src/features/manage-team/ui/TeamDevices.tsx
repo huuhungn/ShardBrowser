@@ -31,11 +31,17 @@ const STATUS_COLOR: Record<string, BadgeColor> = { pending: "warning", active: "
  * whose code matches, inside this computer's ten-minute window, and revoke
  * any other active one.
  */
-export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionProps & {
+export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, fleetKeyBlocked, onFleetKey }: TeamActionProps & {
   /** This custodian's bootstrap anchor A0. */
   anchor: string;
   /** This device's id, which is never offered Revoke. */
   selfId: string;
+  /** `team_status`: this computer holds a fleet key that verifies and may seal. */
+  hasFleetKey: boolean;
+  /** `team_status`: it holds a verified key, but Q-18 blocks sealing under it. */
+  fleetKeyBlocked: boolean;
+  /** Create fleet key may have kept a key: reload `team_status`. */
+  onFleetKey: () => void;
 }) {
   const t = useT();
   const [fleet, setFleet] = useState<FleetCustodyStatus | null>(null);
@@ -50,7 +56,10 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
     return () => clearInterval(id);
   }, []);
 
-  const ready = !!fleet?.created && !fleet.setup_key_held;
+  // The journal says how far Create fleet key got; whether the key is usable
+  // now is team_status's live check. Approve hands that key on.
+  const done = !!fleet?.created && !fleet.setup_key_held;
+  const ready = done && hasFleetKey;
   // A tick vouches for the exact code shown, so a refreshed code needs a new one.
   const tick = (r: TeamDevice) => `${r.device_id} ${r.sas}`;
   const login = () => [account.username.trim(), account.take()] as const;
@@ -66,10 +75,12 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
     const [u, p] = login();
     try {
       setFleet(await teamFleetKeySetup(u, p));
+      onFleetKey();
       toast.ok(t("team.devices.fleetKeyReady"));
     } catch (e) {
       // Whatever step it reached is saved; show where the next try resumes.
       teamFleetCustodyStatus().then(setFleet).catch(() => {});
+      onFleetKey();
       throw e;
     }
   });
@@ -117,7 +128,11 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
 
   return (
     <div data-testid="team-devices" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
-      {ready ? (
+      {done && fleetKeyBlocked ? (
+        <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.joinCode.blocked")}</p>
+      ) : done && !hasFleetKey ? (
+        <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.devices.fleetKeyNotUsable")}</p>
+      ) : ready ? (
         <>
           <p className="m-0 text-paragraph-xs text-text-sub-600">{t("team.devices.fleetKeyReady")}</p>
           <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>
@@ -225,9 +240,10 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
                     ]}
                   />
                 </div>
+                {/* Revoke needs only the saved Create fleet key, not a usable key: a lost key must not block it. */}
                 <Button
                   size="small" variant="error" mode="stroke"
-                  disabled={!!busy || !account.signedIn || !ready}
+                  disabled={!!busy || !account.signedIn || !fleet?.created}
                   onClick={() => { void revoke(r); }}
                 >
                   {t("team.devices.revoke")}

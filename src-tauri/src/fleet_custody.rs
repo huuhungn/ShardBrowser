@@ -53,7 +53,8 @@ use crate::root_bootstrap::{
     unhex_vec, BootstrapState, Context16,
 };
 
-/// Where the fleet key lives from its creation until the verified collect,
+/// Where the fleet key lives from its creation until the generation is
+/// activated,
 /// under the reference [`setup_ref`] names.
 pub trait FkekStore: Sync {
     fn store(&self, credential_ref: &str, key: &[u8; 32]) -> Result<()>;
@@ -92,7 +93,7 @@ pub struct FleetCustodyState {
     #[serde(default)]
     pub capability_grants: Vec<String>,
     /// Names this run's setup key: saved before the key is stored, cleared
-    /// once the key is released after the verified collect.
+    /// once the key is released after activation, before the verified collect.
     #[serde(default)]
     pub fkek_nonce: String,
     /// The id of the setup key, saved once the store holds the key.
@@ -1167,8 +1168,8 @@ pub struct FleetCustodyStatus {
     pub fkek_key_id: String,
 }
 
-/// Releases the setup key of the state on disk, after the verified collect,
-/// which may itself have saved an ack there.
+/// Releases the setup key of the state on disk once generation 0 is active,
+/// before the verified collect: no later step reads it.
 pub fn release(vault: &dyn FkekStore) -> Result<()> {
     let mut state = load()?;
     release_fkek(vault, &mut state, &mut |s| save(s))
@@ -1751,7 +1752,9 @@ mod tests {
             }
         })));
         let fleet = rt
-            .block_on(crate::collect_fleet_grant(&client, &c, "access", &[0; 32]))
+            .block_on(crate::collect_fleet_grant(
+                &client, &c, "access", &[0; 32], true,
+            ))
             .unwrap();
         assert_eq!(fleet, crate::FleetGrant::None);
         let calls: Vec<String> = seen
@@ -1840,11 +1843,10 @@ mod tests {
         );
     }
 
-    /// Step 9 as `team_fleet_key_setup` runs it, with a server that still
-    /// reports the device grant PENDING_ACK after step 7: the collect saves
-    /// its ack, and releasing the setup key afterwards keeps that ack.
+    /// An ack Collect key custody saved for a grant still PENDING_ACK is kept
+    /// when the setup key is released afterwards.
     #[test]
-    fn a_setup_where_the_server_reports_pending_ack_keeps_the_saved_ack_after_release() {
+    fn a_collected_ack_survives_a_later_release_of_the_setup_key() {
         let f = fixture();
         let setup = f.prepared();
         let container = unhex_vec(&setup.device_grant).unwrap();
@@ -2105,6 +2107,95 @@ mod tests {
             .members
             .values()
             .all(|m| m.approval.is_empty()));
+    }
+
+    #[test]
+    fn a_successful_device_listing_does_not_echo_its_access_token_to_ipc() {
+        let f = fixture();
+        let rt = runtime();
+        let access = format!("v2a.{}", "6f".repeat(32));
+        let (mut row, _) = joiner();
+        // A hostile server knows the bearer it just received. Return it in
+        // the label encoding the client decodes before forming its IPC reply.
+        row.label_hex = hex(access.as_bytes());
+        let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+            "device_id": row.device_id, "account_id": row.account_id,
+            "status": row.status, "label_hex": row.label_hex,
+            "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+            "signing_public_key": row.signing_public_key,
+            "hpke_public_key": row.hpke_public_key,
+        }] }))
+        .unwrap();
+        let (client, _) = rt.block_on(mock(Arc::new(move |call, _| {
+            assert!(call.ends_with("/devices"));
+            (200, body.clone())
+        })));
+        let rows = rt
+            .block_on(client.list_tenant_devices(&access, &f.tenant))
+            .unwrap();
+        let mut state = f.state();
+        let listed = see_devices(&rows, &f.pin(), now_ms(), &mut state, &mut |_| Ok(())).unwrap();
+        let reply = serde_json::to_string(&listed).unwrap();
+        assert!(
+            !reply.contains(&access),
+            "the device-list IPC reply leaked the access token"
+        );
+    }
+
+    /// Lists `row` as the server answers it to the bearer `access`, then sees
+    /// it, saving into `saved`: the IPC reply, or the error.
+    fn list_and_see(access: &str, row: &TenantDevice, saved: &mut Vec<String>) -> Result<String> {
+        let f = fixture();
+        let rt = runtime();
+        let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+            "device_id": row.device_id, "account_id": row.account_id,
+            "status": row.status, "label_hex": row.label_hex,
+            "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+            "signing_public_key": row.signing_public_key,
+            "hpke_public_key": row.hpke_public_key,
+        }] }))
+        .unwrap();
+        let (client, _) = rt.block_on(mock(Arc::new(move |_, _| (200, body.clone()))));
+        let rows = rt.block_on(client.list_tenant_devices(access, &f.tenant))?;
+        let mut state = f.state();
+        let listed = see_devices(&rows, &f.pin(), now_ms(), &mut state, &mut |s| {
+            saved.push(serde_json::to_string(s).unwrap());
+            Ok(())
+        })?;
+        Ok(serde_json::to_string(&listed).unwrap())
+    }
+
+    #[test]
+    fn a_device_row_with_a_bad_key_id_is_refused_before_anything_is_saved() {
+        let access = format!("v2a.{}", "6e".repeat(32));
+        let (mut row, _) = joiner();
+        assert_eq!(row.status, "pending");
+        row.signing_key_id = access.clone();
+        let mut saved = Vec::new();
+        let err = list_and_see(&access, &row, &mut saved)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fleet.badReplyCustody"), "{err}");
+        assert!(
+            saved.iter().all(|s| !s.contains(&access)),
+            "the state kept the token"
+        );
+    }
+
+    #[test]
+    fn a_device_label_holding_the_token_body_is_not_echoed_to_ipc() {
+        let body = "6d".repeat(32);
+        let access = format!("v2a.{body}");
+        // The server reads hex in either case: so must the scrub.
+        for echoed in [body.clone(), body.to_ascii_uppercase()] {
+            let (mut row, _) = joiner();
+            row.label_hex = hex(format!("label {echoed}").as_bytes());
+            let reply = list_and_see(&access, &row, &mut Vec::new()).unwrap();
+            assert!(
+                !reply.to_ascii_lowercase().contains(&body),
+                "the IPC reply leaked the token body as {echoed}"
+            );
+        }
     }
 
     #[test]

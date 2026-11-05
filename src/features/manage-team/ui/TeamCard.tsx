@@ -454,7 +454,11 @@ export function TeamCard() {
                     </>
                   )}
                   {st.can_sync && boot && (boot.activated ? (
-                    <TeamDevices account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id} />
+                    <TeamDevices
+                      account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
+                      hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
+                      onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); }}
+                    />
                   ) : st.has_fleet_key ? (
                     <p data-testid="team-joined" className="m-0 text-paragraph-xs text-text-sub-600">
                       {t("team.joinCode.joined")}
