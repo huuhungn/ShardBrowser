@@ -1047,7 +1047,7 @@ pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
 
 /// Runs, or resumes, Revoke of `row` as `reason` (section 4.R) under the
 /// device session `access`. A saved revocation is resent as saved, whatever
-/// `reason` now says, unless the server refuses it and can no longer file it.
+/// `reason` now says, unless the server refuses it as one it cannot file now.
 /// This device never revokes itself.
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_member(
@@ -1115,7 +1115,7 @@ pub async fn revoke_member(
         }
         .await;
         // The server refuses, with a 403 coded `REVOCATION_OUTSIDE_WINDOW`, a
-        // revocation it has not filed whose time window no longer holds on
+        // revocation it has not filed whose time window does not hold now on
         // its clock (`v2_device_revoke.rs`), and filing one revokes the row.
         // So only a saved one refused so, of a row still not revoked, is
         // built anew, once; any other 403 leaves the saved bytes as they are.
@@ -2671,7 +2671,8 @@ mod tests {
                 (503, Vec::new())
             }
         })));
-        let _ = approve(&rt, &f, &client, &row, &f.code(&row), t0);
+        let error = approve(&rt, &f, &client, &row, &f.code(&row), t0);
+        assert!(error.contains("fleet.approvalWindowClosed"), "{error}");
         assert!(now_ms() > first_seen + JOIN_WINDOW_MS);
         assert!(
             sent(&seen).is_empty(),

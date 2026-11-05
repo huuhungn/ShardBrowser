@@ -5720,6 +5720,11 @@ mod tests {
             !holds_verified_key(&w.dev, &FLEET, NOW).unwrap(),
             "the UI reports a usable fleet key while push is blocked"
         );
+        // Held but blocked, so the UI shows the notice, not the join steps.
+        assert_eq!(
+            verified_key_blocked(&w.dev, &FLEET, NOW).unwrap(),
+            Some(true)
+        );
     }
 
     /// `world` with `extra` containers in its trust evidence.

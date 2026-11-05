@@ -349,13 +349,15 @@ impl FleetClient {
         let status = res.status();
         if !status.is_success() {
             // The server got the password and may echo it in any encoding,
-            // so none of its text is kept: only an error code it names.
+            // so none of its text is kept: only an error code it names, and
+            // not one that holds the password.
             let body: serde_json::Value = res.json().await.unwrap_or_default();
             let code = body["code"].as_str().filter(|c| {
                 c.len() <= 64
                     && c.starts_with(|ch: char| ch.is_ascii_uppercase())
                     && c.bytes()
                         .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && (login.password.is_empty() || !c.contains(login.password))
             });
             bail!(crate::errcode::code_with(
                 "fleet.refusedLogin",
@@ -2030,6 +2032,13 @@ mod tests {
         );
         let error = login_error_echoing("pw", r#"{"code":"Not a code","error":"x"}"#.into());
         assert_eq!(error, "[[shardx:fleet.refusedLogin|status=400|detail=]]");
+        let error = login_error_echoing("PW_42", r#"{"code":"BAD_PW_42_X"}"#.into());
+        assert_eq!(error, "[[shardx:fleet.refusedLogin|status=400|detail=]]");
+        let error = login_error_echoing("", r#"{"code":"LOGIN_FAILED"}"#.into());
+        assert_eq!(
+            error,
+            "[[shardx:fleet.refusedLogin|status=400|detail=LOGIN_FAILED]]"
+        );
     }
 
     #[test]
