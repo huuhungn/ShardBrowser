@@ -711,7 +711,7 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        let body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
+        let mut body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .json()
             .await
@@ -720,28 +720,30 @@ impl FleetClient {
         // the free text left reaches the UI, so a hostile server cannot hand
         // back the bearer it just received through it.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyCustody"));
-        for d in &body.devices {
+        for d in &mut body.devices {
             for id in [&d.device_id, &d.account_id] {
                 decode_hex16(id, "device").map_err(|_| bad())?;
             }
-            for key in [
-                &d.signing_key_id,
-                &d.hpke_key_id,
-                &d.signing_public_key,
-                &d.hpke_public_key,
-            ] {
-                decode_hex32(key, "key").map_err(|_| bad())?;
-            }
-            // A key ID must hash from its listed key: a bearer body is hex of
-            // the same size but has no preimage, so it cannot pass as one.
             let key = |s: &str| decode_hex32(s, "key").map_err(|_| bad());
-            let signing = shardx_core::keys::signing_key_id(&key(&d.signing_public_key)?);
-            let hpke = shardx_core::keys::hpke_key_id(&key(&d.hpke_public_key)?);
-            if hex(&signing) != d.signing_key_id.to_ascii_lowercase()
-                || hex(&hpke) != d.hpke_key_id.to_ascii_lowercase()
+            key(&d.signing_key_id)?;
+            key(&d.hpke_key_id)?;
+            let (signing_pk, hpke_pk) = (key(&d.signing_public_key)?, key(&d.hpke_public_key)?);
+            // A key ID must hash from its listed key: a bearer body is hex of
+            // the same size but has no preimage. A pending row is kept and
+            // approved, so a mismatch refuses the reply; an honest server
+            // still lists a quarantined or revoked row with stale IDs
+            // (`integrity.rs`), so any other row shows the derived ones.
+            let ids = (
+                hex(&shardx_core::keys::signing_key_id(&signing_pk)),
+                hex(&shardx_core::keys::hpke_key_id(&hpke_pk)),
+            );
+            if d.status == "pending"
+                && (ids.0 != d.signing_key_id.to_ascii_lowercase()
+                    || ids.1 != d.hpke_key_id.to_ascii_lowercase())
             {
                 return Err(bad());
             }
+            (d.signing_key_id, d.hpke_key_id) = ids;
         }
         let secrets = [access_token];
         Ok(body

@@ -404,8 +404,9 @@ fn saved_request(saved: &str) -> Result<IdempotentMutationRequestV2> {
 /// No request here has the server check its `issued_at_ms`, only its
 /// validity window (`v2_fleet.rs`, `v2_capability.rs`).
 /// shortcut: a saved request not filed within its window (365 days, the
-/// recovery grant 3650) is refused for good; rebuild it once a resume that
-/// late is seen.
+/// recovery grant 3650) is refused for good; a rebuilt grant cannot match the
+/// committed required set, so this needs a server route to finish or discard
+/// the PREPARING generation (fleet key rotation).
 pub async fn bootstrap_fleet(
     client: &FleetClient,
     access: &str,
@@ -2238,6 +2239,49 @@ mod tests {
             (0, 0),
             "bearer body crossed a custody boundary"
         );
+    }
+
+    /// An honest server keeps listing a revoked or quarantined row whose
+    /// stored key IDs no longer hash from its keys (`integrity.rs`): the
+    /// listing survives and shows the derived IDs, never what stood in for
+    /// them. A pending row like that is still refused.
+    #[test]
+    fn a_settled_row_with_a_bad_key_id_is_listed_by_its_derived_ids() {
+        let body = "9a".repeat(32);
+        let access = format!("v2a.{body}");
+        let (good, _) = joiner();
+        for status in ["revoked", "quarantined", "pending"] {
+            for hpke in [false, true] {
+                for echoed in [body.clone(), body.to_ascii_uppercase()] {
+                    let mut row = TenantDevice {
+                        status: status.into(),
+                        ..good.clone()
+                    };
+                    if hpke {
+                        row.hpke_key_id = echoed;
+                    } else {
+                        row.signing_key_id = echoed;
+                    }
+                    let mut saved = Vec::new();
+                    let reply = list_and_see(&access, &row, &mut saved);
+                    assert!(saved
+                        .iter()
+                        .all(|s| !s.to_ascii_lowercase().contains(&body)));
+                    if status == "pending" {
+                        let err = reply.unwrap_err().to_string();
+                        assert!(err.contains("fleet.badReplyCustody"), "{err}");
+                        continue;
+                    }
+                    let reply = reply.unwrap();
+                    assert!(!reply.to_ascii_lowercase().contains(&body), "{status}");
+                    let listed: serde_json::Value = serde_json::from_str(&reply).unwrap();
+                    assert_eq!(listed.as_array().unwrap().len(), 1, "{status}");
+                    assert_eq!(listed[0]["status"], status);
+                    assert_eq!(listed[0]["signing_key_id"], good.signing_key_id);
+                    assert_eq!(listed[0]["hpke_key_id"], good.hpke_key_id);
+                }
+            }
+        }
     }
 
     #[test]
