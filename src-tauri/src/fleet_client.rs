@@ -228,6 +228,33 @@ impl FleetClient {
     }
 }
 
+/// `text` with each of `secrets`, and the value after every `v2t.`, `v2a.`,
+/// `v2r.` token prefix and `Bearer `, replaced: a refusal's text is shown and
+/// logged, so it must not carry a credential back.
+pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(secret, "[redacted]");
+    }
+    for marker in ["v2t.", "v2a.", "v2r.", "bearer "] {
+        // ASCII lower-casing keeps every byte offset of `out`.
+        let lower = out.to_ascii_lowercase();
+        let (mut done, mut at) = (String::new(), 0);
+        while let Some(i) = lower[at..].find(marker) {
+            let start = at + i + marker.len();
+            let end = out[start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ','))
+                .map_or(out.len(), |j| start + j);
+            done.push_str(&out[at..start]);
+            done.push_str("[redacted]");
+            at = end;
+        }
+        done.push_str(&out[at..]);
+        out = done;
+    }
+    out
+}
+
 /// True for `https://`, or `http://` to this machine.
 fn sends_secrets_safely(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
@@ -247,15 +274,25 @@ impl FleetClient {
     /// The body carries refusal text (version conflicts, expired leases), no
     /// key material.
     async fn ok_or_err(res: reqwest::Response, key: &str) -> Result<reqwest::Response> {
+        Self::ok_or_err_hiding(res, key, &[]).await
+    }
+
+    /// `ok_or_err`, also hiding each of `secrets` the request sent, should a
+    /// hostile server or proxy echo it back.
+    async fn ok_or_err_hiding(
+        res: reqwest::Response,
+        key: &str,
+        secrets: &[&str],
+    ) -> Result<reqwest::Response> {
         let status = res.status();
         if status.is_success() {
             return Ok(res);
         }
         let body = res.text().await.unwrap_or_default();
-        let detail = body.chars().take(300).collect::<String>();
+        let detail = redact(&body, secrets).chars().take(300).collect::<String>();
         // `key` is the locale key for this exact refusal, so a translator sees
         // a whole sentence rather than a verb spliced into one. `detail` is
-        // the server's own words, passed through as sent.
+        // the server's own words, less any credential they echo.
         Err(anyhow!(crate::errcode::code_with(
             key,
             &[
@@ -309,7 +346,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableLogin"))?;
-        Self::ok_or_err(res, "fleet.refusedLogin")
+        // A server may echo the password as sent, or as escaped in the JSON.
+        let quoted = serde_json::to_string(login.password).unwrap_or_default();
+        let escaped = quoted
+            .get(1..quoted.len().saturating_sub(1))
+            .unwrap_or_default();
+        Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[login.password, escaped])
             .await?
             .json()
             .await
@@ -1803,5 +1845,91 @@ mod tests {
     #[test]
     fn replay_ids_are_unique() {
         assert_ne!(random_id_hex(), random_id_hex());
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_words_but_no_credential() {
+        let body =
+            r#"{"code":"BASE_VERSION_MISMATCH","a":"bearer opaque-1","t":"v2a.x1","p":"pw 9"}"#;
+        assert_eq!(
+            super::redact(body, &["pw 9"]),
+            r#"{"code":"BASE_VERSION_MISMATCH","a":"bearer [redacted]","t":"v2a.[redacted]","p":"[redacted]"}"#
+        );
+    }
+
+    #[test]
+    fn an_error_reply_hides_echoed_session_tokens() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+                let echoed = headers
+                    .get("authorization")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                (axum::http::StatusCode::BAD_REQUEST, echoed)
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = FleetClient::new(&url, "").unwrap();
+            let mut leaked = false;
+            for prefix in ["v2t.", "v2a.", "v2r."] {
+                let token = format!("{prefix}{}", "7d".repeat(32));
+                let error = client
+                    .server_identity(&token)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                leaked |= error.contains(&token);
+            }
+            task.abort();
+            assert!(
+                !leaked,
+                "an echoed bearer reached the launcher error string"
+            );
+        });
+    }
+
+    #[test]
+    fn a_login_error_hides_the_echoed_password() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new().fallback(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        body["password"].as_str().unwrap().to_owned(),
+                    )
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = FleetClient::new(&url, "").unwrap();
+            let password = format!("account-password-{}", random_id_hex());
+            let login = super::AccountLogin {
+                tenant_id: "11",
+                username: "owner",
+                password: &password,
+            };
+            let result = client.login_ticket(&login).await;
+            let error = match result {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected error response"),
+            };
+            task.abort();
+            assert!(
+                !error.contains(&password),
+                "the account password reached the launcher error string"
+            );
+        });
     }
 }

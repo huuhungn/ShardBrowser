@@ -812,7 +812,7 @@ fn refused(reply: &Exact) -> anyhow::Error {
     if reply.status == 401 {
         return anyhow!(code("sync.authRequired"));
     }
-    let detail: String = String::from_utf8_lossy(&reply.body)
+    let detail: String = crate::fleet_client::redact(&String::from_utf8_lossy(&reply.body), &[])
         .chars()
         .take(300)
         .collect();
@@ -5662,6 +5662,33 @@ mod tests {
     /// with a profile worth several chunks.
     fn world() -> World {
         world_with(Vec::new())
+    }
+
+    #[test]
+    fn a_refused_sync_reply_hides_an_echoed_token() {
+        let token = format!("v2a.{}", "7d".repeat(32));
+        let reply = Exact {
+            status: 400,
+            headers: Default::default(),
+            body: format!("{{\"error\":\"bad\",\"auth\":\"Bearer {token}\"}}").into_bytes(),
+        };
+        let error = refused(&reply).to_string();
+        assert!(error.contains("fleet.refusedSync"), "{error}");
+        assert!(!error.contains(&token), "an echoed token reached the error");
+    }
+
+    #[test]
+    fn key_status_and_push_agree_after_the_fleet_key_is_lost() {
+        let w = world();
+        assert!(holds_verified_key(&w.dev, &FLEET, NOW).unwrap());
+        assert_eq!(w.push().unwrap().version, 1);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        assert!(!holds_verified_key(&w.dev, &FLEET, NOW).unwrap());
+        let error = w.push().unwrap_err();
+        assert!(
+            has(&error, "sync.noVerifiedFleetKey"),
+            "push must also reject the missing key"
+        );
     }
 
     /// `world` with `extra` containers in its trust evidence.

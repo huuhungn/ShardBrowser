@@ -51,6 +51,8 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
   }, []);
 
   const ready = !!fleet?.created && !fleet.setup_key_held;
+  // A tick vouches for the exact code shown, so a refreshed code needs a new one.
+  const tick = (r: TeamDevice) => `${r.device_id} ${r.sas}`;
   const login = () => [account.username.trim(), account.take()] as const;
   const toggle = (set: Set<string>, id: string) => {
     const next = new Set(set);
@@ -193,14 +195,14 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
                 )}
                 <Checkbox
                   label={t("team.devices.codeMatches")}
-                  checked={matched.has(r.device_id)}
+                  checked={matched.has(tick(r))}
                   disabled={expired}
-                  onChange={() => setMatched((s) => toggle(s, r.device_id))}
+                  onChange={() => setMatched((s) => toggle(s, tick(r)))}
                 />
                 <div>
                   <Button
                     size="small"
-                    disabled={!!busy || !account.signedIn || expired || !matched.has(r.device_id)}
+                    disabled={!!busy || !account.signedIn || !ready || expired || !matched.has(tick(r))}
                     onClick={() => { void approve(r); }}
                   >
                     {t("team.devices.approve")}

@@ -1189,8 +1189,8 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         .collect();
     assert_eq!(
         secrets.len(),
-        4,
-        "the FKEK, the TRK and two HPKE private keys"
+        8,
+        "the FKEK, the TRK, two HPKE private keys and both devices' four seeds"
     );
     secrets.push(PASSWORD.into());
     let mut scanned = vec![
@@ -1231,6 +1231,29 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         }
     }
     assert!(hits.is_empty(), "{hits:?}");
+    // Join codes belong in the deliberate IPC reply, but never in log lines.
+    let replies = std::fs::read_to_string(scan.path().join("replies.jsonl")).unwrap();
+    let codes: Vec<String> = replies
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value.get("sas").and_then(|v| v.as_str()).map(str::to_owned))
+        })
+        .collect();
+    assert!(
+        !codes.is_empty(),
+        "the journey must exercise a displayed join code"
+    );
+    for (_, output) in scanned
+        .iter()
+        .filter(|(name, _)| name == "stdout" || name == "stderr")
+    {
+        assert!(
+            !codes.iter().any(|sas| output.contains(sas)),
+            "a join code reached a log line"
+        );
+    }
 }
 
 /// Copies this device's team state files that exist into `dir`, each named
@@ -1268,6 +1291,8 @@ fn the_journey_leak_scan_worker() {
     let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
     let c = crate::team_config::load().unwrap();
     let (a_sk, _) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+    let a_signing_seed = c.signing_key().unwrap().to_bytes();
+    let a_hpke_seed = c.hpke_seed().unwrap();
     let grants = with_session(&rt, &h, async |client, access| {
         client
             .root_key_grants(access, &h.tenant, &c.device_id)
@@ -1291,13 +1316,24 @@ fn the_journey_leak_scan_worker() {
         crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
     )
     .unwrap_err();
-    let (b_sk, _) = shardx_core::grants::derive_keypair(
-        &crate::team_config::load().unwrap().hpke_seed().unwrap(),
-    );
+    let b_config = crate::team_config::load().unwrap();
+    let b_signing_seed = b_config.signing_key().unwrap().to_bytes();
+    let b_hpke_seed = b_config.hpke_seed().unwrap();
+    let (b_sk, _) = shardx_core::grants::derive_keypair(&b_hpke_seed);
     keep_state(&dir, "b");
     std::fs::write(
         secrets,
-        [hex(&*fkek), hex(&*trk), hex(&a_sk), hex(&b_sk)].join("\n"),
+        [
+            hex(&*fkek),
+            hex(&*trk),
+            hex(&a_sk),
+            hex(&b_sk),
+            hex(&a_signing_seed),
+            hex(&a_hpke_seed),
+            hex(&b_signing_seed),
+            hex(&b_hpke_seed),
+        ]
+        .join("\n"),
     )
     .unwrap();
 }

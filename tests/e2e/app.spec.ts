@@ -933,6 +933,42 @@ test("the reason list offers only Retired and Lost", async ({ page: a }) => {
   await expect(reason).toContainText("Lost");
 });
 
+test("approval stays disabled until the custodian creates its fleet key", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Verifier Pending", status: "pending", granted: false }]);
+  await teamDevicePage(a, "a", server);
+  const row = await listDevices(a, "Verifier Pending");
+  await row.getByLabel("The code on the other device matches").check();
+  await cardSignIn(a);
+  await expect(a.getByRole("button", { name: "Create fleet key", exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+});
+
+test("refreshed keys require a fresh join-code comparison", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Verifier Pending", status: "pending", granted: false }]);
+  await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  const row = await listDevices(a, "Verifier Pending");
+  await row.getByLabel("The code on the other device matches").check();
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_devices") {
+        return (result as Record<string, unknown>[]).map((r) => r.label === "Verifier Pending"
+          ? { ...r, signing_key_id: "d2".repeat(32), hpke_key_id: "e3".repeat(32), sas: "1234 5678 90ab cdef 1234 5678 90ab cdef" }
+          : r);
+      }
+      return result;
+    };
+  });
+  await listDevices(a, "Verifier Pending");
+  await cardSignIn(a);
+  await expect(row.getByTestId("team-device-sas")).toHaveText("1234 5678 90ab cdef 1234 5678 90ab cdef");
+  await expect(row.getByLabel("The code on the other device matches")).not.toBeChecked();
+  await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+});
+
 test("connecting needs no token", async ({ page }) => {
   await gotoMocked(page);
   await page.getByRole("button", { name: "Team", exact: true }).click();

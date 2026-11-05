@@ -50,3 +50,7 @@ on the first, plus the blind verifier round.
   VERDICT: PASS: all ten properties hold and every refactor hunk preserves
   behavior. Its new probe (a revert refuses a mixed run without touching local
   data) is kept as a regression test without the `round8_` prefix.
+- [codex-custodian-round-1.md](codex-custodian-round-1.md): the Codex blind
+  verifier of the custodian flow, round 1, at 07260ecc. VERDICT: FAIL with six
+  defects (D1 to D6), fixed with regression tests in the same change; its tests
+  are kept without the `verifier_` prefix. Round 2 runs on the fixed main.
