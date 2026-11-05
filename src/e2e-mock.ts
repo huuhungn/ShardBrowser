@@ -277,6 +277,18 @@ let keyState = scenario === "team-first-device-resume"
   : scenario === "team-keys-locked"
     ? { keys_protected: true, has_key_file: true, keys_locked: true }
     : { keys_protected: true, has_key_file: false, keys_locked: false };
+// "team-device-a" and "team-device-b": two devices of one fleet (see below).
+const teamDevice = scenario === "team-device-a" || scenario === "team-device-b" ? scenario.slice(-1) : null;
+// The connection `team_set_connection` saved. A device session needs no token.
+let teamConnection = teamDevice
+  ? { server_url: "https://team.example.com", tenant_id: "22222222222222222222222222222222", has_token: false }
+  : { server_url: "", tenant_id: "", has_token: false };
+// This team device's own identity, pin and fleet key, as its team_config,
+// trust ledger and fleet key store hold them. A is the root custodian.
+type TeamMe = { device_id: string; enrolled_at_ms: number; pinned: boolean; collected: boolean };
+let teamMe: TeamMe = teamDevice === "a"
+  ? { device_id: "aa".repeat(16), enrolled_at_ms: 0, pinned: true, collected: false }
+  : { device_id: "", enrolled_at_ms: 0, pinned: false, collected: false };
 const teamStatusFixture = () => (firstDevice
   ? {
     server_url: "https://team.example.com",
@@ -291,15 +303,13 @@ const teamStatusFixture = () => (firstDevice
     ...keyState,
   }
   : {
-    server_url: "",
-    tenant_id: "",
-    device_id: "",
-    has_token: false,
-    is_enrolled: false,
+    ...teamConnection,
+    device_id: teamMe.device_id,
+    is_enrolled: !!teamMe.device_id,
     keys_unreadable: false,
-    can_sync: false,
-    can_receive_custody: false,
-    has_fleet_key: false,
+    can_sync: !!teamMe.device_id,
+    can_receive_custody: !!teamMe.device_id,
+    has_fleet_key: teamMe.collected,
     keys_protected: true,
     has_key_file: false,
     keys_locked: false,
@@ -321,14 +331,19 @@ const teamBound = (payload?: InvokeArgs) => {
   return b;
 };
 
+// The bootstrap anchor A0 of every team fixture.
+const TEAM_ANCHOR = "a0".repeat(32);
 let custodyBootstrap = scenario === "team-first-device-resume"
   ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
-  : { started: false, activated: false, recovery_path: "", anchor: "" };
+  : teamDevice === "a"
+    ? { started: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery", anchor: TEAM_ANCHOR }
+    : { started: false, activated: false, recovery_path: "", anchor: "" };
+let fleetCustody = { started: false, created: false, setup_key_held: false, fkek_key_id: "" };
 
 // "team-device-a" and "team-device-b": two devices of one fleet. Each page keeps
-// its own bindings; the server they share is the `e2eTeamServer` binding the
-// two-device journey in tests/e2e exposes, so a pin is the version a device accepted.
-const teamDevice = scenario === "team-device-a" || scenario === "team-device-b" ? scenario.slice(-1) : null;
+// its own bindings, pin and fleet key; the server they share is the
+// `e2eTeamServer` binding the team journeys in tests/e2e expose, so a pin is the
+// version a device accepted. No device holds a fleet key until it collected one.
 type TeamServerHead = {
   remote_profile_id: string; version: number; label: string | null; quarantine: string | null; revert_available: boolean;
 };
@@ -346,11 +361,107 @@ const teamSettle = (b: TeamProfileStatus, head: TeamServerHead) => {
     };
   return Object.assign(b, patch);
 };
+// Every row's keys and code derive from its device id, the same way on both pages.
+const teamKeyIds = (id: string) => ({ signing_key_id: id + id, hpke_key_id: [...id + id].reverse().join("") });
+const teamSas = (id: string) => [...id].reverse().join("").match(/.{4}/g)!.join(" ");
+const TEAM_WINDOW_MS = 10 * 60_000;
+// When this custodian first saw each pending device, by its own clock; never reset.
+const teamFirstSeen = new Map<string, number>();
+const teamRefuse = (code: string): never => { throw new Error(`[[shardx:${code}]]`); };
+const teamWindowOpen = () => {
+  if (!teamMe.enrolled_at_ms || Date.now() > teamMe.enrolled_at_ms + TEAM_WINDOW_MS) teamRefuse("fleet.joinCodeExpired");
+};
+const teamCustodian = () => { if (!custodyBootstrap.activated) teamRefuse("fleet.notCustodian"); };
+const TEAM_SYNC = new Set([
+  "team_fleet_profiles", "profile_sync_publish", "team_join_profile", "profile_sync_pull", "profile_sync_push",
+  "profile_sync_revert",
+]);
 async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
-  const args = (payload ?? {}) as { profileId?: string; remoteProfileId?: string; localProfileId?: string };
+  const args = (payload ?? {}) as {
+    profileId?: string; remoteProfileId?: string; localProfileId?: string; deviceId?: string; sas?: string;
+    reason?: string; anchor?: string; label?: string;
+  };
   const id = String(args.profileId ?? args.localProfileId ?? "");
   const head = () => ({ remote_profile_id: teamRemoteOf.get(id), pin: teamBound(payload).remote_version });
+  const me = { device_id: teamMe.device_id };
+  if (TEAM_SYNC.has(cmd)) {
+    await teamServer("live", me);
+    if (!teamMe.collected) teamRefuse("sync.noVerifiedFleetKey");
+  }
   switch (cmd) {
+    case "team_enroll_device": {
+      const { device_id } = await teamServer<{ device_id: string }>("enroll", { label: args.label });
+      // A pin binds the server, tenant and anchor, not the device, so it stays.
+      teamMe = { device_id, enrolled_at_ms: Date.now(), pinned: teamMe.pinned, collected: false };
+      return teamStatusFixture();
+    }
+    case "team_fleet_key_setup":
+      teamCustodian();
+      await teamServer("fleetKey", me);
+      fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
+      teamMe.collected = true; // the setup ends with the verified collect
+      return fleetCustody;
+    case "team_devices": {
+      teamCustodian();
+      const rows = await teamServer<{ device_id: string; label: string; status: string }[]>("devices", me);
+      return rows.map((r) => {
+        if (r.status === "pending" && !teamFirstSeen.has(r.device_id)) teamFirstSeen.set(r.device_id, Date.now());
+        const first = r.status === "pending" ? teamFirstSeen.get(r.device_id) : undefined;
+        return {
+          ...r, account_id: "ac".repeat(16), ...teamKeyIds(r.device_id), sas: teamSas(r.device_id),
+          approve_until_ms: first === undefined ? null : first + TEAM_WINDOW_MS,
+        };
+      });
+    }
+    case "team_approve_device": {
+      teamCustodian();
+      const target = String(args.deviceId);
+      const first = teamFirstSeen.get(target);
+      if (first === undefined || Date.now() - first > TEAM_WINDOW_MS) teamRefuse("fleet.approvalWindowClosed");
+      if (args.sas !== teamSas(target)) teamRefuse("fleet.joinCodeMismatch");
+      if (!teamMe.collected) teamRefuse("fleet.createFleetKeyFirst");
+      await teamServer("approve", { ...me, target });
+      return null;
+    }
+    case "team_revoke_device":
+      teamCustodian();
+      if (args.reason !== "retired" && args.reason !== "lost") teamRefuse("fleet.revokeReasonUnsupported");
+      if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
+      await teamServer("revoke", { ...me, target: args.deviceId });
+      return null;
+    case "team_join_code":
+      teamWindowOpen();
+      await teamServer("live", me);
+      return {
+        sas: teamSas(teamMe.device_id), anchor: TEAM_ANCHOR, ...teamKeyIds(teamMe.device_id),
+        expires_at_ms: teamMe.enrolled_at_ms + TEAM_WINDOW_MS,
+      };
+    case "team_join_confirm":
+      teamWindowOpen();
+      await teamServer("live", me);
+      if (args.anchor !== TEAM_ANCHOR) teamRefuse("fleet.joinAnchorChanged");
+      if (args.sas !== teamSas(teamMe.device_id)) teamRefuse("fleet.joinCodeChanged");
+      teamMe.pinned = true;
+      return null;
+    case "team_enroll_again": {
+      const status = await teamServer<string | null>("status", me);
+      if (custodyBootstrap.activated || !(status === "pending" || (status === "active" && !teamMe.pinned))) {
+        teamRefuse("fleet.enrollAgainRefused");
+      }
+      teamMe = { ...teamMe, device_id: "", enrolled_at_ms: 0, collected: false };
+      return teamStatusFixture();
+    }
+    case "team_collect_custody": {
+      const { granted } = await teamServer<{ granted: boolean }>("collect", me);
+      // A grant is kept only once this device pins the anchor to verify it against.
+      const kept = granted && teamMe.pinned;
+      if (kept) teamMe.collected = true;
+      return {
+        grants: 0, opened: 0, failed: 0, newest_generation: null,
+        fleet_opened: kept ? 1 : 0, fleet_failed: 0, newest_fleet_generation: kept ? 0 : null,
+        fleet_grants_waiting: granted && !kept ? 1 : 0, fleet_refusal: null, can_sync_without_passphrase: false,
+      };
+    }
     case "team_fleet_profiles":
       return (await teamServer<TeamServerHead[]>("list", {})).map((h): TeamFleetProfile => ({
         remote_profile_id: h.remote_profile_id, current_version: h.version, label: h.label,
@@ -756,6 +867,20 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return null;
     case "team_status":
       return teamStatusFixture();
+    case "team_set_connection": {
+      const args = payload as { serverUrl?: string; token?: string; tenantId?: string };
+      teamConnection = {
+        server_url: String(args?.serverUrl ?? ""),
+        tenant_id: String(args?.tenantId ?? ""),
+        has_token: !!args?.token || teamConnection.has_token,
+      };
+      return teamStatusFixture();
+    }
+    case "team_test_connection":
+      if (!teamConnection.server_url || !teamConnection.tenant_id) throw new Error("fixture team not configured");
+      return "5e".repeat(16);
+    case "team_fleet_custody_status":
+      return fleetCustody;
     // Copies, as IPC would: a later change must not reach the UI unless it refetches.
     case "team_profiles_status":
       if (Number(params.get("teamStatusDelay") ?? 0) > 0) await wait(Number(params.get("teamStatusDelay")));

@@ -1619,6 +1619,17 @@ fn verified_key(
     readable_key(db, dev, fleet, generation, fkek_key_id, now)
 }
 
+/// Whether this device holds the key a publish would seal under: the
+/// highest generation it verified, from a grant that reverifies now
+/// ([`verified_key`]). A key cached by 2.4.2, never verified, does not count.
+pub(crate) fn holds_verified_key(dev: &Device, fleet: &[u8; 16], now: u64) -> Result<bool> {
+    let db = Db::open()?;
+    let Some(generation) = ledger::highest_generation(&db, &dev.pin.0, fleet)? else {
+        return Ok(false);
+    };
+    Ok(verified_key(&db, dev, fleet, generation, None, now).is_ok())
+}
+
 /// [`verified_key`] without "Fleet generation freshness", only to read rule
 /// 6's anchor `P`, which may be of a generation a rotation since replaced,
 /// and may lie past the pin (owner decision B) or be what a revert seals

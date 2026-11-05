@@ -250,9 +250,8 @@ pub struct TeamStatus {
     /// key, but the private half was discarded, so grants sealed to it can
     /// never be opened. Such a device must re-enroll.
     pub can_receive_custody: bool,
-    /// Whether sync can run without a passphrase. Always false for now: push
-    /// never seals under a fleet key cached from the team server, because the
-    /// server cannot yet prove who issued it. Kept for the interface's shape.
+    /// Whether this device holds a fleet key whose grant still verifies
+    /// against the anchor it pinned: the key published profiles sync under.
     pub has_fleet_key: bool,
     /// Whether every key this device holds is in the OS credential store.
     /// False while a seed or fleet key is still in plaintext on disk because
@@ -325,9 +324,9 @@ pub fn status() -> Result<TeamStatus> {
         keys_unreadable: c.keys_unreadable(),
         can_sync: c.can_sync(),
         can_receive_custody: c.can_receive_custody(),
-        // A cached fleet key no longer lets sync skip the passphrase: push
-        // always seals under the passphrase (see `sync_cmd`).
-        has_fleet_key: false,
+        // The key a publish seals under, as push selects it: fail closed.
+        has_fleet_key: c.can_sync()
+            && crate::sync_cmd::holds_verified_fleet_key(&c, crate::root_bootstrap::now_ms()),
         keys_protected: c.signing_key_seed.is_empty()
             && c.hpke_key_seed.is_empty()
             && crate::fleet_keys::load()
@@ -396,6 +395,37 @@ mod tests {
         // A reference whose credential is gone fails closed.
         crate::credential::forget(&saved.hpke_credential_ref).unwrap();
         assert!(saved.hpke_seed().is_err());
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn a_legacy_cached_fleet_key_alone_is_not_a_fleet_key() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let tenant = "ef".repeat(16);
+        save(&TeamConfig {
+            tenant_id: tenant.clone(),
+            account_id: "ac".repeat(16),
+            device_id: "ab".repeat(16),
+            signing_key_seed: "11".repeat(32).into(),
+            hpke_key_seed: "22".repeat(32).into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // As 2.4.2 cached it: no verified grant, so `verified` does not list it.
+        let mut keys = crate::fleet_keys::FleetKeyStore::default();
+        keys.insert(&tenant, 0, &[7; 32]);
+        crate::fleet_keys::save(&keys).unwrap();
+
+        let st = status().unwrap();
+        assert!(st.can_sync);
+        assert!(
+            !st.has_fleet_key,
+            "only a verified key a publish seals under counts"
+        );
         store::set_config_root(None);
     }
 

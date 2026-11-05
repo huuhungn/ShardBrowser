@@ -214,7 +214,7 @@ test("settings dirty state and MCP readiness render from fixture", async ({ page
 
 test("Team section shows the team card and Settings no longer does", async ({ page }) => {
   await gotoMocked(page);
-  const intro = page.getByText("Enrol this device with a team server to sync encrypted profiles.");
+  const intro = page.getByText("Enroll this device with a team server to sync encrypted profiles.");
 
   await page.getByRole("button", { name: "Team", exact: true }).click();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Team");
@@ -486,15 +486,33 @@ test("a refused action shows the localized error and keeps the row", async ({ pa
 });
 
 type TeamHead = { version: number; label: string | null; holder: string | null; revoked: boolean };
+type TeamDeviceRow = { device_id: string; label: string; status: "pending" | "active" | "revoked"; granted: boolean };
 
 /**
  * The one team server both devices of the journey talk to, through the
  * `e2eTeamServer` binding the `team-device-*` mocks call. Each op answers with
  * the head a device would accept; a head signed by a key later proven revoked
  * quarantines whoever pulls it until a revert seals a valid one over it.
+ *
+ * It also lists the tenant's devices: A, the active root custodian, plus any
+ * in `more`. Enrolling files a pending row; approving one grants it the fleet
+ * key once A created it, and revoking one refuses its sessions from then on.
  */
-function fakeTeamServer() {
+function fakeTeamServer(more: TeamDeviceRow[] = []) {
   const heads = new Map<string, TeamHead>();
+  const devices: TeamDeviceRow[] = [{ device_id: "aa".repeat(16), label: "Machine A", status: "active", granted: false }, ...more];
+  let fleetKey = false;
+  let enrolled = 0;
+  const row = (id: unknown) => devices.find((d) => d.device_id === id);
+  // A device session: a revoked device is refused, as v2_auth refuses it.
+  const live = (id: unknown) => {
+    const d = row(id);
+    if (!d) throw new Error("[[shardx:fleet.refusedSession|status=401|detail=unknown device]]");
+    if (d.status === "revoked") {
+      throw new Error("[[shardx:fleet.refusedSession|status=403|detail=the device is revoked and holds no live approval]]");
+    }
+    return d;
+  };
   const head = (id: string) => {
     const h = heads.get(id);
     if (!h) throw new Error(`no team profile ${id}`);
@@ -507,8 +525,39 @@ function fakeTeamServer() {
       quarantine: h.revoked ? "SIGNER_REVOKED" : null, revert_available: h.revoked,
     };
   };
-  type Args = { label?: string | null; remote_profile_id?: string; pin?: number | null };
+  type Args = {
+    label?: string | null; remote_profile_id?: string; pin?: number | null; device_id?: string; target?: string;
+  };
   const ops: Record<string, (device: string, args: Args) => unknown> = {
+    enroll: (_device, { label }) => {
+      const device_id = `b${++enrolled}`.repeat(16);
+      devices.push({ device_id, label: String(label), status: "pending", granted: false });
+      return { device_id };
+    },
+    live: (_device, { device_id }) => { live(device_id); return null; },
+    status: (_device, { device_id }) => row(device_id)?.status ?? null,
+    devices: (_device, { device_id }) => {
+      live(device_id);
+      return devices.map(({ device_id: id, label, status }) => ({ device_id: id, label, status }));
+    },
+    fleetKey: (_device, { device_id }) => {
+      live(device_id).granted = true;
+      fleetKey = true;
+      return null;
+    },
+    approve: (_device, { device_id, target }) => {
+      live(device_id);
+      const d = row(target);
+      if (d?.status !== "pending") throw new Error("[[shardx:fleet.deviceNotPending]]");
+      Object.assign(d, { status: "active", granted: fleetKey });
+      return null;
+    },
+    revoke: (_device, { device_id, target }) => {
+      live(device_id);
+      Object.assign(row(target) ?? {}, { status: "revoked", granted: false });
+      return null;
+    },
+    collect: (_device, { device_id }) => ({ granted: live(device_id).granted }),
     list: () => [...heads.keys()].map(reply),
     publish: (device, { label }) => {
       const id = `d${heads.size + 1}`.repeat(16);
@@ -534,6 +583,7 @@ function fakeTeamServer() {
   };
   return {
     heads,
+    devices,
     call: (op: string, device: string, args: Args) => ops[op](device, args),
     /** A device whose key is later proven revoked checks in a new head. */
     revokedCheckIn: (id: string) => Object.assign(head(id), { version: head(id).version + 1, revoked: true }),
@@ -547,6 +597,97 @@ const teamPins = (page: Page) => page.evaluate(async () => {
   }).__TAURI_INTERNALS__;
   return (await ipc.invoke("team_profiles_status")).profiles.map((p) => `${p.sync_state}@${p.remote_version}`);
 });
+
+/** Open team device `device`'s Team page against `server`, its clock faked when `clock` is set. */
+async function teamDevicePage(page: Page, device: "a" | "b", server: ReturnType<typeof fakeTeamServer>, clock = false) {
+  if (clock) await page.clock.install();
+  await page.exposeFunction("e2eTeamServer", server.call);
+  await gotoMocked(page, `/?e2e=team-device-${device}`);
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  return page.getByTestId("team-card");
+}
+
+// TeamCard's own account login; each call that reaches the server clears the password.
+async function cardSignIn(page: Page) {
+  const card = page.getByTestId("team-card");
+  await card.getByLabel("Account username").fill("owner");
+  await card.getByLabel("Account password").fill("pw");
+}
+
+async function cardClick(page: Page, name: string) {
+  await cardSignIn(page);
+  await page.getByTestId("team-card").getByRole("button", { name, exact: true }).click();
+}
+
+async function teamEnroll(page: Page, label: string) {
+  const card = page.getByTestId("team-card");
+  await card.getByLabel("Device label").fill(label);
+  await cardClick(page, "Enroll this device");
+  await expect(card.getByTestId("team-join")).toBeVisible();
+}
+
+/** The custodian's device rows labelled `label`, freshly listed. */
+async function listDevices(a: Page, label: string) {
+  await cardClick(a, "Show devices");
+  return a.getByTestId("team-device").filter({ hasText: label });
+}
+
+/**
+ * B enrolls as "Machine B" and is refused the fleet until it collects; A
+ * creates the fleet key, the codes on both pages match, A approves B, and B
+ * pins the anchor and collects generation 0.
+ */
+async function admitB(a: Page, b: Page) {
+  await test.step("B enrolls, and its fleet list is refused before it collects", async () => {
+    await teamEnroll(b, "Machine B");
+    await teamSignIn(b);
+    await b.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+    await expect(b.getByText("No fleet key this device verified opens this team profile.")).toBeVisible();
+    await expect(b.getByTestId("team-fleet-profile")).toHaveCount(0);
+  });
+
+  await test.step("A creates the fleet key", async () => {
+    await cardClick(a, "Create fleet key");
+    await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toBeVisible();
+    await expect(a.getByTestId("team-devices")).toContainText("The recovery bundle does not include the fleet key yet.");
+  });
+
+  const row = await test.step("B's join code is the code A's Devices shows, full key IDs too", async () => {
+    await cardClick(b, "Show join code");
+    const sas = b.getByTestId("team-join-sas");
+    await expect(sas).toHaveText(/^([0-9a-f]{4} ){7}[0-9a-f]{4}$/);
+    const rowB = await listDevices(a, "Machine B");
+    await expect(rowB).toContainText("Pending");
+    await expect(rowB.getByTestId("team-device-sas")).toHaveText(await sas.innerText());
+    await b.getByTestId("team-join").getByRole("button", { name: "Show full key IDs" }).click();
+    await rowB.getByRole("button", { name: "Show full key IDs" }).click();
+    const ids = await b.getByTestId("team-join-key-ids").locator("dd").allInnerTexts();
+    expect(ids).toHaveLength(3);
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{64}$/);
+    await expect(rowB.getByTestId("team-device-key-ids").locator("dd")).toHaveText(ids);
+    return rowB;
+  });
+
+  await test.step("Approve stays disabled until the codes are confirmed to match", async () => {
+    const approve = row.getByRole("button", { name: "Approve" });
+    await cardSignIn(a);
+    await expect(approve).toBeDisabled();
+    await row.getByLabel("The code on the other device matches").check();
+    await expect(approve).toBeEnabled();
+    await approve.click();
+    await expect(row).toContainText("Active");
+  });
+
+  await test.step("B clicks Codes match, then collects the fleet key", async () => {
+    await cardClick(b, "Codes match");
+    await expect(b.getByTestId("team-join")).toContainText("Codes confirmed.");
+    await cardClick(b, "Collect key custody");
+    await expect(b.getByText("Fleet key collected (generation 0).")).toBeVisible();
+    // Joined: status reports the kept key, so no join code or Enroll again is offered.
+    await expect(b.getByTestId("team-join")).toHaveCount(0);
+    await expect(b.getByTestId("team-joined")).toContainText("holds a verified fleet key");
+  });
+}
 
 // The two-machine gate (Plan:2388), each step a test.step below:
 //   publish               = S5 publish on A
@@ -562,11 +703,9 @@ test("two devices pass one team profile back and forth, then revert a revoked he
   test.slow();
   const server = fakeTeamServer();
   const b = await (await browser.newContext({ baseURL, viewport })).newPage();
-  for (const [page, device] of [[a, "a"], [b, "b"]] as const) {
-    await page.exposeFunction("e2eTeamServer", server.call);
-    await gotoMocked(page, `/?e2e=team-device-${device}`);
-    await page.getByRole("button", { name: "Team", exact: true }).click();
-  }
+  await teamDevicePage(a, "a", server);
+  await teamDevicePage(b, "b", server);
+  await admitB(a, b);
   const rowA = a.getByTestId("team-profile").filter({ hasText: "Beta Research" });
   const rowB = b.getByTestId("team-profile").filter({ hasText: "Beta Research" });
   const click = async (page: Page, row: ReturnType<Page["getByTestId"]>, name: string) => {
@@ -655,6 +794,160 @@ test("two devices pass one team profile back and forth, then revert a revoked he
     expect(server.heads.get(id)).toEqual({ version: 5, label: "Beta Research", holder: null, revoked: false });
   });
   await b.context().close();
+});
+
+test("a custodian revokes a device and the device can no longer pull", async ({ page: a, browser, baseURL, viewport }) => {
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server);
+  await teamDevicePage(b, "b", server);
+  await admitB(a, b);
+  const rowA = a.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const rowB = b.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const click = async (page: Page, row: ReturnType<Page["getByTestId"]>, name: string) => {
+    await teamSignIn(page);
+    await row.getByRole("button", { name, exact: true }).click();
+  };
+  await click(a, rowA, "Publish");
+  await click(a, rowA, "Check in");
+  await expect(rowA).toContainText("Available");
+  await teamSignIn(b);
+  await b.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+  await teamSignIn(b);
+  await b.getByTestId("team-fleet-profile").filter({ hasText: "Beta Research" }).getByRole("button", { name: "Join" }).click();
+  await expect(rowB).toContainText("Available");
+  await click(b, rowB, "Pull");
+  await expect(b.getByText("Profile pulled from the team.")).toBeVisible();
+
+  const row = await listDevices(a, "Machine B");
+  await expect(row).toContainText("Active");
+  await cardSignIn(a);
+  await row.getByRole("button", { name: "Revoke" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("It keeps the fleet key it already holds");
+  await expect(dialog).toContainText(
+    "A head it signed before the revoke that this computer already pinned is quarantined too (signer revoked): run Revert on that profile to continue.",
+  );
+  await dialog.getByRole("button", { name: "Revoke" }).click();
+  await expect(row).toContainText("Revoked");
+  await expect(row.getByRole("button", { name: "Revoke" })).toHaveCount(0);
+  expect(server.devices.find((d) => d.label === "Machine B")?.status).toBe("revoked");
+
+  await click(b, rowB, "Pull");
+  await expect(b.getByText("The team server refused to open a session for this device (403)")).toBeVisible();
+  await expect(b.getByText("revoked and holds no live approval")).toBeVisible();
+  await b.context().close();
+});
+
+test("an expired join code offers Enroll again and a new code", async ({ page: b }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(b, "b", server, true);
+  await teamEnroll(b, "Machine B");
+  await cardClick(b, "Show join code");
+  const sas = b.getByTestId("team-join-sas");
+  const first = await sas.innerText();
+  await expect(card.getByTestId("team-join")).toContainText("left on this computer's clock");
+
+  await b.clock.fastForward("10:01");
+  await expect(card.getByTestId("team-join")).toContainText("This join code has expired.");
+  await expect(sas).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Codes match" })).toHaveCount(0);
+
+  await cardClick(b, "Enroll again");
+  await expect(card.getByRole("button", { name: "Enroll this device" })).toBeVisible();
+  await teamEnroll(b, "Machine B");
+  await cardClick(b, "Show join code");
+  await expect(sas).toHaveText(/^([0-9a-f]{4} ){7}[0-9a-f]{4}$/);
+  expect(await sas.innerText()).not.toBe(first);
+  await expect(card.getByRole("button", { name: "Codes match" })).toBeVisible();
+});
+
+test("an approved device whose join code expired can enroll again", async ({ page: a, browser, baseURL, viewport }) => {
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server);
+  const cardB = await teamDevicePage(b, "b", server, true);
+  await cardClick(a, "Create fleet key");
+  await teamEnroll(b, "Machine B");
+  await cardClick(b, "Show join code");
+  const old = await listDevices(a, "Machine B");
+  await old.getByLabel("The code on the other device matches").check();
+  await cardSignIn(a);
+  await old.getByRole("button", { name: "Approve" }).click();
+  await expect(old).toContainText("Active");
+
+  await b.clock.fastForward("10:01");
+  await expect(cardB.getByTestId("team-join")).toContainText("This join code has expired.");
+  await cardClick(b, "Enroll again");
+  await teamEnroll(b, "Machine B");
+
+  const rows = await listDevices(a, "Machine B");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText("Active");
+  await expect(rows.nth(0)).not.toContainText("Newest");
+  await expect(rows.nth(1)).toContainText("Pending");
+  await expect(rows.nth(1)).toContainText("Newest");
+  await expect(rows.nth(1)).toContainText("approve this one if its code matches");
+  await b.context().close();
+});
+
+test("the custodian cannot approve a row it first saw more than ten minutes ago", async ({ page: a, browser, baseURL, viewport }) => {
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server, true);
+  await teamDevicePage(b, "b", server);
+  await cardClick(a, "Create fleet key");
+  await teamEnroll(b, "Machine B");
+
+  const row = await listDevices(a, "Machine B");
+  const approve = row.getByRole("button", { name: "Approve" });
+  await row.getByLabel("The code on the other device matches").check();
+  await cardSignIn(a);
+  await expect(approve).toBeEnabled();
+  await expect(row).toContainText("left on this computer's clock");
+
+  await a.clock.fastForward("10:01");
+  await expect(row).toContainText("Expired");
+  await expect(approve).toBeDisabled();
+  // Listing again keeps the first sight: the window is not reset.
+  await listDevices(a, "Machine B");
+  await cardSignIn(a);
+  await expect(row).toContainText("Expired");
+  await expect(approve).toBeDisabled();
+  expect(server.devices.find((d) => d.label === "Machine B")?.status).toBe("pending");
+  await b.context().close();
+});
+
+test("the reason list offers only Retired and Lost", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: false }]);
+  await teamDevicePage(a, "a", server);
+  const row = await listDevices(a, "Machine C");
+  await expect(a.getByTestId("team-device").filter({ hasText: "Machine A" }).getByRole("combobox")).toHaveCount(0);
+  const reason = row.getByRole("combobox", { name: "Reason" });
+  await expect(reason).toContainText("Retired");
+  await reason.click();
+  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost"]);
+  await a.getByRole("option", { name: "Lost" }).click();
+  await expect(reason).toContainText("Lost");
+});
+
+test("connecting needs no token", async ({ page }) => {
+  await gotoMocked(page);
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  const card = page.getByTestId("team-card");
+  await expect(card.getByLabel("API token (optional, only for legacy passphrase sync)")).toHaveValue("");
+  await card.getByLabel("Server URL").fill("https://team.example.com");
+  await card.getByLabel("Tenant ID").fill("22222222222222222222222222222222");
+  await card.getByRole("button", { name: "Save connection" }).click();
+  await expect(page.getByText("Connection saved")).toBeVisible();
+  await expect(card).not.toContainText("Save a server URL and tenant ID first.");
+
+  await cardSignIn(page);
+  await expect(card.getByRole("button", { name: "Enroll this device" })).toBeEnabled();
+  await card.getByRole("button", { name: "Test connection" }).click();
+  await expect(page.getByText(`Server identity: ${"5e".repeat(16)}`)).toBeVisible();
 });
 
 test("the first device sets up root custody once its passphrases agree", async ({ page }) => {

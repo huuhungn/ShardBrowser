@@ -21,8 +21,8 @@ export type TeamStatus = {
    */
   can_receive_custody: boolean;
   /**
-   * Always false: push seals under the team passphrase, never a fleet key
-   * cached from the server, until verified key distribution ships.
+   * Whether this device holds a fleet key whose grant still verifies against
+   * the anchor it pinned, the key published profiles sync under.
    */
   has_fleet_key: boolean;
   /**
@@ -52,7 +52,7 @@ export type CustodyBootstrapStatus = {
 
 /** What `team_collect_custody` found waiting on the server. */
 export type CustodyResult = {
-  /** Grants the server holds for this device. */
+  /** Root key grants the server holds for this device. */
   grants: number;
   /** Of those, how many this device could actually open. */
   opened: number;
@@ -60,20 +60,62 @@ export type CustodyResult = {
   failed: number;
   /** Highest root generation among the opened grants, if any. */
   newest_generation: number | null;
-  /** Always 0: fleet key grants from the server are counted, not opened. */
+  /** 1 when the fleet key grant verified, opened and was kept. */
   fleet_opened: number;
-  /** Always 0, for the same reason. */
+  /** 1 when a filed fleet key grant did not verify, open or fetch its evidence. */
   fleet_failed: number;
-  /** Always null, for the same reason. */
+  /** The generation of the kept fleet key, if one was kept. */
   newest_fleet_generation: number | null;
   /**
-   * Fleet key grants the server holds for this device. They are not accepted
-   * until verified key distribution ships; sync uses the team passphrase.
+   * 1 when a fleet key grant is filed but was not kept: this device pins no
+   * anchor yet (confirm its join code first), or the grant was refused.
    */
   fleet_grants_waiting: number;
-  /** Always false, for the same reason. */
+  /** `KEY_SUBSTITUTION_DETECTED` when this device already holds another key for that generation. */
+  fleet_refusal: string | null;
+  /** Always false: the passphrase path is legacy only. */
   can_sync_without_passphrase: boolean;
 };
+
+/** How far Create fleet key got, as `team_fleet_custody_status` reports it; no secret. */
+export type FleetCustodyStatus = {
+  /** Some step ran, so a new attempt resumes rather than starts over. */
+  started: boolean;
+  /** Generation 0 was built; it is done once its setup key is released. */
+  created: boolean;
+  setup_key_held: boolean;
+  /** The public id of the fleet key, once it was made. */
+  fkek_key_id: string;
+};
+
+/** A device of the tenant, as `team_devices` lists it for the root custodian. */
+export type TeamDevice = {
+  device_id: string;
+  account_id: string;
+  /** The server's status: `pending`, `active` or `revoked`. */
+  status: string;
+  label: string;
+  signing_key_id: string;
+  hpke_key_id: string;
+  /** The code the joining device must show, computed from this custodian's pin. */
+  sas: string;
+  /** For a pending device: until when it may be approved, by this computer's clock. */
+  approve_until_ms: number | null;
+};
+
+/** What `team_join_code` shows on a joining device while its window is open. */
+export type TeamJoinCode = {
+  sas: string;
+  /** The bootstrap anchor A0 the tenant's evidence verifies to. */
+  anchor: string;
+  signing_key_id: string;
+  hpke_key_id: string;
+  /** The end of this device's join window, by its own clock. */
+  expires_at_ms: number;
+};
+
+/** The reasons Revoke offers. */
+export type TeamRevokeReason = "retired" | "lost";
 
 /** A `profile_bindings` sync state. */
 export type TeamSyncState =

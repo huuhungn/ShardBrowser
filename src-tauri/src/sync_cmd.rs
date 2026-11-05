@@ -462,6 +462,25 @@ async fn published_session(
     Ok((client, session, team::sync::Device { signer, me, pin }))
 }
 
+/// Whether a publish could seal now: this device pins an anchor and holds the
+/// verified key `team::sync` seals under. Any error reads as false, and no
+/// team database is created for a device that pins nothing.
+pub(crate) fn holds_verified_fleet_key(c: &team_config::TeamConfig, now: u64) -> bool {
+    let check = || -> anyhow::Result<bool> {
+        let Some(pin) = crate::pinned_anchor(c) else {
+            return Ok(false);
+        };
+        let dev = team::sync::Device {
+            signer: c.signing_key()?,
+            me: crate::recipient(c)?,
+            pin,
+        };
+        let fleet = fleet_client::decode_hex16(&fleet_id(c), "fleet_id")?;
+        team::sync::holds_verified_key(&dev, &fleet, now)
+    };
+    check().unwrap_or(false)
+}
+
 /// What the server currently holds for `profile_id`, or `None` if nothing.
 ///
 /// This needs no passphrase: it reads version metadata, never contents.
