@@ -329,6 +329,7 @@
   "fleet.notCustodian": "Only the device that set up the team's root custody can do this",
   "fleet.joinCodeExpired": "This device's join code has expired: enroll this device again",
   "fleet.joinAnchorChanged": "The team server now shows a different bootstrap anchor than the one confirmed; nothing was pinned",
+  "fleet.joinCodeChanged": "The team server now shows another server or team than the one this device's join code was computed for; nothing was pinned",
   "fleet.approvalWindowClosed": "More than ten minutes passed since this computer first saw that device waiting; it cannot be approved now. Ask its user to enroll it again",
   "fleet.joinCodeMismatch": "The code you confirmed is not the code computed for that device; nothing was approved",
   "fleet.deviceKeysMismatch": "The team server listed key IDs that do not come from that device's keys; nothing was approved",

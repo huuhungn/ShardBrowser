@@ -636,6 +636,7 @@ fn two_devices_share_a_profile_through_a_real_server_after_approval() {
         OWNER.into(),
         PASSWORD.into(),
         code.anchor.clone(),
+        code.sas.clone(),
     ))
     .unwrap();
     rt.block_on(crate::team_collect_custody(OWNER.into(), PASSWORD.into()))

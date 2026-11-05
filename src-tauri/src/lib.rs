@@ -2788,14 +2788,19 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
     })
 }
 
-/// Section 4.J step 3: pins `evaluated` as this device's `JOIN` anchor when
-/// it is the `shown` one the user confirmed and the window is still open.
+/// Section 4.J step 3: pins `evaluated` for `binding` as this device's
+/// `JOIN` anchor when it is the `shown` one the user confirmed, the code
+/// over the binding, the anchor and this device's keys is still the `sas`
+/// shown beside it (ADR 0002 Q-12: the whole `(server_instance_id,
+/// tenant_id, A0)` is what is pinned), and the window is still open.
+#[allow(clippy::too_many_arguments)]
 fn pin_join(
     c: &team_config::TeamConfig,
     ledger: &team::db::Db,
     binding: &shardx_core::trust_chain::Binding,
     evaluated: &[u8; 32],
     shown: &str,
+    sas: &str,
     now: u64,
 ) -> Result<(), String> {
     join_window(c, now)?;
@@ -2805,6 +2810,22 @@ fn pin_join(
         .eq_ignore_ascii_case(&fleet_client::hex(evaluated))
     {
         return Err(changed());
+    }
+    let me = recipient(c).map_err(|e| e.to_string())?;
+    let code = shardx_core::trust_chain::join_sas_display(&shardx_core::trust_chain::join_sas(
+        &binding.server_instance_id,
+        &binding.tenant_id,
+        evaluated,
+        &me.signing_key_id,
+        &me.hpke_key_id,
+    ));
+    let typed: String = sas
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if typed != code.replace(' ', "") {
+        return Err(crate::errcode::code("fleet.joinCodeChanged"));
     }
     let pinned = team::ledger::pin_anchor(ledger, binding, evaluated, team::ledger::JOIN, now)
         .map_err(|e| {
@@ -2817,14 +2838,15 @@ fn pin_join(
     Ok(())
 }
 
-/// Pins the anchor `anchor` the user saw beside a matching code (section 4.J
-/// step 3), only inside this device's join window: a late confirm is never
-/// allowed, approved or not.
+/// Pins the anchor `anchor` the user saw beside the matching code `sas`
+/// (section 4.J step 3), only inside this device's join window: a late
+/// confirm is never allowed, approved or not.
 #[tauri::command]
 async fn team_join_confirm(
     username: String,
     password: String,
     anchor: String,
+    sas: String,
 ) -> Result<(), String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
@@ -2842,15 +2864,17 @@ async fn team_join_confirm(
         &binding,
         &evaluated,
         &anchor,
+        &sas,
         root_bootstrap::now_ms(),
     )
 }
 
 /// Clears this device's identity so it can enroll again (section 4.J step
-/// 4): only while the server lists it pending, or active without a pin here,
-/// as when an approval landed after its join window closed. A pinned device
-/// and the root custodian keep theirs. The old row stays on the server until
-/// a custodian revokes it.
+/// 4): only while the server lists it pending, pinned here or not, or active
+/// without a pin here, as when an approval landed after its join window
+/// closed. A pin binds the server, tenant and anchor, not the device, so it
+/// stays. An active pinned device and the root custodian keep theirs. The old
+/// row stays on the server until a custodian revokes it.
 #[tauri::command]
 async fn team_enroll_again(
     username: String,
@@ -2867,7 +2891,7 @@ async fn team_enroll_again(
     let root = root_bootstrap::load().map_err(|e| e.to_string())?;
     let custodian = root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
         && root.device_id.eq_ignore_ascii_case(&c.device_id);
-    if custodian || pinned_anchor(&c).is_some() {
+    if custodian {
         return Err(refused());
     }
     let client =
@@ -2883,7 +2907,12 @@ async fn team_enroll_again(
         )
         .await
         .map_err(|e| e.to_string())?;
-    if !matches!(status.as_deref(), Some("pending" | "active")) {
+    let allowed = match status.as_deref() {
+        Some("pending") => true,
+        Some("active") => pinned_anchor(&c).is_none(),
+        _ => false,
+    };
+    if !allowed {
         return Err(refused());
     }
     let stale_refs = clear_identity(&mut c);
@@ -5813,7 +5842,12 @@ mod custody_tests {
         let _j = joiner(&url, now - 11 * MINUTE);
         let anchor = [0x0a; 32];
         let err = rt
-            .block_on(team_join_confirm("u".into(), "p".into(), hex(&anchor)))
+            .block_on(team_join_confirm(
+                "u".into(),
+                "p".into(),
+                hex(&anchor),
+                String::new(),
+            ))
             .unwrap_err();
         assert!(err.contains("fleet.joinCodeExpired"), "{err}");
         assert!(calls.lock().unwrap().is_empty(), "no server is asked");
@@ -5822,9 +5856,50 @@ mod custody_tests {
         // The pin itself checks the window again, with the anchor shown.
         let c = team_config::load().unwrap();
         let ledger = team::db::Db::open().unwrap();
-        let err = pin_join(&c, &ledger, &BINDING_J, &anchor, &hex(&anchor), now).unwrap_err();
+        let sas = code_for(&c, &BINDING_J, &anchor);
+        let err = pin_join(&c, &ledger, &BINDING_J, &anchor, &hex(&anchor), &sas, now).unwrap_err();
         assert!(err.contains("fleet.joinCodeExpired"), "{err}");
         assert_eq!(join_pin(), None);
+    }
+
+    /// The code this joiner shows for `binding` and `anchor`.
+    fn code_for(
+        c: &team_config::TeamConfig,
+        binding: &shardx_core::trust_chain::Binding,
+        anchor: &[u8; 32],
+    ) -> String {
+        let me = recipient(c).unwrap();
+        shardx_core::trust_chain::join_sas_display(&shardx_core::trust_chain::join_sas(
+            &binding.server_instance_id,
+            &binding.tenant_id,
+            anchor,
+            &me.signing_key_id,
+            &me.hpke_key_id,
+        ))
+    }
+
+    /// ADR 0002 Q-12: the whole `(server_instance_id, tenant_id, A0)` is
+    /// pinned only as the code showed it. A server that shows another
+    /// instance at confirm time, with the same anchor, pins nothing.
+    #[test]
+    fn a_join_confirm_is_refused_when_the_server_instance_changed() {
+        let now = root_bootstrap::now_ms();
+        let _j = joiner("http://127.0.0.1:9", now);
+        let c = team_config::load().unwrap();
+        let ledger = team::db::Db::open().unwrap();
+        let anchor = [0x0a; 32];
+        let shown = code_for(&c, &BINDING_J, &anchor);
+        let other = shardx_core::trust_chain::Binding {
+            server_instance_id: [0x0d; 16],
+            ..BINDING_J
+        };
+        for (binding, sas) in [(&other, shown.as_str()), (&BINDING_J, "")] {
+            let err = pin_join(&c, &ledger, binding, &anchor, &hex(&anchor), sas, now).unwrap_err();
+            assert!(err.contains("fleet.joinCodeChanged"), "{err}");
+        }
+        assert_eq!(join_pin(), None);
+        pin_join(&c, &ledger, &BINDING_J, &anchor, &hex(&anchor), &shown, now).unwrap();
+        assert_eq!(join_pin(), Some((BINDING_J, anchor, "JOIN".to_string())));
     }
 
     #[test]
@@ -5834,8 +5909,9 @@ mod custody_tests {
         let c = team_config::load().unwrap();
         let ledger = team::db::Db::open().unwrap();
         let (evaluated, shown) = ([0x0a; 32], [0x0b; 32]);
+        let sas = code_for(&c, &BINDING_J, &evaluated);
         for shown in [hex(&shown), String::new()] {
-            let err = pin_join(&c, &ledger, &BINDING_J, &evaluated, &shown, now).unwrap_err();
+            let err = pin_join(&c, &ledger, &BINDING_J, &evaluated, &shown, &sas, now).unwrap_err();
             assert!(err.contains("fleet.joinAnchorChanged"), "{err}");
         }
         assert_eq!(join_pin(), None);
@@ -5845,12 +5921,14 @@ mod custody_tests {
             &BINDING_J,
             &evaluated,
             &hex(&evaluated).to_uppercase(),
+            &sas,
             now,
         )
         .unwrap();
         assert_eq!(join_pin(), Some((BINDING_J, evaluated, "JOIN".to_string())));
         // A later ceremony against another anchor never replaces it.
-        let err = pin_join(&c, &ledger, &BINDING_J, &shown, &hex(&shown), now).unwrap_err();
+        let other = code_for(&c, &BINDING_J, &shown);
+        let err = pin_join(&c, &ledger, &BINDING_J, &shown, &hex(&shown), &other, now).unwrap_err();
         assert!(err.contains("fleet.joinAnchorChanged"), "{err}");
         assert_eq!(join_pin(), Some((BINDING_J, evaluated, "JOIN".to_string())));
     }
@@ -5925,28 +6003,30 @@ mod custody_tests {
         assert_cleared(refs);
     }
 
-    #[test]
-    fn enroll_again_is_refused_for_a_pinned_or_custodian_device() {
-        let rt = runtime();
-        for status in ["active", "pending"] {
-            // A device that pinned its anchor.
-            let (url, calls) = me_server(&rt, status);
-            let _j = joiner(&url, root_bootstrap::now_ms());
-            let before = format!("{:?}", team_config::load().unwrap());
-            let ledger = team::db::Db::open().unwrap();
-            assert!(team::ledger::pin_anchor(&ledger, &BINDING_J, &[0x0a; 32], "JOIN", 1).unwrap());
-            let refused = |calls: &Calls| {
-                let err = rt
-                    .block_on(team_enroll_again("u".into(), "p".into()))
-                    .unwrap_err();
-                assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
-                assert!(calls.lock().unwrap().is_empty(), "no server is asked");
-                assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
-            };
-            refused(&calls);
-            drop(_j);
+    /// Pins the joiner's tenant to an anchor, as a confirmed join does.
+    fn pin_here() {
+        let ledger = team::db::Db::open().unwrap();
+        assert!(team::ledger::pin_anchor(&ledger, &BINDING_J, &[0x0a; 32], "JOIN", 1).unwrap());
+    }
 
-            // The root custodian, pinned or not.
+    #[test]
+    fn enroll_again_is_refused_for_an_active_pinned_or_custodian_device() {
+        let rt = runtime();
+        // An approved device that pinned its anchor.
+        let (url, calls) = me_server(&rt, "active");
+        let j = joiner(&url, root_bootstrap::now_ms());
+        let before = format!("{:?}", team_config::load().unwrap());
+        pin_here();
+        let err = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+        assert!(calls.lock().unwrap().contains(&"GET /v2/me".to_string()));
+        assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
+        drop(j);
+
+        for status in ["active", "pending"] {
+            // The root custodian, whatever the server says.
             let (url, calls) = me_server(&rt, status);
             let _j = joiner(&url, root_bootstrap::now_ms());
             let before = format!("{:?}", team_config::load().unwrap());
@@ -5960,7 +6040,7 @@ mod custody_tests {
                 .block_on(team_enroll_again("u".into(), "p".into()))
                 .unwrap_err();
             assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
-            assert!(calls.lock().unwrap().is_empty());
+            assert!(calls.lock().unwrap().is_empty(), "no server is asked");
             assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
         }
 
@@ -5974,6 +6054,25 @@ mod custody_tests {
             assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
             assert!(team_config::load().unwrap().is_enrolled());
         }
+    }
+
+    /// Plan amendment (Architect, S3 review): a joiner that pinned inside its
+    /// window but was never approved is not stuck pending. The pin binds the
+    /// server, tenant and anchor, not the device, so it stays.
+    #[test]
+    fn a_pinned_pending_device_can_enroll_again() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        pin_here();
+        let refs = refs();
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert_cleared(refs);
+        assert_eq!(
+            join_pin(),
+            Some((BINDING_J, [0x0a; 32], "JOIN".to_string()))
+        );
     }
 }
 
