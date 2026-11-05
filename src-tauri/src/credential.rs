@@ -52,6 +52,19 @@ thread_local! {
     pub(crate) static OS_STORE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This test thread's device: appended to the service name, so two devices
+    /// driven from one process keep separate credentials. Empty by default.
+    static NAMESPACE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Files this thread's credentials under `device` from now on.
+#[cfg(test)]
+pub(crate) fn test_namespace(device: &str) {
+    NAMESPACE.with(|n| *n.borrow_mut() = device.to_string());
+}
+
 /// Tests run against the in-memory mock store, on every platform.
 #[cfg(test)]
 fn ensure_store() -> Result<()> {
@@ -73,7 +86,10 @@ fn entry(credential_ref: &str) -> Result<keyring_core::Entry> {
         &std::collections::HashMap::from([("persistence", "Local")]),
     );
     #[cfg(test)]
-    let entry = keyring_core::Entry::new(SERVICE, credential_ref);
+    let entry = keyring_core::Entry::new(
+        &NAMESPACE.with(|n| format!("{SERVICE}{}", n.borrow())),
+        credential_ref,
+    );
     entry.map_err(|_| unavailable())
 }
 
@@ -187,6 +203,20 @@ mod tests {
         store("test-b", &[2; 32]).unwrap();
         assert_eq!(*load("test-a").unwrap(), [1; 32]);
         assert_eq!(*load("test-b").unwrap(), [2; 32]);
+    }
+
+    #[test]
+    fn a_namespace_keeps_one_devices_credentials_from_another() {
+        test_namespace("device-a");
+        store("test-namespaced", &[1; 32]).unwrap();
+        test_namespace("device-b");
+        store("test-namespaced", &[2; 32]).unwrap();
+        forget("test-namespaced").unwrap();
+        test_namespace("device-a");
+        assert_eq!(*load("test-namespaced").unwrap(), [1; 32]);
+        test_namespace("");
+        let err = load("test-namespaced").unwrap_err();
+        assert!(err.to_string().contains("credential.missing"), "{err}");
     }
 
     #[test]

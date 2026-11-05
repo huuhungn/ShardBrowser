@@ -1056,7 +1056,8 @@ impl DeviceHpkeGrantV2 {
         ]))
     }
 
-    fn parse(payload: &[u8]) -> Result<Self> {
+    /// Decodes the payload only; its container's signature is the caller's.
+    pub fn parse(payload: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("DeviceHpkeGrant", payload)?;
         let common = CommonFields::take(&mut f, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE)?;
         f.exact_text("grant_variant", GRANT_VARIANT_DEVICE_HPKE)?;

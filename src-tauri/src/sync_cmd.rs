@@ -83,7 +83,7 @@ fn ready_config() -> Result<team_config::TeamConfig, String> {
 /// so a device uses the fleet recorded at enrollment, falling back to its
 /// tenant id. This keeps a single-fleet tenant working without inventing an id
 /// the server has never seen.
-fn fleet_id(c: &team_config::TeamConfig) -> String {
+pub(crate) fn fleet_id(c: &team_config::TeamConfig) -> String {
     if c.fleet_id.is_empty() {
         c.tenant_id.clone()
     } else {

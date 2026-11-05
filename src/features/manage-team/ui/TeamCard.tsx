@@ -93,7 +93,9 @@ export function TeamCard() {
   });
 
   const test = () => run("test", async () => {
-    const id = await teamTestConnection();
+    const typed = password;
+    setPassword("");
+    const id = await teamTestConnection(username, typed);
     toast.ok(t("team.serverIdentity", { id }));
   });
 

@@ -157,6 +157,12 @@ pub fn custody_bootstrap_path() -> Result<PathBuf> {
     Ok(config_root()?.join("custody-bootstrap.json"))
 }
 
+/// Where Create fleet key keeps its exact requests between attempts. The
+/// fleet key is not here: only the nonce of its credential reference.
+pub fn fleet_custody_path() -> Result<PathBuf> {
+    Ok(config_root()?.join("fleet-custody.json"))
+}
+
 pub fn psapi_path() -> Result<PathBuf> {
     Ok(config_root()?.join("psapi.json"))
 }
