@@ -255,6 +255,34 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// `s` escaped as inside a JSON string, with every non-ASCII char as its
+/// UTF-16 `\uXXXX` units (Python's `ensure_ascii`), hex in upper or lower case.
+fn json_ascii_escaped(s: &str, upper: bool) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            ' '..='~' => out.push(c),
+            _ => {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&if upper {
+                        format!("\\u{unit:04X}")
+                    } else {
+                        format!("\\u{unit:04x}")
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True for `https://`, or `http://` to this machine.
 fn sends_secrets_safely(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
@@ -346,16 +374,23 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableLogin"))?;
-        // A server may echo the password as sent, or as escaped in the JSON.
+        // A server may echo the password as sent, or as escaped in the JSON,
+        // non-ASCII kept or as `\uXXXX`.
         let quoted = serde_json::to_string(login.password).unwrap_or_default();
         let escaped = quoted
             .get(1..quoted.len().saturating_sub(1))
             .unwrap_or_default();
-        Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[login.password, escaped])
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplyLogin"))
+        let lower = json_ascii_escaped(login.password, false);
+        let upper = json_ascii_escaped(login.password, true);
+        Self::ok_or_err_hiding(
+            res,
+            "fleet.refusedLogin",
+            &[login.password, escaped, &lower, &upper],
+        )
+        .await?
+        .json()
+        .await
+        .context(crate::errcode::code("fleet.badReplyLogin"))
     }
 
     /// Ends a device session. Best effort: it expires on its own.
@@ -851,7 +886,7 @@ impl FleetClient {
     /// ticket or device session, or the v1 token.
     pub async fn server_identity(&self, bearer: &str) -> Result<ServerIdentity> {
         let res = self.identity_reply(bearer).await?;
-        Self::identity_of(res).await
+        Self::identity_of(res, bearer).await
     }
 
     /// Logs `login` in for a ticket and reads the server identity with it. A
@@ -868,7 +903,7 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        Self::identity_of(res).await
+        Self::identity_of(res, &ticket.ticket).await
     }
 
     /// The status `GET /v2/me` reports for `device_id` among the devices of
@@ -920,8 +955,8 @@ impl FleetClient {
             .context(crate::errcode::code("fleet.unreachableIdentity"))
     }
 
-    async fn identity_of(res: reqwest::Response) -> Result<ServerIdentity> {
-        Self::ok_or_err(res, "fleet.refusedIdentity")
+    async fn identity_of(res: reqwest::Response, bearer: &str) -> Result<ServerIdentity> {
+        Self::ok_or_err_hiding(res, "fleet.refusedIdentity", &[bearer])
             .await?
             .json()
             .await
@@ -953,7 +988,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableClaim"))?;
-        Self::ok_or_err(res, "fleet.refusedClaim")
+        Self::ok_or_err_hiding(res, "fleet.refusedClaim", &[self.token.as_str()])
             .await?
             .json()
             .await
@@ -969,7 +1004,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableRelease"))?;
-        Self::ok_or_err(res, "fleet.refusedRelease").await?;
+        Self::ok_or_err_hiding(res, "fleet.refusedRelease", &[self.token.as_str()]).await?;
         Ok(())
     }
 
@@ -981,7 +1016,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableHead"))?;
-        Self::ok_or_err(res, "fleet.refusedHead")
+        Self::ok_or_err_hiding(res, "fleet.refusedHead", &[self.token.as_str()])
             .await?
             .json()
             .await
@@ -1019,11 +1054,12 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableDownload"))?;
-            let bytes = Self::ok_or_err(res, "fleet.refusedDownload")
-                .await?
-                .bytes()
-                .await
-                .context(crate::errcode::code("fleet.downloadBrokeOff"))?;
+            let bytes =
+                Self::ok_or_err_hiding(res, "fleet.refusedDownload", &[self.token.as_str()])
+                    .await?
+                    .bytes()
+                    .await
+                    .context(crate::errcode::code("fleet.downloadBrokeOff"))?;
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
@@ -1446,7 +1482,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableUploadBegin"))?;
-        Self::ok_or_err(open, "fleet.refusedUploadOpen").await?;
+        Self::ok_or_err_hiding(open, "fleet.refusedUploadOpen", &[self.token.as_str()]).await?;
 
         // Staging failure leaves a session the server can discard; nothing is
         // published until commit succeeds.
@@ -1478,11 +1514,12 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableUploadPublish"))?;
 
-        let body: serde_json::Value = Self::ok_or_err(commit, "fleet.refusedUploadCommit")
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplyUploadPublish"))?;
+        let body: serde_json::Value =
+            Self::ok_or_err_hiding(commit, "fleet.refusedUploadCommit", &[self.token.as_str()])
+                .await?
+                .json()
+                .await
+                .context(crate::errcode::code("fleet.badReplyUploadPublish"))?;
 
         body.get("version")
             .and_then(|v| v.as_i64())
@@ -1506,7 +1543,7 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableUploadChunk"))?;
-            Self::ok_or_err(res, "fleet.refusedUploadChunk").await?;
+            Self::ok_or_err_hiding(res, "fleet.refusedUploadChunk", &[self.token.as_str()]).await?;
             offset = end;
         }
         Ok(())
@@ -1521,7 +1558,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableUploadAbort"))?;
-        Self::ok_or_err(res, "fleet.refusedUploadAbort").await?;
+        Self::ok_or_err_hiding(res, "fleet.refusedUploadAbort", &[self.token.as_str()]).await?;
         Ok(())
     }
 
@@ -1930,6 +1967,103 @@ mod tests {
                 !error.contains(&password),
                 "the account password reached the launcher error string"
             );
+        });
+    }
+
+    /// The error string a login refused with `echo` as its body leaves.
+    fn login_error_echoing(password: &str, echo: String) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new()
+                .fallback(move || async move { (axum::http::StatusCode::BAD_REQUEST, echo) });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = FleetClient::new(&url, "").unwrap();
+            let login = super::AccountLogin {
+                tenant_id: "11",
+                username: "owner",
+                password,
+            };
+            let error = match client.login_ticket(&login).await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected error response"),
+            };
+            task.abort();
+            error
+        })
+    }
+
+    #[test]
+    fn a_login_error_hides_a_password_echoed_with_json_escapes() {
+        let suffix = random_id_hex();
+        let password = format!("q\"b\\s\nt\u{1}-{suffix}");
+        let echo = format!(r#"{{"password":"q\"b\\s\nt\u0001-{suffix}"}}"#);
+        let error = login_error_echoing(&password, echo);
+        assert!(
+            !error.contains(&suffix),
+            "a JSON-escaped password reached the launcher error string"
+        );
+    }
+
+    #[test]
+    fn a_login_error_hides_a_non_ascii_password_echoed_as_ascii_escapes() {
+        let suffix = random_id_hex();
+        let password = format!("q\"\u{1}\u{7f}\u{e9}\u{1f600}-{suffix}");
+        // Python's `json.dumps` default, then the same in upper-case hex.
+        let u = "\x5cu";
+        for echo in [
+            format!(r#"{{"password":"q\"{u}0001{u}007f{u}00e9{u}d83d{u}de00-{suffix}"}}"#),
+            format!(r#"{{"password":"q\"{u}0001{u}007F{u}00E9{u}D83D{u}DE00-{suffix}"}}"#),
+        ] {
+            let error = login_error_echoing(&password, echo);
+            assert!(
+                !error.contains(&suffix),
+                "an ASCII-escaped password reached the launcher error string"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_hides_the_v1_token_echoed_bare() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let app = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+                let auth = headers["authorization"].to_str().unwrap();
+                let token = auth.strip_prefix("Bearer ").unwrap().to_owned();
+                (axum::http::StatusCode::BAD_REQUEST, token)
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let token = "5c".repeat(32);
+            let client = FleetClient::new(&url, &token).unwrap();
+            let errors = [
+                client.head("11", "22").await.unwrap_err().to_string(),
+                client
+                    .release_lease("11", "33")
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                client
+                    .server_identity(&token)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            ];
+            task.abort();
+            for error in errors {
+                assert!(
+                    !error.contains(&token),
+                    "a bare v1 token reached the launcher error string"
+                );
+            }
         });
     }
 }
