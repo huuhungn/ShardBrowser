@@ -1,0 +1,23 @@
+   Compiling shardx-core v0.1.0 (C:\Users\User\dev\wt\shardbrowser-custodian-verify\shared)
+   Compiling shardx-team-server v0.1.0 (C:\Users\User\dev\wt\shardbrowser-custodian-verify\server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.65s
+     Running tests\v2_auth.rs (server\target\debug\deps\v2_auth-08d8e8e8895d1316.exe)
+
+running 1 test
+test round4_same_account_v1_token_does_not_bypass_device_root_grant_isolation ... FAILED
+
+failures:
+
+---- round4_same_account_v1_token_does_not_bypass_device_root_grant_isolation stdout ----
+
+thread 'round4_same_account_v1_token_does_not_bypass_device_root_grant_isolation' (37264) panicked at tests\v2_auth.rs:11033:5:
+an account-only v1 bearer bypassed device isolation: HTTP 200, 1 grants
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    round4_same_account_v1_token_does_not_bypass_device_root_grant_isolation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 82 filtered out; finished in 3.21s
+
+error: test failed, to rerun pass `--test v2_auth`

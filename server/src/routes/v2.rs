@@ -745,7 +745,8 @@ pub async fn get_active_root_generation(
 ///
 /// This is the collection half of custody: a device that was granted the tenant
 /// root key fetches the sealed grant here and opens it with its own HPKE
-/// private key. The server returns ciphertext it cannot read.
+/// private key. The server returns ciphertext it cannot read. Only that
+/// device's own session reads them; a v1 bearer is refused.
 pub async fn list_tenant_root_key_grants(
     State(app): State<AppState>,
     who: Caller,
@@ -754,25 +755,11 @@ pub async fn list_tenant_root_key_grants(
     let tenant_id = parse_id16(&tenant_hex, "tenant_id")?;
     let device_id = parse_id16(&device_hex, "device_id")?;
 
-    // Membership is checked against the authenticated user rather than the path,
-    // so a caller cannot read another tenant's grants by naming that tenant. A
-    // device session reads only its own device's grants, and a v1 member only
-    // those of its own account's devices.
-    if let Caller::V1(user) = &who {
-        let account = require_tenant_member(&app, tenant_id, user).await?;
-        let owner: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT account_id FROM v2_devices WHERE tenant_id = ? AND id = ?")
-                .bind(tenant_id.as_slice())
-                .bind(device_id.as_slice())
-                .fetch_optional(&app.db)
-                .await?;
-        if owner.as_deref() != Some(account.as_slice()) {
-            return Err(AppError::Forbidden);
-        }
-    } else if require_tenant_caller(&app, tenant_id, &who)
-        .await?
-        .is_some_and(|own| own != device_id)
-    {
+    // The tenant is checked against the authenticated session rather than the
+    // path, so a caller cannot read another tenant's grants by naming that
+    // tenant. Only a device's own session reads its grants: a v1 account token
+    // proves no device key, so it would read every device of its account.
+    if require_tenant_caller(&app, tenant_id, &who).await? != Some(device_id) {
         return Err(AppError::Forbidden);
     }
 

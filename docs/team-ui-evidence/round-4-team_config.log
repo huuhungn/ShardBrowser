@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\shardx_launcher_lib-f56ed3c5cad76fc7.exe)
+
+running 12 tests
+test team_config::tests::a_device_without_an_identity_moves_nothing ... ok
+test team_config::tests::secrets_zeroize_on_drop_and_the_file_format_is_unchanged ... ok
+test team_config::tests::an_old_team_config_without_enrolled_at_ms_still_loads ... ok
+test team_config::tests::debug_never_prints_the_token_or_a_seed ... ok
+test team_config::tests::team_config_golden_includes_enrolled_at_ms ... ok
+test team_config::tests::a_dpapi_protected_seed_moves_to_the_credential_store ... ok
+test team_config::tests::a_seed_the_store_refuses_stays_in_the_file ... ok
+test team_config::tests::a_plaintext_file_still_loads_and_is_rewritten_protected ... ok
+test team_config::tests::an_unopenable_dpapi_seed_is_named_kept_and_allows_re_enrollment ... ok
+test team_config::tests::enrolled_seeds_move_to_the_credential_store_and_still_open ... ok
+test team_config::tests::saved_seeds_are_dpapi_protected_and_load_back ... ok
+test team_config::tests::a_legacy_cached_fleet_key_alone_is_not_a_fleet_key ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 717 filtered out; finished in 0.04s
+

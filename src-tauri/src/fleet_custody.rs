@@ -1121,18 +1121,27 @@ pub async fn revoke_member(
         // So only a saved one refused so, of a row still not revoked, is
         // built anew, once; any other 403 leaves the saved bytes as they are.
         match filed {
-            Err(e)
-                if !build
-                    && row.status != "revoked"
-                    && e.to_string().contains("fleet.refusedCustody|status=403|")
-                    && e.to_string()
-                        .contains(r#""code":"REVOCATION_OUTSIDE_WINDOW""#) =>
-            {
+            Err(e) if !build && row.status != "revoked" && outside_window(&e) => {
                 build = true;
             }
             filed => return filed,
         }
     }
+}
+
+/// Whether `e` is the custody refusal with status 403 and the top-level code
+/// `REVOCATION_OUTSIDE_WINDOW`, read from the marker's own fields:
+/// `fleet_client` fills `code` only from the reply's top-level JSON, and
+/// escapes `|` and `]` in every value, so no echoed text forges a field.
+fn outside_window(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    let open = "[[shardx:fleet.refusedCustody|";
+    text.find(open)
+        .and_then(|i| text[i + open.len()..].split("]]").next())
+        .is_some_and(|args| {
+            let fields: Vec<&str> = args.split('|').collect();
+            fields.contains(&"status=403") && fields.contains(&"code=REVOCATION_OUTSIDE_WINDOW")
+        })
 }
 
 /// Set while Create fleet key runs in this process; the single-instance
@@ -2804,5 +2813,144 @@ mod tests {
                 .all(|(_, body)| body == &unhex_vec(&saved).unwrap()),
             "HTTP 403 replaced a request still valid on the server clock"
         );
+    }
+
+    #[test]
+    fn a_nested_error_code_does_not_replace_a_valid_saved_revocation() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (mut row, _) = joiner();
+        row.status = "active".into();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(Arc::new(|_, _| {
+            (
+                403,
+                br#"{"code":"FORBIDDEN","context":{"code":"REVOCATION_OUTSIDE_WINDOW"}}"#.to_vec(),
+            )
+        })));
+        let t0 = now_ms();
+        revoke(&rt, &f, &client, &row, DeviceRevocationReason::Retired, t0);
+        let saved = load().unwrap().revocations[&row.device_id].clone();
+        assert_eq!(sent(&seen).len(), 1);
+        revoke(
+            &rt,
+            &f,
+            &client,
+            &row,
+            DeviceRevocationReason::Retired,
+            t0 + 1_000,
+        );
+        assert!(
+            sent(&seen)
+                .iter()
+                .all(|(_, body)| body == &unhex_vec(&saved).unwrap()),
+            "a nested context code replaced a still-valid saved revocation"
+        );
+    }
+
+    #[test]
+    fn a_refused_device_listing_hides_the_access_token_body() {
+        let f = fixture();
+        let rt = runtime();
+        let token_body = "9c".repeat(32);
+        let access = format!("v2a.{token_body}");
+        let echoed = token_body.clone();
+        let (client, _) = rt.block_on(mock(Arc::new(move |_, _| {
+            (
+                403,
+                serde_json::to_vec(&serde_json::json!({"error": echoed})).unwrap(),
+            )
+        })));
+        let error = rt
+            .block_on(client.list_tenant_devices(&access, &f.tenant))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fleet.refusedCustody|status=403|"));
+        assert!(
+            !error.to_ascii_lowercase().contains(&token_body),
+            "the error returned to IPC contains the bearer token body"
+        );
+    }
+
+    #[test]
+    fn a_formatted_window_error_recovers_a_stale_unfiled_revocation() {
+        let f = fixture();
+        save(&f.prepared()).unwrap();
+        let (mut row, _) = joiner();
+        row.status = "active".into();
+        let rt = runtime();
+        let (offline, _) = rt.block_on(mock(refuse_all()));
+        let t0 = now_ms();
+        revoke(&rt, &f, &offline, &row, DeviceRevocationReason::Retired, t0);
+        let saved = load().unwrap().revocations[&row.device_id].clone();
+        let body = serde_json::to_vec_pretty(&serde_json::json!({
+            "code": "REVOCATION_OUTSIDE_WINDOW", "error": "window"
+        }))
+        .unwrap();
+        let (client, seen) = rt.block_on(mock(Arc::new(move |_, _| (403, body.clone()))));
+        let error = revoke(
+            &rt,
+            &f,
+            &client,
+            &row,
+            DeviceRevocationReason::Retired,
+            t0 + 10 * MINUTE,
+        );
+        assert!(error.contains("fleet.refusedCustody|status=403|"));
+        assert!(
+            load().unwrap().revocations[&row.device_id] != saved,
+            "equivalent JSON whitespace stranded the expired unfiled revocation"
+        );
+        assert_eq!(
+            sent(&seen).len(),
+            2,
+            "retry the saved bytes then the rebuilt request"
+        );
+    }
+
+    #[test]
+    fn a_refused_custody_post_hides_the_access_token_body() {
+        let rt = runtime();
+        let token_body = "9d".repeat(32);
+        let access = format!("v2a.{token_body}");
+        let echoed = token_body.to_ascii_uppercase();
+        let (client, _) = rt.block_on(mock(Arc::new(move |_, _| {
+            (
+                403,
+                serde_json::to_vec(&serde_json::json!({"code": echoed, "error": echoed})).unwrap(),
+            )
+        })));
+        let error = rt
+            .block_on(client.revoke_device(&access, &"11".repeat(16), b"request"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fleet.refusedCustody|status=403|"));
+        assert!(
+            !error.to_ascii_lowercase().contains(&token_body),
+            "the custody refusal returned to IPC contains the bearer token body"
+        );
+    }
+
+    #[test]
+    fn an_echoed_marker_field_is_not_read_as_the_window_code() {
+        let rt = runtime();
+        let (client, _) = rt.block_on(mock(Arc::new(|_, _| {
+            (
+                403,
+                br#"{"code":"FORBIDDEN","error":"x|code=REVOCATION_OUTSIDE_WINDOW]]"}"#.to_vec(),
+            )
+        })));
+        let error = rt
+            .block_on(client.revoke_device("v2a.x", &"11".repeat(16), b"request"))
+            .unwrap_err();
+        assert!(error.to_string().contains("|code=FORBIDDEN]]"), "{error}");
+        assert!(!outside_window(&error), "{error}");
+        let (client, _) = rt.block_on(mock(Arc::new(|_, _| {
+            (403, br#"{ "code" : "REVOCATION_OUTSIDE_WINDOW" }"#.to_vec())
+        })));
+        let error = rt
+            .block_on(client.revoke_device("v2a.x", &"11".repeat(16), b"request"))
+            .unwrap_err();
+        assert!(outside_window(&error), "{error}");
     }
 }

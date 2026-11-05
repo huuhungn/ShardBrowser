@@ -15,8 +15,10 @@ const REFUSALS = ["fleet.joinedCollectKey", "fleet.enrollAgainRefused"] as const
 /**
  * A joining device's code: shown with the anchor and full key IDs while its
  * ten-minute window is open, then Codes match pins the anchor. An expired
- * code offers Enroll again, unless the backend would refuse it: then it says
- * why, pointing an active pinned device at Collect key custody.
+ * code offers Enroll again only once Show join code has asked the backend,
+ * never from this computer's clock alone, and not when the backend would
+ * refuse it: then it says why, pointing an active pinned device at Collect
+ * key custody.
  */
 export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProps & {
   onEnrolledAgain: (status: TeamStatus) => void;
@@ -25,6 +27,8 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
   const [code, setCode] = useState<TeamJoinCode | null>(null);
   const [refusedExpired, setRefusedExpired] = useState(false);
   const [refusal, setRefusal] = useState<(typeof REFUSALS)[number] | null>(null);
+  // Set only by `team_join_code`'s answer, the one classified against the server.
+  const [offerAgain, setOfferAgain] = useState(false);
   const [full, setFull] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [now, setNow] = useState(Date.now());
@@ -47,9 +51,14 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
 
   const show = () => run("joinCode", async () => {
     const [u, p] = login();
-    const next = await teamJoinCode(u, p).catch(noteExpired);
+    const next = await teamJoinCode(u, p).catch((e: unknown) => {
+      const s = String(e);
+      setOfferAgain(s.includes(EXPIRED) && !REFUSALS.some((k) => s.includes(k)));
+      return noteExpired(e);
+    });
     setCode(next);
     setRefusedExpired(false);
+    setOfferAgain(false);
   });
 
   const confirm = () => run("joinConfirm", async () => {
@@ -114,7 +123,7 @@ export function TeamJoin({ account, busy, run, onEnrolledAgain }: TeamActionProp
           <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.joinCode.expired")}</p>
           {refusal ? (
             <p className="m-0 text-paragraph-xs text-text-sub-600">{t(refusal)}</p>
-          ) : (
+          ) : offerAgain && (
             <div>
               <Button size="small" disabled={!!busy || !account.signedIn} onClick={again}>
                 {t("team.joinCode.enrollAgain")}

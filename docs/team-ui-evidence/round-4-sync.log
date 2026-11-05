@@ -1,0 +1,231 @@
+   Compiling shardx-launcher v2.6.1 (C:\Users\User\dev\wt\shardbrowser-custodian-verify\src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 16s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\shardx_launcher_lib-f56ed3c5cad76fc7.exe)
+
+running 200 tests
+test team::sync::tests::a_blocked_publish_is_cancelled_by_its_command_and_stops_blocking_a_downgrade ... ok
+test team::sync::tests::a_compromise_counted_mid_transfer_aborts_the_upload ... ok
+test team::sync::tests::a_corrupt_revert_source_preserves_data_and_retries ... ok
+test team::sync::tests::a_crash_inside_the_staging_swap_resumes ... ok
+test team::sync::tests::a_custodian_not_yet_appointed_signs_no_transition ... ok
+test team::sync::tests::a_compromise_counted_after_a_lost_revocation_of_the_same_key_blocks ... ok
+test team::sync::tests::a_binding_and_its_rows_name_the_servers_account_and_key ... ok
+test team::sync::tests::a_custodian_reappointed_after_its_lapse_signs_again ... ok
+test team::sync::tests::a_cut_off_acceptance_leaves_the_binding_quarantined_until_reopen ... ok
+test team::sync::tests::a_device_clock_behind_the_server_still_binds_one_profile ... ok
+test team::sync::tests::a_failed_release_of_an_old_lease_is_retried_as_stored ... ok
+test team::sync::tests::a_blocked_push_leaves_the_profile_available_and_dirty_with_the_local_code ... ok
+test team::sync::tests::a_failed_anchor_restore_keeps_the_quarantine_and_unresolved_rows ... ok
+test team::sync::tests::a_custodian_distrusted_here_signs_no_transition ... ok
+test team::sync::tests::a_checkout_replayed_after_its_expiry_or_a_restore_takes_a_new_key ... ok
+test team::sync::tests::a_device_withdrawn_in_the_walks_evidence_sends_no_revert ... ok
+test team::sync::tests::a_compromised_custodian_blocks_every_fleet_through_the_root ... ok
+test team::sync::tests::a_device_whose_own_key_is_withdrawn_sends_no_revert ... ok
+test team::sync::tests::a_failed_record_leaves_no_evaluation_and_keeps_the_refusal ... ok
+test team::sync::tests::a_create_upload_whose_reply_was_lost_is_replayed_byte_for_byte ... ok
+test team::sync::tests::a_folder_delete_keeps_a_profile_whose_pending_swap_cannot_land ... ok
+test team::sync::tests::a_binding_changed_during_acceptance_is_not_moved has been running for over 60 seconds
+test team::sync::tests::a_checkout_reply_for_another_tenant_fleet_or_expiry_is_never_kept has been running for over 60 seconds
+test team::sync::tests::a_compromised_revocation_blocks_commits_under_an_exposed_generation has been running for over 60 seconds
+test team::sync::tests::a_crash_after_finish_completes_the_staging_swap has been running for over 60 seconds
+test team::sync::tests::a_head_committed_on_top_does_not_strand_the_push ... ok
+test team::sync::tests::a_head_met_again_after_an_unbind_reopens_its_row ... ok
+test team::sync::tests::a_join_past_an_untrusted_child_keeps_data_and_can_unbind ... ok
+test team::sync::tests::a_join_refused_on_an_invalid_transition_pins_nothing_and_can_unbind ... ok
+test team::sync::tests::a_failed_join_recovers_by_pull_then_push_or_by_unbind ... ok
+test team::sync::tests::a_join_whose_pin_fails_keeps_the_local_profile ... ok
+test team::sync::tests::a_binding_changed_during_acceptance_is_not_moved ... ok
+test team::sync::tests::a_key_without_its_kept_record_asks_to_be_collected_again ... ok
+test team::sync::tests::a_checkout_reply_for_another_tenant_fleet_or_expiry_is_never_kept ... ok
+test team::sync::tests::a_crash_after_finish_completes_the_staging_swap ... ok
+test team::sync::tests::a_known_custodian_with_no_root_holding_blocks ... ok
+test team::sync::tests::a_failure_inside_a_run_writes_no_unresolved_rows ... ok
+test team::sync::tests::a_landed_commit_whose_reply_was_lost_replays_after_its_pin_signer_is_revoked ... ok
+test team::sync::tests::a_landed_r_whose_staging_is_gone_is_accepted_by_the_next_pull ... ok
+test team::sync::tests::a_lapse_seen_while_accepting_refuses_a_backdated_transition ... ok
+test team::sync::tests::a_lease_at_risk_is_still_a_held_lease ... ok
+test team::sync::tests::a_key_the_checkout_does_not_name_is_never_used ... ok
+test team::sync::tests::a_lease_from_before_the_restore_is_released_before_the_binding_moves ... ok
+test team::sync::tests::a_new_head_from_an_earlier_epoch_is_a_rollback ... ok
+test team::sync::tests::a_compromised_revocation_blocks_commits_under_an_exposed_generation ... ok
+test team::sync::tests::a_new_head_of_a_signer_revoked_in_this_pulls_evidence_is_refused ... ok
+test team::sync::tests::a_head_whose_signer_may_not_commit_is_not_restored has been running for over 60 seconds
+test team::sync::tests::a_pinned_head_is_read_back_only_as_the_bindings_own ... ok
+test team::sync::tests::a_head_whose_signer_may_not_commit_is_not_restored ... ok
+test team::sync::tests::a_lapsed_or_former_custodian_signs_no_transition ... ok
+test team::sync::tests::a_pinned_head_stays_readable_after_its_signers_grants_expire ... ok
+test team::sync::tests::a_publish_replayed_after_its_lease_ended_binds_the_one_profile ... ok
+test team::sync::tests::a_normal_push_still_refuses_a_quarantined_binding ... ok
+test team::sync::tests::a_kept_revocation_reloads_with_every_column_equal has been running for over 60 seconds
+test team::sync::tests::a_profile_removed_for_good_drops_its_binding ... ok
+test team::sync::tests::a_profile_is_published_with_its_first_lease_and_then_pushed ... ok
+test team::sync::tests::a_lost_session_or_rate_limit_keeps_the_stored_request ... ok
+test team::sync::tests::a_profile_published_after_a_restore_starts_at_the_servers_epoch ... ok
+test team::sync::tests::a_pinned_head_of_a_since_revoked_signer_is_not_restored ... ok
+test team::sync::tests::a_missing_or_withdrawn_fleet_key_is_refused ... ok
+test team::sync::tests::a_publish_whose_operation_was_cancelled_meanwhile_binds_nothing ... ok
+test team::sync::tests::a_published_profile_pushes_and_another_device_pulls_it ... ok
+test team::sync::tests::a_profile_removed_for_good_releases_its_lease_unless_work_is_pending ... ok
+test team::sync::tests::a_pull_keeps_the_devices_local_state ... ok
+test team::sync::tests::a_leaf_head_is_accepted_only_as_a_new_head_is has been running for over 60 seconds
+test team::sync::tests::a_pull_never_pins_a_head_whose_signer_is_withdrawn_during_its_download ... ok
+test team::sync::tests::a_lease_expiry_outside_the_ttl_is_refused_by_name has been running for over 60 seconds
+test team::sync::tests::a_refused_revert_discards_its_staging ... ok
+test team::sync::tests::a_refused_sync_reply_hides_an_echoed_token ... ok
+test team::sync::tests::a_refused_revert_checkout_keeps_the_local_profile ... ok
+test team::sync::tests::a_pull_crossing_an_accepted_run_into_another_keeps_the_quarantine ... ok
+test team::sync::tests::a_receipt_or_readback_that_does_not_match_is_never_kept ... ok
+test team::sync::tests::a_pull_whose_pin_fails_keeps_the_local_profile ... ok
+test team::sync::tests::a_push_behind_the_listed_head_is_refused ... ok
+test team::sync::tests::a_refused_publish_is_not_replayed_and_the_next_one_starts_afresh ... ok
+test team::sync::tests::a_refused_or_mismatched_reply_is_never_kept ... ok
+test team::sync::tests::a_pull_waits_for_a_push_in_flight ... ok
+test team::sync::tests::a_release_pending_for_another_lease_keeps_the_staging ... ok
+test team::sync::tests::a_release_whose_reply_was_lost_is_replayed_byte_for_byte ... ok
+test team::sync::tests::a_kept_revocation_reloads_with_every_column_equal ... ok
+test team::sync::tests::a_renewed_lease_moves_the_bindings_expiry_forward ... ok
+test team::sync::tests::a_replayed_r_whose_signer_is_withdrawn_during_readback_is_never_pinned ... ok
+test team::sync::tests::a_replayed_revert_never_pins_an_r_whose_signer_is_now_revoked ... ok
+test team::sync::tests::a_publish_at_a_restore_epoch_never_waits_on_its_acceptance has been running for over 60 seconds
+test team::sync::tests::a_reply_too_large_to_hold_is_refused ... ok
+test team::sync::tests::a_publish_is_bound_whatever_its_lease_expiry_says has been running for over 60 seconds
+test team::sync::tests::a_publish_reply_that_does_not_name_the_request_is_never_kept has been running for over 60 seconds
+test team::sync::tests::a_report_of_a_revoked_signer_a_pull_saw_is_kept ... ok
+test team::sync::tests::a_lease_expiry_outside_the_ttl_is_refused_by_name ... ok
+test team::sync::tests::a_publish_that_cannot_be_trusted_stores_and_sends_nothing has been running for over 60 seconds
+test team::sync::tests::a_reported_only_quarantine_stays_once_the_approval_is_hidden ... ok
+test team::sync::tests::a_restore_epoch_that_goes_back_is_a_rollback ... ok
+test team::sync::tests::a_resumed_revert_never_commits_a_source_withdrawn_before_its_retry ... ok
+test team::sync::tests::a_resumed_revert_whose_staging_is_gone_restores_p_again ... ok
+test team::sync::tests::a_retried_revert_files_each_accepted_run_once ... ok
+test team::sync::tests::a_replayed_checkout_on_an_old_head_is_released_and_taken_again ... ok
+test team::sync::tests::a_revert_audits_the_accepted_runs_it_crosses ... ok
+test team::sync::tests::a_revert_keeps_the_devices_local_state ... ok
+test team::sync::tests::a_revert_lease_held_over_a_rollback_is_released ... ok
+test team::sync::tests::a_revert_lease_whose_walk_fails_is_released_on_the_server ... ok
+test team::sync::tests::a_revert_never_commits_a_source_withdrawn_during_its_download ... ok
+test team::sync::tests::a_revert_pin_failure_preserves_local_data_and_retries ... ok
+test team::sync::tests::a_publish_at_a_restore_epoch_never_waits_on_its_acceptance ... ok
+test team::sync::tests::a_leaf_head_is_accepted_only_as_a_new_head_is ... ok
+test team::sync::tests::a_revert_uses_the_newest_valid_content_and_reads_back_remotely ... ok
+test team::sync::tests::a_revocation_naming_another_device_never_enables_a_skip ... ok
+test team::sync::tests::a_publish_is_bound_whatever_its_lease_expiry_says ... ok
+test team::sync::tests::a_revocation_recorded_after_checkout_abandons_an_ordinary_push ... ok
+test team::sync::tests::a_stored_publish_goes_out_while_its_key_holds ... ok
+test team::sync::tests::a_staging_dir_without_a_swap_row_is_never_swapped_in ... ok
+test team::sync::tests::a_revert_lease_whose_run_was_closed_elsewhere_is_released has been running for over 60 seconds
+test team::sync::tests::a_revert_refuses_a_mixed_run_without_touching_local_data ... ok
+test team::sync::tests::a_stored_finalize_is_not_sent_once_a_compromise_is_counted ... ok
+test team::sync::tests::a_revert_lease_whose_run_was_closed_elsewhere_is_released ... ok
+test team::sync::tests::a_stacked_run_never_temporarily_pins_a_rejected_head ... ok
+test team::sync::tests::a_server_integer_past_the_signed_range_is_refused_before_any_row ... ok
+test team::sync::tests::a_swap_row_for_a_deleted_profile_is_cleared ... ok
+test team::sync::tests::a_rolled_back_head_or_epoch_quarantines_the_binding has been running for over 60 seconds
+test team::sync::tests::a_verified_transition_moves_only_the_bindings_it_covers ... ok
+test team::sync::tests::a_stored_publish_is_not_sent_once_its_key_is_blocked_or_withdrawn ... ok
+test team::sync::tests::a_withdrawn_committer_sends_no_prepared_revert_commit ... ok
+test team::sync::tests::a_withdrawn_device_releases_its_revert_lease_on_the_server ... ok
+test team::sync::tests::a_stored_column_that_drifts_from_its_bytes_is_never_sent has been running for over 60 seconds
+test team::sync::tests::a_stored_publish_that_drifts_from_its_bytes_is_never_sent has been running for over 60 seconds
+test team::sync::tests::a_superseded_replay_ends_cleanly_and_the_next_push_starts_fresh has been running for over 60 seconds
+test team::sync::tests::an_abandoned_revert_with_a_lost_release_keeps_no_plaintext ... ok
+test team::sync::tests::an_exposure_survives_a_recollection_that_omits_its_grant ... ok
+test team::sync::tests::a_tombstone_that_no_longer_recomputes_is_never_returned has been running for over 60 seconds
+test team::sync::tests::a_transition_that_does_not_verify_keeps_the_binding_quarantined has been running for over 60 seconds
+test team::sync::tests::a_superseded_replay_ends_cleanly_and_the_next_push_starts_fresh ... ok
+test team::sync::tests::an_interrupted_upload_resumes_at_the_offset_head_reports ... ok
+test team::sync::tests::an_open_run_anchor_withdrawn_during_download_is_not_pinned ... ok
+test team::sync::tests::an_open_run_restore_keeps_what_an_ordinary_pull_keeps ... ok
+test team::sync::tests::an_open_upload_is_aborted_once_a_compromise_is_counted ... ok
+test team::sync::tests::an_abandoned_revert_keeps_the_binding_quarantined has been running for over 60 seconds
+test team::sync::tests::an_abandoned_revert_lease_discards_its_staging has been running for over 60 seconds
+test team::sync::tests::an_abandoned_revert_lease_discards_its_staging ... ok
+test team::sync::tests::a_rolled_back_head_or_epoch_quarantines_the_binding ... ok
+test team::sync::tests::an_ordinary_push_refuses_a_revert_lease_on_the_pinned_head ... ok
+test team::sync::tests::an_ordinary_push_refuses_over_a_pinned_head_whose_signer_is_proven_revoked ... ok
+test team::sync::tests::an_unbind_after_an_accepted_transition_keeps_its_evidence ... ok
+test team::sync::tests::an_unbind_at_version_zero_omits_the_head ... ok
+test team::sync::tests::an_unbind_is_refused_while_a_lease_request_or_journal_is_open ... ok
+test team::sync::tests::an_unbind_tombstone_outlives_its_binding_and_replays_exactly ... ok
+test team::sync::tests::an_unreadable_release_reply_is_reported_and_replayed ... ok
+test team::sync::tests::deleting_or_unbinding_a_profile_discards_its_revert_staging ... ok
+test team::sync::tests::deletion_unbind_and_discard_remove_the_unpack_leftovers_beside_the_staging ... ok
+test team::sync::tests::folder_delete_discards_decrypted_revert_staging ... ok
+test team::sync::tests::join_after_a_restore_pins_the_transition_leaf_then_pulls ... ok
+test team::sync::tests::an_abandoned_revert_keeps_the_binding_quarantined ... ok
+test team::sync::tests::an_unbind_cut_off_at_any_write_leaves_the_binding_whole has been running for over 60 seconds
+test team::sync::tests::join_after_more_post_restore_commits_than_the_leaf_search_pins_the_leaf ... ok
+test team::sync::tests::a_publish_reply_that_does_not_name_the_request_is_never_kept ... ok
+test team::sync::tests::an_unsent_cancel_release_is_retried_and_then_given_up has been running for over 60 seconds
+test team::sync::tests::join_binds_and_pulls_a_remote_profile_on_a_new_device ... ok
+test team::sync::tests::join_lists_fleet_profiles_with_their_opened_labels_and_marks_bound_ones ... ok
+test team::sync::tests::join_never_pins_a_leaf_withdrawn_during_the_proof_fetch ... ok
+test team::sync::tests::a_publish_that_cannot_be_trusted_stores_and_sends_nothing ... ok
+test team::sync::tests::join_of_a_profile_created_after_a_restore_starts_at_that_epoch ... ok
+test team::sync::tests::join_never_pins_a_leaf_whose_signer_its_own_evidence_revokes ... ok
+test team::sync::tests::join_refuses_a_remote_profile_already_bound_here ... ok
+test team::sync::tests::join_refuses_a_bound_or_running_local_profile ... ok
+test team::sync::tests::a_stored_publish_that_drifts_from_its_bytes_is_never_sent ... ok
+test team::sync::tests::join_refuses_a_remote_profile_bound_here_meanwhile ... ok
+test team::sync::tests::join_refuses_a_local_profile_with_an_unfinished_publish ... ok
+test team::sync::tests::every_crash_point_resumes_with_the_exact_stored_bytes ... ok
+test team::sync::tests::join_refuses_the_rolled_back_child_of_the_leaf ... ok
+test team::sync::tests::every_publish_crash_point_resumes_with_the_exact_stored_bytes ... ok
+test team::sync::tests::an_unbind_cut_off_at_any_write_leaves_the_binding_whole ... ok
+test team::sync::tests::join_refuses_without_the_collected_fleet_key_and_creates_no_binding ... ok
+test team::sync::tests::join_then_a_lost_checkout_and_a_restore_still_pulls_and_pushes ... ok
+test team::sync::tests::join_then_check_in_then_pull_on_the_first_device ... ok
+test team::sync::tests::an_unsent_cancel_release_is_retried_and_then_given_up ... ok
+test team::sync::tests::key_status_agrees_with_a_compromise_blocked_push ... ok
+test team::sync::tests::key_status_and_push_agree_after_the_fleet_key_is_lost ... ok
+test team::sync::tests::local_distrust_alone_enables_a_revert ... ok
+test team::sync::tests::join_with_a_lying_first_snapshot_pins_nothing ... ok
+test team::sync::tests::revert_accepts_on_a_new_device_without_a_pin ... ok
+test team::sync::tests::revert_accepts_after_a_current_custodian_refiles ... ok
+test team::sync::tests::revert_accepts_a_revocation_another_device_filed ... ok
+test team::sync::tests::revert_commits_over_a_head_pinned_before_its_signer_was_proven_revoked ... ok
+test team::sync::tests::revert_accepts_one_proven_revoked_head ... ok
+test team::sync::tests::revert_accepts_two_stacked_proven_revoked_heads ... ok
+test team::sync::tests::revert_advances_the_pin_over_a_valid_head_first ... ok
+test team::sync::tests::join_then_a_push_before_the_first_pull_restores_is_refused ... ok
+test team::sync::tests::revert_accepts_after_forty_days_offline ... ok
+test team::sync::tests::revert_accepts_a_head_both_proven_and_reported ... ok
+test team::sync::tests::only_a_signer_revoked_quarantine_lets_a_pull_through ... ok
+test team::sync::tests::revert_commits_the_newest_valid_snapshot_on_top_of_the_rejected_head ... ok
+test team::sync::tests::revert_committed_here_is_accepted_by_a_second_device ... ok
+test team::sync::tests::revert_rule_accepts_a_head_both_proven_and_reported ... ok
+test team::sync::tests::revert_rule_accepts_on_a_new_device_without_a_pin ... ok
+test team::sync::tests::revert_rule_accepts_one_proven_revoked_head ... ok
+test team::sync::tests::revert_rule_accepts_two_stacked_proven_revoked_heads ... ok
+test team::sync::tests::revert_rule_advances_the_pin_over_a_valid_head_first ... ok
+test team::sync::tests::revert_rule_refuses_a_gap_below_the_pin ... ok
+test team::sync::tests::revert_rule_refuses_a_reported_only_revocation ... ok
+test team::sync::tests::revert_rule_refuses_a_run_with_a_lapsed_unrevoked_head ... ok
+test team::sync::tests::revert_is_refused_for_a_reported_only_revocation ... ok
+test team::sync::tests::revert_never_pins_an_r_withdrawn_during_the_readback ... ok
+test team::sync::tests::revert_refuses_a_gap_below_the_pin ... ok
+test team::sync::tests::revert_refuses_a_reported_only_head_below_a_revoked_pin ... ok
+test team::sync::tests::revert_refuses_a_reported_only_revocation ... ok
+test team::sync::tests::revert_refuses_a_revocation_whose_issuer_lacked_device_revoke ... ok
+test team::sync::tests::revert_refuses_a_revocation_whose_issuer_lapsed_before_first_sight ... ok
+test team::sync::tests::revert_restores_an_anchor_of_an_older_generation_after_rotation ... ok
+test team::sync::tests::revert_resumes_after_a_lost_commit_reply ... ok
+test team::sync::tests::revert_skips_a_head_pinned_before_its_signer_was_proven_revoked ... ok
+test team::sync::tests::revert_waits_for_rotation_after_a_compromised_revocation ... ok
+test team::sync::tests::revert_refuses_a_run_with_a_lapsed_unrevoked_head ... ok
+test team::sync::tests::revert_refuses_without_a_valid_earlier_snapshot ... ok
+test team::sync::tests::revert_resumes_after_a_lost_release_of_an_abandoned_lease ... ok
+test team::sync::tests::a_tombstone_that_no_longer_recomputes_is_never_returned ... ok
+test team::sync::tests::statuses_report_renewed_after_revocation_alerts ... ok
+test team::sync::tests::statuses_without_a_database_are_empty_and_create_nothing ... ok
+test team::sync::tests::the_launch_settle_needs_a_team_database_only_when_one_exists ... ok
+test team::sync::tests::statuses_flag_a_revert_in_progress ... ok
+test team::sync::tests::stale_unresolved_rows_are_superseded_once_by_a_transition_or_unbind ... ok
+test team::sync::tests::statuses_offer_revert_for_any_unresolved_proven_run ... ok
+test team::sync::tests::the_leaf_head_search_is_bounded_and_skipped_for_an_unchanged_pin ... ok
+test team::sync::tests::a_transition_that_does_not_verify_keeps_the_binding_quarantined ... ok
+test team::sync::tests::statuses_map_each_binding_state ... ok
+test team::sync::tests::a_stored_column_that_drifts_from_its_bytes_is_never_sent ... ok
+
+test result: ok. 200 passed; 0 failed; 0 ignored; 0 measured; 529 filtered out; finished in 481.99s
+

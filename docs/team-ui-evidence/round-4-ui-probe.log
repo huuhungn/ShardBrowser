@@ -1,0 +1,68 @@
+npm notice run shardx-launcher@2.6.1 test:e2e
+npm notice run playwright test --config playwright.round4.config.ts --grep round4
+[WebServer] npm notice run shardx-launcher@2.6.1 build:e2e
+[WebServer] npm notice run tsc && vite build --mode e2e
+[WebServer] (node:10424) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
+[WebServer] 
+[WebServer] (!) Some chunks are larger than 500 kB after minification. Consider:
+[WebServer] - Using dynamic import() to code-split the application
+[WebServer] - Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
+[WebServer] - Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+[WebServer] npm notice run shardx-launcher@2.6.1 preview
+[WebServer] npm notice run vite preview --host 127.0.0.1 --port 4173
+[WebServer] (node:17880) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
+
+Running 1 test using 1 worker
+
+(node:6444) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  x  1 [chromium-desktop] › tests\e2e\app.spec.ts:931:1 › round4 active pinned device is not offered reenrollment when a remounted code expires (26.7s)
+
+
+  1) [chromium-desktop] › tests\e2e\app.spec.ts:931:1 › round4 active pinned device is not offered reenrollment when a remounted code expires 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  getByTestId('team-card').getByRole('button', { name: 'Enroll again', exact: true })
+    Expected: 0
+    Received: 1
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" getByTestId('team-card').getByRole('button', { name: 'Enroll again', exact: true }) with timeout 5000ms
+      - waiting for getByTestId('team-card').getByRole('button', { name: 'Enroll again', exact: true })
+        14 × locator resolved to 1 element
+           - unexpected value "1"
+
+
+      959 |     });
+      960 |     expect(rejected).toBe(true);
+    > 961 |     await expect(b.getByTestId("team-card").getByRole("button", { name: "Enroll again", exact: true })).toHaveCount(0);
+          |                                                                                                         ^
+      962 |   } finally { await b.context().close(); }
+      963 | });
+      964 |
+        at C:\Users\User\dev\wt\shardbrowser-custodian-verify\tests\e2e\app.spec.ts:961:105
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results\app-round4-active-pinned-d-3841a-en-a-remounted-code-expires-chromium-desktop\test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    attachment #2: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results\app-round4-active-pinned-d-3841a-en-a-remounted-code-expires-chromium-desktop\test-failed-2.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results\app-round4-active-pinned-d-3841a-en-a-remounted-code-expires-chromium-desktop\error-context.md
+
+    attachment #4: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results\app-round4-active-pinned-d-3841a-en-a-remounted-code-expires-chromium-desktop\trace.zip
+    Usage:
+
+        npx playwright show-trace test-results\app-round4-active-pinned-d-3841a-en-a-remounted-code-expires-chromium-desktop\trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium-desktop] › tests\e2e\app.spec.ts:931:1 › round4 active pinned device is not offered reenrollment when a remounted code expires 

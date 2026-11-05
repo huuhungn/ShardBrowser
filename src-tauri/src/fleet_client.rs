@@ -272,6 +272,15 @@ pub(crate) fn redact(text: &str, secrets: &[&str]) -> String {
     out
 }
 
+/// Whether `c` is a server error code, `[A-Z][A-Z0-9_]{0,63}`: none of the
+/// marker delimiters an echoed value could forge a field with.
+fn plain_code(c: &str) -> bool {
+    c.len() <= 64
+        && c.starts_with(|ch: char| ch.is_ascii_uppercase())
+        && c.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// True for `https://`, or `http://` to this machine.
 fn sends_secrets_safely(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
@@ -289,9 +298,14 @@ fn sends_secrets_safely(base_url: &str) -> bool {
 impl FleetClient {
     /// Turn a non-2xx response into an error that keeps the server reason.
     /// The body carries refusal text (version conflicts, expired leases), no
-    /// key material.
-    async fn ok_or_err(res: reqwest::Response, key: &str) -> Result<reqwest::Response> {
-        Self::ok_or_err_hiding(res, key, &[]).await
+    /// key material; `bearer`, the credential the request sent, is hidden
+    /// should a hostile server or proxy echo it back.
+    async fn ok_or_err(
+        res: reqwest::Response,
+        key: &str,
+        bearer: &str,
+    ) -> Result<reqwest::Response> {
+        Self::ok_or_err_hiding(res, key, &[bearer]).await
     }
 
     /// `ok_or_err`, also hiding each of `secrets` the request sent, should a
@@ -305,18 +319,20 @@ impl FleetClient {
         if status.is_success() {
             return Ok(res);
         }
-        let body = res.text().await.unwrap_or_default();
-        let detail = redact(&body, secrets).chars().take(300).collect::<String>();
+        let body = redact(&res.text().await.unwrap_or_default(), secrets);
+        let detail = body.chars().take(300).collect::<String>();
         // `key` is the locale key for this exact refusal, so a translator sees
         // a whole sentence rather than a verb spliced into one. `detail` is
         // the server's own words, less any credential they echo.
-        Err(anyhow!(crate::errcode::code_with(
-            key,
-            &[
-                ("status", &status.as_u16().to_string()),
-                ("detail", &detail)
-            ],
-        )))
+        let status = status.as_u16().to_string();
+        let mut args = vec![("status", status.as_str()), ("detail", detail.as_str())];
+        // The top-level JSON `code`, as its own field, so a caller acting on
+        // it never matches text a nested field or reformatting would change.
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+        if let Some(code) = parsed["code"].as_str().filter(|c| plain_code(c)) {
+            args.push(("code", code));
+        }
+        Err(anyhow!(crate::errcode::code_with(key, &args)))
     }
 
     /// Register this device's keys with the server, as `login`'s account.
@@ -370,11 +386,7 @@ impl FleetClient {
             // not one that holds the password.
             let body: serde_json::Value = res.json().await.unwrap_or_default();
             let code = body["code"].as_str().filter(|c| {
-                c.len() <= 64
-                    && c.starts_with(|ch: char| ch.is_ascii_uppercase())
-                    && c.bytes()
-                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                    && (login.password.is_empty() || !c.contains(login.password))
+                plain_code(c) && (login.password.is_empty() || !c.contains(login.password))
             });
             bail!(crate::errcode::code_with(
                 "fleet.refusedLogin",
@@ -453,11 +465,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        let challenge: SessionChallenge = Self::ok_or_err(res, "fleet.refusedSession")
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplySession"))?;
+        let challenge: SessionChallenge =
+            Self::ok_or_err(res, "fleet.refusedSession", &ticket.ticket)
+                .await?
+                .json()
+                .await
+                .context(crate::errcode::code("fleet.badReplySession"))?;
 
         let mismatch = || anyhow!(crate::errcode::code("fleet.sessionBindingMismatch"));
         let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
@@ -499,7 +512,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        Self::ok_or_err(res, "fleet.refusedSession")
+        Self::ok_or_err(res, "fleet.refusedSession", &ticket.ticket)
             .await?
             .json()
             .await
@@ -518,7 +531,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableCustody"))?;
-        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+        let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .bytes()
             .await
@@ -574,7 +587,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableCustody"))?;
-        let body = Self::ok_or_err(res, "fleet.refusedCustody")
+        let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .bytes()
             .await
@@ -627,7 +640,7 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableCustody"))?;
-            let body = Self::ok_or_err(res, "fleet.refusedCustody")
+            let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
                 .await?
                 .bytes()
                 .await
@@ -695,7 +708,7 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        let body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody")
+        let body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .json()
             .await
@@ -837,7 +850,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        Self::ok_or_err(res, "fleet.refusedRefresh")
+        Self::ok_or_err(res, "fleet.refusedRefresh", refresh_token)
             .await?
             .json()
             .await
@@ -864,11 +877,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableRegister"))?;
-        let challenge: EnrollmentChallenge = Self::ok_or_err(res, "fleet.refusedRegister")
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplyRegister"))?;
+        let challenge: EnrollmentChallenge =
+            Self::ok_or_err(res, "fleet.refusedRegister", &ticket.ticket)
+                .await?
+                .json()
+                .await
+                .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
         let mismatch = || anyhow!(crate::errcode::code("fleet.bindingMismatch"));
         let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
@@ -901,11 +915,12 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableRegisterFinish"))?;
 
-        let enrolled: EnrolledDevice = Self::ok_or_err(res, "fleet.refusedRegisterFinish")
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
+        let enrolled: EnrolledDevice =
+            Self::ok_or_err(res, "fleet.refusedRegisterFinish", &ticket.ticket)
+                .await?
+                .json()
+                .await
+                .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
         // Both are stored and shown: an id, and the account the ticket named.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyRegisterFinish"));
         decode_hex16(&enrolled.device_id, "device_id").map_err(|_| bad())?;
@@ -964,7 +979,7 @@ impl FleetClient {
             .await;
         let me = async {
             let res = res.context(crate::errcode::code("fleet.unreachableLogin"))?;
-            Self::ok_or_err(res, "fleet.refusedLogin")
+            Self::ok_or_err(res, "fleet.refusedLogin", &ticket.ticket)
                 .await?
                 .json::<Me>()
                 .await
@@ -1143,7 +1158,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
-        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedAccountKeys")
+        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedAccountKeys", bearer)
             .await?
             .json()
             .await
@@ -1167,11 +1182,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
-        let body: Option<ActiveFleetGeneration> = Self::ok_or_err(res, "fleet.refusedTeamKeys")
-            .await?
-            .json()
-            .await
-            .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
+        let body: Option<ActiveFleetGeneration> =
+            Self::ok_or_err(res, "fleet.refusedTeamKeys", bearer)
+                .await?
+                .json()
+                .await
+                .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
         Ok(body.map(|g| g.generation))
     }
 
@@ -1197,7 +1213,7 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body = Self::ok_or_err(res, "fleet.refusedTeamKeys")
+        let body = Self::ok_or_err(res, "fleet.refusedTeamKeys", access_token)
             .await?
             .bytes()
             .await
