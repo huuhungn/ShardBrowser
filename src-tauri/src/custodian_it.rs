@@ -20,6 +20,40 @@ const OWNER: &str = "owner";
 const PASSWORD: &str = "custodian-it-owner-pass";
 const PASSPHRASE: &str = "custodian-it-recovery-passphrase";
 
+/// While the leak scan's worker runs, the directory it files every reply and
+/// state file in, and the side file of the secrets the scan looks for (see
+/// `the_journey_leaks_no_secret_to_output_state_or_replies`).
+const SCAN_DIR: &str = "SHARDX_LEAK_SCAN_DIR";
+const SECRETS_FILE: &str = "SHARDX_LEAK_SCAN_SECRETS";
+
+/// A launcher command's reply, appended as the JSON its IPC reply carries to
+/// the scan directory's `replies.jsonl` while a leak scan runs.
+fn note<T: serde::Serialize>(reply: Result<T, String>) -> Result<T, String> {
+    if let Some(dir) = std::env::var_os(SCAN_DIR) {
+        use std::io::Write;
+        let line = match &reply {
+            Ok(value) => serde_json::to_string(value),
+            Err(error) => serde_json::to_string(error),
+        }
+        .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dir).join("replies.jsonl"))
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+    reply
+}
+
+/// Runs one launcher command on `rt`, and notes its reply.
+fn call<T: serde::Serialize>(
+    rt: &tokio::runtime::Runtime,
+    command: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    note(rt.block_on(command))
+}
+
 /// The server built by `cargo build --manifest-path server/Cargo.toml`, or
 /// the one `SHARDX_TEAM_SERVER_BIN` names when it was built elsewhere.
 fn server_binary() -> std::path::PathBuf {
@@ -229,14 +263,17 @@ fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
         _lock: lock,
     };
 
-    crate::team_set_connection(h.server.url(), String::new(), h.tenant.clone()).unwrap();
-    let status = rt
-        .block_on(crate::team_enroll_device(
-            "custodian".into(),
-            OWNER.into(),
-            PASSWORD.into(),
-        ))
-        .unwrap();
+    note(crate::team_set_connection(
+        h.server.url(),
+        String::new(),
+        h.tenant.clone(),
+    ))
+    .unwrap();
+    let status = call(
+        rt,
+        crate::team_enroll_device("custodian".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     let c = crate::team_config::load().unwrap();
     let signing =
         shardx_core::keys::signing_key_id(c.signing_key().unwrap().verifying_key().as_bytes());
@@ -257,14 +294,11 @@ fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
         ),
     );
     let recovery = config_path("recovery.shardx-recovery");
-    let root = rt
-        .block_on(crate::team_bootstrap_custody(
-            OWNER.into(),
-            PASSWORD.into(),
-            recovery,
-            PASSPHRASE.into(),
-        ))
-        .unwrap();
+    let root = call(
+        rt,
+        crate::team_bootstrap_custody(OWNER.into(), PASSWORD.into(), recovery, PASSPHRASE.into()),
+    )
+    .unwrap();
     assert!(root.activated);
     h
 }
@@ -345,9 +379,11 @@ fn the_custodian_creates_and_collects_the_fleet_key_against_the_real_server() {
     let rt = runtime();
     let h = custodian(0, "cs2-create", &rt);
 
-    let status = rt
-        .block_on(crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    let status = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     assert!(status.created && !status.setup_key_held, "{status:?}");
 
     // The session read reports generation 0 ACTIVE.
@@ -436,9 +472,11 @@ fn a_fleet_setup_resumes_after_a_failed_save_and_a_replayed_run_against_the_real
     ));
 
     // The rerun reuses that key and completes.
-    let status = rt
-        .block_on(crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    let status = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     assert!(status.created && !status.setup_key_held, "{status:?}");
     assert_eq!(status.fkek_key_id, held);
     let gone = crate::credential::load(&name).unwrap_err();
@@ -446,9 +484,11 @@ fn a_fleet_setup_resumes_after_a_failed_save_and_a_replayed_run_against_the_real
     assert_eq!(audit(&h), expected_audit());
 
     // A third run is answered from stored responses: nothing new is filed.
-    let again = rt
-        .block_on(crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    let again = call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     assert_eq!(again, status);
     assert_eq!(audit(&h), expected_audit());
     assert_eq!(
@@ -566,8 +606,11 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     let (user, pass) = account();
     let fleet_ref = format!("fleet-key.{}.0", h.tenant);
     let held = |r: &str| crate::credential::load(r).map(|k| *k);
-    rt.block_on(crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    call(
+        rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     let a_key = held(&fleet_ref).expect("A's fleet key, in A's namespace");
 
     // 1. B enrolls. It may not list the fleet, and holds no generation 0.
@@ -576,21 +619,23 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
         data: tempfile::tempdir().unwrap(),
     };
     b.act_as_b();
-    crate::team_set_connection(h.server.url(), String::new(), h.tenant.clone()).unwrap();
-    let b_id = rt
-        .block_on(crate::team_enroll_device(
-            "member".into(),
-            OWNER.into(),
-            PASSWORD.into(),
-        ))
-        .unwrap()
-        .device_id;
-    let refused = rt
-        .block_on(crate::sync_cmd::team_fleet_profiles(
-            user.clone(),
-            pass.clone(),
-        ))
-        .unwrap_err();
+    note(crate::team_set_connection(
+        h.server.url(),
+        String::new(),
+        h.tenant.clone(),
+    ))
+    .unwrap();
+    let b_id = call(
+        rt,
+        crate::team_enroll_device("member".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let refused = call(
+        rt,
+        crate::sync_cmd::team_fleet_profiles(user.clone(), pass.clone()),
+    )
+    .unwrap_err();
     assert!(refused.contains("sync.noVerifiedFleetKey"), "{refused}");
     assert!(crate::fleet_keys::load()
         .unwrap()
@@ -603,13 +648,9 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     );
 
     // 2. B's code is the one A computes for B's row.
-    let code = rt
-        .block_on(crate::team_join_code(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    let code = call(rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
     h.act_as_a();
-    let rows = rt
-        .block_on(crate::team_devices(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    let rows = call(rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
     let row = rows.iter().find(|r| r.device_id == b_id).expect("B's row");
     assert_eq!(row.status, "pending");
     assert_eq!(row.sas, code.sas);
@@ -620,12 +661,15 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     assert_eq!(code.anchor, crate::root_bootstrap::load().unwrap().anchor);
 
     // 3. A approves B.
-    rt.block_on(crate::team_approve_device(
-        OWNER.into(),
-        PASSWORD.into(),
-        b_id.clone(),
-        code.sas.clone(),
-    ))
+    call(
+        rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            code.sas.clone(),
+        ),
+    )
     .unwrap();
     let of_b = |table: &str, extra: &str| {
         h.server.count(&format!(
@@ -649,15 +693,21 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     // 4. B pins A0, then collects generation 0 and acknowledges it once.
     b.act_as_b();
     assert!(held(&fleet_ref).is_err(), "B's namespace holds no key yet");
-    rt.block_on(crate::team_join_confirm(
-        OWNER.into(),
-        PASSWORD.into(),
-        code.anchor.clone(),
-        code.sas.clone(),
-    ))
+    call(
+        rt,
+        crate::team_join_confirm(
+            OWNER.into(),
+            PASSWORD.into(),
+            code.anchor.clone(),
+            code.sas.clone(),
+        ),
+    )
     .unwrap();
-    rt.block_on(crate::team_collect_custody(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    call(
+        rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     let (b_key, generation) = crate::fleet_keys::load()
         .unwrap()
         .active_key(&h.tenant)
@@ -673,8 +723,11 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
             .count("SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_grant.ack'")
     };
     let acked = acks();
-    rt.block_on(crate::team_collect_custody(OWNER.into(), PASSWORD.into()))
-        .unwrap();
+    call(
+        rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
     assert_eq!(acks(), acked, "a second collect sends no ack");
 
     // A's key still lives only under A's namespace entry, B's under B's.
@@ -687,34 +740,37 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
 
     // 5. A publishes and pushes version 1.
     let a_profile = local_profile("Shared", 1);
-    let published = rt
-        .block_on(crate::sync_cmd::profile_sync_publish(
+    let published = call(
+        rt,
+        crate::sync_cmd::profile_sync_publish(
             a_profile.clone(),
             Some("Shared".into()),
             user.clone(),
             pass.clone(),
-        ))
-        .unwrap();
-    let pushed = rt
-        .block_on(crate::sync_cmd::profile_sync_push(
+        ),
+    )
+    .unwrap();
+    let pushed = call(
+        rt,
+        crate::sync_cmd::profile_sync_push(
             a_profile.clone(),
             String::new(),
             0,
             user.clone(),
             pass.clone(),
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert_eq!(pushed.version, 1);
     let a_files = files(&a_profile);
 
     // 6. B lists, joins and pulls it: the files are A's.
     b.act_as_b();
-    let listed = rt
-        .block_on(crate::sync_cmd::team_fleet_profiles(
-            user.clone(),
-            pass.clone(),
-        ))
-        .unwrap();
+    let listed = call(
+        rt,
+        crate::sync_cmd::team_fleet_profiles(user.clone(), pass.clone()),
+    )
+    .unwrap();
     let remote = listed
         .iter()
         .find(|p| p.remote_profile_id == published.profile_id)
@@ -722,44 +778,55 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
     assert_eq!(remote.label.as_deref(), Some("Shared"));
     let b_profile = local_profile("Shared", 2);
     std::fs::remove_dir_all(crate::profile::user_data_dir(&b_profile).unwrap()).unwrap();
-    rt.block_on(crate::sync_cmd::team_join_profile(
-        published.profile_id.clone(),
-        b_profile.clone(),
-        user.clone(),
-        pass.clone(),
-    ))
+    call(
+        rt,
+        crate::sync_cmd::team_join_profile(
+            published.profile_id.clone(),
+            b_profile.clone(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
     .unwrap();
-    rt.block_on(crate::sync_cmd::profile_sync_pull(
-        b_profile.clone(),
-        String::new(),
-        user.clone(),
-        pass.clone(),
-    ))
+    call(
+        rt,
+        crate::sync_cmd::profile_sync_pull(
+            b_profile.clone(),
+            String::new(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
     .unwrap();
     assert_eq!(files(&b_profile), a_files);
 
     // 7. B pushes version 2, and A pulls it.
     let udd = crate::profile::user_data_dir(&b_profile).unwrap();
     std::fs::write(udd.join("Preferences"), b"{\"from\":\"b\"}").unwrap();
-    let pushed = rt
-        .block_on(crate::sync_cmd::profile_sync_push(
+    let pushed = call(
+        rt,
+        crate::sync_cmd::profile_sync_push(
             b_profile.clone(),
             String::new(),
             1,
             user.clone(),
             pass.clone(),
-        ))
-        .unwrap();
+        ),
+    )
+    .unwrap();
     assert_eq!(pushed.version, 2);
     let b_files = files(&b_profile);
     let b_pin = pinned_version(&b_profile);
     h.act_as_a();
-    rt.block_on(crate::sync_cmd::profile_sync_pull(
-        a_profile.clone(),
-        String::new(),
-        user.clone(),
-        pass.clone(),
-    ))
+    call(
+        rt,
+        crate::sync_cmd::profile_sync_pull(
+            a_profile.clone(),
+            String::new(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
     .unwrap();
     assert_eq!(files(&a_profile), b_files);
 
@@ -792,12 +859,15 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     let (user, pass) = account();
 
     // 1. A revokes B as retired.
-    rt.block_on(crate::team_revoke_device(
-        OWNER.into(),
-        PASSWORD.into(),
-        b_id.clone(),
-        "retired".into(),
-    ))
+    call(
+        &rt,
+        crate::team_revoke_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            "retired".into(),
+        ),
+    )
     .unwrap();
     let revoked = h.server.count(&format!(
         "SELECT count(*) FROM v2_devices WHERE lower(hex(id)) = '{b_id}' AND status = 'revoked'"
@@ -820,16 +890,17 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     // 2. B is cut off from the server, but keeps generation 0.
     const REVOKED: &str = "the device is revoked and holds no live approval";
     b.act_as_b();
-    let listed = rt
-        .block_on(crate::sync_cmd::team_fleet_profiles(
-            user.clone(),
-            pass.clone(),
-        ))
-        .unwrap_err();
+    let listed = call(
+        &rt,
+        crate::sync_cmd::team_fleet_profiles(user.clone(), pass.clone()),
+    )
+    .unwrap_err();
     assert!(listed.contains(REVOKED), "{listed}");
-    let collected = rt
-        .block_on(crate::team_collect_custody(OWNER.into(), PASSWORD.into()))
-        .unwrap_err();
+    let collected = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap_err();
     assert!(collected.contains(REVOKED), "{collected}");
     let (b_key, generation) = crate::fleet_keys::load()
         .unwrap()
@@ -917,13 +988,16 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     let udd = crate::profile::user_data_dir(&a_profile).unwrap();
     std::fs::write(udd.join("Preferences"), b"{\"from\":\"a, after\"}").unwrap();
     let push = |base: i64| {
-        rt.block_on(crate::sync_cmd::profile_sync_push(
-            a_profile.clone(),
-            String::new(),
-            base,
-            user.clone(),
-            pass.clone(),
-        ))
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_push(
+                a_profile.clone(),
+                String::new(),
+                base,
+                user.clone(),
+                pass.clone(),
+            ),
+        )
         .unwrap()
         .version
     };
@@ -1007,4 +1081,218 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     };
     assert!(!open(&b_key).expect("B's key opens version 3").is_empty());
     assert!(open(&[0x5a; 32]).is_err(), "another key does not");
+}
+
+#[test]
+fn the_journey_writes_one_audit_row_per_mutation() {
+    let rt = runtime();
+    let Journey { h, b_id, .. } = shared_profile(4, "cs5-audit", &rt);
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into()),
+    )
+    .unwrap();
+    let counts: Vec<(&str, i64)> = [
+        "fleet.create",
+        "capability.grant",
+        "fleet.key_generation.create",
+        "fleet.key_generation.activate",
+        "fleet.key_grant.create",
+        "fleet.key_grant.ack",
+        "device.approve",
+        "device.revoke",
+    ]
+    .into_iter()
+    .map(|action| {
+        let n = h.server.count(&format!(
+            "SELECT count(*) FROM v2_audit_events WHERE action = '{action}'"
+        ));
+        (action, n)
+    })
+    .collect();
+    assert_eq!(
+        counts,
+        [
+            ("fleet.create", 1),
+            // Six for A, three for B.
+            ("capability.grant", 9),
+            ("fleet.key_generation.create", 1),
+            ("fleet.key_generation.activate", 1),
+            // A's device and recovery grants, and B's device grant.
+            ("fleet.key_grant.create", 3),
+            ("fleet.key_grant.ack", 3),
+            // D1 and B.
+            ("device.approve", 2),
+            ("device.revoke", 1),
+        ]
+    );
+}
+
+/// The first `v2a.`, `v2t.` or `v2r.` token followed by 16 or more hex
+/// digits in `text`.
+fn session_token(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    (0..b.len().saturating_sub(4)).find_map(|i| {
+        let prefix = &b[i..i + 4];
+        if &prefix[..2] != b"v2" || !matches!(prefix[2], b'a' | b't' | b'r') || prefix[3] != b'.' {
+            return None;
+        }
+        let n = b[i + 4..]
+            .iter()
+            .take_while(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+            .count();
+        (n >= 16).then(|| &text[i..i + 4 + n])
+    })
+}
+
+/// Re-runs this test binary on the journey worker below, and scans what it
+/// printed, every command reply and both devices' state files for the
+/// account password, the fleet key, the root key, both HPKE private keys and
+/// any session token (plan v0.2.2a section 8).
+#[test]
+fn the_journey_leaks_no_secret_to_output_state_or_replies() {
+    assert_eq!(
+        session_token("x v2a.0123456789abcdef y"),
+        Some("v2a.0123456789abcdef")
+    );
+    assert_eq!(session_token("v2t.0123456789abcde"), None);
+    let scan = tempfile::tempdir().unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let secrets_file = side.path().join("secrets.txt");
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "custodian_it::the_journey_leak_scan_worker",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(SCAN_DIR, scan.path())
+        .env(SECRETS_FILE, &secrets_file)
+        .output()
+        .expect("re-run this test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the worker failed:\n{stdout}\n{stderr}"
+    );
+
+    let mut secrets: Vec<String> = std::fs::read_to_string(&secrets_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        secrets.len(),
+        4,
+        "the FKEK, the TRK and two HPKE private keys"
+    );
+    secrets.push(PASSWORD.into());
+    let mut scanned = vec![
+        ("stdout".to_string(), stdout),
+        ("stderr".to_string(), stderr),
+    ];
+    for entry in std::fs::read_dir(scan.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        scanned.push((
+            name,
+            String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned(),
+        ));
+    }
+    let names: Vec<&str> = scanned.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in [
+        "replies.jsonl",
+        "a-team.json",
+        "a-fleet-custody.json",
+        "a-custody-bootstrap.json",
+        "b-team.json",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+    let mut hits = Vec::new();
+    for (name, text) in &scanned {
+        let text = text.to_ascii_lowercase();
+        for (n, secret) in secrets.iter().enumerate() {
+            if text.contains(&secret.to_ascii_lowercase()) {
+                hits.push(format!("{name}: secret #{n}"));
+            }
+        }
+        if session_token(&text).is_some() {
+            hits.push(format!("{name}: a session token"));
+        }
+    }
+    assert!(hits.is_empty(), "{hits:?}");
+}
+
+/// Copies this device's team state files that exist into `dir`, each named
+/// after `device`.
+fn keep_state(dir: &std::path::Path, device: &str) {
+    for path in [
+        crate::store::team_config_path(),
+        crate::store::fleet_custody_path(),
+        crate::store::custody_bootstrap_path(),
+    ] {
+        let path = path.unwrap();
+        if path.exists() {
+            let name = path.file_name().unwrap().to_string_lossy();
+            std::fs::copy(&path, dir.join(format!("{device}-{name}"))).unwrap();
+        }
+    }
+}
+
+/// The journey the leak scan watches: the S3 journey, A's revoke of B and
+/// B's refused collect. Each reply and each device's state files go to the
+/// scan directory; the secrets to look for go to the side file.
+#[test]
+#[ignore = "a worker of the_journey_leaks_no_secret_to_output_state_or_replies"]
+fn the_journey_leak_scan_worker() {
+    let dir = std::path::PathBuf::from(std::env::var_os(SCAN_DIR).expect("run by the leak scan"));
+    let secrets = std::env::var_os(SECRETS_FILE).expect("run by the leak scan");
+    let rt = runtime();
+    let Journey { b, h, b_id, .. } = shared_profile(5, "cs5-leak", &rt);
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into()),
+    )
+    .unwrap();
+
+    let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
+    let c = crate::team_config::load().unwrap();
+    let (a_sk, _) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+    let grants = with_session(&rt, &h, async |client, access| {
+        client
+            .root_key_grants(access, &h.tenant, &c.device_id)
+            .await
+            .unwrap()
+    });
+    let grant = grants.first().expect("A's root grant");
+    let bytes = |s: &str| crate::fleet_client::decode_hex(s).unwrap();
+    let trk = shardx_core::grants::open_trk_with_info(
+        &a_sk,
+        &bytes(&grant.hpke_info_hex),
+        &bytes(&grant.hpke_encapped_key_hex),
+        &bytes(&grant.hpke_wrapped_trk_hex),
+    )
+    .unwrap();
+    keep_state(&dir, "a");
+
+    b.act_as_b();
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap_err();
+    let (b_sk, _) = shardx_core::grants::derive_keypair(
+        &crate::team_config::load().unwrap().hpke_seed().unwrap(),
+    );
+    keep_state(&dir, "b");
+    std::fs::write(
+        secrets,
+        [hex(&*fkek), hex(&*trk), hex(&a_sk), hex(&b_sk)].join("\n"),
+    )
+    .unwrap();
 }
