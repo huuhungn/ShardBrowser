@@ -172,6 +172,12 @@ It does not:
   in and enroll a *new* pending device, which gets nothing without a fresh
   approval. A shared legacy v1 token, if one was configured, also stays valid.
 
+The launcher saves a revocation request before sending it and resends those
+exact bytes on a retry. It builds a new one only when the server refuses the
+saved one with `REVOCATION_OUTSIDE_WINDOW` and the device is not yet revoked;
+any other refusal leaves the saved request as it is. An older server never
+sends that code, so the launcher and the server are released together.
+
 ### A failure worth remembering
 
 `record_table` in `v2_replay_ledger` had a CHECK constraint listing only the
@@ -332,5 +338,12 @@ What does not hold:
   snapshot that opens.
 - Recovery of local backups and legacy passphrase snapshots, if the passphrase
   is lost.
+- Secrecy of the account password or a session token against a hostile team
+  server. The launcher keeps them out of its own logs, state and error
+  strings, and removes the forms of them it recognizes from a server's refusal
+  text; a refused login keeps only the server's error code. A server that
+  received the password or a token can still return it in an encoding the
+  launcher does not recognize. The account password protects that account at
+  that server only, so use a password unique to it.
 
 `P-OP` remains blocked, and this is one of the reasons.

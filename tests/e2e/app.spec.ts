@@ -943,6 +943,15 @@ test("approval stays disabled until the custodian creates its fleet key", async 
   await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
 });
 
+test("revoke stays disabled until the custodian creates its fleet key", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Verifier Active", status: "active", granted: false }]);
+  await teamDevicePage(a, "a", server);
+  const row = await listDevices(a, "Verifier Active");
+  await cardSignIn(a);
+  await expect(a.getByRole("button", { name: "Create fleet key", exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Revoke", exact: true })).toBeDisabled();
+});
+
 test("refreshed keys require a fresh join-code comparison", async ({ page: a }) => {
   const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Verifier Pending", status: "pending", granted: false }]);
   await teamDevicePage(a, "a", server);
@@ -1008,6 +1017,13 @@ test("the first device sets up root custody once its passphrases agree", async (
   await expect(page.getByText("Bootstrap anchor")).toBeVisible();
   await expect(page.locator(`input[value="${"a0".repeat(32)}"]`)).toBeVisible();
   await expect(page.getByTestId("keys-unprotected")).toHaveCount(0);
+});
+
+test("a fleet key Q-18 blocks is reported instead of the join steps", async ({ page }) => {
+  await gotoMocked(page, "/?e2e=team-key-blocked");
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(page.getByTestId("team-key-blocked")).toContainText("pushing under it is blocked");
+  await expect(page.getByTestId("team-join")).toHaveCount(0);
 });
 
 test("an interrupted custody setup resumes at its saved bundle without asking for a path", async ({ page }) => {

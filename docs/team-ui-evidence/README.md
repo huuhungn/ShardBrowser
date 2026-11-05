@@ -54,3 +54,7 @@ on the first, plus the blind verifier round.
   verifier of the custodian flow, round 1, at 07260ecc. VERDICT: FAIL with six
   defects (D1 to D6), fixed with regression tests in the same change; its tests
   are kept without the `verifier_` prefix. Round 2 runs on the fixed main.
+- [codex-custodian-round-2.md](codex-custodian-round-2.md): the Codex blind
+  verifier of the custodian flow, round 2, at 6781e565. VERDICT: FAIL with five
+  defects (D1 to D5), fixed with regression tests in the same change; its tests
+  are kept without the `verifier_` prefix. Round 3 runs on the fixed main.

@@ -26,6 +26,11 @@ export type TeamStatus = {
    */
   has_fleet_key: boolean;
   /**
+   * Whether this device holds such a key but Q-18 blocks sealing under it,
+   * so push is refused until a custodian rotates the fleet key.
+   */
+  fleet_key_blocked: boolean;
+  /**
    * Whether every key this device holds is in the OS credential store. False
    * while a key is still in plaintext on disk because no store was usable.
    */

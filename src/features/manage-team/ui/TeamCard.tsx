@@ -459,6 +459,10 @@ export function TeamCard() {
                     <p data-testid="team-joined" className="m-0 text-paragraph-xs text-text-sub-600">
                       {t("team.joinCode.joined")}
                     </p>
+                  ) : st.fleet_key_blocked ? (
+                    <p data-testid="team-key-blocked" className="m-0 text-paragraph-xs text-state-error-base">
+                      {t("team.joinCode.blocked")}
+                    </p>
                   ) : (
                     <TeamJoin
                       account={account}

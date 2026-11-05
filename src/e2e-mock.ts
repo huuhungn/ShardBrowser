@@ -268,8 +268,9 @@ const teamFleet: TeamFleetProfile[] = scenario === "team-profiles"
 
 // A device enrolled as a tenant's first, before or part-way through custody
 // setup. The bootstrap itself is the backend's; the card only drives it.
+// `team-key-blocked` also holds a verified fleet key Q-18 blocks sealing under.
 const firstDevice = scenario === "team-first-device" || scenario === "team-first-device-resume"
-  || scenario === "team-keys-locked";
+  || scenario === "team-keys-locked" || scenario === "team-key-blocked";
 // The resumed setup also stands for a host whose credential store refused the
 // keys; `team-keys-locked` for one whose keys sit in a key file not yet opened.
 let keyState = scenario === "team-first-device-resume"
@@ -300,6 +301,7 @@ const teamStatusFixture = () => (firstDevice
     can_sync: true,
     can_receive_custody: true,
     has_fleet_key: false,
+    fleet_key_blocked: scenario === "team-key-blocked",
     ...keyState,
   }
   : {
@@ -310,6 +312,7 @@ const teamStatusFixture = () => (firstDevice
     can_sync: !!teamMe.device_id,
     can_receive_custody: !!teamMe.device_id,
     has_fleet_key: teamMe.collected,
+    fleet_key_blocked: false,
     keys_protected: true,
     has_key_file: false,
     keys_locked: false,

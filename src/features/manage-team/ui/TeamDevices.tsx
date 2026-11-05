@@ -227,7 +227,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId }: TeamActionPr
                 </div>
                 <Button
                   size="small" variant="error" mode="stroke"
-                  disabled={!!busy || !account.signedIn}
+                  disabled={!!busy || !account.signedIn || !ready}
                   onClick={() => { void revoke(r); }}
                 >
                   {t("team.devices.revoke")}
