@@ -11021,60 +11021,27 @@ async fn a_same_account_v1_token_does_not_bypass_device_root_grant_isolation() {
             json!({"username":"admin", "password":"secret"}),
         )
         .await;
-    server.sql(
-        "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?",
-        &[&OWNER]
-    ).await;
-    let (status, body) = server
-        .call(&path, login["token"].as_str().unwrap(), None)
-        .await;
-    let returned = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v["grants"].as_array().map(Vec::len))
-        .unwrap_or(0);
-    assert!(
-        status == 403 && returned == 0,
-        "an account-only v1 bearer bypassed device isolation: HTTP {status}, {returned} grants"
-    );
-}
-
-#[tokio::test]
-async fn a_v1_member_cannot_read_another_accounts_root_grants() {
-    let mut server = start("v1-root-reader", 28451).await;
-    let (custodian, access, _) = custodian(&mut server, 0x6c).await;
-    let path = format!(
-        "/v2/tenants/{}/devices/{}/root-key-grants",
-        hex(&TENANT),
-        hex(&custodian.id)
-    );
-    let (status, body) = server.call(&path, &access, None).await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap()["grants"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    let (_, login) = server
-        .post(
-            "/auth/login",
-            None,
-            json!({"username":"admin", "password":"secret"}),
-        )
-        .await;
     let v1 = login["token"].as_str().unwrap();
-    // This v1 user maps to OTHER, not the custodian's OWNER account.
-    server.sql("UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?", &[&OTHER]).await;
-    let (status, body) = server.call(&path, v1, None).await;
-    let returned = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v["grants"].as_array().map(Vec::len))
-        .unwrap_or(0);
-    assert!(
-        status == 403 && returned == 0,
-        "another account's root grant was readable (HTTP {status}, {returned} grants)"
-    );
+    // Neither a v1 bearer of another account nor one of the device's own
+    // account reads the grants: neither proves the device's key.
+    for account in [OTHER, OWNER] {
+        server
+            .sql("UPDATE v2_accounts SET legacy_user_id = NULL", &[])
+            .await;
+        server.sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?",
+            &[&account]
+        ).await;
+        let (status, body) = server.call(&path, v1, None).await;
+        let returned = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v["grants"].as_array().map(Vec::len))
+            .unwrap_or(0);
+        assert!(
+            status == 403 && returned == 0,
+            "an account-only v1 bearer bypassed device isolation: HTTP {status}, {returned} grants"
+        );
+    }
 }
 
 #[tokio::test]

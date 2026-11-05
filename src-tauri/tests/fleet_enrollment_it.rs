@@ -370,9 +370,30 @@ async fn an_enrolled_device_collects_and_opens_its_root_key_grant() {
         .await
         .expect("enrollment must succeed");
 
+    // Root grants are read only through the device's own session: the v1
+    // account token proves no device key, so it is refused.
+    let refused = client
+        .root_key_grants(&token, &tenant_hex, &device.device_id)
+        .await
+        .expect_err("a v1 token must not read a device's root grants")
+        .to_string();
+    assert!(
+        refused.contains("fleet.refusedAccountKeys|status=403|"),
+        "{refused}"
+    );
+    let session = client
+        .open_device_session(
+            &account(&tenant_hex),
+            &device.device_id,
+            &signer,
+            &hpke_seed,
+        )
+        .await
+        .expect("an enrolled device must open a session");
+
     // A device with no grants must get an empty list, not an error.
     let none = client
-        .root_key_grants(&token, &tenant_hex, &device.device_id)
+        .root_key_grants(&session.access_token, &tenant_hex, &device.device_id)
         .await
         .expect("collecting with no grants must succeed");
     assert!(none.is_empty(), "a fresh device has no grants");

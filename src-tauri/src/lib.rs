@@ -2830,8 +2830,9 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
     let expires_at_ms = match join_window(&c, root_bootstrap::now_ms()) {
         Ok(end) => end,
         // The UI offers Enroll again for an expired code, so say when
-        // `team_enroll_again` would refuse it. Unasked or unanswered, the
-        // code just reads as expired.
+        // `team_enroll_again` would refuse it. Unasked, the code just reads
+        // as expired; asked but unanswered (a refused login, a server down),
+        // the error stands, so Enroll again is never offered on a guess.
         Err(expired) if !username.trim().is_empty() && !password.is_empty() => {
             let client = fleet_client::FleetClient::new(&c.server_url, &c.token)
                 .map_err(|e| e.to_string())?;
@@ -2840,9 +2841,10 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
                 username: username.trim(),
                 password: &password,
             };
-            let Ok(status) = client.account_device_status(&login, &c.device_id).await else {
-                return Err(expired);
-            };
+            let status = client
+                .account_device_status(&login, &c.device_id)
+                .await
+                .map_err(|e| e.to_string())?;
             let pinned = pinned_anchor(&c).is_some();
             return Err(if enroll_again_allowed(status.as_deref(), pinned) {
                 expired
@@ -5856,6 +5858,12 @@ mod custody_tests {
                 async move {
                     let call = format!("{method} {}", uri.path());
                     log.lock().unwrap().push(call.clone());
+                    // `refused`: the server refuses the account login.
+                    let code = if status == "refused" && call == "POST /v2/auth/login" {
+                        axum::http::StatusCode::UNAUTHORIZED
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
                     let body = match call.as_str() {
                         "POST /v2/auth/login" => serde_json::json!({
                             "ticket": "v2t.fresh",
@@ -5874,7 +5882,7 @@ mod custody_tests {
                         }),
                         _ => serde_json::json!({}),
                     };
-                    axum::Json(body)
+                    (code, axum::Json(body))
                 }
             },
         );
@@ -6175,6 +6183,22 @@ mod custody_tests {
                 .unwrap_err();
             assert!(err.contains(expired), "{status} {pinned}: {err}");
         }
+    }
+
+    /// An expired code whose status could not be asked (the login refused)
+    /// reports that error, never the plain expired code the UI answers with
+    /// Enroll again.
+    #[test]
+    fn an_expired_code_whose_status_is_unanswered_is_not_plain_expired() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "refused");
+        let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+        pin_here();
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("fleet.refusedLogin"), "{err}");
+        assert!(!err.contains("fleet.joinCodeExpired"), "{err}");
     }
 
     /// Pins the joiner's tenant to an anchor, as a confirmed join does.

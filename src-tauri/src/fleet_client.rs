@@ -329,7 +329,10 @@ impl FleetClient {
         // The top-level JSON `code`, as its own field, so a caller acting on
         // it never matches text a nested field or reformatting would change.
         let parsed = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
-        if let Some(code) = parsed["code"].as_str().filter(|c| plain_code(c)) {
+        if let Some(code) = parsed["code"]
+            .as_str()
+            .filter(|c| plain_code(c) && redact(c, secrets) == *c)
+        {
             args.push(("code", code));
         }
         Err(anyhow!(crate::errcode::code_with(key, &args)))

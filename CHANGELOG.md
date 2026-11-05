@@ -18,6 +18,8 @@
   keeps the fleet key. An expired code offers Enroll again.
 - **No token needed.** Connecting needs only the server URL and the tenant ID.
   The API token is optional and serves legacy passphrase sync only.
+- **Root key grants.** A device's root key grants are served only to that
+  device's own v2 session; a v1 token now gets 403.
 
 ### Known limitations
 

@@ -2911,7 +2911,7 @@ mod tests {
     #[test]
     fn a_refused_custody_post_hides_the_access_token_body() {
         let rt = runtime();
-        let token_body = "9d".repeat(32);
+        let token_body = "ad".repeat(32);
         let access = format!("v2a.{token_body}");
         let echoed = token_body.to_ascii_uppercase();
         let (client, _) = rt.block_on(mock(Arc::new(move |_, _| {
