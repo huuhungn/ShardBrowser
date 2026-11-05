@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.33s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\shardx_launcher_lib-f56ed3c5cad76fc7.exe)
+
+running 3 tests
+test fleet_custody::tests::round4_nested_error_code_does_not_replace_a_valid_saved_revocation ... FAILED
+test fleet_custody::tests::round4_refused_device_listing_hides_the_access_token_body ... FAILED
+test fleet_custody::tests::round4_formatted_window_error_recovers_a_stale_unfiled_revocation ... FAILED
+
+failures:
+
+---- fleet_custody::tests::round4_nested_error_code_does_not_replace_a_valid_saved_revocation stdout ----
+
+thread 'fleet_custody::tests::round4_nested_error_code_does_not_replace_a_valid_saved_revocation' (10396) panicked at src\fleet_custody.rs:2834:9:
+a nested context code replaced a still-valid saved revocation
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- fleet_custody::tests::round4_refused_device_listing_hides_the_access_token_body stdout ----
+
+thread 'fleet_custody::tests::round4_refused_device_listing_hides_the_access_token_body' (49244) panicked at src\fleet_custody.rs:2860:9:
+the error returned to IPC contains the bearer token body
+
+---- fleet_custody::tests::round4_formatted_window_error_recovers_a_stale_unfiled_revocation stdout ----
+
+thread 'fleet_custody::tests::round4_formatted_window_error_recovers_a_stale_unfiled_revocation' (9136) panicked at src\fleet_custody.rs:2891:9:
+equivalent JSON whitespace stranded the expired unfiled revocation
+
+
+failures:
+    fleet_custody::tests::round4_formatted_window_error_recovers_a_stale_unfiled_revocation
+    fleet_custody::tests::round4_nested_error_code_does_not_replace_a_valid_saved_revocation
+    fleet_custody::tests::round4_refused_device_listing_hides_the_access_token_body
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 726 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `--lib`

@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running tests\identity_authority.rs (server\target\debug\deps\identity_authority-a303ede03cce197b.exe)
+
+running 1 test
+skipping: cannot create a symlink here: A required privilege is not held by the client. (os error 1314)
+test a_symlinked_record_is_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.54s
+

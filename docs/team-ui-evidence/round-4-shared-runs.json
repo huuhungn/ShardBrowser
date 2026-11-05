@@ -1,0 +1,63 @@
+[
+  {
+    "filter": "join_sas",
+    "command": "cargo test -j 4 --manifest-path shared/Cargo.toml join_sas",
+    "exit": 0,
+    "output": [
+      "running 3 tests",
+      "test trust_chain::tests::join_sas_displays_eight_groups_of_four ... ok",
+      "test trust_chain::tests::join_sas_matches_an_independent_sha256 ... ok",
+      "test trust_chain::tests::join_sas_changes_with_every_input ... ok",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 303 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s"
+    ]
+  },
+  {
+    "filter": "authz_record",
+    "command": "cargo test -j 4 --manifest-path shared/Cargo.toml authz_record",
+    "exit": 0,
+    "output": [
+      "running 24 tests",
+      "test authz_record::tests::integers_outside_the_sqlite_domain_have_their_own_code ... ok",
+      "test authz_record::tests::capability_strings_outside_the_closed_set_reject ... ok",
+      "test authz_record::tests::approval_rejects_contract_violations ... ok",
+      "test authz_record::tests::recovery_grant_opens_only_under_its_root_and_to_its_fkek ... ok",
+      "test authz_record::tests::hpke_grant_binds_info_suite_and_lengths ... ok",
+      "test authz_record::tests::recovery_grant_binds_context_suite_and_lengths ... ok",
+      "test authz_record::tests::payload_must_match_the_container_and_a_known_schema ... ok",
+      "test authz_record::tests::container_rejects_every_field_level_defect ... ok",
+      "test authz_record::tests::a_first_self_grant_is_signed_by_its_subject ... ok",
+      "test authz_record::tests::root_grant_pins_the_hpke_tuple_info_and_lengths ... ok",
+      "test authz_record::tests::capability_grants_follow_the_d2_table ... ok",
+      "test authz_record::tests::rotation_grant_follows_its_generation_window_and_count_rules ... ok",
+      "test authz_record::tests::root_grant_opens_only_to_the_trk_its_key_id_names ... ok",
+      "test authz_record::tests::small_order_issuer_key_never_verifies ... ok",
+      "test authz_record::tests::signature_binds_issuer_and_bytes ... ok",
+      "test authz_record::tests::tenant_scope_must_name_the_tenant ... ok",
+      "test authz_record::tests::root_grant_variants_follow_their_generation_rules ... ok",
+      "test authz_record::tests::subject_device_fields_are_present_iff_device_scoped ... ok",
+      "test authz_record::tests::a_device_revocation_roundtrips_and_refuses_bad_fields ... ok",
+      "test authz_record::tests::record_roundtrips_and_verifies ... ok",
+      "test authz_record::tests::golden_vectors ... ok",
+      "test authz_record::tests::grants_roundtrip_inside_a_record ... ok",
+      "test authz_record::tests::recovery_and_rotation_grants_roundtrip_inside_a_record ... ok",
+      "test authz_record::tests::root_grants_roundtrip_inside_a_record ... ok",
+      "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 282 filtered out; finished in 0.04s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+      "running 0 tests",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s"
+    ]
+  }
+]

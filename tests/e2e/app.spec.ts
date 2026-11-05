@@ -853,7 +853,10 @@ test("an expired join code offers Enroll again and a new code", async ({ page: b
   await expect(card.getByTestId("team-join")).toContainText("This join code has expired.");
   await expect(sas).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Codes match" })).toHaveCount(0);
+  // The local clock alone offers nothing: Show join code asks the backend.
+  await expect(card.getByRole("button", { name: "Enroll again" })).toHaveCount(0);
 
+  await cardClick(b, "Show join code");
   await cardClick(b, "Enroll again");
   await expect(card.getByRole("button", { name: "Enroll this device" })).toBeVisible();
   await teamEnroll(b, "Machine B");
@@ -880,6 +883,7 @@ test("an approved device whose join code expired can enroll again", async ({ pag
 
   await b.clock.fastForward("10:01");
   await expect(cardB.getByTestId("team-join")).toContainText("This join code has expired.");
+  await cardClick(b, "Show join code");
   await cardClick(b, "Enroll again");
   await teamEnroll(b, "Machine B");
 
@@ -916,6 +920,40 @@ test("an active pinned device is not offered reenrollment after reopening Team",
     await cardClick(b, "Show join code");
     await expect(b.getByTestId("team-join")).toContainText("This join code has expired.");
     // Prove the actual mock command models the backend's refusal for this state.
+    const rejected = await b.evaluate(async () => {
+      const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__;
+      try {
+        await ipc.invoke("team_enroll_again", { username: "owner", password: "pw" });
+        return false;
+      } catch (e) { return String(e).includes("fleet.enrollAgainRefused"); }
+    });
+    expect(rejected).toBe(true);
+    await expect(b.getByTestId("team-card").getByRole("button", { name: "Enroll again", exact: true })).toHaveCount(0);
+  } finally { await b.context().close(); }
+});
+
+test("an active pinned device is not offered reenrollment when a remounted code expires", async ({ page: a, browser, baseURL, viewport }) => {
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  try {
+    await teamDevicePage(a, "a", server);
+    await teamDevicePage(b, "b", server, true);
+    await cardClick(a, "Create fleet key");
+    await teamEnroll(b, "Pinned B");
+    await cardClick(b, "Show join code");
+    const row = await listDevices(a, "Pinned B");
+    await row.getByLabel("The code on the other device matches").check();
+    await cardSignIn(a);
+    await row.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(row).toContainText("Active");
+    await cardClick(b, "Codes match");
+    await expect(b.getByTestId("team-join")).toContainText("Codes confirmed.");
+    await b.getByRole("button", { name: "Settings", exact: true }).click();
+    await b.getByRole("button", { name: "Team", exact: true }).click();
+    await cardClick(b, "Show join code");
+    await expect(b.getByTestId("team-join-sas")).toBeVisible();
+    await b.clock.fastForward("10:01");
+    await expect(b.getByTestId("team-join")).toContainText("This join code has expired.");
     const rejected = await b.evaluate(async () => {
       const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__;
       try {

@@ -1,0 +1,21 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running unittests src\lib.rs (src-tauri\target\debug\deps\shardx_launcher_lib-f56ed3c5cad76fc7.exe)
+
+running 9 tests
+test custodian_it::the_journey_leak_scan_worker ... ignored, a worker of the_journey_leaks_no_secret_to_output_state_or_replies
+test custodian_it::a_fleet_setup_resumes_after_a_failed_save_and_a_replayed_run_against_the_real_server ... ok
+test custodian_it::the_journey_leaks_no_secret_to_output_state_or_replies ... ok
+test custodian_it::a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real_server ... ok
+test custodian_it::a_setup_does_not_ack_again_after_its_acked_receipt has been running for over 60 seconds
+test custodian_it::a_setup_whose_cleanup_fails_leaves_no_usable_verified_key has been running for over 60 seconds
+test custodian_it::the_custodian_creates_and_collects_the_fleet_key_against_the_real_server has been running for over 60 seconds
+test custodian_it::the_journey_writes_one_audit_row_per_mutation has been running for over 60 seconds
+test custodian_it::two_devices_share_a_profile_through_a_real_server_after_approval has been running for over 60 seconds
+test custodian_it::a_setup_does_not_ack_again_after_its_acked_receipt ... ok
+test custodian_it::a_setup_whose_cleanup_fails_leaves_no_usable_verified_key ... ok
+test custodian_it::the_custodian_creates_and_collects_the_fleet_key_against_the_real_server ... ok
+test custodian_it::the_journey_writes_one_audit_row_per_mutation ... ok
+test custodian_it::two_devices_share_a_profile_through_a_real_server_after_approval ... ok
+
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 720 filtered out; finished in 149.41s
+

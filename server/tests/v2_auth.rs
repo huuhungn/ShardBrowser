@@ -3790,7 +3790,8 @@ async fn only_an_acknowledged_unrevoked_custody_grant_issues() {
 async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
     let mut server = start("quarantine-pass", 28208).await;
     let (dev, access, bootstrap) = custodian(&mut server, 0x6c).await;
-    // The v1 collection route lists the grant, and the bootstrap replays.
+    // The device's own session lists the grant, a v1 bearer of its account is
+    // refused, and the bootstrap replays.
     server
         .sql(
             "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin')
@@ -3817,7 +3818,8 @@ async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
             .unwrap()
             .len()
     };
-    let (status, body) = server.call(&collect, &v1, None).await;
+    assert_eq!(server.call(&collect, &v1, None).await.0, 403);
+    let (status, body) = server.call(&collect, &access, None).await;
     assert_eq!((status, listed(body)), (200, 1));
     assert_eq!(server.root(&TENANT, &access, &bootstrap).await.0, 201);
     let filed = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xf2; 16]);
@@ -3883,7 +3885,7 @@ async fn the_startup_pass_quarantines_grants_that_left_their_containers() {
     assert_eq!(server.call(GRANTS, &access, Some(&next)).await.0, 422);
     // Neither is the quarantined self-grant collected, nor does its bootstrap
     // replay.
-    let (status, body) = server.call(&collect, &v1, None).await;
+    let (status, body) = server.call(&collect, &access, None).await;
     assert_eq!((status, listed(body)), (200, 0));
     let (status, body) = server.root(&TENANT, &access, &bootstrap).await;
     assert_eq!(
@@ -10986,15 +10988,17 @@ fn devices_path(tenant: &[u8; 16]) -> String {
 }
 
 #[tokio::test]
-async fn a_v1_member_cannot_read_another_accounts_root_grants() {
-    let mut server = start("v1-root-reader", 28451).await;
-    let (custodian, access, _) = custodian(&mut server, 0x6c).await;
+async fn a_same_account_v1_token_does_not_bypass_device_root_grant_isolation() {
+    let mut server = start("same-account-v1-root", 28461).await;
+    let (owner_device, owner_access, _) = custodian(&mut server, 0x6c).await;
+    let peer = device(&server, OWNER, 0x7d, "pending").await;
+    let peer_session = session(&server, &peer).await;
     let path = format!(
         "/v2/tenants/{}/devices/{}/root-key-grants",
         hex(&TENANT),
-        hex(&custodian.id)
+        hex(&owner_device.id)
     );
-    let (status, body) = server.call(&path, &access, None).await;
+    let (status, body) = server.call(&path, &owner_access, None).await;
     assert_eq!(status, 200);
     assert_eq!(
         serde_json::from_slice::<Value>(&body).unwrap()["grants"]
@@ -11002,6 +11006,13 @@ async fn a_v1_member_cannot_read_another_accounts_root_grants() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        server
+            .call(&path, peer_session["access_token"].as_str().unwrap(), None)
+            .await
+            .0,
+        403
     );
     let (_, login) = server
         .post(
@@ -11011,17 +11022,26 @@ async fn a_v1_member_cannot_read_another_accounts_root_grants() {
         )
         .await;
     let v1 = login["token"].as_str().unwrap();
-    // This v1 user maps to OTHER, not the custodian's OWNER account.
-    server.sql("UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?", &[&OTHER]).await;
-    let (status, body) = server.call(&path, v1, None).await;
-    let returned = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|v| v["grants"].as_array().map(Vec::len))
-        .unwrap_or(0);
-    assert!(
-        status == 403 && returned == 0,
-        "another account's root grant was readable (HTTP {status}, {returned} grants)"
-    );
+    // Neither a v1 bearer of another account nor one of the device's own
+    // account reads the grants: neither proves the device's key.
+    for account in [OTHER, OWNER] {
+        server
+            .sql("UPDATE v2_accounts SET legacy_user_id = NULL", &[])
+            .await;
+        server.sql(
+            "UPDATE v2_accounts SET legacy_user_id = (SELECT id FROM users WHERE username = 'admin') WHERE id = ?",
+            &[&account]
+        ).await;
+        let (status, body) = server.call(&path, v1, None).await;
+        let returned = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v["grants"].as_array().map(Vec::len))
+            .unwrap_or(0);
+        assert!(
+            status == 403 && returned == 0,
+            "an account-only v1 bearer bypassed device isolation: HTTP {status}, {returned} grants"
+        );
+    }
 }
 
 #[tokio::test]
@@ -11331,8 +11351,8 @@ async fn a_device_session_reads_the_active_fleet_generation_and_its_own_root_gra
         .await;
     let (status, body) = server.call(&active, &v1, None).await;
     assert_eq!((status, generation(body)), (200, json!(0)));
-    let (status, body) = server.call(&own, &v1, None).await;
-    assert_eq!((status, listed(body)), (200, 1));
+    // A mapped v1 bearer still reads no root grant: it proves no device key.
+    assert_eq!(server.call(&own, &v1, None).await.0, 403);
 }
 
 #[tokio::test]
