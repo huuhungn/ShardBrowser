@@ -8,6 +8,10 @@ on the first, plus the blind verifier round.
   two-machine run of the gate. Status: BLOCKED until v0.2.2: v2.6.1 cannot
   create a fleet key or approve a second device, so a real server cannot get
   to the first publish (details in the file).
+- [sandbox-reachability.md](sandbox-reachability.md): spike S0, 2026-11-05.
+  Windows Sandbox reaches a team server on the host through a `portproxy` to
+  its loopback (health 200, login 201), so step M.0b uses that method, with
+  disposable credentials only.
 - [codex-revert-round-1.md](codex-revert-round-1.md): the Codex blind verifier,
   round 1, at 33e431ae. VERDICT: FAIL with four defects (D1 to D4), fixed with
   regression tests in the same change; round 2 runs on the fixed main.
