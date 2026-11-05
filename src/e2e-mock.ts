@@ -429,6 +429,8 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       teamCustodian();
       if (args.reason !== "retired" && args.reason !== "lost") teamRefuse("fleet.revokeReasonUnsupported");
       if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
+      // As the launcher: no saved Create fleet key, no revoke.
+      if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
       await teamServer("revoke", { ...me, target: args.deviceId });
       return null;
     case "team_join_code":
