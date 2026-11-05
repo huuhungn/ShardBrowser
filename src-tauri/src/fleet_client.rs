@@ -705,6 +705,22 @@ impl FleetClient {
         .await
     }
 
+    /// Revokes the device `device_id` (ADR 0002 Q-13). Returns the exact
+    /// stored response.
+    pub async fn revoke_device(
+        &self,
+        access_token: &str,
+        device_id: &str,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/devices/{device_id}/revoke"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
     /// Rotates a device session's tokens. The old refresh token is spent:
     /// never retry with it, because a reused token revokes the session.
     pub async fn refresh_device_session(&self, refresh_token: &str) -> Result<DeviceSession> {

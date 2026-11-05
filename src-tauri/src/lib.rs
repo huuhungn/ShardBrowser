@@ -2703,6 +2703,62 @@ async fn team_approve_device(
     result
 }
 
+/// Revokes the tenant's device `device_id` as `reason`, `retired` or `lost`
+/// (section 4.R). A saved revocation is resent as saved. The device is cut
+/// off from the server, but keeps the fleet key it already holds (section 7).
+#[tauri::command]
+async fn team_revoke_device(
+    username: String,
+    password: String,
+    device_id: String,
+    reason: String,
+) -> Result<(), String> {
+    let reason = fleet_custody::revoke_reason(&reason).map_err(|e| e.to_string())?;
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let device = fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &fleet_custody::CredentialFkekStore,
+    };
+    let result = async {
+        let rows = client
+            .list_tenant_devices(access, &c.tenant_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let row = rows
+            .iter()
+            .find(|r| r.device_id.eq_ignore_ascii_case(device_id.trim()))
+            .ok_or_else(|| crate::errcode::code("fleet.deviceNotListed"))?;
+        let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+        fleet_custody::revoke_member(
+            &client,
+            access,
+            &device,
+            row,
+            reason,
+            root_bootstrap::now_ms(),
+            &mut state,
+            &mut |s| fleet_custody::save(s),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+    .await;
+    client.end_session(access).await;
+    result
+}
+
 /// What a joining device shows beside its code (section 4.J step 2): the
 /// full anchor and key IDs are one click away.
 #[derive(serde::Serialize, Debug)]
@@ -6227,6 +6283,7 @@ pub fn run() {
             team_fleet_key_setup,
             team_devices,
             team_approve_device,
+            team_revoke_device,
             team_join_code,
             team_join_confirm,
             team_enroll_again,
