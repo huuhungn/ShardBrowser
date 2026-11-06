@@ -260,10 +260,14 @@ custodian's own machine after its keys were lost. The user ticks that the old
 root custodian device is lost or its keys were reset. The import refuses to
 run over another device's identity (`recovery.deviceHasIdentity`: reset a
 member first), checks the bundle against the saved tenant and against the
-server's live row of the bundle's device (`recovery.otherServer`,
-`recovery.otherAccount`, `recovery.deviceNotActive`), opens a session with the
-bundle's keys, reads the root self-grant back, writes the state files and
-`team.json` last, then collects the fleet key. A failed collect leaves the
+anchor this device already trusts for that tenant before any request
+(`recovery.otherAnchor`), then against the server's live row of the bundle's
+device (`recovery.otherServer`, `recovery.otherAccount`,
+`recovery.deviceNotActive`), opens a session with the bundle's keys, reads the
+root self-grant back, writes the state files and `team.json` last, then
+collects the fleet key. A member's `fleet-custody.json` found on the device is
+moved aside as `fleet-custody.json.replaced-<ms>` and written again for the
+root custodian; another custodian's is refused (`fleet.custodyOtherDevice`). A failed collect leaves the
 import done (`recovery.importedCollectFailed`); run Collect key custody again.
 When the session challenge answers 409 for a row the server listed as active
 with the bundle's keys, the import reports `recovery.approvalExpired`; the
@@ -298,7 +302,10 @@ the Team page: with the launcher closed, edit `server_url` in `team.json`.
 
 A corrupt `fleet-custody.json` blocks a server or tenant change and a member
 Reset: both clear the saved acknowledgements in that file, and when it does
-not parse they fail closed before `team.json` changes.
+not parse they fail closed before `team.json` changes. Reset has by then
+already removed the unopenable fleet keys from the `fleet-keys.json` index
+only. That is harmless: the file was copied aside first, the stored keys are
+kept, and a later collect writes a verified key again.
 
 The recovery passphrase is not stored anywhere: losing it and every device
 that holds the keys loses the team profiles. Backups of `team.json` preserve
