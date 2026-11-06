@@ -166,6 +166,15 @@ pub fn preserve_unreadable() -> Result<std::path::PathBuf> {
     Ok(copy)
 }
 
+/// Whether a seed that did not load is gone for good: its credential is
+/// `credential.missing`, or the file holds a DPAPI blob this account cannot
+/// open. A locked key file or a store that did not answer is not.
+pub fn seed_lost(e: &anyhow::Error) -> bool {
+    let e = e.to_string();
+    crate::errcode::has_code(&e, "credential.missing")
+        || crate::errcode::has_code(&e, "keyStore.otherWindowsAccount")
+}
+
 /// A seed from the file while it is still there, else from the credential
 /// store. The file copy is the newer one: a seed leaves it only once stored.
 /// A store error is reported as it is (a locked key file is not a corrupt
@@ -272,6 +281,12 @@ pub struct TeamStatus {
     /// Whether that file exists but was not opened in this run, so keys kept
     /// in it cannot be used until the passphrase is entered.
     pub keys_locked: bool,
+    /// Whether an enrolled seed is gone for good (`seed_lost`): this device
+    /// can only be reset, or for the root custodian, restored by import.
+    pub keys_lost: bool,
+    /// Whether the OS credential store did not answer for an enrolled seed
+    /// (`credential.unavailable`), as after an admin password reset.
+    pub key_store_unavailable: bool,
 }
 
 pub fn load() -> Result<TeamConfig> {
@@ -331,8 +346,19 @@ pub fn status() -> Result<TeamStatus> {
     } else {
         None
     };
+    let seeds = (c.signing_key(), c.hpke_seed());
+    let failed = |lost: fn(&anyhow::Error) -> bool| {
+        c.is_enrolled()
+            && [seeds.0.as_ref().err(), seeds.1.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .any(lost)
+    };
+    let keys_lost = failed(seed_lost);
+    let key_store_unavailable =
+        failed(|e| crate::errcode::has_code(&e.to_string(), "credential.unavailable"));
     // Public halves only; a seed that cannot be read (locked key file) shows none.
-    let (signing_key_id, hpke_key_id) = match (c.signing_key(), c.hpke_seed()) {
+    let (signing_key_id, hpke_key_id) = match seeds {
         (Ok(signer), Ok(seed)) if c.is_enrolled() && !c.keys_unreadable() => {
             let (_, hpke) = shardx_core::grants::derive_keypair(&seed);
             let signing = signer.verifying_key().to_bytes();
@@ -362,6 +388,8 @@ pub fn status() -> Result<TeamStatus> {
                 .is_ok_and(|s| s.fleets.values().all(|f| f.keys.is_empty())),
         has_key_file: crate::key_file::exists(),
         keys_locked: crate::key_file::exists() && !crate::key_file::is_open(),
+        keys_lost,
+        key_store_unavailable,
     })
 }
 
@@ -660,6 +688,53 @@ mod tests {
             "the interface offers enrollment"
         );
         assert_eq!(body.matches(junk).count(), 2, "the blob is kept: {body}");
+    }
+
+    /// S4 (plan v0.2.2b): a forgotten credential and a foreign DPAPI blob are
+    /// lost, a store that does not answer is unavailable, and a locked key
+    /// file or plaintext seeds are neither.
+    #[test]
+    fn status_tells_lost_keys_from_an_unavailable_store() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let flags = || {
+            let s = status().unwrap();
+            (s.keys_lost, s.key_store_unavailable)
+        };
+        let mut c = TeamConfig {
+            device_id: "4c".repeat(16),
+            ..enrolled()
+        };
+        save(&c).unwrap();
+        assert_eq!(flags(), (false, false), "plaintext seeds");
+        assert!(protect_keys(&mut c).unwrap());
+        assert_eq!(flags(), (false, false), "stored seeds");
+
+        crate::credential::fail_next_call(&c.signing_credential_ref);
+        assert_eq!(flags(), (false, true), "an unavailable store");
+        assert_eq!(flags(), (false, false), "it answers again");
+
+        crate::credential::forget(&c.hpke_credential_ref).unwrap();
+        assert_eq!(flags(), (true, false), "a forgotten credential");
+
+        crate::credential::forget(&c.signing_credential_ref).unwrap();
+        let key_file = crate::key_file::path().unwrap();
+        fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+        fs::write(&key_file, b"locked").unwrap();
+        assert_eq!(flags(), (false, false), "a locked key file");
+        fs::remove_file(&key_file).unwrap();
+
+        save(&TeamConfig {
+            signing_key_seed: "dpapi:AAAA".to_string().into(),
+            hpke_key_seed: HPKE.to_string().into(),
+            ..enrolled()
+        })
+        .unwrap();
+        assert_eq!(flags(), (true, false), "a foreign DPAPI blob");
+        store::set_config_root(None);
     }
 
     #[cfg(windows)]

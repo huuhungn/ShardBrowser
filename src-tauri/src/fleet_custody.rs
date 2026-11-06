@@ -1203,6 +1203,18 @@ pub fn status() -> Result<FleetCustodyStatus> {
     })
 }
 
+/// Drops the saved fleet grant acks (G12) when this device's identity goes:
+/// an ack names its grant, not the device, so a new identity of this device
+/// would resend the old one.
+pub fn forget_device_acks() -> Result<()> {
+    let mut state = load()?;
+    if state.device_acks.is_empty() {
+        return Ok(());
+    }
+    state.device_acks.clear();
+    save(&state)
+}
+
 /// Loads the state; none yet is the empty state.
 pub fn load() -> Result<FleetCustodyState> {
     let path = crate::store::fleet_custody_path()?;
