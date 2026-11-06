@@ -2025,10 +2025,34 @@ fn team_set_connection(
     }
 
     let server_changed = url != c.server_url || tenant_id.trim() != c.tenant_id;
+    // G13: the change would wipe the root custodian. Only one whose seeds
+    // are both lost may go, its file copied and its credentials kept: a
+    // recovery import is its way back. A root state that does not load
+    // fails closed, as Enroll again does.
+    let root_custodian = server_changed && {
+        let root = root_bootstrap::load().map_err(|e| e.to_string())?;
+        root.activated
+            && root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+            && root.device_id.eq_ignore_ascii_case(&c.device_id)
+    };
+    if root_custodian
+        && !(c.signing_key().is_err_and(|e| team_config::seed_lost(&e))
+            && c.hpke_seed().is_err_and(|e| team_config::seed_lost(&e)))
+    {
+        return Err(crate::errcode::code("fleet.rootCustodianKeepsConnection"));
+    }
+    if root_custodian {
+        let copy = team_config::preserve_unreadable().map_err(|e| e.to_string())?;
+        eprintln!(
+            "[recovery] lost root custodian leaves its server; team.json copied to {}",
+            copy.display()
+        );
+    }
     c.server_url = url;
     c.token = token.trim().to_string().into();
     c.tenant_id = tenant_id.trim().to_string();
     let stale_refs = if server_changed {
+        fleet_custody::forget_device_acks().map_err(|e| e.to_string())?;
         clear_identity(&mut c)
     } else {
         Default::default()
@@ -2037,7 +2061,10 @@ fn team_set_connection(
     team_config::save(&c).map_err(|e| e.to_string())?;
     // The identity is gone from the file; its keys go with it. Best effort:
     // a credential left behind names a device no config refers to.
-    for reference in stale_refs.iter().filter(|r| !r.is_empty()) {
+    for reference in stale_refs
+        .iter()
+        .filter(|r| !r.is_empty() && !root_custodian)
+    {
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
@@ -2047,6 +2074,7 @@ fn team_set_connection(
 /// references that held its keys.
 fn clear_identity(c: &mut team_config::TeamConfig) -> [String; 2] {
     c.device_id.clear();
+    c.fleet_id.clear();
     c.signing_key_seed.clear();
     c.hpke_key_seed.clear();
     [
@@ -2962,9 +2990,10 @@ async fn team_join_confirm(
 }
 
 /// Clears this device's identity so it can enroll again (section 4.J step
-/// 4): only while the server lists it pending, pinned here or not, or active
-/// without a pin here, as when an approval landed after its join window
-/// closed. A pin binds the server, tenant and anchor, not the device, so it
+/// 4): only while the server lists it pending or revoked, pinned here or not,
+/// or active without a pin here, as when an approval landed after its join
+/// window closed (v0.2.2b section 4.Z: revoked resets a device whose keys
+/// are lost). A pin binds the server, tenant and anchor, not the device, so it
 /// stays. An active pinned device and the root custodian keep theirs. The old
 /// row stays on the server until a custodian revokes it.
 #[tauri::command]
@@ -3004,9 +3033,26 @@ async fn team_enroll_again(
     if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
+    // `revoked` is the server's unauthenticated word, and a seed that does
+    // not read may come back: the file is copied and the keys are kept.
+    let keep =
+        status.as_deref() == Some("revoked") || c.signing_key().is_err() || c.hpke_seed().is_err();
+    if keep {
+        let copy = team_config::preserve_unreadable().map_err(|e| e.to_string())?;
+        eprintln!(
+            "[recovery] reset keeps the old credentials; team.json copied to {}",
+            copy.display()
+        );
+    }
+    // G8 and G12: the new identity collects the fleet key again and acks it
+    // with its own request.
+    let removed =
+        fleet_keys::unindex_unopenable(&sync_cmd::fleet_id(&c)).map_err(|e| e.to_string())?;
+    eprintln!("[recovery] reset: unindexed fleet key generations {removed:?}");
+    fleet_custody::forget_device_acks().map_err(|e| e.to_string())?;
     let stale_refs = clear_identity(&mut c);
     team_config::save(&c).map_err(|e| e.to_string())?;
-    for reference in stale_refs.iter().filter(|r| !r.is_empty()) {
+    for reference in stale_refs.iter().filter(|r| !r.is_empty() && !keep) {
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
@@ -3056,10 +3102,10 @@ fn imported_collect(
 }
 
 /// Whether a device the server lists as `status` may enroll again: while
-/// pending, or active without a pin here.
+/// pending or revoked, or active without a pin here.
 fn enroll_again_allowed(status: Option<&str>, pinned: bool) -> bool {
     match status {
-        Some("pending") => true,
+        Some("pending" | "revoked") => true,
         Some("active") => !pinned,
         _ => false,
     }
@@ -6215,7 +6261,7 @@ mod custody_tests {
     }
 
     /// An expired code reads as expired only where Enroll again is allowed:
-    /// an active pinned device is pointed at its key, and a revoked or
+    /// an active pinned device is pointed at its key, and a quarantined or
     /// unlisted one is told it cannot enroll again. Unasked, it is expired.
     #[test]
     fn an_expired_code_says_whether_enroll_again_is_allowed() {
@@ -6225,8 +6271,9 @@ mod custody_tests {
             ("active", false, true, expired),
             ("pending", true, true, expired),
             ("pending", false, true, expired),
-            ("revoked", true, false, "fleet.enrollAgainRefused"),
-            ("revoked", false, false, "fleet.enrollAgainRefused"),
+            ("revoked", true, true, expired),
+            ("revoked", false, true, expired),
+            ("quarantined", false, false, "fleet.enrollAgainRefused"),
             ("missing", true, false, "fleet.enrollAgainRefused"),
             ("missing", false, false, "fleet.enrollAgainRefused"),
         ] {
@@ -6311,8 +6358,8 @@ mod custody_tests {
             assert_eq!(format!("{:?}", team_config::load().unwrap()), before);
         }
 
-        // A device the server no longer lists as waiting or approved.
-        for status in ["revoked", "retired"] {
+        // A device the server no longer lists as waiting, approved or revoked.
+        for status in ["quarantined", "retired"] {
             let (url, _) = me_server(&rt, status);
             let _j = joiner(&url, root_bootstrap::now_ms());
             let err = rt
@@ -6340,6 +6387,206 @@ mod custody_tests {
             join_pin(),
             Some((BINDING_J, [0x0a; 32], "JOIN".to_string()))
         );
+    }
+
+    /// How many `team.json.unreadable-*` copies the config root holds.
+    fn team_json_copies() -> usize {
+        let dir = store::team_config_path().unwrap();
+        std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .filter(|e| {
+                let name = e.as_ref().unwrap().file_name();
+                name.to_string_lossy().starts_with("team.json.unreadable-")
+            })
+            .count()
+    }
+
+    /// A saved fleet grant ack, as an earlier collect of this device left it.
+    fn saved_ack() {
+        fleet_custody::save(&fleet_custody::FleetCustodyState {
+            device_acks: [("f.0".to_string(), "00".to_string())].into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// S4, C12 (plan v0.2.2b): a revoked device whose seeds still read
+    /// enrolls again with its file copied aside and both old credentials
+    /// kept; its fleet ID and saved fleet grant acks go.
+    #[test]
+    fn a_revoked_device_enrolls_again_and_keeps_its_old_credentials() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "revoked");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        pin_here();
+        let mut c = team_config::load().unwrap();
+        c.fleet_id = hex(&TENANT);
+        team_config::save(&c).unwrap();
+        saved_ack();
+        let refs = refs();
+        assert_eq!(team_json_copies(), 0);
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        let c = team_config::load().unwrap();
+        assert!(c.device_id.is_empty() && c.fleet_id.is_empty() && !c.is_enrolled());
+        assert_eq!(team_json_copies(), 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+        assert!(fleet_custody::load().unwrap().device_acks.is_empty());
+    }
+
+    /// Makes the joiner the activated root custodian of its tenant.
+    fn root_here() {
+        root_bootstrap::save(&root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&JOINER),
+            server_instance_id: hex(&INSTANCE),
+            anchor: hex(&[0x0a; 32]),
+            activated: true,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    const URL_J: &str = "http://team.example";
+
+    /// A server change and a tenant change of the joiner.
+    fn connection_changes() -> [(String, String); 2] {
+        [
+            ("http://other.example".into(), hex(&TENANT)),
+            (URL_J.into(), hex(&[0x0e; 16])),
+        ]
+    }
+
+    fn team_json() -> Vec<u8> {
+        std::fs::read(store::team_config_path().unwrap()).unwrap()
+    }
+
+    fn load_err(reference: &str) -> String {
+        credential::load(reference).unwrap_err().to_string()
+    }
+
+    /// S4, G13: a root state that does not load fails the change closed, as
+    /// Enroll again does: nothing is copied, saved or forgotten.
+    #[test]
+    fn a_server_change_with_a_corrupt_root_state_is_refused() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            std::fs::write(store::custody_bootstrap_path().unwrap(), b"{corrupt").unwrap();
+            let refs = refs();
+            let before = team_json();
+            assert!(team_set_connection(url, String::new(), tenant).is_err());
+            assert_eq!(team_json(), before);
+            assert_eq!(team_json_copies(), 0);
+            assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+            assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+        }
+    }
+
+    /// S4, G13 (plan v0.2.2b): a server or tenant change is refused for the
+    /// root custodian whose seeds read, do not answer or are locked, with
+    /// `team.json` and its credentials unchanged.
+    #[test]
+    fn a_root_custodian_whose_keys_are_not_lost_keeps_its_connection() {
+        for case in ["readable", "unavailable", "locked"] {
+            for (url, tenant) in connection_changes() {
+                let _j = joiner(URL_J, root_bootstrap::now_ms());
+                root_here();
+                let refs = refs();
+                if case != "readable" {
+                    for r in &refs {
+                        credential::forget(r).unwrap();
+                    }
+                }
+                if case == "unavailable" {
+                    // One seed unavailable and one missing: only both lost
+                    // lets the change through, so the guard refuses. Only
+                    // its own read may take this failure: had anything read
+                    // it first, both seeds would be lost.
+                    credential::fail_next_call(&refs[0]);
+                }
+                if case == "locked" {
+                    let key_file = key_file::path().unwrap();
+                    std::fs::create_dir_all(key_file.parent().unwrap()).unwrap();
+                    std::fs::write(&key_file, b"locked").unwrap();
+                }
+                let before = team_json();
+                let err = team_set_connection(url, String::new(), tenant).unwrap_err();
+                assert!(
+                    err.contains("fleet.rootCustodianKeepsConnection"),
+                    "{case}: {err}"
+                );
+                assert_eq!(team_json(), before, "{case}");
+                assert_eq!(team_json_copies(), 0, "{case}");
+                match case {
+                    "readable" => {
+                        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+                        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+                    }
+                    "unavailable" => {
+                        for r in &refs {
+                            assert!(load_err(r).contains("credential.missing"), "{r}");
+                        }
+                    }
+                    _ => {
+                        for r in &refs {
+                            assert!(load_err(r).contains("credential.locked"), "{r}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// S4, G13: with both seeds lost, as missing credentials or as DPAPI
+    /// blobs this account cannot open, the root custodian's change goes
+    /// through with `team.json` copied and no credential forgotten. A member
+    /// changes as before, its credentials forgotten. Either way the saved
+    /// fleet grant acks go (G12).
+    #[test]
+    fn a_root_custodian_with_lost_keys_or_a_member_may_change_its_connection() {
+        for case in ["missing", "foreign", "member"] {
+            for (url, tenant) in connection_changes() {
+                let _j = joiner(URL_J, root_bootstrap::now_ms());
+                if case != "member" {
+                    root_here();
+                }
+                saved_ack();
+                let refs = refs();
+                if case == "missing" {
+                    for r in &refs {
+                        credential::forget(r).unwrap();
+                    }
+                }
+                if case == "foreign" {
+                    // The file's blobs win over the stored seeds, which a
+                    // forget would delete.
+                    let mut c = team_config::load().unwrap();
+                    c.signing_key_seed = "dpapi:AAAA".to_string().into();
+                    c.hpke_key_seed = "dpapi:AAAA".to_string().into();
+                    team_config::save(&c).unwrap();
+                }
+                team_set_connection(url.clone(), String::new(), tenant.clone()).unwrap();
+                let c = team_config::load().unwrap();
+                assert!(c.device_id.is_empty() && !c.is_enrolled(), "{case}");
+                assert_eq!((c.server_url, c.tenant_id), (url, tenant));
+                assert!(fleet_custody::load().unwrap().device_acks.is_empty());
+                match case {
+                    "missing" => assert_eq!(team_json_copies(), 1),
+                    "foreign" => {
+                        assert_eq!(team_json_copies(), 1);
+                        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+                        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+                    }
+                    _ => {
+                        assert_eq!(team_json_copies(), 0);
+                        for r in &refs {
+                            assert!(load_err(r).contains("credential.missing"), "{r}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

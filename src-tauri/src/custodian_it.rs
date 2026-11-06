@@ -1651,6 +1651,166 @@ fn an_interrupted_import_resumes() {
     assert_eq!(replaced, 0, "no custody state was replaced");
 }
 
+/// The names of the files in `dir`.
+fn file_names(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// S4 (plan v0.2.2b): after the S3 journey B's device keys are gone, and
+/// its fleet key is gone too or, with `unavailable`, its store does not
+/// answer. Enroll again waits for A to revoke B, then resets B on the same
+/// roots; B enrolls, A approves it, and B collects generation 0 with its own
+/// ack (G8, G12).
+fn a_reset_member_rejoins(slot: u16, slug: &str, unavailable: bool) {
+    let rt = runtime();
+    let Journey { b, h, b_id, .. } = shared_profile(slot, slug, &rt);
+    let fleet_ref = format!("fleet-key.{}.0", h.tenant);
+    b.act_as_b();
+    let old = crate::team_config::load().unwrap();
+    for reference in [&old.signing_credential_ref, &old.hpke_credential_ref] {
+        crate::credential::forget(reference).unwrap();
+    }
+    if !unavailable {
+        crate::credential::forget(&fleet_ref).unwrap();
+    }
+    let enroll_again = || call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into()));
+    let refused = enroll_again().unwrap_err();
+    assert!(
+        crate::errcode::has_code(&refused, "fleet.enrollAgainRefused"),
+        "B is active and pinned: {refused}"
+    );
+
+    h.act_as_a();
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id.clone(), "lost".into()),
+    )
+    .unwrap();
+
+    // Reset: copies kept, generation 0 out of the index, nothing deleted.
+    b.act_as_b();
+    let indexed = || {
+        let keys = crate::fleet_keys::load().unwrap();
+        keys.fleets.get(&h.tenant).is_some_and(|f| {
+            f.keys.contains_key(&0) || f.credential_refs.contains_key(&0) || f.verified.contains(&0)
+        })
+    };
+    assert!(indexed(), "B's index holds generation 0 before Reset");
+    if unavailable {
+        crate::credential::fail_next_call(&fleet_ref);
+    }
+    enroll_again().unwrap();
+    let names = file_names(b.config.path());
+    for copy in ["team.json.unreadable-", "fleet-keys.json.unopenable-"] {
+        assert!(
+            names.iter().any(|n| n.starts_with(copy)),
+            "{copy}: {names:?}"
+        );
+    }
+    assert!(!indexed(), "generation 0 is out of the index");
+    if unavailable {
+        assert!(
+            crate::credential::load(&fleet_ref).is_ok(),
+            "Reset read the store and consumed the injected failure (C10); the stored key is kept"
+        );
+    }
+    let c = crate::team_config::load().unwrap();
+    assert!(c.device_id.is_empty() && c.fleet_id.is_empty());
+
+    // B enrolls again on the same roots, and A approves it.
+    let new_id = call(
+        &rt,
+        crate::team_enroll_device("member".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    assert_ne!(new_id, b_id);
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    h.act_as_a();
+    call(
+        &rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            new_id.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+
+    // B collects generation 0 and files its own ack.
+    b.act_as_b();
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    let collected = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(collected["fleet_opened"], 1, "{collected}");
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{new_id}' AND acked_at IS NOT NULL"
+        )),
+        1
+    );
+    assert!(crate::team_config::status().unwrap().has_fleet_key);
+}
+
+#[test]
+fn a_member_with_lost_keys_is_reset_after_revocation_and_rejoins_against_a_real_server() {
+    a_reset_member_rejoins(10, "rs4-lost", false);
+}
+
+/// C10, the admin password reset case: the fleet key's store answers
+/// `credential.unavailable` rather than `credential.missing`.
+#[test]
+fn a_member_whose_fleet_key_store_is_unavailable_rejoins_against_a_real_server() {
+    a_reset_member_rejoins(11, "rs4-unavailable", true);
+}
+
+/// S4: the root custodian whose keys are lost is refused Enroll again, and
+/// imports its own recovery bundle on the same roots.
+#[test]
+fn a_root_custodian_with_lost_keys_imports_its_bundle_on_its_own_roots() {
+    let rt = runtime();
+    let h = custodian(12, "rs4-root", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let bundle = config_path("recovery.shardx-recovery");
+    let a = crate::team_config::load().unwrap();
+    for reference in [
+        a.signing_credential_ref.clone(),
+        a.hpke_credential_ref.clone(),
+        format!("fleet-key.{}.0", h.tenant),
+    ] {
+        crate::credential::forget(&reference).unwrap();
+    }
+    let status = serde_json::to_value(crate::team_config::status().unwrap()).unwrap();
+    assert_eq!(status["keys_lost"], true, "{status}");
+
+    let refused = call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into())).unwrap_err();
+    assert!(
+        crate::errcode::has_code(&refused, "fleet.enrollAgainRefused"),
+        "{refused}"
+    );
+
+    let report = import(&rt, &bundle).unwrap();
+    assert_eq!(report["fleet_opened"], 1, "{report}");
+    assert_eq!(crate::team_config::load().unwrap().device_id, a.device_id);
+    assert!(crate::team_config::status().unwrap().has_fleet_key);
+}
+
 /// The first `v2a.`, `v2t.` or `v2r.` token followed by 16 or more hex
 /// digits in `text`.
 fn session_token(text: &str) -> Option<&str> {
