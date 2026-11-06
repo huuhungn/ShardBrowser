@@ -210,14 +210,30 @@ fn a_symlinked_record_is_refused() {
     let linked = std::os::unix::fs::symlink(&target, &record);
     #[cfg(windows)]
     let linked = std::os::windows::fs::symlink_file(&target, &record);
-    if let Err(e) = linked {
-        // Windows needs Developer Mode or a privilege to create symlinks.
+    // Windows needs Developer Mode or a privilege to create symlinks; a
+    // directory junction needs none and is refused the same way.
+    #[cfg(windows)]
+    let junction = linked.is_err() && {
+        let dir = d.data.join("junction-target");
+        std::fs::create_dir(&dir).unwrap();
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&record)
+            .arg(&dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    #[cfg(not(windows))]
+    let junction = false;
+    if let (Err(e), false) = (&linked, junction) {
         // Under CI a skip would hide a check that must run.
         assert!(
             std::env::var_os("CI").is_none(),
-            "CI is set and a symlink cannot be created here: {e}"
+            "CI is set and no link can be created here: {e}"
         );
-        eprintln!("skipping: cannot create a symlink here: {e}");
+        eprintln!("skipping: cannot create a link here: {e}");
         return;
     }
     let out = cli(&d, &["identity", "show"]);
@@ -229,7 +245,11 @@ fn a_symlinked_record_is_refused() {
     );
 
     // The same bytes as a regular file verify.
-    std::fs::remove_file(&record).unwrap();
+    if junction {
+        std::fs::remove_dir(&record).unwrap();
+    } else {
+        std::fs::remove_file(&record).unwrap();
+    }
     std::fs::rename(&target, &record).unwrap();
     assert_eq!(field(&cli(&d, &["identity", "show"]), "status"), "OK");
 }

@@ -342,7 +342,7 @@ fn open_pulled(
 /// that cannot be read leaves only the passphrase.
 pub(crate) fn pull_candidates(c: &team_config::TeamConfig, now: u64) -> Vec<([u8; 32], u64)> {
     fleet_keys::load()
-        .map(|s| s.keys_newest_first(&c.fleet_id, |g, k| crate::fleet_key_usable(c, g, k, now)))
+        .map(|s| s.keys_newest_first(&fleet_id(c), |g, k| crate::fleet_key_usable(c, g, k, now)))
         .unwrap_or_default()
 }
 
