@@ -855,6 +855,13 @@ async fn the_first_device_bootstraps_root_custody_and_resumes_from_its_saved_req
     let (_, plaintext) =
         shardx_core::recovery_bundle::open(&file, passphrase).expect("the bundle opens");
     assert_eq!(*plaintext.trk, trk);
+    // v3: it carries the bootstrapped device as the root custodian.
+    let custodian = plaintext
+        .root_custodian
+        .as_ref()
+        .expect("the bundle carries the root custodian");
+    assert_eq!(custodian.device_id, hex_to_16(&enrolled.device_id));
+    assert_eq!(custodian.account_id, hex_to_16(&enrolled.account_id));
     let pinned: String = shardx_core::recovery_bundle::recovery_bundle_sha256(&file)
         .iter()
         .map(|b| format!("{b:02x}"))
