@@ -1405,6 +1405,7 @@
   "team.recovery.exportNeedsFleetKey": "Hãy tạo khoá đội máy ở trên trước khi xuất gói khôi phục.",
   "team.recovery.keysLost": "Khoá của thiết bị này đã mất. Hãy nhờ một thiết bị giữ khoá thu hồi thiết bị này, rồi đặt lại nó.",
   "team.recovery.keyStoreUnavailable": "Kho khoá không phản hồi; hãy thử lại trước khi đặt lại thiết bị này.",
+  "team.recovery.rootKeyStoreUnavailable": "Kho khoá không phản hồi; hãy thử lại. Thiết bị này là thiết bị giữ khoá gốc nên không thể đặt lại.",
   "team.recovery.rootKeysLost": "Khoá của thiết bị này đã mất, và đây là thiết bị giữ khoá gốc của nhóm: hãy nhập gói khôi phục của bạn để khôi phục nó.",
   "team.recovery.reset": "Đặt lại thiết bị này",
   "team.resumeCustodySetup": "Tiếp tục thiết lập quyền giữ khóa",

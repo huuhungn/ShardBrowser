@@ -1405,6 +1405,7 @@
   "team.recovery.exportNeedsFleetKey": "Create the fleet key above before exporting the recovery bundle.",
   "team.recovery.keysLost": "This device's keys are lost. Ask a custodian to revoke this device, then reset it.",
   "team.recovery.keyStoreUnavailable": "The key store did not answer; try again before resetting this device.",
+  "team.recovery.rootKeyStoreUnavailable": "The key store did not answer; try again. This device is the root custodian and cannot be reset.",
   "team.recovery.rootKeysLost": "This device's keys are lost, and it is the team's root custodian: import your recovery bundle to restore it.",
   "team.recovery.reset": "Reset this device",
   "team.resumeCustodySetup": "Resume custody setup",

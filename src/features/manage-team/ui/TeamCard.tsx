@@ -8,7 +8,7 @@ import {
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
   teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle,
-  type TeamStatus, type CustodyBootstrapStatus,
+  type TeamStatus, type CustodyBootstrapStatus, type CustodyResult,
 } from "../../../entities/team";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { TeamDevices, type TeamAccount } from "./TeamDevices";
@@ -198,10 +198,11 @@ export function TeamCard() {
     const typed = password;
     setPassword("");
     try {
-      await teamImportRecoveryBundle(path, passphrase, username.trim(), typed, oldDeviceLost);
+      const r = await teamImportRecoveryBundle(path, passphrase, username.trim(), typed, oldDeviceLost);
       setPassphrase("");
       setOldDeviceLost(false);
       toast.ok(t("team.recovery.imported"));
+      report(r);
     } finally {
       // A failed collect after the import still leaves this device the root custodian.
       refresh();
@@ -217,10 +218,8 @@ export function TeamCard() {
     toast.ok(t("team.joinCode.enrollAgainDone"));
   });
 
-  const collect = () => run("collect", async () => {
-    const typed = password;
-    setPassword("");
-    const r = await teamCollectCustody(username, typed);
+  /** Toasts what a collect report says: grants opened, the fleet key kept, waiting or refused. */
+  const report = (r: CustodyResult) => {
     if (r.fleet_opened > 0) {
       toast.ok(t("team.fleetKeyCollected", { n: r.newest_fleet_generation ?? 0 }));
     }
@@ -248,6 +247,12 @@ export function TeamCard() {
     }
     // A kept fleet key turns has_fleet_key on, which ends the join steps.
     if (r.fleet_opened > 0) teamStatus().then(setSt).catch(() => {});
+  };
+
+  const collect = () => run("collect", async () => {
+    const typed = password;
+    setPassword("");
+    report(await teamCollectCustody(username, typed));
   });
 
   // A device session needs no token: the token only serves legacy passphrase sync.
@@ -524,25 +529,30 @@ export function TeamCard() {
               {lost ? (
                 <div className="flex flex-col gap-2" data-testid="team-keys-lost">
                   <p className="m-0 text-paragraph-xs text-state-error-base">
-                    {t(st.key_store_unavailable
-                      ? "team.recovery.keyStoreUnavailable"
-                      : boot?.activated ? "team.recovery.rootKeysLost" : "team.recovery.keysLost")}
+                    {t(boot?.activated
+                      ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
+                      : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
                   </p>
-                  <Input
-                    label={t("team.accountUsername")}
-                    inputSize="small"
-                    autoComplete="username"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                  />
-                  <Input
-                    label={t("team.accountPassword")}
-                    inputSize="small"
-                    type="password"
-                    autoComplete="current-password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
+                  {/* A root custodian whose store only did not answer has nothing to sign in for. */}
+                  {(!boot?.activated || st.keys_lost) && (
+                    <>
+                      <Input
+                        label={t("team.accountUsername")}
+                        inputSize="small"
+                        autoComplete="username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.accountPassword")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                      />
+                    </>
+                  )}
                   {/* The root custodian is never reset: its way back is its recovery bundle. */}
                   {boot?.activated ? st.keys_lost && importForm : (
                     <div>

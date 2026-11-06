@@ -281,12 +281,14 @@ let keyState = scenario === "team-first-device-resume"
 // "team-device-a" and "team-device-b": two devices of one fleet (see below).
 // "team-keys-lost" and "team-key-store-unavailable" are B enrolled and joined
 // as "b0"x16, whose seeds are lost or whose key store does not answer;
-// "team-root-keys-lost" is A, the root custodian, with its seeds lost.
+// "team-root-keys-lost" and "team-root-key-store-unavailable" are A, the root
+// custodian, with its seeds lost or its key store not answering.
 const TEAM_SEEDS: Record<string, "lost" | "unavailable"> = {
   "team-keys-lost": "lost", "team-key-store-unavailable": "unavailable", "team-root-keys-lost": "lost",
+  "team-root-key-store-unavailable": "unavailable",
 };
 let teamSeeds: "lost" | "unavailable" | null = TEAM_SEEDS[scenario] ?? null;
-const teamDevice = scenario === "team-device-a" || scenario === "team-root-keys-lost" ? "a"
+const teamDevice = scenario === "team-device-a" || scenario.startsWith("team-root-") ? "a"
   : scenario === "team-device-b" || teamSeeds ? "b" : null;
 // The connection `team_set_connection` saved. A device session needs no token.
 let teamConnection = teamDevice
