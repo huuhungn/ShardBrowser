@@ -863,6 +863,18 @@ mod tests {
                 },
             ),
             ("not a record", custodian(vec![1, 2, 3])),
+            // Each of these parses, verifies and opens: only its own check
+            // refuses it.
+            (
+                "a root grant that is not the first self-grant",
+                custodian(self_grant(&TRK, |g| {
+                    g.variant = RootGrantVariant::ExistingRootGrant
+                })),
+            ),
+            (
+                "a self-grant for another server instance",
+                custodian(self_grant(&TRK, |g| g.common.server_instance_id = [8; 16])),
+            ),
         ];
         for (what, c) in cases {
             let file = seal_with(&h, &plaintext_v3(vec![], c), PASS).unwrap();
@@ -1232,34 +1244,36 @@ mod tests {
             RecoveryBundleError::Format(RecordError::BadValue("retained_fkeks"))
         );
 
-        // A first self-grant past its bound: refused when sealing, and when
-        // an honestly sealed file carries one.
-        let oversized = vec![0; *FIRST_SELF_GRANT_BYTES.end() + 1];
-        let pt = plaintext_v3(vec![], custodian(oversized.clone()));
-        assert_eq!(
-            seal_with(&header(), &pt, PASS).unwrap_err(),
-            RecoveryBundleError::Format(RecordError::BadValue("first_self_grant"))
-        );
-        let raw = plaintext_v3(vec![], custodian(vec![1])).encode().unwrap();
-        let Value::Map(mut entries) = c::decode(&raw).unwrap() else {
-            panic!("a map")
-        };
-        let Some((_, Value::Map(block))) = entries.iter_mut().find(|(k, _)| k == "root_custodian")
-        else {
-            panic!("root_custodian")
-        };
-        block
-            .iter_mut()
-            .find(|(k, _)| k == "first_self_grant")
-            .unwrap()
-            .1 = c::b(&oversized);
-        let file = seal_exact(&header(), &c::encode(&Value::Map(entries)), PASS).unwrap();
-        assert!(matches!(
-            open(&file, PASS).unwrap_err(),
-            RecoveryBundleError::Format(RecordError::BadField {
-                field: "first_self_grant",
-                ..
-            })
-        ));
+        // A first self-grant outside its bound, empty or oversized: refused
+        // when sealing, and when an honestly sealed file carries one.
+        for bad in [vec![], vec![0; *FIRST_SELF_GRANT_BYTES.end() + 1]] {
+            let pt = plaintext_v3(vec![], custodian(bad.clone()));
+            assert_eq!(
+                seal_with(&header(), &pt, PASS).unwrap_err(),
+                RecoveryBundleError::Format(RecordError::BadValue("first_self_grant"))
+            );
+            let raw = plaintext_v3(vec![], custodian(vec![1])).encode().unwrap();
+            let Value::Map(mut entries) = c::decode(&raw).unwrap() else {
+                panic!("a map")
+            };
+            let Some((_, Value::Map(block))) =
+                entries.iter_mut().find(|(k, _)| k == "root_custodian")
+            else {
+                panic!("root_custodian")
+            };
+            block
+                .iter_mut()
+                .find(|(k, _)| k == "first_self_grant")
+                .unwrap()
+                .1 = c::b(&bad);
+            let file = seal_exact(&header(), &c::encode(&Value::Map(entries)), PASS).unwrap();
+            assert!(matches!(
+                open(&file, PASS).unwrap_err(),
+                RecoveryBundleError::Format(RecordError::BadField {
+                    field: "first_self_grant",
+                    ..
+                })
+            ));
+        }
     }
 }

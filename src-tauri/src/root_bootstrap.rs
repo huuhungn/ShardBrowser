@@ -415,20 +415,24 @@ fn check_bundle(
 }
 
 /// Step 3 reuses a saved bundle the server has not yet seen only while it
-/// passes [`check_bundle`] and carries this device as the root custodian; a
-/// v2 one cannot restore the team, so it is exported again.
+/// passes [`check_bundle`] and carries this device, with the saved self-grant,
+/// as the root custodian; a v2 one cannot restore the team, so it is exported
+/// again.
 fn reusable_bundle(
     recovery: &RecoveryExport<'_>,
     state: &BootstrapState,
     trk: &[u8; 32],
     device: &[u8; 16],
+    self_grant: &[u8],
 ) -> Result<bool> {
     if state.recovery_bundle_sha256.is_empty() {
         return Ok(false);
     }
     Ok(
-        check_bundle(recovery, &unhex(&state.recovery_bundle_sha256)?, trk)
-            .is_ok_and(|pt| pt.root_custodian.is_some_and(|c| c.device_id == *device)),
+        check_bundle(recovery, &unhex(&state.recovery_bundle_sha256)?, trk).is_ok_and(|pt| {
+            pt.root_custodian
+                .is_some_and(|c| c.device_id == *device && c.first_self_grant == self_grant)
+        }),
     )
 }
 
@@ -767,7 +771,7 @@ impl Run<'_> {
         // seen is reused while it is still there, opens and names this device
         // as root custodian, else replaced.
         if state.create_request.is_empty() {
-            if !reusable_bundle(self.recovery, state, &trk, &cx.device)? {
+            if !reusable_bundle(self.recovery, state, &trk, &cx.device, &container)? {
                 let sha = hex(&export_recovery_bundle(
                     cx,
                     &trk,
@@ -1416,18 +1420,24 @@ mod tests {
             &trk
         )
         .is_ok());
-        assert!(!reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
+        assert!(!reusable_bundle(&export, &state, &trk, &cx.device, &grant).unwrap());
 
         state.recovery_bundle_sha256 = hex(&export_v3(&cx, &trk, &grant, &export));
-        assert!(reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
-        assert!(!reusable_bundle(&export, &state, &trk, &[0x0e; 16]).unwrap());
+        assert!(reusable_bundle(&export, &state, &trk, &cx.device, &grant).unwrap());
+        assert!(!reusable_bundle(&export, &state, &trk, &[0x0e; 16], &grant).unwrap());
+        // Another self-grant of this device (a fresh replay ID) is not the
+        // saved one: exported again.
+        let (_, newer) = custodian_cx([5; 16], &trk);
+        assert_ne!(newer, grant);
+        assert!(!reusable_bundle(&export, &state, &trk, &cx.device, &newer).unwrap());
 
         // A v3 bundle of another device is exported again too.
         let (other, other_grant) = custodian_cx([0x0e; 16], &trk);
         state.recovery_bundle_sha256 = hex(&export_v3(&other, &trk, &other_grant, &export));
-        assert!(!reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
+        assert!(!reusable_bundle(&export, &state, &trk, &cx.device, &grant).unwrap());
         // Nothing saved yet: nothing to reuse.
-        assert!(!reusable_bundle(&export, &BootstrapState::default(), &trk, &cx.device).unwrap());
+        let empty = BootstrapState::default();
+        assert!(!reusable_bundle(&export, &empty, &trk, &cx.device, &grant).unwrap());
     }
 
     /// Resume after the create request: activation checks the bundle the
