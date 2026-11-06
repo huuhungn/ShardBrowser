@@ -2027,8 +2027,14 @@ fn team_set_connection(
     let server_changed = url != c.server_url || tenant_id.trim() != c.tenant_id;
     // G13: the change would wipe the root custodian. Only one whose seeds
     // are both lost may go, its file copied and its credentials kept: a
-    // recovery import is its way back.
-    let root_custodian = server_changed && bootstrap_anchor(&c).is_some();
+    // recovery import is its way back. A root state that does not load
+    // fails closed, as Enroll again does.
+    let root_custodian = server_changed && {
+        let root = root_bootstrap::load().map_err(|e| e.to_string())?;
+        root.activated
+            && root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+            && root.device_id.eq_ignore_ascii_case(&c.device_id)
+    };
     if root_custodian
         && !(c.signing_key().is_err_and(|e| team_config::seed_lost(&e))
             && c.hpke_seed().is_err_and(|e| team_config::seed_lost(&e)))
@@ -6460,6 +6466,23 @@ mod custody_tests {
         credential::load(reference).unwrap_err().to_string()
     }
 
+    /// S4, G13: a root state that does not load fails the change closed, as
+    /// Enroll again does: nothing is copied, saved or forgotten.
+    #[test]
+    fn a_server_change_with_a_corrupt_root_state_is_refused() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            std::fs::write(store::custody_bootstrap_path().unwrap(), b"{corrupt").unwrap();
+            let refs = refs();
+            let before = team_json();
+            assert!(team_set_connection(url, String::new(), tenant).is_err());
+            assert_eq!(team_json(), before);
+            assert_eq!(team_json_copies(), 0);
+            assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+            assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+        }
+    }
+
     /// S4, G13 (plan v0.2.2b): a server or tenant change is refused for the
     /// root custodian whose seeds read, do not answer or are locked, with
     /// `team.json` and its credentials unchanged.
@@ -6476,8 +6499,10 @@ mod custody_tests {
                     }
                 }
                 if case == "unavailable" {
-                    // Only the guard's own read may take this failure: had
-                    // anything read it first, both seeds would be lost.
+                    // One seed unavailable and one missing: only both lost
+                    // lets the change through, so the guard refuses. Only
+                    // its own read may take this failure: had anything read
+                    // it first, both seeds would be lost.
                     credential::fail_next_call(&refs[0]);
                 }
                 if case == "locked" {

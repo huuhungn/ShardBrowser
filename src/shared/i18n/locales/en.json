@@ -337,7 +337,7 @@
   "fleet.deviceNotPending": "That device is not waiting for approval",
   "fleet.createFleetKeyFirst": "This computer holds no verified fleet key to share: create or collect the fleet key first",
   "fleet.enrollAgainRefused": "This device cannot enroll again: it is the root custodian, has joined the team, or the team server no longer lists it as waiting or approved",
-  "fleet.rootCustodianKeepsConnection": "This device is the team's root custodian and its keys are not lost, so changing its server or tenant would wipe it; nothing was changed",
+  "fleet.rootCustodianKeepsConnection": "This device is the team's root custodian, so its server and tenant stay as they are unless both of its device keys are lost; nothing was changed",
   "fleet.joinedCollectKey": "This device was approved and already confirmed its code, so it cannot enroll again: run Collect key custody to collect its fleet key",
   "fleet.revokeReasonUnsupported": "A device can be revoked only as retired or lost",
   "fleet.cannotRevokeSelf": "This computer cannot revoke itself",

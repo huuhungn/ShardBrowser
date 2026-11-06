@@ -1692,6 +1692,13 @@ fn a_reset_member_rejoins(slot: u16, slug: &str, unavailable: bool) {
 
     // Reset: copies kept, generation 0 out of the index, nothing deleted.
     b.act_as_b();
+    let indexed = || {
+        let keys = crate::fleet_keys::load().unwrap();
+        keys.fleets.get(&h.tenant).is_some_and(|f| {
+            f.keys.contains_key(&0) || f.credential_refs.contains_key(&0) || f.verified.contains(&0)
+        })
+    };
+    assert!(indexed(), "B's index holds generation 0 before Reset");
     if unavailable {
         crate::credential::fail_next_call(&fleet_ref);
     }
@@ -1703,15 +1710,11 @@ fn a_reset_member_rejoins(slot: u16, slug: &str, unavailable: bool) {
             "{copy}: {names:?}"
         );
     }
-    let keys = crate::fleet_keys::load().unwrap();
-    let indexed = keys.fleets.get(&h.tenant).is_some_and(|f| {
-        f.keys.contains_key(&0) || f.credential_refs.contains_key(&0) || f.verified.contains(&0)
-    });
-    assert!(!indexed, "generation 0 is out of the index");
+    assert!(!indexed(), "generation 0 is out of the index");
     if unavailable {
         assert!(
             crate::credential::load(&fleet_ref).is_ok(),
-            "the stored fleet key is kept"
+            "Reset read the store and consumed the injected failure (C10); the stored key is kept"
         );
     }
     let c = crate::team_config::load().unwrap();

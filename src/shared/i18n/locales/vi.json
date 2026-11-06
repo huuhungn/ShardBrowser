@@ -337,7 +337,7 @@
   "fleet.deviceNotPending": "Thiết bị đó không ở trạng thái chờ duyệt",
   "fleet.createFleetKeyFirst": "Máy này chưa giữ khóa nhóm đã xác minh để chia sẻ: hãy tạo hoặc nhận khóa nhóm trước",
   "fleet.enrollAgainRefused": "Thiết bị này không thể đăng ký lại: đây là thiết bị giữ khóa gốc, đã tham gia nhóm, hoặc máy chủ nhóm không còn liệt kê nó là đang chờ hay đã được duyệt",
-  "fleet.rootCustodianKeepsConnection": "Thiết bị này là thiết bị giữ khoá gốc của nhóm và khoá của nó chưa bị mất, nên đổi máy chủ hoặc tenant sẽ xoá nó; không có gì bị thay đổi",
+  "fleet.rootCustodianKeepsConnection": "Thiết bị này là thiết bị giữ khoá gốc của nhóm, nên máy chủ và tenant được giữ nguyên trừ khi cả hai khoá thiết bị của nó đều đã mất; không có gì bị thay đổi",
   "fleet.joinedCollectKey": "Thiết bị này đã được duyệt và đã xác nhận mã nên không thể ghi danh lại: hãy chạy Nhận quyền giữ khoá để nhận khoá đội máy",
   "fleet.revokeReasonUnsupported": "Chỉ có thể thu hồi thiết bị với lý do đã ngừng dùng hoặc bị mất",
   "fleet.cannotRevokeSelf": "Máy này không thể tự thu hồi chính nó",
