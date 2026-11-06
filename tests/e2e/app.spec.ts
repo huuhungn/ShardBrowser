@@ -665,6 +665,10 @@ async function admitB(a: Page, b: Page) {
     expect(ids).toHaveLength(3);
     for (const id of ids) expect(id).toMatch(/^[0-9a-f]{64}$/);
     await expect(rowB.getByTestId("team-device-key-ids").locator("dd")).toHaveText(ids);
+    // B's own Team page shows the same two key IDs the custodian compares.
+    const own = b.getByTestId("team-own-key-ids").locator("input");
+    await expect(own.nth(0)).toHaveValue(ids[0]);
+    await expect(own.nth(1)).toHaveValue(ids[1]);
     return rowB;
   });
 
@@ -1076,9 +1080,14 @@ test("approval stays disabled until the custodian creates its fleet key", async 
   await teamDevicePage(a, "a", server);
   const row = await listDevices(a, "Verifier Pending");
   await row.getByLabel("The code on the other device matches").check();
+  const devices = a.getByTestId("team-devices");
+  // Listing cleared the password: the hint says why Approve is off.
+  await expect(devices).toContainText("Enter your password above to approve or revoke.");
   await cardSignIn(a);
   await expect(a.getByRole("button", { name: "Create fleet key", exact: true })).toBeVisible();
   await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  await expect(devices).toContainText("Create the fleet key above before approving a device.");
+  await expect(devices).not.toContainText("Enter your password above to approve or revoke.");
 });
 
 test("revoke stays disabled until the custodian creates its fleet key", async ({ page: a }) => {

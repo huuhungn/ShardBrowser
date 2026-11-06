@@ -320,6 +320,18 @@ export function TeamCard() {
                 <span className="text-paragraph-xs text-text-soft-400">Device ID</span>
                 <CopyField value={st.device_id} />
               </div>
+              {st.signing_key_id && (
+                <div data-testid="team-own-key-ids" className="flex flex-col gap-2">
+                  <div>
+                    <span className="text-paragraph-xs text-text-soft-400">{t("team.devices.signingKeyId")}</span>
+                    <CopyField value={st.signing_key_id} />
+                  </div>
+                  <div>
+                    <span className="text-paragraph-xs text-text-soft-400">{t("team.devices.hpkeKeyId")}</span>
+                    <CopyField value={st.hpke_key_id} />
+                  </div>
+                </div>
+              )}
 
               {st.keys_locked ? (
                 <div className="flex flex-col gap-2" data-testid="keys-locked">

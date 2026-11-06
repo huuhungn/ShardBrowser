@@ -3,6 +3,12 @@ export type TeamStatus = {
   server_url: string;
   tenant_id: string;
   device_id: string;
+  /**
+   * This device's own signing and HPKE key IDs, which `confirm-first-device`
+   * asks the operator to compare. Empty while its seeds cannot be read.
+   */
+  signing_key_id: string;
+  hpke_key_id: string;
   has_token: boolean;
   /** False when the stored keys cannot be opened, so enrollment is offered. */
   is_enrolled: boolean;

@@ -1422,6 +1422,8 @@
   "team.devices.fleetKeyNotUsable": "This computer holds no usable fleet key, so it cannot approve devices. Run Collect key custody to verify and keep it again.",
   "team.devices.show": "Show devices",
   "team.devices.empty": "The team server lists no devices.",
+  "team.devices.needPassword": "Enter your password above to approve or revoke.",
+  "team.devices.needFleetKey": "Create the fleet key above before approving a device.",
   "team.devices.status.pending": "Pending",
   "team.devices.status.active": "Active",
   "team.devices.status.revoked": "Revoked",

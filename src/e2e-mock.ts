@@ -295,6 +295,8 @@ const teamStatusFixture = () => (firstDevice
     server_url: "https://team.example.com",
     tenant_id: "11111111-1111-4111-8111-111111111111",
     device_id: "0123456789abcdef0123456789abcdef",
+    // As the backend: a locked key file hides the seeds the IDs derive from.
+    ...(keyState.keys_locked ? teamNoKeyIds : teamKeyIds("0123456789abcdef0123456789abcdef")),
     has_token: true,
     is_enrolled: true,
     keys_unreadable: false,
@@ -307,6 +309,7 @@ const teamStatusFixture = () => (firstDevice
   : {
     ...teamConnection,
     device_id: teamMe.device_id,
+    ...(teamMe.device_id ? teamKeyIds(teamMe.device_id) : teamNoKeyIds),
     is_enrolled: !!teamMe.device_id,
     keys_unreadable: false,
     can_sync: !!teamMe.device_id,
@@ -366,6 +369,7 @@ const teamSettle = (b: TeamProfileStatus, head: TeamServerHead) => {
 };
 // Every row's keys and code derive from its device id, the same way on both pages.
 const teamKeyIds = (id: string) => ({ signing_key_id: id + id, hpke_key_id: [...id + id].reverse().join("") });
+const teamNoKeyIds = { signing_key_id: "", hpke_key_id: "" };
 const teamSas = (id: string) => [...id].reverse().join("").match(/.{4}/g)!.join(" ");
 const TEAM_WINDOW_MS = 10 * 60_000;
 // When this custodian first saw each pending device, by its own clock; never reset.

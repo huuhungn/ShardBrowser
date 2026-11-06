@@ -1422,6 +1422,8 @@
   "team.devices.fleetKeyNotUsable": "Máy này không giữ khoá đội máy nào dùng được nên chưa thể duyệt thiết bị. Hãy chạy Nhận quyền giữ khoá để xác minh và giữ lại khoá.",
   "team.devices.show": "Xem thiết bị",
   "team.devices.empty": "Máy chủ nhóm không liệt kê thiết bị nào.",
+  "team.devices.needPassword": "Nhập mật khẩu ở trên để duyệt hoặc thu hồi.",
+  "team.devices.needFleetKey": "Hãy tạo khoá đội máy ở trên trước khi duyệt thiết bị.",
   "team.devices.status.pending": "Đang chờ",
   "team.devices.status.active": "Đang hoạt động",
   "team.devices.status.revoked": "Đã thu hồi",

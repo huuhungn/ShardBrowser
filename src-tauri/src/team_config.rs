@@ -237,6 +237,12 @@ pub struct TeamStatus {
     pub server_url: String,
     pub tenant_id: String,
     pub device_id: String,
+    /// This device's signing and HPKE key IDs, hex, derived from its own
+    /// public keys: what `confirm-first-device` asks the operator to compare
+    /// (ADR 0001 D1). Empty while not enrolled or its seeds cannot be read,
+    /// e.g. a key file not opened yet.
+    pub signing_key_id: String,
+    pub hpke_key_id: String,
     pub has_token: bool,
     pub is_enrolled: bool,
     /// The stored keys were protected by another Windows account or machine.
@@ -325,10 +331,24 @@ pub fn status() -> Result<TeamStatus> {
     } else {
         None
     };
+    // Public halves only; a seed that cannot be read (locked key file) shows none.
+    let (signing_key_id, hpke_key_id) = match (c.signing_key(), c.hpke_seed()) {
+        (Ok(signer), Ok(seed)) if c.is_enrolled() && !c.keys_unreadable() => {
+            let (_, hpke) = shardx_core::grants::derive_keypair(&seed);
+            let signing = signer.verifying_key().to_bytes();
+            (
+                crate::fleet_client::hex(&shardx_core::keys::signing_key_id(&signing)),
+                crate::fleet_client::hex(&shardx_core::keys::hpke_key_id(&hpke)),
+            )
+        }
+        _ => (String::new(), String::new()),
+    };
     Ok(TeamStatus {
         server_url: c.server_url.clone(),
         tenant_id: c.tenant_id.clone(),
         device_id: c.device_id.clone(),
+        signing_key_id,
+        hpke_key_id,
         has_token: !c.token.is_empty(),
         is_enrolled: c.is_enrolled() && !c.keys_unreadable(),
         keys_unreadable: c.keys_unreadable(),
@@ -404,6 +424,39 @@ mod tests {
         // A reference whose credential is gone fails closed.
         crate::credential::forget(&saved.hpke_credential_ref).unwrap();
         assert!(saved.hpke_seed().is_err());
+        store::set_config_root(None);
+    }
+
+    #[test]
+    fn status_shows_the_key_ids_of_this_devices_own_public_keys() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        assert!(status().unwrap().signing_key_id.is_empty());
+        let mut c = TeamConfig {
+            device_id: "cd".repeat(16),
+            signing_key_seed: "44".repeat(32).into(),
+            hpke_key_seed: "55".repeat(32).into(),
+            ..Default::default()
+        };
+        save(&c).unwrap();
+        let signing = Ed25519SigningKey::from_bytes(&[0x44; 32])
+            .verifying_key()
+            .to_bytes();
+        let (_, hpke) = shardx_core::grants::derive_keypair(&[0x55; 32]);
+        let want = (
+            crate::fleet_client::hex(&shardx_core::keys::signing_key_id(&signing)),
+            crate::fleet_client::hex(&shardx_core::keys::hpke_key_id(&hpke)),
+        );
+        let s = status().unwrap();
+        assert_eq!((s.signing_key_id, s.hpke_key_id), want);
+
+        // The same once the seeds left the file for the credential store.
+        assert!(protect_keys(&mut c).unwrap());
+        let s = status().unwrap();
+        assert_eq!((s.signing_key_id, s.hpke_key_id), want);
         store::set_config_root(None);
     }
 

@@ -280,7 +280,8 @@ mod tests {
 
         // A new run starts locked; the keys come back only with the passphrase.
         close();
-        assert!(team_config::status().unwrap().keys_locked);
+        let s = team_config::status().unwrap();
+        assert!(s.keys_locked && s.signing_key_id.is_empty() && s.hpke_key_id.is_empty());
         assert!(err(saved.signing_key().map(|_| ())).contains("credential.locked"));
         assert!(
             err(crate::credential::load(&saved.hpke_credential_ref)).contains("credential.locked")

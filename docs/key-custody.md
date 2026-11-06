@@ -76,6 +76,14 @@ operator creates one. A seed still in `team.json` is DPAPI-protected for the
 current Windows user (`dpapi.rs`); elsewhere it is plaintext hex, protected by
 file permissions alone. Keychain and kernel keyring are not wired up.
 
+> **Warning: an administrator password reset loses the device keys.** Windows
+> Credential Manager and DPAPI protect them with the Windows user's password.
+> The user changing that password keeps them readable; an administrator
+> resetting it (from another account or with `net user`) makes them
+> unreadable for good on a local Windows account. The device must then enroll
+> again. For the root custodian that loses the team until recovery-bundle
+> import ships.
+
 ## What the design calls for
 
 `.omx/plans/…-team-fleet-encrypted-backup.md` §5.6.4 defines a tenant root key

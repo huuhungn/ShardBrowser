@@ -60,6 +60,13 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   // now is team_status's live check. Approve hands that key on.
   const done = !!fleet?.created && !fleet.setup_key_held;
   const ready = done && hasFleetKey;
+  const isExpired = (r: TeamDevice) => r.status === "pending" && (r.approve_until_ms == null || now > r.approve_until_ms);
+  // Why an open pending row's Approve is off when nothing on the row says so.
+  const approvable = rows?.some((r) => r.status === "pending" && !isExpired(r));
+  const hint = !approvable ? null
+    : !account.signedIn ? t("team.devices.needPassword")
+    : !done ? t("team.devices.needFleetKey")
+    : null;
   // A tick vouches for the exact code shown, so a refreshed code needs a new one.
   const tick = (r: TeamDevice) => `${r.device_id} ${r.sas}`;
   const login = () => [account.username.trim(), account.take()] as const;
@@ -158,9 +165,10 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
       {rows?.length === 0 && (
         <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.empty")}</p>
       )}
+      {hint && <p className="m-0 text-paragraph-xs text-text-soft-400">{hint}</p>}
       {rows?.map((r) => {
         const self = r.device_id.toLowerCase() === selfId.toLowerCase();
-        const expired = r.status === "pending" && (r.approve_until_ms == null || now > r.approve_until_ms);
+        const expired = isExpired(r);
         const isNewest = r.status !== "revoked" && (shared.get(r.label) ?? 0) > 1 && newest.get(r.label) === r.device_id;
         return (
           <div
