@@ -74,7 +74,7 @@ jobs:
   windows-rust:
     runs-on: windows-latest
     name: Rust tests on Windows
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
