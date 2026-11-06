@@ -1,6 +1,6 @@
 # Team UI two-machine run
 
-**Status:** PENDING-MANUAL: the operator runs it after v2.7.0 is released, with the steps below (plan v0.2.2a section 6 M). It was BLOCKED from 2026-11-04 until the custodian work (Create fleet key, the device list with Approve and Revoke, the join code) shipped; the reason is kept below. Before that it was PENDING-MANUAL (owner decision 2026-11-03: the real two-machine run is done by the operator after release, like G2-48).
+**Status:** PASS on 2026-11-06 with v2.7.0 (build a8d512d1), on the second attempt; see Notes for the first. It was BLOCKED from 2026-11-04 until the custodian work (Create fleet key, the device list with Approve and Revoke, the join code) shipped; the reason is kept below.
 
 ## Setup steps (M.0a-0g)
 
@@ -64,17 +64,22 @@ Do not paste tokens, hostnames, URLs or credentials; attach logs only after reda
 
 | | Machine A | Machine B |
 |---|---|---|
-| Machine label (A/B, no hostname) | | |
-| OS and version | | |
-| Device ID (first 8) | | |
-| App version | | |
-| App build SHA | | |
+| Machine label (A/B, no hostname) | A: a temporary local Windows user | B: Windows Sandbox |
+| OS and version | Windows 11 Pro 10.0.26300 | Windows Sandbox, 10.0.26100 |
+| Device ID (first 8) | bab9a5d4 | 3717ede4 |
+| App version | 2.7.0 | 2.7.0 |
+| App build SHA | a8d512d1 | a8d512d1 |
 
 Both machines must run the same build: the app version and build SHA above match.
 
-- **Tenant (first 8 characters at most):**
-- **Operator:**
-- **Date:**
+- **Tenant (first 8 characters at most):** ada0465f
+- **Operator:** the repository owner, with the agent preparing the server, firewall rule, temporary user and Sandbox
+- **Date:** 2026-11-06
+
+Both machines installed `ShardX.Launcher_2.7.0_x64-setup.exe` from the v2.7.0
+release, and the server was that release's `shardx-team-server-win-x64.exe`,
+on a throwaway data directory, identity and tenant. Machine B reached it
+through the loopback `portproxy` of step M.0b.
 
 ## Gate steps
 
@@ -84,19 +89,25 @@ what was seen). "Badge" and "pin" are what the Team page and
 
 | # | Gate step | Path | Machine | Time | Badge, pin | Result |
 |---|---|---|---|---|---|---|
-| 1 | publish | S5 publish | A | | | |
-| 2 | checkout/restore on B | S3b join + pull | B | | | |
-| 3 | use | an ordinary launch (`launch_profile_synced`) | B | | | |
-| 4 | check-in on B | S5 check-in (checkout inside push) | B | | | |
-| 5 | checkout on A | A pull + check-in | A | | | |
+| 1 | publish | S5 publish | A | 09:20 +07 (version 1 filed 09:20:08) | Available, version 1 | PASS |
+| 2 | checkout/restore on B | S3b join + pull | B | between 09:20 and 09:23 +07 | Available, version 1 | PASS |
+| 3 | use | an ordinary launch (`launch_profile_synced`) | B | between 09:20 and 09:23 +07 | browser opened, page loaded, closed | PASS |
+| 4 | check-in on B | S5 check-in (checkout inside push) | B | 09:23 +07 (version 2 filed 09:23:56) | Available, version 2 | PASS |
+| 5 | checkout on A | A pull + check-in | A | 09:26-09:27 +07 (versions 3 and 4 filed 09:26:39 and 09:27:05) | Available, version 4 | PASS |
+
+Times for steps 2 and 3 were not written down during the run; the window comes
+from the server's snapshot times. Every filed version names the device that
+signed it (`created_by_device`): versions 1, 3 and 4 by A, version 2 by B. A
+checked in twice in step 5, so the head ended on version 4, not 3. The
+optional revoke step was not run.
 
 ## Final pins
 
 | | Machine A | Machine B |
 |---|---|---|
-| Badge | | |
-| Pinned version | | |
-| Server head version | | |
+| Badge | Available | Available |
+| Pinned version | 4 | 4 (after a final Pull) |
+| Server head version | 4 | 4 |
 
 Read the server head version on the Team page: "Show fleet profiles" in the
 "Join from fleet" list shows "Version N" for the profile. Both machines must
@@ -106,3 +117,31 @@ end on the same pinned version as the server head.
 
 Anything unexpected: errors and their toasts, retries, timings. Attach logs
 only after removing tokens, hostnames, URLs and credentials.
+
+Run on 2026-11-06:
+
+- **Attempt 1 was lost to the run setup, not to the app.** After A set up root
+  custody, the agent cleared the temporary user's Windows password with an
+  administrator reset. That makes the user's DPAPI-protected Credential
+  Manager entries unreadable, and A then refused Create fleet key with "A
+  device key is missing from the OS credential store; this device must
+  re-enroll". A was the root custodian and v2.7.0 cannot import a recovery
+  bundle, so the tenant was abandoned. Attempt 2 used a new user created with
+  no password, a new server data directory, identity and tenant, and a new
+  Sandbox.
+- **Defect: the first device never shows its key IDs.** `tenant
+  confirm-first-device` asks for both key IDs "as shown on the client" (ADR
+  0001 D1), but the Team page of an enrolled, pending first device shows only
+  its Device ID. The operator typed the IDs the CLI printed, so the D1 cross
+  check was not performed. Fix planned for v2.7.1.
+- **UX: Approve is disabled with no reason given.** It needs the password
+  field filled (the field is cleared after every action) and a usable fleet
+  key. In attempt 1 the operator had set up root custody but not yet run
+  Create fleet key, and nothing said why Approve stayed disabled. Fix planned
+  for v2.7.1.
+- Saving the recovery bundle into a folder the user cannot write failed with
+  "Could not write the recovery bundle, read it back and open it; custody
+  setup stopped before anything was filed", as designed. Saving to
+  Documents worked.
+- Windows Sandbox has no Notepad; the setup script was changed to start the
+  launcher directly.
