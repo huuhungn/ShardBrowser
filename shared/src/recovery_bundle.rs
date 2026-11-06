@@ -18,16 +18,26 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::ChaCha20Poly1305;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::authz_record::{Fields, RecordError};
+use crate::authz_record::{
+    self as authz, AuthorizationRecord, Fields, RecordError, RootGrantVariant,
+};
 use crate::canonical::{self as c, Value};
 use crate::fleet_grants::{fkek_key_id, FKEK_LEN};
-use crate::keys::{fill_random, root_key_id};
+use crate::grants::derive_keypair;
+use crate::keys::{fill_random, root_key_id, signing_key_id};
 use crate::passphrase::MIN_PASSPHRASE_LEN;
+use crate::signing::Ed25519SigningKey;
 
 pub const DOMAIN_RECOVERY_BUNDLE: &str = "shardx.recovery.bundle.v2";
 pub const DOMAIN_PLAINTEXT: &str = "shardx.recovery.bundle-plaintext.v2";
+/// The plaintext that also carries the root custodian (ADR 0002 D-5
+/// amendment of 2026-11-06).
+pub const DOMAIN_PLAINTEXT_V3: &str = "shardx.recovery.bundle-plaintext.v3";
 pub const DOMAIN_READINESS_PROBE: &str = "shardx.recovery.readiness-probe.v2";
 const VERSION: u64 = 2;
+const VERSION_V3: u64 = 3;
+/// Plan L862.
+pub const FIRST_SELF_GRANT_BYTES: RangeInclusive<usize> = 1..=131_072;
 pub const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-RECOVERY-BUNDLE-KDF-V2\0";
 pub const L_RECOVERY_BUNDLE: &str = "SHARDX-RECOVERY-BUNDLE-V2\0";
 
@@ -222,13 +232,103 @@ pub struct RetainedFkek {
     pub fkek: Zeroizing<[u8; FKEK_LEN]>,
 }
 
-/// `RecoveryBundlePlaintextV2`. The root key id is derived from `trk`.
+/// The root custodian device the bundle restores: its IDs, both key seeds and
+/// its exact first root self-grant. [`open`] checks they belong together.
+pub struct RootCustodian {
+    pub account_id: [u8; 16],
+    pub device_id: [u8; 16],
+    pub signing_key_seed: Zeroizing<[u8; 32]>,
+    pub hpke_key_seed: Zeroizing<[u8; 32]>,
+    pub first_self_grant: Vec<u8>,
+}
+
+impl std::fmt::Debug for RootCustodian {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootCustodian")
+            .field("account_id", &self.account_id)
+            .field("device_id", &self.device_id)
+            .field("signing_key_seed", &"<redacted>")
+            .field("hpke_key_seed", &"<redacted>")
+            .field("first_self_grant", &self.first_self_grant.len())
+            .finish()
+    }
+}
+
+impl RootCustodian {
+    fn entries(&self) -> Result<Value> {
+        if !FIRST_SELF_GRANT_BYTES.contains(&self.first_self_grant.len()) {
+            return Err(RecordError::BadValue("first_self_grant").into());
+        }
+        Ok(c::m(vec![
+            ("account_id", c::b(&self.account_id)),
+            ("device_id", c::b(&self.device_id)),
+            ("signing_key_seed", c::b(self.signing_key_seed.as_slice())),
+            ("hpke_key_seed", c::b(self.hpke_key_seed.as_slice())),
+            ("first_self_grant", c::b(&self.first_self_grant)),
+        ]))
+    }
+
+    fn read(v: Value) -> Result<Self> {
+        let mut f = Fields::open("RootCustodian", v)?;
+        let custodian = Self {
+            account_id: f.fixed("account_id")?,
+            device_id: f.fixed("device_id")?,
+            signing_key_seed: Zeroizing::new(f.fixed("signing_key_seed")?),
+            hpke_key_seed: Zeroizing::new(f.fixed("hpke_key_seed")?),
+            first_self_grant: f.bytes(
+                "first_self_grant",
+                *FIRST_SELF_GRANT_BYTES.start(),
+                *FIRST_SELF_GRANT_BYTES.end(),
+            )?,
+        };
+        f.finish()?;
+        Ok(custodian)
+    }
+
+    /// The signing seed is the anchor's key, and the first self-grant is
+    /// signed by it, names this tenant, root key, generation, account and
+    /// device, and opens with the HPKE seed to `trk`.
+    fn check(
+        &self,
+        header: &RecoveryBundleHeaderV2,
+        anchor: &[u8; 32],
+        trk: &[u8; 32],
+    ) -> Result<()> {
+        let vk = Ed25519SigningKey::from_bytes(&self.signing_key_seed).verifying_key();
+        let grant = AuthorizationRecord::parse(&self.first_self_grant)
+            .and_then(|r| r.verify_signature(vk.as_bytes()));
+        let names_us = match grant.as_ref().map(|v| v.payload()) {
+            Ok(authz::Payload::TenantRootKeyGrant(g)) => {
+                g.variant == RootGrantVariant::FirstRootSelfGrant
+                    && g.common.tenant_id == header.tenant_id
+                    && g.common.server_instance_id == header.server_instance_id
+                    && g.root_key_id == header.root_key_id
+                    && g.root_generation == header.root_generation
+                    && g.subject_account_id == self.account_id
+                    && g.subject_device_id == self.device_id
+                    && g.subject_signing_key_id == *anchor
+                    && g.open_trk(&derive_keypair(&self.hpke_key_seed).0)
+                        .is_ok_and(|opened| *opened == *trk)
+            }
+            _ => false,
+        };
+        if signing_key_id(vk.as_bytes()) != *anchor || !names_us {
+            return Err(RecoveryBundleError::Mismatch("root_custodian"));
+        }
+        Ok(())
+    }
+}
+
+/// `RecoveryBundlePlaintextV2`, or v3 when it carries the root custodian.
+/// The root key id is derived from `trk`.
 pub struct RecoveryBundlePlaintextV2 {
     pub trk: Zeroizing<[u8; 32]>,
     pub bootstrap_anchor_signing_key_id: [u8; 32],
     /// Sorted by `(fleet_id, generation)`, each at most once. Empty at
     /// bootstrap.
     pub retained_fkeks: Vec<RetainedFkek>,
+    /// Present in every bundle this build writes (v3); absent in a 2.7.x one.
+    pub root_custodian: Option<RootCustodian>,
 }
 
 impl std::fmt::Debug for RecoveryBundlePlaintextV2 {
@@ -240,6 +340,7 @@ impl std::fmt::Debug for RecoveryBundlePlaintextV2 {
                 &self.bootstrap_anchor_signing_key_id,
             )
             .field("retained_fkeks", &self.retained_fkeks.len())
+            .field("root_custodian", &self.root_custodian)
             .finish()
     }
 }
@@ -268,7 +369,7 @@ impl RecoveryBundlePlaintextV2 {
                 ])
             })
             .collect();
-        Ok(Zeroizing::new(c::encode(&c::m(vec![
+        let mut entries = vec![
             ("domain", c::t(DOMAIN_PLAINTEXT)),
             ("version", c::u(VERSION)),
             ("root_key_id", c::b(&root_key_id(&self.trk))),
@@ -278,13 +379,29 @@ impl RecoveryBundlePlaintextV2 {
                 c::b(&self.bootstrap_anchor_signing_key_id),
             ),
             ("retained_fkeks", Value::Array(items)),
-        ]))))
+        ];
+        if let Some(custodian) = &self.root_custodian {
+            entries[0].1 = c::t(DOMAIN_PLAINTEXT_V3);
+            entries[1].1 = c::u(VERSION_V3);
+            entries.push(("root_custodian", custodian.entries()?));
+        }
+        Ok(Zeroizing::new(c::encode(&c::m(entries))))
     }
 
     fn parse(bytes: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("RecoveryBundlePlaintextV2", bytes)?;
-        f.exact_text("domain", DOMAIN_PLAINTEXT)?;
-        supported(&mut f, "version", VERSION)?;
+        // The v2 domain carries no custodian; `finish` refuses one.
+        let v3 = match f.text("domain")?.as_str() {
+            DOMAIN_PLAINTEXT => false,
+            DOMAIN_PLAINTEXT_V3 => true,
+            _ => return Err(RecordError::BadValue("domain").into()),
+        };
+        supported(&mut f, "version", if v3 { VERSION_V3 } else { VERSION })?;
+        let root_custodian = if v3 {
+            Some(RootCustodian::read(f.req("root_custodian")?)?)
+        } else {
+            None
+        };
         let named_root = f.fixed::<32>("root_key_id")?;
         let trk = Zeroizing::new(f.fixed::<32>("trk")?);
         let bootstrap_anchor_signing_key_id = f.fixed("bootstrap_anchor_signing_key_id")?;
@@ -321,6 +438,7 @@ impl RecoveryBundlePlaintextV2 {
             trk,
             bootstrap_anchor_signing_key_id,
             retained_fkeks,
+            root_custodian,
         })
     }
 }
@@ -439,7 +557,8 @@ pub fn seal(
 }
 
 /// Opens exact bundle file bytes. After this, the TRK hashes to both root
-/// key ids and every FKEK to its key id.
+/// key ids, every FKEK to its key id, and a root custodian passes
+/// [`RootCustodian::check`].
 pub fn open(
     file: &[u8],
     passphrase: &str,
@@ -470,6 +589,13 @@ pub fn open(
     let plaintext = RecoveryBundlePlaintextV2::parse(&plaintext)?;
     if root_key_id(&plaintext.trk) != header.root_key_id {
         return Err(RecoveryBundleError::Mismatch("root_key_id"));
+    }
+    if let Some(custodian) = &plaintext.root_custodian {
+        custodian.check(
+            &header,
+            &plaintext.bootstrap_anchor_signing_key_id,
+            &plaintext.trk,
+        )?;
     }
     Ok((header, plaintext))
 }
@@ -530,6 +656,11 @@ fn readiness_probe(trk: &[u8; 32], root_key_id: &[u8; 32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz_record::{
+        build_record, CommonFields, TenantRootKeyGrantV2, DOMAIN_TENANT_ROOT_KEY_GRANT,
+    };
+    use crate::grants::seal_trk;
+    use crate::keys::hpke_key_id;
 
     const PASS: &str = "correct horse battery";
     const TRK: [u8; 32] = [0x7c; 32];
@@ -565,7 +696,231 @@ mod tests {
             trk: Zeroizing::new(TRK),
             bootstrap_anchor_signing_key_id: [9; 32],
             retained_fkeks: retained,
+            root_custodian: None,
         }
+    }
+
+    // Test keys only: fixed seeds, never a real device's.
+    const SIGNING_SEED: [u8; 32] = [0x21; 32];
+    const HPKE_SEED: [u8; 32] = [0x22; 32];
+    const ACCOUNT: [u8; 16] = [0x0a; 16];
+    const DEVICE: [u8; 16] = [0x0b; 16];
+
+    fn anchor_of(seed: &[u8; 32]) -> [u8; 32] {
+        signing_key_id(
+            Ed25519SigningKey::from_bytes(seed)
+                .verifying_key()
+                .as_bytes(),
+        )
+    }
+
+    /// A first root self-grant of `trk`, signed with `SIGNING_SEED` and
+    /// sealed to `HPKE_SEED`, after `edit`.
+    fn self_grant(trk: &[u8; 32], edit: fn(&mut TenantRootKeyGrantV2)) -> Vec<u8> {
+        let sk = Ed25519SigningKey::from_bytes(&SIGNING_SEED);
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        let h = header();
+        let mut g = TenantRootKeyGrantV2 {
+            common: CommonFields {
+                replay_id: [0x31; 16],
+                tenant_id: h.tenant_id,
+                issued_at_ms: 1,
+                not_before_ms: 1,
+                not_after_ms: 2,
+                server_instance_id: h.server_instance_id,
+                restore_epoch: 0,
+            },
+            variant: RootGrantVariant::FirstRootSelfGrant,
+            root_key_id: root_key_id(trk),
+            root_generation: 0,
+            subject_account_id: ACCOUNT,
+            subject_device_id: DEVICE,
+            subject_signing_key_id: anchor_of(&SIGNING_SEED),
+            recipient_hpke_key_id: hpke_key_id(&pk),
+            subject_device_approval_replay_id: [0x32; 16],
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        edit(&mut g);
+        let sealed = seal_trk(&pk, &g.scope(), trk).unwrap();
+        g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+        g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+        build_record(&sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+    }
+
+    fn custodian(first_self_grant: Vec<u8>) -> RootCustodian {
+        RootCustodian {
+            account_id: ACCOUNT,
+            device_id: DEVICE,
+            signing_key_seed: Zeroizing::new(SIGNING_SEED),
+            hpke_key_seed: Zeroizing::new(HPKE_SEED),
+            first_self_grant,
+        }
+    }
+
+    fn plaintext_v3(retained: Vec<RetainedFkek>, c: RootCustodian) -> RecoveryBundlePlaintextV2 {
+        RecoveryBundlePlaintextV2 {
+            bootstrap_anchor_signing_key_id: anchor_of(&SIGNING_SEED),
+            root_custodian: Some(c),
+            ..plaintext(retained)
+        }
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_v3_bundle_round_trips_with_its_root_custodian() {
+        let h = header();
+        let grant = self_grant(&TRK, |_| {});
+        let file = seal_with(
+            &h,
+            &plaintext_v3(vec![fkek(1, 0)], custodian(grant.clone())),
+            PASS,
+        )
+        .unwrap();
+        let (opened, pt) = open(&file, PASS).unwrap();
+        assert_eq!(opened, h);
+        assert_eq!(*pt.trk, TRK);
+        assert_eq!(pt.retained_fkeks.len(), 1);
+        let c = pt.root_custodian.as_ref().unwrap();
+        assert_eq!((c.account_id, c.device_id), (ACCOUNT, DEVICE));
+        assert_eq!(
+            (*c.signing_key_seed, *c.hpke_key_seed),
+            (SIGNING_SEED, HPKE_SEED)
+        );
+        assert_eq!(c.first_self_grant, grant);
+        assert_eq!(
+            verify_export(&file, PASS, &h),
+            Ok(recovery_bundle_sha256(&file))
+        );
+
+        // The debug print shows neither seed (0x21 = 33, 0x22 = 34).
+        let debug = format!("{pt:?}");
+        assert!(debug.contains("RootCustodian"), "{debug}");
+        assert!(!debug.contains("33, 33") && !debug.contains("34, 34"));
+    }
+
+    /// Sealed by the 2.7 encoder before v3 existed (fixed test keys): it
+    /// still opens, holds no custodian, and today's encoder writes exactly
+    /// the same bytes for a plaintext without one.
+    #[test]
+    fn a_v2_bundle_sealed_by_2_7_still_opens_without_a_custodian() {
+        let golden = unhex(include_str!("../tests/fixtures/recovery_bundle_v2_2_7.hex").trim());
+        let (opened, pt) = open(&golden, PASS).unwrap();
+        assert_eq!(opened, header());
+        assert!(pt.root_custodian.is_none());
+        assert_eq!(*pt.trk, TRK);
+        assert_eq!(pt.bootstrap_anchor_signing_key_id, [9; 32]);
+        assert_eq!(pt.retained_fkeks.len(), 1);
+        assert_eq!(
+            seal_with(&header(), &plaintext(vec![fkek(1, 0)]), PASS).unwrap(),
+            golden
+        );
+    }
+
+    #[test]
+    fn a_custodian_block_that_does_not_match_the_anchor_or_self_grant_is_refused() {
+        let h = header();
+        let good = self_grant(&TRK, |_| {});
+        let cases: Vec<(&str, RootCustodian)> = vec![
+            (
+                "wrong signing seed",
+                RootCustodian {
+                    signing_key_seed: Zeroizing::new([0x23; 32]),
+                    ..custodian(good.clone())
+                },
+            ),
+            (
+                "self-grant of another device",
+                custodian(self_grant(&TRK, |g| g.subject_device_id = [0x0c; 16])),
+            ),
+            (
+                "self-grant of another account",
+                custodian(self_grant(&TRK, |g| g.subject_account_id = [0x0d; 16])),
+            ),
+            (
+                "self-grant for another tenant",
+                custodian(self_grant(&TRK, |g| g.common.tenant_id = [0x42; 16])),
+            ),
+            (
+                "another root key",
+                custodian(self_grant(&[0x11; 32], |_| {})),
+            ),
+            (
+                "another root generation",
+                custodian(self_grant(&TRK, |g| g.root_generation = 1)),
+            ),
+            (
+                "an HPKE seed that does not open it",
+                RootCustodian {
+                    hpke_key_seed: Zeroizing::new([0x24; 32]),
+                    ..custodian(good.clone())
+                },
+            ),
+            ("not a record", custodian(vec![1, 2, 3])),
+        ];
+        for (what, c) in cases {
+            let file = seal_with(&h, &plaintext_v3(vec![], c), PASS).unwrap();
+            assert_eq!(
+                open(&file, PASS).unwrap_err(),
+                RecoveryBundleError::Mismatch("root_custodian"),
+                "{what}"
+            );
+        }
+        // The anchor must be the custodian's own signing key.
+        let other_anchor = RecoveryBundlePlaintextV2 {
+            bootstrap_anchor_signing_key_id: [9; 32],
+            ..plaintext_v3(vec![], custodian(good))
+        };
+        let file = seal_with(&h, &other_anchor, PASS).unwrap();
+        assert_eq!(
+            open(&file, PASS).unwrap_err(),
+            RecoveryBundleError::Mismatch("root_custodian")
+        );
+    }
+
+    #[test]
+    fn a_v2_plaintext_with_a_custodian_block_and_a_v3_plaintext_without_one_are_refused() {
+        let h = header();
+        let reseal = |pt: &RecoveryBundlePlaintextV2, domain: &str, version: u64, drop: bool| {
+            let Value::Map(mut entries) = c::decode(&pt.encode().unwrap()).unwrap() else {
+                panic!("a map")
+            };
+            entries.iter_mut().find(|(k, _)| k == "domain").unwrap().1 = c::t(domain);
+            entries.iter_mut().find(|(k, _)| k == "version").unwrap().1 = c::u(version);
+            if drop {
+                entries.retain(|(k, _)| k != "root_custodian");
+            }
+            let file = seal_exact(&h, &c::encode(&Value::Map(entries)), PASS).unwrap();
+            open(&file, PASS).unwrap_err()
+        };
+        let v3 = plaintext_v3(vec![], custodian(self_grant(&TRK, |_| {})));
+        assert!(matches!(
+            reseal(&v3, DOMAIN_PLAINTEXT, VERSION, false),
+            RecoveryBundleError::Format(RecordError::UnknownField { field, .. })
+                if field == "root_custodian"
+        ));
+        assert!(matches!(
+            reseal(&v3, DOMAIN_PLAINTEXT_V3, VERSION_V3, true),
+            RecoveryBundleError::Format(RecordError::MissingField {
+                field: "root_custodian",
+                ..
+            })
+        ));
+        // Each domain takes only its own version.
+        assert!(matches!(
+            reseal(&v3, DOMAIN_PLAINTEXT_V3, VERSION, false),
+            RecoveryBundleError::Format(RecordError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            reseal(&plaintext(vec![]), DOMAIN_PLAINTEXT, VERSION_V3, false),
+            RecoveryBundleError::Format(RecordError::Unsupported { .. })
+        ));
     }
 
     const GOLDEN_BUNDLE: &str = "a30861716f4f7506a7941cfa19e8bf04a17d0a685ebbf4cb2105145008564d76";
@@ -876,5 +1231,35 @@ mod tests {
             seal_with(&header(), &plaintext(many), PASS).unwrap_err(),
             RecoveryBundleError::Format(RecordError::BadValue("retained_fkeks"))
         );
+
+        // A first self-grant past its bound: refused when sealing, and when
+        // an honestly sealed file carries one.
+        let oversized = vec![0; *FIRST_SELF_GRANT_BYTES.end() + 1];
+        let pt = plaintext_v3(vec![], custodian(oversized.clone()));
+        assert_eq!(
+            seal_with(&header(), &pt, PASS).unwrap_err(),
+            RecoveryBundleError::Format(RecordError::BadValue("first_self_grant"))
+        );
+        let raw = plaintext_v3(vec![], custodian(vec![1])).encode().unwrap();
+        let Value::Map(mut entries) = c::decode(&raw).unwrap() else {
+            panic!("a map")
+        };
+        let Some((_, Value::Map(block))) = entries.iter_mut().find(|(k, _)| k == "root_custodian")
+        else {
+            panic!("root_custodian")
+        };
+        block
+            .iter_mut()
+            .find(|(k, _)| k == "first_self_grant")
+            .unwrap()
+            .1 = c::b(&oversized);
+        let file = seal_exact(&header(), &c::encode(&Value::Map(entries)), PASS).unwrap();
+        assert!(matches!(
+            open(&file, PASS).unwrap_err(),
+            RecoveryBundleError::Format(RecordError::BadField {
+                field: "first_self_grant",
+                ..
+            })
+        ));
     }
 }

@@ -1019,6 +1019,46 @@ random 12-byte nonce and AAD = canonical `RecoveryReadinessProbeV2`
 probe_nonce:Nonce16}`, and opens it again (critic minor 8). Only the hash
 travels, in the activate payload.
 
+**Amendment: plaintext v3 carries the root custodian (decided by the owner
+2026-11-06; v0.2.2b recovery slice, Option A).** Every bundle a launcher from
+v2.8.0 writes uses plaintext v3, so a fresh device can be restored as the root
+custodian with no server change. The header and the file format stay v2.
+
+```text
+RecoveryBundlePlaintextV3 (closed map) = RecoveryBundlePlaintextV2 with
+  domain           tstr  "shardx.recovery.bundle-plaintext.v3"
+  version          U16   3
+  root_custodian   closed map
+    account_id        Uuid16
+    device_id         Uuid16
+    signing_key_seed  Bytes(32,32)   Ed25519 seed of the root custodian device
+    hpke_key_seed     Bytes(32,32)   HPKE IKM of that device
+    first_self_grant  Bytes(1,131072) exact FirstRootSelfGrant container (L862)
+```
+
+The reader dispatches on `domain`: the v2 domain must not carry
+`root_custodian` and the v3 domain must. A v2 bundle (2.7.x) still opens, and
+activation still accepts one pinned before the upgrade, but it cannot restore
+a custodian. After decrypt, a v3 bundle is refused as a `root_custodian`
+mismatch unless the signing key ID of `signing_key_seed` equals
+`bootstrap_anchor_signing_key_id`, and `first_self_grant` verifies under that
+key, is a `FirstRootSelfGrant` for the header's tenant, instance, `root_key_id`
+and `root_generation` with this subject account, device and signing key, and
+opens with `hpke_key_seed` to the bundle's TRK. Bootstrap step 3 reuses a
+saved, unpinned bundle only when it is v3 and names this device; otherwise it
+exports again.
+
+Exposure, accepted by the owner: a v3 bundle plus its passphrase **is** the
+root custodian device. The account password is not a separate factor (one
+owner account per tenant, no password change in v2). Rotating the TRK or a
+FKEK does not cut off a leaked bundle or a stolen root machine with readable
+keys, because both are the same device row. Until custody moves, either stays
+a root custodian for as long as the row's approval and grants run (365 days
+from bootstrap). **Required in the next (rotation) phase:** move root custody
+to a new device row (an `ExistingRootGrant` to it) and then revoke the A0 row;
+that is the only step that cuts off a stolen root machine and every v3 bundle
+exported before it.
+
 **Fallback encrypted key file (new; for W7/G2-48; own header per round-2 minor 5).**
 `<config_root>/team-sync/keys-fallback.bin` is one closed canonical map with the
 fields of `FallbackKeyFileHeaderV2` plus `ciphertext Bytes(48,16777216)`;

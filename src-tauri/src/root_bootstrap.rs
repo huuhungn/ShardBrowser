@@ -42,7 +42,7 @@ use shardx_core::mutation::{
     RECORD_TYPE_ROOT_GENERATION_ACTIVATED, RECORD_TYPE_ROOT_GENERATION_CREATED,
     RECORD_TYPE_ROOT_GRANT_ACKED,
 };
-use shardx_core::recovery_bundle::{self as rb, RecoveryBundlePlaintextV2};
+use shardx_core::recovery_bundle::{self as rb, RecoveryBundlePlaintextV2, RootCustodian};
 use shardx_core::signing::Ed25519SigningKey;
 use shardx_core::trust_chain::{Binding, Evidence, TrustChain};
 
@@ -356,11 +356,15 @@ pub(crate) fn stored_payload(
     Ok(s.canonical_response_payload_bytes)
 }
 
-/// Writes the bundle, re-reads it from its final path and checks it opens
-/// (L819, L1387). Returns the hash the create request pins.
+/// Writes the bundle (v3: it carries this device as the root custodian, with
+/// both key seeds and its first self-grant), re-reads it from its final path
+/// and checks it opens (L819, L1387). Returns the hash the create request pins.
 fn export_recovery_bundle(
     cx: &Context16,
     trk: &[u8; 32],
+    signer: &Ed25519SigningKey,
+    hpke_seed: &[u8; 32],
+    self_grant: &[u8],
     recovery: &RecoveryExport<'_>,
     now: u64,
 ) -> Result<[u8; 32]> {
@@ -369,6 +373,13 @@ fn export_recovery_bundle(
         trk: (*trk).into(),
         bootstrap_anchor_signing_key_id: cx.signing_key_id,
         retained_fkeks: Vec::new(),
+        root_custodian: Some(RootCustodian {
+            account_id: cx.account,
+            device_id: cx.device,
+            signing_key_seed: signer.to_bytes().into(),
+            hpke_key_seed: (*hpke_seed).into(),
+            first_self_grant: self_grant.to_vec(),
+        }),
     };
     let (header, file) = rb::seal(
         cx.tenant,
@@ -386,16 +397,39 @@ fn export_recovery_bundle(
 }
 
 /// The bundle at `recovery.path` is the pinned one and still opens to `trk`.
-fn check_bundle(recovery: &RecoveryExport<'_>, pinned: &[u8; 32], trk: &[u8; 32]) -> Result<()> {
+/// A 2.7.x (v2) bundle passes: activation accepts the one it pinned.
+fn check_bundle(
+    recovery: &RecoveryExport<'_>,
+    pinned: &[u8; 32],
+    trk: &[u8; 32],
+) -> Result<RecoveryBundlePlaintextV2> {
     let changed = || anyhow!(crate::errcode::code("fleet.recoveryBundleChanged"));
     let file = std::fs::read(recovery.path).map_err(|_| changed())?;
     if rb::recovery_bundle_sha256(&file) != *pinned {
         return Err(changed());
     }
     match rb::open(&file, recovery.passphrase) {
-        Ok((_, plaintext)) if *plaintext.trk == *trk => Ok(()),
+        Ok((_, plaintext)) if *plaintext.trk == *trk => Ok(plaintext),
         _ => Err(changed()),
     }
+}
+
+/// Step 3 reuses a saved bundle the server has not yet seen only while it
+/// passes [`check_bundle`] and carries this device as the root custodian; a
+/// v2 one cannot restore the team, so it is exported again.
+fn reusable_bundle(
+    recovery: &RecoveryExport<'_>,
+    state: &BootstrapState,
+    trk: &[u8; 32],
+    device: &[u8; 16],
+) -> Result<bool> {
+    if state.recovery_bundle_sha256.is_empty() {
+        return Ok(false);
+    }
+    Ok(
+        check_bundle(recovery, &unhex(&state.recovery_bundle_sha256)?, trk)
+            .is_ok_and(|pt| pt.root_custodian.is_some_and(|c| c.device_id == *device)),
+    )
 }
 
 /// Applies `change` to a copy of `state`, saves the copy, and only then
@@ -730,13 +764,19 @@ impl Run<'_> {
         }
 
         // 3. The bundle, saved on its own: an export the server has not yet
-        // seen is reused while it is still there and opens, else replaced.
+        // seen is reused while it is still there, opens and names this device
+        // as root custodian, else replaced.
         if state.create_request.is_empty() {
-            let reusable = !state.recovery_bundle_sha256.is_empty()
-                && check_bundle(self.recovery, &unhex(&state.recovery_bundle_sha256)?, &trk)
-                    .is_ok();
-            if !reusable {
-                let sha = hex(&export_recovery_bundle(cx, &trk, self.recovery, now)?);
+            if !reusable_bundle(self.recovery, state, &trk, &cx.device)? {
+                let sha = hex(&export_recovery_bundle(
+                    cx,
+                    &trk,
+                    signer,
+                    self.device.hpke_seed,
+                    &container,
+                    self.recovery,
+                    now,
+                )?);
                 let path = self.recovery.path.to_string_lossy().into_owned();
                 commit(state, save, |s| {
                     s.recovery_bundle_sha256 = sha;
@@ -1260,6 +1300,40 @@ mod tests {
         }
     }
 
+    /// The test HPKE seed (never a real device's).
+    const HPKE_SEED: [u8; 32] = [7; 32];
+
+    /// `cx` with this device's real HPKE key ID, and its first self-grant of
+    /// `trk`.
+    fn custodian_cx(device: [u8; 16], trk: &[u8; 32]) -> (Context16, Vec<u8>) {
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        let cx = Context16 {
+            device,
+            hpke_key_id: hpke_key_id(&pk),
+            ..cx()
+        };
+        let grant = self_grant(&cx, &signer(), &pk, trk, [0x33; 16], 1_800_000_000_000).unwrap();
+        (cx, grant)
+    }
+
+    fn export_v3(
+        cx: &Context16,
+        trk: &[u8; 32],
+        grant: &[u8],
+        export: &RecoveryExport<'_>,
+    ) -> [u8; 32] {
+        export_recovery_bundle(
+            cx,
+            trk,
+            &signer(),
+            &HPKE_SEED,
+            grant,
+            export,
+            1_800_000_000_000,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_recovery_export_is_read_back_and_its_pinned_hash_returned() {
         let dir = std::env::temp_dir().join(format!("shardx-bootstrap-{}", std::process::id()));
@@ -1270,16 +1344,23 @@ mod tests {
             path: &path,
             passphrase: "correct horse battery",
         };
-        let pinned = export_recovery_bundle(&cx(), &trk, &export, 1_800_000_000_000).unwrap();
+        let (cx, grant) = custodian_cx([5; 16], &trk);
+        let pinned = export_v3(&cx, &trk, &grant, &export);
         let file = std::fs::read(&path).unwrap();
         assert_eq!(pinned, recovery_bundle_sha256(&file));
         let (header, plaintext) = open(&file, "correct horse battery").unwrap();
         assert_eq!(*plaintext.trk, trk);
-        assert_eq!(
-            plaintext.bootstrap_anchor_signing_key_id,
-            cx().signing_key_id
-        );
+        assert_eq!(plaintext.bootstrap_anchor_signing_key_id, cx.signing_key_id);
         assert_eq!((header.tenant_id, header.root_generation), ([1; 16], 0));
+        // v3: it carries this device as the root custodian.
+        let custodian = plaintext.root_custodian.as_ref().unwrap();
+        assert_eq!(
+            (custodian.account_id, custodian.device_id),
+            (cx.account, cx.device)
+        );
+        assert_eq!(*custodian.signing_key_seed, signer().to_bytes());
+        assert_eq!(*custodian.hpke_key_seed, HPKE_SEED);
+        assert_eq!(custodian.first_self_grant, grant);
         assert!(!dir.join("recovery.bundle.tmp").exists());
 
         // The pinned bundle checks out; a changed or missing one does not.
@@ -1295,6 +1376,75 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(check_bundle(&export, &pinned, &trk).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2.7.x bundle sealed with no custodian, as that launcher's step 3
+    /// wrote it.
+    fn write_v2(cx: &Context16, trk: &[u8; 32], export: &RecoveryExport<'_>) -> [u8; 32] {
+        let plaintext = RecoveryBundlePlaintextV2 {
+            trk: (*trk).into(),
+            bootstrap_anchor_signing_key_id: cx.signing_key_id,
+            retained_fkeks: Vec::new(),
+            root_custodian: None,
+        };
+        let (_, file) =
+            rb::seal(cx.tenant, cx.instance, 0, 1, &plaintext, export.passphrase).unwrap();
+        std::fs::write(export.path, &file).unwrap();
+        recovery_bundle_sha256(&file)
+    }
+
+    /// Resume before the create request: a v2 bundle on disk (from 2.7.x) is
+    /// not reused but exported again as v3, and only a v3 bundle naming this
+    /// device is reused.
+    #[test]
+    fn a_v2_bundle_saved_before_the_create_is_replaced_by_a_v3_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.bundle");
+        let export = RecoveryExport {
+            path: &path,
+            passphrase: "correct horse battery",
+        };
+        let trk = [9; 32];
+        let (cx, grant) = custodian_cx([5; 16], &trk);
+        let mut state = BootstrapState {
+            recovery_bundle_sha256: hex(&write_v2(&cx, &trk, &export)),
+            ..Default::default()
+        };
+        assert!(check_bundle(
+            &export,
+            &unhex(&state.recovery_bundle_sha256).unwrap(),
+            &trk
+        )
+        .is_ok());
+        assert!(!reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
+
+        state.recovery_bundle_sha256 = hex(&export_v3(&cx, &trk, &grant, &export));
+        assert!(reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
+        assert!(!reusable_bundle(&export, &state, &trk, &[0x0e; 16]).unwrap());
+
+        // A v3 bundle of another device is exported again too.
+        let (other, other_grant) = custodian_cx([0x0e; 16], &trk);
+        state.recovery_bundle_sha256 = hex(&export_v3(&other, &trk, &other_grant, &export));
+        assert!(!reusable_bundle(&export, &state, &trk, &cx.device).unwrap());
+        // Nothing saved yet: nothing to reuse.
+        assert!(!reusable_bundle(&export, &BootstrapState::default(), &trk, &cx.device).unwrap());
+    }
+
+    /// Resume after the create request: activation checks the bundle the
+    /// create pinned, and a pinned v2 bundle still passes.
+    #[test]
+    fn activation_accepts_the_v2_bundle_a_2_7_create_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.bundle");
+        let export = RecoveryExport {
+            path: &path,
+            passphrase: "correct horse battery",
+        };
+        let trk = [9; 32];
+        let pinned = write_v2(&cx(), &trk, &export);
+        let plaintext = check_bundle(&export, &pinned, &trk).unwrap();
+        assert!(plaintext.root_custodian.is_none());
+        assert!(check_bundle(&export, &pinned, &[8; 32]).is_err());
     }
 
     #[test]
