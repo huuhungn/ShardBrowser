@@ -90,7 +90,9 @@ both toolchains, against the real Windows Credential Manager):
   user can still ask Credential Manager for them; no user-mode store prevents
   that (plan 9.5: zeroize is not protection against a compromised process).
 - A Windows profile reset or a move to a new machine loses the keys by design.
-  Recovery goes through the recovery bundle (ADR 0002 D-5) and re-enrolment.
+  From 2.8.0 the root custodian's identity survives through its v3 recovery
+  bundle (ADR 0002 D-5, imported on the new device); a member device is reset
+  and enrolls again.
 - One `cfg(windows)` dependency. Linux and macOS builds gain only `keyring-core`,
   which compiles no platform code.
 
