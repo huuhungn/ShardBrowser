@@ -2526,6 +2526,48 @@ async fn team_bootstrap_custody(
     .map_err(|e| e.to_string())
 }
 
+/// Export the recovery bundle again (v0.2.2b plan, section 4.X) to `path`,
+/// sealed under `passphrase`: this root custodian device with every verified
+/// fleet key it holds. Nothing is filed and no state file changes. The
+/// password is used for one login and never stored.
+#[tauri::command]
+async fn team_export_recovery_bundle(
+    username: String,
+    password: String,
+    path: String,
+    passphrase: String,
+) -> Result<(), String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let fleet_hex = sync_cmd::fleet_id(&c);
+    let fkeks = fleet_keys::verified_keys(&fleet_hex).map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let recovery = root_bootstrap::RecoveryExport {
+        path: std::path::Path::new(&path),
+        passphrase: &passphrase,
+    };
+    let result = root_bootstrap::export_again(
+        &client, access, &fleet_hex, &signer, &seed, fkeks, &recovery,
+    )
+    .await
+    .map_err(|e| e.to_string());
+    client.end_session(access).await;
+    match &result {
+        Ok(()) => eprintln!("[recovery] export: ok"),
+        Err(e) => eprintln!(
+            "[recovery] export: refused {}",
+            recovery_import::error_code(e)
+        ),
+    }
+    result
+}
+
 /// How far this device's Create fleet key got.
 #[tauri::command]
 fn team_fleet_custody_status() -> Result<fleet_custody::FleetCustodyStatus, String> {
@@ -6816,6 +6858,7 @@ pub fn run() {
             team_collect_custody,
             team_custody_bootstrap_status,
             team_bootstrap_custody,
+            team_export_recovery_bundle,
             team_fleet_custody_status,
             team_fleet_key_setup,
             team_devices,

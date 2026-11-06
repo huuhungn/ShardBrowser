@@ -257,6 +257,24 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
     Ok(true)
 }
 
+/// Every generation of `fleet_id` collected from a verified grant, oldest
+/// first, with its key, for the recovery bundle (v0.2.2b plan, section 4.X
+/// step 4). A verified generation whose key does not read stops the export.
+pub fn verified_keys(fleet_id: &str) -> Result<Vec<(u64, Zeroizing<[u8; 32]>)>> {
+    let s = load()?;
+    let Some(f) = s.fleets.get(fleet_id) else {
+        return Ok(Vec::new());
+    };
+    f.verified
+        .iter()
+        .map(|&g| {
+            f.key(g)
+                .map(|k| (g, k))
+                .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.recoveryExportFailed")))
+        })
+        .collect()
+}
+
 /// Moves every plaintext key in the saved file into the OS credential store,
 /// and rewrites the file without the keys that read back. Returns whether
 /// any key moved.
@@ -536,6 +554,41 @@ mod tests {
         store::set_config_root(None);
         assert!(locked.unwrap().is_empty());
         assert_eq!(copies(), 1);
+    }
+
+    /// The recovery bundle takes only verified generations, oldest first, and
+    /// a verified one that does not read stops it.
+    #[test]
+    fn verified_keys_lists_only_verified_generations_and_refuses_an_unreadable_one() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "d4".repeat(16);
+        assert!(verified_keys(&fleet).unwrap().is_empty(), "no file");
+        // 1 cached by 2.4.2 (not verified), 2 and 3 verified.
+        let mut s = FleetKeyStore::default();
+        for g in 1..=3 {
+            s.insert(&fleet, g, &[g as u8; 32]);
+        }
+        s.fleets.get_mut(&fleet).unwrap().verified.extend([3, 2]);
+        save(&s).unwrap();
+        let held: Vec<(u64, [u8; 32])> = verified_keys(&fleet)
+            .unwrap()
+            .into_iter()
+            .map(|(g, k)| (g, *k))
+            .collect();
+        assert_eq!(held, [(2, [2; 32]), (3, [3; 32])]);
+
+        let refs = load().unwrap().fleets[&fleet].credential_refs.clone();
+        crate::credential::forget(&refs[&3]).unwrap();
+        let err = verified_keys(&fleet).unwrap_err().to_string();
+        store::set_config_root(None);
+        assert!(
+            crate::errcode::has_code(&err, "fleet.recoveryExportFailed"),
+            "{err}"
+        );
     }
 
     #[test]

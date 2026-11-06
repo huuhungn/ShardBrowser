@@ -896,6 +896,24 @@ mod tests {
         );
     }
 
+    /// Only the root generation check refuses a good custodian block under a
+    /// header that names root generation 1.
+    #[test]
+    fn a_header_of_another_root_generation_than_the_self_grant_is_refused() {
+        let good = || custodian(self_grant(&TRK, |_| {}));
+        let file = seal_with(&header(), &plaintext_v3(vec![], good()), PASS).unwrap();
+        assert!(open(&file, PASS).is_ok());
+        let h = RecoveryBundleHeaderV2 {
+            root_generation: 1,
+            ..header()
+        };
+        let file = seal_with(&h, &plaintext_v3(vec![], good()), PASS).unwrap();
+        assert_eq!(
+            open(&file, PASS).unwrap_err(),
+            RecoveryBundleError::Mismatch("root_custodian")
+        );
+    }
+
     #[test]
     fn a_v2_plaintext_with_a_custodian_block_and_a_v3_plaintext_without_one_are_refused() {
         let h = header();

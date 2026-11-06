@@ -42,7 +42,9 @@ use shardx_core::mutation::{
     RECORD_TYPE_ROOT_GENERATION_ACTIVATED, RECORD_TYPE_ROOT_GENERATION_CREATED,
     RECORD_TYPE_ROOT_GRANT_ACKED,
 };
-use shardx_core::recovery_bundle::{self as rb, RecoveryBundlePlaintextV2, RootCustodian};
+use shardx_core::recovery_bundle::{
+    self as rb, RecoveryBundlePlaintextV2, RetainedFkek, RootCustodian,
+};
 use shardx_core::signing::Ed25519SigningKey;
 use shardx_core::trust_chain::{Binding, Evidence, TrustChain};
 
@@ -357,14 +359,17 @@ pub(crate) fn stored_payload(
 }
 
 /// Writes the bundle (v3: it carries this device as the root custodian, with
-/// both key seeds and its first self-grant), re-reads it from its final path
-/// and checks it opens (L819, L1387). Returns the hash the create request pins.
+/// both key seeds and its first self-grant, and `retained_fkeks`), re-reads it
+/// from its final path and checks it opens (L819, L1387). Returns the hash the
+/// create request pins.
+#[allow(clippy::too_many_arguments)]
 fn export_recovery_bundle(
     cx: &Context16,
     trk: &[u8; 32],
     signer: &Ed25519SigningKey,
     hpke_seed: &[u8; 32],
     self_grant: &[u8],
+    retained_fkeks: Vec<RetainedFkek>,
     recovery: &RecoveryExport<'_>,
     now: u64,
 ) -> Result<[u8; 32]> {
@@ -372,7 +377,7 @@ fn export_recovery_bundle(
     let plaintext = RecoveryBundlePlaintextV2 {
         trk: (*trk).into(),
         bootstrap_anchor_signing_key_id: cx.signing_key_id,
-        retained_fkeks: Vec::new(),
+        retained_fkeks,
         root_custodian: Some(RootCustodian {
             account_id: cx.account,
             device_id: cx.device,
@@ -778,6 +783,7 @@ impl Run<'_> {
                     signer,
                     self.device.hpke_seed,
                     &container,
+                    Vec::new(),
                     self.recovery,
                     now,
                 )?);
@@ -974,6 +980,78 @@ pub async fn run(
     bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await?;
     keep_records(client.base_url(), &state)?;
     Ok(BootstrapStatus::of(&state))
+}
+
+/// Exports the recovery bundle again (v0.2.2b plan, section 4.X) over this
+/// root custodian's device session `access`. `fkeks` is every verified fleet
+/// key of `fleet_hex` this device holds: the fleet's ACTIVE generation must be
+/// among them. The first self-grant must read back acknowledged under an
+/// ACTIVE root generation and open to the TRK. The bundle names the
+/// self-grant's server instance and root generation. Nothing is filed and no
+/// state file changes.
+#[allow(clippy::too_many_arguments)]
+pub async fn export_again(
+    client: &FleetClient,
+    access: &str,
+    fleet_hex: &str,
+    signer: &Ed25519SigningKey,
+    hpke_seed: &[u8; 32],
+    fkeks: Vec<(u64, Zeroizing<[u8; 32]>)>,
+    recovery: &RecoveryExport<'_>,
+) -> Result<()> {
+    let state = load()?;
+    let container = unhex_vec(&state.self_grant)?;
+    let (grant, _) = own_grant(&container, signer)?;
+    let tenant_hex = hex(&grant.common.tenant_id);
+    let active = client
+        .active_fleet_generation(access, &tenant_hex, fleet_hex)
+        .await?;
+    if !active.is_some_and(|g| fkeks.iter().any(|(held, _)| *held == g)) {
+        bail!(crate::errcode::code("fleet.recoveryExportNeedsFleetKey"));
+    }
+    let (hpke_secret, _) = derive_keypair(hpke_seed);
+    let trk = grant
+        .open_trk(&hpke_secret)
+        .map_err(|_| anyhow!(crate::errcode::code("fleet.custodyGrantMismatch")))?;
+    crate::recovery_import::check_root_grant(
+        client,
+        access,
+        &tenant_hex,
+        &container,
+        signer,
+        &hpke_secret,
+        &trk,
+    )
+    .await?;
+    let fleet_id = decode_hex16(fleet_hex, "fleet_id")?;
+    let retained = fkeks
+        .into_iter()
+        .map(|(generation, fkek)| RetainedFkek {
+            fleet_id,
+            generation,
+            fkek,
+        })
+        .collect();
+    let cx = Context16 {
+        tenant: grant.common.tenant_id,
+        instance: grant.common.server_instance_id,
+        epoch: grant.common.restore_epoch,
+        account: grant.subject_account_id,
+        device: grant.subject_device_id,
+        signing_key_id: signing_key_id(signer.verifying_key().as_bytes()),
+        hpke_key_id: grant.recipient_hpke_key_id,
+    };
+    export_recovery_bundle(
+        &cx,
+        &trk,
+        signer,
+        hpke_seed,
+        &container,
+        retained,
+        recovery,
+        now_ms(),
+    )?;
+    Ok(())
 }
 
 /// Files the activated generation 0, its self-grant and this device's
@@ -1332,10 +1410,50 @@ mod tests {
             &signer(),
             &HPKE_SEED,
             grant,
+            Vec::new(),
             export,
             1_800_000_000_000,
         )
         .unwrap()
+    }
+
+    /// S3: an export whose file cannot be written and read back, or that does
+    /// not open as a bundle of this root custodian, is refused.
+    #[test]
+    fn an_export_that_cannot_read_back_or_open_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let trk = [9; 32];
+        let (cx, grant) = custodian_cx([5; 16], &trk);
+        let refused = |path: &Path, grant: &[u8]| {
+            let export = RecoveryExport {
+                path,
+                passphrase: "correct horse battery",
+            };
+            let err = export_recovery_bundle(
+                &cx,
+                &trk,
+                &signer(),
+                &HPKE_SEED,
+                grant,
+                Vec::new(),
+                &export,
+                1_800_000_000_000,
+            )
+            .unwrap_err();
+            assert!(
+                crate::errcode::has_code(&format!("{err:#}"), "fleet.recoveryExportFailed"),
+                "{err:#}"
+            );
+        };
+        // Its folder is missing, or the path is a folder: nothing to read back.
+        let missing = dir.path().join("gone").join("recovery.bundle");
+        refused(&missing, &grant);
+        assert!(!missing.exists());
+        refused(dir.path(), &grant);
+        // A self-grant of another device: the file is written and read back,
+        // but does not open as this root custodian's bundle.
+        let (_, other) = custodian_cx([0x0e; 16], &trk);
+        refused(&dir.path().join("recovery.bundle"), &other);
     }
 
     #[test]

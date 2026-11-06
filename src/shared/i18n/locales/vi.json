@@ -321,6 +321,7 @@
   "fleet.custodyEntropy": "Máy này không tạo được dữ liệu ngẫu nhiên để thiết lập quyền giữ khóa",
   "fleet.custodySealFailed": "Không niêm phong được khóa gốc của đơn vị cho thiết bị này",
   "fleet.recoveryExportFailed": "Không ghi, đọc lại và mở được gói khôi phục; đã dừng trước khi nộp bất cứ thứ gì",
+  "fleet.recoveryExportNeedsFleetKey": "Chỉ xuất được gói khôi phục khi thiết bị này giữ khoá đội máy đã xác minh của thế hệ đang hiệu lực: hãy tạo hoặc nhận khoá đội máy trước",
   "fleet.custodyServerChanged": "Máy chủ nhóm không còn là phiên bản hoặc kỳ khôi phục lúc bắt đầu thiết lập quyền giữ khóa; không gửi được các yêu cầu đã lưu",
   "fleet.custodyBusy": "Máy này đang thiết lập quyền giữ khóa",
   "fleet.keySubstitutionDetected": "Máy chủ nhóm gửi một khóa nhóm khác với khóa mà thiết bị này đang giữ cho thế hệ này; không giữ khóa nào",

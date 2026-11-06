@@ -1370,9 +1370,54 @@ fn audit_rows(h: &Harness) -> (i64, i64) {
     )
 }
 
-/// S2 (plan v0.2.2b section 5): after the S3 journey A's machine is lost. A
-/// fresh device C imports A's bootstrap bundle and keeps the team: it
-/// approves a new device D, publishes, and revokes B.
+/// The acting device's team state files as stored, `None` where absent.
+fn state_files() -> Vec<Option<Vec<u8>>> {
+    [
+        crate::store::team_config_path(),
+        crate::store::fleet_custody_path(),
+        crate::store::custody_bootstrap_path(),
+        crate::store::fleet_keys_path(),
+    ]
+    .into_iter()
+    .map(|path| std::fs::read(path.unwrap()).ok())
+    .collect()
+}
+
+/// Exports the acting device's recovery bundle again to `path` (S3).
+fn export(rt: &tokio::runtime::Runtime, path: &str) -> Result<(), String> {
+    call(
+        rt,
+        crate::team_export_recovery_bundle(
+            OWNER.into(),
+            PASSWORD.into(),
+            path.into(),
+            PASSPHRASE.into(),
+        ),
+    )
+}
+
+/// S3: before Create fleet key the root custodian holds no fleet key to
+/// carry, so the export is refused and writes and files nothing.
+#[test]
+fn an_export_before_the_fleet_key_is_refused() {
+    let rt = runtime();
+    let h = custodian(14, "rs3-early", &rt);
+    let bundle = config_path("again.shardx-recovery");
+    let (files, rows) = (state_files(), audit_rows(&h));
+    let err = export(&rt, &bundle).unwrap_err();
+    assert!(
+        crate::errcode::has_code(&err, "fleet.recoveryExportNeedsFleetKey"),
+        "{err}"
+    );
+    assert!(!std::path::Path::new(&bundle).exists());
+    assert_eq!(state_files(), files);
+    assert_eq!(audit_rows(&h), rows);
+}
+
+/// S2 and S3 (plan v0.2.2b section 5): after the S3 journey A exports its
+/// recovery bundle again, now with the fleet key, and its machine is lost. A
+/// fresh device C imports that bundle and keeps the team: it approves a new
+/// device D, publishes, and revokes B.
 #[test]
 fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_server() {
     let rt = runtime();
@@ -1386,10 +1431,53 @@ fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_
     } = shared_profile(6, "rs2-import", &rt);
     let (user, pass) = account();
 
-    // A's seeds and fleet key are gone, and nothing reads A's roots again.
+    // S3: member B cannot export, and nothing is written.
     h.act_as_a();
-    let bundle = config_path("recovery.shardx-recovery");
+    let bundle = config_path("again.shardx-recovery");
+    b.act_as_b();
+    let b_files = state_files();
+    let err = export(&rt, &bundle).unwrap_err();
+    assert!(
+        crate::errcode::has_code(&err, "fleet.notCustodian"),
+        "{err}"
+    );
+    assert!(!std::path::Path::new(&bundle).exists());
+    assert_eq!(state_files(), b_files);
+
+    // A exports again: v3 with generation 0's fleet key, under the
+    // self-grant's server instance and root generation 0. No state file
+    // changes and nothing is filed.
+    h.act_as_a();
+    let (a_files, rows) = (state_files(), audit_rows(&h));
+    export(&rt, &bundle).unwrap();
+    assert_eq!(state_files(), a_files);
+    assert_eq!(audit_rows(&h), rows);
+    let (header, plaintext) =
+        shardx_core::recovery_bundle::open(&std::fs::read(&bundle).unwrap(), PASSPHRASE).unwrap();
+    let id16 = |s: &str| crate::fleet_client::decode_hex16(s, "id").unwrap();
+    let root = crate::root_bootstrap::load().unwrap();
+    assert_eq!(
+        (
+            header.tenant_id,
+            header.server_instance_id,
+            header.root_generation
+        ),
+        (id16(&h.tenant), id16(&root.server_instance_id), 0)
+    );
+    let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
+    let retained: Vec<_> = plaintext
+        .retained_fkeks
+        .iter()
+        .map(|r| (r.fleet_id, r.generation, *r.fkek))
+        .collect();
+    assert_eq!(retained, [(id16(&h.tenant), 0, *fkek)]);
+
+    // A's seeds and fleet key are gone, and nothing reads A's roots again.
     let a = crate::team_config::load().unwrap();
+    assert_eq!(
+        plaintext.root_custodian.map(|c| c.device_id),
+        Some(id16(&a.device_id))
+    );
     for reference in [
         a.signing_credential_ref.clone(),
         a.hpke_credential_ref.clone(),
@@ -1896,7 +1984,7 @@ fn session_token(text: &str) -> Option<&str> {
 /// printed, every command reply and the devices' state files for the
 /// account password, the recovery passphrase, the fleet key, the root key,
 /// both HPKE private keys, every seed and any session token (plan v0.2.2a
-/// section 8; v0.2.2b S2 adds the import).
+/// section 8; v0.2.2b S2 adds the import, S3 the export again).
 #[test]
 fn the_journey_leaks_no_secret_to_output_state_or_replies() {
     assert_eq!(
@@ -2019,8 +2107,9 @@ fn keep_state(dir: &std::path::Path, device: &str) {
     }
 }
 
-/// The journey the leak scan watches: the S3 journey, A's revoke of B, B's
-/// refused collect and a fresh device's import of A's recovery bundle. Each reply and each device's state files go to the
+/// The journey the leak scan watches: the S3 journey, A's revoke of B, A's
+/// export of its recovery bundle again, B's refused collect and a fresh
+/// device's import of that bundle. Each reply and each device's state files go to the
 /// scan directory; the secrets to look for go to the side file.
 #[test]
 #[ignore = "a worker of the_journey_leaks_no_secret_to_output_state_or_replies"]
@@ -2055,8 +2144,9 @@ fn the_journey_leak_scan_worker() {
         &bytes(&grant.hpke_wrapped_trk_hex),
     )
     .unwrap();
+    let bundle = config_path("again.shardx-recovery");
+    export(&rt, &bundle).unwrap();
     keep_state(&dir, "a");
-    let bundle = config_path("recovery.shardx-recovery");
 
     b.act_as_b();
     call(

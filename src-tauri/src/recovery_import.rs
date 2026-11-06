@@ -61,17 +61,20 @@ pub(crate) struct Bundle<'a> {
 fn logged<T>(step: &str, result: Result<T>) -> Result<T> {
     match &result {
         Ok(_) => eprintln!("[recovery] import {step}: ok"),
-        Err(e) => {
-            let text = e.to_string();
-            let code = text
-                .split("[[shardx:")
-                .nth(1)
-                .and_then(|rest| rest.split(['|', ']']).next())
-                .unwrap_or("error");
-            eprintln!("[recovery] import {step}: refused {code}");
-        }
+        Err(e) => eprintln!(
+            "[recovery] import {step}: refused {}",
+            error_code(&e.to_string())
+        ),
     }
     result
+}
+
+/// The code of the first error marker in `text`, or "error".
+pub(crate) fn error_code(text: &str) -> &str {
+    text.split("[[shardx:")
+        .nth(1)
+        .and_then(|rest| rest.split(['|', ']']).next())
+        .unwrap_or("error")
 }
 
 /// Whether `e` is the `key` refusal with HTTP `status`, read from the
@@ -195,8 +198,8 @@ fn check_listing(
 
 /// Step 5: the server reads the bundle's self-grant back exactly,
 /// acknowledged under an ACTIVE root generation, and it opens to the
-/// bundle's TRK.
-async fn check_root_grant(
+/// bundle's TRK. Export again (section 4.X step 3) runs it too.
+pub(crate) async fn check_root_grant(
     client: &FleetClient,
     access: &str,
     tenant: &str,
