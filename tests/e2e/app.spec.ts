@@ -604,7 +604,7 @@ const teamPins = (page: Page) => page.evaluate(async () => {
  */
 async function teamDevicePage(
   page: Page,
-  device: "a" | "b" | "keys-lost" | "key-store-unavailable" | "root-keys-lost",
+  device: "a" | "b" | "keys-lost" | "key-store-unavailable" | "root-keys-lost" | "root-key-store-unavailable",
   server: ReturnType<typeof fakeTeamServer>,
   clock = false,
 ) {
@@ -1164,7 +1164,7 @@ test("the import needs the old device lost tick", async ({ page }) => {
   await expect(button).toBeDisabled();
   await form.getByLabel(OLD_DEVICE_LOST).check();
   await expect(button).toBeEnabled();
-  // The mock refuses an unticked import the way the launcher does.
+  // This checks the mock only; the launcher's own refusal is unit-tested in recovery_import.rs.
   const refused = await page.evaluate(async () => {
     const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__;
     try {
@@ -1176,6 +1176,28 @@ test("the import needs the old device lost tick", async ({ page }) => {
   });
   expect(refused).toBe(true);
   await expect(card.getByTestId("team-import")).toBeVisible();
+});
+
+test("an import whose collect is refused another fleet key says so", async ({ page: c }) => {
+  const card = await teamDevicePage(c, "b", fakeTeamServer());
+  // As the follow-up collect finding another key than this device holds for that generation.
+  await c.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_import_recovery_bundle"
+        ? { ...(result as object), fleet_opened: 0, newest_fleet_generation: null, fleet_refusal: "KEY_SUBSTITUTION_DETECTED" }
+        : result;
+    };
+  });
+  const form = card.getByTestId("team-import");
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(c, "Import recovery bundle");
+  await expect(c.getByText("The recovery bundle was imported.")).toBeVisible();
+  await expect(c.getByText("Refused: the team server offered another fleet key")).toBeVisible();
+  await expect(c.getByText("Fleet key collected")).toHaveCount(0);
 });
 
 test("the root custodian exports a recovery bundle, and Export is off before the fleet key exists", async ({ page: a }) => {
@@ -1256,6 +1278,15 @@ test("a root custodian whose keys are lost is offered import, not Reset", async 
   await cardClick(a, "Import recovery bundle");
   await expect(card.getByTestId("team-keys-lost")).toHaveCount(0);
   await expect(card.getByTestId("team-devices")).toBeVisible();
+});
+
+test("a root custodian whose key store is unavailable is told to try again, with no Reset or sign-in", async ({ page: a }) => {
+  const card = await teamDevicePage(a, "root-key-store-unavailable", fakeTeamServer());
+  const notice = card.getByTestId("team-keys-lost");
+  await expect(notice).toContainText("The key store did not answer; try again. This device is the root custodian and cannot be reset.");
+  await expect(notice.getByLabel("Account username")).toHaveCount(0);
+  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(card.getByTestId("team-import")).toHaveCount(0);
 });
 
 test("an expired join code of a revoked device offers Enroll again", async ({ page: b }) => {
