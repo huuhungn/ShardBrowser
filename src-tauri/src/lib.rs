@@ -2182,6 +2182,8 @@ async fn team_enroll_device(
         .map_err(|e| e.to_string())?;
 
     c.device_id = enrolled.device_id;
+    // The default fleet has the tenant's ID, so no second call is needed.
+    c.fleet_id = c.tenant_id.clone();
     // The join window runs from here, by this device's clock.
     c.enrolled_at_ms = root_bootstrap::now_ms();
     // Fleet routes are account-scoped, and the server is the only source for
@@ -3501,7 +3503,7 @@ fn fleet_key_usable(
     };
     let verifies = || {
         let ledger = team::db::Db::open()?;
-        let fleet = fleet_client::decode_hex16(&c.fleet_id, "fleet_id")?;
+        let fleet = fleet_client::decode_hex16(&sync_cmd::fleet_id(c), "fleet_id")?;
         fleet_key_verifies(&ledger, &pin, &recipient(c)?, &fleet, generation, key, now)
     };
     verifies().unwrap_or_else(|e| {
@@ -3817,10 +3819,23 @@ mod custody_tests {
         fkek_key_id: [u8; 32],
         fkek: &[u8; 32],
     ) -> Vec<u8> {
+        grant_of(FLEET, issuer, me, generation, common, fkek_key_id, fkek)
+    }
+
+    /// `grant_at` for the fleet `fleet_id`.
+    fn grant_of(
+        fleet_id: [u8; 16],
+        issuer: &shardx_core::signing::Ed25519SigningKey,
+        me: &Me,
+        generation: u64,
+        common: shardx_core::authz_record::CommonFields,
+        fkek_key_id: [u8; 32],
+        fkek: &[u8; 32],
+    ) -> Vec<u8> {
         use shardx_core::authz_record::*;
         let mut g = DeviceHpkeGrantV2 {
             common,
-            fleet_id: FLEET,
+            fleet_id,
             fkek_key_id,
             generation,
             subject_account_id: me.to.account_id,
@@ -5155,6 +5170,70 @@ mod custody_tests {
             assert_eq!(proven(path), [(hex(&d_id()), "DEVICE_REVOCATION".into())]);
         });
         assert!(revoked.is_empty(), "proven revoked since");
+    }
+
+    /// S6 (plan v0.2.2b): a device 2.7.x enrolled has no fleet ID. The default
+    /// fleet has the tenant's ID, so pull falls back to it and still tries the
+    /// key of the grant this device verified.
+    #[test]
+    fn a_device_enrolled_without_a_fleet_id_pulls_with_its_verified_fleet_key() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let me = me();
+        let fkek = [0x6e; 32];
+        let kid = shardx_core::fleet_grants::fkek_key_id(&fkek);
+        let grant = grant_of(TENANT, &me.sk, &me, 1, common(40), kid, &fkek);
+        let pages = evidence(&me, grant.clone());
+        let c = team_config::TeamConfig {
+            tenant_id: hex(&TENANT),
+            account_id: hex(&me.to.account_id),
+            device_id: hex(&me.to.device_id),
+            signing_key_seed: hex(&[1; 32]).into(),
+            hpke_key_seed: hex(&[7; 32]).into(),
+            ..Default::default()
+        };
+        assert!(c.fleet_id.is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let s = root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&me.to.device_id),
+            server_instance_id: hex(&INSTANCE),
+            activated: true,
+            anchor: hex(&me.to.signing_key_id),
+            ..Default::default()
+        };
+        std::fs::write(
+            store::custody_bootstrap_path().unwrap(),
+            serde_json::to_string(&s).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join("team-sync");
+        std::fs::create_dir_all(&path).unwrap();
+        let path = path.join("team-sync.db");
+        let mut ledger = team::db::Db::open_at(&path).unwrap();
+        let pin = (BINDING, me.to.signing_key_id);
+        let opened = open_fleet_grant(
+            &grant,
+            &pages,
+            &pin,
+            &me.to,
+            &TENANT,
+            1,
+            &me.hpke_sk,
+            T0 + DAY,
+            &mut ledger,
+            "https://fleet.test",
+        )
+        .unwrap()
+        .map(|k| *k);
+        drop(ledger);
+        let kept = fleet_keys::collect(&hex(&TENANT), 1, &fkek).unwrap();
+        let got = sync_cmd::pull_candidates(&c, T0 + 2 * DAY);
+        store::set_config_root(None);
+        assert_eq!((opened, kept), (Some(fkek), true));
+        assert_eq!(got, [(fkek, 1)]);
     }
 
     /// The custodian ledger row of `key`: cached first window and known end.

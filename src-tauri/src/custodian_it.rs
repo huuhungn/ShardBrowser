@@ -1776,6 +1776,70 @@ fn a_member_whose_fleet_key_store_is_unavailable_rejoins_against_a_real_server()
     a_reset_member_rejoins(11, "rs4-unavailable", true);
 }
 
+/// S6 (plan v0.2.2b): the fleet ID is the tenant's, set at every enrollment
+/// and gone with the identity, so a tenant change never leaves the old one.
+#[test]
+fn the_fleet_id_follows_a_tenant_change_and_a_new_enrollment() {
+    let rt = runtime();
+    let lock = crate::store::config_root_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (mut server, first) = tenant_server(13, "s6-first");
+    let created = server.operator(
+        &[
+            "tenant",
+            "create",
+            "--slug",
+            "s6-second",
+            "--owner-username",
+            OWNER,
+            "--password-stdin",
+        ],
+        &format!("{PASSWORD}\n"),
+    );
+    let second = created
+        .lines()
+        .find_map(|l| l.strip_prefix("tenant_id="))
+        .expect("tenant create prints the tenant id")
+        .trim()
+        .to_string();
+    let (config, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    act_as(config.path(), data.path(), "a");
+    let h = Harness {
+        server,
+        _config: config,
+        _data: data,
+        tenant: first.clone(),
+        _lock: lock,
+    };
+
+    let enroll = || {
+        call(
+            &rt,
+            crate::team_enroll_device("member".into(), OWNER.into(), PASSWORD.into()),
+        )
+        .unwrap()
+    };
+    note(crate::team_set_connection(
+        h.server.url(),
+        String::new(),
+        first.clone(),
+    ))
+    .unwrap();
+    enroll();
+    assert_eq!(crate::team_config::load().unwrap().fleet_id, first);
+
+    note(crate::team_set_connection(
+        h.server.url(),
+        String::new(),
+        second.clone(),
+    ))
+    .unwrap();
+    assert!(crate::team_config::load().unwrap().fleet_id.is_empty());
+    enroll();
+    assert_eq!(crate::team_config::load().unwrap().fleet_id, second);
+}
+
 /// S4: the root custodian whose keys are lost is refused Enroll again, and
 /// imports its own recovery bundle on the same roots.
 #[test]
