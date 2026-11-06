@@ -108,6 +108,22 @@ export const teamJoinConfirm = (username: string, password: string, anchor: stri
 export const teamEnrollAgain = (username: string, password: string) =>
   invoke<TeamStatus>("team_enroll_again", { username, password });
 
+/**
+ * Import a recovery bundle: this device becomes the root custodian it
+ * restores, then collects the fleet key. The passphrase and password serve
+ * this call only.
+ */
+export const teamImportRecoveryBundle = (
+  path: string,
+  passphrase: string,
+  username: string,
+  password: string,
+  oldDeviceLost: boolean,
+) =>
+  invoke<CustodyResult>("team_import_recovery_bundle", {
+    path, passphrase, username, password, oldDeviceLost,
+  });
+
 /** Every bound profile's sync state and every custodian alert; no server is asked. */
 export const teamProfilesStatus = () => invoke<TeamProfilesStatus>("team_profiles_status");
 

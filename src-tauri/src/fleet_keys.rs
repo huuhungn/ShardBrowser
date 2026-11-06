@@ -290,6 +290,63 @@ pub fn protect() -> Result<bool> {
     Ok(moved)
 }
 
+/// Removes from the index of `fleet_id` every generation whose key does not
+/// open for any reason but `credential.locked`, so the next collect writes it
+/// again from its verified grant instead of reading it as a substitution.
+/// With nothing to remove it changes and copies nothing. Otherwise the file is
+/// first copied aside as it is stored, and no stored key is ever deleted.
+/// Returns the removed generations.
+pub fn unindex_unopenable(fleet_id: &str) -> Result<Vec<u64>> {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let path = store::fleet_keys_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
+    let Some(f) = s.fleets.get_mut(fleet_id) else {
+        return Ok(Vec::new());
+    };
+    let opens = |generation: &u64| match (f.keys.get(generation), f.credential_refs.get(generation))
+    {
+        (Some(hex), _) => decode_key(hex).is_ok(),
+        (None, Some(reference)) => crate::credential::load(reference).map_or_else(
+            |e| crate::errcode::has_code(&e.to_string(), "credential.locked"),
+            |_| true,
+        ),
+        (None, None) => true,
+    };
+    let removed: Vec<u64> = f
+        .keys
+        .keys()
+        .chain(f.credential_refs.keys())
+        .copied()
+        .collect::<BTreeSet<u64>>()
+        .into_iter()
+        .filter(|g| !opens(g))
+        .collect();
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let copy = path.with_extension(format!("json.unopenable-{stamp}"));
+    fs::copy(&path, &copy)?;
+    // Flushing needs a writable handle on Windows.
+    fs::OpenOptions::new().write(true).open(&copy)?.sync_all()?;
+    for g in &removed {
+        f.keys.remove(g);
+        f.credential_refs.remove(g);
+        f.verified.remove(g);
+    }
+    write(&s)?;
+    eprintln!(
+        "[recovery] unindexed fleet key generations {removed:?}; fleet keys copied to {}",
+        copy.display()
+    );
+    Ok(removed)
+}
+
 /// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
 fn write(s: &FleetKeyStore) -> Result<()> {
     let path = store::fleet_keys_path()?;
@@ -404,6 +461,81 @@ mod tests {
             [([0x62; 32], 2)]
         );
         store::set_config_root(None);
+    }
+
+    /// Only generations that do not open for a reason other than a locked key
+    /// file leave the index, after a copy of the file; their stored keys stay.
+    #[test]
+    fn unopenable_generations_leave_the_index_and_nothing_else_is_lost() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "c7".repeat(16);
+        let path = store::fleet_keys_path().unwrap();
+        let copies = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    let name = e.as_ref().unwrap().file_name();
+                    name.to_string_lossy().contains(".unopenable-")
+                })
+                .count()
+        };
+        assert!(unindex_unopenable(&fleet).unwrap().is_empty(), "no file");
+        assert!(!path.exists());
+
+        // 1 readable, 2 missing, 3 unavailable, 4 another fleet's.
+        let mut s = FleetKeyStore::default();
+        for g in 1..=3 {
+            s.insert(&fleet, g, &[g as u8; 32]);
+        }
+        s.insert("ab", 4, &[4; 32]);
+        save(&s).unwrap();
+        let mut s = load().unwrap();
+        for g in 1..=3 {
+            s.fleets.get_mut(&fleet).unwrap().verified.insert(g);
+        }
+        save(&s).unwrap();
+        let refs = s.fleets[&fleet].credential_refs.clone();
+        assert_eq!(refs.len(), 3);
+        crate::credential::forget(&refs[&2]).unwrap();
+        crate::credential::fail_next_call(&refs[&3]);
+        let before = fs::read(&path).unwrap();
+
+        assert_eq!(unindex_unopenable(&fleet).unwrap(), [2, 3]);
+        let after = load().unwrap();
+        let f = &after.fleets[&fleet];
+        assert_eq!(f.credential_refs.keys().collect::<Vec<_>>(), [&1]);
+        assert_eq!(f.verified.iter().collect::<Vec<_>>(), [&1]);
+        assert!(after.fleets["ab"].credential_refs.contains_key(&4));
+        assert_eq!(copies(), 1);
+        let copy = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains(".unopenable-"))
+            .unwrap();
+        assert_eq!(
+            fs::read(copy).unwrap(),
+            before,
+            "the copy is the stored file"
+        );
+        assert_eq!(
+            *crate::credential::load(&refs[&3]).unwrap(),
+            [3; 32],
+            "the unavailable key was never deleted"
+        );
+
+        // A locked key file keeps its generation, and nothing is copied.
+        fs::create_dir_all(crate::key_file::path().unwrap().parent().unwrap()).unwrap();
+        fs::write(crate::key_file::path().unwrap(), b"locked").unwrap();
+        crate::credential::OS_STORE_DOWN.with(|d| d.set(true));
+        let locked = unindex_unopenable(&fleet);
+        crate::credential::OS_STORE_DOWN.with(|d| d.set(false));
+        store::set_config_root(None);
+        assert!(locked.unwrap().is_empty());
+        assert_eq!(copies(), 1);
     }
 
     #[test]
