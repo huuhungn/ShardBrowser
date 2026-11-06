@@ -3,6 +3,59 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.8.0",
+      "date": "2026-11-07",
+      "entries": [
+        {
+          "id": "team-recovery-import",
+          "title": "Restore the root custodian from a recovery bundle, and export one again",
+          "lead": "A team survives losing the root custodian device: a fresh device restores it from a bundle and its passphrase.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A new recovery bundle carries the root custodian's own identity and the team's fleet keys. On a fresh device, or on the root custodian's machine after its keys were lost, Import recovery bundle restores the root custodian, so Publish, Pull, Approve and Revoke work as before. The import needs the box ticked that the old device is lost or its keys were reset, and checks the bundle against the saved tenant, the team's anchor and the server's record of the device first."
+            },
+            {
+              "type": "p",
+              "text": "The root custodian exports a new bundle from the Team page once it holds the fleet key. Do this after updating: a bundle from 2.7.x holds no root custodian and cannot restore the team. A bundle plus its passphrase is the root custodian device, so keep it offline. The team server is unchanged."
+            }
+          ]
+        },
+        {
+          "id": "team-reset-device",
+          "title": "Reset a device whose keys are lost or that was revoked",
+          "lead": "A member whose keys are gone can enroll again from the Team page, once a custodian has revoked it.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The Team page now says when a device's keys are lost, or when the key store did not answer, and Reset this device clears the identity so the device can enroll again. The old files are kept as copies. A revoked device may enroll again, and an expired join code of a revoked device offers Enroll again. The root custodian is offered import instead of Reset."
+            },
+            {
+              "type": "p",
+              "text": "The root custodian keeps its connection: changing the server URL or tenant is refused unless both its device keys are lost."
+            }
+          ]
+        },
+        {
+          "id": "team-fleet-id-at-enrollment",
+          "title": "Legacy profiles pull with the team's fleet key",
+          "lead": "Enrollment now records the team's fleet ID.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A legacy profile that was never published now finds its fleet key when it is pulled, also on devices enrolled by 2.7.x."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.7.1",
       "date": "2026-11-06",
       "entries": [
