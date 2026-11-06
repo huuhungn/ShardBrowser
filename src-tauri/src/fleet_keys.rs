@@ -260,8 +260,13 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
 /// Every generation of `fleet_id` collected from a verified grant, oldest
 /// first, with its key, for the recovery bundle (v0.2.2b plan, section 4.X
 /// step 4). A verified generation whose key does not read stops the export.
+/// Read as `collect` reads it: the file is never rewritten.
 pub fn verified_keys(fleet_id: &str) -> Result<Vec<(u64, Zeroizing<[u8; 32]>)>> {
-    let s = load()?;
+    let path = store::fleet_keys_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
     let Some(f) = s.fleets.get(fleet_id) else {
         return Ok(Vec::new());
     };

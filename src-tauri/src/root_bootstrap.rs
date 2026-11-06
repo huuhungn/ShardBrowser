@@ -359,9 +359,9 @@ pub(crate) fn stored_payload(
 }
 
 /// Writes the bundle (v3: it carries this device as the root custodian, with
-/// both key seeds and its first self-grant, and `retained_fkeks`), re-reads it
-/// from its final path and checks it opens (L819, L1387). Returns the hash the
-/// create request pins.
+/// both key seeds and its first self-grant, and `retained_fkeks`) once its
+/// sealed bytes open (L819, L1387), then re-reads exactly those bytes from its
+/// final path. Returns the hash the create request pins.
 #[allow(clippy::too_many_arguments)]
 fn export_recovery_bundle(
     cx: &Context16,
@@ -395,10 +395,15 @@ fn export_recovery_bundle(
         recovery.passphrase,
     )
     .map_err(|e| anyhow!(e).context(failed()))?;
+    // Verified before the write, so a bundle that does not open never
+    // replaces an older one at the path; the reread must be those bytes.
+    let pinned = rb::verify_export(&file, recovery.passphrase, &header)
+        .map_err(|e| anyhow!(e).context(failed()))?;
     crate::durable::write_private(recovery.path, &file).with_context(failed)?;
-    let reread = std::fs::read(recovery.path).with_context(failed)?;
-    rb::verify_export(&reread, recovery.passphrase, &header)
-        .map_err(|e| anyhow!(e).context(failed()))
+    if std::fs::read(recovery.path).with_context(failed)? != file {
+        bail!(failed());
+    }
+    Ok(pinned)
 }
 
 /// The bundle at `recovery.path` is the pinned one and still opens to `trk`.
@@ -987,8 +992,8 @@ pub async fn run(
 /// key of `fleet_hex` this device holds: the fleet's ACTIVE generation must be
 /// among them. The first self-grant must read back acknowledged under an
 /// ACTIVE root generation and open to the TRK. The bundle names the
-/// self-grant's server instance and root generation. Nothing is filed and no
-/// state file changes.
+/// self-grant's server instance and root generation 0, which the first
+/// self-grant always names. Nothing is filed and no state file changes.
 #[allow(clippy::too_many_arguments)]
 pub async fn export_again(
     client: &FleetClient,
@@ -1450,10 +1455,77 @@ mod tests {
         refused(&missing, &grant);
         assert!(!missing.exists());
         refused(dir.path(), &grant);
-        // A self-grant of another device: the file is written and read back,
-        // but does not open as this root custodian's bundle.
+        // A self-grant of another device: the sealed bytes do not open as this
+        // root custodian's bundle, so an older bundle at the path is kept.
         let (_, other) = custodian_cx([0x0e; 16], &trk);
-        refused(&dir.path().join("recovery.bundle"), &other);
+        let older = dir.path().join("recovery.bundle");
+        std::fs::write(&older, b"an older bundle").unwrap();
+        refused(&older, &other);
+        assert_eq!(std::fs::read(&older).unwrap(), b"an older bundle");
+    }
+
+    /// S3: a verified key of generation 0 while the server reports generation
+    /// 1 ACTIVE is refused before the root grant is read; with generation 0
+    /// ACTIVE the export goes on to that read.
+    #[test]
+    fn an_export_without_the_active_generations_key_is_refused() {
+        use crate::fleet_custody::tests::{mock, runtime};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let (_, grant) = custodian_cx([5; 16], &[9; 32]);
+        save(&BootstrapState {
+            self_grant: hex(&grant),
+            ..Default::default()
+        })
+        .unwrap();
+        let path = dir.path().join("again.bundle");
+        let export = RecoveryExport {
+            path: &path,
+            passphrase: "correct horse battery",
+        };
+        let fleet = hex(&[1; 16]);
+        let rt = runtime();
+        let attempt = |active: u64| {
+            let body = format!("{{\"generation\":{active}}}").into_bytes();
+            let (client, seen) =
+                rt.block_on(mock(std::sync::Arc::new(move |call: &str, _: &[u8]| {
+                    if call.ends_with("/key-generation") {
+                        (200, body.clone())
+                    } else {
+                        (404, Vec::new())
+                    }
+                })));
+            let err = rt
+                .block_on(export_again(
+                    &client,
+                    "access",
+                    &fleet,
+                    &signer(),
+                    &HPKE_SEED,
+                    vec![(0, Zeroizing::new([0x44; 32]))],
+                    &export,
+                ))
+                .unwrap_err()
+                .to_string();
+            let calls = seen.lock().unwrap().len();
+            (err, calls)
+        };
+        let (err, calls) = attempt(1);
+        let (onward, _) = attempt(0);
+        crate::store::set_config_root(None);
+        assert!(
+            crate::errcode::has_code(&err, "fleet.recoveryExportNeedsFleetKey"),
+            "{err}"
+        );
+        assert_eq!(calls, 1, "only the ACTIVE generation was read");
+        assert!(
+            crate::errcode::has_code(&onward, "recovery.rootGrantMissing"),
+            "{onward}"
+        );
+        assert!(!path.exists());
     }
 
     #[test]
