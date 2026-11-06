@@ -107,6 +107,8 @@ test("every key the backend emits exists in both dictionaries", () => {
     "src-tauri/src/updater.rs",
     "src-tauri/src/bookmarks.rs",
     "src-tauri/src/recovery_import.rs",
+    "src-tauri/src/root_bootstrap.rs",
+    "src-tauri/src/fleet_keys.rs",
   ]
     .map((p) => read(`../${p}`))
     .join("\n");

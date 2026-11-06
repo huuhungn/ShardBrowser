@@ -69,6 +69,21 @@ export const teamBootstrapCustody = (
     username, password, recoveryPath, passphrase,
   });
 
+/**
+ * Export the recovery bundle again as the root custodian, with every
+ * verified fleet key, to `path` under `passphrase`. Nothing is filed; the
+ * password is used for one login and never stored.
+ */
+export const teamExportRecoveryBundle = (
+  username: string,
+  password: string,
+  path: string,
+  passphrase: string,
+) =>
+  invoke<void>("team_export_recovery_bundle", {
+    username, password, path, passphrase,
+  });
+
 /** How far this device's Create fleet key got. */
 export const teamFleetCustodyStatus = () =>
   invoke<FleetCustodyStatus>("team_fleet_custody_status");
