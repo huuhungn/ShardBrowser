@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button, Input } from "@proxyshard/shardx-ui-kit";
+import { Button, Checkbox, Input } from "@proxyshard/shardx-ui-kit";
 import { CopyField } from "../../../shared/ui/CopyField";
 import { toast } from "../../../shared/model/toast";
 import {
@@ -7,9 +7,10 @@ import {
   teamEnrollDevice, teamCollectCustody, useTeam,
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
-  type TeamStatus, type CustodyBootstrapStatus,
+  teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle,
+  type TeamStatus, type CustodyBootstrapStatus, type CustodyResult,
 } from "../../../entities/team";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { TeamDevices, type TeamAccount } from "./TeamDevices";
 import { TeamJoin } from "./TeamJoin";
 
@@ -64,6 +65,7 @@ export function TeamCard() {
   const [passphrase2, setPassphrase2] = useState("");
   const [keyPass, setKeyPass] = useState("");
   const [keyPass2, setKeyPass2] = useState("");
+  const [oldDeviceLost, setOldDeviceLost] = useState(false);
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -111,15 +113,21 @@ export function TeamCard() {
     toast.ok(t("team.deviceEnrolled"));
   });
 
-  const createKeyFile = () => run("keyFile", async () => {
-    if (keyPass.length < MIN_RECOVERY_PASSPHRASE) {
+  /** The floor and the match check every new passphrase has to pass. */
+  const passphrasesAgree = (a: string, b: string) => {
+    if (a.length < MIN_RECOVERY_PASSPHRASE) {
       toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
-      return;
+      return false;
     }
-    if (keyPass !== keyPass2) {
+    if (a !== b) {
       toast.err(t("team.recoveryPassphrasesDiffer"));
-      return;
+      return false;
     }
+    return true;
+  };
+
+  const createKeyFile = () => run("keyFile", async () => {
+    if (!passphrasesAgree(keyPass, keyPass2)) return;
     const next = await teamKeysCreateFile(keyPass);
     setKeyPass("");
     setKeyPass2("");
@@ -138,14 +146,7 @@ export function TeamCard() {
   });
 
   const bootstrap = () => run("bootstrap", async () => {
-    if (passphrase.length < MIN_RECOVERY_PASSPHRASE) {
-      toast.err(t("team.recoveryPassphraseTooShort", { n: MIN_RECOVERY_PASSPHRASE }));
-      return;
-    }
-    if (passphrase !== passphrase2) {
-      toast.err(t("team.recoveryPassphrasesDiffer"));
-      return;
-    }
+    if (!passphrasesAgree(passphrase, passphrase2)) return;
     // A resumed setup keeps the bundle it already wrote; the backend ignores
     // a new path then, so do not ask for one.
     let path = boot?.recovery_path ?? "";
@@ -172,10 +173,53 @@ export function TeamCard() {
     }
   });
 
-  const collect = () => run("collect", async () => {
+  const exportBundle = () => run("export", async () => {
+    if (!passphrasesAgree(passphrase, passphrase2)) return;
+    const path = await saveDialog({
+      defaultPath: "shardx-recovery.shxrecovery",
+      filters: [{ name: t("team.recoveryBundle"), extensions: ["shxrecovery"] }],
+    });
+    if (typeof path !== "string") return; // cancelled
     const typed = password;
     setPassword("");
-    const r = await teamCollectCustody(username, typed);
+    await teamExportRecoveryBundle(username.trim(), typed, path, passphrase);
+    setPassphrase("");
+    setPassphrase2("");
+    toast.ok(t("team.recovery.exported", { path }));
+  });
+
+  const importBundle = () => run("import", async () => {
+    const path = await openDialog({
+      multiple: false,
+      directory: false,
+      filters: [{ name: t("team.recoveryBundle"), extensions: ["shxrecovery"] }],
+    });
+    if (typeof path !== "string") return; // cancelled
+    const typed = password;
+    setPassword("");
+    try {
+      const r = await teamImportRecoveryBundle(path, passphrase, username.trim(), typed, oldDeviceLost);
+      setPassphrase("");
+      setOldDeviceLost(false);
+      toast.ok(t("team.recovery.imported"));
+      report(r);
+    } finally {
+      // A failed collect after the import still leaves this device the root custodian.
+      refresh();
+      void shareStatus();
+    }
+  });
+
+  const reset = () => run("reset", async () => {
+    const typed = password;
+    setPassword("");
+    setSt(await teamEnrollAgain(username.trim(), typed));
+    void shareStatus();
+    toast.ok(t("team.joinCode.enrollAgainDone"));
+  });
+
+  /** Toasts what a collect report says: grants opened, the fleet key kept, waiting or refused. */
+  const report = (r: CustodyResult) => {
     if (r.fleet_opened > 0) {
       toast.ok(t("team.fleetKeyCollected", { n: r.newest_fleet_generation ?? 0 }));
     }
@@ -203,15 +247,53 @@ export function TeamCard() {
     }
     // A kept fleet key turns has_fleet_key on, which ends the join steps.
     if (r.fleet_opened > 0) teamStatus().then(setSt).catch(() => {});
+  };
+
+  const collect = () => run("collect", async () => {
+    const typed = password;
+    setPassword("");
+    report(await teamCollectCustody(username, typed));
   });
 
   // A device session needs no token: the token only serves legacy passphrase sync.
   const connected = !!st && !!st.server_url && !!st.tenant_id;
+  // Nothing past the device's own seeds works while they cannot be read.
+  const lost = !!st && (st.keys_lost || st.key_store_unavailable);
   const account: TeamAccount = {
     username,
     signedIn: !!username.trim() && !!password,
     take: () => { setPassword(""); return password; },
   };
+
+  // Restoring the root custodian: on a fresh device, or on its own machine once its keys are lost.
+  const importForm = (
+    <div data-testid="team-import" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
+      <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.recovery.importHelp")}</p>
+      <Input
+        label={t("team.recoveryPassphrase")}
+        inputSize="small"
+        type="password"
+        autoComplete="off"
+        value={passphrase}
+        onChange={(e) => setPassphrase(e.target.value)}
+      />
+      <Checkbox
+        label={t("team.recovery.oldDeviceLost")}
+        checked={oldDeviceLost}
+        onChange={() => setOldDeviceLost((v) => !v)}
+      />
+      <div>
+        <Button
+          size="small"
+          mode="stroke"
+          disabled={!!busy || !connected || !username.trim() || !password || !passphrase || !oldDeviceLost}
+          onClick={importBundle}
+        >
+          {busy === "import" ? t("busy.importing") : t("team.recovery.import")}
+        </Button>
+      </div>
+    </div>
+  );
 
   return (
     <div data-testid="team-card" className="flex flex-col gap-2">
@@ -313,6 +395,7 @@ export function TeamCard() {
                   {t("team.saveServerAndTenantFirst")}
                 </p>
               )}
+              {importForm}
             </>
           ) : (
             <>
@@ -389,7 +472,7 @@ export function TeamCard() {
                 </div>
               )}
 
-              {st.can_receive_custody && st.can_sync && boot && !boot.activated && (
+              {!lost && st.can_receive_custody && st.can_sync && boot && !boot.activated && (
                 <div className="flex flex-col gap-2" data-testid="custody-bootstrap">
                   <p className="m-0 text-paragraph-xs text-text-soft-400">
                     {boot.started
@@ -443,7 +526,49 @@ export function TeamCard() {
                 </div>
               )}
 
-              {st.can_receive_custody ? (
+              {lost ? (
+                <div className="flex flex-col gap-2" data-testid="team-keys-lost">
+                  <p className="m-0 text-paragraph-xs text-state-error-base">
+                    {t(boot?.activated
+                      ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
+                      : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
+                  </p>
+                  {/* A root custodian whose store only did not answer has nothing to sign in for. */}
+                  {(!boot?.activated || st.keys_lost) && (
+                    <>
+                      <Input
+                        label={t("team.accountUsername")}
+                        inputSize="small"
+                        autoComplete="username"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.accountPassword")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="current-password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                      />
+                    </>
+                  )}
+                  {/* The root custodian is never reset: its way back is its recovery bundle. */}
+                  {boot?.activated ? st.keys_lost && importForm : (
+                    <div>
+                      <Button
+                        size="small"
+                        variant="error"
+                        mode="stroke"
+                        disabled={!!busy || !username.trim() || !password}
+                        onClick={reset}
+                      >
+                        {busy === "reset" ? t("busy.resetting") : t("team.recovery.reset")}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ) : st.can_receive_custody ? (
                 <>
                   {/* The bootstrap form above already holds the account login. */}
                   {!(st.can_sync && boot && !boot.activated) && (
@@ -487,6 +612,41 @@ export function TeamCard() {
                       onEnrolledAgain={(next) => { setSt(next); void shareStatus(); }}
                     />
                   ))}
+                  {st.can_sync && boot?.activated && (
+                    <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
+                      <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>
+                      <Input
+                        label={t("team.recoveryPassphrase")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={passphrase}
+                        onChange={(e) => setPassphrase(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.recoveryPassphraseAgain")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={passphrase2}
+                        onChange={(e) => setPassphrase2(e.target.value)}
+                      />
+                      <div>
+                        <Button
+                          size="small"
+                          mode="stroke"
+                          disabled={!!busy || !(st.has_fleet_key || st.fleet_key_blocked)
+                            || !username.trim() || !password || !passphrase || !passphrase2}
+                          onClick={exportBundle}
+                        >
+                          {busy === "export" ? t("busy.exporting") : t("team.recovery.export")}
+                        </Button>
+                      </div>
+                      {!(st.has_fleet_key || st.fleet_key_blocked) && (
+                        <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.recovery.exportNeedsFleetKey")}</p>
+                      )}
+                    </div>
+                  )}
                   <div>
                     <Button size="small" disabled={!!busy} onClick={collect}>
                       {busy === "collect" ? t("busy.collecting") : t("team.collectKeyCustody")}

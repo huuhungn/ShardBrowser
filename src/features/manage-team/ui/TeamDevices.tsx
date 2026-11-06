@@ -140,10 +140,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
       ) : done && !hasFleetKey ? (
         <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.devices.fleetKeyNotUsable")}</p>
       ) : ready ? (
-        <>
-          <p className="m-0 text-paragraph-xs text-text-sub-600">{t("team.devices.fleetKeyReady")}</p>
-          <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>
-        </>
+        <p className="m-0 text-paragraph-xs text-text-sub-600">{t("team.devices.fleetKeyReady")}</p>
       ) : (
         <>
           <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.fleetKeyHelp")}</p>

@@ -598,11 +598,19 @@ const teamPins = (page: Page) => page.evaluate(async () => {
   return (await ipc.invoke("team_profiles_status")).profiles.map((p) => `${p.sync_state}@${p.remote_version}`);
 });
 
-/** Open team device `device`'s Team page against `server`, its clock faked when `clock` is set. */
-async function teamDevicePage(page: Page, device: "a" | "b", server: ReturnType<typeof fakeTeamServer>, clock = false) {
+/**
+ * Open team device `device`'s Team page against `server`, its clock faked when
+ * `clock` is set. The longer names are B, or A, with seeds that do not read.
+ */
+async function teamDevicePage(
+  page: Page,
+  device: "a" | "b" | "keys-lost" | "key-store-unavailable" | "root-keys-lost" | "root-key-store-unavailable",
+  server: ReturnType<typeof fakeTeamServer>,
+  clock = false,
+) {
   if (clock) await page.clock.install();
   await page.exposeFunction("e2eTeamServer", server.call);
-  await gotoMocked(page, `/?e2e=team-device-${device}`);
+  await gotoMocked(page, device.length === 1 ? `/?e2e=team-device-${device}` : `/?e2e=team-${device}`);
   await page.getByRole("button", { name: "Team", exact: true }).click();
   return page.getByTestId("team-card");
 }
@@ -649,7 +657,7 @@ async function admitB(a: Page, b: Page) {
   await test.step("A creates the fleet key", async () => {
     await cardClick(a, "Create fleet key");
     await expect(a.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toBeVisible();
-    await expect(a.getByTestId("team-devices")).toContainText("The recovery bundle does not include the fleet key yet.");
+    await expect(a.getByTestId("team-export")).toContainText("A recovery bundle exported before 2.8.0 cannot restore the team");
   });
 
   const row = await test.step("B's join code is the code A's Devices shows, full key IDs too", async () => {
@@ -1123,6 +1131,191 @@ test("refreshed keys require a fresh join-code comparison", async ({ page: a }) 
   await expect(row.getByTestId("team-device-sas")).toHaveText("1234 5678 90ab cdef 1234 5678 90ab cdef");
   await expect(row.getByLabel("The code on the other device matches")).not.toBeChecked();
   await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+});
+
+// Recovery (plan v0.2.2b, S5): import, export, Reset, and the expired join code of G11.
+const OLD_DEVICE_LOST = "The old root custodian device is lost or its keys were reset";
+/** B as the `team-keys-lost` and `team-key-store-unavailable` mocks enroll it: active and joined. */
+const LOST_B: TeamDeviceRow = { device_id: "b0".repeat(16), label: "Lost B", status: "active", granted: true };
+
+test("a fresh device imports a recovery bundle and becomes root custodian", async ({ page: c }) => {
+  const server = fakeTeamServer([{ device_id: "d4".repeat(16), label: "Machine D", status: "pending", granted: false }]);
+  const card = await teamDevicePage(c, "b", server);
+  const form = card.getByTestId("team-import");
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(c, "Import recovery bundle");
+  await expect(c.getByText("The recovery bundle was imported.")).toBeVisible();
+  await expect(c.locator("html")).toHaveAttribute("data-e2e-import-path", "C:\\Users\\Example\\a.shxrecovery");
+  await expect(card.getByTestId("team-import")).toHaveCount(0);
+  await expect(card.getByText("Bootstrap anchor")).toBeVisible();
+  const row = await listDevices(c, "Machine D");
+  await row.getByLabel("The code on the other device matches").check();
+  await cardSignIn(c);
+  await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeEnabled();
+});
+
+test("the import needs the old device lost tick", async ({ page }) => {
+  const card = await teamDevicePage(page, "b", fakeTeamServer());
+  const form = card.getByTestId("team-import");
+  const button = form.getByRole("button", { name: "Import recovery bundle" });
+  await cardSignIn(page);
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await expect(button).toBeDisabled();
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await expect(button).toBeEnabled();
+  // This checks the mock only; the launcher's own refusal is unit-tested in recovery_import.rs.
+  const refused = await page.evaluate(async () => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    try {
+      await ipc.invoke("team_import_recovery_bundle", {
+        path: "C:\\Users\\Example\\a.shxrecovery", passphrase: "correct horse", username: "owner", password: "pw", oldDeviceLost: false,
+      });
+      return false;
+    } catch (e) { return String(e).includes("recovery.confirmOldDeviceLost"); }
+  });
+  expect(refused).toBe(true);
+  await expect(card.getByTestId("team-import")).toBeVisible();
+});
+
+test("an import whose collect is refused another fleet key says so", async ({ page: c }) => {
+  const card = await teamDevicePage(c, "b", fakeTeamServer());
+  // As the follow-up collect finding another key than this device holds for that generation.
+  await c.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_import_recovery_bundle"
+        ? { ...(result as object), fleet_opened: 0, newest_fleet_generation: null, fleet_refusal: "KEY_SUBSTITUTION_DETECTED" }
+        : result;
+    };
+  });
+  const form = card.getByTestId("team-import");
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(c, "Import recovery bundle");
+  await expect(c.getByText("The recovery bundle was imported.")).toBeVisible();
+  await expect(c.getByText("Refused: the team server offered another fleet key")).toBeVisible();
+  await expect(c.getByText("Fleet key collected")).toHaveCount(0);
+});
+
+test("the root custodian exports a recovery bundle, and Export is off before the fleet key exists", async ({ page: a }) => {
+  await teamDevicePage(a, "a", fakeTeamServer());
+  const out = a.getByTestId("team-export");
+  await expect(out).toContainText("A recovery bundle exported before 2.8.0 cannot restore the team");
+  const button = out.getByRole("button", { name: "Export recovery bundle" });
+  await cardSignIn(a);
+  await out.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await out.getByLabel("Recovery passphrase again").fill("correct horse");
+  await expect(button).toBeDisabled();
+  await expect(out).toContainText("Create the fleet key above before exporting the recovery bundle.");
+  await cardClick(a, "Create fleet key");
+  await expect(out).not.toContainText("Create the fleet key above");
+  await cardSignIn(a);
+  await button.click();
+  await expect(a.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
+  await expect(a.locator("html")).toHaveAttribute("data-e2e-export-path", "C:\\Users\\Example\\shardx-recovery.shxrecovery");
+});
+
+test("a member whose keys are lost is reset after a custodian revokes it, then enrolls again", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  const server = fakeTeamServer([LOST_B]);
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  try {
+    await teamDevicePage(a, "a", server);
+    const cardB = await teamDevicePage(b, "keys-lost", server);
+    await expect(cardB.getByTestId("team-keys-lost")).toContainText("Ask a custodian to revoke this device, then reset it.");
+    await cardClick(a, "Create fleet key");
+    const row = await listDevices(a, "Lost B");
+    await cardSignIn(a);
+    await row.getByRole("combobox", { name: "Reason" }).click();
+    await a.getByRole("option", { name: "Lost" }).click();
+    await row.getByRole("button", { name: "Revoke" }).click();
+    await a.getByRole("dialog").getByRole("button", { name: "Revoke" }).click();
+    await expect(row).toContainText("Revoked");
+
+    await cardClick(b, "Reset this device");
+    await expect(b.getByText("This device's identity was cleared.")).toBeVisible();
+    await expect(cardB.getByTestId("team-keys-lost")).toHaveCount(0);
+    await teamEnroll(b, "Machine B");
+    expect(server.devices.map((d) => `${d.label}:${d.status}`)).toEqual(["Machine A:active", "Lost B:revoked", "Machine B:pending"]);
+  } finally { await b.context().close(); }
+});
+
+test("a member whose keys are lost and is still active is told to ask for revocation, and Reset is refused", async ({ page }) => {
+  const server = fakeTeamServer([LOST_B]);
+  const card = await teamDevicePage(page, "keys-lost", server);
+  const lost = card.getByTestId("team-keys-lost");
+  await expect(lost).toContainText("This device's keys are lost. Ask a custodian to revoke this device, then reset it.");
+  await expect(card.getByTestId("team-join")).toHaveCount(0);
+  await expect(card.getByTestId("team-import")).toHaveCount(0);
+  await cardClick(page, "Reset this device");
+  await expect(page.getByText(
+    "This device cannot enroll again: it is the root custodian, has joined the team, or the team server does not list it as waiting, approved or revoked",
+  )).toBeVisible();
+  await expect(lost).toBeVisible();
+  expect(server.devices.find((d) => d.label === "Lost B")?.status).toBe("active");
+});
+
+test("a member whose key store is unavailable sees the try again notice, not keys lost", async ({ page }) => {
+  const card = await teamDevicePage(page, "key-store-unavailable", fakeTeamServer([LOST_B]));
+  const notice = card.getByTestId("team-keys-lost");
+  await expect(notice).toContainText("The key store did not answer; try again before resetting this device.");
+  await expect(notice).not.toContainText("keys are lost");
+  await expect(notice.getByRole("button", { name: "Reset this device" })).toBeVisible();
+});
+
+test("a root custodian whose keys are lost is offered import, not Reset", async ({ page: a }) => {
+  const card = await teamDevicePage(a, "root-keys-lost", fakeTeamServer());
+  const lost = card.getByTestId("team-keys-lost");
+  await expect(lost).toContainText("import your recovery bundle to restore it");
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  await expect(card.getByTestId("team-devices")).toHaveCount(0);
+  await lost.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await lost.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(a, "Import recovery bundle");
+  await expect(card.getByTestId("team-keys-lost")).toHaveCount(0);
+  await expect(card.getByTestId("team-devices")).toBeVisible();
+});
+
+test("a root custodian whose key store is unavailable is told to try again, with no Reset or sign-in", async ({ page: a }) => {
+  const card = await teamDevicePage(a, "root-key-store-unavailable", fakeTeamServer());
+  const notice = card.getByTestId("team-keys-lost");
+  await expect(notice).toContainText("The key store did not answer; try again. This device is the root custodian and cannot be reset.");
+  await expect(notice.getByLabel("Account username")).toHaveCount(0);
+  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(card.getByTestId("team-import")).toHaveCount(0);
+});
+
+test("an expired join code of a revoked device offers Enroll again", async ({ page: b }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(b, "b", server, true);
+  await teamEnroll(b, "Machine B");
+  await cardClick(b, "Show join code");
+  await expect(b.getByTestId("team-join-sas")).toBeVisible();
+  Object.assign(server.devices.find((d) => d.label === "Machine B")!, { status: "revoked" });
+  await b.clock.fastForward("10:01");
+  await cardClick(b, "Show join code");
+  await expect(card.getByTestId("team-join")).toContainText("This join code has expired.");
+  await cardClick(b, "Enroll again");
+  await expect(card.getByRole("button", { name: "Enroll this device" })).toBeVisible();
+});
+
+test("an expired join code of a device the server no longer lists shows why and no Enroll again", async ({ page: b }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(b, "b", server, true);
+  await teamEnroll(b, "Machine B");
+  await cardClick(b, "Show join code");
+  await expect(b.getByTestId("team-join-sas")).toBeVisible();
+  server.devices.splice(server.devices.findIndex((d) => d.label === "Machine B"), 1);
+  await b.clock.fastForward("10:01");
+  await cardClick(b, "Show join code");
+  const join = card.getByTestId("team-join");
+  await expect(join).toContainText("This join code has expired.");
+  await expect(join).toContainText("the team server does not list it as waiting, approved or revoked");
+  await expect(card.getByRole("button", { name: "Enroll again" })).toHaveCount(0);
 });
 
 test("connecting needs no token", async ({ page }) => {

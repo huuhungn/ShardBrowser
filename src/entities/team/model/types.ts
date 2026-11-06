@@ -48,6 +48,13 @@ export type TeamStatus = {
    * be used until the passphrase is entered.
    */
   keys_locked: boolean;
+  /**
+   * An enrolled seed is gone for good: the device can only be reset, or for
+   * the root custodian, restored by importing its recovery bundle.
+   */
+  keys_lost: boolean;
+  /** The OS credential store did not answer for an enrolled seed; try again before resetting. */
+  key_store_unavailable: boolean;
 };
 
 /** How far `team_bootstrap_custody` got; none of its secrets. */

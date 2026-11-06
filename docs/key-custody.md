@@ -82,13 +82,17 @@ file permissions alone. Keychain and kernel keyring are not wired up.
 > resetting it (from another account or with `net user`) makes them
 > unreadable for good on a local Windows account. A domain-joined account may
 > recover them through the domain's DPAPI backup key; that was not checked.
-> The launcher has no recovery for this: `team.json` still holds the key
-> references, so it reports the device as enrolled and refuses Enroll this
-> device. For a member device, a custodian revokes it; then, with the launcher
-> closed, move `team.json` out of `%APPDATA%\shardx-launcher`, reopen the
-> launcher, save the server URL and tenant ID again, and enroll it as a new
-> device. For the root custodian the team is lost until recovery-bundle import
-> ships.
+> The Team page then says the keys are lost (`keys_lost`), or that the key
+> store did not answer (`key_store_unavailable`: try again before resetting).
+> A member device is reset: a custodian revokes it, then **Reset this device**
+> (`team_enroll_again`, which accepts a pending, an unpinned active or a
+> revoked row) copies `team.json` aside as `team.json.unreadable-<ms>`, keeps
+> the old credentials, and the device enrolls again as a new row. The root
+> custodian is never reset: it imports its recovery bundle (see "Recovery").
+> For a member whose keys are lost and that the server **no longer lists**,
+> Reset is refused; with the launcher closed, move `team.json` out of
+> `%APPDATA%\shardx-launcher`, reopen the launcher, save the server URL and
+> tenant ID again, and enroll it as a new device.
 
 ## What the design calls for
 
@@ -233,9 +237,75 @@ generation 0 is filed, and that generation pins the bundle's hash
 (`root_bootstrap.rs`).
 
 Create fleet key also files a *recovery grant*: the fleet key wrapped under the
-TRK, kept on the team server. The bundle does not yet hold the fleet key; the
-fleet key stays recoverable through that server recovery grant (the bundle's
-TRK opens it). No restore command ships yet, so this path is not automated.
+TRK, kept on the team server.
+
+### Recovery bundle v3 (2.8.0)
+
+From 2.8.0 the bundle's plaintext is v3: besides the TRK, the anchor ID and
+the fleet keys it retains, it carries the root custodian's account and device
+IDs, its signing and HPKE seeds and its exact first root self-grant. **A v3
+bundle plus its passphrase is the root custodian device.** The team account
+password adds no factor (every team device signs in as the one owner
+account), so keep the bundle offline. A bundle exported before 2.8.0 holds no
+root custodian and cannot restore the team (`recovery.bundleWithoutCustodian`):
+the root custodian exports a new one with **Export recovery bundle** on the
+Team page, once it holds the fleet key (`team_export_recovery_bundle`; it
+files nothing and changes no state file). A bundle works only while the root
+custodian's approval and grants run: 365 days from bootstrap. 2.7.x cannot
+read the v3 state an import writes, so do not downgrade after an import.
+
+**Import** (`team_import_recovery_bundle`, under "Restore root custodian from a
+recovery bundle" on the Team page) runs on a fresh device, or on the root
+custodian's own machine after its keys were lost. The user ticks that the old
+root custodian device is lost or its keys were reset. The import refuses to
+run over another device's identity (`recovery.deviceHasIdentity`: reset a
+member first), checks the bundle against the saved tenant and against the
+anchor this device already trusts for that tenant before any request
+(`recovery.otherAnchor`), then against the server's live row of the bundle's
+device (`recovery.otherServer`, `recovery.otherAccount`,
+`recovery.deviceNotActive`), opens a session with the bundle's keys, reads the
+root self-grant back, writes the state files and `team.json` last, then
+collects the fleet key. A member's `fleet-custody.json` found on the device is
+moved aside as `fleet-custody.json.replaced-<ms>` and written again for the
+root custodian; another custodian's is refused (`fleet.custodyOtherDevice`). A failed collect leaves the
+import done (`recovery.importedCollectFailed`); run Collect key custody again.
+When the session challenge answers 409 for a row the server listed as active
+with the bundle's keys, the import reports `recovery.approvalExpired`; the
+challenge's rare other 409s ("keys need reconciliation", "cannot hold a
+session") read the same way.
+
+What an import does not carry:
+
+- `key_first_seen` starts empty, so a device that was pending when the root
+  was lost gets a new ten-minute approval window on the importing machine.
+  The code comparison still gates it.
+- An approval the lost root filed whose fleet grant was not filed cannot be
+  finished: approvals start empty. Revoke that device and have it enroll
+  again.
+- Saved revocations start empty; a revocation the lost root saved but never
+  filed is rebuilt when the user revokes again.
+
+Import and Reset remove from the `fleet-keys.json` index every fleet key that
+does not open (any reason but a key file not opened yet), after copying the
+file aside as `fleet-keys.json.unopenable-<ms>`. Stored keys are never deleted;
+the next collect writes the key again from its verified grant. A 2.4.2 key
+that left the index during a passing store fault has no verified grant and is
+not collected again: restore it from the copy, which helps only while a later
+collect has not rewritten the credential `fleet-key.{fleet}.{generation}`.
+
+The root custodian keeps its connection: changing its server URL or tenant
+is refused (`fleet.rootCustodianKeepsConnection`) unless both its device
+keys are lost; then `team.json` is copied aside, nothing is forgotten, and
+import is the way back. Any change of the URL string counts, so a root
+custodian whose server moved to a new LAN address or port cannot change it on
+the Team page: with the launcher closed, edit `server_url` in `team.json`.
+
+A corrupt `fleet-custody.json` blocks a server or tenant change and a member
+Reset: both clear the saved acknowledgements in that file, and when it does
+not parse they fail closed before `team.json` changes. Reset has by then
+already removed the unopenable fleet keys from the `fleet-keys.json` index
+only. That is harmless: the file was copied aside first, the stored keys are
+kept, and a later collect writes a verified key again.
 
 The recovery passphrase is not stored anywhere: losing it and every device
 that holds the keys loses the team profiles. Backups of `team.json` preserve
@@ -263,15 +333,16 @@ Roughly the sequence the constraints force:
    seal under the verified fleet key. Local `.shxbak` files keep the
    passphrase, since they have no tenant and should stay openable on a machine
    that has never enrolled, and so does legacy passphrase sync.
-5. ~~**Recovery bundle plus readback.**~~ Done for the TRK. The fleet key is
-   recoverable through the server recovery grant; no restore command ships.
+5. ~~**Recovery bundle plus readback.**~~ Done. From 2.8.0 the v3 bundle
+   carries the root custodian itself, and import restores it (see "Recovery").
 6. **Move device keys into the OS credential store.** Done on Windows
    (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
    key file as the fallback. Keychain and kernel keyring are not wired up.
 
 Still to come: root and fleet key rotation (a revoked device keeps generation
-0), a restore command for the recovery bundle, and renewal of approvals and
-grants, which run one year.
+0), moving root custody to a new device row so a lost machine or an old bundle
+stops being a root custodian, and renewal of approvals and grants, which run
+one year.
 
 ## Threat model, stated plainly
 
@@ -331,10 +402,12 @@ under the same Windows account with the same DPAPI master key. An
 administrator resetting the account password, reinstalling Windows and copying
 `%APPDATA%` back, or moving the files to another account or machine leaves
 them unreadable. A backup of these files therefore no longer carries a device
-identity across machines: the device must enroll again, and the Launcher says
-so (`keyStore.otherWindowsAccount`) instead of reporting a corrupt key. The
-fleet keys in `fleet-keys.json` are lost the same way: the device enrolls
-again, is approved again and collects the fleet key again.
+identity across machines: a member device must enroll again, and the Launcher
+says so (`keyStore.otherWindowsAccount`) instead of reporting a corrupt key.
+The fleet keys in `fleet-keys.json` are lost the same way: the device enrolls
+again, is approved again and collects the fleet key again. The root
+custodian's identity survives through its v3 recovery bundle instead: import
+it on the new machine or account (see "Recovery").
 
 What does not hold:
 

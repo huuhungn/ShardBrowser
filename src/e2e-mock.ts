@@ -279,7 +279,17 @@ let keyState = scenario === "team-first-device-resume"
     ? { keys_protected: true, has_key_file: true, keys_locked: true }
     : { keys_protected: true, has_key_file: false, keys_locked: false };
 // "team-device-a" and "team-device-b": two devices of one fleet (see below).
-const teamDevice = scenario === "team-device-a" || scenario === "team-device-b" ? scenario.slice(-1) : null;
+// "team-keys-lost" and "team-key-store-unavailable" are B enrolled and joined
+// as "b0"x16, whose seeds are lost or whose key store does not answer;
+// "team-root-keys-lost" and "team-root-key-store-unavailable" are A, the root
+// custodian, with its seeds lost or its key store not answering.
+const TEAM_SEEDS: Record<string, "lost" | "unavailable"> = {
+  "team-keys-lost": "lost", "team-key-store-unavailable": "unavailable", "team-root-keys-lost": "lost",
+  "team-root-key-store-unavailable": "unavailable",
+};
+let teamSeeds: "lost" | "unavailable" | null = TEAM_SEEDS[scenario] ?? null;
+const teamDevice = scenario === "team-device-a" || scenario.startsWith("team-root-") ? "a"
+  : scenario === "team-device-b" || teamSeeds ? "b" : null;
 // The connection `team_set_connection` saved. A device session needs no token.
 let teamConnection = teamDevice
   ? { server_url: "https://team.example.com", tenant_id: "22222222222222222222222222222222", has_token: false }
@@ -289,7 +299,9 @@ let teamConnection = teamDevice
 type TeamMe = { device_id: string; enrolled_at_ms: number; pinned: boolean; collected: boolean };
 let teamMe: TeamMe = teamDevice === "a"
   ? { device_id: "aa".repeat(16), enrolled_at_ms: 0, pinned: true, collected: false }
-  : { device_id: "", enrolled_at_ms: 0, pinned: false, collected: false };
+  : teamSeeds
+    ? { device_id: "b0".repeat(16), enrolled_at_ms: 0, pinned: true, collected: true }
+    : { device_id: "", enrolled_at_ms: 0, pinned: false, collected: false };
 const teamStatusFixture = () => (firstDevice
   ? {
     server_url: "https://team.example.com",
@@ -309,7 +321,8 @@ const teamStatusFixture = () => (firstDevice
   : {
     ...teamConnection,
     device_id: teamMe.device_id,
-    ...(teamMe.device_id ? teamKeyIds(teamMe.device_id) : teamNoKeyIds),
+    // As the backend: no key IDs while a seed cannot be read.
+    ...(teamMe.device_id && !teamSeeds ? teamKeyIds(teamMe.device_id) : teamNoKeyIds),
     is_enrolled: !!teamMe.device_id,
     keys_unreadable: false,
     can_sync: !!teamMe.device_id,
@@ -319,6 +332,8 @@ const teamStatusFixture = () => (firstDevice
     keys_protected: true,
     has_key_file: false,
     keys_locked: false,
+    keys_lost: teamSeeds === "lost",
+    key_store_unavailable: teamSeeds === "unavailable",
   });
 // `teamRefuse=<command>[,<command>]` makes those team commands refuse the way
 // the backend does, before anything changes.
@@ -386,7 +401,7 @@ const TEAM_SYNC = new Set([
 async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
   const args = (payload ?? {}) as {
     profileId?: string; remoteProfileId?: string; localProfileId?: string; deviceId?: string; sas?: string;
-    reason?: string; anchor?: string; label?: string;
+    reason?: string; anchor?: string; label?: string; path?: string; oldDeviceLost?: boolean;
   };
   const id = String(args.profileId ?? args.localProfileId ?? "");
   const head = () => ({ remote_profile_id: teamRemoteOf.get(id), pin: teamBound(payload).remote_version });
@@ -400,6 +415,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       const { device_id } = await teamServer<{ device_id: string }>("enroll", { label: args.label });
       // A pin binds the server, tenant and anchor, not the device, so it stays.
       teamMe = { device_id, enrolled_at_ms: Date.now(), pinned: teamMe.pinned, collected: false };
+      teamSeeds = null;
       return teamStatusFixture();
     }
     case "team_fleet_key_setup":
@@ -444,7 +460,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       try { teamWindowOpen(); } catch (e) {
         // As the launcher: an expired code says when Enroll again would be refused.
         const status = await teamServer<string | null>("status", me);
-        if (!(status === "pending" || (status === "active" && !teamMe.pinned))) {
+        if (!(status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned))) {
           teamRefuse(status === "active" ? "fleet.joinedCollectKey" : "fleet.enrollAgainRefused");
         }
         throw e;
@@ -463,12 +479,36 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return null;
     case "team_enroll_again": {
       const status = await teamServer<string | null>("status", me);
-      if (custodyBootstrap.activated || !(status === "pending" || (status === "active" && !teamMe.pinned))) {
-        teamRefuse("fleet.enrollAgainRefused");
-      }
+      const allowed = status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned);
+      if (custodyBootstrap.activated || !allowed) teamRefuse("fleet.enrollAgainRefused");
       teamMe = { ...teamMe, device_id: "", enrolled_at_ms: 0, collected: false };
+      teamSeeds = null;
       return teamStatusFixture();
     }
+    case "team_import_recovery_bundle": {
+      // Every bundle restores A, the fixtures' root custodian, as the launcher checks it.
+      const bundle = "aa".repeat(16);
+      if (!args.oldDeviceLost) teamRefuse("recovery.confirmOldDeviceLost");
+      if (teamMe.device_id && teamMe.device_id !== bundle) teamRefuse("recovery.deviceHasIdentity");
+      if (await teamServer<string | null>("status", { device_id: bundle }) !== "active") {
+        teamRefuse("recovery.deviceNotActive");
+      }
+      document.documentElement.dataset.e2eImportPath = String(args.path ?? "");
+      teamMe = { device_id: bundle, enrolled_at_ms: 0, pinned: true, collected: true };
+      teamSeeds = null;
+      custodyBootstrap = { started: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR };
+      fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
+      return {
+        grants: 0, opened: 0, failed: 0, newest_generation: null, fleet_opened: 1, fleet_failed: 0,
+        newest_fleet_generation: 0, fleet_grants_waiting: 0, fleet_refusal: null, can_sync_without_passphrase: false,
+      };
+    }
+    case "team_export_recovery_bundle":
+      teamCustodian();
+      await teamServer("live", me);
+      if (!teamMe.collected) teamRefuse("fleet.recoveryExportNeedsFleetKey");
+      document.documentElement.dataset.e2eExportPath = String(args.path ?? "");
+      return null;
     case "team_collect_custody": {
       const { granted } = await teamServer<{ granted: boolean }>("collect", me);
       // A grant is kept only once this device pins the anchor to verify it against.
@@ -696,6 +736,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     // Directory pickers are native; the suite drives the value the operator
     // would have chosen so the adopt path stays exercisable headlessly.
     case "plugin:dialog|open":
+      if (JSON.stringify(payload ?? {}).includes("shxrecovery")) return "C:\\Users\\Example\\a.shxrecovery";
       return scenario === "mcp-adopt-cancelled"
         ? null
         : "C:\\Users\\Example\\Existing-MCP";
