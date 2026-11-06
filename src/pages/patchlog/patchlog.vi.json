@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.7.1",
+      "date": "2026-11-06",
+      "entries": [
+        {
+          "id": "team-first-device-key-ids",
+          "title": "Trang Team: mã khoá của thiết bị này và lý do Approve bị tắt",
+          "lead": "Phát hiện trong lần chạy thật đầu tiên trên hai máy của bản 2.7.0.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thiết bị đã enroll giờ hiện mã khoá ký và mã khoá mã hoá (HPKE) của chính nó ngay dưới Device ID, có nút sao chép, để người vận hành đối chiếu khi xác nhận thiết bị đầu tiên của team trên server."
+            },
+            {
+              "type": "p",
+              "text": "Khi danh sách có thiết bị chờ duyệt mà nút Approve đang tắt, giờ có dòng nói rõ đang chờ mật khẩu tài khoản hay chờ Create fleet key."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.7.0",
       "date": "2026-11-06",
       "entries": [

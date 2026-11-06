@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.7.1",
+      "date": "2026-11-06",
+      "entries": [
+        {
+          "id": "team-first-device-key-ids",
+          "title": "Team page: this device's key IDs, and why Approve is off",
+          "lead": "Found in the first real two-machine run of 2.7.0.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "An enrolled device now shows its own signing and encryption (HPKE) key IDs under its Device ID, with copy buttons, so the operator can match them when confirming the team's first device on the server."
+            },
+            {
+              "type": "p",
+              "text": "When a pending device is listed but Approve is off, the device list now says whether it is waiting for the account password or for Create fleet key."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.7.0",
       "date": "2026-11-06",
       "entries": [
