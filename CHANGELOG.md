@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Team
+
+- **This device's key IDs.** An enrolled device's Team page shows its full
+  signing key ID and encryption (HPKE) key ID next to its Device ID, with a
+  copy button, so the operator can compare them with what
+  `tenant confirm-first-device` prints.
+- **Why Approve is off.** With a pending device listed, the device list says
+  when Approve waits for the account password or for Create fleet key.
+
 ## v2.7.0
 
 A Team release: the root custodian creates the team's fleet key, approves a
