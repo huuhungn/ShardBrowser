@@ -3039,12 +3039,20 @@ async fn team_import_recovery_bundle(
         .await
         .map_err(|e| e.to_string())?;
     }
-    let report = team_collect_custody(username, password).await;
+    imported_collect(team_collect_custody(username, password).await)
+}
+
+/// The collect after an import: its failure says the import itself is done,
+/// so the UI offers Collect key custody rather than a new import.
+fn imported_collect(
+    report: Result<serde_json::Value, String>,
+) -> Result<serde_json::Value, String> {
     eprintln!(
         "[recovery] import collect: {}",
         if report.is_ok() { "ok" } else { "failed" }
     );
     report
+        .map_err(|e| crate::errcode::code_with("recovery.importedCollectFailed", &[("error", &e)]))
 }
 
 /// Whether a device the server lists as `status` may enroll again: while
@@ -3631,6 +3639,27 @@ mod custody_tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A collect that fails after an import says the import is done, and
+    /// keeps the collect's own error; a report passes through.
+    #[test]
+    fn a_failed_collect_after_an_import_says_the_import_is_done() {
+        let failed = errcode::code_with(
+            "fleet.refusedCustody",
+            &[("status", "503"), ("detail", "down")],
+        );
+        let err = imported_collect(Err(failed)).unwrap_err();
+        assert!(
+            errcode::has_code(&err, "recovery.importedCollectFailed"),
+            "{err}"
+        );
+        assert!(errcode::has_code(
+            &errcode::unescape_value(&err),
+            "fleet.refusedCustody"
+        ));
+        let report = serde_json::json!({ "fleet_opened": 1 });
+        assert_eq!(imported_collect(Ok(report.clone())), Ok(report));
     }
 
     /// A fleet grant this device cannot verify is only counted: the server

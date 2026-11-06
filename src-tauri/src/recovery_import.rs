@@ -31,10 +31,6 @@ use crate::fleet_custody::FleetCustodyState;
 use crate::root_bootstrap::{now_ms, own_grant, unhex_vec, BootstrapState};
 use crate::team_config::TeamConfig;
 
-fn refused(key: &str) -> anyhow::Error {
-    anyhow!(crate::errcode::code(key))
-}
-
 /// One state write of step 6. Each goes through the caller's `save`, which
 /// tests fail on purpose.
 pub enum Write<'a> {
@@ -90,13 +86,13 @@ fn refused_with(e: &anyhow::Error, key: &str, status: &str) -> bool {
         .is_some_and(|args| args.split('|').any(|field| field == status))
 }
 
-/// Step 4: once step 3 saw this device active with the bundle's keys, a 409
-/// on the session means its row holds no live approval (the server's other
-/// 409s are rare then, and read the same). Only the status decides, never
-/// the server's text; without that listing the error stands.
-fn session_refusal(e: anyhow::Error, listed_active: bool) -> anyhow::Error {
-    if listed_active && refused_with(&e, "fleet.refusedSession", "409") {
-        refused("recovery.approvalExpired")
+/// Step 4, run only once step 3 saw this device active with the bundle's
+/// keys: a 409 on the session then means its row holds no live approval (the
+/// server's other 409s are rare then, and read the same). Only the status
+/// decides, never the server's text.
+fn session_refusal(e: anyhow::Error) -> anyhow::Error {
+    if refused_with(&e, "fleet.refusedSession", "409") {
+        anyhow!(crate::errcode::code("recovery.approvalExpired"))
     } else {
         e
     }
@@ -119,7 +115,9 @@ fn preconditions(
         bail!(crate::errcode::code("fleet.setAccountFirst"));
     }
     if !old_device_lost {
-        return Err(refused("recovery.confirmOldDeviceLost"));
+        return Err(anyhow!(crate::errcode::code(
+            "recovery.confirmOldDeviceLost"
+        )));
     }
     Ok(())
 }
@@ -133,10 +131,12 @@ fn custodian_of<'b>(
     plaintext: &'b RecoveryBundlePlaintextV2,
 ) -> Result<&'b RootCustodian> {
     let Some(custodian) = &plaintext.root_custodian else {
-        return Err(refused("recovery.bundleWithoutCustodian"));
+        return Err(anyhow!(crate::errcode::code(
+            "recovery.bundleWithoutCustodian"
+        )));
     };
     if decode_hex16(&c.tenant_id, "tenant_id").ok() != Some(header.tenant_id) {
-        return Err(refused("recovery.otherTenant"));
+        return Err(anyhow!(crate::errcode::code("recovery.otherTenant")));
     }
     let other = !c.device_id.is_empty()
         && (!c.device_id.eq_ignore_ascii_case(&hex(&custodian.device_id))
@@ -144,9 +144,21 @@ fn custodian_of<'b>(
                 .is_ok_and(|k| k.to_bytes() != *custodian.signing_key_seed)
             || c.hpke_seed().is_ok_and(|s| s != *custodian.hpke_key_seed));
     if other {
-        return Err(refused("recovery.deviceHasIdentity"));
+        return Err(anyhow!(crate::errcode::code("recovery.deviceHasIdentity")));
     }
     Ok(custodian)
+}
+
+/// A tenant this device already pinned keeps its anchor: a bundle naming
+/// another one (a made-up bundle from a server posing as the team's) is
+/// refused before any request.
+fn check_pin(header: &RecoveryBundleHeaderV2, plaintext: &RecoveryBundlePlaintextV2) -> Result<()> {
+    match crate::tenant_pin(&header.tenant_id)? {
+        Some((_, anchor, _)) if anchor != plaintext.bootstrap_anchor_signing_key_id => {
+            Err(anyhow!(crate::errcode::code("recovery.otherAnchor")))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Step 3: the server is the bundle's, the ticket's account is the bundle's,
@@ -162,13 +174,13 @@ fn check_listing(
         .server_instance_id
         .eq_ignore_ascii_case(&hex(&header.server_instance_id))
     {
-        return Err(refused("recovery.otherServer"));
+        return Err(anyhow!(crate::errcode::code("recovery.otherServer")));
     }
     if !me
         .account_id
         .eq_ignore_ascii_case(&hex(&custodian.account_id))
     {
-        return Err(refused("recovery.otherAccount"));
+        return Err(anyhow!(crate::errcode::code("recovery.otherAccount")));
     }
     let active = me.device.as_ref().is_some_and(|d| {
         d.status == "active"
@@ -176,7 +188,7 @@ fn check_listing(
             && d.hpke_key_id.eq_ignore_ascii_case(hpke_id)
     });
     if !active {
-        return Err(refused("recovery.deviceNotActive"));
+        return Err(anyhow!(crate::errcode::code("recovery.deviceNotActive")));
     }
     Ok(())
 }
@@ -193,7 +205,7 @@ async fn check_root_grant(
     hpke_secret: &[u8],
     trk: &[u8; 32],
 ) -> Result<()> {
-    let missing = || refused("recovery.rootGrantMissing");
+    let missing = || anyhow!(crate::errcode::code("recovery.rootGrantMissing"));
     let (grant, grant_ref) = own_grant(container, signer).map_err(|_| missing())?;
     let descriptor = client
         .read_root_grant(
@@ -239,8 +251,10 @@ pub async fn run(
         "preconditions",
         preconditions(&c, username, password, old_device_lost),
     )?;
-    let file = logged("read", std::fs::read(path).map_err(anyhow::Error::from))?;
-    let (header, plaintext) = logged("open", rb::open(&file, passphrase).map_err(|e| anyhow!(e)))?;
+    // Neither the passphrase nor the file's content is in the error.
+    let unopened = || anyhow!(crate::errcode::code("recovery.bundleDoesNotOpen"));
+    let file = logged("read", std::fs::read(path).map_err(|_| unopened()))?;
+    let (header, plaintext) = logged("open", rb::open(&file, passphrase).map_err(|_| unopened()))?;
     let bundle = Bundle {
         path,
         file: &file,
@@ -259,6 +273,7 @@ pub(crate) async fn import(
     save: &mut impl FnMut(Write<'_>) -> Result<()>,
 ) -> Result<()> {
     let custodian = logged("bundle", custodian_of(c, &bundle.header, &bundle.plaintext))?;
+    logged("pin", check_pin(&bundle.header, &bundle.plaintext))?;
     let tenant = c.tenant_id.clone();
     let device = hex(&custodian.device_id);
     let signer = Ed25519SigningKey::from_bytes(&custodian.signing_key_seed);
@@ -293,7 +308,7 @@ pub(crate) async fn import(
         client
             .open_device_session(&login, &device, &signer, &custodian.hpke_key_seed)
             .await
-            .map_err(|e| session_refusal(e, true)),
+            .map_err(session_refusal),
     )?;
     let access = session.access_token.as_str();
     let checked = async {
@@ -359,6 +374,18 @@ fn write(
     let anchor = hex(&bundle.plaintext.bootstrap_anchor_signing_key_id);
     let self_grant = hex(&custodian.first_self_grant);
     let instance = hex(&bundle.header.server_instance_id);
+
+    // `team.json` may have changed during the network steps (Enroll, a new
+    // connection): only the identity that was checked is written over.
+    let now = crate::team_config::load()?;
+    let unchanged = now.server_url == c.server_url
+        && now.tenant_id == c.tenant_id
+        && now.device_id == c.device_id
+        && now.signing_credential_ref == c.signing_credential_ref
+        && now.hpke_credential_ref == c.hpke_credential_ref;
+    if !unchanged {
+        bail!(crate::errcode::code("recovery.deviceHasIdentity"));
+    }
 
     // A6: a root state on disk is kept only when it is this one.
     let root_on_disk = crate::store::custody_bootstrap_path()?.exists();
@@ -726,23 +753,14 @@ mod tests {
         assert!(unchanged);
     }
 
+    /// An echoed `status=409` in the server's text forges no field.
     #[test]
-    fn a_409_without_an_active_matching_listing_keeps_the_servers_error() {
-        let conflict = anyhow!(crate::errcode::code_with(
-            "fleet.refusedSession",
-            &[("status", "409"), ("detail", "the device is revoked")],
-        ));
-        let kept = session_refusal(conflict, false).to_string();
-        assert!(
-            crate::errcode::has_code(&kept, "fleet.refusedSession"),
-            "{kept}"
-        );
-        // An echoed `status=409` in the detail forges no field.
+    fn an_echoed_status_is_not_read_as_a_409() {
         let echoed = anyhow!(crate::errcode::code_with(
             "fleet.refusedSession",
             &[("status", "500"), ("detail", "x|status=409")],
         ));
-        let kept = session_refusal(echoed, true).to_string();
+        let kept = session_refusal(echoed).to_string();
         assert!(
             crate::errcode::has_code(&kept, "fleet.refusedSession"),
             "{kept}"
@@ -926,16 +944,24 @@ mod tests {
         assert_eq!(saved.signing_key().unwrap().to_bytes(), SIGNING_SEED);
         assert_eq!(saved.hpke_seed().unwrap(), HPKE_SEED);
 
-        // This custodian's own state is kept, less a foreign ack.
+        // This custodian's own state is kept, less a foreign ack; the ack of
+        // its own device grant stays.
+        let own = own_ack(&f.self_grant);
         let kept = FleetCustodyState {
             imported: true,
-            device_acks: [("f.0".to_string(), "00".to_string())].into(),
+            device_grant: hex(&f.self_grant),
+            device_acks: [
+                ("f.0".to_string(), "00".to_string()),
+                ("f.1".to_string(), own.clone()),
+            ]
+            .into(),
             ..state.clone()
         };
         crate::fleet_custody::save(&kept).unwrap();
         written(&f, &mut c, false).unwrap();
         let after = crate::fleet_custody::load().unwrap();
-        assert!(after.imported && after.device_acks.is_empty());
+        assert!(after.imported);
+        assert_eq!(after.device_acks, [("f.1".to_string(), own)].into());
 
         // Another custodian's state is refused, whether it holds a create
         // request or only the capability grants of a setup still preparing,
@@ -962,6 +988,132 @@ mod tests {
                 crate::errcode::has_code(&err, "fleet.custodyOtherDevice"),
                 "{err}"
             );
+            assert_eq!(f.files(), before);
+        }
+    }
+
+    /// A saved ack request of the grant whose exact container is `container`.
+    fn own_ack(container: &[u8]) -> String {
+        use shardx_core::fleet_lifecycle::{
+            FleetGenerationRef, FleetGrantVariant, FleetKeyGrantCreateV2,
+        };
+        use shardx_core::mutation::OperationKind;
+        let record = AuthorizationRecord::parse(container).unwrap();
+        let grant = FleetKeyGrantCreateV2::new(
+            FleetGenerationRef {
+                tenant_id: TENANT,
+                server_instance_id: INSTANCE,
+                restore_epoch: 0,
+                fleet_id: TENANT,
+                generation: 0,
+                fkek_key_id: [0x33; 32],
+            },
+            FleetGrantVariant::DeviceHpke,
+            [1; 16],
+            *record.signed_container_hash(),
+            container.to_vec(),
+        )
+        .grant;
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        let cx = Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: ACCOUNT,
+            device: DEVICE,
+            signing_key_id: signing_key_id(signer().verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&pk),
+        };
+        let request = cx
+            .request(
+                OperationKind::FleetGrantAck,
+                FleetKeyGrantAckV2 { grant }.encode(),
+            )
+            .unwrap();
+        let request = hex(&request);
+        assert!(acked_grant(&request).is_some());
+        request
+    }
+
+    /// `team.json` that changed after it was checked is not written over.
+    #[test]
+    fn a_team_json_that_changed_since_the_check_is_refused() {
+        let f = fixture();
+        let mut checked = f.connected("http://127.0.0.1:9");
+        crate::team_config::save(&TeamConfig {
+            device_id: hex(&[0x6f; 16]),
+            signing_credential_ref: format!("device-signing.{}", hex(&[0x6f; 16])),
+            ..checked.clone()
+        })
+        .unwrap();
+        let before = f.files();
+        let err = written(&f, &mut checked, true).unwrap_err().to_string();
+        assert!(
+            crate::errcode::has_code(&err, "recovery.deviceHasIdentity"),
+            "{err}"
+        );
+        assert_eq!(f.files(), before);
+    }
+
+    /// A tenant pinned to another anchor is refused before any request.
+    #[test]
+    fn a_bundle_of_another_anchor_than_the_pinned_one_is_refused() {
+        let f = fixture();
+        let binding = shardx_core::trust_chain::Binding {
+            server_instance_id: INSTANCE,
+            tenant_id: TENANT,
+        };
+        let ledger = crate::team::db::Db::open().unwrap();
+        assert!(crate::team::ledger::pin_anchor(
+            &ledger,
+            &binding,
+            &[0xa0; 32],
+            crate::team::ledger::JOIN,
+            now_ms()
+        )
+        .unwrap());
+        drop(ledger);
+        let (err, calls, unchanged) = refused_by(&f, server(serde_json::json!({}), (500, "")));
+        assert!(
+            crate::errcode::has_code(&err, "recovery.otherAnchor"),
+            "{err}"
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(unchanged);
+    }
+
+    /// A wrong passphrase, or a file that is not there, says only that the
+    /// bundle does not open, and nothing is written.
+    #[test]
+    fn a_bundle_that_does_not_open_is_refused_with_its_own_code() {
+        let f = fixture();
+        f.connected("http://127.0.0.1:9");
+        let bundle = f.bundle();
+        let (_, file) = rb::seal(
+            TENANT,
+            INSTANCE,
+            0,
+            0,
+            &bundle.plaintext,
+            "right passphrase",
+        )
+        .unwrap();
+        let path = f.dir.path().join("bundle.bin");
+        std::fs::write(&path, file).unwrap();
+        let before = f.files();
+        for (path, passphrase) in [
+            (path.as_path(), "wrong passphrase"),
+            (Path::new("no-such-bundle"), "right passphrase"),
+        ] {
+            let err = runtime()
+                .block_on(run(path, passphrase, "owner", "pw", true, &mut save))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                crate::errcode::has_code(&err, "recovery.bundleDoesNotOpen"),
+                "{err}"
+            );
+            assert!(!err.contains("passphrase"), "{err}");
             assert_eq!(f.files(), before);
         }
     }

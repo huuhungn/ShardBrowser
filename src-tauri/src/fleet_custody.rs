@@ -141,7 +141,10 @@ impl std::fmt::Debug for FleetCustodyState {
             .field("tenant_id", &self.tenant_id)
             .field("device_id", &self.device_id)
             .field("fkek_key_id", &self.fkek_key_id)
-            .field("created", &!self.create_request.is_empty())
+            .field(
+                "created",
+                &(!self.create_request.is_empty() || self.imported),
+            )
             .finish_non_exhaustive()
     }
 }
