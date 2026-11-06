@@ -295,7 +295,7 @@ const teamStatusFixture = () => (firstDevice
     server_url: "https://team.example.com",
     tenant_id: "11111111-1111-4111-8111-111111111111",
     device_id: "0123456789abcdef0123456789abcdef",
-    // As the backend: a locked key file hides the seeds the IDs derive from.
+    // As the backend: no IDs when a seed cannot be read, here because it sits in the unopened key file.
     ...(keyState.keys_locked ? teamNoKeyIds : teamKeyIds("0123456789abcdef0123456789abcdef")),
     has_token: true,
     is_enrolled: true,

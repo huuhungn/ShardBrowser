@@ -65,7 +65,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   const approvable = rows?.some((r) => r.status === "pending" && !isExpired(r));
   const hint = !approvable ? null
     : !account.signedIn ? t("team.devices.needPassword")
-    : !done ? t("team.devices.needFleetKey")
+    : fleet && !done ? t("team.devices.needFleetKey")
     : null;
   // A tick vouches for the exact code shown, so a refreshed code needs a new one.
   const tick = (r: TeamDevice) => `${r.device_id} ${r.sas}`;

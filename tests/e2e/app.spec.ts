@@ -1082,12 +1082,12 @@ test("approval stays disabled until the custodian creates its fleet key", async 
   await row.getByLabel("The code on the other device matches").check();
   const devices = a.getByTestId("team-devices");
   // Listing cleared the password: the hint says why Approve is off.
-  await expect(devices).toContainText("Enter your password above to approve or revoke.");
+  await expect(devices).toContainText("Enter your password above to approve.");
   await cardSignIn(a);
   await expect(a.getByRole("button", { name: "Create fleet key", exact: true })).toBeVisible();
   await expect(row.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
   await expect(devices).toContainText("Create the fleet key above before approving a device.");
-  await expect(devices).not.toContainText("Enter your password above to approve or revoke.");
+  await expect(devices).not.toContainText("Enter your password above to approve.");
 });
 
 test("revoke stays disabled until the custodian creates its fleet key", async ({ page: a }) => {
