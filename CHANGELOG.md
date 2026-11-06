@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v2.7.1
+
+A Team fix release from the first real two-machine run of v2.7.0. The
+browser engine and the team server protocol are unchanged.
 
 ### Team
 
