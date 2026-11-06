@@ -50,6 +50,27 @@ pub struct ServerIdentity {
     pub restore_epoch: i64,
 }
 
+/// What a ticket's `GET /v2/me` says: the ticket's account, the server's
+/// instance and restore epoch, and one listed device of that account.
+#[derive(Debug, Clone)]
+pub struct AccountDeviceStatus {
+    pub account_id: String,
+    pub server_instance_id: String,
+    pub restore_epoch: u64,
+    pub device: Option<ListedAccountDevice>,
+}
+
+/// A device of the ticket's account as `GET /v2/me` lists it, key IDs in hex.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedAccountDevice {
+    pub device_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub signing_key_id: String,
+    #[serde(default)]
+    pub hpke_key_id: String,
+}
+
 /// A write claim on one profile, plus the fencing token ordering writers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Lease {
@@ -969,21 +990,25 @@ impl FleetClient {
         Self::identity_of(res, &ticket.ticket).await
     }
 
-    /// The status `GET /v2/me` reports for `device_id` among the devices of
-    /// `login`'s account, read with a ticket; `None` when it is not listed.
+    /// What `GET /v2/me` reports for `device_id` among the devices of
+    /// `login`'s account, read with a ticket: `device` is `None` when it is
+    /// not listed.
     pub async fn account_device_status(
         &self,
         login: &AccountLogin<'_>,
         device_id: &str,
-    ) -> Result<Option<String>> {
-        #[derive(Deserialize)]
-        struct Listed {
-            device_id: String,
-            status: String,
-        }
+    ) -> Result<AccountDeviceStatus> {
+        // Only `devices` was ever required: a reply without the rest reads
+        // as empty, which no recovery check accepts.
         #[derive(Deserialize)]
         struct Me {
-            devices: Vec<Listed>,
+            #[serde(default)]
+            account_id: String,
+            #[serde(default)]
+            server_instance_id: String,
+            #[serde(default)]
+            restore_epoch: u64,
+            devices: Vec<ListedAccountDevice>,
         }
         let ticket = self.login_ticket(login).await?;
         let res = self
@@ -1002,11 +1027,16 @@ impl FleetClient {
         }
         .await;
         self.end_ticket(&ticket).await;
-        Ok(me?
-            .devices
-            .into_iter()
-            .find(|d| d.device_id.eq_ignore_ascii_case(device_id))
-            .map(|d| d.status))
+        let me = me?;
+        Ok(AccountDeviceStatus {
+            device: me
+                .devices
+                .into_iter()
+                .find(|d| d.device_id.eq_ignore_ascii_case(device_id)),
+            account_id: me.account_id,
+            server_instance_id: me.server_instance_id,
+            restore_epoch: me.restore_epoch,
+        })
     }
 
     async fn identity_reply(&self, bearer: &str) -> Result<reqwest::Response> {

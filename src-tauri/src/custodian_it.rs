@@ -213,43 +213,7 @@ fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
     let lock = crate::store::config_root_test_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let bin = server_binary();
-    assert!(
-        bin.exists(),
-        "team server binary missing at {}: build it first with \
-         cargo build --manifest-path server/Cargo.toml",
-        bin.display()
-    );
-    // Its own range, below the Linux ephemeral ports, one slot per test.
-    let port = 26100 + (std::process::id() % 300) as u16 + slot * 400;
-    let (data, identity) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    Server::cli(data.path(), identity.path(), &["identity", "init"], "");
-    let created = Server::cli(
-        data.path(),
-        identity.path(),
-        &[
-            "tenant",
-            "create",
-            "--slug",
-            slug,
-            "--owner-username",
-            OWNER,
-            "--password-stdin",
-        ],
-        &format!("{PASSWORD}\n"),
-    );
-    let tenant = created
-        .lines()
-        .find_map(|l| l.strip_prefix("tenant_id="))
-        .expect("tenant create prints the tenant id")
-        .trim()
-        .to_string();
-    let server = Server {
-        child: Server::start(data.path(), identity.path(), port),
-        port,
-        data,
-        identity,
-    };
+    let (server, tenant) = tenant_server(slot, slug);
 
     let (config, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     crate::store::set_config_root(Some(config.path().to_path_buf()));
@@ -301,6 +265,49 @@ fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
     .unwrap();
     assert!(root.activated);
     h
+}
+
+/// A running server, on port slot `slot`, with one CLI-created tenant
+/// `slug`, and that tenant's id.
+fn tenant_server(slot: u16, slug: &str) -> (Server, String) {
+    let bin = server_binary();
+    assert!(
+        bin.exists(),
+        "team server binary missing at {}: build it first with \
+         cargo build --manifest-path server/Cargo.toml",
+        bin.display()
+    );
+    // Its own range, below the Linux ephemeral ports, one slot per test.
+    let port = 26100 + (std::process::id() % 300) as u16 + slot * 400;
+    let (data, identity) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    Server::cli(data.path(), identity.path(), &["identity", "init"], "");
+    let created = Server::cli(
+        data.path(),
+        identity.path(),
+        &[
+            "tenant",
+            "create",
+            "--slug",
+            slug,
+            "--owner-username",
+            OWNER,
+            "--password-stdin",
+        ],
+        &format!("{PASSWORD}\n"),
+    );
+    let tenant = created
+        .lines()
+        .find_map(|l| l.strip_prefix("tenant_id="))
+        .expect("tenant create prints the tenant id")
+        .trim()
+        .to_string();
+    let server = Server {
+        child: Server::start(data.path(), identity.path(), port),
+        port,
+        data,
+        identity,
+    };
+    (server, tenant)
 }
 
 fn config_path(name: &str) -> String {
@@ -778,6 +785,7 @@ struct Journey {
     h: Harness,
     b_id: String,
     a_profile: String,
+    b_profile: String,
     profile_id: String,
 }
 
@@ -1035,6 +1043,7 @@ fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journe
         h,
         b_id,
         a_profile,
+        b_profile,
         profile_id: published.profile_id,
     }
 }
@@ -1048,6 +1057,7 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
         b_id,
         a_profile,
         profile_id,
+        ..
     } = shared_profile(3, "cs4-revoke", &rt);
     let (user, pass) = account();
 
@@ -1321,6 +1331,326 @@ fn the_journey_writes_one_audit_row_per_mutation() {
     );
 }
 
+/// A fresh device with roots of its own, its credentials in `namespace`,
+/// acting now and connected to `url` for `tenant`.
+fn fresh_device(namespace: &str, url: String, tenant: String) -> Member {
+    let m = Member {
+        config: tempfile::tempdir().unwrap(),
+        data: tempfile::tempdir().unwrap(),
+    };
+    act_as(m.config.path(), m.data.path(), namespace);
+    note(crate::team_set_connection(url, String::new(), tenant)).unwrap();
+    m
+}
+
+/// Imports the recovery bundle at `path` on the acting device.
+fn import(rt: &tokio::runtime::Runtime, path: &str) -> Result<serde_json::Value, String> {
+    call(
+        rt,
+        crate::team_import_recovery_bundle(
+            path.into(),
+            PASSPHRASE.into(),
+            OWNER.into(),
+            PASSWORD.into(),
+            true,
+        ),
+    )
+}
+
+/// The server's audit rows other than device sessions and fleet grant acks,
+/// and its fleet grant acks.
+fn audit_rows(h: &Harness) -> (i64, i64) {
+    (
+        h.server.count(
+            "SELECT count(*) FROM v2_audit_events
+              WHERE action NOT IN ('auth.device_session', 'fleet.key_grant.ack')",
+        ),
+        h.server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'fleet.key_grant.ack'"),
+    )
+}
+
+/// S2 (plan v0.2.2b section 5): after the S3 journey A's machine is lost. A
+/// fresh device C imports A's bootstrap bundle and keeps the team: it
+/// approves a new device D, publishes, and revokes B.
+#[test]
+fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_server() {
+    let rt = runtime();
+    let Journey {
+        b,
+        h,
+        b_id,
+        b_profile,
+        profile_id,
+        ..
+    } = shared_profile(6, "rs2-import", &rt);
+    let (user, pass) = account();
+
+    // A's seeds and fleet key are gone, and nothing reads A's roots again.
+    h.act_as_a();
+    let bundle = config_path("recovery.shardx-recovery");
+    let a = crate::team_config::load().unwrap();
+    for reference in [
+        a.signing_credential_ref.clone(),
+        a.hpke_credential_ref.clone(),
+        format!("fleet-key.{}.0", h.tenant),
+    ] {
+        crate::credential::forget(&reference).unwrap();
+    }
+
+    // 1. C imports and holds generation 0; the import itself files nothing
+    // but, at most, the collect's ack.
+    let c = fresh_device("c", h.server.url(), h.tenant.clone());
+    let before = audit_rows(&h);
+    let report = import(&rt, &bundle).unwrap();
+    let after = audit_rows(&h);
+    assert_eq!(report["fleet_opened"], 1, "{report}");
+    assert_eq!(after.0, before.0, "no audited mutation but the ack");
+    assert!(after.1 - before.1 <= 1);
+    let imported = crate::team_config::load().unwrap();
+    assert_eq!(imported.device_id, a.device_id);
+    assert_eq!(imported.fleet_id, h.tenant);
+    assert!(crate::team_config::status().unwrap().has_fleet_key);
+
+    // 2. D enrolls, C approves it, and D collects and pulls A's profile.
+    let d = fresh_device("d", h.server.url(), h.tenant.clone());
+    let d_id = call(
+        &rt,
+        crate::team_enroll_device("member-d".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    act_as(c.config.path(), c.data.path(), "c");
+    let rows = call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    let row = rows.iter().find(|r| r.device_id == d_id).expect("D's row");
+    assert_eq!(row.sas, code.sas);
+    call(
+        &rt,
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), d_id, code.sas.clone()),
+    )
+    .unwrap();
+    act_as(d.config.path(), d.data.path(), "d");
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    let collected = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(collected["fleet_opened"], 1, "{collected}");
+    let join_and_pull = |seed: u32| {
+        let local = local_profile("Shared", seed);
+        std::fs::remove_dir_all(crate::profile::user_data_dir(&local).unwrap()).unwrap();
+        call(
+            &rt,
+            crate::sync_cmd::team_join_profile(
+                profile_id.clone(),
+                local.clone(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_pull(
+                local.clone(),
+                String::new(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        local
+    };
+    let d_profile = join_and_pull(4);
+    let head = files(&d_profile);
+
+    // 3. C publishes version 3, and B pulls it.
+    act_as(c.config.path(), c.data.path(), "c");
+    let c_profile = join_and_pull(3);
+    assert_eq!(files(&c_profile), head);
+    let udd = crate::profile::user_data_dir(&c_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"c\"}").unwrap();
+    let pushed = call(
+        &rt,
+        crate::sync_cmd::profile_sync_push(
+            c_profile.clone(),
+            String::new(),
+            2,
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(pushed.version, 3);
+    let c_files = files(&c_profile);
+    b.act_as_b();
+    let pull_b = || {
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_pull(
+                b_profile.clone(),
+                String::new(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+    };
+    pull_b().unwrap();
+    assert_eq!(files(&b_profile), c_files);
+
+    // 4. C revokes B as lost; B's next pull is refused.
+    act_as(c.config.path(), c.data.path(), "c");
+    let revokes = || {
+        h.server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.revoke'")
+    };
+    let revoked_before = revokes();
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id.clone(), "lost".into()),
+    )
+    .unwrap();
+    assert_eq!(revokes(), revoked_before + 1);
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_devices WHERE lower(hex(id)) = '{b_id}' AND status = 'revoked'"
+        )),
+        1
+    );
+    b.act_as_b();
+    let refused = pull_b().unwrap_err();
+    assert!(refused.contains("revoked"), "{refused}");
+}
+
+/// The state files a refused import must not leave on the acting device.
+fn no_import_state(device: &str) {
+    for path in [
+        crate::store::custody_bootstrap_path(),
+        crate::store::fleet_custody_path(),
+        crate::store::fleet_keys_path(),
+    ] {
+        let path = path.unwrap();
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for kind in ["device-signing", "device-hpke"] {
+        let err = crate::credential::load(&format!("{kind}.{device}")).unwrap_err();
+        assert!(err.to_string().contains("credential.missing"), "{err}");
+    }
+}
+
+#[test]
+fn an_import_is_refused_for_a_v2_bundle_another_tenant_or_a_second_server_against_a_real_server() {
+    let rt = runtime();
+    let h = custodian(7, "rs2-refuse", &rt);
+    let bundle = config_path("recovery.shardx-recovery");
+    let a = crate::team_config::load().unwrap();
+    let root = crate::root_bootstrap::load().unwrap();
+    // A 2.7 bundle of this tenant: no root custodian.
+    let v2 = config_path("v2.shardx-recovery");
+    let (_, file) = shardx_core::recovery_bundle::seal(
+        crate::fleet_client::decode_hex16(&h.tenant, "t").unwrap(),
+        crate::fleet_client::decode_hex16(&root.server_instance_id, "i").unwrap(),
+        0,
+        crate::root_bootstrap::now_ms(),
+        &shardx_core::recovery_bundle::RecoveryBundlePlaintextV2 {
+            trk: [0x42; 32].into(),
+            bootstrap_anchor_signing_key_id: [0; 32],
+            retained_fkeks: Vec::new(),
+            root_custodian: None,
+        },
+        PASSPHRASE,
+    )
+    .unwrap();
+    std::fs::write(&v2, file).unwrap();
+    let (second, other_tenant) = tenant_server(9, "rs2-other");
+
+    for (url, tenant, path, code) in [
+        (
+            h.server.url(),
+            h.tenant.clone(),
+            &v2,
+            "recovery.bundleWithoutCustodian",
+        ),
+        (
+            second.url(),
+            other_tenant.clone(),
+            &bundle,
+            "recovery.otherTenant",
+        ),
+        // The second server does not know the bundle's tenant.
+        (
+            second.url(),
+            h.tenant.clone(),
+            &bundle,
+            "fleet.refusedLogin",
+        ),
+    ] {
+        let _c = fresh_device("c", url, tenant);
+        let team_json = std::fs::read(crate::store::team_config_path().unwrap()).unwrap();
+        let err = import(&rt, path).unwrap_err();
+        assert!(crate::errcode::has_code(&err, code), "{code}: {err}");
+        assert_eq!(
+            std::fs::read(crate::store::team_config_path().unwrap()).unwrap(),
+            team_json
+        );
+        no_import_state(&a.device_id);
+    }
+}
+
+#[test]
+fn an_interrupted_import_resumes() {
+    let rt = runtime();
+    let h = custodian(8, "rs2-resume", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let bundle = config_path("recovery.shardx-recovery");
+    let a = crate::team_config::load().unwrap();
+
+    // The first run stores both seeds, then its team.json write fails.
+    let c = fresh_device("c", h.server.url(), h.tenant.clone());
+    let failed = rt.block_on(crate::recovery_import::run(
+        std::path::Path::new(&bundle),
+        PASSPHRASE,
+        OWNER,
+        PASSWORD,
+        true,
+        &mut |write| match write {
+            crate::recovery_import::Write::Team(_) => anyhow::bail!("interrupted"),
+            other => crate::recovery_import::save(other),
+        },
+    ));
+    assert!(failed.is_err());
+    assert!(crate::team_config::load().unwrap().device_id.is_empty());
+    assert!(crate::credential::load(&format!("device-signing.{}", a.device_id)).is_ok());
+    let saved = |path: anyhow::Result<std::path::PathBuf>| std::fs::read(path.unwrap()).unwrap();
+    let root = saved(crate::store::custody_bootstrap_path());
+    let custody = saved(crate::store::fleet_custody_path());
+
+    // The second run resumes on the same states and finishes.
+    let report = import(&rt, &bundle).unwrap();
+    assert_eq!(report["fleet_opened"], 1, "{report}");
+    assert_eq!(crate::team_config::load().unwrap().device_id, a.device_id);
+    assert_eq!(saved(crate::store::custody_bootstrap_path()), root);
+    assert_eq!(saved(crate::store::fleet_custody_path()), custody);
+    let replaced = std::fs::read_dir(c.config.path())
+        .unwrap()
+        .filter(|e| {
+            let name = e.as_ref().unwrap().file_name();
+            name.to_string_lossy().contains(".replaced-")
+        })
+        .count();
+    assert_eq!(replaced, 0, "no custody state was replaced");
+}
+
 /// The first `v2a.`, `v2t.` or `v2r.` token followed by 16 or more hex
 /// digits in `text`.
 fn session_token(text: &str) -> Option<&str> {
@@ -1339,9 +1669,10 @@ fn session_token(text: &str) -> Option<&str> {
 }
 
 /// Re-runs this test binary on the journey worker below, and scans what it
-/// printed, every command reply and both devices' state files for the
-/// account password, the fleet key, the root key, both HPKE private keys and
-/// any session token (plan v0.2.2a section 8).
+/// printed, every command reply and the devices' state files for the
+/// account password, the recovery passphrase, the fleet key, the root key,
+/// both HPKE private keys, every seed and any session token (plan v0.2.2a
+/// section 8; v0.2.2b S2 adds the import).
 #[test]
 fn the_journey_leaks_no_secret_to_output_state_or_replies() {
     assert_eq!(
@@ -1381,6 +1712,7 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         "the FKEK, the TRK, two HPKE private keys and both devices' four seeds"
     );
     secrets.push(PASSWORD.into());
+    secrets.push(PASSPHRASE.into());
     let mut scanned = vec![
         ("stdout".to_string(), stdout),
         ("stderr".to_string(), stderr),
@@ -1400,6 +1732,9 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         "a-fleet-custody.json",
         "a-custody-bootstrap.json",
         "b-team.json",
+        "c-team.json",
+        "c-fleet-custody.json",
+        "c-custody-bootstrap.json",
     ] {
         assert!(
             names.contains(&expected),
@@ -1460,8 +1795,8 @@ fn keep_state(dir: &std::path::Path, device: &str) {
     }
 }
 
-/// The journey the leak scan watches: the S3 journey, A's revoke of B and
-/// B's refused collect. Each reply and each device's state files go to the
+/// The journey the leak scan watches: the S3 journey, A's revoke of B, B's
+/// refused collect and a fresh device's import of A's recovery bundle. Each reply and each device's state files go to the
 /// scan directory; the secrets to look for go to the side file.
 #[test]
 #[ignore = "a worker of the_journey_leaks_no_secret_to_output_state_or_replies"]
@@ -1497,6 +1832,7 @@ fn the_journey_leak_scan_worker() {
     )
     .unwrap();
     keep_state(&dir, "a");
+    let bundle = config_path("recovery.shardx-recovery");
 
     b.act_as_b();
     call(
@@ -1509,6 +1845,11 @@ fn the_journey_leak_scan_worker() {
     let b_hpke_seed = b_config.hpke_seed().unwrap();
     let (b_sk, _) = shardx_core::grants::derive_keypair(&b_hpke_seed);
     keep_state(&dir, "b");
+
+    // A fresh device C imports A's bundle under its passphrase.
+    let _c = fresh_device("c", h.server.url(), h.tenant.clone());
+    import(&rt, &bundle).unwrap();
+    keep_state(&dir, "c");
     std::fs::write(
         secrets,
         [

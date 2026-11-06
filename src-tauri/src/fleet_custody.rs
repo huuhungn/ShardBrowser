@@ -129,6 +129,10 @@ pub struct FleetCustodyState {
     /// Revoke (section 4.R): the exact request, per lower-case device id.
     #[serde(default)]
     pub revocations: BTreeMap<String, String>,
+    /// Written by a recovery import while the fleet had an ACTIVE generation:
+    /// this device is its custodian without a saved create request.
+    #[serde(default)]
+    pub imported: bool,
 }
 
 impl std::fmt::Debug for FleetCustodyState {
@@ -888,11 +892,11 @@ fn build_member(
 }
 
 /// The facts this custodian's records name, once `state` holds its own
-/// Create fleet key.
+/// Create fleet key or a recovery import of it.
 fn custodian(me: &FleetDevice<'_>, state: &FleetCustodyState) -> Result<Context16> {
     let ours = state.tenant_id.eq_ignore_ascii_case(me.tenant_id)
         && state.device_id.eq_ignore_ascii_case(me.device_id);
-    if !ours || state.create_request.is_empty() {
+    if !ours || (state.create_request.is_empty() && !state.imported) {
         bail!(crate::errcode::code("fleet.notCustodian"));
     }
     let (_, hpke_public) = derive_keypair(me.hpke_seed);
@@ -1190,7 +1194,7 @@ pub fn status() -> Result<FleetCustodyStatus> {
     let s = load()?;
     Ok(FleetCustodyStatus {
         started: !s.tenant_id.is_empty(),
-        created: !s.create_request.is_empty(),
+        created: !s.create_request.is_empty() || s.imported,
         setup_key_held: !s.fkek_nonce.is_empty(),
         fkek_key_id: s.fkek_key_id,
     })
@@ -1214,7 +1218,7 @@ pub fn save(state: &FleetCustodyState) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fleet_keys;
     use shardx_core::mutation::IdempotentStoredResponseV2;
@@ -1334,19 +1338,19 @@ mod tests {
         parse(&saved_request(saved).unwrap().canonical_payload_bytes).unwrap()
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
     }
 
-    type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
-    type Reply = dyn Fn(&str, &[u8]) -> (u16, Vec<u8>) + Send + Sync;
+    pub(crate) type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+    pub(crate) type Reply = dyn Fn(&str, &[u8]) -> (u16, Vec<u8>) + Send + Sync;
 
     /// A server on this machine that records every request as
     /// `"METHOD /path"` and its body, and answers with `reply`.
-    async fn mock(reply: Arc<Reply>) -> (FleetClient, Seen) {
+    pub(crate) async fn mock(reply: Arc<Reply>) -> (FleetClient, Seen) {
         use axum::http::{Method, StatusCode, Uri};
         let seen: Seen = Arc::default();
         let log = seen.clone();
@@ -1742,6 +1746,22 @@ mod tests {
             assert!(!text.contains(&hex(&f.seed)), "the HPKE seed");
         }
         assert!(!debug.contains(&state.create_request) && !debug.contains(&state.device_grant));
+    }
+
+    /// A recovery import's state is this device's custody without a saved
+    /// create request; a member's is not.
+    #[test]
+    fn an_imported_state_is_custody_without_a_create_request() {
+        let f = fixture();
+        let device = f.device(&CredentialFkekStore);
+        let mut state = f.state();
+        assert!(custodian(&device, &state).is_err());
+        save(&state).unwrap();
+        assert!(!status().unwrap().created);
+        state.imported = true;
+        assert!(custodian(&device, &state).is_ok());
+        save(&state).unwrap();
+        assert!(status().unwrap().created);
     }
 
     #[test]

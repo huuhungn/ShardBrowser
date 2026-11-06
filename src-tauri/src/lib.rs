@@ -28,6 +28,7 @@ pub mod http_session;
 mod key_file;
 mod launch;
 mod profile_icon;
+mod recovery_import;
 pub mod root_bootstrap;
 pub mod runner;
 pub mod traffic;
@@ -2844,7 +2845,9 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
             let status = client
                 .account_device_status(&login, &c.device_id)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .device
+                .map(|d| d.status);
             let pinned = pinned_anchor(&c).is_some();
             return Err(if enroll_again_allowed(status.as_deref(), pinned) {
                 expired
@@ -2995,7 +2998,9 @@ async fn team_enroll_again(
             &c.device_id,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .device
+        .map(|d| d.status);
     if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
@@ -3005,6 +3010,41 @@ async fn team_enroll_again(
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
+}
+
+/// Import a recovery bundle (v0.2.2b plan, section 4.I): this device becomes
+/// the root custodian the bundle restores, then collects the fleet key and
+/// returns that report. `old_device_lost` is the user's confirmation that the
+/// old root device is lost or its keys were reset. The passphrase and
+/// password serve this command only. A failed collect leaves the import
+/// done, and Collect key custody runs it again.
+#[tauri::command]
+async fn team_import_recovery_bundle(
+    path: String,
+    passphrase: String,
+    username: String,
+    password: String,
+    old_device_lost: bool,
+) -> Result<serde_json::Value, String> {
+    {
+        let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+        recovery_import::run(
+            std::path::Path::new(&path),
+            &passphrase,
+            username.trim(),
+            &password,
+            old_device_lost,
+            &mut recovery_import::save,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let report = team_collect_custody(username, password).await;
+    eprintln!(
+        "[recovery] import collect: {}",
+        if report.is_ok() { "ok" } else { "failed" }
+    );
+    report
 }
 
 /// Whether a device the server lists as `status` may enroll again: while
@@ -6429,6 +6469,7 @@ pub fn run() {
             team_join_code,
             team_join_confirm,
             team_enroll_again,
+            team_import_recovery_bundle,
             team_set_connection,
             team_test_connection,
             team_enroll_device,
