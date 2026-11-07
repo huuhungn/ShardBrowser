@@ -17,7 +17,7 @@
             },
             {
               "type": "p",
-              "text": "Khoá đội máy lưu từ bản 2.4.2 mà grant đã xác minh giờ được đánh dấu là đã xác minh, nên Export recovery bundle dùng được trên máy đó. Khi trạng thái root custodian còn đang tải, hoặc khi thiết lập root còn dở, trang Team không hiện Reset hay Enroll again."
+              "text": "Khoá đội máy lưu từ bản 2.4.2 mà grant đã xác minh giờ được đánh dấu là đã xác minh, nên Export recovery bundle dùng được trên máy đó. Khi trạng thái root custodian còn đang tải, hoặc khi thiết lập root còn dở, trang Team không hiện Reset hay Enroll again. Trạng thái root hoặc custody không kiểm tra được giờ bị báo lỗi chứ không bị coi là không có, nên đổi kết nối hay Reset vẫn giữ root custodian đang hoạt động, và trạng thái root của máy khác không còn hiện các thao tác root hay Resume custody setup."
             }
           ]
         }

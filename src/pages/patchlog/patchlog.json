@@ -19,7 +19,7 @@
             },
             {
               "type": "p",
-              "text": "A fleet key cached by 2.4.2 that a grant verifies is now marked verified, so Export recovery bundle works on that device. While the root custodian's status loads, and for an unfinished root setup, the Team page offers no Reset or Enroll again."
+              "text": "A fleet key cached by 2.4.2 that a grant verifies is now marked verified, so Export recovery bundle works on that device. While the root custodian's status loads, and for an unfinished root setup, the Team page offers no Reset or Enroll again. A root or custody state that cannot be checked is now an error instead of a missing one, so a connection change or Reset keeps a working root custodian, and another device's root state no longer offers root actions or Resume custody setup."
             }
           ]
         }

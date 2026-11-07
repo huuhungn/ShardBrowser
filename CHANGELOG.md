@@ -28,6 +28,13 @@ are unchanged.
   hides Reset.
 - **Trust ledger checks.** A trust ledger that cannot be checked is an error,
   and an unreadable ledger blocks Reset only for an active device.
+- **Root state checks.** A root or custody state file that cannot be checked
+  is an error instead of a missing file, so a server or tenant change and
+  Reset no longer clear a working root custodian.
+- **Another device's root state.** A root state left by another device,
+  finished or not, no longer shows the bootstrap anchor, Show devices, Export
+  recovery bundle or Resume custody setup, and the device's own join steps
+  stay visible.
 
 ### Known limitations
 
