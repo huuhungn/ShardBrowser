@@ -780,6 +780,7 @@ fn stored_for<'a>(db: &Db, local: &str, op: &'a Op) -> Result<&'a [u8]> {
 /// operation, so it is never resent; anything else (a lost reply, 401, 408,
 /// 429, 5xx) leaves it PENDING for the next attempt to resend as it is.
 fn settle(
+    client: &FleetClient,
     access: &str,
     db: &Db,
     op: &Op,
@@ -788,7 +789,7 @@ fn settle(
     if (200..300).contains(&reply.status) {
         return Ok(Ok(reply.body));
     }
-    let err = refused(access, &reply);
+    let err = refused(client, access, &reply);
     if terminal(reply.status) {
         db.conn.execute(
             "UPDATE operations SET state = 'FAILED', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -814,16 +815,17 @@ fn lease_expiry_ok(expires_at_ms: u64, now: u64) -> bool {
 }
 
 /// `access`, the bearer every sync request sends, is hidden should the
-/// server or a proxy echo it, as is any token marker.
-fn refused(access: &str, reply: &Exact) -> anyhow::Error {
+/// server or a proxy echo it, as is any token marker and every password
+/// `client` logged in with.
+fn refused(client: &FleetClient, access: &str, reply: &Exact) -> anyhow::Error {
     if reply.status == 401 {
         return anyhow!(code("sync.authRequired"));
     }
-    let detail: String =
-        crate::fleet_client::redact(&String::from_utf8_lossy(&reply.body), &[access])
-            .chars()
-            .take(300)
-            .collect();
+    let detail: String = client
+        .hide(&String::from_utf8_lossy(&reply.body), &[access])
+        .chars()
+        .take(300)
+        .collect();
     anyhow!(code_with(
         "fleet.refusedSync",
         &[("status", &reply.status.to_string()), ("detail", &detail)]
@@ -831,11 +833,11 @@ fn refused(access: &str, reply: &Exact) -> anyhow::Error {
 }
 
 /// A reply that is not a stored request's: success or an error.
-fn ok(access: &str, reply: Exact) -> Result<Exact> {
+fn ok(client: &FleetClient, access: &str, reply: Exact) -> Result<Exact> {
     if (200..300).contains(&reply.status) {
         Ok(reply)
     } else {
-        Err(refused(access, &reply))
+        Err(refused(client, access, &reply))
     }
 }
 
@@ -987,6 +989,7 @@ async fn fleet_pages(
     let mut epoch = None;
     loop {
         let reply = ok(
+            client,
             access,
             client
                 .list_fleet_profiles(access, &b.fleet, after.as_ref())
@@ -1170,7 +1173,7 @@ async fn accept_transitions(
                 let checked = match reply.status {
                     404 => Err(refusal(TRANSITION_REQUIRED, "")),
                     _ => {
-                        let body = ok(access, reply)?.body;
+                        let body = ok(client, access, reply)?.body;
                         verify_transition(db, dev, b, chain, &keys, epochs, &body, now)
                     }
                 };
@@ -1180,7 +1183,7 @@ async fn accept_transitions(
                         match reply.status {
                             404 => Err(refusal("RESTORE_EPOCH_PROOF_MISSING", "")),
                             _ => {
-                                let body = ok(access, reply)?.body;
+                                let body = ok(client, access, reply)?.body;
                                 verify_proof(&t, b, head, body).map(|(p, bytes)| (t, p, bytes))
                             }
                         }
@@ -1215,6 +1218,7 @@ async fn accept_transitions(
                         let mut found = None;
                         for v in (low..=top).rev() {
                             let reply = ok(
+                                client,
                                 access,
                                 client.snapshot_manifest(access, &b.profile, v).await?,
                             )?;
@@ -2666,7 +2670,7 @@ async fn send_publish(
         bail!(code("sync.commitBlockedCompromised"));
     }
     let reply = client.publish_profile(access, &fleet, exact).await?;
-    let body = settle(access, db, op, reply)??;
+    let body = settle(client, access, db, op, reply)??;
     let accepted = || -> Result<ProfileLeaseV2> {
         let payload = stored_response(op, RECORD_TYPE_PUBLISH_CREATED, &body)?;
         let g = ProfileLeaseV2::parse(LeaseOrigin::PublishCreate, &payload)
@@ -2942,7 +2946,7 @@ async fn checkout(
     };
     let exact = stored(db, b, &op)?;
     let reply = client.checkout_profile(access, &b.profile, exact).await?;
-    let body = settle(access, db, &op, reply)??;
+    let body = settle(client, access, db, &op, reply)??;
     let payload = stored_response(&op, RECORD_TYPE_CHECKED_OUT, &body)?;
     let g = ProfileLeaseV2::parse(LeaseOrigin::Checkout, &payload)
         .map_err(|_| bad("ProfileLeaseV2"))?;
@@ -3168,7 +3172,7 @@ async fn create_upload(
     let exact = stored(db, b, op)?;
     let reply = client.create_upload(access, &b.profile, exact).await?;
     let gone = refusal_of(&reply).0.as_deref() == Some("RESOURCE_NOT_FOUND");
-    let body = match settle(access, db, op, reply)? {
+    let body = match settle(client, access, db, op, reply)? {
         Ok(body) => body,
         Err(e) => {
             let e = if gone { superseded_upload() } else { e };
@@ -3376,7 +3380,7 @@ async fn abort_compromised(
 ) -> anyhow::Error {
     let aborted = async {
         let upload = decode_hex16(&s.upload, "upload_id")?;
-        ok(access, client.upload_abort(access, &upload).await?)
+        ok(client, access, client.upload_abort(access, &upload).await?)
     };
     if let Err(e) = aborted.await {
         eprintln!("[sync] abort: {e:#}");
@@ -3411,10 +3415,10 @@ async fn transfer(
     for _ in 0..3 {
         let reply = client.upload_head(access, &upload).await?;
         if terminal(reply.status) {
-            let e = refused(access, &reply);
+            let e = refused(client, access, &reply);
             return Err(fail_upload(client, access, db, b, lease, commit_op, e).await);
         }
-        let reply = ok(access, reply)?;
+        let reply = ok(client, access, reply)?;
         let (mut at, state) = offset_of(&reply).ok_or_else(|| bad("upload-offset"))?;
         if state != "OPEN" || at > s.size {
             return Err(bad("upload-state"));
@@ -3446,7 +3450,7 @@ async fn transfer(
             if reply.status == 409 {
                 break;
             }
-            let reply = ok(access, reply)?;
+            let reply = ok(client, access, reply)?;
             let got = reply
                 .headers
                 .get("upload-offset")
@@ -3470,6 +3474,7 @@ async fn renew(client: &FleetClient, access: &str, b: &Bound, lease: LeaseRef) -
     }
     .encode();
     let reply = ok(
+        client,
         access,
         client
             .renew_lease_v2(access, &b.profile, &lease.lease_id, &body)
@@ -3532,7 +3537,7 @@ async fn finalize(
     let exact = stored(db, b, &op)?;
     let reply = client.finalize_upload(access, &upload, exact).await?;
     let gone = refusal_of(&reply).0.as_deref() == Some("RESOURCE_NOT_FOUND");
-    let body = match settle(access, db, &op, reply)? {
+    let body = match settle(client, access, db, &op, reply)? {
         Ok(body) => body,
         Err(e) => {
             let e = if gone { superseded_upload() } else { e };
@@ -3581,7 +3586,7 @@ async fn commit(
         (Some(c), Some(epoch)) if c == "BASE_VERSION_MISMATCH" => Some(epoch),
         _ => None,
     };
-    let body = match settle(access, db, op, reply)? {
+    let body = match settle(client, access, db, op, reply)? {
         Ok(body) => body,
         Err(e) => {
             let Some(epoch) = superseded else {
@@ -3665,6 +3670,7 @@ async fn finish(
         .map_err(|_| bad("manifest"))?;
     let mismatch = |field: &str| anyhow!(code_with("sync.readbackMismatch", &[("field", field)]));
     let manifest = ok(
+        client,
         access,
         client
             .snapshot_manifest(access, &b.profile, version)
@@ -3674,6 +3680,7 @@ async fn finish(
         return Err(mismatch("manifest"));
     }
     let object = ok(
+        client,
         access,
         client
             .snapshot_range(access, &b.profile, version, 0, 0)
@@ -3817,7 +3824,7 @@ async fn release_reply(
     let reply = client
         .release_lease_v2(access, &b.profile, &lease_id, exact)
         .await?;
-    let released = match settle(access, db, op, reply)? {
+    let released = match settle(client, access, db, op, reply)? {
         Ok(body) => {
             let payload = stored_response(op, RECORD_TYPE_LEASE_RELEASED, &body)?;
             let r = LeaseReleasedV2::parse(&payload).map_err(|_| bad("LeaseReleasedV2"))?;
@@ -4211,6 +4218,7 @@ async fn manifest(
     v: u64,
 ) -> Result<SignedSnapshotManifestV2> {
     let reply = ok(
+        client,
         access,
         client.snapshot_manifest(access, &b.profile, v).await?,
     )?;
@@ -4701,6 +4709,7 @@ async fn restore(
         let start = object.len() as u64;
         let end = (start + CHUNK as u64).min(p.ciphertext_size) - 1;
         let reply = ok(
+            client,
             access,
             client
                 .snapshot_range(access, &b.profile, p.target_version, start, end)
@@ -5081,6 +5090,8 @@ mod tests {
         fkek_key_id: Option<[u8; 32]>,
         /// Routes whose next request is refused unprocessed, with a status.
         refuse: Vec<(&'static str, u16)>,
+        /// The body of a refused reply, when not `refused`.
+        refused_body: Option<Vec<u8>>,
         fence: u64,
         lease: Option<LeaseRef>,
         stored: HashMap<[u8; 16], (Vec<u8>, u16, Vec<u8>)>,
@@ -5623,6 +5634,21 @@ mod tests {
         assert!(f.log.len() < 400, "request storm");
         let path = uri.path().to_string();
         f.log.push((format!("{method} {path}"), body.to_vec()));
+        // An account login, so the client holds a password as a sync
+        // command's does.
+        match path.as_str() {
+            "/v2/auth/login" => {
+                let ticket = serde_json::json!({
+                    "ticket": "v2t.0123456789abcdef0123", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[2; 16]), "server_instance_id": hex(&[3; 16]),
+                    "restore_epoch": 0,
+                });
+                return reply(200, &[], serde_json::to_vec(&ticket).unwrap());
+            }
+            "/v2/me" => return reply(200, &[], br#"{"devices":[]}"#.to_vec()),
+            "/v2/auth/logout" => return reply(204, &[], Vec::new()),
+            _ => {}
+        }
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
         let tag = match (method.as_str(), parts.last().copied()) {
             ("PATCH", _) => "patch",
@@ -5672,7 +5698,8 @@ mod tests {
         }
         if let Some(i) = f.refuse.iter().position(|(t, _)| *t == tag) {
             let (_, status) = f.refuse.remove(i);
-            return reply(status, &[("retry-after", "0".into())], b"refused".to_vec());
+            let body = f.refused_body.clone().unwrap_or(b"refused".to_vec());
+            return reply(status, &[("retry-after", "0".into())], body);
         }
         let r = f.route(&method, &parts, &headers, &body);
         if take(&mut f.lose, tag) {
@@ -5718,7 +5745,8 @@ mod tests {
             headers: Default::default(),
             body: format!("{{\"error\":\"bad\",\"auth\":\"Bearer {token}\"}}").into_bytes(),
         };
-        let error = refused("", &reply).to_string();
+        let client = FleetClient::new("http://127.0.0.1:9", "").unwrap();
+        let error = refused(&client, "", &reply).to_string();
         assert!(error.contains("fleet.refusedSync"), "{error}");
         assert!(!error.contains(&token), "an echoed token reached the error");
     }
@@ -5732,11 +5760,39 @@ mod tests {
             headers: Default::default(),
             body: format!("{{\"error\":\"{body}\"}}").into_bytes(),
         };
-        let error = refused(&access, &reply).to_string();
+        let client = FleetClient::new("http://127.0.0.1:9", "").unwrap();
+        let error = refused(&client, &access, &reply).to_string();
         assert!(error.contains("fleet.refusedSync|status=403|"), "{error}");
         assert!(
             !error.to_ascii_lowercase().contains(&body),
             "the bearer token body reached the error"
+        );
+    }
+
+    /// A sync command logs in on the client it syncs with: a refused push
+    /// reply that echoes the account password never returns it.
+    #[test]
+    fn a_refused_push_hides_the_echoed_login_password() {
+        let w = world();
+        // No `t`: the fixture's access token is `t`, which is hidden too.
+        let password = format!("pw-{}", crate::fleet_client::random_id_hex());
+        let login = crate::fleet_client::AccountLogin {
+            tenant_id: &hex(&[4; 16]),
+            username: "owner",
+            password: &password,
+        };
+        w.rt.block_on(w.client.account_device_status(&login, &hex(&[5; 16])))
+            .unwrap();
+        w.fake().refused_body = Some(format!(r#"{{"error":"{password}"}}"#).into_bytes());
+        w.fake().refuse.push(("checkout", 409));
+        let err = w.push().unwrap_err();
+        assert!(
+            has(&err, "fleet.refusedSync"),
+            "another error than the refused checkout"
+        );
+        assert!(
+            !format!("{err:#}").contains(&password),
+            "the account password reached a refused push's error"
         );
     }
 

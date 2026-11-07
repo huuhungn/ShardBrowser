@@ -260,6 +260,15 @@ impl FleetClient {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+
+    /// `text` less each of `secrets` and every password this client logged
+    /// in with: for server text another module shows or logs.
+    pub(crate) fn hide(&self, text: &str, secrets: &[&str]) -> String {
+        let passwords = self.passwords();
+        let mut all = secrets.to_vec();
+        all.extend(passwords.iter().map(|p| p.as_str()));
+        redact(text, &all)
+    }
 }
 
 /// `text` with each of `secrets`, and the value after every `v2t.`, `v2a.`,
