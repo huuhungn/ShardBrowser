@@ -2925,7 +2925,7 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
                 .map_err(|e| e.to_string())?
                 .device
                 .map(|d| d.status);
-            let pinned = pinned_anchor(&c).is_some();
+            let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
             return Err(if enroll_again_allowed(status.as_deref(), pinned) {
                 expired
             } else if status.as_deref() == Some("active") {
@@ -3092,7 +3092,8 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
     }
     let status = me.device.map(|d| d.status);
-    if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
+    let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
+    if !enroll_again_allowed(status.as_deref(), pinned) {
         return Err(refused());
     }
     // `team.json` and the root state may have changed during the listing (an
@@ -3367,15 +3368,25 @@ fn keep_fleet_key(
 /// bootstrapped the tenant's custody keeps them in its root state, and
 /// `open_fleet_grant` keeps the first one in the W6 ledger. Any other device
 /// has the one pin of its tenant in the ledger, from the join ceremony (ADR
-/// 0002 Q-12), or none.
+/// 0002 Q-12), or none. A ledger that does not read counts as none here,
+/// which only ever refuses trust; see [`read_pinned_anchor`].
 fn pinned_anchor(
     c: &team_config::TeamConfig,
 ) -> Option<(shardx_core::trust_chain::Binding, [u8; 32])> {
-    bootstrap_anchor(c).or_else(|| {
-        let tenant = fleet_client::decode_hex16(&c.tenant_id, "tenant_id").ok()?;
-        let (binding, anchor, _) = tenant_pin(&tenant).ok()??;
-        Some((binding, anchor))
-    })
+    read_pinned_anchor(c).ok().flatten()
+}
+
+/// [`pinned_anchor`], with a ledger that does not read as the error: a
+/// decision that an unpinned device may lose its identity never takes an
+/// unreadable pin for none.
+fn read_pinned_anchor(
+    c: &team_config::TeamConfig,
+) -> anyhow::Result<Option<(shardx_core::trust_chain::Binding, [u8; 32])>> {
+    if let Some(pin) = bootstrap_anchor(c) {
+        return Ok(Some(pin));
+    }
+    let tenant = fleet_client::decode_hex16(&c.tenant_id, "tenant_id")?;
+    Ok(tenant_pin(&tenant)?.map(|(binding, anchor, _)| (binding, anchor)))
 }
 
 /// The ledger's one pin of `tenant`, without creating a ledger that does not
@@ -6608,6 +6619,36 @@ mod custody_tests {
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
         assert_cleared(refs);
+    }
+
+    /// A pin that no longer reads is no proof of no pin: Reset of a device
+    /// listed active keeps its identity and credentials.
+    #[test]
+    fn reset_preserves_an_active_device_whose_pin_ledger_is_unreadable() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "active");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        pin_here();
+        assert!(pinned_anchor(&team_config::load().unwrap()).is_some());
+        let before = team_json();
+        let references = refs();
+        std::fs::write(team::db::Db::path().unwrap(), b"unreadable test ledger").unwrap();
+        assert!(team::db::Db::open().is_err());
+        let result = rt.block_on(team_enroll_again("u".into(), "p".into()));
+        let unchanged = team_json() == before;
+        let credentials_kept = references.iter().all(|r| credential::load(r).is_ok());
+        assert!(
+            result.is_err() && unchanged && credentials_kept,
+            "Reset with unreadable pin: refused={}, identity_kept={}, credentials_kept={}",
+            result.is_err(),
+            unchanged,
+            credentials_kept
+        );
+        let err = result.unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "team.trustLedgerUnreadable"),
+            "{err}"
+        );
     }
 
     #[test]
