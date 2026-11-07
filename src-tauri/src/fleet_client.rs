@@ -55,6 +55,8 @@ pub struct ServerIdentity {
 #[derive(Debug, Clone)]
 pub struct AccountDeviceStatus {
     pub account_id: String,
+    /// The account the login ticket itself named.
+    pub ticket_account_id: String,
     pub server_instance_id: String,
     pub restore_epoch: u64,
     pub device: Option<ListedAccountDevice>,
@@ -1089,6 +1091,7 @@ impl FleetClient {
                 .into_iter()
                 .find(|d| d.device_id.eq_ignore_ascii_case(device_id)),
             account_id: me.account_id,
+            ticket_account_id: ticket.account_id.clone(),
             server_instance_id: me.server_instance_id,
             restore_epoch: me.restore_epoch,
         })

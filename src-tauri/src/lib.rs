@@ -3080,11 +3080,14 @@ async fn team_enroll_again(
         )
         .await
         .map_err(|e| e.to_string())?;
-    // A listing that names another account than the one that enrolled this
-    // device never resets it, as recovery import checks the bundle's.
-    if !c.account_id.is_empty()
-        && !me.account_id.is_empty()
-        && !me.account_id.eq_ignore_ascii_case(&c.account_id)
+    // The ticket and the listing name one account, and it is the one that
+    // enrolled this device when `team.json` records it (a config from before
+    // `account_id` has none): anything else never resets it, as recovery
+    // import checks the bundle's.
+    let account = &me.ticket_account_id;
+    if account.is_empty()
+        || !me.account_id.eq_ignore_ascii_case(account)
+        || (!c.account_id.is_empty() && !c.account_id.eq_ignore_ascii_case(account))
     {
         return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
     }
@@ -6139,6 +6142,7 @@ mod custody_tests {
                         // `missing`: the server no longer lists the joiner.
                         "GET /v2/me" => serde_json::json!({
                             "kind": "pre_device",
+                            "account_id": hex(&[6; 16]),
                             "devices": [
                                 {"device_id": hex(&[9; 16]), "status": "active"},
                                 {"device_id": hex(if status == "missing" { &[9; 16] } else { &JOINER }), "status": status},
@@ -6408,7 +6412,7 @@ mod custody_tests {
                     })
                     .unwrap();
                     changed_in_reply.store(true, std::sync::atomic::Ordering::SeqCst);
-                    serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                    serde_json::json!({"account_id": hex(&[6; 16]), "devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
                 }
                 _ => serde_json::json!({}),
             };
@@ -6444,7 +6448,7 @@ mod custody_tests {
                     }),
                     "GET /v2/me" => {
                         race();
-                        serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                        serde_json::json!({"account_id": hex(&[6; 16]), "devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
                     }
                     _ => serde_json::json!({}),
                 };
@@ -6546,6 +6550,64 @@ mod custody_tests {
             &result.unwrap_err(),
             "fleet.enrollAgainOtherAccount"
         ));
+    }
+
+    /// A ticket of another account, with a `GET /v2/me` that leaves the
+    /// account out, never resets the saved owner's device.
+    #[test]
+    fn reset_is_refused_when_the_listing_omits_the_ticket_account() {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(|call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => serde_json::json!({
+                    "server_instance_id": hex(&INSTANCE),
+                    "devices": [{"device_id": hex(&JOINER), "status": "pending"}]
+                }),
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        assert!(team_config::load().unwrap().account_id != hex(&[0x6c; 16]));
+        let before = team_json();
+        let references = refs();
+        let result = rt.block_on(team_enroll_again("other-account".into(), "p".into()));
+        let unchanged = team_json() == before;
+        let credentials_kept = references.iter().all(|r| credential::load(r).is_ok());
+        assert!(
+            result.is_err() && unchanged && credentials_kept,
+            "Reset with omitted owner: refused={}, identity_kept={}, credentials_kept={}",
+            result.is_err(),
+            unchanged,
+            credentials_kept
+        );
+        let err = result.unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.enrollAgainOtherAccount"),
+            "{err}"
+        );
+    }
+
+    /// A config from before `account_id` still resets once the ticket and
+    /// the listing name one account.
+    #[test]
+    fn a_config_without_an_account_resets_when_ticket_and_listing_agree() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        let mut c = team_config::load().unwrap();
+        c.account_id.clear();
+        team_config::save(&c).unwrap();
+        let refs = refs();
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert_cleared(refs);
     }
 
     #[test]
