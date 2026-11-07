@@ -1444,6 +1444,7 @@
   "team.saveServerAndTenantFirst": "Hãy lưu địa chỉ máy chủ và mã nhóm trước.",
   "team.fleetKeyCollected": "Đã nhận khoá đội máy (thế hệ {n}). Hồ sơ nhóm sẽ đồng bộ bằng khoá này.",
   "team.fleetKeyWaiting": "Có một quyền khoá đội máy đang chờ nhưng chưa được giữ lại. Nếu thiết bị này chưa xác nhận mã tham gia, hãy xác nhận trước rồi nhận lại.",
+  "team.fleetKeyFailed": "Quyền khoá đội máy của thiết bị này không qua được bước kiểm tra: không xác minh hoặc mở được, hoặc không lấy được bằng chứng, nên chưa giữ lại gì. Hãy nhận quyền giữ khoá lại; nếu vẫn lỗi, hãy nhờ một thiết bị giữ khoá cấp lại khoá đội máy.",
   "team.fleetKeySubstituted": "Đã từ chối: máy chủ nhóm đưa ra một khoá đội máy khác với khoá thiết bị này đang giữ cho thế hệ đó.",
   "team.devices.fleetKeyHelp": "Là người giữ khoá gốc, hãy tạo khoá đội máy của nhóm một lần. Hồ sơ nhóm được mã hoá bằng khoá này, và mỗi thiết bị đã duyệt sẽ nhận nó.",
   "team.devices.createFleetKey": "Tạo khoá đội máy",

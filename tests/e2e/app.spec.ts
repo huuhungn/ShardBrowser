@@ -1200,6 +1200,29 @@ test("an import whose collect is refused another fleet key says so", async ({ pa
   await expect(c.getByText("Fleet key collected")).toHaveCount(0);
 });
 
+test("an import with rejected fleet evidence reports failure rather than waiting", async ({ page }) => {
+  const card = await teamDevicePage(page, "b", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      // Exact report shape of custody_report(..., FleetGrant::Failed).
+      return args[0] === "team_import_recovery_bundle"
+        ? { ...(result as object), fleet_opened: 0, fleet_failed: 1, newest_fleet_generation: null,
+            fleet_grants_waiting: 1, fleet_refusal: null }
+        : result;
+    };
+  });
+  const form = card.getByTestId("team-import");
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(page, "Import recovery bundle");
+  await expect(page.getByText("The recovery bundle was imported.")).toBeVisible();
+  await expect(page.getByText("A fleet key grant is waiting but was not kept.", { exact: false })).toHaveCount(0);
+  await expect(page.getByText(/fleet.*(failed|refused|does not verify)/i)).toBeVisible();
+});
+
 test("the root custodian exports a recovery bundle, and Export is off before the fleet key exists", async ({ page: a }) => {
   await teamDevicePage(a, "a", fakeTeamServer());
   const out = a.getByTestId("team-export");

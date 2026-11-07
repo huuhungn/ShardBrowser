@@ -1444,6 +1444,7 @@
   "team.saveServerAndTenantFirst": "Save a server URL and tenant ID first.",
   "team.fleetKeyCollected": "Fleet key collected (generation {n}). Team profiles sync with it.",
   "team.fleetKeyWaiting": "A fleet key grant is waiting but was not kept. If this device has not confirmed its join code yet, do that first, then collect again.",
+  "team.fleetKeyFailed": "The fleet key grant for this device failed its check: it did not verify or open, or its evidence could not be fetched, so nothing was kept. Collect key custody again; if it fails again, ask a custodian to grant the fleet key again.",
   "team.fleetKeySubstituted": "Refused: the team server offered another fleet key than the one this device already holds for that generation.",
   "team.devices.fleetKeyHelp": "As the root custodian, create the team's fleet key once. Team profiles are encrypted with it, and each approved device collects it.",
   "team.devices.createFleetKey": "Create fleet key",

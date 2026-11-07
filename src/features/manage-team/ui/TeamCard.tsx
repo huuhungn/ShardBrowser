@@ -249,6 +249,8 @@ export function TeamCard() {
     }
     if (r.fleet_refusal) {
       toast.err(t("team.fleetKeySubstituted"));
+    } else if (r.fleet_failed > 0) {
+      toast.err(t("team.fleetKeyFailed"));
     } else if (r.fleet_grants_waiting > 0) {
       toast.info(t("team.fleetKeyWaiting"));
     }
