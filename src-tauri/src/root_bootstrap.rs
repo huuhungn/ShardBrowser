@@ -1464,6 +1464,36 @@ mod tests {
         assert_eq!(std::fs::read(&older).unwrap(), b"an older bundle");
     }
 
+    #[test]
+    fn a_rejected_export_preserves_an_openable_older_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.bundle");
+        let recovery = RecoveryExport {
+            path: &path,
+            passphrase: "fixture passphrase",
+        };
+        let trk = [9; 32];
+        let (cx, good) = custodian_cx([5; 16], &trk);
+        export_v3(&cx, &trk, &good, &recovery);
+        let before = std::fs::read(&path).unwrap();
+        assert!(rb::open(&before, recovery.passphrase).is_ok());
+        let (_, wrong) = custodian_cx([0x0e; 16], &trk);
+        let result = export_recovery_bundle(
+            &cx,
+            &trk,
+            &signer(),
+            &HPKE_SEED,
+            &wrong,
+            Vec::new(),
+            &recovery,
+            1_800_000_000_000,
+        );
+        assert!(result.is_err());
+        let after = std::fs::read(&path).unwrap();
+        assert!(after == before, "the good bundle was replaced");
+        assert!(rb::open(&after, recovery.passphrase).is_ok());
+    }
+
     /// S3: a verified key of generation 0 while the server reports generation
     /// 1 ACTIVE is refused before the root grant is read; with generation 0
     /// ACTIVE the export goes on to that read.

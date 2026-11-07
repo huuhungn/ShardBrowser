@@ -712,6 +712,16 @@ mod tests {
     }
 
     #[test]
+    fn import_rejects_a_different_hpke_id_without_writing() {
+        let f = fixture();
+        let listing = me(INSTANCE, ACCOUNT, "active", (key_ids().0, hex(&[0xee; 32])));
+        let (err, calls, unchanged) = refused_by(&f, server(listing, (500, "")));
+        assert!(crate::errcode::has_code(&err, "recovery.deviceNotActive"));
+        assert!(!calls.iter().any(|c| c == CHALLENGE));
+        assert!(unchanged);
+    }
+
+    #[test]
     fn another_server_is_refused_before_any_session_is_asked_for() {
         let f = fixture();
         let reply = server(me([0xee; 16], ACCOUNT, "active", key_ids()), (500, ""));
