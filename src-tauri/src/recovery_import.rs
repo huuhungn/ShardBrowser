@@ -1176,6 +1176,86 @@ mod tests {
         assert!(unchanged);
     }
 
+    /// Only an acknowledged self-grant passes step 5: one still pending its
+    /// ack, or revoked, reads as missing.
+    #[test]
+    fn a_pending_or_revoked_root_grant_is_refused() {
+        let f = fixture();
+        let rt = runtime();
+        let (hpke_secret, _) = derive_keypair(&HPKE_SEED);
+        for grant_state in [
+            RootGrantState::Acknowledged,
+            RootGrantState::PendingAck,
+            RootGrantState::Revoked,
+        ] {
+            let record = AuthorizationRecord::parse(&f.self_grant)
+                .unwrap()
+                .verify_signature(signer().verifying_key().as_bytes())
+                .unwrap();
+            let descriptor =
+                TenantRootGrantDescriptorV2::new(record, grant_state, RootGenerationState::Active)
+                    .unwrap()
+                    .encode();
+            let reply: Arc<Reply> = Arc::new(move |_, _| (200, descriptor.clone()));
+            let (client, _) = rt.block_on(mock(reply));
+            let result = rt.block_on(check_root_grant(
+                &client,
+                "v2a.fixture",
+                &hex(&TENANT),
+                &f.self_grant,
+                &signer(),
+                &hpke_secret,
+                &TRK,
+            ));
+            match grant_state {
+                RootGrantState::Acknowledged => assert!(result.is_ok()),
+                _ => assert!(crate::errcode::has_code(
+                    &result.unwrap_err().to_string(),
+                    "recovery.rootGrantMissing"
+                )),
+            }
+        }
+    }
+
+    /// A v3 bundle whose custodian block does not check is refused at the
+    /// full entry point before any request, and nothing is written.
+    #[test]
+    fn an_invalid_v3_bundle_never_reaches_the_listing_or_writes() {
+        let f = fixture();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(server(serde_json::json!({}), (500, ""))));
+        f.connected(client.base_url());
+        let mut bundle = f.bundle();
+        bundle
+            .plaintext
+            .root_custodian
+            .as_mut()
+            .unwrap()
+            .hpke_key_seed = [0x7b; 32].into();
+        let (_, file) =
+            rb::seal(TENANT, INSTANCE, 0, 0, &bundle.plaintext, "test passphrase").unwrap();
+        let path = f.dir.path().join("invalid-v3.bundle");
+        std::fs::write(&path, &file).unwrap();
+        let before = f.files();
+        let result = rt.block_on(run(
+            &path,
+            "test passphrase",
+            "owner",
+            "pw",
+            true,
+            &mut save,
+        ));
+        assert!(crate::errcode::has_code(
+            &result.unwrap_err().to_string(),
+            "recovery.bundleDoesNotOpen"
+        ));
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "invalid bundle reached the server"
+        );
+        assert!(f.files() == before, "invalid bundle changed state");
+    }
+
     /// A wrong passphrase, or a file that is not there, says only that the
     /// bundle does not open, and nothing is written.
     #[test]
