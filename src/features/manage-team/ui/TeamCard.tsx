@@ -554,8 +554,10 @@ export function TeamCard() {
                       {t(bootUnreadable
                         ? "team.recovery.rootStateUnreadable"
                         : boot?.this_device
-                          ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable"
-                            : boot.activated ? "team.recovery.rootKeysLost" : "team.recovery.rootSetupInterrupted"
+                          ? !boot.activated
+                            ? st.key_store_unavailable
+                              ? "team.recovery.rootSetupKeyStoreUnavailable" : "team.recovery.rootSetupInterrupted"
+                            : st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
                           : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
                     </p>
                   )}

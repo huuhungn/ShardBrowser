@@ -1426,6 +1426,29 @@ test("a lost-key device offers no Reset or sign-in while its root state is still
   await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
 });
 
+test("an unfinished root setup whose key store is unavailable does not claim to be the root custodian", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-key-store-unavailable", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_custody_bootstrap_status") {
+        return { ...(result as Record<string, unknown>), started: true, activated: false };
+      }
+      return result;
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  const notice = card.getByTestId("team-keys-lost");
+  await expect(notice).toContainText(
+    "The key store did not answer; try again. This device started setting up the team's root key without finishing",
+  );
+  await expect(notice).not.toContainText("This device is the root custodian");
+  await expect(notice.getByRole("button")).toHaveCount(0);
+});
+
 test("an expired join code of a device with an unfinished root setup offers no Enroll again", async ({ page: a }) => {
   const server = fakeTeamServer();
   // The server lists A pending, where an ordinary device could enroll again.
