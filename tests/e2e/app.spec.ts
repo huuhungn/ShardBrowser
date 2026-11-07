@@ -1280,6 +1280,26 @@ test("a root custodian whose keys are lost is offered import, not Reset", async 
   await expect(card.getByTestId("team-devices")).toBeVisible();
 });
 
+test("an unreadable root state never offers Reset", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-keys-lost", fakeTeamServer());
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      if (args[0] === "team_custody_bootstrap_status") {
+        throw new Error("[[shardx:fleet.custodyStateCorrupt]]");
+      }
+      return original(...args);
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(card.getByTestId("team-keys-lost")).toBeVisible();
+  await expect(card.getByTestId("team-root-state-unreadable")).toBeVisible();
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+});
+
 test("a root custodian whose key store is unavailable is told to try again, with no Reset or sign-in", async ({ page: a }) => {
   const card = await teamDevicePage(a, "root-key-store-unavailable", fakeTeamServer());
   const notice = card.getByTestId("team-keys-lost");

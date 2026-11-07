@@ -61,6 +61,8 @@ export function TeamCard() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [boot, setBoot] = useState<CustodyBootstrapStatus | null>(null);
+  // The root state did not read: this device may be the root custodian, so no Reset until it does.
+  const [bootUnreadable, setBootUnreadable] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [passphrase2, setPassphrase2] = useState("");
   const [keyPass, setKeyPass] = useState("");
@@ -69,13 +71,18 @@ export function TeamCard() {
 
   const shareStatus = useTeam((s) => s.refresh);
 
+  const loadBoot = () =>
+    teamCustodyBootstrapStatus()
+      .then((b) => { setBoot(b); setBootUnreadable(false); })
+      .catch(() => { setBoot(null); setBootUnreadable(true); });
+
   const refresh = () => {
     teamStatus().then((s) => {
       setSt(s);
       setUrl(s.server_url);
       setTenant(s.tenant_id);
     }).catch(() => {});
-    teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+    void loadBoot();
   };
   useEffect(() => { refresh(); }, []);
 
@@ -168,7 +175,7 @@ export function TeamCard() {
       toast.ok(t("team.rootCustodyReady", { path: next.recovery_path }));
     } catch (e) {
       // Whatever step it reached is saved; show where the next try resumes.
-      teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+      void loadBoot();
       throw e;
     }
   });
@@ -526,15 +533,26 @@ export function TeamCard() {
                 </div>
               )}
 
+              {bootUnreadable && !lost && (
+                <p data-testid="team-root-state-unreadable" className="m-0 text-paragraph-xs text-state-error-base">
+                  {t("team.recovery.rootStateUnreadable")}
+                </p>
+              )}
+
               {lost ? (
                 <div className="flex flex-col gap-2" data-testid="team-keys-lost">
-                  <p className="m-0 text-paragraph-xs text-state-error-base">
-                    {t(boot?.activated
-                      ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
-                      : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
+                  <p
+                    data-testid={bootUnreadable ? "team-root-state-unreadable" : undefined}
+                    className="m-0 text-paragraph-xs text-state-error-base"
+                  >
+                    {t(bootUnreadable
+                      ? "team.recovery.rootStateUnreadable"
+                      : boot?.activated
+                        ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
+                        : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
                   </p>
                   {/* A root custodian whose store only did not answer has nothing to sign in for. */}
-                  {(!boot?.activated || st.keys_lost) && (
+                  {!bootUnreadable && (!boot?.activated || st.keys_lost) && (
                     <>
                       <Input
                         label={t("team.accountUsername")}
@@ -554,7 +572,7 @@ export function TeamCard() {
                     </>
                   )}
                   {/* The root custodian is never reset: its way back is its recovery bundle. */}
-                  {boot?.activated ? st.keys_lost && importForm : (
+                  {bootUnreadable ? null : boot?.activated ? st.keys_lost && importForm : (
                     <div>
                       <Button
                         size="small"
