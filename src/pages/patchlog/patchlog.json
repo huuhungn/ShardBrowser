@@ -3,6 +3,29 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.8.1",
+      "date": "2026-11-07",
+      "entries": [
+        {
+          "id": "team-recovery-strict-server",
+          "title": "Recovery checks the team server's answers more strictly",
+          "lead": "Import, Reset and the Team page no longer act on a team server answer that contradicts what the launcher holds.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Import recovery bundle refuses a login for another account or server than the bundle's. When the server says a device is pending, Reset keeps a copy of team.json and the device keys, as it does for a revoked device. A malformed root key grant is refused with an error instead of crashing the launcher."
+            },
+            {
+              "type": "p",
+              "text": "A fleet key cached by 2.4.2 that a grant verifies is now marked verified, so Export recovery bundle works on that device. While the root custodian's status loads, and for an unfinished root setup, the Team page offers no Reset or Enroll again."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.8.0",
       "date": "2026-11-07",
       "entries": [

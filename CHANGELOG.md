@@ -1,5 +1,39 @@
 # Changelog
 
+## v2.8.1
+
+A Team fix release: the launcher checks the team server's answers more
+strictly during recovery. It fixes the known limitations of 2.8.0 that a
+misreporting server could trigger. The browser engine and the team server
+are unchanged.
+
+### Team
+
+- **Import binds the login to the bundle.** Import recovery bundle refuses a
+  login ticket or device session for another account or server than the
+  bundle's, before any proof or write.
+- **Reset keeps a pending device's keys.** When the server says a device is
+  pending, Reset keeps a copy of `team.json` and the device keys, as it does
+  for a revoked device.
+- **No crash on a malformed root key grant.** A root key grant with a
+  malformed hex field is refused with an error instead of crashing the
+  launcher.
+- **A verified cached fleet key is marked verified.** A fleet key cached by
+  2.4.2 that a grant verifies is now marked verified, so Export recovery
+  bundle works on that device.
+- **Root custodian actions on the Team page.** While the root custodian's
+  status loads, and for an unfinished root setup, the Team page offers no
+  Reset or Enroll again, and an unfinished setup no longer says the device is
+  the root custodian. A root state left by another team or device no longer
+  hides Reset.
+- **Trust ledger checks.** A trust ledger that cannot be checked is an error,
+  and an unreadable ledger blocks Reset only for an active device.
+
+### Known limitations
+
+- The known limitations of 2.8.0 about the recovery bundle, the server URL
+  and fleet key rotation still apply.
+
 ## v2.8.0
 
 A Team release: a team survives losing its devices' keys. The root custodian
