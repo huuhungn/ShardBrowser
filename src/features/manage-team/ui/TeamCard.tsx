@@ -551,12 +551,13 @@ export function TeamCard() {
                   >
                     {t(bootUnreadable
                       ? "team.recovery.rootStateUnreadable"
-                      : boot?.activated
-                        ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
+                      : boot?.started
+                        ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable"
+                          : boot.activated ? "team.recovery.rootKeysLost" : "team.recovery.rootSetupInterrupted"
                         : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
                   </p>
-                  {/* A root custodian whose store only did not answer has nothing to sign in for. */}
-                  {!bootUnreadable && (!boot?.activated || st.keys_lost) && (
+                  {/* A root custodian whose store only did not answer, or whose setup never finished, has nothing to sign in for. */}
+                  {!bootUnreadable && (!boot?.started || (boot.activated && st.keys_lost)) && (
                     <>
                       <Input
                         label={t("team.accountUsername")}
@@ -575,8 +576,10 @@ export function TeamCard() {
                       />
                     </>
                   )}
-                  {/* The root custodian is never reset: its way back is its recovery bundle. */}
-                  {bootUnreadable ? null : boot?.activated ? st.keys_lost && importForm : (
+                  {/* A saved root setup, finished or not, is never reset (the backend refuses it). A finished
+                      one comes back from its recovery bundle; an unfinished one saved no anchor, so import
+                      refuses it too. */}
+                  {bootUnreadable ? null : boot?.started ? boot.activated && st.keys_lost && importForm : (
                     <div>
                       <Button
                         size="small"
