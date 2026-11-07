@@ -2929,7 +2929,8 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
                 .map_err(|e| e.to_string())?
                 .device
                 .map(|d| d.status);
-            let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
+            let pinned = status.as_deref() == Some("active")
+                && read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
             return Err(if enroll_again_allowed(status.as_deref(), pinned) {
                 expired
             } else if status.as_deref() == Some("active") {
@@ -3090,7 +3091,9 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
     }
     let status = me.device.map(|d| d.status);
-    let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
+    // Only an active device's pin decides, so only its ledger is read.
+    let pinned = status.as_deref() == Some("active")
+        && read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
     if !enroll_again_allowed(status.as_deref(), pinned) {
         return Err(refused());
     }
@@ -7095,6 +7098,27 @@ mod custody_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::write(&dir, b"not a directory").unwrap();
         assert!(tenant_pin(&TENANT).is_err());
+    }
+
+    /// Nit 2: the pin decides only for an active device, so a ledger that
+    /// does not read never stops Enroll again of a pending or revoked one.
+    #[test]
+    fn an_unreadable_ledger_stops_only_an_active_device() {
+        for status in ["pending", "revoked"] {
+            let rt = runtime();
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            let ledger = team::db::Db::path().unwrap();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, b"unreadable test ledger").unwrap();
+            let err = rt
+                .block_on(team_join_code("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains("fleet.joinCodeExpired"), "{status}: {err}");
+            rt.block_on(team_enroll_again("u".into(), "p".into()))
+                .unwrap();
+            assert!(!team_config::load().unwrap().is_enrolled(), "{status}");
+        }
     }
 
     /// Makes the joiner the activated root custodian of its tenant.
