@@ -250,7 +250,9 @@ account), so keep the bundle offline. A bundle exported before 2.8.0 holds no
 root custodian and cannot restore the team (`recovery.bundleWithoutCustodian`):
 the root custodian exports a new one with **Export recovery bundle** on the
 Team page, once it holds the fleet key (`team_export_recovery_bundle`; it
-files nothing and changes no state file). A bundle works only while the root
+files nothing and changes no state file). The page shows the root key ID, the
+bundle's fingerprint (ADR 0002 D-5), and Export stays off until the owner
+ticks that it was recorded. A bundle works only while the root
 custodian's approval and grants run: 365 days from bootstrap. 2.7.x cannot
 read the v3 state an import writes, so do not downgrade after an import.
 
@@ -293,10 +295,12 @@ that left the index during a passing store fault has no verified grant and is
 not collected again: restore it from the copy, which helps only while a later
 collect has not rewritten the credential `fleet-key.{fleet}.{generation}`.
 
-The root custodian keeps its connection: changing its server URL or tenant
-is refused (`fleet.rootCustodianKeepsConnection`) unless both its device
-keys are lost; then `team.json` is copied aside, nothing is forgotten, and
-import is the way back. Any change of the URL string counts, so a root
+The root custodian keeps its connection, and so does a device whose root
+custody setup has saved its create request, since the server may have
+activated it before the setup finished: changing its server URL or tenant is
+refused (`fleet.rootCustodianKeepsConnection`) unless both its device keys
+are lost; then `team.json` is copied aside, nothing is forgotten, and import
+is the way back. Any change of the URL string counts, so a root
 custodian whose server moved to a new LAN address or port cannot change it on
 the Team page: with the launcher closed, edit `server_url` in `team.json`.
 

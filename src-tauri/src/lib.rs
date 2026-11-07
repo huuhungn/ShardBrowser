@@ -2028,10 +2028,15 @@ fn team_set_connection(
     // G13: the change would wipe the root custodian. Only one whose seeds
     // are both lost may go, its file copied and its credentials kept: a
     // recovery import is its way back. A root state that does not load
-    // fails closed, as Enroll again does.
+    // fails closed, as Enroll again does. A bootstrap with a saved create
+    // request counts too: it is saved before it is sent, and the server may
+    // have activated the generation before the local flag was saved. A
+    // self-grant alone is saved before the create request, so the server
+    // has seen no root generation yet (`root_bootstrap.rs` step 2 saves the
+    // self-grant, step 4 saves the create request, then sends it).
     let root_custodian = server_changed && {
         let root = root_bootstrap::load().map_err(|e| e.to_string())?;
-        root.activated
+        (root.activated || !root.create_request.is_empty())
             && root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
             && root.device_id.eq_ignore_ascii_case(&c.device_id)
     };
@@ -3053,15 +3058,18 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let refused = || crate::errcode::code("fleet.enrollAgainRefused");
-    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
-    let custodian = root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
-        && root.device_id.eq_ignore_ascii_case(&c.device_id);
-    if custodian {
+    let custodian = |c: &team_config::TeamConfig| {
+        root_bootstrap::load().map(|root| {
+            root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+                && root.device_id.eq_ignore_ascii_case(&c.device_id)
+        })
+    };
+    if custodian(&c).map_err(|e| e.to_string())? {
         return Err(refused());
     }
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
-    let status = client
+    let me = client
         .account_device_status(
             &fleet_client::AccountLogin {
                 tenant_id: &c.tenant_id,
@@ -3071,12 +3079,32 @@ async fn team_enroll_again(
             &c.device_id,
         )
         .await
-        .map_err(|e| e.to_string())?
-        .device
-        .map(|d| d.status);
+        .map_err(|e| e.to_string())?;
+    // A listing that names another account than the one that enrolled this
+    // device never resets it, as recovery import checks the bundle's.
+    if !c.account_id.is_empty()
+        && !me.account_id.is_empty()
+        && !me.account_id.eq_ignore_ascii_case(&c.account_id)
+    {
+        return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
+    }
+    let status = me.device.map(|d| d.status);
     if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
+    // `team.json` and the root state may have changed during the listing (an
+    // import, Enroll, a new connection): only the identity checked above is
+    // cleared, as import's write does.
+    let now = team_config::load().map_err(|e| e.to_string())?;
+    let unchanged = now.server_url == c.server_url
+        && now.tenant_id == c.tenant_id
+        && now.device_id == c.device_id
+        && now.signing_credential_ref == c.signing_credential_ref
+        && now.hpke_credential_ref == c.hpke_credential_ref;
+    if !unchanged || custodian(&now).map_err(|e| e.to_string())? {
+        return Err(crate::errcode::code("fleet.identityChanged"));
+    }
+    c = now;
     // `revoked` is the server's unauthenticated word, and a seed that does
     // not read may come back: the file is copied and the keys are kept.
     let keep =
@@ -6348,6 +6376,265 @@ mod custody_tests {
         let c = team_config::load().unwrap();
         assert!(!c.signing_credential_ref.is_empty() && !c.hpke_credential_ref.is_empty());
         [c.signing_credential_ref, c.hpke_credential_ref]
+    }
+
+    #[test]
+    fn reset_preserves_an_identity_replaced_while_listing_is_in_flight() {
+        use std::sync::Arc;
+        let rt = runtime();
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed_in_reply = changed.clone();
+        let reply: Arc<fleet_custody::tests::Reply> = Arc::new(move |call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => {
+                    // A concurrent enrollment/import has committed another working identity.
+                    let mut current = team_config::load().unwrap();
+                    current.device_id = hex(&[0x6b; 16]);
+                    current.signing_credential_ref = "race-signing".into();
+                    current.hpke_credential_ref = "race-hpke".into();
+                    credential::store(&current.signing_credential_ref, &[0x71; 32]).unwrap();
+                    credential::store(&current.hpke_credential_ref, &[0x72; 32]).unwrap();
+                    team_config::save(&current).unwrap();
+                    root_bootstrap::save(&root_bootstrap::BootstrapState {
+                        tenant_id: current.tenant_id,
+                        device_id: current.device_id,
+                        activated: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    changed_in_reply.store(true, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                }
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let result = rt.block_on(team_enroll_again("u".into(), "p".into()));
+        assert!(changed.load(std::sync::atomic::Ordering::SeqCst));
+        let after = team_config::load().unwrap();
+        assert!(
+            after.device_id == hex(&[0x6b; 16]),
+            "Reset overwrote the newer root identity"
+        );
+        assert!(
+            crate::errcode::has_code(&result.unwrap_err(), "fleet.identityChanged"),
+            "Reset accepted a stale identity snapshot"
+        );
+    }
+
+    /// Reset of the joiner, listed revoked, while `race` writes during the
+    /// listing: the error, whether the joiner's credentials were kept, and
+    /// the device ID `team.json` holds afterwards.
+    fn reset_racing(race: fn()) -> (String, bool, String) {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(
+            move |call, _| {
+                let body = match call {
+                    "POST /v2/auth/login" => serde_json::json!({
+                        "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                        "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                        "restore_epoch": 0
+                    }),
+                    "GET /v2/me" => {
+                        race();
+                        serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                (200, serde_json::to_vec(&body).unwrap())
+            },
+        );
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let refs = refs();
+        let err = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        let kept = credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok();
+        (err, kept, team_config::load().unwrap().device_id)
+    }
+
+    /// D1: a root state that names this device by the time the listing
+    /// returns refuses the Reset, though `team.json` did not change.
+    #[test]
+    fn reset_is_refused_when_only_the_root_state_changed_during_the_listing() {
+        let (err, kept, device) = reset_racing(|| {
+            root_bootstrap::save(&root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT),
+                device_id: hex(&JOINER),
+                activated: true,
+                ..Default::default()
+            })
+            .unwrap();
+        });
+        assert!(
+            crate::errcode::has_code(&err, "fleet.identityChanged"),
+            "{err}"
+        );
+        assert!(
+            kept,
+            "Reset cleared a device that became the root custodian"
+        );
+        assert_eq!(device, hex(&JOINER));
+    }
+
+    /// D1: another identity in `team.json` by the time the listing returns
+    /// refuses the Reset, though the root state did not change.
+    #[test]
+    fn reset_is_refused_when_only_team_json_changed_during_the_listing() {
+        let (err, kept, device) = reset_racing(|| {
+            let mut current = team_config::load().unwrap();
+            current.device_id = hex(&[0x6b; 16]);
+            team_config::save(&current).unwrap();
+        });
+        assert!(
+            crate::errcode::has_code(&err, "fleet.identityChanged"),
+            "{err}"
+        );
+        assert!(kept, "Reset overwrote a newer identity");
+        assert_eq!(device, hex(&[0x6b; 16]));
+    }
+
+    #[test]
+    fn reset_of_an_unlisted_device_keeps_identity_and_credentials() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "missing");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        let before = team_json();
+        let refs = refs();
+        let result = rt.block_on(team_enroll_again("other-account".into(), "p".into()));
+        assert!(result.is_err());
+        assert!(team_json() == before);
+        assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
+    }
+
+    #[test]
+    fn reset_checks_the_signed_in_account_against_the_saved_owner() {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(|call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => serde_json::json!({
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "devices": [{"device_id": hex(&JOINER), "status": "pending"}]
+                }),
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let before = team_json();
+        assert!(team_config::load().unwrap().account_id != hex(&[0x6c; 16]));
+        let result = rt.block_on(team_enroll_again("other-account".into(), "p".into()));
+        assert!(
+            team_json() == before,
+            "a different signed-in account cleared the saved owner's device"
+        );
+        assert!(crate::errcode::has_code(
+            &result.unwrap_err(),
+            "fleet.enrollAgainOtherAccount"
+        ));
+    }
+
+    #[test]
+    fn connection_change_preserves_an_unfinished_root_identity() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            root_here();
+            let mut root = root_bootstrap::load().unwrap();
+            root.self_grant = self_grant_here(&[9; 32]);
+            root.create_request = "ab".into();
+            // An interrupted bootstrap has saved its create request, which
+            // the server may have acted on, but has not yet persisted
+            // finish_activation's activated flag.
+            root.activated = false;
+            root_bootstrap::save(&root).unwrap();
+            let before = team_json();
+            let refs = refs();
+            let result = team_set_connection(url, String::new(), tenant);
+            assert!(
+                team_json() == before,
+                "connection change cleared the unfinished root identity"
+            );
+            assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
+            assert!(crate::errcode::has_code(
+                &result.unwrap_err(),
+                "fleet.rootCustodianKeepsConnection"
+            ));
+        }
+    }
+
+    /// A self-grant alone was never sent: the server holds no root
+    /// generation of this device, so it may change its connection.
+    #[test]
+    fn a_bootstrap_with_only_a_self_grant_may_change_its_connection() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            root_here();
+            let mut root = root_bootstrap::load().unwrap();
+            root.self_grant = self_grant_here(&[9; 32]);
+            root.activated = false;
+            root_bootstrap::save(&root).unwrap();
+            team_set_connection(url.clone(), String::new(), tenant.clone()).unwrap();
+            let c = team_config::load().unwrap();
+            assert!(c.device_id.is_empty() && !c.is_enrolled());
+            assert_eq!((c.server_url, c.tenant_id), (url, tenant));
+        }
+    }
+
+    /// The joiner's first root self-grant of `trk`, in hex.
+    fn self_grant_here(trk: &[u8; 32]) -> String {
+        let c = team_config::load().unwrap();
+        let signer = c.signing_key().unwrap();
+        let (_, hpke_public) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+        let cx = root_bootstrap::Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: [6; 16],
+            device: JOINER,
+            signing_key_id: shardx_core::keys::signing_key_id(signer.verifying_key().as_bytes()),
+            hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+        };
+        hex(&root_bootstrap::self_grant(
+            &cx,
+            &signer,
+            &hpke_public,
+            trk,
+            [8; 16],
+            root_bootstrap::now_ms(),
+        )
+        .unwrap())
+    }
+
+    /// D7: the export's fingerprint is the activated root's `root_key_id`,
+    /// and nothing before activation.
+    #[test]
+    fn bootstrap_status_shows_the_root_key_id_once_activated() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        root_here();
+        let mut root = root_bootstrap::load().unwrap();
+        root.self_grant = self_grant_here(&[9; 32]);
+        root_bootstrap::save(&root).unwrap();
+        assert_eq!(
+            root_bootstrap::status().unwrap().root_key_id,
+            hex(&shardx_core::keys::root_key_id(&[9; 32]))
+        );
+        root.activated = false;
+        root_bootstrap::save(&root).unwrap();
+        assert!(root_bootstrap::status().unwrap().root_key_id.is_empty());
     }
 
     #[test]

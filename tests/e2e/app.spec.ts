@@ -1200,6 +1200,29 @@ test("an import whose collect is refused another fleet key says so", async ({ pa
   await expect(c.getByText("Fleet key collected")).toHaveCount(0);
 });
 
+test("an import with rejected fleet evidence reports failure rather than waiting", async ({ page }) => {
+  const card = await teamDevicePage(page, "b", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      // Exact report shape of custody_report(..., FleetGrant::Failed).
+      return args[0] === "team_import_recovery_bundle"
+        ? { ...(result as object), fleet_opened: 0, fleet_failed: 1, newest_fleet_generation: null,
+            fleet_grants_waiting: 1, fleet_refusal: null }
+        : result;
+    };
+  });
+  const form = card.getByTestId("team-import");
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel(OLD_DEVICE_LOST).check();
+  await cardClick(page, "Import recovery bundle");
+  await expect(page.getByText("The recovery bundle was imported.")).toBeVisible();
+  await expect(page.getByText("A fleet key grant is waiting but was not kept.", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("The fleet key grant for this device failed its check: it did not verify or open, or its evidence could not be fetched, so nothing was kept. Collect key custody again; if it fails again, ask a custodian to grant the fleet key again.")).toBeVisible();
+});
+
 test("the root custodian exports a recovery bundle, and Export is off before the fleet key exists", async ({ page: a }) => {
   await teamDevicePage(a, "a", fakeTeamServer());
   const out = a.getByTestId("team-export");
@@ -1213,9 +1236,56 @@ test("the root custodian exports a recovery bundle, and Export is off before the
   await cardClick(a, "Create fleet key");
   await expect(out).not.toContainText("Create the fleet key above");
   await cardSignIn(a);
+  await out.getByLabel("I recorded this root key fingerprint").check();
   await button.click();
   await expect(a.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
   await expect(a.locator("html")).toHaveAttribute("data-e2e-export-path", "C:\\Users\\Example\\shardx-recovery.shxrecovery");
+});
+
+test("export waits for the owner's recovery fingerprint confirmation", async ({ page }) => {
+  await teamDevicePage(page, "a", fakeTeamServer());
+  await cardClick(page, "Create fleet key");
+  const form = page.getByTestId("team-export");
+  await cardSignIn(page);
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel("Recovery passphrase again").fill("correct horse");
+  // Journey E requires owner fingerprint confirmation in addition to the
+  // passphrase confirmation: the root key ID is shown, and Export stays off
+  // until the owner ticks that it was recorded.
+  await expect(form.getByText("Root key fingerprint (root key ID)")).toBeVisible();
+  await expect(form.locator("input[readonly]")).toHaveValue("5e".repeat(32));
+  const button = form.getByRole("button", { name: "Export recovery bundle" });
+  await expect(button).toBeDisabled();
+  await button.click({ force: true });
+  await expect(page.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toHaveCount(0);
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-export-path", /./);
+  await form.getByLabel("I recorded this root key fingerprint").check();
+  await button.click();
+  await expect(page.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
+});
+
+test("export says why it is off when the root key fingerprint does not read", async ({ page }) => {
+  await teamDevicePage(page, "a", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      return args[0] === "team_custody_bootstrap_status" ? { ...(result as object), root_key_id: "" } : result;
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await cardClick(page, "Create fleet key");
+  const form = page.getByTestId("team-export");
+  await cardSignIn(page);
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel("Recovery passphrase again").fill("correct horse");
+  await expect(form.getByTestId("team-export-no-root-key-id")).toHaveText(
+    "Export is off: the root key fingerprint could not be read from this device's saved root custody setup.",
+  );
+  await expect(form.getByLabel("I recorded this root key fingerprint")).toHaveCount(0);
+  await expect(form.getByRole("button", { name: "Export recovery bundle" })).toBeDisabled();
 });
 
 test("a member whose keys are lost is reset after a custodian revokes it, then enrolls again", async ({
@@ -1278,6 +1348,26 @@ test("a root custodian whose keys are lost is offered import, not Reset", async 
   await cardClick(a, "Import recovery bundle");
   await expect(card.getByTestId("team-keys-lost")).toHaveCount(0);
   await expect(card.getByTestId("team-devices")).toBeVisible();
+});
+
+test("an unreadable root state never offers Reset", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-keys-lost", fakeTeamServer());
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      if (args[0] === "team_custody_bootstrap_status") {
+        throw new Error("[[shardx:fleet.custodyStateCorrupt]]");
+      }
+      return original(...args);
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(card.getByTestId("team-keys-lost")).toBeVisible();
+  await expect(card.getByTestId("team-root-state-unreadable")).toBeVisible();
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
 });
 
 test("a root custodian whose key store is unavailable is told to try again, with no Reset or sign-in", async ({ page: a }) => {

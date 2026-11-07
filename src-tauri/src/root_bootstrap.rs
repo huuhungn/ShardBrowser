@@ -1087,6 +1087,10 @@ pub struct BootstrapStatus {
     pub recovery_path: String,
     /// The bootstrap anchor, once the trust evidence verified to it.
     pub anchor: String,
+    /// The recovery fingerprint (ADR 0002 D-5), the activated root's
+    /// `root_key_id` in hex: empty before activation or when the self-grant
+    /// does not read under this device's key.
+    pub root_key_id: String,
 }
 
 impl BootstrapStatus {
@@ -1096,7 +1100,23 @@ impl BootstrapStatus {
             activated: state.activated,
             recovery_path: state.recovery_path.clone(),
             anchor: state.anchor.clone(),
+            root_key_id: root_key_id_of(state),
         }
+    }
+}
+
+/// The `root_key_id` of `state`'s first self-grant, verified under this
+/// device's signing key; empty when not activated or when either does not read.
+fn root_key_id_of(state: &BootstrapState) -> String {
+    if !state.activated {
+        return String::new();
+    }
+    let signer = crate::team_config::load().and_then(|c| c.signing_key());
+    match (unhex_vec(&state.self_grant), signer) {
+        (Ok(grant), Ok(signer)) => own_grant(&grant, &signer)
+            .map(|(g, _)| hex(&g.root_key_id))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -1462,6 +1482,36 @@ mod tests {
         std::fs::write(&older, b"an older bundle").unwrap();
         refused(&older, &other);
         assert_eq!(std::fs::read(&older).unwrap(), b"an older bundle");
+    }
+
+    #[test]
+    fn a_rejected_export_preserves_an_openable_older_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recovery.bundle");
+        let recovery = RecoveryExport {
+            path: &path,
+            passphrase: "fixture passphrase",
+        };
+        let trk = [9; 32];
+        let (cx, good) = custodian_cx([5; 16], &trk);
+        export_v3(&cx, &trk, &good, &recovery);
+        let before = std::fs::read(&path).unwrap();
+        assert!(rb::open(&before, recovery.passphrase).is_ok());
+        let (_, wrong) = custodian_cx([0x0e; 16], &trk);
+        let result = export_recovery_bundle(
+            &cx,
+            &trk,
+            &signer(),
+            &HPKE_SEED,
+            &wrong,
+            Vec::new(),
+            &recovery,
+            1_800_000_000_000,
+        );
+        assert!(result.is_err());
+        let after = std::fs::read(&path).unwrap();
+        assert!(after == before, "the good bundle was replaced");
+        assert!(rb::open(&after, recovery.passphrase).is_ok());
     }
 
     /// S3: a verified key of generation 0 while the server reports generation

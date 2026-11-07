@@ -61,13 +61,21 @@ export function TeamCard() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [boot, setBoot] = useState<CustodyBootstrapStatus | null>(null);
+  // The root state did not read: this device may be the root custodian, so no Reset until it does.
+  const [bootUnreadable, setBootUnreadable] = useState(false);
   const [passphrase, setPassphrase] = useState("");
   const [passphrase2, setPassphrase2] = useState("");
   const [keyPass, setKeyPass] = useState("");
   const [keyPass2, setKeyPass2] = useState("");
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
+  const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
 
   const shareStatus = useTeam((s) => s.refresh);
+
+  const loadBoot = () =>
+    teamCustodyBootstrapStatus()
+      .then((b) => { setBoot(b); setBootUnreadable(false); })
+      .catch(() => { setBoot(null); setBootUnreadable(true); });
 
   const refresh = () => {
     teamStatus().then((s) => {
@@ -75,7 +83,7 @@ export function TeamCard() {
       setUrl(s.server_url);
       setTenant(s.tenant_id);
     }).catch(() => {});
-    teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+    void loadBoot();
   };
   useEffect(() => { refresh(); }, []);
 
@@ -168,7 +176,7 @@ export function TeamCard() {
       toast.ok(t("team.rootCustodyReady", { path: next.recovery_path }));
     } catch (e) {
       // Whatever step it reached is saved; show where the next try resumes.
-      teamCustodyBootstrapStatus().then(setBoot).catch(() => {});
+      void loadBoot();
       throw e;
     }
   });
@@ -185,6 +193,7 @@ export function TeamCard() {
     await teamExportRecoveryBundle(username.trim(), typed, path, passphrase);
     setPassphrase("");
     setPassphrase2("");
+    setRootKeyIdRecorded(false);
     toast.ok(t("team.recovery.exported", { path }));
   });
 
@@ -242,6 +251,8 @@ export function TeamCard() {
     }
     if (r.fleet_refusal) {
       toast.err(t("team.fleetKeySubstituted"));
+    } else if (r.fleet_failed > 0) {
+      toast.err(t("team.fleetKeyFailed"));
     } else if (r.fleet_grants_waiting > 0) {
       toast.info(t("team.fleetKeyWaiting"));
     }
@@ -526,15 +537,26 @@ export function TeamCard() {
                 </div>
               )}
 
+              {bootUnreadable && !lost && (
+                <p data-testid="team-root-state-unreadable" className="m-0 text-paragraph-xs text-state-error-base">
+                  {t("team.recovery.rootStateUnreadable")}
+                </p>
+              )}
+
               {lost ? (
                 <div className="flex flex-col gap-2" data-testid="team-keys-lost">
-                  <p className="m-0 text-paragraph-xs text-state-error-base">
-                    {t(boot?.activated
-                      ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
-                      : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
+                  <p
+                    data-testid={bootUnreadable ? "team-root-state-unreadable" : undefined}
+                    className="m-0 text-paragraph-xs text-state-error-base"
+                  >
+                    {t(bootUnreadable
+                      ? "team.recovery.rootStateUnreadable"
+                      : boot?.activated
+                        ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable" : "team.recovery.rootKeysLost"
+                        : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
                   </p>
                   {/* A root custodian whose store only did not answer has nothing to sign in for. */}
-                  {(!boot?.activated || st.keys_lost) && (
+                  {!bootUnreadable && (!boot?.activated || st.keys_lost) && (
                     <>
                       <Input
                         label={t("team.accountUsername")}
@@ -554,7 +576,7 @@ export function TeamCard() {
                     </>
                   )}
                   {/* The root custodian is never reset: its way back is its recovery bundle. */}
-                  {boot?.activated ? st.keys_lost && importForm : (
+                  {bootUnreadable ? null : boot?.activated ? st.keys_lost && importForm : (
                     <div>
                       <Button
                         size="small"
@@ -631,12 +653,26 @@ export function TeamCard() {
                         value={passphrase2}
                         onChange={(e) => setPassphrase2(e.target.value)}
                       />
+                      {/* The owner's fingerprint ceremony (ADR 0002 D-5): the root key ID, recorded before export. */}
+                      {boot.root_key_id && (
+                        <>
+                          <div>
+                            <span className="text-paragraph-xs text-text-soft-400">{t("team.recovery.rootKeyId")}</span>
+                            <CopyField value={boot.root_key_id} />
+                          </div>
+                          <Checkbox
+                            label={t("team.recovery.rootKeyIdRecorded")}
+                            checked={rootKeyIdRecorded}
+                            onChange={() => setRootKeyIdRecorded((v) => !v)}
+                          />
+                        </>
+                      )}
                       <div>
                         <Button
                           size="small"
                           mode="stroke"
-                          disabled={!!busy || !(st.has_fleet_key || st.fleet_key_blocked)
-                            || !username.trim() || !password || !passphrase || !passphrase2}
+                          disabled={!!busy || !(st.has_fleet_key || st.fleet_key_blocked) || !boot.root_key_id
+                            || !rootKeyIdRecorded || !username.trim() || !password || !passphrase || !passphrase2}
                           onClick={exportBundle}
                         >
                           {busy === "export" ? t("busy.exporting") : t("team.recovery.export")}
@@ -644,6 +680,11 @@ export function TeamCard() {
                       </div>
                       {!(st.has_fleet_key || st.fleet_key_blocked) && (
                         <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.recovery.exportNeedsFleetKey")}</p>
+                      )}
+                      {!boot.root_key_id && (
+                        <p data-testid="team-export-no-root-key-id" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.recovery.exportNeedsRootKeyId")}
+                        </p>
                       )}
                     </div>
                   )}
