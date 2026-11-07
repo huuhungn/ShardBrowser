@@ -3109,10 +3109,12 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.identityChanged"));
     }
     c = now;
-    // `revoked` is the server's unauthenticated word, and a seed that does
-    // not read may come back: the file is copied and the keys are kept.
-    let keep =
-        status.as_deref() == Some("revoked") || c.signing_key().is_err() || c.hpke_seed().is_err();
+    // `revoked` and `pending` are the server's unauthenticated word, and a
+    // seed that does not read may come back: the file is copied and the keys
+    // are kept.
+    let keep = matches!(status.as_deref(), Some("revoked" | "pending"))
+        || c.signing_key().is_err()
+        || c.hpke_seed().is_err();
     if keep {
         let copy = team_config::preserve_unreadable().map_err(|e| e.to_string())?;
         eprintln!(
@@ -6371,8 +6373,9 @@ mod custody_tests {
         assert_eq!(pinned_anchor(&c), Some((BINDING_J, [0x0a; 32])));
     }
 
-    /// What enrolling again leaves: no id, no seeds, no credentials.
-    fn assert_cleared(refs: [String; 2]) {
+    /// What enrolling again leaves: no id, no seeds, and the credentials
+    /// only when `kept` (a device the server listed pending or revoked).
+    fn assert_cleared(refs: [String; 2], kept: bool) {
         let c = team_config::load().unwrap();
         assert!(c.device_id.is_empty() && !c.is_enrolled() && !c.blocks_enrollment());
         assert!(c.signing_key_seed.is_empty() && c.hpke_key_seed.is_empty());
@@ -6382,8 +6385,13 @@ mod custody_tests {
             (false, hex(&TENANT).as_str())
         );
         for r in refs {
-            let gone = credential::load(&r).unwrap_err();
-            assert!(gone.to_string().contains("credential.missing"), "{gone}");
+            match credential::load(&r) {
+                Ok(_) => assert!(kept, "{r} was kept"),
+                Err(gone) => {
+                    assert!(!kept, "{r} was forgotten: {gone}");
+                    assert!(gone.to_string().contains("credential.missing"), "{gone}");
+                }
+            }
         }
     }
 
@@ -6618,7 +6626,7 @@ mod custody_tests {
         let refs = refs();
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, true);
     }
 
     /// A pin that no longer reads is no proof of no pin: Reset of a device
@@ -6750,7 +6758,7 @@ mod custody_tests {
             .block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
         assert!(status.device_id.is_empty());
-        assert_cleared(refs);
+        assert_cleared(refs, true);
         assert!(calls.lock().unwrap().contains(&"GET /v2/me".to_string()));
     }
 
@@ -6768,7 +6776,7 @@ mod custody_tests {
         assert!(err.contains("fleet.joinCodeExpired"), "{err}");
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, false);
     }
 
     /// An expired code reads as expired only where Enroll again is allowed:
@@ -6893,7 +6901,7 @@ mod custody_tests {
         let refs = refs();
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, true);
         assert_eq!(
             join_pin(),
             Some((BINDING_J, [0x0a; 32], "JOIN".to_string()))
@@ -6944,6 +6952,25 @@ mod custody_tests {
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
         assert!(fleet_custody::load().unwrap().device_acks.is_empty());
+    }
+
+    /// R3-D2: `pending` is the server's unauthenticated word as `revoked`
+    /// is, so a working device it lists pending keeps a copy of its file and
+    /// both credentials.
+    #[test]
+    fn a_pending_reply_keeps_readable_credentials_and_a_copy() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        pin_here();
+        let refs = refs();
+        assert_eq!(team_json_copies(), 0);
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert!(!team_config::load().unwrap().is_enrolled());
+        assert_eq!(team_json_copies(), 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
     }
 
     /// Makes the joiner the activated root custodian of its tenant.
