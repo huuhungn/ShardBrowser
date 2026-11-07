@@ -227,9 +227,11 @@ pub fn save(s: &FleetKeyStore) -> Result<()> {
 }
 
 /// Keeps `key`, opened from a verified grant, as `generation` of `fleet_id`,
-/// marked `verified`. Returns false, and saves nothing, when the store
-/// already holds a different key for that generation, or one it cannot read
-/// (ADR 0002 trust chain, rule 5: `KEY_SUBSTITUTION_DETECTED`). Reads, checks
+/// marked `verified`, as is an equal key the store already holds (a 2.4.2
+/// cache, or one kept through Reset or import). Returns false, and saves
+/// nothing, when the store already holds a different key for that
+/// generation, or one it cannot read (ADR 0002 trust chain, rule 5:
+/// `KEY_SUBSTITUTION_DETECTED`). Reads, checks
 /// and writes under one lock, and refuses a store that does not parse.
 pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> {
     {
@@ -240,12 +242,19 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
         } else {
             FleetKeyStore::default()
         };
-        if let Some(f) = s.fleets.get(fleet_id) {
-            if f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation) {
-                return Ok(f.key(generation).is_some_and(|held| *held == *key));
+        let held = s.fleets.get(fleet_id).filter(|f| {
+            f.keys.contains_key(&generation) || f.credential_refs.contains_key(&generation)
+        });
+        match held {
+            // The same key, as 2.4.2 cached it: this grant verifies it.
+            Some(f) if f.key(generation).is_some_and(|held| *held == *key) => {
+                if f.verified.contains(&generation) {
+                    return Ok(true);
+                }
             }
+            Some(_) => return Ok(false),
+            None => s.insert(fleet_id, generation, key),
         }
-        s.insert(fleet_id, generation, key);
         if let Some(f) = s.fleets.get_mut(fleet_id) {
             f.verified.insert(generation);
         }
@@ -594,6 +603,35 @@ mod tests {
             crate::errcode::has_code(&err, "fleet.recoveryExportFailed"),
             "{err}"
         );
+    }
+
+    /// R3-D4: a key cached by 2.4.2 that a verified grant opens to the same
+    /// bytes is marked verified, so the recovery bundle takes it; a different
+    /// key is still refused and stays unverified.
+    #[test]
+    fn collect_marks_an_equal_cached_key_verified_and_refuses_a_different_one() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let fleet = "e5".repeat(16);
+        let mut s = FleetKeyStore::default();
+        s.insert(&fleet, 0, &[5; 32]);
+        s.insert(&fleet, 1, &[6; 32]);
+        save(&s).unwrap();
+        assert!(verified_keys(&fleet).unwrap().is_empty());
+        assert!(!collect(&fleet, 1, &[7; 32]).unwrap(), "a different key");
+        assert!(collect(&fleet, 0, &[5; 32]).unwrap());
+        let held: Vec<(u64, [u8; 32])> = verified_keys(&fleet)
+            .unwrap()
+            .into_iter()
+            .map(|(g, k)| (g, *k))
+            .collect();
+        let verified = load().unwrap().fleets[&fleet].verified.clone();
+        store::set_config_root(None);
+        assert_eq!(held, [(0, [5; 32])]);
+        assert_eq!(verified, BTreeSet::from([0]));
     }
 
     #[test]
