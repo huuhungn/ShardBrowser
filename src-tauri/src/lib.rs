@@ -3053,10 +3053,13 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let refused = || crate::errcode::code("fleet.enrollAgainRefused");
-    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
-    let custodian = root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
-        && root.device_id.eq_ignore_ascii_case(&c.device_id);
-    if custodian {
+    let custodian = |c: &team_config::TeamConfig| {
+        root_bootstrap::load().map(|root| {
+            root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+                && root.device_id.eq_ignore_ascii_case(&c.device_id)
+        })
+    };
+    if custodian(&c).map_err(|e| e.to_string())? {
         return Err(refused());
     }
     let client =
@@ -3077,6 +3080,19 @@ async fn team_enroll_again(
     if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
+    // `team.json` and the root state may have changed during the listing (an
+    // import, Enroll, a new connection): only the identity checked above is
+    // cleared, as import's write does.
+    let now = team_config::load().map_err(|e| e.to_string())?;
+    let unchanged = now.server_url == c.server_url
+        && now.tenant_id == c.tenant_id
+        && now.device_id == c.device_id
+        && now.signing_credential_ref == c.signing_credential_ref
+        && now.hpke_credential_ref == c.hpke_credential_ref;
+    if !unchanged || custodian(&now).map_err(|e| e.to_string())? {
+        return Err(crate::errcode::code("fleet.identityChanged"));
+    }
+    c = now;
     // `revoked` is the server's unauthenticated word, and a seed that does
     // not read may come back: the file is copied and the keys are kept.
     let keep =
@@ -6348,6 +6364,54 @@ mod custody_tests {
         let c = team_config::load().unwrap();
         assert!(!c.signing_credential_ref.is_empty() && !c.hpke_credential_ref.is_empty());
         [c.signing_credential_ref, c.hpke_credential_ref]
+    }
+
+    #[test]
+    fn reset_preserves_an_identity_replaced_while_listing_is_in_flight() {
+        use std::sync::Arc;
+        let rt = runtime();
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed_in_reply = changed.clone();
+        let reply: Arc<fleet_custody::tests::Reply> = Arc::new(move |call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => {
+                    // A concurrent enrollment/import has committed another working identity.
+                    let mut current = team_config::load().unwrap();
+                    current.device_id = hex(&[0x6b; 16]);
+                    current.signing_credential_ref = "race-signing".into();
+                    current.hpke_credential_ref = "race-hpke".into();
+                    credential::store(&current.signing_credential_ref, &[0x71; 32]).unwrap();
+                    credential::store(&current.hpke_credential_ref, &[0x72; 32]).unwrap();
+                    team_config::save(&current).unwrap();
+                    root_bootstrap::save(&root_bootstrap::BootstrapState {
+                        tenant_id: current.tenant_id,
+                        device_id: current.device_id,
+                        activated: true,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    changed_in_reply.store(true, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                }
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let result = rt.block_on(team_enroll_again("u".into(), "p".into()));
+        assert!(changed.load(std::sync::atomic::Ordering::SeqCst));
+        let after = team_config::load().unwrap();
+        assert!(
+            after.device_id == hex(&[0x6b; 16]),
+            "Reset overwrote the newer root identity"
+        );
+        assert!(result.is_err(), "Reset accepted a stale identity snapshot");
     }
 
     #[test]
