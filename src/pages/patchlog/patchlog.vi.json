@@ -1,6 +1,59 @@
 {
   "releases": [
     {
+      "version": "2.8.0",
+      "date": "2026-11-07",
+      "entries": [
+        {
+          "id": "team-recovery-import",
+          "title": "Khôi phục root custodian từ gói khôi phục, và xuất lại gói mới",
+          "lead": "Team vẫn sống khi mất thiết bị root custodian: thiết bị mới khôi phục nó từ gói và cụm mật khẩu.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Gói khôi phục mới mang danh tính của chính root custodian và các khoá đội máy của team. Trên thiết bị mới, hoặc trên máy của root custodian sau khi mất khoá, Import recovery bundle khôi phục root custodian để Publish, Pull, Approve và Revoke hoạt động như trước. Khi nhập cần tick ô xác nhận thiết bị cũ đã mất hoặc khoá của nó đã bị đặt lại, và trước tiên đối chiếu gói với tenant đã lưu, anchor của team và bản ghi thiết bị trên server."
+            },
+            {
+              "type": "p",
+              "text": "Root custodian xuất gói mới từ trang Team khi đã giữ khoá đội máy, sau khi ghi lại dấu vân tay khoá gốc mà trang hiển thị. Hãy làm việc này sau khi cập nhật: gói từ 2.7.x không chứa root custodian nên không khôi phục được team. Gói cùng cụm mật khẩu chính là thiết bị root custodian, nên hãy cất ngoại tuyến. Server của team không thay đổi."
+            }
+          ]
+        },
+        {
+          "id": "team-reset-device",
+          "title": "Đặt lại thiết bị mất khoá hoặc đã bị thu hồi",
+          "lead": "Thành viên mất khoá có thể enroll lại từ trang Team, sau khi custodian đã thu hồi thiết bị đó.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trang Team giờ báo khi khoá của thiết bị đã mất, hoặc khi kho khoá không trả lời, và Reset this device xoá danh tính để thiết bị enroll lại được. Các tệp cũ được giữ lại dưới dạng bản sao. Thiết bị đã bị thu hồi được phép enroll lại, và mã tham gia hết hạn của thiết bị đã bị thu hồi sẽ hiện nút Enroll again. Root custodian được đề nghị nhập gói khôi phục thay vì Reset."
+            },
+            {
+              "type": "p",
+              "text": "Root custodian giữ nguyên kết nối: đổi URL server hoặc tenant bị từ chối trừ khi cả hai khoá thiết bị của nó đã mất."
+            }
+          ]
+        },
+        {
+          "id": "team-fleet-id-at-enrollment",
+          "title": "Profile cũ pull được bằng khoá đội máy của team",
+          "lead": "Enroll giờ ghi lại fleet ID của team.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Profile cũ chưa từng publish giờ tìm được khoá đội máy khi pull, kể cả trên thiết bị đã enroll bằng 2.7.x."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.7.1",
       "date": "2026-11-06",
       "entries": [

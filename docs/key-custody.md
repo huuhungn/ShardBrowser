@@ -136,7 +136,7 @@ the right model to keep.
 | Joining | The new device's "Show join code" works for ten minutes after its own enrollment, by its own clock. "Codes match" pins the anchor (A0), and "Collect key custody" keeps the fleet key once its grant verifies against that pin. An expired code offers "Enroll again"; the old row stays on the server until a custodian revokes it |
 | Revocation | Revoke on the device list, as retired or lost. `compromised` is not offered |
 | Fleet key rotation | Not implemented: a revoked device keeps generation 0 (see below) |
-| Recovery bundle | Holds the root key. It does not include the fleet key yet, which stays recoverable through the server's recovery grant |
+| Recovery bundle | A v3 bundle (2.8.0) holds the root custodian's device identity, the root key and, when exported again after the fleet key exists, the team's verified fleet keys; a bundle from 2.7.x holds only the root key and cannot restore the team |
 | Approvals and grants | Run one year, with no renewal |
 
 A grant has to name a generation that exists, and wrap the key that generation

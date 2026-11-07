@@ -1,5 +1,83 @@
 # Changelog
 
+## v2.8.0
+
+A Team release: a team survives losing its devices' keys. The root custodian
+can be restored from a recovery bundle on a fresh device, and a member whose
+keys are lost or that was revoked can reset and enroll again from the Team
+page. The browser engine and the team server are unchanged.
+
+### Upgrade notes
+
+- The team server is unchanged: a 2.7.x server works with launcher 2.8.0.
+- Root custodians: after updating, export a new recovery bundle from the Team
+  page. A bundle exported by 2.7.x holds no root custodian and cannot restore
+  the team.
+- Do not downgrade a device that imported a recovery bundle, or that holds a
+  v3 bundle state, to 2.7.x. 2.7.x cannot open a v3 bundle and ignores the
+  imported state, so it reports `fleet.notCustodian`.
+
+### Team
+
+- **Recovery import.** A fresh device, or the root custodian's own machine
+  after its keys were lost, restores the root custodian from a recovery bundle
+  and its passphrase, so Publish, Pull, Approve and Revoke work as before. The
+  import needs the "old root custodian device is lost or its keys were reset"
+  box ticked and checks the bundle against the saved tenant, the team's anchor
+  and the server's own record of the device before it writes anything. It
+  refuses to run over another device's identity.
+- **Export recovery bundle.** The root custodian can export the bundle again
+  once it holds the fleet key. A new bundle carries the root custodian's own
+  identity and the team's fleet keys, and files nothing on the server. The
+  export shows the root key fingerprint and stays off until the owner ticks
+  that it was recorded.
+- **Reset this device.** A member device whose keys are lost, or whose key
+  store did not answer, is shown as such on the Team page. Once a custodian
+  revokes it, Reset this device clears its identity so it can enroll again,
+  and the old files are kept as copies. The root custodian is offered import
+  instead.
+- **Revoked devices may enroll again.** The server's own listing decides: a
+  pending device, an active device that is not pinned, or a revoked device. An
+  expired join code of a revoked device offers Enroll again.
+- **The root custodian keeps its connection.** Changing the server URL or
+  tenant is refused on the root custodian unless both its device keys are
+  lost.
+- **Fleet ID recorded.** Enrollment records the team's fleet ID, so a legacy
+  profile that was never published finds its fleet key when it is pulled.
+
+### Known limitations
+
+- A recovery bundle plus its passphrase is the root custodian device, and the
+  account password shared by the team does not add a factor. A leaked bundle,
+  or a root machine stolen with readable keys, stays a root custodian until
+  custody moves to a new device row and the old one is revoked, which comes
+  with rotation.
+- A bundle restores the team only while the root's approval and grants run
+  (365 days from bootstrap); renewal comes later.
+- After an import, a device that was pending gets a new approval window, and
+  an approval the lost root left unfinished needs that device revoked and
+  enrolled again.
+- The server's recovery bundle pin keeps naming the first bundle.
+- A root custodian cannot change the server URL, not even to a new address of
+  the same server. With the launcher closed, edit `server_url` in
+  `team.json`.
+- Fleet key rotation is not available yet: a revoked device keeps the fleet
+  key it holds and can still decrypt snapshots sealed under it.
+- A fleet key setup left unfinished for more than a year cannot be finished or
+  discarded: its saved requests have expired and the generation stays
+  `PREPARING`. Finishing or discarding it comes with fleet key rotation.
+- The launcher trusts the team server's answers about device status. A
+  server that misreports them can still make Reset forget a working member's
+  keys (by reporting the device as pending), make an import accept a login
+  ticket for another account, or keep the Team page from offering the right
+  action while the root custodian's status loads or its setup is unfinished.
+  Tightening these checks is tracked for the next release.
+- A fleet key cached by 2.4.2 that a later collect verifies is not marked
+  verified, so Export recovery bundle stays refused on that device until the
+  key is collected again from a new grant.
+- A malformed hex field in a root key grant from the server crashes the
+  launcher instead of returning an error.
+
 ## v2.7.1
 
 A Team fix release from the first real two-machine run of v2.7.0. The
