@@ -1087,6 +1087,10 @@ pub struct BootstrapStatus {
     pub recovery_path: String,
     /// The bootstrap anchor, once the trust evidence verified to it.
     pub anchor: String,
+    /// The recovery fingerprint (ADR 0002 D-5), the activated root's
+    /// `root_key_id` in hex: empty before activation or when the self-grant
+    /// does not read under this device's key.
+    pub root_key_id: String,
 }
 
 impl BootstrapStatus {
@@ -1096,7 +1100,23 @@ impl BootstrapStatus {
             activated: state.activated,
             recovery_path: state.recovery_path.clone(),
             anchor: state.anchor.clone(),
+            root_key_id: root_key_id_of(state),
         }
+    }
+}
+
+/// The `root_key_id` of `state`'s first self-grant, verified under this
+/// device's signing key; empty when not activated or when either does not read.
+fn root_key_id_of(state: &BootstrapState) -> String {
+    if !state.activated {
+        return String::new();
+    }
+    let signer = crate::team_config::load().and_then(|c| c.signing_key());
+    match (unhex_vec(&state.self_grant), signer) {
+        (Ok(grant), Ok(signer)) => own_grant(&grant, &signer)
+            .map(|(g, _)| hex(&g.root_key_id))
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 

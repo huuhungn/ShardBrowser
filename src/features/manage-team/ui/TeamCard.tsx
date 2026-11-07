@@ -68,6 +68,7 @@ export function TeamCard() {
   const [keyPass, setKeyPass] = useState("");
   const [keyPass2, setKeyPass2] = useState("");
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
+  const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -192,6 +193,7 @@ export function TeamCard() {
     await teamExportRecoveryBundle(username.trim(), typed, path, passphrase);
     setPassphrase("");
     setPassphrase2("");
+    setRootKeyIdRecorded(false);
     toast.ok(t("team.recovery.exported", { path }));
   });
 
@@ -651,12 +653,26 @@ export function TeamCard() {
                         value={passphrase2}
                         onChange={(e) => setPassphrase2(e.target.value)}
                       />
+                      {/* The owner's fingerprint ceremony (ADR 0002 D-5): the root key ID, recorded before export. */}
+                      {boot.root_key_id && (
+                        <>
+                          <div>
+                            <span className="text-paragraph-xs text-text-soft-400">{t("team.recovery.rootKeyId")}</span>
+                            <CopyField value={boot.root_key_id} />
+                          </div>
+                          <Checkbox
+                            label={t("team.recovery.rootKeyIdRecorded")}
+                            checked={rootKeyIdRecorded}
+                            onChange={() => setRootKeyIdRecorded((v) => !v)}
+                          />
+                        </>
+                      )}
                       <div>
                         <Button
                           size="small"
                           mode="stroke"
-                          disabled={!!busy || !(st.has_fleet_key || st.fleet_key_blocked)
-                            || !username.trim() || !password || !passphrase || !passphrase2}
+                          disabled={!!busy || !(st.has_fleet_key || st.fleet_key_blocked) || !boot.root_key_id
+                            || !rootKeyIdRecorded || !username.trim() || !password || !passphrase || !passphrase2}
                           onClick={exportBundle}
                         >
                           {busy === "export" ? t("busy.exporting") : t("team.recovery.export")}

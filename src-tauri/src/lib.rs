@@ -6472,29 +6472,7 @@ mod custody_tests {
             let _j = joiner(URL_J, root_bootstrap::now_ms());
             root_here();
             let mut root = root_bootstrap::load().unwrap();
-            let c = team_config::load().unwrap();
-            let signer = c.signing_key().unwrap();
-            let (_, hpke_public) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
-            let cx = root_bootstrap::Context16 {
-                tenant: TENANT,
-                instance: INSTANCE,
-                epoch: 0,
-                account: [6; 16],
-                device: JOINER,
-                signing_key_id: shardx_core::keys::signing_key_id(
-                    signer.verifying_key().as_bytes(),
-                ),
-                hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
-            };
-            root.self_grant = hex(&root_bootstrap::self_grant(
-                &cx,
-                &signer,
-                &hpke_public,
-                &[9; 32],
-                [8; 16],
-                root_bootstrap::now_ms(),
-            )
-            .unwrap());
+            root.self_grant = self_grant_here(&[9; 32]);
             // An interrupted bootstrap has saved its first self-grant but has
             // not yet persisted finish_activation's activated flag.
             root.activated = false;
@@ -6509,6 +6487,49 @@ mod custody_tests {
             assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
             assert!(result.is_err());
         }
+    }
+
+    /// The joiner's first root self-grant of `trk`, in hex.
+    fn self_grant_here(trk: &[u8; 32]) -> String {
+        let c = team_config::load().unwrap();
+        let signer = c.signing_key().unwrap();
+        let (_, hpke_public) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+        let cx = root_bootstrap::Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: [6; 16],
+            device: JOINER,
+            signing_key_id: shardx_core::keys::signing_key_id(signer.verifying_key().as_bytes()),
+            hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+        };
+        hex(&root_bootstrap::self_grant(
+            &cx,
+            &signer,
+            &hpke_public,
+            trk,
+            [8; 16],
+            root_bootstrap::now_ms(),
+        )
+        .unwrap())
+    }
+
+    /// D7: the export's fingerprint is the activated root's `root_key_id`,
+    /// and nothing before activation.
+    #[test]
+    fn bootstrap_status_shows_the_root_key_id_once_activated() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        root_here();
+        let mut root = root_bootstrap::load().unwrap();
+        root.self_grant = self_grant_here(&[9; 32]);
+        root_bootstrap::save(&root).unwrap();
+        assert_eq!(
+            root_bootstrap::status().unwrap().root_key_id,
+            hex(&shardx_core::keys::root_key_id(&[9; 32]))
+        );
+        root.activated = false;
+        root_bootstrap::save(&root).unwrap();
+        assert!(root_bootstrap::status().unwrap().root_key_id.is_empty());
     }
 
     #[test]

@@ -354,11 +354,13 @@ const teamBound = (payload?: InvokeArgs) => {
 
 // The bootstrap anchor A0 of every team fixture.
 const TEAM_ANCHOR = "a0".repeat(32);
+// The root key ID, the recovery fingerprint, of every team fixture.
+const TEAM_ROOT_KEY_ID = "5e".repeat(32);
 let custodyBootstrap = scenario === "team-first-device-resume"
-  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "" }
+  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "", root_key_id: "" }
   : teamDevice === "a"
-    ? { started: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery", anchor: TEAM_ANCHOR }
-    : { started: false, activated: false, recovery_path: "", anchor: "" };
+    ? { started: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery", anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID }
+    : { started: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
 let fleetCustody = { started: false, created: false, setup_key_held: false, fkek_key_id: "" };
 
 // "team-device-a" and "team-device-b": two devices of one fleet. Each page keeps
@@ -496,7 +498,10 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       document.documentElement.dataset.e2eImportPath = String(args.path ?? "");
       teamMe = { device_id: bundle, enrolled_at_ms: 0, pinned: true, collected: true };
       teamSeeds = null;
-      custodyBootstrap = { started: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR };
+      custodyBootstrap = {
+        started: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
+        root_key_id: TEAM_ROOT_KEY_ID,
+      };
       fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
       return {
         grants: 0, opened: 0, failed: 0, newest_generation: null, fleet_opened: 1, fleet_failed: 0,
@@ -1028,6 +1033,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         activated: true,
         recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
         anchor: "a0".repeat(32),
+        root_key_id: TEAM_ROOT_KEY_ID,
       };
       return custodyBootstrap;
     }

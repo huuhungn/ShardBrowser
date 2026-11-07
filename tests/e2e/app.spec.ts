@@ -1236,9 +1236,32 @@ test("the root custodian exports a recovery bundle, and Export is off before the
   await cardClick(a, "Create fleet key");
   await expect(out).not.toContainText("Create the fleet key above");
   await cardSignIn(a);
+  await out.getByLabel("I recorded this root key fingerprint").check();
   await button.click();
   await expect(a.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
   await expect(a.locator("html")).toHaveAttribute("data-e2e-export-path", "C:\\Users\\Example\\shardx-recovery.shxrecovery");
+});
+
+test("export waits for the owner's recovery fingerprint confirmation", async ({ page }) => {
+  await teamDevicePage(page, "a", fakeTeamServer());
+  await cardClick(page, "Create fleet key");
+  const form = page.getByTestId("team-export");
+  await cardSignIn(page);
+  await form.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await form.getByLabel("Recovery passphrase again").fill("correct horse");
+  // Journey E requires owner fingerprint confirmation in addition to the
+  // passphrase confirmation: the root key ID is shown, and Export stays off
+  // until the owner ticks that it was recorded.
+  await expect(form.getByText("Root key fingerprint (root key ID)")).toBeVisible();
+  await expect(form.locator("input[readonly]")).toHaveValue("5e".repeat(32));
+  const button = form.getByRole("button", { name: "Export recovery bundle" });
+  await expect(button).toBeDisabled();
+  await button.click({ force: true });
+  await expect(page.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toHaveCount(0);
+  await expect(page.locator("html")).not.toHaveAttribute("data-e2e-export-path", /./);
+  await form.getByLabel("I recorded this root key fingerprint").check();
+  await button.click();
+  await expect(page.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
 });
 
 test("a member whose keys are lost is reset after a custodian revokes it, then enrolls again", async ({

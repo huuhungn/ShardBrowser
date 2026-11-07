@@ -66,6 +66,8 @@ export type CustodyBootstrapStatus = {
   recovery_path: string;
   /** The bootstrap anchor the trust evidence verified to; empty until then. */
   anchor: string;
+  /** The recovery fingerprint, the activated root's key ID; empty until then. */
+  root_key_id: string;
 };
 
 /** What `team_collect_custody` found waiting on the server. */

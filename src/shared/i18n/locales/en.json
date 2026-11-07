@@ -1404,6 +1404,8 @@
   "team.recovery.imported": "The recovery bundle was imported. This device is the team's root custodian.",
   "team.recovery.export": "Export recovery bundle",
   "team.recovery.exported": "Recovery bundle exported to {path}. Keep it offline with its passphrase.",
+  "team.recovery.rootKeyId": "Root key fingerprint (root key ID)",
+  "team.recovery.rootKeyIdRecorded": "I recorded this root key fingerprint",
   "team.recovery.exportNeedsFleetKey": "Create the fleet key above before exporting the recovery bundle.",
   "team.recovery.keysLost": "This device's keys are lost. Ask a custodian to revoke this device, then reset it.",
   "team.recovery.keyStoreUnavailable": "The key store did not answer; try again before resetting this device.",

@@ -1404,6 +1404,8 @@
   "team.recovery.imported": "Đã nhập gói khôi phục. Thiết bị này là thiết bị giữ khoá gốc của nhóm.",
   "team.recovery.export": "Xuất gói khôi phục",
   "team.recovery.exported": "Đã xuất gói khôi phục tới {path}. Hãy cất gói ngoại tuyến cùng mật khẩu của nó.",
+  "team.recovery.rootKeyId": "Dấu vân tay khoá gốc (mã khoá gốc)",
+  "team.recovery.rootKeyIdRecorded": "Tôi đã ghi lại dấu vân tay khoá gốc này",
   "team.recovery.exportNeedsFleetKey": "Hãy tạo khoá đội máy ở trên trước khi xuất gói khôi phục.",
   "team.recovery.keysLost": "Khoá của thiết bị này đã mất. Hãy nhờ một thiết bị giữ khoá thu hồi thiết bị này, rồi đặt lại nó.",
   "team.recovery.keyStoreUnavailable": "Kho khoá không phản hồi; hãy thử lại trước khi đặt lại thiết bị này.",

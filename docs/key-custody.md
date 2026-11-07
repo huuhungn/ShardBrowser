@@ -250,7 +250,9 @@ account), so keep the bundle offline. A bundle exported before 2.8.0 holds no
 root custodian and cannot restore the team (`recovery.bundleWithoutCustodian`):
 the root custodian exports a new one with **Export recovery bundle** on the
 Team page, once it holds the fleet key (`team_export_recovery_bundle`; it
-files nothing and changes no state file). A bundle works only while the root
+files nothing and changes no state file). The page shows the root key ID, the
+bundle's fingerprint (ADR 0002 D-5), and Export stays off until the owner
+ticks that it was recorded. A bundle works only while the root
 custodian's approval and grants run: 365 days from bootstrap. 2.7.x cannot
 read the v3 state an import writes, so do not downgrade after an import.
 
