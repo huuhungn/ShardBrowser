@@ -692,6 +692,26 @@ mod tests {
     const CHALLENGE: &str = "POST /v2/auth/device-session-challenges";
 
     #[test]
+    fn import_error_does_not_echo_the_login_password_after_login() {
+        let f = fixture();
+        let ordinary = server(me(INSTANCE, ACCOUNT, "active", key_ids()), (500, ""));
+        let reply: Arc<Reply> = Arc::new(move |call, body| {
+            if call == "GET /v2/me" {
+                (500, br#"{"error":"pw"}"#.to_vec())
+            } else {
+                ordinary(call, body)
+            }
+        });
+        let (err, calls, unchanged) = refused_by(&f, reply);
+        assert!(calls.iter().any(|c| c == "GET /v2/me"));
+        assert!(unchanged);
+        assert!(
+            !err.contains("pw"),
+            "account password reached the import error"
+        );
+    }
+
+    #[test]
     fn another_server_is_refused_before_any_session_is_asked_for() {
         let f = fixture();
         let reply = server(me([0xee; 16], ACCOUNT, "active", key_ids()), (500, ""));

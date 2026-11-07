@@ -379,7 +379,14 @@ impl FleetClient {
         let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
         let ticket = self.login_ticket(login).await?;
         let enrolled = self
-            .enroll_with_ticket(&ticket, &tenant, signer, hpke_public_key, label_ciphertext)
+            .enroll_with_ticket(
+                &ticket,
+                login.password,
+                &tenant,
+                signer,
+                hpke_public_key,
+                label_ciphertext,
+            )
             .await;
         self.end_ticket(&ticket).await;
         enrolled
@@ -467,7 +474,7 @@ impl FleetClient {
         let device = decode_hex16(device_id, "device_id")?;
         let ticket = self.login_ticket(login).await?;
         let session = self
-            .session_with_ticket(&ticket, &tenant, &device, signer, hpke_seed)
+            .session_with_ticket(&ticket, login.password, &tenant, &device, signer, hpke_seed)
             .await;
         self.end_ticket(&ticket).await;
         session
@@ -476,6 +483,7 @@ impl FleetClient {
     async fn session_with_ticket(
         &self,
         ticket: &Ticket,
+        password: &str,
         tenant: &[u8; 16],
         device: &[u8; 16],
         signer: &Ed25519SigningKey,
@@ -490,7 +498,7 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
         let challenge: SessionChallenge =
-            Self::ok_or_err(res, "fleet.refusedSession", &ticket.ticket)
+            Self::ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
                 .await?
                 .json()
                 .await
@@ -536,7 +544,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        Self::ok_or_err(res, "fleet.refusedSession", &ticket.ticket)
+        Self::ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
             .await?
             .json()
             .await
@@ -896,6 +904,7 @@ impl FleetClient {
     async fn enroll_with_ticket(
         &self,
         ticket: &Ticket,
+        password: &str,
         tenant: &[u8; 16],
         signer: &Ed25519SigningKey,
         hpke_public_key: &[u8; 32],
@@ -914,7 +923,7 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableRegister"))?;
         let challenge: EnrollmentChallenge =
-            Self::ok_or_err(res, "fleet.refusedRegister", &ticket.ticket)
+            Self::ok_or_err_hiding(res, "fleet.refusedRegister", &[&ticket.ticket, password])
                 .await?
                 .json()
                 .await
@@ -951,12 +960,15 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableRegisterFinish"))?;
 
-        let enrolled: EnrolledDevice =
-            Self::ok_or_err(res, "fleet.refusedRegisterFinish", &ticket.ticket)
-                .await?
-                .json()
-                .await
-                .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
+        let enrolled: EnrolledDevice = Self::ok_or_err_hiding(
+            res,
+            "fleet.refusedRegisterFinish",
+            &[&ticket.ticket, password],
+        )
+        .await?
+        .json()
+        .await
+        .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
         // Both are stored and shown: an id, and the account the ticket named.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyRegisterFinish"));
         decode_hex16(&enrolled.device_id, "device_id").map_err(|_| bad())?;
@@ -970,7 +982,7 @@ impl FleetClient {
     /// ticket or device session, or the v1 token.
     pub async fn server_identity(&self, bearer: &str) -> Result<ServerIdentity> {
         let res = self.identity_reply(bearer).await?;
-        Self::identity_of(res, bearer).await
+        Self::identity_of(res, &[bearer]).await
     }
 
     /// Logs `login` in for a ticket and reads the server identity with it. A
@@ -987,7 +999,7 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        Self::identity_of(res, &ticket.ticket).await
+        Self::identity_of(res, &[&ticket.ticket, login.password]).await
     }
 
     /// What `GET /v2/me` reports for `device_id` among the devices of
@@ -1019,7 +1031,7 @@ impl FleetClient {
             .await;
         let me = async {
             let res = res.context(crate::errcode::code("fleet.unreachableLogin"))?;
-            Self::ok_or_err(res, "fleet.refusedLogin", &ticket.ticket)
+            Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[&ticket.ticket, login.password])
                 .await?
                 .json::<Me>()
                 .await
@@ -1048,8 +1060,8 @@ impl FleetClient {
             .context(crate::errcode::code("fleet.unreachableIdentity"))
     }
 
-    async fn identity_of(res: reqwest::Response, bearer: &str) -> Result<ServerIdentity> {
-        let id: ServerIdentity = Self::ok_or_err_hiding(res, "fleet.refusedIdentity", &[bearer])
+    async fn identity_of(res: reqwest::Response, secrets: &[&str]) -> Result<ServerIdentity> {
+        let id: ServerIdentity = Self::ok_or_err_hiding(res, "fleet.refusedIdentity", secrets)
             .await?
             .json()
             .await
