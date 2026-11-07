@@ -7121,6 +7121,57 @@ mod custody_tests {
         }
     }
 
+    /// Nit 5: an expired code of an active device whose ledger does not read
+    /// reports that, never the plain expired code that offers Enroll again.
+    #[test]
+    fn an_expired_code_with_an_unreadable_ledger_offers_no_enroll_again() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "active");
+        let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+        pin_here();
+        std::fs::write(team::db::Db::path().unwrap(), b"unreadable test ledger").unwrap();
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("team.trustLedgerUnreadable"), "{err}");
+        assert!(!err.contains("fleet.joinCodeExpired"), "{err}");
+    }
+
+    /// Nit 5: a ticket and a listing that both name an account, but not the
+    /// same one, never reset the device.
+    #[test]
+    fn reset_is_refused_when_ticket_and_listing_name_different_accounts() {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(|call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => serde_json::json!({
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "devices": [{"device_id": hex(&JOINER), "status": "pending"}]
+                }),
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let before = team_json();
+        let references = refs();
+        let err = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.enrollAgainOtherAccount"),
+            "{err}"
+        );
+        assert!(team_json() == before);
+        assert!(references.iter().all(|r| credential::load(r).is_ok()));
+    }
+
     /// Makes the joiner the activated root custodian of its tenant.
     fn root_here() {
         root_bootstrap::save(&root_bootstrap::BootstrapState {
