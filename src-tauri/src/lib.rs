@@ -2028,10 +2028,12 @@ fn team_set_connection(
     // G13: the change would wipe the root custodian. Only one whose seeds
     // are both lost may go, its file copied and its credentials kept: a
     // recovery import is its way back. A root state that does not load
-    // fails closed, as Enroll again does.
+    // fails closed, as Enroll again does. A bootstrap past its self-grant
+    // counts too: the server may have activated it before the local flag
+    // was saved.
     let root_custodian = server_changed && {
         let root = root_bootstrap::load().map_err(|e| e.to_string())?;
-        root.activated
+        (root.activated || !root.self_grant.is_empty() || !root.create_request.is_empty())
             && root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
             && root.device_id.eq_ignore_ascii_case(&c.device_id)
     };
@@ -6462,6 +6464,51 @@ mod custody_tests {
             "a different signed-in account cleared the saved owner's device"
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn connection_change_preserves_an_unfinished_root_identity() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            root_here();
+            let mut root = root_bootstrap::load().unwrap();
+            let c = team_config::load().unwrap();
+            let signer = c.signing_key().unwrap();
+            let (_, hpke_public) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+            let cx = root_bootstrap::Context16 {
+                tenant: TENANT,
+                instance: INSTANCE,
+                epoch: 0,
+                account: [6; 16],
+                device: JOINER,
+                signing_key_id: shardx_core::keys::signing_key_id(
+                    signer.verifying_key().as_bytes(),
+                ),
+                hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+            };
+            root.self_grant = hex(&root_bootstrap::self_grant(
+                &cx,
+                &signer,
+                &hpke_public,
+                &[9; 32],
+                [8; 16],
+                root_bootstrap::now_ms(),
+            )
+            .unwrap());
+            // An interrupted bootstrap has saved its first self-grant but has
+            // not yet persisted finish_activation's activated flag.
+            root.activated = false;
+            root_bootstrap::save(&root).unwrap();
+            let before = team_json();
+            let refs = refs();
+            let result = team_set_connection(url, String::new(), tenant);
+            assert!(
+                team_json() == before,
+                "connection change cleared the unfinished root identity"
+            );
+            assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
+            assert!(result.is_err());
+        }
     }
 
     #[test]

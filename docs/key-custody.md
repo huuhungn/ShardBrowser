@@ -293,8 +293,9 @@ that left the index during a passing store fault has no verified grant and is
 not collected again: restore it from the copy, which helps only while a later
 collect has not rewritten the credential `fleet-key.{fleet}.{generation}`.
 
-The root custodian keeps its connection: changing its server URL or tenant
-is refused (`fleet.rootCustodianKeepsConnection`) unless both its device
+The root custodian keeps its connection, and so does a device whose root
+custody setup has saved its self-grant, since the server may have activated
+it before the setup finished: changing its server URL or tenant is refused (`fleet.rootCustodianKeepsConnection`) unless both its device
 keys are lost; then `team.json` is copied aside, nothing is forgotten, and
 import is the way back. Any change of the URL string counts, so a root
 custodian whose server moved to a new LAN address or port cannot change it on
