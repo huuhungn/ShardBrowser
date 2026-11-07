@@ -3404,7 +3404,7 @@ fn read_pinned_anchor(
 fn tenant_pin(
     tenant: &[u8; 16],
 ) -> anyhow::Result<Option<(shardx_core::trust_chain::Binding, [u8; 32], String)>> {
-    if !team::db::Db::path()?.exists() {
+    if !team::db::Db::path()?.try_exists()? {
         return Ok(None);
     }
     team::ledger::tenant_pin(&team::db::Db::open()?, tenant)
@@ -7079,6 +7079,22 @@ mod custody_tests {
             serde_json::json!(true),
             "an unreadable team.json"
         );
+    }
+
+    /// Nit 1: a ledger whose existence cannot be checked is not a device
+    /// with no ledger.
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_cannot_be_checked_is_an_error() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        let dir = team::db::Db::path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(tenant_pin(&TENANT).is_err());
     }
 
     /// Makes the joiner the activated root custodian of its tenant.
