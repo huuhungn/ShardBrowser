@@ -356,8 +356,17 @@ const teamBound = (payload?: InvokeArgs) => {
 const TEAM_ANCHOR = "a0".repeat(32);
 // The root key ID, the recovery fingerprint, of every team fixture.
 const TEAM_ROOT_KEY_ID = "5e".repeat(32);
-// Every saved fixture root state is this device's, in its tenant.
-let custodyBootstrap = scenario === "team-first-device-resume"
+// Every saved fixture root state is this device's, in its tenant, except with
+// `teamRootJournal=foreign` or `foreign-unfinished`: another device's root
+// state, finished or not, that a connection change kept.
+const foreignRoot = params.get("teamRootJournal");
+let custodyBootstrap = foreignRoot
+  ? {
+    started: true, this_device: false, activated: foreignRoot === "foreign",
+    recovery_path: "C:\\Users\\Example\\old.shxrecovery", anchor: foreignRoot === "foreign" ? "0f".repeat(32) : "",
+    root_key_id: "",
+  }
+  : scenario === "team-first-device-resume"
   ? {
     started: true, this_device: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "",
     root_key_id: "",

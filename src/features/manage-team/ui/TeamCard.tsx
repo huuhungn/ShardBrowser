@@ -270,6 +270,9 @@ export function TeamCard() {
   const connected = !!st && !!st.server_url && !!st.tenant_id;
   // Nothing past the device's own seeds works while they cannot be read.
   const lost = !!st && (st.keys_lost || st.key_store_unavailable);
+  // Only this device's root state makes it the root custodian. Another device's, kept by a connection change,
+  // offers no setup: the backend refuses to start or resume over it.
+  const setupOpen = !!boot && (boot.this_device ? !boot.activated : !boot.started);
   const account: TeamAccount = {
     username,
     signedIn: !!username.trim() && !!password,
@@ -476,14 +479,14 @@ export function TeamCard() {
                 </div>
               )}
 
-              {boot?.activated && boot.anchor && (
+              {boot?.this_device && boot.activated && boot.anchor && (
                 <div>
                   <span className="text-paragraph-xs text-text-soft-400">{t("team.bootstrapAnchor")}</span>
                   <CopyField value={boot.anchor} />
                 </div>
               )}
 
-              {!lost && st.can_receive_custody && st.can_sync && boot && !boot.activated && (
+              {!lost && st.can_receive_custody && st.can_sync && boot && setupOpen && (
                 <div className="flex flex-col gap-2" data-testid="custody-bootstrap">
                   <p className="m-0 text-paragraph-xs text-text-soft-400">
                     {boot.started
@@ -601,7 +604,7 @@ export function TeamCard() {
               ) : st.can_receive_custody ? (
                 <>
                   {/* The bootstrap form above already holds the account login. */}
-                  {!(st.can_sync && boot && !boot.activated) && (
+                  {!(st.can_sync && setupOpen) && (
                     <>
                       <Input
                         label={t("team.accountUsername")}
@@ -620,7 +623,7 @@ export function TeamCard() {
                       />
                     </>
                   )}
-                  {st.can_sync && boot && (boot.activated ? (
+                  {st.can_sync && boot && (boot.this_device && boot.activated ? (
                     <TeamDevices
                       account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
                       hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
@@ -642,7 +645,7 @@ export function TeamCard() {
                       onEnrolledAgain={(next) => { setSt(next); void shareStatus(); }}
                     />
                   ))}
-                  {st.can_sync && boot?.activated && (
+                  {st.can_sync && boot?.this_device && boot.activated && (
                     <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
                       <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>
                       <Input

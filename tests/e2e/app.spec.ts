@@ -601,16 +601,18 @@ const teamPins = (page: Page) => page.evaluate(async () => {
 /**
  * Open team device `device`'s Team page against `server`, its clock faked when
  * `clock` is set. The longer names are B, or A, with seeds that do not read.
+ * `query` adds mock parameters to the page URL.
  */
 async function teamDevicePage(
   page: Page,
   device: "a" | "b" | "keys-lost" | "key-store-unavailable" | "root-keys-lost" | "root-key-store-unavailable",
   server: ReturnType<typeof fakeTeamServer>,
   clock = false,
+  query = "",
 ) {
   if (clock) await page.clock.install();
   await page.exposeFunction("e2eTeamServer", server.call);
-  await gotoMocked(page, device.length === 1 ? `/?e2e=team-device-${device}` : `/?e2e=team-${device}`);
+  await gotoMocked(page, (device.length === 1 ? `/?e2e=team-device-${device}` : `/?e2e=team-${device}`) + query);
   await page.getByRole("button", { name: "Team", exact: true }).click();
   return page.getByTestId("team-card");
 }
@@ -1473,6 +1475,33 @@ test("an expired join code of a device with an unfinished root setup offers no E
   await expect(join).toContainText("This join code has expired.");
   await expect(join).toContainText("it is the root custodian");
   await expect(card.getByRole("button", { name: "Enroll again" })).toHaveCount(0);
+});
+
+test("another device's finished root state selects no root actions for a readable member", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server);
+  // A connection change after both old root keys were lost kept that root's journal; B enrolls on these roots.
+  const card = await teamDevicePage(b, "b", server, false, "&teamRootJournal=foreign");
+  // B shows and confirms its own join code and collects as any member.
+  await admitB(a, b);
+  await expect(card.getByText("Bootstrap anchor")).toHaveCount(0);
+  await expect(card.getByTestId("team-devices")).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Show devices" })).toHaveCount(0);
+  await expect(card.getByTestId("team-export")).toHaveCount(0);
+});
+
+test("another device's unfinished root setup offers no Resume to a member", async ({ page }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(page, "b", server, false, "&teamRootJournal=foreign-unfinished");
+  await teamEnroll(page, "Machine B");
+  await expect(card.getByTestId("custody-bootstrap")).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Resume custody setup" })).toHaveCount(0);
+  await cardClick(page, "Show join code");
+  await expect(card.getByTestId("team-join-sas")).toBeVisible();
 });
 
 test("an expired join code of a revoked device offers Enroll again", async ({ page: b }) => {
