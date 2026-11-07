@@ -545,19 +545,22 @@ export function TeamCard() {
 
               {lost ? (
                 <div className="flex flex-col gap-2" data-testid="team-keys-lost">
-                  <p
-                    data-testid={bootUnreadable ? "team-root-state-unreadable" : undefined}
-                    className="m-0 text-paragraph-xs text-state-error-base"
-                  >
-                    {t(bootUnreadable
-                      ? "team.recovery.rootStateUnreadable"
-                      : boot?.started
-                        ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable"
-                          : boot.activated ? "team.recovery.rootKeysLost" : "team.recovery.rootSetupInterrupted"
-                        : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
-                  </p>
+                  {/* Until the root state reads, this device may be the root custodian: nothing to act on yet. */}
+                  {(boot || bootUnreadable) && (
+                    <p
+                      data-testid={bootUnreadable ? "team-root-state-unreadable" : undefined}
+                      className="m-0 text-paragraph-xs text-state-error-base"
+                    >
+                      {t(bootUnreadable
+                        ? "team.recovery.rootStateUnreadable"
+                        : boot?.this_device
+                          ? st.key_store_unavailable ? "team.recovery.rootKeyStoreUnavailable"
+                            : boot.activated ? "team.recovery.rootKeysLost" : "team.recovery.rootSetupInterrupted"
+                          : st.key_store_unavailable ? "team.recovery.keyStoreUnavailable" : "team.recovery.keysLost")}
+                    </p>
+                  )}
                   {/* A root custodian whose store only did not answer, or whose setup never finished, has nothing to sign in for. */}
-                  {!bootUnreadable && (!boot?.started || (boot.activated && st.keys_lost)) && (
+                  {boot && (!boot.this_device || (boot.activated && st.keys_lost)) && (
                     <>
                       <Input
                         label={t("team.accountUsername")}
@@ -576,10 +579,10 @@ export function TeamCard() {
                       />
                     </>
                   )}
-                  {/* A saved root setup, finished or not, is never reset (the backend refuses it). A finished
-                      one comes back from its recovery bundle; an unfinished one saved no anchor, so import
-                      refuses it too. */}
-                  {bootUnreadable ? null : boot?.started ? boot.activated && st.keys_lost && importForm : (
+                  {/* This device's saved root setup, finished or not, is never reset (the backend refuses it). A
+                      finished one comes back from its recovery bundle; an unfinished one saved no anchor, so
+                      import refuses it too. */}
+                  {!boot ? null : boot.this_device ? boot.activated && st.keys_lost && importForm : (
                     <div>
                       <Button
                         size="small"

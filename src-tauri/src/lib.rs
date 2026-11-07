@@ -2910,7 +2910,11 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
         // The UI offers Enroll again for an expired code, so say when
         // `team_enroll_again` would refuse it. Unasked, the code just reads
         // as expired; asked but unanswered (a refused login, a server down),
-        // the error stands, so Enroll again is never offered on a guess.
+        // the error stands, so Enroll again is never offered on a guess. A
+        // device with its own root state is refused unasked, as Reset is.
+        Err(_) if own_root_state(&c).map_err(|e| e.to_string())? => {
+            return Err(crate::errcode::code("fleet.enrollAgainRefused"));
+        }
         Err(expired) if !username.trim().is_empty() && !password.is_empty() => {
             let client = fleet_client::FleetClient::new(&c.server_url, &c.token)
                 .map_err(|e| e.to_string())?;
@@ -3058,13 +3062,7 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let refused = || crate::errcode::code("fleet.enrollAgainRefused");
-    let custodian = |c: &team_config::TeamConfig| {
-        root_bootstrap::load().map(|root| {
-            root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
-                && root.device_id.eq_ignore_ascii_case(&c.device_id)
-        })
-    };
-    if custodian(&c).map_err(|e| e.to_string())? {
+    if own_root_state(&c).map_err(|e| e.to_string())? {
         return Err(refused());
     }
     let client =
@@ -3105,7 +3103,7 @@ async fn team_enroll_again(
         && now.device_id == c.device_id
         && now.signing_credential_ref == c.signing_credential_ref
         && now.hpke_credential_ref == c.hpke_credential_ref;
-    if !unchanged || custodian(&now).map_err(|e| e.to_string())? {
+    if !unchanged || own_root_state(&now).map_err(|e| e.to_string())? {
         return Err(crate::errcode::code("fleet.identityChanged"));
     }
     c = now;
@@ -3177,6 +3175,16 @@ fn imported_collect(
     );
     report
         .map_err(|e| crate::errcode::code_with("recovery.importedCollectFailed", &[("error", &e)]))
+}
+
+/// Whether the saved root state, finished or not, names this tenant and
+/// device: such a device never enrolls again. One that does not load is the
+/// error.
+fn own_root_state(c: &team_config::TeamConfig) -> anyhow::Result<bool> {
+    root_bootstrap::load().map(|root| {
+        root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+            && root.device_id.eq_ignore_ascii_case(&c.device_id)
+    })
 }
 
 /// Whether a device the server lists as `status` may enroll again: while
@@ -7008,6 +7016,69 @@ mod custody_tests {
                 .unwrap_err();
             assert!(!err.contains(secret), "{field}: {err}");
         }
+    }
+
+    /// R3-D5: an expired code of a device with its own root state, finished
+    /// or not, never reads as plain expired, the code the UI answers with
+    /// Enroll again: the Reset would refuse it.
+    #[test]
+    fn an_expired_code_of_a_device_with_its_own_root_state_offers_no_enroll_again() {
+        for status in ["pending", "active"] {
+            let rt = runtime();
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            root_bootstrap::save(&root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT),
+                device_id: hex(&JOINER),
+                ..Default::default()
+            })
+            .unwrap();
+            for password in ["p", ""] {
+                let err = rt
+                    .block_on(team_join_code("u".into(), password.into()))
+                    .unwrap_err();
+                assert!(
+                    err.contains("fleet.enrollAgainRefused"),
+                    "{status} {password:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// R3-D5: the UI treats a root state as this device's only when it names
+    /// this tenant and device, or when `team.json` does not read.
+    #[test]
+    fn bootstrap_status_says_whether_the_root_state_is_this_devices() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        let this_device = || {
+            serde_json::to_value(root_bootstrap::status().unwrap()).unwrap()["this_device"].clone()
+        };
+        assert_eq!(this_device(), serde_json::json!(false), "no root state");
+        root_here();
+        assert_eq!(this_device(), serde_json::json!(true));
+        let mine = root_bootstrap::load().unwrap();
+        for other in [
+            root_bootstrap::BootstrapState {
+                device_id: hex(&[0x6b; 16]),
+                ..mine.clone()
+            },
+            root_bootstrap::BootstrapState {
+                tenant_id: hex(&[0x0e; 16]),
+                ..mine.clone()
+            },
+        ] {
+            root_bootstrap::save(&other).unwrap();
+            assert_eq!(this_device(), serde_json::json!(false), "{other:?}");
+        }
+        // A directory in its place: `team.json` does not read at all.
+        let team_json = store::team_config_path().unwrap();
+        std::fs::remove_file(&team_json).unwrap();
+        std::fs::create_dir(&team_json).unwrap();
+        assert_eq!(
+            this_device(),
+            serde_json::json!(true),
+            "an unreadable team.json"
+        );
     }
 
     /// Makes the joiner the activated root custodian of its tenant.

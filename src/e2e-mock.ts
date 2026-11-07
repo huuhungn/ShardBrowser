@@ -356,11 +356,18 @@ const teamBound = (payload?: InvokeArgs) => {
 const TEAM_ANCHOR = "a0".repeat(32);
 // The root key ID, the recovery fingerprint, of every team fixture.
 const TEAM_ROOT_KEY_ID = "5e".repeat(32);
+// Every saved fixture root state is this device's, in its tenant.
 let custodyBootstrap = scenario === "team-first-device-resume"
-  ? { started: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "", root_key_id: "" }
+  ? {
+    started: true, this_device: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "",
+    root_key_id: "",
+  }
   : teamDevice === "a"
-    ? { started: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery", anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID }
-    : { started: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
+    ? {
+      started: true, this_device: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery",
+      anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID,
+    }
+    : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
 let fleetCustody = { started: false, created: false, setup_key_held: false, fkek_key_id: "" };
 
 // "team-device-a" and "team-device-b": two devices of one fleet. Each page keeps
@@ -460,7 +467,9 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return null;
     case "team_join_code":
       try { teamWindowOpen(); } catch (e) {
-        // As the launcher: an expired code says when Enroll again would be refused.
+        // As the launcher: an expired code says when Enroll again would be refused,
+        // and a device with its own root state, finished or not, is refused unasked.
+        if (custodyBootstrap.this_device) teamRefuse("fleet.enrollAgainRefused");
         const status = await teamServer<string | null>("status", me);
         if (!(status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned))) {
           teamRefuse(status === "active" ? "fleet.joinedCollectKey" : "fleet.enrollAgainRefused");
@@ -482,7 +491,8 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     case "team_enroll_again": {
       const status = await teamServer<string | null>("status", me);
       const allowed = status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned);
-      if (custodyBootstrap.activated || !allowed) teamRefuse("fleet.enrollAgainRefused");
+      // As the launcher: this device's root state refuses it, activated or not.
+      if (custodyBootstrap.this_device || !allowed) teamRefuse("fleet.enrollAgainRefused");
       teamMe = { ...teamMe, device_id: "", enrolled_at_ms: 0, collected: false };
       teamSeeds = null;
       return teamStatusFixture();
@@ -499,7 +509,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       teamMe = { device_id: bundle, enrolled_at_ms: 0, pinned: true, collected: true };
       teamSeeds = null;
       custodyBootstrap = {
-        started: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
+        started: true, this_device: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
         root_key_id: TEAM_ROOT_KEY_ID,
       };
       fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
@@ -1030,6 +1040,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       document.documentElement.dataset.e2eCustodyPath = String(args?.recoveryPath ?? "");
       custodyBootstrap = {
         started: true,
+        this_device: true,
         activated: true,
         recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
         anchor: "a0".repeat(32),

@@ -1401,6 +1401,57 @@ test("a root custodian whose key store is unavailable is told to try again, with
   await expect(card.getByTestId("team-import")).toHaveCount(0);
 });
 
+test("a lost-key device offers no Reset or sign-in while its root state is still loading", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-keys-lost", fakeTeamServer());
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> }; e2eReleaseBoot: () => void;
+    };
+    const ipc = w.__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    const held = new Promise<void>((resolve) => { w.e2eReleaseBoot = resolve; });
+    ipc.invoke = async (...args) => {
+      if (args[0] === "team_custody_bootstrap_status") await held;
+      return original(...args);
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  const lost = card.getByTestId("team-keys-lost");
+  await expect(lost).toBeAttached();
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  await expect(lost.getByLabel("Account username")).toHaveCount(0);
+  await page.evaluate(() => (window as unknown as { e2eReleaseBoot: () => void }).e2eReleaseBoot());
+  await expect(lost).toContainText("import your recovery bundle to restore it");
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+});
+
+test("an expired join code of a device with an unfinished root setup offers no Enroll again", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  // The server lists A pending, where an ordinary device could enroll again.
+  Object.assign(server.devices[0], { status: "pending" });
+  const card = await teamDevicePage(a, "a", server);
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_custody_bootstrap_status") {
+        return { ...(result as Record<string, unknown>), started: true, activated: false, anchor: "", root_key_id: "" };
+      }
+      return result;
+    };
+  });
+  await a.getByRole("button", { name: "Settings", exact: true }).click();
+  await a.getByRole("button", { name: "Team", exact: true }).click();
+  const join = card.getByTestId("team-join");
+  await expect(join).toBeVisible();
+  await cardClick(a, "Show join code");
+  await expect(join).toContainText("This join code has expired.");
+  await expect(join).toContainText("it is the root custodian");
+  await expect(card.getByRole("button", { name: "Enroll again" })).toHaveCount(0);
+});
+
 test("an expired join code of a revoked device offers Enroll again", async ({ page: b }) => {
   const server = fakeTeamServer();
   const card = await teamDevicePage(b, "b", server, true);
