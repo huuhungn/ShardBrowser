@@ -6423,7 +6423,83 @@ mod custody_tests {
             after.device_id == hex(&[0x6b; 16]),
             "Reset overwrote the newer root identity"
         );
-        assert!(result.is_err(), "Reset accepted a stale identity snapshot");
+        assert!(
+            crate::errcode::has_code(&result.unwrap_err(), "fleet.identityChanged"),
+            "Reset accepted a stale identity snapshot"
+        );
+    }
+
+    /// Reset of the joiner, listed revoked, while `race` writes during the
+    /// listing: the error, whether the joiner's credentials were kept, and
+    /// the device ID `team.json` holds afterwards.
+    fn reset_racing(race: fn()) -> (String, bool, String) {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(
+            move |call, _| {
+                let body = match call {
+                    "POST /v2/auth/login" => serde_json::json!({
+                        "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                        "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                        "restore_epoch": 0
+                    }),
+                    "GET /v2/me" => {
+                        race();
+                        serde_json::json!({"devices": [{"device_id": hex(&JOINER), "status": "revoked"}]})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                (200, serde_json::to_vec(&body).unwrap())
+            },
+        );
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let refs = refs();
+        let err = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        let kept = credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok();
+        (err, kept, team_config::load().unwrap().device_id)
+    }
+
+    /// D1: a root state that names this device by the time the listing
+    /// returns refuses the Reset, though `team.json` did not change.
+    #[test]
+    fn reset_is_refused_when_only_the_root_state_changed_during_the_listing() {
+        let (err, kept, device) = reset_racing(|| {
+            root_bootstrap::save(&root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT),
+                device_id: hex(&JOINER),
+                activated: true,
+                ..Default::default()
+            })
+            .unwrap();
+        });
+        assert!(
+            crate::errcode::has_code(&err, "fleet.identityChanged"),
+            "{err}"
+        );
+        assert!(
+            kept,
+            "Reset cleared a device that became the root custodian"
+        );
+        assert_eq!(device, hex(&JOINER));
+    }
+
+    /// D1: another identity in `team.json` by the time the listing returns
+    /// refuses the Reset, though the root state did not change.
+    #[test]
+    fn reset_is_refused_when_only_team_json_changed_during_the_listing() {
+        let (err, kept, device) = reset_racing(|| {
+            let mut current = team_config::load().unwrap();
+            current.device_id = hex(&[0x6b; 16]);
+            team_config::save(&current).unwrap();
+        });
+        assert!(
+            crate::errcode::has_code(&err, "fleet.identityChanged"),
+            "{err}"
+        );
+        assert!(kept, "Reset overwrote a newer identity");
+        assert_eq!(device, hex(&[0x6b; 16]));
     }
 
     #[test]
@@ -6466,7 +6542,10 @@ mod custody_tests {
             team_json() == before,
             "a different signed-in account cleared the saved owner's device"
         );
-        assert!(result.is_err());
+        assert!(crate::errcode::has_code(
+            &result.unwrap_err(),
+            "fleet.enrollAgainOtherAccount"
+        ));
     }
 
     #[test]
