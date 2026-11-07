@@ -3064,7 +3064,7 @@ async fn team_enroll_again(
     }
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
-    let status = client
+    let me = client
         .account_device_status(
             &fleet_client::AccountLogin {
                 tenant_id: &c.tenant_id,
@@ -3074,9 +3074,16 @@ async fn team_enroll_again(
             &c.device_id,
         )
         .await
-        .map_err(|e| e.to_string())?
-        .device
-        .map(|d| d.status);
+        .map_err(|e| e.to_string())?;
+    // A listing that names another account than the one that enrolled this
+    // device never resets it, as recovery import checks the bundle's.
+    if !c.account_id.is_empty()
+        && !me.account_id.is_empty()
+        && !me.account_id.eq_ignore_ascii_case(&c.account_id)
+    {
+        return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
+    }
+    let status = me.device.map(|d| d.status);
     if !enroll_again_allowed(status.as_deref(), pinned_anchor(&c).is_some()) {
         return Err(refused());
     }
@@ -6412,6 +6419,49 @@ mod custody_tests {
             "Reset overwrote the newer root identity"
         );
         assert!(result.is_err(), "Reset accepted a stale identity snapshot");
+    }
+
+    #[test]
+    fn reset_of_an_unlisted_device_keeps_identity_and_credentials() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "missing");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        let before = team_json();
+        let refs = refs();
+        let result = rt.block_on(team_enroll_again("other-account".into(), "p".into()));
+        assert!(result.is_err());
+        assert!(team_json() == before);
+        assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
+    }
+
+    #[test]
+    fn reset_checks_the_signed_in_account_against_the_saved_owner() {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(|call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => serde_json::json!({
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "devices": [{"device_id": hex(&JOINER), "status": "pending"}]
+                }),
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let before = team_json();
+        assert!(team_config::load().unwrap().account_id != hex(&[0x6c; 16]));
+        let result = rt.block_on(team_enroll_again("other-account".into(), "p".into()));
+        assert!(
+            team_json() == before,
+            "a different signed-in account cleared the saved owner's device"
+        );
+        assert!(result.is_err());
     }
 
     #[test]
