@@ -1,6 +1,29 @@
 {
   "releases": [
     {
+      "version": "2.8.1",
+      "date": "2026-11-07",
+      "entries": [
+        {
+          "id": "team-recovery-strict-server",
+          "title": "Khôi phục kiểm tra câu trả lời của server nhóm chặt hơn",
+          "lead": "Import, Reset và trang Team không còn làm theo câu trả lời của server nhóm khi nó trái với dữ liệu launcher đang giữ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Import recovery bundle từ chối đăng nhập vào tài khoản hoặc server khác với tài khoản và server ghi trong gói. Khi server báo thiết bị đang chờ duyệt, Reset giữ một bản sao team.json và khoá của thiết bị, giống như với thiết bị đã bị thu hồi. Root key grant có trường hex sai định dạng giờ bị từ chối kèm thông báo lỗi, không còn làm launcher dừng đột ngột."
+            },
+            {
+              "type": "p",
+              "text": "Khoá đội máy lưu từ bản 2.4.2 mà grant đã xác minh giờ được đánh dấu là đã xác minh, nên Export recovery bundle dùng được trên máy đó. Khi trạng thái root custodian còn đang tải, hoặc khi thiết lập root còn dở, trang Team không hiện Reset hay Enroll again. Trạng thái root hoặc custody không kiểm tra được giờ bị báo lỗi chứ không bị coi là không có, nên đổi kết nối hay Reset vẫn giữ root custodian đang hoạt động, và trạng thái root của máy khác không còn hiện các thao tác root hay Resume custody setup."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.8.0",
       "date": "2026-11-07",
       "entries": [

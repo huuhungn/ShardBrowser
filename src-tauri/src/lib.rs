@@ -2910,7 +2910,11 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
         // The UI offers Enroll again for an expired code, so say when
         // `team_enroll_again` would refuse it. Unasked, the code just reads
         // as expired; asked but unanswered (a refused login, a server down),
-        // the error stands, so Enroll again is never offered on a guess.
+        // the error stands, so Enroll again is never offered on a guess. A
+        // device with its own root state is refused unasked, as Reset is.
+        Err(_) if own_root_state(&c).map_err(|e| e.to_string())? => {
+            return Err(crate::errcode::code("fleet.enrollAgainRefused"));
+        }
         Err(expired) if !username.trim().is_empty() && !password.is_empty() => {
             let client = fleet_client::FleetClient::new(&c.server_url, &c.token)
                 .map_err(|e| e.to_string())?;
@@ -2925,7 +2929,8 @@ async fn team_join_code(username: String, password: String) -> Result<JoinCode, 
                 .map_err(|e| e.to_string())?
                 .device
                 .map(|d| d.status);
-            let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
+            let pinned = status.as_deref() == Some("active")
+                && read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
             return Err(if enroll_again_allowed(status.as_deref(), pinned) {
                 expired
             } else if status.as_deref() == Some("active") {
@@ -3058,13 +3063,7 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let refused = || crate::errcode::code("fleet.enrollAgainRefused");
-    let custodian = |c: &team_config::TeamConfig| {
-        root_bootstrap::load().map(|root| {
-            root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
-                && root.device_id.eq_ignore_ascii_case(&c.device_id)
-        })
-    };
-    if custodian(&c).map_err(|e| e.to_string())? {
+    if own_root_state(&c).map_err(|e| e.to_string())? {
         return Err(refused());
     }
     let client =
@@ -3092,7 +3091,9 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
     }
     let status = me.device.map(|d| d.status);
-    let pinned = read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
+    // Only an active device's pin decides, so only its ledger is read.
+    let pinned = status.as_deref() == Some("active")
+        && read_pinned_anchor(&c).map_err(|e| e.to_string())?.is_some();
     if !enroll_again_allowed(status.as_deref(), pinned) {
         return Err(refused());
     }
@@ -3105,14 +3106,16 @@ async fn team_enroll_again(
         && now.device_id == c.device_id
         && now.signing_credential_ref == c.signing_credential_ref
         && now.hpke_credential_ref == c.hpke_credential_ref;
-    if !unchanged || custodian(&now).map_err(|e| e.to_string())? {
+    if !unchanged || own_root_state(&now).map_err(|e| e.to_string())? {
         return Err(crate::errcode::code("fleet.identityChanged"));
     }
     c = now;
-    // `revoked` is the server's unauthenticated word, and a seed that does
-    // not read may come back: the file is copied and the keys are kept.
-    let keep =
-        status.as_deref() == Some("revoked") || c.signing_key().is_err() || c.hpke_seed().is_err();
+    // `revoked` and `pending` are the server's unauthenticated word, and a
+    // seed that does not read may come back: the file is copied and the keys
+    // are kept.
+    let keep = matches!(status.as_deref(), Some("revoked" | "pending"))
+        || c.signing_key().is_err()
+        || c.hpke_seed().is_err();
     if keep {
         let copy = team_config::preserve_unreadable().map_err(|e| e.to_string())?;
         eprintln!(
@@ -3175,6 +3178,16 @@ fn imported_collect(
     );
     report
         .map_err(|e| crate::errcode::code_with("recovery.importedCollectFailed", &[("error", &e)]))
+}
+
+/// Whether the saved root state, finished or not, names this tenant and
+/// device: such a device never enrolls again. One that does not load is the
+/// error.
+fn own_root_state(c: &team_config::TeamConfig) -> anyhow::Result<bool> {
+    root_bootstrap::load().map(|root| {
+        root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+            && root.device_id.eq_ignore_ascii_case(&c.device_id)
+    })
 }
 
 /// Whether a device the server lists as `status` may enroll again: while
@@ -3394,7 +3407,7 @@ fn read_pinned_anchor(
 fn tenant_pin(
     tenant: &[u8; 16],
 ) -> anyhow::Result<Option<(shardx_core::trust_chain::Binding, [u8; 32], String)>> {
-    if !team::db::Db::path()?.exists() {
+    if !team::db::Db::path()?.try_exists()? {
         return Ok(None);
     }
     team::ledger::tenant_pin(&team::db::Db::open()?, tenant)
@@ -3703,14 +3716,10 @@ fn custody_report(
     }))
 }
 
-/// Decode a hex string from the server into bytes.
+/// Decode a hex string from the server into bytes. The error never carries
+/// the input, which a hostile server may fill with a secret it was sent.
 fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
-        return Err(crate::errcode::code("fleet.malformedHexFromServer"));
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    fleet_client::decode_hex(s).ok_or_else(|| crate::errcode::code("fleet.malformedHexFromServer"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -6371,8 +6380,9 @@ mod custody_tests {
         assert_eq!(pinned_anchor(&c), Some((BINDING_J, [0x0a; 32])));
     }
 
-    /// What enrolling again leaves: no id, no seeds, no credentials.
-    fn assert_cleared(refs: [String; 2]) {
+    /// What enrolling again leaves: no id, no seeds, and the credentials
+    /// only when `kept` (a device the server listed pending or revoked).
+    fn assert_cleared(refs: [String; 2], kept: bool) {
         let c = team_config::load().unwrap();
         assert!(c.device_id.is_empty() && !c.is_enrolled() && !c.blocks_enrollment());
         assert!(c.signing_key_seed.is_empty() && c.hpke_key_seed.is_empty());
@@ -6382,8 +6392,13 @@ mod custody_tests {
             (false, hex(&TENANT).as_str())
         );
         for r in refs {
-            let gone = credential::load(&r).unwrap_err();
-            assert!(gone.to_string().contains("credential.missing"), "{gone}");
+            match credential::load(&r) {
+                Ok(_) => assert!(kept, "{r} was kept"),
+                Err(gone) => {
+                    assert!(!kept, "{r} was forgotten: {gone}");
+                    assert!(gone.to_string().contains("credential.missing"), "{gone}");
+                }
+            }
         }
     }
 
@@ -6618,7 +6633,7 @@ mod custody_tests {
         let refs = refs();
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, true);
     }
 
     /// A pin that no longer reads is no proof of no pin: Reset of a device
@@ -6750,7 +6765,7 @@ mod custody_tests {
             .block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
         assert!(status.device_id.is_empty());
-        assert_cleared(refs);
+        assert_cleared(refs, true);
         assert!(calls.lock().unwrap().contains(&"GET /v2/me".to_string()));
     }
 
@@ -6768,7 +6783,7 @@ mod custody_tests {
         assert!(err.contains("fleet.joinCodeExpired"), "{err}");
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, false);
     }
 
     /// An expired code reads as expired only where Enroll again is allowed:
@@ -6893,7 +6908,7 @@ mod custody_tests {
         let refs = refs();
         rt.block_on(team_enroll_again("u".into(), "p".into()))
             .unwrap();
-        assert_cleared(refs);
+        assert_cleared(refs, true);
         assert_eq!(
             join_pin(),
             Some((BINDING_J, [0x0a; 32], "JOIN".to_string()))
@@ -6946,6 +6961,217 @@ mod custody_tests {
         assert!(fleet_custody::load().unwrap().device_acks.is_empty());
     }
 
+    /// R3-D2: `pending` is the server's unauthenticated word as `revoked`
+    /// is, so a working device it lists pending keeps a copy of its file and
+    /// both credentials.
+    #[test]
+    fn a_pending_reply_keeps_readable_credentials_and_a_copy() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms());
+        pin_here();
+        let refs = refs();
+        assert_eq!(team_json_copies(), 0);
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert!(!team_config::load().unwrap().is_enrolled());
+        assert_eq!(team_json_copies(), 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+    }
+
+    /// R3-D3: root grant hex from the server never panics on a multi-byte
+    /// character or takes a sign, and its error never carries the input.
+    #[test]
+    fn root_grant_hex_from_the_server_never_panics_or_echoes() {
+        let secret = "secret-sentinel-00";
+        // A three-byte character, one more, then the literal secret: even length.
+        let tainted = format!("\u{20ac}a{secret}");
+        assert!(tainted.len().is_multiple_of(2));
+        for s in [tainted.as_str(), "+f", "a\u{e9}0"] {
+            let err = std::panic::catch_unwind(|| hex_bytes(s))
+                .expect("hex_bytes panicked")
+                .unwrap_err();
+            assert!(
+                crate::errcode::has_code(&err, "fleet.malformedHexFromServer"),
+                "{err}"
+            );
+            assert!(!err.contains(secret), "{err}");
+        }
+        let grant = fleet_client::RootKeyGrant {
+            grant_variant: String::new(),
+            root_key_id: String::new(),
+            root_generation: 0,
+            recipient_hpke_key_id: String::new(),
+            hpke_info_hex: "00".into(),
+            hpke_encapped_key_hex: "00".into(),
+            hpke_wrapped_trk_hex: "00".into(),
+        };
+        for field in 0..3 {
+            let mut g = grant.clone();
+            *[
+                &mut g.hpke_info_hex,
+                &mut g.hpke_encapped_key_hex,
+                &mut g.hpke_wrapped_trk_hex,
+            ][field] = tainted.clone();
+            let err = std::panic::catch_unwind(|| custody_report(&[0; 32], &[g], FleetGrant::None))
+                .expect("custody_report panicked")
+                .unwrap_err();
+            assert!(!err.contains(secret), "{field}: {err}");
+        }
+    }
+
+    /// R3-D5: an expired code of a device with its own root state, finished
+    /// or not, never reads as plain expired, the code the UI answers with
+    /// Enroll again: the Reset would refuse it.
+    #[test]
+    fn an_expired_code_of_a_device_with_its_own_root_state_offers_no_enroll_again() {
+        for status in ["pending", "active"] {
+            let rt = runtime();
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            root_bootstrap::save(&root_bootstrap::BootstrapState {
+                tenant_id: hex(&TENANT),
+                device_id: hex(&JOINER),
+                ..Default::default()
+            })
+            .unwrap();
+            for password in ["p", ""] {
+                let err = rt
+                    .block_on(team_join_code("u".into(), password.into()))
+                    .unwrap_err();
+                assert!(
+                    err.contains("fleet.enrollAgainRefused"),
+                    "{status} {password:?}: {err}"
+                );
+            }
+        }
+    }
+
+    /// R3-D5: the UI treats a root state as this device's only when it names
+    /// this tenant and device, or when `team.json` does not read.
+    #[test]
+    fn bootstrap_status_says_whether_the_root_state_is_this_devices() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        let this_device = || {
+            serde_json::to_value(root_bootstrap::status().unwrap()).unwrap()["this_device"].clone()
+        };
+        assert_eq!(this_device(), serde_json::json!(false), "no root state");
+        root_here();
+        assert_eq!(this_device(), serde_json::json!(true));
+        let mine = root_bootstrap::load().unwrap();
+        for other in [
+            root_bootstrap::BootstrapState {
+                device_id: hex(&[0x6b; 16]),
+                ..mine.clone()
+            },
+            root_bootstrap::BootstrapState {
+                tenant_id: hex(&[0x0e; 16]),
+                ..mine.clone()
+            },
+        ] {
+            root_bootstrap::save(&other).unwrap();
+            assert_eq!(this_device(), serde_json::json!(false), "{other:?}");
+        }
+        // A directory in its place: `team.json` does not read at all.
+        let team_json = store::team_config_path().unwrap();
+        std::fs::remove_file(&team_json).unwrap();
+        std::fs::create_dir(&team_json).unwrap();
+        assert_eq!(
+            this_device(),
+            serde_json::json!(true),
+            "an unreadable team.json"
+        );
+    }
+
+    /// Nit 1: a ledger whose existence cannot be checked is not a device
+    /// with no ledger.
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_cannot_be_checked_is_an_error() {
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        let dir = team::db::Db::path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(tenant_pin(&TENANT).is_err());
+    }
+
+    /// Nit 2: the pin decides only for an active device, so a ledger that
+    /// does not read never stops Enroll again of a pending or revoked one.
+    #[test]
+    fn an_unreadable_ledger_stops_only_an_active_device() {
+        for status in ["pending", "revoked"] {
+            let rt = runtime();
+            let (url, _) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+            let ledger = team::db::Db::path().unwrap();
+            std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+            std::fs::write(&ledger, b"unreadable test ledger").unwrap();
+            let err = rt
+                .block_on(team_join_code("u".into(), "p".into()))
+                .unwrap_err();
+            assert!(err.contains("fleet.joinCodeExpired"), "{status}: {err}");
+            rt.block_on(team_enroll_again("u".into(), "p".into()))
+                .unwrap();
+            assert!(!team_config::load().unwrap().is_enrolled(), "{status}");
+        }
+    }
+
+    /// Nit 5: an expired code of an active device whose ledger does not read
+    /// reports that, never the plain expired code that offers Enroll again.
+    #[test]
+    fn an_expired_code_with_an_unreadable_ledger_offers_no_enroll_again() {
+        let rt = runtime();
+        let (url, _) = me_server(&rt, "active");
+        let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+        pin_here();
+        std::fs::write(team::db::Db::path().unwrap(), b"unreadable test ledger").unwrap();
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("team.trustLedgerUnreadable"), "{err}");
+        assert!(!err.contains("fleet.joinCodeExpired"), "{err}");
+    }
+
+    /// Nit 5: a ticket and a listing that both name an account, but not the
+    /// same one, never reset the device.
+    #[test]
+    fn reset_is_refused_when_ticket_and_listing_name_different_accounts() {
+        let rt = runtime();
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> = std::sync::Arc::new(|call, _| {
+            let body = match call {
+                "POST /v2/auth/login" => serde_json::json!({
+                    "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                    "restore_epoch": 0
+                }),
+                "GET /v2/me" => serde_json::json!({
+                    "account_id": hex(&[0x6c; 16]), "server_instance_id": hex(&INSTANCE),
+                    "devices": [{"device_id": hex(&JOINER), "status": "pending"}]
+                }),
+                _ => serde_json::json!({}),
+            };
+            (200, serde_json::to_vec(&body).unwrap())
+        });
+        let (client, _) = rt.block_on(fleet_custody::tests::mock(reply));
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        let before = team_json();
+        let references = refs();
+        let err = rt
+            .block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.enrollAgainOtherAccount"),
+            "{err}"
+        );
+        assert!(team_json() == before);
+        assert!(references.iter().all(|r| credential::load(r).is_ok()));
+    }
+
     /// Makes the joiner the activated root custodian of its tenant.
     fn root_here() {
         root_bootstrap::save(&root_bootstrap::BootstrapState {
@@ -6992,6 +7218,64 @@ mod custody_tests {
             assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
             assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
         }
+    }
+
+    /// A link to itself: a path whose existence cannot be checked. Windows
+    /// uses a junction, which needs no privilege.
+    fn link_to_itself(path: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(path)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(path, path).unwrap();
+    }
+
+    /// R4-D1: a root state whose existence cannot be checked is not a device
+    /// without one. A connection change and Reset fail closed, with
+    /// `team.json` and both credentials unchanged; the custody state and
+    /// `team.json` do not read as absent either.
+    #[test]
+    fn a_root_state_that_cannot_be_checked_keeps_the_identity() {
+        let kept = |refs: &[String; 2], before: &[u8]| {
+            assert_eq!(team_json(), before);
+            assert_eq!(team_json_copies(), 0);
+            assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+            assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+        };
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            link_to_itself(&store::custody_bootstrap_path().unwrap());
+            let refs = refs();
+            let before = team_json();
+            assert!(team_set_connection(url, String::new(), tenant).is_err());
+            kept(&refs, &before);
+        }
+        for status in ["pending", "revoked"] {
+            let rt = runtime();
+            let (url, calls) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms());
+            link_to_itself(&store::custody_bootstrap_path().unwrap());
+            let refs = refs();
+            let before = team_json();
+            assert!(rt
+                .block_on(team_enroll_again("u".into(), "p".into()))
+                .is_err());
+            kept(&refs, &before);
+            assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+        }
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        link_to_itself(&store::fleet_custody_path().unwrap());
+        assert!(fleet_custody::load().is_err());
+        std::fs::remove_file(store::team_config_path().unwrap()).unwrap();
+        link_to_itself(&store::team_config_path().unwrap());
+        assert!(team_config::load().is_err());
     }
 
     /// S4, G13 (plan v0.2.2b): a server or tenant change is refused for the

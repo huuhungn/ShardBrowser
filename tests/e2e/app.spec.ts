@@ -601,16 +601,18 @@ const teamPins = (page: Page) => page.evaluate(async () => {
 /**
  * Open team device `device`'s Team page against `server`, its clock faked when
  * `clock` is set. The longer names are B, or A, with seeds that do not read.
+ * `query` adds mock parameters to the page URL.
  */
 async function teamDevicePage(
   page: Page,
   device: "a" | "b" | "keys-lost" | "key-store-unavailable" | "root-keys-lost" | "root-key-store-unavailable",
   server: ReturnType<typeof fakeTeamServer>,
   clock = false,
+  query = "",
 ) {
   if (clock) await page.clock.install();
   await page.exposeFunction("e2eTeamServer", server.call);
-  await gotoMocked(page, device.length === 1 ? `/?e2e=team-device-${device}` : `/?e2e=team-${device}`);
+  await gotoMocked(page, (device.length === 1 ? `/?e2e=team-device-${device}` : `/?e2e=team-${device}`) + query);
   await page.getByRole("button", { name: "Team", exact: true }).click();
   return page.getByTestId("team-card");
 }
@@ -1399,6 +1401,107 @@ test("a root custodian whose key store is unavailable is told to try again, with
   await expect(notice.getByLabel("Account username")).toHaveCount(0);
   await expect(notice.getByRole("button")).toHaveCount(0);
   await expect(card.getByTestId("team-import")).toHaveCount(0);
+});
+
+test("a lost-key device offers no Reset or sign-in while its root state is still loading", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-keys-lost", fakeTeamServer());
+  await page.evaluate(() => {
+    const w = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> }; e2eReleaseBoot: () => void;
+    };
+    const ipc = w.__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    const held = new Promise<void>((resolve) => { w.e2eReleaseBoot = resolve; });
+    ipc.invoke = async (...args) => {
+      if (args[0] === "team_custody_bootstrap_status") await held;
+      return original(...args);
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  const lost = card.getByTestId("team-keys-lost");
+  await expect(lost).toBeAttached();
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  await expect(lost.getByLabel("Account username")).toHaveCount(0);
+  await page.evaluate(() => (window as unknown as { e2eReleaseBoot: () => void }).e2eReleaseBoot());
+  await expect(lost).toContainText("import your recovery bundle to restore it");
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+});
+
+test("an unfinished root setup whose key store is unavailable does not claim to be the root custodian", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-key-store-unavailable", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_custody_bootstrap_status") {
+        return { ...(result as Record<string, unknown>), started: true, activated: false };
+      }
+      return result;
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  const notice = card.getByTestId("team-keys-lost");
+  await expect(notice).toContainText(
+    "The key store did not answer; try again. This device started setting up the team's root key without finishing",
+  );
+  await expect(notice).not.toContainText("This device is the root custodian");
+  await expect(notice.getByRole("button")).toHaveCount(0);
+});
+
+test("an expired join code of a device with an unfinished root setup offers no Enroll again", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  // The server lists A pending, where an ordinary device could enroll again.
+  Object.assign(server.devices[0], { status: "pending" });
+  const card = await teamDevicePage(a, "a", server);
+  await a.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_custody_bootstrap_status") {
+        return { ...(result as Record<string, unknown>), started: true, activated: false, anchor: "", root_key_id: "" };
+      }
+      return result;
+    };
+  });
+  await a.getByRole("button", { name: "Settings", exact: true }).click();
+  await a.getByRole("button", { name: "Team", exact: true }).click();
+  const join = card.getByTestId("team-join");
+  await expect(join).toBeVisible();
+  await cardClick(a, "Show join code");
+  await expect(join).toContainText("This join code has expired.");
+  await expect(join).toContainText("it is the root custodian");
+  await expect(card.getByRole("button", { name: "Enroll again" })).toHaveCount(0);
+});
+
+test("another device's finished root state selects no root actions for a readable member", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server);
+  // A connection change after both old root keys were lost kept that root's journal; B enrolls on these roots.
+  const card = await teamDevicePage(b, "b", server, false, "&teamRootJournal=foreign");
+  // B shows and confirms its own join code and collects as any member.
+  await admitB(a, b);
+  await expect(card.getByText("Bootstrap anchor")).toHaveCount(0);
+  await expect(card.getByTestId("team-devices")).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Show devices" })).toHaveCount(0);
+  await expect(card.getByTestId("team-export")).toHaveCount(0);
+});
+
+test("another device's unfinished root setup offers no Resume to a member", async ({ page }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(page, "b", server, false, "&teamRootJournal=foreign-unfinished");
+  await teamEnroll(page, "Machine B");
+  await expect(card.getByTestId("custody-bootstrap")).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Resume custody setup" })).toHaveCount(0);
+  await cardClick(page, "Show join code");
+  await expect(card.getByTestId("team-join-sas")).toBeVisible();
 });
 
 test("an expired join code of a revoked device offers Enroll again", async ({ page: b }) => {

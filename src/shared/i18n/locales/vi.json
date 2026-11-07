@@ -1413,6 +1413,7 @@
   "team.recovery.rootKeyStoreUnavailable": "Kho khoá không phản hồi; hãy thử lại. Thiết bị này là thiết bị giữ khoá gốc nên không thể đặt lại.",
   "team.recovery.rootKeysLost": "Khoá của thiết bị này đã mất, và đây là thiết bị giữ khoá gốc của nhóm: hãy nhập gói khôi phục của bạn để khôi phục nó.",
   "team.recovery.rootSetupInterrupted": "Khoá của thiết bị này đã mất, và thiết bị đã bắt đầu thiết lập khoá gốc của nhóm nhưng chưa xong. Không thể đặt lại thiết bị, và không thể nhập gói khôi phục đè lên phần thiết lập dở dang; không có gì bị thay đổi.",
+  "team.recovery.rootSetupKeyStoreUnavailable": "Kho khoá không phản hồi; hãy thử lại. Thiết bị này đã bắt đầu thiết lập khoá gốc của nhóm nhưng chưa xong nên không thể đặt lại; không có gì bị thay đổi.",
   "team.recovery.rootStateUnreadable": "Không đọc được dữ liệu thiết lập quyền giữ khoá gốc lưu trên máy này, nên chưa biết thiết bị này có phải là thiết bị giữ khoá gốc của nhóm hay không. Nút Đặt lại sẽ tắt cho đến khi đọc lại được; không có gì bị thay đổi.",
   "team.recovery.reset": "Đặt lại thiết bị này",
   "team.resumeCustodySetup": "Tiếp tục thiết lập quyền giữ khóa",

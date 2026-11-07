@@ -61,6 +61,8 @@ export type TeamStatus = {
 export type CustodyBootstrapStatus = {
   /** Some step ran, so the next attempt resumes rather than starts over. */
   started: boolean;
+  /** The started state is this device's in its saved tenant: only then is it the root custodian. */
+  this_device: boolean;
   activated: boolean;
   /** Where the recovery bundle was written; empty until it was. */
   recovery_path: string;

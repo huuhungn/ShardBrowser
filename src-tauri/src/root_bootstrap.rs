@@ -1082,6 +1082,10 @@ fn keep_records(server_url: &str, state: &BootstrapState) -> Result<()> {
 pub struct BootstrapStatus {
     /// Some step ran, so a new attempt resumes rather than starts over.
     pub started: bool,
+    /// The started state names this device of the saved tenant, or
+    /// `team.json` does not read to say otherwise: the UI treats only this
+    /// as a root custodian, as Reset refuses only it.
+    pub this_device: bool,
     pub activated: bool,
     /// Where the recovery bundle was written, once it was.
     pub recovery_path: String,
@@ -1097,6 +1101,11 @@ impl BootstrapStatus {
     fn of(state: &BootstrapState) -> Self {
         Self {
             started: !state.tenant_id.is_empty(),
+            this_device: !state.tenant_id.is_empty()
+                && crate::team_config::load().map_or(true, |c| {
+                    state.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+                        && state.device_id.eq_ignore_ascii_case(&c.device_id)
+                }),
             activated: state.activated,
             recovery_path: state.recovery_path.clone(),
             anchor: state.anchor.clone(),
@@ -1125,10 +1134,11 @@ pub fn status() -> Result<BootstrapStatus> {
     Ok(BootstrapStatus::of(&load()?))
 }
 
-/// Loads the bootstrap state; none yet is the empty state.
+/// Loads the bootstrap state; none yet is the empty state. A file whose
+/// existence cannot be checked is an error, never no root state.
 pub fn load() -> Result<BootstrapState> {
     let path = crate::store::custody_bootstrap_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(BootstrapState::default());
     }
     let body = Zeroizing::new(std::fs::read_to_string(&path)?);

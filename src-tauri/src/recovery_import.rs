@@ -164,8 +164,9 @@ fn check_pin(header: &RecoveryBundleHeaderV2, plaintext: &RecoveryBundlePlaintex
     }
 }
 
-/// Step 3: the server is the bundle's, the ticket's account is the bundle's,
-/// and it lists the bundle's device active with the bundle's key IDs.
+/// Step 3: the server is the bundle's, the account is the bundle's, both as
+/// the login ticket and as `/v2/me` name them, and it lists the bundle's
+/// device active with the bundle's key IDs.
 fn check_listing(
     me: &AccountDeviceStatus,
     header: &RecoveryBundleHeaderV2,
@@ -173,15 +174,14 @@ fn check_listing(
     signing_id: &str,
     hpke_id: &str,
 ) -> Result<()> {
-    if !me
-        .server_instance_id
-        .eq_ignore_ascii_case(&hex(&header.server_instance_id))
+    let names = |s: &str, ours: &[u8; 16]| s.eq_ignore_ascii_case(&hex(ours));
+    if !names(&me.server_instance_id, &header.server_instance_id)
+        || !names(&me.ticket_server_instance_id, &header.server_instance_id)
     {
         return Err(anyhow!(crate::errcode::code("recovery.otherServer")));
     }
-    if !me
-        .account_id
-        .eq_ignore_ascii_case(&hex(&custodian.account_id))
+    if !names(&me.account_id, &custodian.account_id)
+        || !names(&me.ticket_account_id, &custodian.account_id)
     {
         return Err(anyhow!(crate::errcode::code("recovery.otherAccount")));
     }
@@ -305,11 +305,17 @@ pub(crate) async fn import(
         .await,
     )?;
 
-    // 4 and 5.
+    // 4 and 5, under a ticket of the bundle's account and server.
     let session = logged(
         "session",
         client
-            .open_device_session(&login, &device, &signer, &custodian.hpke_key_seed)
+            .open_device_session_as(
+                &login,
+                &device,
+                &signer,
+                &custodian.hpke_key_seed,
+                Some((&custodian.account_id, &bundle.header.server_instance_id)),
+            )
             .await
             .map_err(session_refusal),
     )?;
@@ -391,7 +397,7 @@ fn write(
     }
 
     // A6: a root state on disk is kept only when it is this one.
-    let root_on_disk = crate::store::custody_bootstrap_path()?.exists();
+    let root_on_disk = crate::store::custody_bootstrap_path()?.try_exists()?;
     let root = crate::root_bootstrap::load()?;
     let same_root = ours(&root.tenant_id, &root.device_id)
         && root.self_grant.eq_ignore_ascii_case(&self_grant)
@@ -401,7 +407,7 @@ fn write(
     }
     // A2: a member's custody state is replaced, another custodian's refused.
     let custody_path = crate::store::fleet_custody_path()?;
-    let custody_on_disk = custody_path.exists();
+    let custody_on_disk = custody_path.try_exists()?;
     let mut custody = crate::fleet_custody::load()?;
     let member = custody.create_request.is_empty()
         && !custody.imported
@@ -793,6 +799,43 @@ mod tests {
         );
         assert!(!calls.iter().any(|c| c == CHALLENGE), "{calls:?}");
         assert!(unchanged);
+    }
+
+    /// R3-D1: a login ticket, the listing's or the session's, of another
+    /// account or server than the bundle's is refused before any session is
+    /// asked for, even while `/v2/me` agrees with the bundle.
+    #[test]
+    fn a_login_ticket_that_is_not_the_bundles_is_refused_before_any_session() {
+        let f = fixture();
+        let ok = (ACCOUNT, INSTANCE);
+        for (logins, code) in [
+            ([([0xac; 16], INSTANCE), ok], "recovery.otherAccount"),
+            ([(ACCOUNT, [0xee; 16]), ok], "recovery.otherServer"),
+            ([ok, ([0xac; 16], INSTANCE)], "recovery.otherAccount"),
+            ([ok, (ACCOUNT, [0xee; 16])], "recovery.otherServer"),
+        ] {
+            let ordinary = server(me(INSTANCE, ACCOUNT, "active", key_ids()), (500, ""));
+            let n = std::sync::atomic::AtomicUsize::new(0);
+            let reply: Arc<Reply> = Arc::new(move |call: &str, body: &[u8]| {
+                if call != "POST /v2/auth/login" {
+                    return ordinary(call, body);
+                }
+                let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst).min(1);
+                let (account, instance) = logins[i];
+                let ticket = serde_json::json!({
+                    "ticket": "v2t.0123456789abcdef0123",
+                    "ticket_id": hex(&[1; 16]),
+                    "account_id": hex(&account),
+                    "server_instance_id": hex(&instance),
+                    "restore_epoch": 0,
+                });
+                (200, serde_json::to_vec(&ticket).unwrap())
+            });
+            let (err, calls, unchanged) = refused_by(&f, reply);
+            assert!(crate::errcode::has_code(&err, code), "{logins:?}: {err}");
+            assert!(!calls.iter().any(|c| c == CHALLENGE), "{calls:?}");
+            assert!(unchanged, "{logins:?}");
+        }
     }
 
     #[test]

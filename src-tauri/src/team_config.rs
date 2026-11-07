@@ -291,7 +291,7 @@ pub struct TeamStatus {
 
 pub fn load() -> Result<TeamConfig> {
     let path = store::team_config_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(TeamConfig::default());
     }
     let mut stored = read(&path)?;

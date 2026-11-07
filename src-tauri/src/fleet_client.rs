@@ -58,6 +58,8 @@ pub struct AccountDeviceStatus {
     /// The account the login ticket itself named.
     pub ticket_account_id: String,
     pub server_instance_id: String,
+    /// The server instance the login ticket itself named.
+    pub ticket_server_instance_id: String,
     pub restore_epoch: u64,
     pub device: Option<ListedAccountDevice>,
 }
@@ -507,12 +509,37 @@ impl FleetClient {
         signer: &Ed25519SigningKey,
         hpke_seed: &[u8; 32],
     ) -> Result<DeviceSession> {
+        self.open_device_session_as(login, device_id, signer, hpke_seed, None)
+            .await
+    }
+
+    /// [`Self::open_device_session`]; with `bound`, the login ticket must
+    /// name that account on that server instance before any challenge is
+    /// asked for, as a recovery import binds its session to the bundle's.
+    pub async fn open_device_session_as(
+        &self,
+        login: &AccountLogin<'_>,
+        device_id: &str,
+        signer: &Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+        bound: Option<(&[u8; 16], &[u8; 16])>,
+    ) -> Result<DeviceSession> {
         let tenant = decode_hex16(login.tenant_id, "tenant_id")?;
         let device = decode_hex16(device_id, "device_id")?;
         let ticket = self.login_ticket(login).await?;
-        let session = self
-            .session_with_ticket(&ticket, login.password, &tenant, &device, signer, hpke_seed)
-            .await;
+        let session = async {
+            if let Some((account, instance)) = bound {
+                if decode_hex16(&ticket.account_id, "account_id")? != *account {
+                    bail!(crate::errcode::code("recovery.otherAccount"));
+                }
+                if decode_hex16(&ticket.server_instance_id, "server_instance_id")? != *instance {
+                    bail!(crate::errcode::code("recovery.otherServer"));
+                }
+            }
+            self.session_with_ticket(&ticket, login.password, &tenant, &device, signer, hpke_seed)
+                .await
+        }
+        .await;
         self.end_ticket(&ticket).await;
         session
     }
@@ -1093,6 +1120,7 @@ impl FleetClient {
             account_id: me.account_id,
             ticket_account_id: ticket.account_id.clone(),
             server_instance_id: me.server_instance_id,
+            ticket_server_instance_id: ticket.server_instance_id.clone(),
             restore_epoch: me.restore_epoch,
         })
     }
