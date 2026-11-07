@@ -681,6 +681,11 @@ export function TeamCard() {
                       {!(st.has_fleet_key || st.fleet_key_blocked) && (
                         <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.recovery.exportNeedsFleetKey")}</p>
                       )}
+                      {!boot.root_key_id && (
+                        <p data-testid="team-export-no-root-key-id" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.recovery.exportNeedsRootKeyId")}
+                        </p>
+                      )}
                     </div>
                   )}
                   <div>
