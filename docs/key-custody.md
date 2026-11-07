@@ -296,10 +296,11 @@ not collected again: restore it from the copy, which helps only while a later
 collect has not rewritten the credential `fleet-key.{fleet}.{generation}`.
 
 The root custodian keeps its connection, and so does a device whose root
-custody setup has saved its self-grant, since the server may have activated
-it before the setup finished: changing its server URL or tenant is refused (`fleet.rootCustodianKeepsConnection`) unless both its device
-keys are lost; then `team.json` is copied aside, nothing is forgotten, and
-import is the way back. Any change of the URL string counts, so a root
+custody setup has saved its create request, since the server may have
+activated it before the setup finished: changing its server URL or tenant is
+refused (`fleet.rootCustodianKeepsConnection`) unless both its device keys
+are lost; then `team.json` is copied aside, nothing is forgotten, and import
+is the way back. Any change of the URL string counts, so a root
 custodian whose server moved to a new LAN address or port cannot change it on
 the Team page: with the launcher closed, edit `server_url` in `team.json`.
 

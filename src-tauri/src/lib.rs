@@ -2028,12 +2028,15 @@ fn team_set_connection(
     // G13: the change would wipe the root custodian. Only one whose seeds
     // are both lost may go, its file copied and its credentials kept: a
     // recovery import is its way back. A root state that does not load
-    // fails closed, as Enroll again does. A bootstrap past its self-grant
-    // counts too: the server may have activated it before the local flag
-    // was saved.
+    // fails closed, as Enroll again does. A bootstrap with a saved create
+    // request counts too: it is saved before it is sent, and the server may
+    // have activated the generation before the local flag was saved. A
+    // self-grant alone is saved before the create request, so the server
+    // has seen no root generation yet (`root_bootstrap.rs` step 2 saves the
+    // self-grant, step 4 saves the create request, then sends it).
     let root_custodian = server_changed && {
         let root = root_bootstrap::load().map_err(|e| e.to_string())?;
-        (root.activated || !root.self_grant.is_empty() || !root.create_request.is_empty())
+        (root.activated || !root.create_request.is_empty())
             && root.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
             && root.device_id.eq_ignore_ascii_case(&c.device_id)
     };
@@ -6473,8 +6476,10 @@ mod custody_tests {
             root_here();
             let mut root = root_bootstrap::load().unwrap();
             root.self_grant = self_grant_here(&[9; 32]);
-            // An interrupted bootstrap has saved its first self-grant but has
-            // not yet persisted finish_activation's activated flag.
+            root.create_request = "ab".into();
+            // An interrupted bootstrap has saved its create request, which
+            // the server may have acted on, but has not yet persisted
+            // finish_activation's activated flag.
             root.activated = false;
             root_bootstrap::save(&root).unwrap();
             let before = team_json();
@@ -6485,7 +6490,28 @@ mod custody_tests {
                 "connection change cleared the unfinished root identity"
             );
             assert!(credential::load(&refs[0]).is_ok() && credential::load(&refs[1]).is_ok());
-            assert!(result.is_err());
+            assert!(crate::errcode::has_code(
+                &result.unwrap_err(),
+                "fleet.rootCustodianKeepsConnection"
+            ));
+        }
+    }
+
+    /// A self-grant alone was never sent: the server holds no root
+    /// generation of this device, so it may change its connection.
+    #[test]
+    fn a_bootstrap_with_only_a_self_grant_may_change_its_connection() {
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            root_here();
+            let mut root = root_bootstrap::load().unwrap();
+            root.self_grant = self_grant_here(&[9; 32]);
+            root.activated = false;
+            root_bootstrap::save(&root).unwrap();
+            team_set_connection(url.clone(), String::new(), tenant.clone()).unwrap();
+            let c = team_config::load().unwrap();
+            assert!(c.device_id.is_empty() && !c.is_enrolled());
+            assert_eq!((c.server_url, c.tenant_id), (url, tenant));
         }
     }
 
