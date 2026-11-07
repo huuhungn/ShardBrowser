@@ -1134,10 +1134,11 @@ pub fn status() -> Result<BootstrapStatus> {
     Ok(BootstrapStatus::of(&load()?))
 }
 
-/// Loads the bootstrap state; none yet is the empty state.
+/// Loads the bootstrap state; none yet is the empty state. A file whose
+/// existence cannot be checked is an error, never no root state.
 pub fn load() -> Result<BootstrapState> {
     let path = crate::store::custody_bootstrap_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(BootstrapState::default());
     }
     let body = Zeroizing::new(std::fs::read_to_string(&path)?);

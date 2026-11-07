@@ -1218,7 +1218,7 @@ pub fn forget_device_acks() -> Result<()> {
 /// Loads the state; none yet is the empty state.
 pub fn load() -> Result<FleetCustodyState> {
     let path = crate::store::fleet_custody_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(FleetCustodyState::default());
     }
     serde_json::from_str(&std::fs::read_to_string(&path)?).map_err(|_| corrupt())

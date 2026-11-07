@@ -7220,6 +7220,64 @@ mod custody_tests {
         }
     }
 
+    /// A link to itself: a path whose existence cannot be checked. Windows
+    /// uses a junction, which needs no privilege.
+    fn link_to_itself(path: &std::path::Path) {
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(path)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(path, path).unwrap();
+    }
+
+    /// R4-D1: a root state whose existence cannot be checked is not a device
+    /// without one. A connection change and Reset fail closed, with
+    /// `team.json` and both credentials unchanged; the custody state and
+    /// `team.json` do not read as absent either.
+    #[test]
+    fn a_root_state_that_cannot_be_checked_keeps_the_identity() {
+        let kept = |refs: &[String; 2], before: &[u8]| {
+            assert_eq!(team_json(), before);
+            assert_eq!(team_json_copies(), 0);
+            assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+            assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+        };
+        for (url, tenant) in connection_changes() {
+            let _j = joiner(URL_J, root_bootstrap::now_ms());
+            link_to_itself(&store::custody_bootstrap_path().unwrap());
+            let refs = refs();
+            let before = team_json();
+            assert!(team_set_connection(url, String::new(), tenant).is_err());
+            kept(&refs, &before);
+        }
+        for status in ["pending", "revoked"] {
+            let rt = runtime();
+            let (url, calls) = me_server(&rt, status);
+            let _j = joiner(&url, root_bootstrap::now_ms());
+            link_to_itself(&store::custody_bootstrap_path().unwrap());
+            let refs = refs();
+            let before = team_json();
+            assert!(rt
+                .block_on(team_enroll_again("u".into(), "p".into()))
+                .is_err());
+            kept(&refs, &before);
+            assert!(calls.lock().unwrap().is_empty(), "no server is asked");
+        }
+        let _j = joiner(URL_J, root_bootstrap::now_ms());
+        link_to_itself(&store::fleet_custody_path().unwrap());
+        assert!(fleet_custody::load().is_err());
+        std::fs::remove_file(store::team_config_path().unwrap()).unwrap();
+        link_to_itself(&store::team_config_path().unwrap());
+        assert!(team_config::load().is_err());
+    }
+
     /// S4, G13 (plan v0.2.2b): a server or tenant change is refused for the
     /// root custodian whose seeds read, do not answer or are locked, with
     /// `team.json` and its credentials unchanged.

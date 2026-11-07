@@ -397,7 +397,7 @@ fn write(
     }
 
     // A6: a root state on disk is kept only when it is this one.
-    let root_on_disk = crate::store::custody_bootstrap_path()?.exists();
+    let root_on_disk = crate::store::custody_bootstrap_path()?.try_exists()?;
     let root = crate::root_bootstrap::load()?;
     let same_root = ours(&root.tenant_id, &root.device_id)
         && root.self_grant.eq_ignore_ascii_case(&self_grant)
@@ -407,7 +407,7 @@ fn write(
     }
     // A2: a member's custody state is replaced, another custodian's refused.
     let custody_path = crate::store::fleet_custody_path()?;
-    let custody_on_disk = custody_path.exists();
+    let custody_on_disk = custody_path.try_exists()?;
     let mut custody = crate::fleet_custody::load()?;
     let member = custody.create_request.is_empty()
         && !custody.imported
