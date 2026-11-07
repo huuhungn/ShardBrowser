@@ -3705,14 +3705,10 @@ fn custody_report(
     }))
 }
 
-/// Decode a hex string from the server into bytes.
+/// Decode a hex string from the server into bytes. The error never carries
+/// the input, which a hostile server may fill with a secret it was sent.
 fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
-        return Err(crate::errcode::code("fleet.malformedHexFromServer"));
-    }
-    (0..s.len() / 2)
-        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
-        .collect()
+    fleet_client::decode_hex(s).ok_or_else(|| crate::errcode::code("fleet.malformedHexFromServer"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -6971,6 +6967,47 @@ mod custody_tests {
         assert_eq!(team_json_copies(), 1);
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+    }
+
+    /// R3-D3: root grant hex from the server never panics on a multi-byte
+    /// character or takes a sign, and its error never carries the input.
+    #[test]
+    fn root_grant_hex_from_the_server_never_panics_or_echoes() {
+        let secret = "secret-sentinel-00";
+        // A three-byte character, one more, then the literal secret: even length.
+        let tainted = format!("\u{20ac}a{secret}");
+        assert!(tainted.len().is_multiple_of(2));
+        for s in [tainted.as_str(), "+f", "a\u{e9}0"] {
+            let err = std::panic::catch_unwind(|| hex_bytes(s))
+                .expect("hex_bytes panicked")
+                .unwrap_err();
+            assert!(
+                crate::errcode::has_code(&err, "fleet.malformedHexFromServer"),
+                "{err}"
+            );
+            assert!(!err.contains(secret), "{err}");
+        }
+        let grant = fleet_client::RootKeyGrant {
+            grant_variant: String::new(),
+            root_key_id: String::new(),
+            root_generation: 0,
+            recipient_hpke_key_id: String::new(),
+            hpke_info_hex: "00".into(),
+            hpke_encapped_key_hex: "00".into(),
+            hpke_wrapped_trk_hex: "00".into(),
+        };
+        for field in 0..3 {
+            let mut g = grant.clone();
+            *[
+                &mut g.hpke_info_hex,
+                &mut g.hpke_encapped_key_hex,
+                &mut g.hpke_wrapped_trk_hex,
+            ][field] = tainted.clone();
+            let err = std::panic::catch_unwind(|| custody_report(&[0; 32], &[g], FleetGrant::None))
+                .expect("custody_report panicked")
+                .unwrap_err();
+            assert!(!err.contains(secret), "{field}: {err}");
+        }
     }
 
     /// Makes the joiner the activated root custodian of its tenant.
