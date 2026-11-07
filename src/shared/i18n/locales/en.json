@@ -1412,6 +1412,7 @@
   "team.recovery.keyStoreUnavailable": "The key store did not answer; try again before resetting this device.",
   "team.recovery.rootKeyStoreUnavailable": "The key store did not answer; try again. This device is the root custodian and cannot be reset.",
   "team.recovery.rootKeysLost": "This device's keys are lost, and it is the team's root custodian: import your recovery bundle to restore it.",
+  "team.recovery.rootSetupInterrupted": "This device's keys are lost, and it started setting up the team's root key without finishing. It cannot be reset, and a recovery bundle cannot be imported over the unfinished setup; nothing was changed.",
   "team.recovery.rootStateUnreadable": "The saved root custody setup on this computer cannot be read, so it is unknown whether this device is the team's root custodian. Reset stays off until the setup reads again; nothing was changed.",
   "team.recovery.reset": "Reset this device",
   "team.resumeCustodySetup": "Resume custody setup",

@@ -1370,6 +1370,28 @@ test("an unreadable root state never offers Reset", async ({ page }) => {
   await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
 });
 
+test("an interrupted root setup with lost keys never offers Reset", async ({ page }) => {
+  const card = await teamDevicePage(page, "root-keys-lost", fakeTeamServer());
+  await page.evaluate(() => {
+    const ipc = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...args: unknown[]) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = ipc.invoke.bind(ipc);
+    ipc.invoke = async (...args) => {
+      const result = await original(...args);
+      if (args[0] === "team_custody_bootstrap_status") {
+        return { ...(result as Record<string, unknown>), started: true, activated: false };
+      }
+      return result;
+    };
+  });
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Team", exact: true }).click();
+  await expect(card.getByTestId("team-keys-lost")).toBeVisible();
+  await expect(card.getByRole("button", { name: "Reset this device" })).toHaveCount(0);
+  // Import refuses a root state that saved no anchor, so none is offered either.
+  await expect(card.getByTestId("team-keys-lost")).toContainText("started setting up the team's root key");
+  await expect(card.getByTestId("team-import")).toHaveCount(0);
+});
+
 test("a root custodian whose key store is unavailable is told to try again, with no Reset or sign-in", async ({ page: a }) => {
   const card = await teamDevicePage(a, "root-key-store-unavailable", fakeTeamServer());
   const notice = card.getByTestId("team-keys-lost");

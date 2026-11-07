@@ -1963,6 +1963,155 @@ fn a_root_custodian_with_lost_keys_imports_its_bundle_on_its_own_roots() {
     assert!(crate::team_config::status().unwrap().has_fleet_key);
 }
 
+/// A bootstrap stopped before its create request resumes from a v2 bundle
+/// on disk: an unpinned one is exported again as v3, while one whose hash
+/// the server already holds in a create request stays byte for byte and
+/// activates on replay. Both make one root generation.
+#[test]
+fn a_v2_bundle_bootstrap_resumes_before_and_after_the_server_create() {
+    use crate::root_bootstrap as rb;
+    use shardx_core::mutation::{IdempotentMutationRequestV2, TenantRootGenerationCreateV2};
+    use shardx_core::recovery_bundle as bundle;
+
+    let rt = runtime();
+    for pinned in [false, true] {
+        let lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let slug = if pinned {
+            "r2-v2-pinned"
+        } else {
+            "r2-v2-unpinned"
+        };
+        let (server, tenant) = tenant_server(if pinned { 21 } else { 20 }, slug);
+        let (config, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        act_as(config.path(), data.path(), "r2-v2");
+        let mut h = Harness {
+            server,
+            _config: config,
+            _data: data,
+            tenant,
+            _lock: lock,
+        };
+        crate::team_set_connection(h.server.url(), String::new(), h.tenant.clone()).unwrap();
+        let enrolled = call(
+            &rt,
+            crate::team_enroll_device("root".into(), OWNER.into(), PASSWORD.into()),
+        )
+        .unwrap();
+        let c = crate::team_config::load().unwrap();
+        let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+        let (_, hpke) = shardx_core::grants::derive_keypair(&seed);
+        h.server.operator(
+            &[
+                "tenant",
+                "confirm-first-device",
+                "--tenant",
+                slug,
+                "--device",
+                &enrolled.device_id,
+            ],
+            &format!(
+                "{}\n{}\n",
+                hex(&shardx_core::keys::signing_key_id(
+                    signer.verifying_key().as_bytes()
+                )),
+                hex(&shardx_core::keys::hpke_key_id(&hpke))
+            ),
+        );
+        let client = FleetClient::new(&h.server.url(), "").unwrap();
+        let device = rb::BootstrapDevice {
+            login: AccountLogin {
+                tenant_id: &c.tenant_id,
+                username: OWNER,
+                password: PASSWORD,
+            },
+            device_id: &c.device_id,
+            account_id: &c.account_id,
+            signer: &signer,
+            hpke_seed: &seed,
+            trk_store: &rb::CredentialTrkStore,
+        };
+        let path = config_path("v2-resume.bundle");
+        let recovery = rb::RecoveryExport {
+            path: std::path::Path::new(&path),
+            passphrase: PASSPHRASE,
+        };
+        let mut state = rb::BootstrapState::default();
+        let mut candidate = None;
+        let interrupted = rt.block_on(rb::bootstrap_root(
+            &client,
+            &device,
+            &recovery,
+            &mut state,
+            &mut |s| {
+                if !s.create_request.is_empty() {
+                    candidate = Some(s.clone());
+                    anyhow::bail!("interrupted");
+                }
+                rb::save(s)
+            },
+        ));
+        assert!(interrupted.is_err() && candidate.is_some());
+        assert!(state.create_request.is_empty());
+        let (header, mut plaintext) =
+            bundle::open(&std::fs::read(&path).unwrap(), PASSPHRASE).unwrap();
+        plaintext.root_custodian = None;
+        let (_, legacy) = bundle::seal(
+            header.tenant_id,
+            header.server_instance_id,
+            0,
+            header.created_at_ms,
+            &plaintext,
+            PASSPHRASE,
+        )
+        .unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        let hash = bundle::recovery_bundle_sha256(&legacy);
+        state.recovery_bundle_sha256 = hex(&hash);
+        if pinned {
+            let mut request = IdempotentMutationRequestV2::parse(
+                &rb::unhex_vec(&candidate.unwrap().create_request).unwrap(),
+            )
+            .unwrap();
+            let mut create =
+                TenantRootGenerationCreateV2::parse(&request.canonical_payload_bytes).unwrap();
+            create.target.recovery_bundle_sha256 = hash;
+            request.canonical_payload_bytes = create.encode();
+            state.create_request = hex(&request.encode());
+            with_session(&rt, &h, async |client, access| {
+                client
+                    .create_root_generation(access, &h.tenant, &request.encode())
+                    .await
+                    .unwrap();
+            });
+        }
+        rb::save(&state).unwrap();
+        let done = call(
+            &rt,
+            crate::team_bootstrap_custody(
+                OWNER.into(),
+                PASSWORD.into(),
+                path.clone(),
+                PASSPHRASE.into(),
+            ),
+        )
+        .unwrap();
+        assert!(done.activated);
+        let final_file = std::fs::read(&path).unwrap();
+        let (_, opened) = bundle::open(&final_file, PASSPHRASE).unwrap();
+        assert_eq!(opened.root_custodian.is_none(), pinned);
+        if pinned {
+            assert!(final_file == legacy, "pinned v2 bytes changed");
+        }
+        assert_eq!(
+            h.server
+                .count("SELECT count(*) FROM v2_root_key_generations"),
+            1
+        );
+    }
+}
+
 /// The first `v2a.`, `v2t.` or `v2r.` token followed by 16 or more hex
 /// digits in `text`.
 fn session_token(text: &str) -> Option<&str> {
