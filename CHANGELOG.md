@@ -28,7 +28,9 @@ page. The browser engine and the team server are unchanged.
   refuses to run over another device's identity.
 - **Export recovery bundle.** The root custodian can export the bundle again
   once it holds the fleet key. A new bundle carries the root custodian's own
-  identity and the team's fleet keys, and files nothing on the server.
+  identity and the team's fleet keys, and files nothing on the server. The
+  export shows the root key fingerprint and stays off until the owner ticks
+  that it was recorded.
 - **Reset this device.** A member device whose keys are lost, or whose key
   store did not answer, is shown as such on the Team page. Once a custodian
   revokes it, Reset this device clears its identity so it can enroll again,

@@ -17,7 +17,7 @@
             },
             {
               "type": "p",
-              "text": "Root custodian xuất gói mới từ trang Team khi đã giữ khoá đội máy. Hãy làm việc này sau khi cập nhật: gói từ 2.7.x không chứa root custodian nên không khôi phục được team. Gói cùng cụm mật khẩu chính là thiết bị root custodian, nên hãy cất ngoại tuyến. Server của team không thay đổi."
+              "text": "Root custodian xuất gói mới từ trang Team khi đã giữ khoá đội máy, sau khi ghi lại dấu vân tay khoá gốc mà trang hiển thị. Hãy làm việc này sau khi cập nhật: gói từ 2.7.x không chứa root custodian nên không khôi phục được team. Gói cùng cụm mật khẩu chính là thiết bị root custodian, nên hãy cất ngoại tuyến. Server của team không thay đổi."
             }
           ]
         },

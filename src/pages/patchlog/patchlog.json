@@ -19,7 +19,7 @@
             },
             {
               "type": "p",
-              "text": "The root custodian exports a new bundle from the Team page once it holds the fleet key. Do this after updating: a bundle from 2.7.x holds no root custodian and cannot restore the team. A bundle plus its passphrase is the root custodian device, so keep it offline. The team server is unchanged."
+              "text": "The root custodian exports a new bundle from the Team page once it holds the fleet key, after recording the root key fingerprint the page shows. Do this after updating: a bundle from 2.7.x holds no root custodian and cannot restore the team. A bundle plus its passphrase is the root custodian device, so keep it offline. The team server is unchanged."
             }
           ]
         },
