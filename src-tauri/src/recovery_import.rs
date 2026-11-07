@@ -691,6 +691,67 @@ mod tests {
 
     const CHALLENGE: &str = "POST /v2/auth/device-session-challenges";
 
+    /// Step 5 runs over the device session, but the server got the account
+    /// password at login: a root grant read that echoes it never returns it.
+    #[test]
+    fn a_root_grant_refusal_after_the_session_hides_the_login_password() {
+        let f = fixture();
+        let rt = runtime();
+        let password = format!("account-password-{}", crate::fleet_client::random_id_hex());
+        let echo = format!(r#"{{"error":"{password}"}}"#).into_bytes();
+        let ordinary = server(me(INSTANCE, ACCOUNT, "active", key_ids()), (500, ""));
+        // The login's ticket ID is [1; 16].
+        let challenge = crate::fleet_client::tests::session_challenge(
+            TENANT,
+            INSTANCE,
+            ACCOUNT,
+            [1; 16],
+            DEVICE,
+            &signer(),
+            &HPKE_SEED,
+        );
+        let reply: Arc<Reply> = Arc::new(move |call: &str, body: &[u8]| match call {
+            CHALLENGE => (200, challenge.clone()),
+            "POST /v2/auth/device-session-proofs" => (
+                200,
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": "s",
+                    "class": "full",
+                    "access_token": "v2a.x",
+                    "access_expires_at_ms": 1,
+                    "refresh_token": "v2r.x",
+                    "absolute_expires_at_ms": 2,
+                }))
+                .unwrap(),
+            ),
+            c if c.starts_with("GET /v2/tenants/") => (500, echo.clone()),
+            _ => ordinary(call, body),
+        });
+        let (client, seen): (FleetClient, Seen) = rt.block_on(mock(reply));
+        let mut c = f.connected(client.base_url());
+        let before = f.files();
+        let err = rt
+            .block_on(import(&mut c, &f.bundle(), "owner", &password, &mut save))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|(c, _)| c.starts_with("GET /v2/tenants/")),
+            "the import did not reach the root grant read"
+        );
+        assert!(f.files() == before);
+        assert!(
+            crate::errcode::has_code(&err, "fleet.refusedCustody"),
+            "another refusal than the root grant read's"
+        );
+        assert!(
+            !err.contains(&password),
+            "the account password reached the import error"
+        );
+    }
+
     #[test]
     fn import_error_does_not_echo_the_login_password_after_login() {
         let f = fixture();

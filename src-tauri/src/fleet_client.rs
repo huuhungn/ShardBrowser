@@ -218,6 +218,10 @@ pub struct FleetClient {
     http: reqwest::Client,
     base_url: String,
     token: Zeroizing<String>,
+    /// Every account password this client logged in with: that server may
+    /// echo one in any later reply of the operation, so each refusal and
+    /// listing it returns hides them.
+    passwords: std::sync::Mutex<Vec<Zeroizing<String>>>,
 }
 
 impl FleetClient {
@@ -237,6 +241,7 @@ impl FleetClient {
             http,
             base_url: base,
             token: token.to_string().into(),
+            passwords: Default::default(),
         })
     }
 
@@ -246,6 +251,14 @@ impl FleetClient {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The passwords `login_ticket` sent, to hide in what the server returns.
+    fn passwords(&self) -> Vec<Zeroizing<String>> {
+        self.passwords
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -322,16 +335,19 @@ impl FleetClient {
     /// key material; `bearer`, the credential the request sent, is hidden
     /// should a hostile server or proxy echo it back.
     async fn ok_or_err(
+        &self,
         res: reqwest::Response,
         key: &str,
         bearer: &str,
     ) -> Result<reqwest::Response> {
-        Self::ok_or_err_hiding(res, key, &[bearer]).await
+        self.ok_or_err_hiding(res, key, &[bearer]).await
     }
 
-    /// `ok_or_err`, also hiding each of `secrets` the request sent, should a
-    /// hostile server or proxy echo it back.
+    /// `ok_or_err`, also hiding each of `secrets` the request sent, and every
+    /// password this client logged in with, should a hostile server or proxy
+    /// echo it back.
     async fn ok_or_err_hiding(
+        &self,
         res: reqwest::Response,
         key: &str,
         secrets: &[&str],
@@ -340,6 +356,10 @@ impl FleetClient {
         if status.is_success() {
             return Ok(res);
         }
+        let passwords = self.passwords();
+        let mut all = secrets.to_vec();
+        all.extend(passwords.iter().map(|p| p.as_str()));
+        let secrets = all.as_slice();
         let body = redact(&res.text().await.unwrap_or_default(), secrets);
         let detail = body.chars().take(300).collect::<String>();
         // `key` is the locale key for this exact refusal, so a translator sees
@@ -398,6 +418,12 @@ impl FleetClient {
         // it never crosses a network in clear.
         if !sends_secrets_safely(&self.base_url) {
             bail!(crate::errcode::code("fleet.insecureLogin"));
+        }
+        if !login.password.is_empty() {
+            let mut sent = self.passwords.lock().unwrap_or_else(|p| p.into_inner());
+            if !sent.iter().any(|p| p.as_str() == login.password) {
+                sent.push(login.password.to_string().into());
+            }
         }
         let res = self
             .http
@@ -497,12 +523,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        let challenge: SessionChallenge =
-            Self::ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
-                .await?
-                .json()
-                .await
-                .context(crate::errcode::code("fleet.badReplySession"))?;
+        let challenge: SessionChallenge = self
+            .ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplySession"))?;
 
         let mismatch = || anyhow!(crate::errcode::code("fleet.sessionBindingMismatch"));
         let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
@@ -544,7 +570,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
+        self.ok_or_err_hiding(res, "fleet.refusedSession", &[&ticket.ticket, password])
             .await?
             .json()
             .await
@@ -563,7 +589,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableCustody"))?;
-        let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
+        let body = self
+            .ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .bytes()
             .await
@@ -619,7 +646,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableCustody"))?;
-        let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
+        let body = self
+            .ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .bytes()
             .await
@@ -672,7 +700,8 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableCustody"))?;
-            let body = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
+            let body = self
+                .ok_or_err(res, "fleet.refusedCustody", access_token)
                 .await?
                 .bytes()
                 .await
@@ -740,7 +769,8 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        let mut body: TenantDevices = Self::ok_or_err(res, "fleet.refusedCustody", access_token)
+        let mut body: TenantDevices = self
+            .ok_or_err(res, "fleet.refusedCustody", access_token)
             .await?
             .json()
             .await
@@ -774,7 +804,9 @@ impl FleetClient {
             }
             (d.signing_key_id, d.hpke_key_id) = ids;
         }
-        let secrets = [access_token];
+        let passwords = self.passwords();
+        let mut secrets = vec![access_token];
+        secrets.extend(passwords.iter().map(|p| p.as_str()));
         Ok(body
             .devices
             .into_iter()
@@ -894,7 +926,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableSession"))?;
-        Self::ok_or_err(res, "fleet.refusedRefresh", refresh_token)
+        self.ok_or_err(res, "fleet.refusedRefresh", refresh_token)
             .await?
             .json()
             .await
@@ -922,12 +954,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableRegister"))?;
-        let challenge: EnrollmentChallenge =
-            Self::ok_or_err_hiding(res, "fleet.refusedRegister", &[&ticket.ticket, password])
-                .await?
-                .json()
-                .await
-                .context(crate::errcode::code("fleet.badReplyRegister"))?;
+        let challenge: EnrollmentChallenge = self
+            .ok_or_err_hiding(res, "fleet.refusedRegister", &[&ticket.ticket, password])
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyRegister"))?;
 
         let mismatch = || anyhow!(crate::errcode::code("fleet.bindingMismatch"));
         let binding = decode_hex(&challenge.binding).ok_or_else(mismatch)?;
@@ -960,15 +992,16 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableRegisterFinish"))?;
 
-        let enrolled: EnrolledDevice = Self::ok_or_err_hiding(
-            res,
-            "fleet.refusedRegisterFinish",
-            &[&ticket.ticket, password],
-        )
-        .await?
-        .json()
-        .await
-        .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
+        let enrolled: EnrolledDevice = self
+            .ok_or_err_hiding(
+                res,
+                "fleet.refusedRegisterFinish",
+                &[&ticket.ticket, password],
+            )
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyRegisterFinish"))?;
         // Both are stored and shown: an id, and the account the ticket named.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyRegisterFinish"));
         decode_hex16(&enrolled.device_id, "device_id").map_err(|_| bad())?;
@@ -982,7 +1015,7 @@ impl FleetClient {
     /// ticket or device session, or the v1 token.
     pub async fn server_identity(&self, bearer: &str) -> Result<ServerIdentity> {
         let res = self.identity_reply(bearer).await?;
-        Self::identity_of(res, &[bearer]).await
+        self.identity_of(res, &[bearer]).await
     }
 
     /// Logs `login` in for a ticket and reads the server identity with it. A
@@ -999,7 +1032,8 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::UNAUTHORIZED {
             bail!(crate::errcode::code("fleet.serverTooOld"));
         }
-        Self::identity_of(res, &[&ticket.ticket, login.password]).await
+        self.identity_of(res, &[&ticket.ticket, login.password])
+            .await
     }
 
     /// What `GET /v2/me` reports for `device_id` among the devices of
@@ -1031,7 +1065,7 @@ impl FleetClient {
             .await;
         let me = async {
             let res = res.context(crate::errcode::code("fleet.unreachableLogin"))?;
-            Self::ok_or_err_hiding(res, "fleet.refusedLogin", &[&ticket.ticket, login.password])
+            self.ok_or_err_hiding(res, "fleet.refusedLogin", &[&ticket.ticket, login.password])
                 .await?
                 .json::<Me>()
                 .await
@@ -1060,8 +1094,13 @@ impl FleetClient {
             .context(crate::errcode::code("fleet.unreachableIdentity"))
     }
 
-    async fn identity_of(res: reqwest::Response, secrets: &[&str]) -> Result<ServerIdentity> {
-        let id: ServerIdentity = Self::ok_or_err_hiding(res, "fleet.refusedIdentity", secrets)
+    async fn identity_of(
+        &self,
+        res: reqwest::Response,
+        secrets: &[&str],
+    ) -> Result<ServerIdentity> {
+        let id: ServerIdentity = self
+            .ok_or_err_hiding(res, "fleet.refusedIdentity", secrets)
             .await?
             .json()
             .await
@@ -1097,7 +1136,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableClaim"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedClaim", &[self.token.as_str()])
+        self.ok_or_err_hiding(res, "fleet.refusedClaim", &[self.token.as_str()])
             .await?
             .json()
             .await
@@ -1113,7 +1152,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableRelease"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedRelease", &[self.token.as_str()]).await?;
+        self.ok_or_err_hiding(res, "fleet.refusedRelease", &[self.token.as_str()])
+            .await?;
         Ok(())
     }
 
@@ -1125,7 +1165,7 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableHead"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedHead", &[self.token.as_str()])
+        self.ok_or_err_hiding(res, "fleet.refusedHead", &[self.token.as_str()])
             .await?
             .json()
             .await
@@ -1163,12 +1203,12 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableDownload"))?;
-            let bytes =
-                Self::ok_or_err_hiding(res, "fleet.refusedDownload", &[self.token.as_str()])
-                    .await?
-                    .bytes()
-                    .await
-                    .context(crate::errcode::code("fleet.downloadBrokeOff"))?;
+            let bytes = self
+                .ok_or_err_hiding(res, "fleet.refusedDownload", &[self.token.as_str()])
+                .await?
+                .bytes()
+                .await
+                .context(crate::errcode::code("fleet.downloadBrokeOff"))?;
             // A server returning nothing while bytes remain would spin this
             // loop forever; treat it as a failed download.
             if bytes.is_empty() {
@@ -1215,7 +1255,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableAccountKeys"))?;
-        let body: RootKeyGrantsResponse = Self::ok_or_err(res, "fleet.refusedAccountKeys", bearer)
+        let body: RootKeyGrantsResponse = self
+            .ok_or_err(res, "fleet.refusedAccountKeys", bearer)
             .await?
             .json()
             .await
@@ -1239,12 +1280,12 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableTeamKeys"))?;
-        let body: Option<ActiveFleetGeneration> =
-            Self::ok_or_err(res, "fleet.refusedTeamKeys", bearer)
-                .await?
-                .json()
-                .await
-                .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
+        let body: Option<ActiveFleetGeneration> = self
+            .ok_or_err(res, "fleet.refusedTeamKeys", bearer)
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyTeamKeys"))?;
         Ok(body.map(|g| g.generation))
     }
 
@@ -1270,7 +1311,8 @@ impl FleetClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body = Self::ok_or_err(res, "fleet.refusedTeamKeys", access_token)
+        let body = self
+            .ok_or_err(res, "fleet.refusedTeamKeys", access_token)
             .await?
             .bytes()
             .await
@@ -1592,7 +1634,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableUploadBegin"))?;
-        Self::ok_or_err_hiding(open, "fleet.refusedUploadOpen", &[self.token.as_str()]).await?;
+        self.ok_or_err_hiding(open, "fleet.refusedUploadOpen", &[self.token.as_str()])
+            .await?;
 
         // Staging failure leaves a session the server can discard; nothing is
         // published until commit succeeds.
@@ -1624,12 +1667,12 @@ impl FleetClient {
             .await
             .context(crate::errcode::code("fleet.unreachableUploadPublish"))?;
 
-        let body: serde_json::Value =
-            Self::ok_or_err_hiding(commit, "fleet.refusedUploadCommit", &[self.token.as_str()])
-                .await?
-                .json()
-                .await
-                .context(crate::errcode::code("fleet.badReplyUploadPublish"))?;
+        let body: serde_json::Value = self
+            .ok_or_err_hiding(commit, "fleet.refusedUploadCommit", &[self.token.as_str()])
+            .await?
+            .json()
+            .await
+            .context(crate::errcode::code("fleet.badReplyUploadPublish"))?;
 
         body.get("version")
             .and_then(|v| v.as_i64())
@@ -1653,7 +1696,8 @@ impl FleetClient {
                 .send()
                 .await
                 .context(crate::errcode::code("fleet.unreachableUploadChunk"))?;
-            Self::ok_or_err_hiding(res, "fleet.refusedUploadChunk", &[self.token.as_str()]).await?;
+            self.ok_or_err_hiding(res, "fleet.refusedUploadChunk", &[self.token.as_str()])
+                .await?;
             offset = end;
         }
         Ok(())
@@ -1668,7 +1712,8 @@ impl FleetClient {
             .send()
             .await
             .context(crate::errcode::code("fleet.unreachableUploadAbort"))?;
-        Self::ok_or_err_hiding(res, "fleet.refusedUploadAbort", &[self.token.as_str()]).await?;
+        self.ok_or_err_hiding(res, "fleet.refusedUploadAbort", &[self.token.as_str()])
+            .await?;
         Ok(())
     }
 
@@ -1837,7 +1882,7 @@ pub fn random_id_hex() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         decode_hex, decode_hex16, random_id_hex, sends_secrets_safely, session_binding_matches,
         DeviceSession, FleetClient, SessionExpectation,
@@ -1913,6 +1958,111 @@ mod tests {
             assert!(
                 !session_binding_matches(&b, &expectation()),
                 "a binding with another {name} must be refused"
+            );
+        }
+    }
+
+    /// The session challenge an honest server sends `device`, holding
+    /// `signer` and `hpke_seed`, for the ticket `ticket_id` of `account`.
+    pub(crate) fn session_challenge(
+        tenant: [u8; 16],
+        instance: [u8; 16],
+        account: [u8; 16],
+        ticket_id: [u8; 16],
+        device: [u8; 16],
+        signer: &shardx_core::signing::Ed25519SigningKey,
+        hpke_seed: &[u8; 32],
+    ) -> Vec<u8> {
+        let (_, hpke_public) = shardx_core::grants::derive_keypair(hpke_seed);
+        let hpke_public: [u8; 32] = hpke_public.as_slice().try_into().unwrap();
+        let signing_public_key = signer.verifying_key().to_bytes();
+        let binding = DeviceSessionBindingV2 {
+            device_id: device,
+            fields: BindingFields {
+                server_instance_id: instance,
+                restore_epoch: 0,
+                tenant_id: tenant,
+                account_id: account,
+                pre_device_session_id: ticket_id,
+                challenge_id: [7; 16],
+                nonce: [8; 16],
+                signing_suite: 1,
+                signing_public_key,
+                signing_key_id: shardx_core::keys::signing_key_id(&signing_public_key),
+                hpke_suite: 1,
+                hpke_public_key: hpke_public,
+                hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_public),
+                expires_at_ms: u64::MAX / 2,
+            },
+        }
+        .encode()
+        .unwrap();
+        let (encapped, ciphertext) =
+            shardx_core::session_binding::seal_pop_secret(&hpke_public, &binding, &[3; 32])
+                .unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "challenge_id": super::hex(&[7; 16]),
+            "binding": super::hex(&binding),
+            "encapsulated_key": super::hex(&encapped),
+            "ciphertext": super::hex(&ciphertext),
+        }))
+        .unwrap()
+    }
+
+    /// A refused session challenge or proof never carries back the account
+    /// password the login sent.
+    #[test]
+    fn a_session_refusal_hides_the_account_password() {
+        use super::hex;
+        let rt = crate::fleet_custody::tests::runtime();
+        let password = format!("account-password-{}", random_id_hex());
+        let signer = shardx_core::signing::Ed25519SigningKey::from_bytes(&[5; 32]);
+        let seed = [6; 32];
+        for refused in [
+            "POST /v2/auth/device-session-challenges",
+            "POST /v2/auth/device-session-proofs",
+        ] {
+            let echo = format!(r#"{{"error":"{password}"}}"#).into_bytes();
+            let challenge =
+                session_challenge([1; 16], [2; 16], [3; 16], [4; 16], [9; 16], &signer, &seed);
+            let reply: std::sync::Arc<crate::fleet_custody::tests::Reply> =
+                std::sync::Arc::new(move |call: &str, _: &[u8]| match call {
+                    c if c == refused => (400, echo.clone()),
+                    "POST /v2/auth/login" => (
+                        200,
+                        serde_json::to_vec(&serde_json::json!({
+                            "ticket": "v2t.0123456789abcdef0123",
+                            "ticket_id": hex(&[4; 16]),
+                            "account_id": hex(&[3; 16]),
+                            "server_instance_id": hex(&[2; 16]),
+                            "restore_epoch": 0,
+                        }))
+                        .unwrap(),
+                    ),
+                    "POST /v2/auth/device-session-challenges" => (200, challenge.clone()),
+                    _ => (204, Vec::new()),
+                });
+            let (client, seen) = rt.block_on(crate::fleet_custody::tests::mock(reply));
+            let login = super::AccountLogin {
+                tenant_id: &hex(&[1; 16]),
+                username: "owner",
+                password: &password,
+            };
+            let error = rt
+                .block_on(client.open_device_session(&login, &hex(&[9; 16]), &signer, &seed))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                seen.lock().unwrap().iter().any(|(c, _)| c == refused),
+                "the request under test was not reached"
+            );
+            assert!(
+                crate::errcode::has_code(&error, "fleet.refusedSession"),
+                "another refusal than the session's"
+            );
+            assert!(
+                !error.contains(&password),
+                "the account password reached a refused session's error"
             );
         }
     }
