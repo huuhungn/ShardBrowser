@@ -66,6 +66,17 @@ page. The browser engine and the team server are unchanged.
 - A fleet key setup left unfinished for more than a year cannot be finished or
   discarded: its saved requests have expired and the generation stays
   `PREPARING`. Finishing or discarding it comes with fleet key rotation.
+- The launcher trusts the team server's answers about device status. A
+  server that misreports them can still make Reset forget a working member's
+  keys (by reporting the device as pending), make an import accept a login
+  ticket for another account, or keep the Team page from offering the right
+  action while the root custodian's status loads or its setup is unfinished.
+  Tightening these checks is tracked for the next release.
+- A fleet key cached by 2.4.2 that a later collect verifies is not marked
+  verified, so Export recovery bundle stays refused on that device until the
+  key is collected again from a new grant.
+- A malformed hex field in a root key grant from the server crashes the
+  launcher instead of returning an error.
 
 ## v2.7.1
 
