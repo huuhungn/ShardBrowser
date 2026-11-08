@@ -821,6 +821,11 @@ fn refused(client: &FleetClient, access: &str, reply: &Exact) -> anyhow::Error {
     if reply.status == 401 {
         return anyhow!(code("sync.authRequired"));
     }
+    // A request under a generation a rotation retired: Collect fetches N+1.
+    if reply.status == 409 && refusal_of(reply).0.as_deref() == Some("FLEET_GENERATION_NOT_ACTIVE")
+    {
+        return anyhow!(code("sync.fleetKeyRotated"));
+    }
     let detail: String = client
         .hide(&String::from_utf8_lossy(&reply.body), &[access])
         .chars()
@@ -12986,6 +12991,103 @@ mod tests {
         assert_eq!(w.sent("POST", "/checkout").len(), checkouts);
         assert_eq!(w.fake().commits, 2);
         revoked_at(&w, 2);
+    }
+
+    // ------------------------------------------ rotation edges (A2) ----
+
+    /// The next request to `tag` is refused as the server refuses one made
+    /// under a generation that is no longer ACTIVE (`v2_uploads.rs`,
+    /// `v2_profiles.rs`).
+    fn not_active(w: &World, tag: &'static str) {
+        let mut f = w.fake();
+        f.refused_body =
+            Some(br#"{"error":"conflict","code":"FLEET_GENERATION_NOT_ACTIVE"}"#.to_vec());
+        f.refuse.push((tag, 409));
+    }
+
+    /// The generation version `v`'s manifest names.
+    fn sealed_under(w: &World, v: u64) -> u64 {
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&v]).unwrap();
+        SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
+            .unwrap()
+            .key_generation
+    }
+
+    /// A publish stored under N and refused once N+1 is ACTIVE names the
+    /// rotation, not a raw 409. It is failed, so nothing is left to cancel,
+    /// and the next publish seals under the collected N+1.
+    #[test]
+    fn a_publish_refused_as_generation_not_active_reads_fleet_key_rotated() {
+        let w = world_unbound();
+        not_active(&w, "publish");
+        let err = w.publish().unwrap_err();
+        assert!(has(&err, "sync.fleetKeyRotated"), "{err:#}");
+        assert!(!has(&err, "fleet.refusedSync"), "{err:#}");
+        assert_eq!(
+            w.count("SELECT count(*) FROM operations WHERE kind = 'PUBLISH' AND state = 'FAILED'"),
+            1
+        );
+        let none = cancel_publish(LOCAL).unwrap_err();
+        assert!(has(&none, "sync.noPublishPending"), "{none:#}");
+        rotate(&w);
+        w.publish().unwrap();
+        let named = |body: &[u8]| {
+            let r = IdempotentMutationRequestV2::parse(body).unwrap();
+            ProfilePublishCreateV2::parse(&r.canonical_payload_bytes)
+                .unwrap()
+                .key_generation
+        };
+        let sent = w.sent("POST", "/profiles");
+        assert_eq!((named(&sent[0]), named(&sent[1])), (GEN, GEN + 1));
+    }
+
+    /// An upload or commit under N refused once N+1 is ACTIVE releases its
+    /// lease and names the rotation; after Collect the next push seals
+    /// under N+1.
+    #[test]
+    fn an_upload_refused_as_generation_not_active_releases_its_lease_and_the_next_push_seals_under_the_new_generation(
+    ) {
+        for tag in ["upload", "commit"] {
+            let w = world();
+            not_active(&w, tag);
+            let err = w.push().unwrap_err();
+            assert!(has(&err, "sync.fleetKeyRotated"), "{tag}: {err:#}");
+            assert_eq!(w.sent("POST", "/release").len(), 1, "{tag}");
+            for sql in [
+                "SELECT count(*) FROM operations WHERE state = 'PENDING'",
+                "SELECT count(*) FROM upload_sessions WHERE state IN ('OPEN', 'READY')",
+                "SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL",
+            ] {
+                assert_eq!(w.count(sql), 0, "{tag}: {sql}");
+            }
+            rotate(&w);
+            assert_eq!(w.push().unwrap().version, 1, "{tag}");
+            assert_eq!(sealed_under(&w, 1), GEN + 1, "{tag}");
+        }
+    }
+
+    /// A revert lease taken under N whose upload is refused once N+1 is
+    /// ACTIVE is released, the binding stays quarantined, and the next
+    /// revert, after Collect, seals `R` under N+1.
+    #[test]
+    fn a_revert_lease_of_the_retired_generation_is_abandoned_and_the_next_revert_seals_under_the_new_one(
+    ) {
+        let w = world();
+        let (heads, _d, udd) = reverting(&w, DeviceRevocationReason::Retired);
+        let released = w.sent("POST", "/release").len();
+        not_active(&w, "upload");
+        let err = w.revert(&udd).unwrap_err();
+        assert!(has(&err, "sync.fleetKeyRotated"), "{err:#}");
+        assert_eq!(w.sent("POST", "/release").len(), released + 1);
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE lease_id IS NOT NULL"),
+            0
+        );
+        assert_eq!(w.state(LOCAL).1.as_deref(), Some("SIGNER_REVOKED"));
+        rotate(&w);
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        r_on(&w, heads[1]);
+        assert_eq!(sealed_under(&w, 3), GEN + 1);
     }
 
     // ---------------------------------------------------------- statuses ----

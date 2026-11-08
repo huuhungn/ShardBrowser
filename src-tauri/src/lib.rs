@@ -3391,6 +3391,9 @@ enum FleetGrant {
     /// Verified and opened, but the store holds another key, or one it
     /// cannot read, for its generation (rule 5, `KEY_SUBSTITUTION_DETECTED`).
     Substituted,
+    /// Filed, but more than one generation above the highest this device
+    /// verified: it missed a rotation and must enroll again (Q-27).
+    MissedRotations,
 }
 
 /// Reads, over the device session `access`, this device's grant of the
@@ -3456,7 +3459,12 @@ async fn collect_fleet_grant(
         &mut ledger,
         &c.server_url,
     )?;
-    let kept = keep_fleet_key(&fleet_id, generation, fkek)?;
+    let kept = match fkek {
+        None if missed_rotations(&ledger, &pin.0, &fleet, generation)? => {
+            FleetGrant::MissedRotations
+        }
+        fkek => keep_fleet_key(&fleet_id, generation, fkek)?,
+    };
     if ack && kept == FleetGrant::Opened(generation) {
         fleet_custody::ack_device_grant(client, access, &container, acknowledged)
             .await
@@ -3476,10 +3484,27 @@ fn setup_collect_error(fleet: FleetGrant, generation: u64) -> Option<String> {
         FleetGrant::Unfetched(error) => Some(error),
         FleetGrant::Failed => code("fleet.trustEvidenceRefused"),
         FleetGrant::Substituted => code("fleet.keySubstitutionDetected"),
+        FleetGrant::MissedRotations => code("fleet.enrollAgainMissedRotations"),
         // The root state was checked as activated, so its pin is readable.
         FleetGrant::Waiting => code("fleet.custodyStateCorrupt"),
         FleetGrant::None | FleetGrant::Opened(_) => code("fleet.custodyReplyMismatch"),
     }
+}
+
+/// Q-27: whether a fleet grant of `generation` lies more than one step above
+/// the highest generation this device verified. `open_fleet_grant` refuses
+/// such a grant, as it does one below; only this one asks to enroll again.
+fn missed_rotations(
+    ledger: &team::db::Db,
+    binding: &shardx_core::trust_chain::Binding,
+    fleet_id: &[u8; 16],
+    generation: u64,
+) -> Result<bool, String> {
+    let highest = team::ledger::highest_generation(ledger, binding, fleet_id).map_err(|e| {
+        eprintln!("[fleet] trust ledger: {e:#}");
+        crate::errcode::code("team.trustLedgerUnreadable")
+    })?;
+    Ok(highest.is_some_and(|h| generation > h.saturating_add(1)))
 }
 
 /// Keeps the FKEK `open_fleet_grant` accepted, unless the store holds
@@ -3812,7 +3837,10 @@ fn custody_report(
 
     let (fleet_opened, fleet_failed, newest_fleet_generation) = match fleet {
         FleetGrant::Opened(g) => (1, 0, Some(g)),
-        FleetGrant::Failed | FleetGrant::Unfetched(_) | FleetGrant::Substituted => (0, 1, None),
+        FleetGrant::Failed
+        | FleetGrant::Unfetched(_)
+        | FleetGrant::Substituted
+        | FleetGrant::MissedRotations => (0, 1, None),
         FleetGrant::None | FleetGrant::Waiting => (0, 0, None),
     };
     let fleet_grants_waiting = usize::from(matches!(
@@ -3821,6 +3849,7 @@ fn custody_report(
             | FleetGrant::Failed
             | FleetGrant::Unfetched(_)
             | FleetGrant::Substituted
+            | FleetGrant::MissedRotations
     ));
     let fleet_refusal = (fleet == FleetGrant::Substituted).then_some("KEY_SUBSTITUTION_DETECTED");
     Ok(serde_json::json!({
@@ -3833,6 +3862,7 @@ fn custody_report(
         "newest_fleet_generation": newest_fleet_generation,
         "fleet_grants_waiting": fleet_grants_waiting,
         "fleet_refusal": fleet_refusal,
+        "fleet_enroll_again": fleet == FleetGrant::MissedRotations,
         "can_sync_without_passphrase": false,
     }))
 }
@@ -4739,6 +4769,87 @@ mod custody_tests {
         assert_eq!(collect(&fresh, &pages, &three, 3), None, "a jump");
         assert_eq!(collect(&fresh, &pages, &two, 2), Some(key(2)));
         assert_eq!(collect(&fresh, &pages, &three, 3), Some(key(3)));
+    }
+
+    /// Grants of `FLEET` generations 1, 2 and 3 to this device, each under
+    /// the key `[generation; 32]`, and evidence holding all three.
+    fn three_generations(me: &Me) -> (Vec<Vec<u8>>, Vec<Page>) {
+        let grants: Vec<Vec<u8>> = (1..=3u8)
+            .map(|g| {
+                let k = [g; 32];
+                let kid = shardx_core::fleet_grants::fkek_key_id(&k);
+                grant_by(&me.sk, me, g.into(), 40 + g, kid, &k)
+            })
+            .collect();
+        let mut pages = evidence(me, grants[0].clone());
+        pages[0].containers.extend(grants[1..].iter().cloned());
+        (grants, pages)
+    }
+
+    /// Q-27: a grant two generations above the highest verified is refused
+    /// as before, and the collect report asks this device to enroll again.
+    #[test]
+    fn a_grant_two_generations_up_asks_to_enroll_again() {
+        let me = me();
+        let (grants, pages) = three_generations(&me);
+        let (_dir, path) = ledger_at();
+        assert_eq!(collect(&path, &pages, &grants[0], 1), Some([1; 32]));
+        assert_eq!(collect(&path, &pages, &grants[2], 3), None);
+        let ledger = team::db::Db::open_at(&path).unwrap();
+        assert_eq!(missed_rotations(&ledger, &BINDING, &FLEET, 3), Ok(true));
+        let report = custody_report(&[], &[], FleetGrant::MissedRotations).unwrap();
+        assert_eq!(report["fleet_enroll_again"], true);
+        assert_eq!(report["fleet_opened"], 0);
+        assert_eq!(report["fleet_failed"], 1);
+    }
+
+    /// A grant below the highest verified generation stays the silent
+    /// refusal it was: no enroll-again.
+    #[test]
+    fn a_grant_below_the_highest_generation_is_refused_silently() {
+        let me = me();
+        let (grants, pages) = three_generations(&me);
+        let (_dir, path) = ledger_at();
+        assert_eq!(collect(&path, &pages, &grants[1], 2), Some([2; 32]));
+        assert_eq!(collect(&path, &pages, &grants[0], 1), None);
+        let ledger = team::db::Db::open_at(&path).unwrap();
+        assert_eq!(missed_rotations(&ledger, &BINDING, &FLEET, 1), Ok(false));
+        let report = custody_report(&[], &[], FleetGrant::Failed).unwrap();
+        assert_eq!(report["fleet_enroll_again"], false);
+        assert_eq!(report["fleet_failed"], 1);
+    }
+
+    /// A member one rotation behind collects N+1 and keeps N beside it, so
+    /// old heads stay readable and the next push seals under N+1.
+    #[test]
+    fn a_member_one_generation_behind_collects_the_new_key_and_keeps_the_old() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let me = me();
+        let (grants, pages) = three_generations(&me);
+        let (_ledger_dir, path) = ledger_at();
+        let fleet = hex(&FLEET);
+        let keep = |g: u64| {
+            let key = collect(&path, &pages, &grants[g as usize - 1], g);
+            keep_fleet_key(&fleet, g, key.map(zeroize::Zeroizing::new))
+        };
+        assert_eq!(keep(1), Ok(FleetGrant::Opened(1)));
+        let ledger = team::db::Db::open_at(&path).unwrap();
+        assert_eq!(missed_rotations(&ledger, &BINDING, &FLEET, 2), Ok(false));
+        assert_eq!(keep(2), Ok(FleetGrant::Opened(2)));
+        let held: Vec<(u64, [u8; 32])> = fleet_keys::verified_keys(&fleet)
+            .unwrap()
+            .into_iter()
+            .map(|(g, k)| (g, *k))
+            .collect();
+        store::set_config_root(None);
+        assert_eq!(held, [(1, [1; 32]), (2, [2; 32])]);
+        let report = custody_report(&[], &[], FleetGrant::Opened(2)).unwrap();
+        assert_eq!(report["newest_fleet_generation"], 2);
+        assert_eq!(report["fleet_enroll_again"], false);
     }
 
     /// D-6 (d): a distrusted key's records first seen after the distrust are
