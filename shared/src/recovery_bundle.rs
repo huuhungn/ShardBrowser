@@ -1170,6 +1170,33 @@ mod tests {
         pt.root_custodian.as_ref().unwrap().root_grant.clone()
     }
 
+    /// Sealed by the v3 encoder as it stood before v4 existed (fixed test
+    /// keys): it still opens to its first self-grant with no issuer, and
+    /// today's encoder writes exactly the same bytes for it.
+    #[test]
+    fn a_v3_golden_vector_reads_back_exactly() {
+        let golden = unhex(include_str!("../tests/fixtures/recovery_bundle_v3.hex").trim());
+        let (opened, pt) = open(&golden, PASS).unwrap();
+        assert_eq!(opened, header());
+        assert_eq!(*pt.trk, TRK);
+        assert_eq!(pt.bootstrap_anchor_signing_key_id, anchor_of(&SIGNING_SEED));
+        assert_eq!(pt.retained_fkeks.len(), 1);
+        let c = pt.root_custodian.as_ref().unwrap();
+        assert_eq!((c.account_id, c.device_id), (ACCOUNT, DEVICE));
+        assert_eq!(
+            (*c.signing_key_seed, *c.hpke_key_seed),
+            (SIGNING_SEED, HPKE_SEED)
+        );
+        assert_eq!(c.root_grant_issuer, None);
+        assert_eq!(seal_with(&header(), &pt, PASS).unwrap(), golden);
+        let Value::Map(entries) = c::decode(&pt.encode().unwrap()).unwrap() else {
+            panic!("a map")
+        };
+        let field = |k: &str| entries.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(field("domain"), Some(c::t(DOMAIN_PLAINTEXT_V3)));
+        assert_eq!(field("version"), Some(c::u(VERSION_V3)));
+    }
+
     /// Sealed once by this build's v4 encoder (fixed test keys): it opens to
     /// exactly the custodian it was made from, and sealing what it opened to
     /// under its header writes exactly its bytes.
