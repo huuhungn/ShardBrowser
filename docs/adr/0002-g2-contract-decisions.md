@@ -64,7 +64,7 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 | Choice | Decision | Plan lines |
 |---|---|---|
 | **Q-23 Issuer of `ROOT_GRANT_REVOKE`** (L947) | **An ACTIVE root custodian only**, the D-2 issuer rule as implemented: a custodian of the tenant's ACTIVE root generation, signing in with its session, may revoke any root grant of that tenant, including its own. The server refuses a revoke that would leave the ACTIVE root with no other custodian (`LAST_ROOT_CUSTODIAN`). No separate capability is added. Rejected: a dedicated `root.revoke` capability (more records for no new guarantee, since custodians already hold the TRK) | none (confirms L947) |
-| **Q-24 A generation stuck before activation** (L949, S6) | **Never re-filed.** If the creator's `FirstRootSelfGrant` or `FirstFleetSelfGrant` is revoked before it is acknowledged, that generation can never activate: no second self-grant is accepted for it, and the creator does not regain the right to file one. Recovery is a new generation (a root rotation, or the next fleet generation). Rejected: allowing a re-filed self-grant, which would let a revoked device regain a key the revoke meant to withhold | none (narrows S6) |
+| **Q-24 A generation stuck before activation** (L949, S6) | **Never re-filed.** If the creator's `FirstRootSelfGrant` or `FirstFleetSelfGrant` is revoked before it is acknowledged, that generation can never activate: no second self-grant is accepted for it, and the creator does not regain the right to file one. Recovery is a new generation (a root rotation, or the next fleet generation). Rejected: allowing a re-filed self-grant, which would let a revoked device regain a key the revoke meant to withhold. **v2.9.0 limit (2026-11-08):** no route discards the stuck PREPARING generation, so the next root or fleet generation (always ACTIVE + 1) cannot be created until a v2.10 discard route; see D-9, "Limits in v2.9.0" | none (narrows S6) |
 
 ### Decided on 2026-10-29 (strict defaults chosen by the user)
 
@@ -1485,8 +1485,8 @@ confirmed in R1-R4).
 1. **Start or resume.** The server identity must match the custody state.
    Start needs N ACTIVE on the server, N as the highest verified generation in
    the key store and the ledger, and this custodian's own approval valid now;
-   it is refused while a saved rotation is unfinished, or `expired`
-   (`fleet.rotationStuck`). Resume skips these checks.
+   a saved unfinished rotation is resumed instead; a saved `expired` one
+   refuses Start (`fleet.rotationStuck`). Resume skips these checks.
 2. **S0.** One `key.rotate` capability grant, fleet scope, for this device,
    saved in the rotation state (Q-51).
 3. **Setup key** with a key ID distinct from N's.
@@ -1508,11 +1508,15 @@ confirmed in R1-R4).
     and to push the profiles still under N (Q-46).
 
 **Expiry decision and `expired` (Q-49).** For a saved rotation not yet
-`activated`, when `now >= deadline_ms` or the saved restore epoch differs from
-the server's, and on a 403 to a rotation filing or ack past the deadline, the
+`activated`, once step 4 has saved `deadline_ms`: when `now >= deadline_ms` or
+the saved restore epoch differs from the server's, and on any 403 to a rotation
+filing or ack (a raw 403 is returned only while `now < deadline_ms -
+CLOCK_TOLERANCE_MS`), the
 launcher reads the server's ACTIVE generation **before sending anything**. N+1
-ACTIVE means the activation already happened (a lost reply), so the run
-continues at step 10. N ACTIVE enters `expired`: the setup key is released, N
+ACTIVE means the activation may already have happened (a lost reply): the
+launcher re-sends the saved activate and continues at step 10 only when the
+server returns the stored reply with matching terms; otherwise it stops with
+`fleet.rotationStateUnknown`. N ACTIVE enters `expired`: the setup key is released, N
 stays ACTIVE, approvals resume (Q-48) and Start stays refused. Anything else
 stops with `fleet.rotationStateUnknown` and changes nothing. The launcher never
 declares `expired` on its own clock alone. Tests
@@ -1731,8 +1735,8 @@ Because every legitimate custodian descends from `g0`, a device anchored on `A0`
 - **The consequence.** A stolen custodian key, combined with a server that hides revocations, is accepted with no time limit. D-6 states the exact bound and the mitigations (a)-(d) that this algorithm implements.
 - **Fleet generation freshness.** "The newest generation" is likewise outside the guarantee. As a cheap tightening, `D` records the highest generation it has verified per fleet and refuses to push under a lower one. Restore no longer lowers generations (D-1), so this rule needs no restore exception.
 
-  **Amendment (decided by the owner 2026-11-08; v0.2.3 rotation slice, Q-46).** Freshness guards what a device **seals**: a push and a revert `R` seal only under the highest verified generation (test `sealing_under_an_older_generation_is_still_refused`, confirmed in R1-R4). A restore may read a lower generation whose delivering grant re-verifies now (Q-26), so a head pushed under N stays readable after N+1 is collected (every restore reads through `readable_key`; tests `a_pull_restores_a_head_sealed_under_an_older_generation_after_rotation`, `a_join_first_pull_restores_a_head_of_an_older_generation`, `a_pull_refuses_an_older_generation_whose_grant_no_longer_reverifies`, confirmed in R1-R4).
-  - **Generation floor.** Along one profile's trusted chain generations never decrease. A forward head that rule 6 would advance to or accept (`Advance`, `Accept`) is refused, nothing pinned, when its manifest's `key_generation` is below the current anchor's: the pinned head's manifest, then each new anchor. Heads that join an open run (withdrawn or reported signers) and the search below a withdrawn pin for `P` are exempt, so revert keeps skipping them; with no pin there is no floor until the first accepted head. A still-valid signer's head below the anchor stops that profile's pulls (fail closed) until the signer is revoked; revert then skips it. Tests `an_advancing_head_below_the_anchor_generation_is_refused`, `an_accepted_revert_below_the_anchor_generation_is_refused`, `a_revoked_signers_lower_generation_head_still_reverts`, `a_p_below_a_withdrawn_pin_of_a_lower_generation_is_still_restored`, `a_pull_after_a_restore_transition_takes_the_floor_from_the_pinned_head` (confirmed in R1-R4).
+  **Amendment (decided by the owner 2026-11-08; v0.2.3 rotation slice, Q-46).** Freshness guards what a device **seals**: a push and a revert `R` seal only under the highest verified generation (test `sealing_under_an_older_generation_is_still_refused`, confirmed in R1-R4). A restore may read a lower generation whose delivering grant re-verifies now (Q-26), so a head pushed under N stays readable after N+1 is collected (from v2.9.0, R1, every restore reads through `readable_key`; tests `a_pull_restores_a_head_sealed_under_an_older_generation_after_rotation`, `a_join_first_pull_restores_a_head_of_an_older_generation`, `a_pull_refuses_an_older_generation_whose_grant_no_longer_reverifies`, confirmed in R1-R4).
+  - **Generation floor.** Along one profile's trusted chain generations never decrease. A forward head that rule 6 would advance to or accept (`Advance`, `Accept`) is refused, nothing pinned, when its manifest's `key_generation` is below the current anchor's: the pinned head's manifest, then each new anchor. Heads that join an open run (withdrawn or reported signers) and the search below a withdrawn pin for `P` are exempt, so revert keeps skipping them; with no pin there is no floor until the first accepted head; after a withdrawn pin the anchor is `P`, so the floor can be N rather than N+1. A still-valid signer's head below the anchor stops that profile's pulls (fail closed) until the signer is revoked; revert then skips it. Tests `an_advancing_head_below_the_anchor_generation_is_refused`, `an_accepted_revert_below_the_anchor_generation_is_refused`, `a_revoked_signers_lower_generation_head_still_reverts`, `a_p_below_a_withdrawn_pin_of_a_lower_generation_is_still_restored`, `a_pull_after_a_restore_transition_takes_the_floor_from_the_pinned_head` (confirmed in R1-R4).
   - **Consequences.** (1) A device revoked while the server hides its revocation can still write under N to a profile whose chain has not moved to N+1; the push prompt (Q-46) shrinks this window, and the floor closes it once the profile is pushed under N+1. (2) **Cost a:** a device approved or restored after a rotation cannot read a head not pushed again under N+1; it gets `sync.headUnderRetiredKey` (test `a_device_without_the_old_key_gets_head_under_retired_key`, confirmed in R1-R4). (3) **Cost b:** N's device grants run 365 days and cannot be renewed once N is RETIRED, so a head left under N becomes unreadable for every device when they end (test `an_old_generation_head_is_unreadable_after_its_grant_window_ends`, confirmed in R1-R4). Bulk re-seal is a v2.10 follow-up.
 
 ### Join ceremony (Q-12; replaces revision 1's truncated confirmation)
