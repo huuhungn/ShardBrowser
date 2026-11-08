@@ -4040,9 +4040,17 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
 /// a release that names no binding (with any release already pending), sent
 /// best effort by the next publish, push or pull, and lapses at its TTL
 /// otherwise; the binding then drops it as a sent release would. No team
-/// database, or one that does not open, has no binding this could drop.
+/// database, or one that does not open, has no binding this could drop; one
+/// whose existence cannot be checked refuses the removal
+/// (`team.trustLedgerUnreadable`), so nothing is removed.
 pub(crate) fn unbind_removed(local: &str) -> Result<()> {
-    if !Db::path()?.try_exists()? {
+    // An unknown existence may hide a readable binding, so it fails closed as
+    // the v2.8.1 state checks do; a database that exists but does not open
+    // holds no binding this launcher could read or release, as before.
+    if !Db::path()?
+        .try_exists()
+        .context(code("team.trustLedgerUnreadable"))?
+    {
         return Ok(());
     }
     let mut db = match Db::open() {
@@ -13070,7 +13078,8 @@ mod tests {
         std::fs::write(fresh.path().join("team-sync"), b"not a directory").unwrap();
         assert!(is_published(LOCAL).is_err());
         assert!(statuses(T0).is_err());
-        assert!(unbind_removed(LOCAL).is_err());
+        let err = unbind_removed(LOCAL).unwrap_err();
+        assert!(has(&err, "team.trustLedgerUnreadable"), "{err:#}");
     }
 
     #[test]

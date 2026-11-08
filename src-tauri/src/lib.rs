@@ -2264,7 +2264,21 @@ async fn forget_revoked_identities(
         if !is_copy {
             continue;
         }
-        let old: team_config::TeamConfig = serde_json::from_slice(&std::fs::read(&copy)?)?;
+        // Recovery import copies `team.json` unparsed: one copy that does not
+        // read stops nothing. Only the path is logged, never the content.
+        let old = match std::fs::read(&copy) {
+            Ok(body) => match serde_json::from_slice::<team_config::TeamConfig>(&body) {
+                Ok(old) => old,
+                Err(_) => {
+                    eprintln!("[team] copy {} skipped: not a team config", copy.display());
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("[team] copy {} skipped: {:?}", copy.display(), e.kind());
+                continue;
+            }
+        };
         // Only an identity of this server and tenant is this login's to ask about.
         if old.device_id.is_empty()
             || old.device_id.eq_ignore_ascii_case(&c.device_id)
@@ -7451,13 +7465,13 @@ mod custody_tests {
         (j, refs)
     }
 
-    fn enroll(rt: &tokio::runtime::Runtime) {
+    fn enroll(rt: &tokio::runtime::Runtime, copies: usize) {
         let status = rt
             .block_on(team_enroll_device("l".into(), "u".into(), "p".into()))
             .unwrap();
         assert!(status.is_enrolled);
         assert_eq!(team_config::load().unwrap().device_id, hex(&ENROLLED));
-        assert_eq!(team_json_copies(), 1, "the copy stays");
+        assert_eq!(team_json_copies(), copies, "the copies stay");
     }
 
     /// v2.8.1 nit 3: after an enrollment, the old identity a copy names loses
@@ -7468,7 +7482,15 @@ mod custody_tests {
         let url =
             fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "revoked"));
         let (_j, refs) = reset_joiner(&url);
-        enroll(&rt);
+        // A copy that is not a team config, as recovery import may leave,
+        // is skipped and stops nothing.
+        let team_json = store::team_config_path().unwrap();
+        std::fs::write(
+            team_json.with_extension("json.unreadable-0"),
+            b"{not a team config",
+        )
+        .unwrap();
+        enroll(&rt, 2);
         for r in &refs {
             let gone = credential::load(r).unwrap_err().to_string();
             assert!(gone.contains("credential.missing"), "{r}: {gone}");
@@ -7478,7 +7500,7 @@ mod custody_tests {
         let url =
             fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "pending"));
         let (_j, refs) = reset_joiner(&url);
-        enroll(&rt);
+        enroll(&rt, 1);
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
     }
@@ -7492,14 +7514,14 @@ mod custody_tests {
             fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "revoked"));
         let (_j, refs) = reset_joiner(&url);
         credential::fail_next_call(&refs[0]);
-        enroll(&rt);
+        enroll(&rt, 1);
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert!(credential::load(&refs[1]).is_err());
         drop(_j);
 
         let url = fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, ""));
         let (_j, refs) = reset_joiner(&url);
-        enroll(&rt);
+        enroll(&rt, 1);
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
     }
