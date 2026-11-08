@@ -2898,20 +2898,7 @@ async fn team_fleet_key_rotate(
             save,
         )
         .await
-        .map_err(error)?;
-        let refused = state
-            .rotation
-            .iter()
-            .flat_map(|r| r.member_results.values())
-            .filter(|v| *v == "refused")
-            .count();
-        if refused > 0 {
-            return Err(crate::errcode::code_with(
-                "fleet.rotationMembersRefused",
-                &[("count", &refused.to_string())],
-            ));
-        }
-        Ok(())
+        .map_err(error)
     }
     .await;
     client.end_session(access).await;

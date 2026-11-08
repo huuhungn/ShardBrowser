@@ -1475,6 +1475,13 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
         .unwrap_err()
     });
     assert!(err.to_string().contains("crash"), "{err}");
+    let nonce = crate::fleet_custody::load()
+        .unwrap()
+        .rotation
+        .unwrap()
+        .fkek_nonce;
+    let setup_ref = format!("fleet-setup.{}.{nonce}", h.tenant.to_ascii_lowercase());
+    assert!(!nonce.is_empty() && device.vault.load(&setup_ref).is_ok());
     assert_eq!(
         h.server
             .count("SELECT count(*) FROM v2_fleet_key_generations WHERE generation = 1"),
@@ -1498,6 +1505,8 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
         (1, crate::fleet_custody::RotationPhase::Done, 1, 0, 0)
     );
     assert!(status.export_due && !status.setup_key_held);
+    let rotation = crate::fleet_custody::load().unwrap().rotation.unwrap();
+    assert!(rotation.fkek_nonce.is_empty() && device.vault.load(&setup_ref).is_err());
     let state = |g: i64| {
         h.server.count(&format!(
             "SELECT count(*) FROM v2_fleet_key_generations WHERE generation = {g} AND state = '{}'",

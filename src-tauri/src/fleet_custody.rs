@@ -1350,6 +1350,15 @@ fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -> bool {
         })
 }
 
+/// Whether `e` is the server's refusal of the request itself: the custody
+/// marker with a 4xx status other than 401, 408 or 429, which a resend of
+/// the same bytes would not change.
+fn refused_for_good(e: &anyhow::Error) -> bool {
+    (400..500)
+        .filter(|s| ![401, 408, 429].contains(s))
+        .any(|s| refused_with(e, s, None))
+}
+
 // ---- Rotate fleet key (sequence K, ADR 0002 D-9) ----
 
 /// The most signers one trust evidence request may name (`MAX_SIGNERS`,
@@ -1506,6 +1515,16 @@ pub async fn rotate_fleet(
         bail!(crate::errcode::code("fleet.custodyServerChanged"));
     }
     let fleet = hex(&cx.tenant);
+    // Stopped before step 4 across a server restore: nothing of N+1 is on
+    // the server, and the saved requests name the old epoch, so it starts
+    // over.
+    if state.rotation.as_ref().is_some_and(|r| {
+        r.phase == RotationPhase::Preparing && r.deadline_ms.is_none() && r.restore_epoch != epoch
+    }) {
+        release_fkek(device.vault, state, rotation_key, save)?;
+        commit(state, save, |s| s.rotation = None)?;
+        eprintln!("[rotation] restarted after a server restore before step 4");
+    }
     match state
         .rotation
         .as_ref()
@@ -1577,6 +1596,9 @@ pub async fn rotate_fleet(
         prepare_rotation(&cx, device, root, now, state, save)?;
     }
     let r = state.rotation.clone().ok_or_else(corrupt)?;
+    if r.grant_requests.len() != 3 || r.ack_requests.len() != 3 {
+        return Err(corrupt());
+    }
 
     // 5. N+1, now PREPARING.
     let create = saved_request(&r.create_request)?;
@@ -1928,11 +1950,14 @@ pub async fn grant_members(
                 built
             }
         };
-        let filed = send_grant(client, access, &fleet, r.generation, &filing, false).await;
-        results.insert(
-            id,
-            if filed.is_ok() { "filed" } else { "refused" }.to_string(),
-        );
+        // Anything but the server's refusal stops here, phase `activated`: a
+        // resume resends the saved filing, which the server replays.
+        let result = match send_grant(client, access, &fleet, r.generation, &filing, false).await {
+            Ok(()) => "filed",
+            Err(e) if refused_for_good(&e) => "refused",
+            Err(e) => return Err(e),
+        };
+        results.insert(id, result.to_string());
     }
     for (id, result) in &results {
         eprintln!("[rotation] member {id}: {result}");
@@ -4813,6 +4838,78 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_rotation_stopped_before_step_4_across_a_restore_epoch_starts_over() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let now = rig.now;
+        // The setup key is held, then the save of its id fails: no deadline.
+        let err = rig
+            .rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut |s| {
+                    if s.rotation
+                        .as_ref()
+                        .is_some_and(|r| !r.fkek_key_id.is_empty())
+                    {
+                        bail!("disk-full")
+                    }
+                    save(s)
+                },
+            )
+            .unwrap_err();
+        assert!(has(&err, "disk-full"));
+        let stopped = rotation();
+        assert_eq!((stopped.deadline_ms, stopped.restore_epoch), (None, 0));
+        let old = setup_ref(&f.tenant, &stopped.fkek_nonce);
+        assert!(CredentialFkekStore.load(&old).is_ok());
+        rig.rot.lock().unwrap().epoch = 1;
+
+        rig.rotate(&f, now).unwrap();
+        assert!(is_missing(&CredentialFkekStore.load(&old).unwrap_err()));
+        let r = rotation();
+        assert_ne!(r.fkek_nonce, stopped.fkek_nonce);
+        assert_eq!(r.restore_epoch, 1);
+        assert_eq!(saved_request(&r.create_request).unwrap().restore_epoch, 1);
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1));
+    }
+
+    #[test]
+    fn a_start_after_an_expired_rotation_whose_create_never_landed_rotates() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let bootstrap_nonce = load().unwrap().fkek_nonce;
+        rig.refuse("/key-generations", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let deadline = rotation().deadline_ms.unwrap();
+        let old = setup_ref(&f.tenant, &rotation().fkek_nonce);
+        let err = rig.rotate(&f, deadline).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{err}");
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+        rig.allow();
+
+        let vault = Counting(AtomicUsize::new(0));
+        let later = deadline + 1;
+        rig.rotate_with(
+            &f,
+            &vault,
+            |_| Ok(Zeroizing::new(OLD_FKEK)),
+            later,
+            &mut |s| save(s),
+        )
+        .unwrap();
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1));
+        assert!(is_missing(&CredentialFkekStore.load(&old).unwrap_err()));
+        assert_eq!(vault.0.load(Ordering::SeqCst), 1, "one new setup key");
+        assert!(rotation_key_held().is_some(), "held until step 10");
+        assert_eq!(load().unwrap().fkek_nonce, bootstrap_nonce);
+        collected(later);
+        assert!(rotation_key_held().is_none());
+    }
+
+    #[test]
     fn an_activation_not_yet_due_before_the_deadline_is_retryable() {
         let f = fixture();
         let mut rig = rig(&f, |_| {});
@@ -5052,6 +5149,27 @@ pub(crate) mod tests {
         let r = rotation();
         assert_eq!(r.phase, RotationPhase::Activated);
         assert!(r.member_grants.is_empty() && r.member_results.is_empty());
+    }
+
+    #[test]
+    fn member_grants_resume_after_a_transport_failure_with_the_saved_filing() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = at_members(&f, vec![b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.refuse("/grants", 503, "");
+        assert!(rig.members(&f, now).is_err());
+        let r = rotation();
+        assert_eq!(r.phase, RotationPhase::Activated);
+        assert!(r.member_results.is_empty());
+        let saved = unhex_vec(&r.member_grants[&b.device_id]).unwrap();
+        rig.allow();
+
+        rig.members(&f, now + 1).unwrap();
+        assert_eq!(rig.bodies("/grants"), [saved.clone(), saved]);
+        assert_eq!(results(), [(b.device_id.clone(), "filed".to_string())]);
+        assert_eq!(rotation().phase, RotationPhase::Done);
     }
 
     #[test]

@@ -337,7 +337,6 @@
   "fleet.rotationNotYetDue": "The server does not accept the new fleet key yet. Check this computer's clock, then try again.",
   "fleet.rotationInProgress": "A fleet key rotation is unfinished. Finish it before approving a device.",
   "fleet.rotationCustodianApprovalExpired": "This custodian's own approval is no longer valid, so it cannot rotate the fleet key.",
-  "fleet.rotationMembersRefused": "The fleet key was rotated, but the server refused the new key for {count} member device(s). Revoke and enroll them again.",
   "fleet.notCustodian": "Only the device that set up the team's root custody can do this",
   "fleet.joinCodeExpired": "This device's join code has expired: enroll this device again",
   "fleet.joinAnchorChanged": "The team server now shows a different bootstrap anchor than the one confirmed; nothing was pinned",
