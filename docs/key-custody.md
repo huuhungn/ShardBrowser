@@ -139,6 +139,21 @@ the right model to keep.
 | Recovery bundle | A v3 bundle (2.8.0) holds the root custodian's device identity, the root key and, when exported again after the fleet key exists, the team's verified fleet keys; a bundle from 2.7.x holds only the root key and cannot restore the team |
 | Approvals and grants | Run one year, with no renewal |
 
+The table describes 2.9.0. v2.10 (in development, ADR 0002 Q-52 to Q-58;
+each point is checked against the code as its story merges) changes it, with
+no server change:
+
+- **Revocation** also offers `compromised` for member rows; custodian rows
+  keep `retired` and `lost` (Q-57).
+- **Recovery bundle:** v3 while the root custodian's current root grant is its
+  first self-grant, v4 once a renewal or a hand-over replaced it (Q-53).
+- **Approvals and grants:** the root custodian renews its own records at
+  half-life, approval and root grant for two years, the rest for one (Q-55).
+  Members' records still run one year with no renewal until v2.11.
+- **Re-seal all profiles** on the root custodian (Q-54).
+- **Root custody hand-over** to a new device (Q-56, Q-58): see "Root custody
+  hand-over" below. Root key rotation still is not implemented (v2.11).
+
 A grant has to name a generation that exists, and wrap the key that generation
 committed to. Before this, the generation number in a grant was decoration: a
 grant could name any number and seal any key, and the mismatch would only
@@ -200,6 +215,25 @@ saved one with `REVOCATION_OUTSIDE_WINDOW` and the device is not yet revoked;
 any other refusal leaves the saved request as it is. An older server never
 sends that code, so the launcher and the server are released together.
 
+From v2.10 (ADR 0002 Q-57, Q-58):
+
+- **`compromised`** is offered for a member row. A counted `compromised`
+  revocation blocks commits under the generations that device held until the
+  custodian rotates and the members collect (Q-18). It is refused for this
+  device, for an outgoing custodian, and for any row whose key fresh evidence
+  counts as a custodian; custodian rows get it in v2.11.
+- **Revoking a custodian** (the old root after a hand-over) makes every device
+  that counts the revocation refuse records by that key it first sees
+  afterwards, member approvals the old root issued included. So the evaluation
+  that would first count it is a *closure evaluation*: one evidence request
+  that names every known device signer, at most 64, so that every member
+  approval is first seen together with the revocation and keeps its standing.
+  A device that would need more than 64 fails closed
+  (`fleet.trustClosureTooLarge`) until v2.11. A member the server leaves out
+  is distrusted and enrolls again. Whether this ships in v2.10 is decided by
+  gate G6; without it the old root is not revoked in v2.10 (see "Root custody
+  hand-over").
+
 ### A failure worth remembering
 
 `record_table` in `v2_replay_ledger` had a CHECK constraint listing only the
@@ -243,7 +277,7 @@ generation 0 is filed, and that generation pins the bundle's hash
 Create fleet key also files a *recovery grant*: the fleet key wrapped under the
 TRK, kept on the team server.
 
-### Recovery bundle v3 (2.8.0)
+### Recovery bundle v3 (2.8.0) and v4 (2.10)
 
 From 2.8.0 the bundle's plaintext is v3: besides the TRK, the anchor ID and
 the fleet keys it retains, it carries the root custodian's account and device
@@ -259,6 +293,20 @@ bundle's fingerprint (ADR 0002 D-5), and Export stays off until the owner
 ticks that it was recorded. A bundle works only while the root
 custodian's approval and grants run: 365 days from bootstrap. 2.7.x cannot
 read the v3 state an import writes, so do not downgrade after an import.
+
+From v2.10 a root custodian whose current root grant is no longer its first
+self-grant (after renewing itself, or after receiving custody in a hand-over)
+writes a **v4** bundle (ADR 0002 Q-53, D-5). Instead of the first self-grant
+it carries the current root grant and the public key of the custodian that
+signed it, so the bundle's device need not be the anchor. Import checks the
+grant offline, then fetches trust evidence and requires the chain from the
+pinned anchor to count the bundle's device as a custodian now
+(`recovery.rootGrantIssuerNotCustodian`). A v4 bundle plus its passphrase is
+that custodian device, exactly as for v3. A renewal replaces the records a
+bundle names, so export again after one (the page asks); the new bundle works
+for as long as the renewed records run. 2.9.x and older
+cannot open a v4 bundle, and a bundle of a revoked device no longer imports
+(`recovery.deviceNotActive`).
 
 **Import** (`team_import_recovery_bundle`, under "Restore root custodian from a
 recovery bundle" on the Team page) runs on a fresh device, or on the root
@@ -347,10 +395,18 @@ Roughly the sequence the constraints force:
    (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
    key file as the fallback. Keychain and kernel keyring are not wired up.
 
-Still to come: root key rotation, moving root custody to a new device row so a
-lost machine or an old bundle stops being a root custodian, renewal of
-approvals and grants, which run one year, and re-sealing every profile under a
-new fleet key at once.
+7. **Fleet key rotation.** Done in 2.9.0 (see below).
+
+In development for v2.10, with no server change (ADR 0002 Q-52 to Q-58):
+moving root custody to a new device row so a lost machine or an old bundle
+stops being a root custodian, the root custodian renewing its own approval
+and grants, and re-sealing every profile under the newest fleet key at once.
+
+Still to come in v2.11, with one batched server update: root key rotation,
+renewal of members' approvals and grants (which run one year), discarding a
+stuck PREPARING generation, `compromised` for custodian rows, Reset of a
+handed-over old root, and, if gate G6 fails in v2.10, revoking the old root
+after a hand-over.
 
 ### Fleet key rotation
 
@@ -406,7 +462,75 @@ the same way. Rotation does not cut off a stolen root machine or a leaked
 recovery bundle: both open the new key's recovery grant. That needs root key
 rotation.
 
-## Threat model, stated plainly
+From v2.10 the root custodian also has **Re-seal all profiles** (ADR 0002
+Q-54). It moves every profile head under an older key, and during a hand-over
+every head the outgoing custodian signed, to the active key in one run,
+re-signed by this custodian, without a profile folder. It skips and lists
+profiles in use (running, leased, with local changes or behind), in error,
+quarantined or under a key this device does not hold, and resumes where it
+stopped. Each re-sealed profile moves up one version, so a member with
+unpushed changes must Pull first, which replaces those changes. Snapshots
+below the heads keep their keys. Pushing a single profile from "Profiles
+still under an older key" stays available.
+
+In a hand-over, the new custodian's rotation grants the new key to every
+member but not to the outgoing custodian (`skipped:outgoing-custodian`).
+
+## Root custody hand-over
+
+In development for v2.10 (ADR 0002 Q-56, Q-58, D-5 sequence H). It moves root
+custody from the current root machine A to a new device B, which is how a
+custodian re-keys before its key age (1095 days) and how a lost machine or an
+old bundle stops being a root custodian. No server change is needed.
+
+1. B enrolls and joins like any member, comparing the join code.
+2. On A, **Approve as root custodian**. It is refused
+   (`fleet.handoverNeedsReseal`) until A's own Re-seal all profiles finished
+   with every head under the active key. A files B's tenant approval and root
+   grant (two years each) and B's grant of the current fleet key N. From then
+   on A refuses every custody action (`fleet.custodyHandedOver`). A can cancel
+   by revoking B only until B rotates (`fleet.handoverPastRotation`).
+3. On B, **Accept root custody**. B keeps the root grant only if its own trust
+   chain, from the anchor it pinned, counts it
+   (`fleet.handoverIssuerNotCustodian`). It then files its own capability
+   grants and its own grant of N, after collecting A's.
+4. B's checklist, each step enabled only after the previous one:
+   0. **Export recovery bundle** (v4). Rotate needs it, so a lost B can be
+      restored from it.
+   1. **Rotate fleet key** to N+1, with no grant to A.
+   2. **Re-seal all profiles**, including every head A signed.
+   3. **Export recovery bundle** again, holding N+1.
+   4. **Revoke the old root** as retired or lost (`compromised` is refused).
+      Every send re-checks steps 0 to 3 and every profile head live
+      (`fleet.handoverNotReady`). `retired` needs no blocker. `lost` may go
+      ahead when the only blockers are heads A pushed after the re-seal, which
+      are listed and reverted right after the revoke once the user confirms
+      that exact list. Before confirming, every member must run 2.10 and have
+      synced once since the hand-over began: a member still on 2.9.x distrusts
+      peers it has not seen and must enroll again.
+5. A stays registered but inert: it cannot push, and every custody command
+   refuses. Switch it off. Reset of the old machine, and wiping its seeds,
+   come in v2.11.
+
+**Step 4.4 ships only if gate G6 passes** (the closure evaluation in
+"Revocation" keeps every member trusted after a custodian is revoked). If G6
+cannot be met without a server change, the checklist ends after step 4.3 with
+a notice (`team.handover.revokeInV211`): A stays a registered root custodian
+until v2.11, and its machine and every bundle it exported must be kept
+offline. Reset of A is v2.11 either way.
+
+What the hand-over does not do:
+
+- **Cut A off cryptographically.** The root key is unchanged until v2.11 root
+  rotation, and the server hands every fleet key's recovery grant to any
+  device session. Until its row is revoked, A can open every fleet key, N+1
+  included. Afterwards, anyone with A's root key and the server's data (a
+  hostile server, a copy of its database) still can.
+- **Keep history readable.** Once A is revoked, the fleet keys A's grants
+  delivered stop opening on every device that counts the revocation. Re-sealed
+  heads, later pushes and B's own key of N stay readable; older snapshots
+  below the heads do not.
+- **Run two at once.** One hand-over at a time.
 
 The team server is trusted for RBAC and coordination (who belongs to a
 tenant, leases, version fencing). It is **not** trusted for key distribution:
@@ -476,6 +600,16 @@ What does not hold:
 - Recalling keys from a revoked device. Revocation cuts the device off the
   server, but it keeps the fleet key it already holds; see "Revocation: what
   it does and does not protect".
+- From v2.10, a cryptographic cut-off of an old root after a hand-over. Its
+  cut-off is server-enforced until v2.11 rotates the root key; see "Root
+  custody hand-over".
+- From v2.10, trust in a member the server leaves out of the evidence when a
+  custodian is revoked: that member is distrusted and enrolls again. A server
+  can deny service this way, not forge trust.
+- From v2.10, renewal of a root custodian nobody uses. Renewal runs on custody
+  and sync actions, so an unused custodian renews only on its next use, with a
+  warning from 75% of its records' lifetime. One left unused until its records
+  end lapses, and the team then recovers into a new tenant (ADR 0002 Q-14).
 - Forward secrecy across rotations. A fleet key rotation protects only what is
   pushed afterwards; old snapshots stay under the keys a revoked device held.
 - Device key confidentiality against code running as the same Windows user,
