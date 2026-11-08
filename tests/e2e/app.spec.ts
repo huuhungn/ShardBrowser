@@ -836,13 +836,13 @@ test("an unfinished rotation shows Resume and its deadline, and refuses Approve 
   await expect(row).toContainText("Active");
 });
 
-test("an expired rotation shows the stuck notice, keeps Rotate off, and Approve works", async ({ page: a }) => {
+test("an expired rotation shows the stuck notice, keeps Rotate on to try again, and Approve works", async ({ page: a }) => {
   const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "pending", granted: false }]);
   const card = await teamDevicePage(a, "a", server, false, "&teamRotation=expired");
   await expect(card.getByTestId("team-rotation-status")).toContainText("expired before it was activated");
   await expect(card.getByTestId("team-rotation-status")).not.toContainText("Finish it before");
   await cardSignIn(a);
-  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeDisabled();
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeEnabled();
   const row = await listDevices(a, "Machine C");
   await cardSignIn(a);
   await row.getByLabel("The code on the other device matches").check();

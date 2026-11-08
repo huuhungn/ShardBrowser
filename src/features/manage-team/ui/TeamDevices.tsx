@@ -249,7 +249,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
           <div>
             <Button
               size="small" mode="stroke"
-              disabled={!!busy || !account.signedIn || stuck || !(ready || unfinished)}
+              disabled={!!busy || !account.signedIn || !(ready || unfinished)}
               onClick={() => { void rotate(); }}
             >
               {busy === "rotate"

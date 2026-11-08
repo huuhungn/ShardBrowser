@@ -12,7 +12,7 @@
 // file is DPAPI-protected on Windows (see `dpapi`); in memory it is plaintext
 // hex, so callers never see the stored form.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::Mutex;
@@ -190,7 +190,7 @@ fn seed(plaintext: &str, credential_ref: &str, corrupt: &str) -> Result<Zeroizin
         }
         decode_hex32(plaintext)
             .map(Zeroizing::new)
-            .context(crate::errcode::code(corrupt))
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code(corrupt)))
     }
 }
 
@@ -206,23 +206,28 @@ pub fn protect_keys(c: &mut TeamConfig) -> Result<bool> {
     }
     let device = c.device_id.clone();
     let mut moved = false;
-    for (plaintext, reference, kind) in [
+    for (plaintext, reference, kind, corrupt) in [
         (
             &mut c.signing_key_seed,
             &mut c.signing_credential_ref,
             "device-signing",
+            "teamConfig.signingKeyCorrupt",
         ),
         (
             &mut c.hpke_key_seed,
             &mut c.hpke_credential_ref,
             "device-hpke",
+            "teamConfig.hpkeKeyUnusable",
         ),
     ] {
         // An unopenable seed stays as it is, for re-enrolment to replace.
         if plaintext.is_empty() || dpapi::unreadable(plaintext) {
             continue;
         }
-        let key = Zeroizing::new(decode_hex32(plaintext)?);
+        let key = Zeroizing::new(
+            decode_hex32(plaintext)
+                .ok_or_else(|| anyhow::anyhow!(crate::errcode::code(corrupt)))?,
+        );
         let name = format!("{kind}.{device}");
         if crate::credential::store(&name, &key).is_err() {
             continue;
@@ -393,10 +398,8 @@ pub fn status() -> Result<TeamStatus> {
     })
 }
 
-fn decode_hex32(s: &str) -> Result<[u8; 32]> {
-    crate::fleet_client::decode_hex(s)
-        .and_then(|raw| raw.try_into().ok())
-        .ok_or_else(|| anyhow::anyhow!("expected 64 hex characters"))
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    crate::fleet_client::decode_hex(s).and_then(|raw| raw.try_into().ok())
 }
 
 #[cfg(test)]
@@ -824,9 +827,9 @@ mod tests {
         let tainted = format!("\u{20ac}{}", "a".repeat(61));
         assert_eq!(tainted.len(), 64);
         for s in [tainted.as_str(), "+f"] {
-            std::panic::catch_unwind(|| decode_hex32(s))
-                .expect("decode_hex32 panicked")
-                .unwrap_err();
+            let decoded =
+                std::panic::catch_unwind(|| decode_hex32(s)).expect("decode_hex32 panicked");
+            assert!(decoded.is_none(), "decode_hex32 accepted {s:?}");
         }
     }
 }

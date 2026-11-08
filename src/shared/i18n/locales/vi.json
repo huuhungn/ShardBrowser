@@ -1507,7 +1507,7 @@
   "team.rotation.retroactive": "Xoay khoá không có hiệu lực ngược về trước: khoá và dữ liệu mà một thiết bị đã thu hồi từng sao chép thì không thể thu hồi lại. Chỉ các bản chụp được đẩy lên từ bây giờ mới được bảo vệ.",
   "team.rotation.deadline": "Hãy hoàn tất trước {date}, theo đồng hồ của máy này.",
   "team.rotation.unfinished": "Đợt xoay khoá đội máy sang thế hệ {n} chưa hoàn tất. Hãy tiếp tục; việc duyệt thiết bị phải chờ đến khi xong.",
-  "team.rotation.expired": "Đợt xoay khoá đội máy sang thế hệ {n} đã hết hạn trước khi được kích hoạt. Nhóm vẫn dùng khoá đội máy hiện tại và việc duyệt thiết bị vẫn hoạt động, nhưng chưa thể bắt đầu đợt xoay mới cho đến khi một phiên bản sau dọn nó đi.",
+  "team.rotation.expired": "Đợt xoay khoá đội máy sang thế hệ {n} đã hết hạn trước khi được kích hoạt. Nhóm vẫn dùng khoá đội máy hiện tại và việc duyệt thiết bị vẫn hoạt động. Hãy xoay lại để bắt đầu từ đầu; nếu máy chủ nhóm vẫn giữ thế hệ đó, đợt xoay vẫn bị kẹt cho đến khi một phiên bản sau dọn nó đi.",
   "team.rotation.done": "Đã xoay khoá đội máy sang thế hệ {n}.",
   "team.rotation.members": "Đã cấp khoá mới cho {filed} thiết bị; máy chủ từ chối {refused}; bỏ qua {skipped}.",
   "team.rotation.membersRefused": "Máy chủ nhóm từ chối cấp khoá đội máy mới cho {n} thiết bị. Hãy thu hồi từng thiết bị đó rồi ghi danh lại.",
