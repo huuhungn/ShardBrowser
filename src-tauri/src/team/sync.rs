@@ -1665,13 +1665,15 @@ pub(crate) fn verified_key_blocked(
     )?))
 }
 
-/// [`verified_key`] without "Fleet generation freshness", only to read rule
-/// 6's anchor `P`, which may be of a generation a rotation since replaced,
-/// and may lie past the pin (owner decision B) or be what a revert seals
-/// again under the lease's generation. Its grant still reverifies
-/// now (Q-26 drops a withdrawn issuer's). `P` skips the freshness check only
-/// when a `J` follows it; never for sealing, nor for any other head. A
-/// fleet listing's labels ([`labels`]) are opened through it too.
+/// [`verified_key`] without "Fleet generation freshness", for every restore:
+/// a head may be of a generation a rotation since replaced (lazy re-seal,
+/// ADR 0002 amendment of 2026-11-08), as may rule 6's anchor `P`, past the
+/// pin (owner decision B) or what a revert seals again under the lease's
+/// generation. Its grant still reverifies now (Q-26 drops a withdrawn
+/// issuer's). Never for sealing; [`walk`]'s generation floor keeps a trusted
+/// chain from going back. A fleet listing's labels ([`labels`]) are opened
+/// through it too. No usable key for a generation below the highest this
+/// device verified is `sync.headUnderRetiredKey`.
 fn readable_key(
     db: &Db,
     dev: &Device,
@@ -1695,6 +1697,11 @@ fn readable_key(
         .ok_or_else(|| {
             if crate::fleet_key_needs_recollect(db, &dev.pin, fleet, generation) {
                 anyhow!(code("sync.fleetKeyRecollect"))
+            } else if matches!(
+                ledger::highest_generation(db, &dev.pin.0, fleet),
+                Ok(Some(h)) if generation < h
+            ) {
+                anyhow!(code("sync.headUnderRetiredKey"))
             } else {
                 none()
             }
@@ -4383,7 +4390,23 @@ async fn walk(
             signer,
             standing,
         };
-        match revert_rule(w.anchor.as_ref().map(|(l, _)| l), &w.open, &link) {
+        let rule = revert_rule(w.anchor.as_ref().map(|(l, _)| l), &w.open, &link);
+        // Generations never decrease along the trusted chain (ADR 0002
+        // amendment of 2026-11-08): a head that would advance or be accepted
+        // is refused below the anchor's generation, nothing pinned or
+        // quarantined. A head joining the run stays revertable; the pinned
+        // head and the search below a withdrawn pin are not checked here.
+        if matches!(rule, Rule::Advance | Rule::Accept(_))
+            && w.anchor
+                .as_ref()
+                .is_some_and(|(_, a)| p.key_generation < a.key_generation)
+        {
+            return Err(anyhow!(code_with(
+                "sync.headBelowKeyGeneration",
+                &[("profile", &b.local), ("signer", &hex(&signer))]
+            )));
+        }
+        match rule {
             Rule::Join => w.open.push(link),
             Rule::Advance => w.anchor = Some((link, p)),
             Rule::Accept(heads) => {
@@ -4850,7 +4873,9 @@ pub(crate) async fn pull(
     let Some((at, p)) = w.anchor else {
         return Err(bad("manifest"));
     };
-    let fkek = verified_key(
+    // A head sealed before a rotation is still read; `walk` refused any
+    // generation below the anchor's.
+    let fkek = readable_key(
         &db,
         dev,
         &b.fleet,
@@ -11351,6 +11376,374 @@ mod tests {
         revoked_at(&w, 1);
         assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
         assert!(out.join("Preferences").exists());
+    }
+
+    // ------------------------------------------- rotation reads (A3) ----
+
+    /// The key of generation `GEN + 1`.
+    const K2: [u8; 32] = [0x52; 32];
+
+    /// Rotates the config root's device to `GEN + 1` (key `K2`): verified,
+    /// stored, and named by the fake's checkouts.
+    fn rotate(w: &World) {
+        w.collect(GEN + 1, &K2, 70, Vec::new());
+        assert!(crate::fleet_keys::collect(&hex(&FLEET), GEN + 1, &K2).unwrap());
+        let mut f = w.fake();
+        f.generation = Some(GEN + 1);
+        f.fkek_key_id = Some(shardx_core::fleet_grants::fkek_key_id(&K2));
+    }
+
+    /// Pushes the next version, the profile's `marker` file reading `v1`,
+    /// `v2`, ...
+    fn push_next(w: &World) {
+        let v = w.fake().version + 1;
+        std::fs::write(w.udd.join("marker"), format!("v{v}")).unwrap();
+        assert_eq!(w.push().unwrap().version, v);
+    }
+
+    /// Version `v`'s manifest re-signed by `sk` as `edit` changes it, served
+    /// at its target version as the listed head. Its head.
+    fn resign(
+        w: &World,
+        v: u64,
+        sk: &Ed25519SigningKey,
+        edit: impl FnOnce(&mut SnapshotManifestV2),
+    ) -> [u8; 32] {
+        let mut f = w.fake();
+        let m = SignedSnapshotManifestV2::parse(&f.manifests[&v]).unwrap();
+        let mut p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        p.signer_signing_key_id = key_id_of(sk);
+        edit(&mut p);
+        let signed = SignedSnapshotManifestV2::sign(sk, &p).unwrap();
+        f.manifests
+            .insert(p.target_version, signed.exact_bytes().to_vec());
+        f.version = f.version.max(p.target_version);
+        f.head = Some(signed.head_hash());
+        signed.head_hash()
+    }
+
+    /// Re-signs versions 1, 2, ... as [`chain_of`] does, `links[v - 1]`
+    /// giving the signer and the generation the manifest names (key `K2` for
+    /// `GEN + 1`, else `FKEK`), whatever it was sealed under. The heads.
+    fn relink(w: &World, links: &[(&Ed25519SigningKey, u64)]) -> Vec<[u8; 32]> {
+        let mut heads: Vec<[u8; 32]> = Vec::new();
+        for (i, (sk, generation)) in links.iter().enumerate() {
+            let below = heads.last().copied();
+            let key = if *generation == GEN { &FKEK } else { &K2 };
+            heads.push(resign(w, i as u64 + 1, sk, |p| {
+                p.previous_signed_head_hash = below;
+                p.key_generation = *generation;
+                p.fkek_key_id = shardx_core::fleet_grants::fkek_key_id(key);
+            }));
+        }
+        heads
+    }
+
+    /// `LOCAL` is still available at `version`, nothing pinned or skipped.
+    fn untouched_at(w: &World, version: i64) {
+        let (state, reason, _, v, _) = w.state(LOCAL);
+        assert_eq!((state.as_str(), reason, v), ("AVAILABLE", None, version));
+        assert!(skipped(w).is_empty());
+    }
+
+    /// Hidden problem 1: after collecting `GEN + 1`, a head sealed under
+    /// `GEN` is still pulled, through `readable_key`.
+    #[test]
+    fn a_pull_restores_a_head_sealed_under_an_older_generation_after_rotation() {
+        let w = world();
+        push_next(&w);
+        let head = w.head_of(1);
+        let d = second(&w);
+        rotate(&w);
+        let out = d.path().join("out");
+        w.pull(&out).unwrap();
+        available_at(&w, 1, head);
+        assert_eq!(marker(&out), "v1");
+    }
+
+    /// A join pulls through the same path; its version-0 binding gives no
+    /// floor.
+    #[test]
+    fn a_join_first_pull_restores_a_head_of_an_older_generation() {
+        let (w, d) = joinable();
+        rotate(&w);
+        let out = d.path().join("joined");
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        let head = w.fake().head.unwrap();
+        available_at(&w, 1, head);
+    }
+
+    /// The generation floor: a valid head under `GEN` advancing over a pin
+    /// under `GEN + 1` is refused, naming the profile and its signer, and
+    /// nothing is pinned.
+    #[test]
+    fn an_advancing_head_below_the_anchor_generation_is_refused() {
+        let w = world();
+        rotate(&w);
+        push_next(&w);
+        push_next(&w);
+        let heads = relink(&w, &[(&w.me.sk, GEN + 1), (&w.me.sk, GEN)]);
+        let d = second(&w);
+        rotate(&w);
+        pin_at(&w, &d, &heads, 1);
+        let out = d.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.headBelowKeyGeneration"), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains(LOCAL), "{text}");
+        assert!(text.contains(&hex(&w.me.to.signing_key_id)), "{text}");
+        untouched_at(&w, 1);
+        assert_eq!(w.state(LOCAL).4, Some(heads[0].to_vec()));
+        assert!(!out.exists());
+    }
+
+    /// The floor holds for an `R` closing a run as well: the anchor `P` is
+    /// under `GEN + 1`, `R` under `GEN`. The refusal keeps its own code
+    /// although a run is open, and nothing is quarantined, pinned or audited.
+    #[test]
+    fn an_accepted_revert_below_the_anchor_generation_is_refused() {
+        let w = world();
+        rotate(&w);
+        for _ in 0..3 {
+            push_next(&w);
+        }
+        relink(
+            &w,
+            &[(&w.me.sk, GEN + 1), (&author(), GEN + 1), (&w.me.sk, GEN)],
+        );
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let d = second(&w);
+        rotate(&w);
+        let out = d.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.headBelowKeyGeneration"), "{err:#}");
+        untouched_at(&w, 0);
+        assert!(!out.exists());
+    }
+
+    /// The floor is never applied to a head that joins the open run: a
+    /// withdrawn signer's head under `GEN` above `P` under `GEN + 1` still
+    /// quarantines, and an `R` under `GEN + 1` over it is accepted.
+    #[test]
+    fn a_revoked_signers_lower_generation_head_still_reverts() {
+        let w = world();
+        rotate(&w);
+        for _ in 0..3 {
+            push_next(&w);
+        }
+        let heads = relink(
+            &w,
+            &[(&w.me.sk, GEN + 1), (&author(), GEN), (&w.me.sk, GEN + 1)],
+        );
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let d = second(&w);
+        rotate(&w);
+        w.fake().listed = Some((2, Some(heads[1])));
+        let err = w.pull(&d.path().join("first")).unwrap_err();
+        assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
+        revoked_at(&w, 1);
+        w.fake().listed = None;
+        let out = d.path().join("out");
+        w.pull(&out).unwrap();
+        available_at(&w, 3, heads[2]);
+        assert_eq!(skipped(&w), [accepted_by(2, heads[2], 1)]);
+        assert_eq!(marker(&out), "v3");
+    }
+
+    /// The search below a withdrawn pin is exempt: the pin is under
+    /// `GEN + 1`, `P` below it under `GEN`, and a revert restores `P`
+    /// through `readable_key` and seals `R` under `GEN + 1`. The anchor is
+    /// then `P`, so the floor is `GEN`, not the withdrawn pin's `GEN + 1`
+    /// (execution note 5).
+    #[test]
+    fn a_p_below_a_withdrawn_pin_of_a_lower_generation_is_still_restored() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        push_next(&w);
+        let heads = relink(&w, &[(&w.me.sk, GEN), (&author(), GEN + 1)]);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, None, false));
+        let d = second(&w);
+        rotate(&w);
+        pin_at(&w, &d, &heads, 2);
+        let retired = Some(DeviceRevocationReason::Retired);
+        serve(&w, &author_pages_for(&w, T0 + 300 * DAY, retired, false));
+        let err = w.pull(&d.path().join("out")).unwrap_err();
+        assert!(has(&err, "sync.signerRevoked"), "{err:#}");
+        revoked_at(&w, 2);
+        let udd = d.path().join("profile");
+        std::fs::create_dir_all(&udd).unwrap();
+        std::fs::write(udd.join("marker"), b"local").unwrap();
+        assert_eq!(w.revert(&udd).unwrap().version, 3);
+        let r = r_on(&w, heads[1]);
+        available_at(&w, 3, r);
+        assert_eq!(marker(&udd), "v1", "P, read under GEN");
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&3]).unwrap();
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        assert_eq!(p.key_generation, GEN + 1, "R sealed under the newest");
+    }
+
+    /// After a restore transition the floor is the generation of the head
+    /// the transition pinned, read from its manifest: the binding's
+    /// `key_generation` column, which a transition does not write, is not
+    /// read (set lower here, it would let the head through).
+    #[test]
+    fn a_pull_after_a_restore_transition_takes_the_floor_from_the_pinned_head() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        push_next(&w);
+        push_next(&w);
+        let heads = [w.head_of(1), w.head_of(2), w.head_of(3)];
+        let h2 = heads[1];
+        let d = second(&w);
+        rotate(&w);
+        pin_at(&w, &d, &heads, 3);
+        w.fake().restore(2);
+        // A fixture bypassing the key that ties the column to its key row.
+        w.db()
+            .conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF; UPDATE profile_bindings SET key_generation = 1",
+            )
+            .unwrap();
+        let leaves = [
+            leaf(PROFILE, heads[2], h2),
+            leaf([0xc4; 16], [7; 32], [8; 32]),
+            leaf([0xc5; 16], [9; 32], [10; 32]),
+        ];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        resign(&w, 2, &w.me.sk, |p| {
+            p.target_version = 3;
+            p.base_version = 2;
+            p.previous_signed_head_hash = Some(h2);
+            p.restore_epoch = 1;
+            p.key_generation = GEN;
+            p.fkek_key_id = shardx_core::fleet_grants::fkek_key_id(&FKEK);
+        });
+        let out = d.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.headBelowKeyGeneration"), "{err:#}");
+        assert_eq!(
+            w.state(LOCAL),
+            ("AVAILABLE".into(), None, 1, 2, Some(h2.to_vec()))
+        );
+        assert_eq!(
+            w.count("SELECT key_generation FROM profile_bindings"),
+            GEN as i64
+        );
+        assert!(!out.exists());
+    }
+
+    /// `readable_key` still needs a grant that reverifies now (Q-26): with
+    /// the kept `GEN` grant record no longer equal to its bytes, a head
+    /// under `GEN` is refused and nothing is pinned.
+    #[test]
+    fn a_pull_refuses_an_older_generation_whose_grant_no_longer_reverifies() {
+        let w = world();
+        push_next(&w);
+        let d = second(&w);
+        rotate(&w);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE signed_authorization_records SET revoked_at_ms = issued_at_ms
+                 WHERE record_kind = 'FleetKeyGrantV2::DeviceHpkeGrant' AND generation = ?1",
+                [GEN as i64],
+            )
+            .unwrap();
+        let out = d.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.headUnderRetiredKey"), "{err:#}");
+        untouched_at(&w, 0);
+        assert!(!out.exists());
+    }
+
+    /// Cost b: once the `GEN` grant's window ends, a head under `GEN` is
+    /// unreadable, while the trust evidence and its signer are still valid.
+    /// The second device holds `GEN` from a grant that ends at `T0 + 2 DAY`.
+    #[test]
+    fn an_old_generation_head_is_unreadable_after_its_grant_window_ends() {
+        let mut w = world();
+        push_next(&w);
+        let mut g = DeviceHpkeGrantV2 {
+            common: CommonFields {
+                not_after_ms: T0 + 2 * DAY,
+                ..common(41)
+            },
+            fleet_id: FLEET,
+            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(&FKEK),
+            generation: GEN,
+            subject_account_id: w.me.to.account_id,
+            subject_device_id: w.me.to.device_id,
+            subject_signing_key_id: w.me.to.signing_key_id,
+            recipient_hpke_key_id: w.me.to.hpke_key_id,
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        };
+        shardx_core::grants::seal_device_fkek(&w.me.hpke_pk, &mut g, &FKEK).unwrap();
+        w.grant = build_record(&w.me.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode());
+        let d = second(&w);
+        rotate(&w);
+        assert!(readable_key(&w.db(), &w.dev, &FLEET, GEN, None, NOW).is_ok());
+        let out = d.path().join("out");
+        let err = w.pull_at(&out, T0 + 3 * DAY).unwrap_err();
+        assert!(has(&err, "sync.headUnderRetiredKey"), "{err:#}");
+        untouched_at(&w, 0);
+        assert!(!out.exists());
+    }
+
+    /// Cost a: a device holding only `GEN + 1` cannot open a head under
+    /// `GEN`, and is told so apart from a missing fleet key.
+    #[test]
+    fn a_device_without_the_old_key_gets_head_under_retired_key() {
+        let w = world();
+        push_next(&w);
+        let d = second(&w);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        rotate(&w);
+        let out = d.path().join("out");
+        let err = w.pull(&out).unwrap_err();
+        assert!(has(&err, "sync.headUnderRetiredKey"), "{err:#}");
+        assert!(!has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        untouched_at(&w, 0);
+        assert!(!out.exists());
+    }
+
+    /// Seal stays fresh-only: a checkout naming `GEN` after this device
+    /// verified `GEN + 1` is released and nothing is uploaded.
+    #[test]
+    fn sealing_under_an_older_generation_is_still_refused() {
+        let w = world();
+        rotate(&w);
+        {
+            let mut f = w.fake();
+            f.generation = None;
+            f.fkek_key_id = None;
+        }
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        assert_eq!(w.sent("POST", "/release").len(), 1);
+        assert!(w.sent("POST", "/uploads").is_empty());
+    }
+
+    /// Lazy re-seal: the first push after a rotation seals under `GEN + 1`.
+    #[test]
+    fn a_push_after_rotation_seals_under_the_newest_generation() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        push_next(&w);
+        let named = |v: u64| {
+            let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&v]).unwrap();
+            let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+            (p.key_generation, p.fkek_key_id)
+        };
+        let id = shardx_core::fleet_grants::fkek_key_id;
+        assert_eq!(named(1), (GEN, id(&FKEK)));
+        assert_eq!(named(2), (GEN + 1, id(&K2)));
     }
 
     /// Architect should 1: a pull that accepts `R1` and stops inside a later
