@@ -244,7 +244,9 @@ pub(crate) async fn check_root_grant(
 /// the closure path (Q-58) and evaluated to the bundle's anchor (which
 /// `check_pin` held equal to a pinned one), counts `subject` as a custodian
 /// now. The offline check proved only that the grant's issuer signed it. The
-/// evaluation is not recorded: the collect after the import records its own.
+/// evaluation is not recorded (the collect after the import records its
+/// own), but it opens the team database, creating an empty one on a fresh
+/// device, and may write the lapses and alerts any evaluation writes.
 async fn check_custodian(
     client: &FleetClient,
     access: &str,
@@ -1420,10 +1422,10 @@ mod tests {
     }
 
     /// A tenant anchored at `A0` whose custody `issuer` gave this device
-    /// (the bundle's): the trust evidence the server serves, and this
-    /// device's grant. `A0` issues only when `issuer` is `A0`; any other
-    /// issuer holds no custody. With `revoked`, this device then revoked
-    /// `A0` (the hand-over's last step).
+    /// (the bundle's), after `approver` approved it tenant-wide: the trust
+    /// evidence the server serves, and this device's grant. Only `A0` holds
+    /// custody; any other issuer or approver holds none. With `revoked`, this
+    /// device then revoked `A0` (the hand-over's last step).
     struct HandOver {
         anchor: [u8; 32],
         issuer: [u8; 32],
@@ -1431,7 +1433,7 @@ mod tests {
         page: shardx_core::trust_evidence::TenantTrustEvidencePageV2,
     }
 
-    fn hand_over(issuer_seed: [u8; 32], revoked: bool) -> HandOver {
+    fn hand_over(approver_seed: [u8; 32], issuer_seed: [u8; 32], revoked: bool) -> HandOver {
         use shardx_core::authz_record::{
             build_record, ApprovalScopeKind, Capability, CapabilityScopeKind, DeviceApprovalV2,
             DeviceRevocationReason, DeviceRevocationV2, GrantSubject, DOMAIN_DEVICE_APPROVAL,
@@ -1490,7 +1492,11 @@ mod tests {
             approval(&a0, &cx_a0, [0x40; 16]),
             crate::root_bootstrap::self_grant(&cx_a0, &a0, &a0_hpke, &TRK, [0x40; 16], now)
                 .unwrap(),
-            approval(&issuer, &me, [0x41; 16]),
+            approval(
+                &Ed25519SigningKey::from_bytes(&approver_seed),
+                &me,
+                [0x41; 16],
+            ),
             grant.clone(),
         ];
         containers.extend(a0_grants.unwrap().iter().map(|g| unhex_vec(g).unwrap()));
@@ -1533,6 +1539,13 @@ mod tests {
         ];
         if issuer_seed != a0_seed {
             keys.push(issuer.verifying_key().to_bytes());
+        }
+        if approver_seed != a0_seed && approver_seed != issuer_seed {
+            keys.push(
+                Ed25519SigningKey::from_bytes(&approver_seed)
+                    .verifying_key()
+                    .to_bytes(),
+            );
         }
         HandOver {
             anchor: cx_a0.signing_key_id,
@@ -1623,7 +1636,7 @@ mod tests {
     #[test]
     fn a_v4_bundle_of_a_non_anchor_custodian_opens_and_imports() {
         let f = fixture();
-        let h = hand_over([0xa0; 32], false);
+        let h = hand_over([0xa0; 32], [0xa0; 32], false);
         let (result, calls, _) = import_v4(&f, &h);
         result.unwrap();
         let reads = calls.iter().filter(|c| c.contains("/trust-evidence"));
@@ -1650,19 +1663,40 @@ mod tests {
     }
 
     /// Q-53: a grant from a key the chain never counted as a custodian is
-    /// refused before anything is written, though it opens offline.
+    /// refused, though it opens offline, whether that key also approved
+    /// this device or `A0` did. No state file is written; the evaluation
+    /// creates the team database but records nothing in it.
     #[test]
     fn a_v4_bundle_whose_issuer_is_not_a_custodian_is_refused() {
-        let f = fixture();
-        let h = hand_over([0x58; 32], false);
-        let (result, _, unchanged) = import_v4(&f, &h);
-        let err = result.unwrap_err().to_string();
-        assert!(
-            crate::errcode::has_code(&err, "recovery.rootGrantIssuerNotCustodian"),
-            "{err}"
-        );
-        assert!(unchanged);
-        assert!(!crate::store::custody_bootstrap_path().unwrap().exists());
+        let x = [0x58; 32];
+        for (what, approver) in [
+            ("approved by the issuer", x),
+            ("approved by A0", [0xa0; 32]),
+        ] {
+            let f = fixture();
+            let h = hand_over(approver, x, false);
+            let (result, _, unchanged) = import_v4(&f, &h);
+            let err = result.unwrap_err().to_string();
+            assert!(
+                crate::errcode::has_code(&err, "recovery.rootGrantIssuerNotCustodian"),
+                "{what}: {err}"
+            );
+            assert!(unchanged, "{what}");
+            assert!(!crate::store::custody_bootstrap_path().unwrap().exists());
+            let db = crate::team::db::Db::open().unwrap();
+            for table in [
+                "trust_anchors",
+                "trust_evaluations",
+                "trust_sightings",
+                "trust_custodian_keys",
+            ] {
+                let rows: i64 = db
+                    .conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(rows, 0, "{what}: {table}");
+            }
+        }
     }
 
     /// Q-53, D-5: once the new custodian revoked `A0`, its v4 bundle still
@@ -1672,7 +1706,7 @@ mod tests {
     #[test]
     fn a_v4_bundle_of_a_handed_over_custodian_imports_after_the_issuer_is_revoked() {
         let f = fixture();
-        let h = hand_over([0xa0; 32], true);
+        let h = hand_over([0xa0; 32], [0xa0; 32], true);
         let (result, calls, _) = import_v4(&f, &h);
         result.unwrap();
         let reads = calls.iter().filter(|c| c.contains("/trust-evidence"));
