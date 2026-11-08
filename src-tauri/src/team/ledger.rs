@@ -1997,4 +1997,155 @@ mod tests {
         assert!(blocked(&db, 0), "N stays blocked");
         assert!(!blocked(&db, 1), "the rotated N+1 is not");
     }
+
+    // ---- v2.10 hand-over: the assumption probes (U1) ----
+
+    /// `live` issued and starting at `t`.
+    fn live_from(replay: u8, t: u64) -> CommonFields {
+        CommonFields {
+            issued_at_ms: t,
+            not_before_ms: t,
+            ..live(replay)
+        }
+    }
+
+    /// Gate G1: member M last evaluated when A0 was the only custodian. Its
+    /// next evaluation first sees, together, A0's tenant approval and
+    /// `ExistingRootGrant` of B, B's own `device.revoke`, and B's revocation
+    /// of A0. The revocation counts, and B, first seen in that counting
+    /// evaluation, keeps its custody and approval in every later evaluation
+    /// ("Order"), while A0 is withdrawn.
+    #[test]
+    fn an_offline_member_keeps_the_new_custodian_seen_with_the_old_roots_revocation() {
+        let a = a0();
+        let b = Ed25519SigningKey::from_bytes(&[0x0b; 32]);
+        let (b_device, b_hpke) = ([0x0b; 16], [0x0c; 32]);
+        let me_b = GrantSubject::Device {
+            account_id: a.to.account_id,
+            device_id: b_device,
+            signing_key_id: id(&b),
+            hpke_key_id: b_hpke,
+        };
+        let capability = |issuer: &Ed25519SigningKey, subject, replay, t, capability| {
+            let g = TenantCapabilityGrantV2 {
+                common: live_from(replay, t),
+                subject,
+                scope_kind: CapabilityScopeKind::Tenant,
+                scope_id: B.tenant_id,
+                capability,
+            };
+            build_record(issuer, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let me_a = GrantSubject::Device {
+            account_id: a.to.account_id,
+            device_id: a.to.device_id,
+            signing_key_id: a.to.signing_key_id,
+            hpke_key_id: a.to.hpke_key_id,
+        };
+        let a_approves = capability(&a.sk, me_a, 20, T0, Capability::DeviceApprove);
+        let approval = DeviceApprovalV2 {
+            common: live_from(21, T0 + DAY),
+            subject_account_id: a.to.account_id,
+            subject_device_id: b_device,
+            subject_signing_key_id: id(&b),
+            subject_hpke_key_id: b_hpke,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: B.tenant_id,
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: live_from(22, T0 + 2 * DAY),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: a.to.account_id,
+            subject_device_id: b_device,
+            subject_signing_key_id: id(&b),
+            recipient_hpke_key_id: b_hpke,
+            subject_device_approval_replay_id: [21; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let revocation = DeviceRevocationV2 {
+            common: live_from(24, T0 + 4 * DAY),
+            subject_account_id: a.to.account_id,
+            subject_device_id: a.to.device_id,
+            subject_signing_key_id: a.to.signing_key_id,
+            subject_hpke_key_id: a.to.hpke_key_id,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        let hand_over = vec![
+            build_record(&a.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(&a.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+            capability(&b, me_b, 23, T0 + 3 * DAY, Capability::DeviceRevoke),
+            build_record(&b, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let anchor = a.to.signing_key_id;
+        assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
+        let mut evaluate_at = |pages: &[TenantTrustEvidencePageV2], now| {
+            let (seen, chain) = evaluate(&db, &B, &anchor, pages, now).unwrap().unwrap();
+            record(&mut db, &B, &seen, &chain, None, now).unwrap();
+            chain
+        };
+        let before = evidence(&a, false, vec![a_approves.clone()]);
+        assert!(evaluate_at(&before, T0 + DAY / 2).custodian_now(&anchor, T0 + DAY / 2));
+
+        let mut after = evidence(&a, false, [vec![a_approves], hand_over].concat());
+        after[0]
+            .signing_public_keys
+            .push(b.verifying_key().to_bytes());
+        after[0].device_revocations.push(RevokedDevice {
+            device_id: a.to.device_id,
+            revoked_at_ms: T0 + 4 * DAY,
+        });
+        for now in [T0 + 5 * DAY, T0 + 6 * DAY] {
+            let chain = evaluate_at(&after, now);
+            assert!(chain.custodian_now(&id(&b), now), "B is custodian at {now}");
+            assert!(!chain.custodian_now(&anchor, now), "A0 is not at {now}");
+            assert!(chain.approval_valid_at(&id(&b), Scope::Tenant, now));
+        }
+        assert!(
+            withdrawn(&db, &B, &anchor).unwrap(),
+            "A0's revocation counted"
+        );
+    }
+
+    /// Gate G5 (characterization, v2.11 input): this device collected
+    /// generation 1 under key `k1`, the rotation was then abandoned, and a
+    /// new rotation filed generation 1 again under `k1b`. The new grant
+    /// verifies and opens, but the ledger keeps the abandoned key's grant for
+    /// that number (rule 5: another key never replaces it), so only `k1`
+    /// verifies as generation 1 and `k1b` never does.
+    #[test]
+    fn a_cached_grant_of_an_abandoned_generation_meets_a_new_key_under_that_number() {
+        let a = a0();
+        let (k0, k1, k1b) = ([0x30; 32], [0x31; 32], [0x41; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        collect(&mut db, &a, 0, &k0, 40, evidence(&a, true, vec![]));
+        let more = rotation(&a, 1, &k1, &k0);
+        collect(&mut db, &a, 1, &k1, 41, evidence(&a, true, more));
+        let more = rotation(&a, 1, &k1b, &k0);
+        collect(&mut db, &a, 1, &k1b, 42, evidence(&a, true, more));
+
+        let kept: String = db
+            .conn
+            .query_row(
+                "SELECT fkek_key_id FROM trust_fleet_key_grants WHERE generation = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let k1_id = hex(&shardx_core::fleet_grants::fkek_key_id(&k1));
+        assert_eq!(kept, k1_id, "the abandoned key's grant stays");
+        assert_eq!(highest_generation(&db, &B, &FLEET).unwrap(), Some(1));
+        let pin = (B, a.to.signing_key_id);
+        let verifies = |k: &[u8; 32]| {
+            crate::fleet_key_verifies(&db, &pin, &a.to, &FLEET, 1, k, T0 + DAY).unwrap()
+        };
+        assert!(verifies(&k1), "the abandoned key still verifies as 1");
+        assert!(!verifies(&k1b), "the new key under that number never does");
+    }
 }

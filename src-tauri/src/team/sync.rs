@@ -1774,7 +1774,17 @@ pub(crate) async fn push(
     clock: &(dyn Fn() -> std::time::Duration + Sync),
 ) -> Result<Pushed> {
     settle_revert_swap(local, udd)?;
-    push_inner(client, access, dev, local, udd, now, clock, None).await
+    push_inner(
+        client,
+        access,
+        dev,
+        local,
+        Plain::Folder(udd),
+        now,
+        clock,
+        None,
+    )
+    .await
 }
 
 /// Whether the signer of `b`'s pinned head is proven revoked (rule 6): a
@@ -1839,8 +1849,18 @@ async fn source_withdrawn(
     ledger::withdrawn(db, &dev.pin.0, m.signer_signing_key_id())
 }
 
+/// What a seal packs: a profile folder, or the plaintext of a head opened
+/// from its ciphertext ([`opened`]), which needs no folder (v2.10 re-seal).
+#[derive(Clone, Copy)]
+enum Plain<'a> {
+    Folder(&'a Path),
+    // U3's re-seal is the production caller; until then only its spike test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Opened(&'a [u8]),
+}
+
 /// [`push`], or with `revert` the commit of `R` on that base (`Jn`'s version
-/// and head) from the staged `P` in `udd`: only then may a `SIGNER_REVOKED`
+/// and head) from the staged `P` in `src`: only then may a `SIGNER_REVOKED`
 /// quarantine check out, and only then is a revert lease continued.
 #[allow(clippy::too_many_arguments)]
 async fn push_inner(
@@ -1848,7 +1868,7 @@ async fn push_inner(
     access: &str,
     dev: &Device,
     local: &str,
-    udd: &Path,
+    src: Plain<'_>,
     now: u64,
     clock: &(dyn Fn() -> std::time::Duration + Sync),
     revert: Option<(u64, [u8; 32])>,
@@ -1928,7 +1948,7 @@ async fn push_inner(
                     let e = signer_revoked(&db, &b);
                     return Err(abandon(client, access, &mut db, &b, lease, e).await);
                 }
-                None => seal_snapshot(client, access, &mut db, dev, &b, lease, udd, now).await?,
+                None => seal_snapshot(client, access, &mut db, dev, &b, lease, src, now).await?,
                 Some(op) if op.state == "PENDING" => {
                     create_upload(client, access, &mut db, &b, lease, &op).await?
                 }
@@ -2307,7 +2327,17 @@ async fn revert_inner(
             base.unwrap_or((jn.version, jn.hash))
         }
     };
-    push_inner(client, access, dev, local, &staging, now, clock, Some(base)).await
+    push_inner(
+        client,
+        access,
+        dev,
+        local,
+        Plain::Folder(&staging),
+        now,
+        clock,
+        Some(base),
+    )
+    .await
 }
 
 // ------------------------------------------------------------- publish ----
@@ -3105,7 +3135,7 @@ async fn seal_snapshot(
     dev: &Device,
     b: &Bound,
     lease: LeaseRef,
-    udd: &Path,
+    src: Plain<'_>,
     now: u64,
 ) -> Result<()> {
     let g = granted(db, b, &lease)?;
@@ -3119,15 +3149,22 @@ async fn seal_snapshot(
         let e = anyhow!(code("sync.commitBlockedCompromised"));
         return Err(abandon(client, access, db, b, lease, e).await);
     }
-    let owned = udd.to_path_buf();
-    let plaintext = tokio::task::spawn_blocking(move || shardx_core::snapshot::pack(&owned))
-        .await
-        .map_err(|e| {
-            anyhow!(code_with(
-                "sync.sealTaskFailed",
-                &[("error", &e.to_string())]
-            ))
-        })??;
+    let packed;
+    let plaintext: &[u8] = match src {
+        Plain::Folder(udd) => {
+            let owned = udd.to_path_buf();
+            packed = tokio::task::spawn_blocking(move || shardx_core::snapshot::pack(&owned))
+                .await
+                .map_err(|e| {
+                    anyhow!(code_with(
+                        "sync.sealTaskFailed",
+                        &[("error", &e.to_string())]
+                    ))
+                })??;
+            &packed
+        }
+        Plain::Opened(plaintext) => plaintext,
+    };
     let (snapshot_id, manifest_replay_id) = (random::<16>()?, random::<16>()?);
     let dek = Zeroizing::new(random::<32>()?);
     let slot = build_dek_slot(
@@ -3174,7 +3211,7 @@ async fn seal_snapshot(
     )
     .map_err(|e| anyhow!("{e}"))?;
     let mut object = Vec::new();
-    let d = seal(&mut &plaintext[..], &mut object, &dek, &intent, &slot).map_err(|e| {
+    let d = seal(&mut &*plaintext, &mut object, &dek, &intent, &slot).map_err(|e| {
         anyhow!(code_with(
             "sync.sealTaskFailed",
             &[("error", &e.to_string())]
@@ -4789,6 +4826,30 @@ async fn restore(
     fkek: Zeroizing<[u8; 32]>,
     udd: &Path,
 ) -> Result<u64> {
+    let plaintext = opened(client, access, b, p, fkek).await?;
+    let target = udd.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        shardx_core::snapshot::unpack(&plaintext, &target)?;
+        Ok(plaintext.len() as u64)
+    })
+    .await
+    .map_err(|e| {
+        anyhow!(code_with(
+            "sync.restoreTaskFailed",
+            &[("error", &e.to_string())]
+        ))
+    })?
+}
+
+/// Fetches the ciphertext of `p` by `Range` and opens it under `fkek`: the
+/// plaintext a restore unpacks, or a re-seal seals again.
+async fn opened(
+    client: &FleetClient,
+    access: &str,
+    b: &Bound,
+    p: &SnapshotManifestV2,
+    fkek: Zeroizing<[u8; 32]>,
+) -> Result<Zeroizing<Vec<u8>>> {
     let mut object = Vec::with_capacity(p.ciphertext_size as usize);
     let etag = format!("\"{}\"", hex(&p.ciphertext_sha256));
     while (object.len() as u64) < p.ciphertext_size {
@@ -4808,9 +4869,8 @@ async fn restore(
         }
         object.extend_from_slice(&reply.body);
     }
-    let target = udd.to_path_buf();
     let p = p.clone();
-    tokio::task::spawn_blocking(move || -> Result<u64> {
+    tokio::task::spawn_blocking(move || -> Result<Zeroizing<Vec<u8>>> {
         let mut plaintext = Zeroizing::new(Vec::new());
         open(
             &mut std::io::Cursor::new(&object),
@@ -4833,8 +4893,7 @@ async fn restore(
             },
         )
         .map_err(|_| bad("envelope"))?;
-        shardx_core::snapshot::unpack(&plaintext, &target)?;
-        Ok(plaintext.len() as u64)
+        Ok(plaintext)
     })
     .await
     .map_err(|e| {
@@ -11579,6 +11638,75 @@ mod tests {
         let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
         assert_eq!(p.key_generation, GEN + 1);
         assert!(under_older_key(&w.dev.pin.0).unwrap().is_empty());
+    }
+
+    /// v2.10 U1 gate G2, the re-seal spike (RS-1): a device whose binding
+    /// never restored anything (a join's version-0 row) walks to the listed
+    /// head under `GEN` and pins it without a restore, opens its ciphertext
+    /// through `readable_key`, and seals that plaintext under `GEN + 1`
+    /// through the ops journal: one lease, one upload, one commit, pinned at
+    /// the new head. No step takes a profile folder, and a third device
+    /// pulls exactly the original files.
+    #[test]
+    fn a_head_reseals_from_its_ciphertext_without_a_profile_folder() {
+        let w = world();
+        push_next(&w);
+        let files = (marker(&w.udd), noise(&w.udd));
+        let d = second(&w);
+        rotate(&w);
+        let before = w.fake().log.len();
+        let pushed =
+            w.rt.block_on(async {
+                let mut db = Db::open()?;
+                let b = bound(&db, LOCAL)?;
+                assert_eq!(b.version, 0, "nothing restored here");
+                let head = listed(&w.client, "t", &mut db, &b).await?;
+                let walk = walked(&w.client, "t", &mut db, &w.dev, &b, &head, NOW).await?;
+                let (at, p) = walk.anchor.expect("the listed head");
+                let signed = (at.hash, at.signer);
+                pin(
+                    &mut db,
+                    &w.dev,
+                    &b,
+                    signed,
+                    &p,
+                    &walk.accepted,
+                    &walk.read,
+                    false,
+                    NOW,
+                )?;
+                let key_id = Some(&p.fkek_key_id);
+                let fkek = readable_key(&db, &w.dev, &b.fleet, p.key_generation, key_id, NOW)?;
+                let plaintext = opened(&w.client, "t", &b, &p, fkek).await?;
+                drop(db);
+                let src = Plain::Opened(&plaintext);
+                let clock = || std::time::Duration::ZERO;
+                push_inner(&w.client, "t", &w.dev, LOCAL, src, NOW, &clock, None).await
+            })
+            .unwrap();
+        assert_eq!(pushed.version, 2);
+        let calls: Vec<String> = w.fake().log[before..]
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
+        let posts = |tail: &str| {
+            calls
+                .iter()
+                .filter(|c| c.starts_with("POST") && c.ends_with(tail))
+                .count()
+        };
+        assert_eq!((posts("/checkout"), posts("/commit")), (1, 1), "{calls:?}");
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&2]).unwrap();
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        assert_eq!((p.key_generation, p.base_version), (GEN + 1, 1));
+        available_at(&w, 2, m.head_hash());
+        assert!(under_older_key(&w.dev.pin.0).unwrap().is_empty());
+
+        let _third = second(&w);
+        rotate(&w);
+        let out = d.path().join("out");
+        w.pull(&out).unwrap();
+        assert_eq!((marker(&out), noise(&out)), files);
     }
 
     /// The generation floor: a valid head under `GEN` advancing over a pin

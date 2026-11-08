@@ -207,13 +207,28 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+/// The port base of the tests up to v2.9: [`tenant_server`]'s range.
+const PORT_BASE: u16 = 20500;
+/// v2.10's real-server tests, slots 0-4 (U1, U2, U3, U5, U6): ports
+/// 29600-31499, above [`PORT_BASE`]'s reserved 29199, below the Linux
+/// ephemeral 32768, and clear of the server tests (28080-28512),
+/// `fleet_enrollment_it` (21500-22999), `fleet_sync_it` (24900-25999),
+/// OmniRoute (20128-20132), Hermes (8642), OpenViking (1933), Ollama
+/// (11434) and the ShardX API (40325).
+const V210_PORT_BASE: u16 = 29600;
+
 /// A server with one CLI-created tenant, on port slot `slot`, and device A
 /// enrolled, confirmed by the operator and bootstrapped as root custodian.
 fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
+    custodian_at(PORT_BASE, slot, slug, rt)
+}
+
+/// [`custodian`] on port slot `slot` above `base`.
+fn custodian_at(base: u16, slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
     let lock = crate::store::config_root_test_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let (server, tenant) = tenant_server(slot, slug);
+    let (server, tenant) = tenant_server_at(base, slot, slug);
 
     let (config, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     crate::store::set_config_root(Some(config.path().to_path_buf()));
@@ -270,6 +285,11 @@ fn custodian(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Harness {
 /// A running server, on port slot `slot`, with one CLI-created tenant
 /// `slug`, and that tenant's id.
 fn tenant_server(slot: u16, slug: &str) -> (Server, String) {
+    tenant_server_at(PORT_BASE, slot, slug)
+}
+
+/// [`tenant_server`] on port slot `slot` above `base`.
+fn tenant_server_at(base: u16, slot: u16, slug: &str) -> (Server, String) {
     let bin = server_binary();
     assert!(
         bin.exists(),
@@ -282,7 +302,7 @@ fn tenant_server(slot: u16, slug: &str) -> (Server, String) {
     // 32768 and clear of OmniRoute's 20128-20132. The range overlaps the
     // `fleet_enrollment_it` (21500) and `fleet_sync_it` (24900) bases, which
     // is safe only because cargo runs test binaries one at a time.
-    let port = 20500 + (std::process::id() % 300) as u16 + slot * 400;
+    let port = base + (std::process::id() % 300) as u16 + slot * 400;
     let (data, identity) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     Server::cli(data.path(), identity.path(), &["identity", "init"], "");
     let created = Server::cli(
@@ -802,7 +822,12 @@ fn two_devices_share_a_profile_through_a_real_server_after_approval() {
 /// The S3 journey (plan section 5): B enrolls, A approves it, B joins and
 /// collects, and the two pass one profile back and forth.
 fn shared_profile(slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journey {
-    let h = custodian(slot, slug, rt);
+    shared_profile_at(PORT_BASE, slot, slug, rt)
+}
+
+/// [`shared_profile`] on port slot `slot` above `base`.
+fn shared_profile_at(base: u16, slot: u16, slug: &str, rt: &tokio::runtime::Runtime) -> Journey {
+    let h = custodian_at(base, slot, slug, rt);
     let (user, pass) = account();
     let fleet_ref = format!("fleet-key.{}.0", h.tenant);
     let held = |r: &str| crate::credential::load(r).map(|k| *k);
@@ -2687,4 +2712,324 @@ fn the_journey_leak_scan_worker() {
         .join("\n"),
     )
     .unwrap();
+}
+
+/// The facts the acting device's records name on `instance` at epoch 0.
+fn context16(instance: [u8; 16]) -> crate::root_bootstrap::Context16 {
+    let c = crate::team_config::load().unwrap();
+    let (_, hpke) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
+    let id = |s: &str| crate::fleet_client::decode_hex16(s, "id").unwrap();
+    crate::root_bootstrap::Context16 {
+        tenant: id(&c.tenant_id),
+        instance,
+        epoch: 0,
+        account: id(&c.account_id),
+        device: id(&c.device_id),
+        signing_key_id: shardx_core::keys::signing_key_id(
+            c.signing_key().unwrap().verifying_key().as_bytes(),
+        ),
+        hpke_key_id: shardx_core::keys::hpke_key_id(&hpke),
+    }
+}
+
+/// v2.10 U1 gate G3 (D11): root custodian A approves B tenant-wide and files
+/// an `ExistingRootGrant` of the ACTIVE root to it, with B's grant of the
+/// ACTIVE fleet generation N; B acknowledges the root grant, files its six
+/// own capability grants, collects and acknowledges A's grant of N, then
+/// files and acknowledges its own grant of N, which the server accepts. The
+/// `root-key-grants` listing shape B reads is recorded on the way.
+#[test]
+fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_a_real_server() {
+    use shardx_core::authz_record::*;
+    use shardx_core::fleet_lifecycle::{
+        FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
+        RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
+    };
+    use shardx_core::mutation::*;
+    let rt = runtime();
+    let h = custodian_at(V210_PORT_BASE, 0, "v210-appoint", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let fleet = h.tenant.clone();
+    let tenant16 = crate::fleet_client::decode_hex16(&h.tenant, "tenant").unwrap();
+    let root = crate::root_bootstrap::load().unwrap();
+    let instance = crate::fleet_client::decode_hex16(&root.server_instance_id, "instance").unwrap();
+    let a = crate::team_config::load().unwrap();
+    let a_signer = a.signing_key().unwrap();
+    let (a_hpke_sk, _) = shardx_core::grants::derive_keypair(&a.hpke_seed().unwrap());
+    let self_grant = crate::root_bootstrap::unhex_vec(&root.self_grant).unwrap();
+    let (g0, _) = crate::root_bootstrap::own_grant(&self_grant, &a_signer).unwrap();
+    let trk = g0.open_trk(&a_hpke_sk).unwrap();
+    let fkek = crate::credential::load(&format!("fleet-key.{fleet}.0")).unwrap();
+    let cx_a = context16(instance);
+    let request = |cx: &crate::root_bootstrap::Context16, kind, payload: Vec<u8>| {
+        let bytes = cx.request(kind, payload).unwrap();
+        (IdempotentMutationRequestV2::parse(&bytes).unwrap(), bytes)
+    };
+
+    // B enrolls and reads its join code.
+    let b = fresh_device("b", h.server.url(), h.tenant.clone());
+    let b_id = call(
+        &rt,
+        crate::team_enroll_device("appointee".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    let cx_b = context16(instance);
+
+    // 1. A: the tenant approval, the root grant sealed to B's listed HPKE
+    // key, and B's grant of N, each filed and read back.
+    h.act_as_a();
+    let now = crate::root_bootstrap::now_ms();
+    with_session(&rt, &h, async |client, access| {
+        let row = client
+            .list_tenant_devices(access, &h.tenant)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.device_id == b_id)
+            .expect("B's row");
+        let hpke_pk: [u8; 32] = crate::fleet_client::decode_hex(&row.hpke_public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(shardx_core::keys::hpke_key_id(&hpke_pk), cx_b.hpke_key_id);
+        let approval = DeviceApprovalV2 {
+            common: cx_a.common(crate::root_bootstrap::random().unwrap(), now),
+            subject_account_id: cx_b.account,
+            subject_device_id: cx_b.device,
+            subject_signing_key_id: cx_b.signing_key_id,
+            subject_hpke_key_id: cx_b.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: tenant16,
+        };
+        let replay = approval.common.replay_id;
+        let approval = build_record(&a_signer, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+        client
+            .approve_device(access, &b_id, &approval)
+            .await
+            .unwrap();
+
+        let mut g = TenantRootKeyGrantV2 {
+            common: cx_a.common(crate::root_bootstrap::random().unwrap(), now),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: g0.root_key_id,
+            root_generation: 0,
+            subject_account_id: cx_b.account,
+            subject_device_id: cx_b.device,
+            subject_signing_key_id: cx_b.signing_key_id,
+            recipient_hpke_key_id: cx_b.hpke_key_id,
+            subject_device_approval_replay_id: replay,
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let sealed = shardx_core::grants::seal_trk(&hpke_pk, &g.scope(), &trk).unwrap();
+        g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+        g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+        let container = build_record(&a_signer, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode());
+        let filing = TenantRootGrantCreateV2 {
+            grant: crate::root_bootstrap::own_grant(&container, &a_signer)
+                .unwrap()
+                .1,
+            exact_signed_grant_container_bytes: container,
+        };
+        let (req, bytes) = request(&cx_a, OperationKind::RootGrantCreate, filing.encode());
+        let stored = client
+            .file_root_grant(access, &h.tenant, 0, &bytes)
+            .await
+            .unwrap();
+        let created = TenantRootGrantCreatedV2::parse(
+            &crate::root_bootstrap::stored_payload(&stored, &req, RECORD_TYPE_ROOT_GRANT_CREATED)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created.grant, filing.grant);
+        assert_eq!(created.grant_variant, "ExistingRootGrant");
+
+        let keys = (cx_b.signing_key_id, cx_b.hpke_key_id, hpke_pk);
+        let ids = (cx_b.account, cx_b.device);
+        let grant =
+            crate::fleet_custody::member_grant(&cx_a, &a_signer, ids, keys, &fkek, 0, now).unwrap();
+        let grant = crate::root_bootstrap::unhex_vec(&grant).unwrap();
+        client
+            .file_fleet_grant(access, &fleet, 0, &grant)
+            .await
+            .unwrap();
+    });
+
+    // 2. B pins A0, reads its root grant from the listing and the evidence,
+    // acknowledges it and files its six own capability grants.
+    b.act_as_b();
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    let b_config = crate::team_config::load().unwrap();
+    let b_signer = b_config.signing_key().unwrap();
+    let (b_hpke_sk, b_hpke_pk) =
+        shardx_core::grants::derive_keypair(&b_config.hpke_seed().unwrap());
+    let a_vk = a_signer.verifying_key().to_bytes();
+    with_session(&rt, &h, async |client, access| {
+        // The listing: one grant, with its variant, generation and HPKE wrap
+        // only. `RootKeyGrant` keeps no container, so the grant to
+        // acknowledge comes from the trust evidence.
+        let listed = client
+            .root_key_grants(access, &h.tenant, &b_id)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].grant_variant.as_str(), listed[0].root_generation),
+            ("ExistingRootGrant", 0)
+        );
+        assert_eq!(listed[0].root_key_id, hex(&g0.root_key_id));
+        assert_eq!(listed[0].recipient_hpke_key_id, hex(&cx_b.hpke_key_id));
+        let pages = client.trust_evidence(access, &h.tenant).await.unwrap();
+        let container = pages
+            .iter()
+            .flat_map(|p| &p.containers)
+            .find(|c| {
+                AuthorizationRecord::parse(c)
+                    .and_then(|r| r.verify_signature(&a_vk))
+                    .is_ok_and(|v| {
+                        matches!(v.payload(), Payload::TenantRootKeyGrant(g)
+                            if g.subject_signing_key_id == cx_b.signing_key_id)
+                    })
+            })
+            .expect("B's root grant in the evidence")
+            .clone();
+        let (g, grant) = crate::root_bootstrap::own_grant(&container, &a_signer).unwrap();
+        assert_eq!(*g.open_trk(&b_hpke_sk).unwrap(), *trk, "B opens the TRK");
+        let ack = TenantRootGrantAckV2 {
+            grant: grant.clone(),
+        };
+        let (req, bytes) = request(&cx_b, OperationKind::RootGrantAck, ack.encode());
+        let replay = hex(&grant.replay_id);
+        let stored = client
+            .ack_root_grant(access, &h.tenant, 0, &replay, &bytes)
+            .await
+            .unwrap();
+        let acked = TenantRootGrantAckedV2::parse(
+            &crate::root_bootstrap::stored_payload(&stored, &req, RECORD_TYPE_ROOT_GRANT_ACKED)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(acked.grant, grant);
+
+        let me = GrantSubject::Device {
+            account_id: cx_b.account,
+            device_id: cx_b.device,
+            signing_key_id: cx_b.signing_key_id,
+            hpke_key_id: cx_b.hpke_key_id,
+        };
+        let own = crate::fleet_custody::own_grants(&cx_b, tenant16);
+        let grants =
+            crate::fleet_custody::capability_grants(&cx_b, &b_signer, &me, own, now).unwrap();
+        for g in grants {
+            let g = crate::root_bootstrap::unhex_vec(&g).unwrap();
+            assert_eq!(client.file_capability_grant(access, &g).await.unwrap(), g);
+        }
+    });
+
+    // 3. B collects A's grant of N and acknowledges it.
+    let report = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            &report["grants"],
+            &report["opened"],
+            &report["fleet_opened"]
+        ),
+        (&1.into(), &1.into(), &1.into()),
+        "{report}"
+    );
+    let (b_fkek, generation) = crate::fleet_keys::load()
+        .unwrap()
+        .active_key(&h.tenant)
+        .expect("B holds N");
+    assert_eq!((b_fkek, generation), (*fkek, 0));
+
+    // 4. B files and acknowledges its own grant of N.
+    with_session(&rt, &h, async |client, access| {
+        let hpke_pk: [u8; 32] = b_hpke_pk.clone().try_into().unwrap();
+        let keys = (cx_b.signing_key_id, cx_b.hpke_key_id, hpke_pk);
+        let ids = (cx_b.account, cx_b.device);
+        let saved =
+            crate::fleet_custody::member_grant(&cx_b, &b_signer, ids, keys, &b_fkek, 0, now)
+                .unwrap();
+        let bytes = crate::root_bootstrap::unhex_vec(&saved).unwrap();
+        let req = IdempotentMutationRequestV2::parse(&bytes).unwrap();
+        let filing = FleetKeyGrantCreateV2::parse(&req.canonical_payload_bytes).unwrap();
+        let stored = client
+            .file_fleet_grant(access, &fleet, 0, &bytes)
+            .await
+            .unwrap();
+        let created = FleetKeyGrantCreatedV2::parse(
+            &crate::root_bootstrap::stored_payload(&stored, &req, RECORD_TYPE_FLEET_GRANT_CREATED)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created.grant, filing.grant);
+        let ack = FleetKeyGrantAckV2 {
+            grant: filing.grant,
+        };
+        let (req, bytes) = request(&cx_b, OperationKind::FleetGrantAck, ack.encode());
+        let stored = client
+            .ack_fleet_grant(access, &fleet, 0, &bytes)
+            .await
+            .unwrap();
+        let acked = FleetKeyGrantAckedV2::parse(
+            &crate::root_bootstrap::stored_payload(&stored, &req, RECORD_TYPE_FLEET_GRANT_ACKED)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(acked.grant, filing.grant);
+    });
+    let of_b = |extra: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{b_id}' {extra}"
+        ))
+    };
+    assert_eq!(of_b(""), 2, "A's grant of N and B's own");
+    assert_eq!(of_b("AND acked_at IS NOT NULL"), 2);
+    let audited = |action: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_audit_events WHERE action = '{action}'"
+        ))
+    };
+    // The bootstrap's own acknowledgement, then B's.
+    let root = (audited("root.grant_create"), audited("root.grant_ack"));
+    assert_eq!(root, (1, 2));
+
+    // 5. A verified collect now reads B's own grant of N back, and the
+    // ledger keeps it as the grant behind N.
+    let report = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(report["fleet_opened"], 1, "{report}");
+    let kept: Vec<u8> = crate::team::db::Db::open()
+        .unwrap()
+        .conn
+        .query_row(
+            "SELECT exact_signed_container_bytes FROM trust_fleet_key_grants
+              WHERE generation = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let issuer = *shardx_core::authz_record::AuthorizationRecord::parse(&kept)
+        .unwrap()
+        .issuer_signing_key_id();
+    assert_eq!(issuer, cx_b.signing_key_id, "B's own grant behind N");
 }
