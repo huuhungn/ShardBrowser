@@ -1494,7 +1494,7 @@ fn refused_for_good(e: &anyhow::Error) -> bool {
 
 /// The most signers one trust evidence request may name (`MAX_SIGNERS`,
 /// `server/src/routes/v2_trust.rs`).
-const MAX_SIGNERS: usize = 64;
+pub(crate) const MAX_SIGNERS: usize = 64;
 
 /// Where a rotation stands.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2046,11 +2046,18 @@ pub async fn grant_members(
     let mut eligible = Vec::new();
     for batch in listed.chunks(MAX_SIGNERS) {
         let signers: Vec<[u8; 32]> = batch.iter().map(|(_, _, k)| k.0).collect();
-        let pages = client
-            .trust_evidence_of(access, me.tenant_id, &signers)
-            .await?;
+        let (pages, closure) = crate::team::ledger::closure_evidence(
+            client,
+            access,
+            me.tenant_id,
+            ledger.db,
+            ledger.pin,
+            &signers,
+            now,
+        )
+        .await?;
         let (seen, chain) = ledger.evaluate(&pages, now)?;
-        crate::team::ledger::record(ledger.db, &ledger.pin.0, &seen, &chain, None, now)?;
+        crate::team::ledger::record(ledger.db, &ledger.pin.0, &seen, &chain, None, closure, now)?;
         for (id, ids, keys) in batch {
             let skip =
                 if state.revocations.contains_key(id) || chain.reported_revoked_at(&keys.0, now) {
@@ -4225,6 +4232,8 @@ pub(crate) mod tests {
         devices: Vec<TenantDevice>,
         custodian_pk: [u8; 32],
         base: Vec<Vec<u8>>,
+        /// The keys of other signers of `base`.
+        base_keys: Vec<[u8; 32]>,
         by_signer: BySigner,
         evidence_down: bool,
         refuse: Option<Refuse>,
@@ -4378,6 +4387,7 @@ pub(crate) mod tests {
                     let query = c.split_once('?').map_or("", |(_, q)| q);
                     let mut containers = self.base.clone();
                     let mut keys = vec![self.custodian_pk];
+                    keys.extend(&self.base_keys);
                     for signer in query.split('&').filter_map(|kv| kv.strip_prefix("signer=")) {
                         let signer = decode_hex32(signer, "signer").unwrap();
                         if let Some((pk, more)) = self.by_signer.get(&signer) {
@@ -4760,6 +4770,7 @@ pub(crate) mod tests {
                 now,
                 db,
                 "https://fleet.test",
+                true,
             )
             .unwrap()
             .expect("the own grant verifies");
@@ -5445,6 +5456,133 @@ pub(crate) mod tests {
             [(b.device_id.clone(), "skipped:no-approval".to_string())]
         );
         assert!(rig.bodies("/grants").is_empty());
+    }
+
+    /// G6 (U1b): an imported custodian rotates after a custodian revocation.
+    /// The fixture's custodian F appointed X; X approved member M, let it
+    /// commit and granted it generation 0; then F revoked X. The collect
+    /// after the import counted X's revocation through the closure path, so
+    /// M's X-issued approval, first seen in that counting evaluation, still
+    /// names M's keys when the member step evaluates it, and M gets N+1. X
+    /// stands for the outgoing root A0; the custodian here is the anchor.
+    #[test]
+    fn a_rotation_after_the_hand_over_grants_every_pre_hand_over_member() {
+        use shardx_core::authz_record::{
+            RootGrantVariant, TenantRootKeyGrantV2, DOMAIN_TENANT_ROOT_KEY_GRANT,
+        };
+        let f = fixture();
+        let m = peer(1);
+        let mut rig = at_members(&f, vec![m.clone()]);
+        let now = rig.now;
+        let mut state = load().unwrap();
+        state.imported = true;
+        state.create_request.clear();
+        state.members.clear();
+        save(&state).unwrap();
+
+        let x = Ed25519SigningKey::from_bytes(&[0x58; 32]);
+        let (_, x_pk) = derive_keypair(&[0x59; 32]);
+        let cx_x = Context16 {
+            device: [0x58; 16],
+            signing_key_id: signing_key_id(x.verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&x_pk),
+            ..f.cx
+        };
+        let x_subject = GrantSubject::Device {
+            account_id: cx_x.account,
+            device_id: cx_x.device,
+            signing_key_id: cx_x.signing_key_id,
+            hpke_key_id: cx_x.hpke_key_id,
+        };
+        let approval = DeviceApprovalV2 {
+            common: f.cx.common([0x50; 16], now),
+            subject_account_id: cx_x.account,
+            subject_device_id: cx_x.device,
+            subject_signing_key_id: cx_x.signing_key_id,
+            subject_hpke_key_id: cx_x.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: f.cx.tenant,
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: f.cx.common([0x51; 16], now),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: cx_x.account,
+            subject_device_id: cx_x.device,
+            subject_signing_key_id: cx_x.signing_key_id,
+            recipient_hpke_key_id: cx_x.hpke_key_id,
+            subject_device_approval_replay_id: [0x50; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let revocation = DeviceRevocationV2 {
+            common: f.cx.common([0x52; 16], now),
+            subject_account_id: cx_x.account,
+            subject_device_id: cx_x.device,
+            subject_signing_key_id: cx_x.signing_key_id,
+            subject_hpke_key_id: cx_x.hpke_key_id,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        let (signing, hpke, hpke_pk) = listed_keys(&m).unwrap();
+        let ids = (
+            decode_hex16(&m.account_id, "a").unwrap(),
+            decode_hex16(&m.device_id, "d").unwrap(),
+        );
+        let m_approval = DeviceApprovalV2 {
+            common: cx_x.common([0x53; 16], now),
+            subject_account_id: ids.0,
+            subject_device_id: ids.1,
+            subject_signing_key_id: signing,
+            subject_hpke_key_id: hpke,
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: f.cx.tenant,
+        };
+        let to_m = member_grant(&cx_x, &x, ids, (signing, hpke, hpke_pk), &OLD_FKEK, 0, now);
+        let to_m = saved_request(&to_m.unwrap()).unwrap();
+        let to_m = FleetKeyGrantCreateV2::parse(&to_m.canonical_payload_bytes).unwrap();
+        let x_grants =
+            capability_grants(&cx_x, &x, &x_subject, own_grants(&cx_x, f.cx.tenant), now).unwrap();
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            rot.base.extend([
+                build_record(&f.signer, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+                build_record(&f.signer, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+                build_record(&f.signer, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+                to_m.exact_signed_grant_container_bytes,
+            ]);
+            rot.base
+                .extend(x_grants.iter().map(|g| unhex_vec(g).unwrap()));
+            rot.base_keys.push(x.verifying_key().to_bytes());
+            let m_pk = decode_hex32(&m.signing_public_key, "pk").unwrap();
+            let m_approval = build_record(&x, DOMAIN_DEVICE_APPROVAL, &m_approval.encode());
+            rot.by_signer.insert(signing, (m_pk, vec![m_approval]));
+        }
+
+        // The collect after the import reads and records its evidence as
+        // `collect_fleet_grant` does.
+        let pin = f.pin();
+        let (pages, closure) = rig
+            .rt
+            .block_on(crate::team::ledger::closure_evidence(
+                &rig.client,
+                "access",
+                &f.tenant,
+                &mut rig.db,
+                &pin,
+                &[],
+                now,
+            ))
+            .unwrap();
+        let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &pages, now)
+            .unwrap()
+            .unwrap();
+        crate::team::ledger::record(&mut rig.db, &pin.0, &seen, &chain, None, closure, now)
+            .unwrap();
+        assert!(crate::team::ledger::withdrawn(&rig.db, &pin.0, &cx_x.signing_key_id).unwrap());
+
+        rig.members(&f, now).unwrap();
+        assert_eq!(results(), [(m.device_id.clone(), "filed".to_string())]);
     }
 
     #[test]

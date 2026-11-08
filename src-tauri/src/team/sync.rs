@@ -1200,7 +1200,8 @@ async fn accept_transitions(
     // that is no root grant subject is refused, fail-closed, as
     // RESTORE_EPOCH_TRANSITION_INVALID; name the leaf's signer when restore
     // transitions come into scope after the v0.2.2a slice.
-    let pages = client.trust_evidence(access, &hex(&b.tenant)).await?;
+    let (pages, closure) =
+        ledger::closure_evidence(client, access, &hex(&b.tenant), db, &dev.pin, &[], now).await?;
     let evaluated = ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?;
     let chain = evaluated.as_ref().map(|(_, c)| c);
     // A reborrow moves in: the future stays Send across its awaits.
@@ -1327,7 +1328,7 @@ async fn accept_transitions(
         // against the revocations this same evaluation counts.
         let record = |tx: &rusqlite::Connection| -> Result<bool> {
             if let Some((seen, c)) = &evaluated {
-                ledger::record_in(tx, &dev.pin.0, seen, c, None, now)?;
+                ledger::record_in(tx, &dev.pin.0, seen, c, None, closure, now)?;
             }
             match signer {
                 Some(s) => Ok(!ledger::withdrawn_in(tx, &dev.pin.0, &s)?),
@@ -1347,7 +1348,7 @@ async fn accept_transitions(
     // In its own transaction, and never in place of the refusal: a record
     // that fails leaves nothing behind, and the next evaluation records.
     if let Some((seen, c)) = &evaluated {
-        if let Err(e) = ledger::record(db, &dev.pin.0, seen, c, None, now) {
+        if let Err(e) = ledger::record(db, &dev.pin.0, seen, c, None, closure, now) {
             eprintln!("[sync] trust ledger: {e:#}");
         }
     }
@@ -4563,12 +4564,13 @@ async fn walked(
         );
     }
     let signers: Vec<[u8; 32]> = signers.into_iter().collect();
-    let pages = client
-        .trust_evidence_of(access, &hex(&b.tenant), &signers)
-        .await?;
+    // D12: a closure this walk triggers names its head signers too.
+    let (pages, closure) =
+        ledger::closure_evidence(client, access, &hex(&b.tenant), db, &dev.pin, &signers, now)
+            .await?;
     let (seen, chain) =
         ledger::evaluate(db, &dev.pin.0, &dev.pin.1, &pages, now)?.ok_or_else(untrusted)?;
-    ledger::record(db, &dev.pin.0, &seen, &chain, None, now)?;
+    ledger::record(db, &dev.pin.0, &seen, &chain, None, closure, now)?;
     let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
         .iter()
         .flat_map(|p| &p.signing_public_keys)
@@ -5222,6 +5224,9 @@ mod tests {
         version: Option<u64>,
     }
 
+    /// A signer's public key and the containers served for it.
+    type Named = ([u8; 32], Vec<Vec<u8>>);
+
     /// The server side of `v2_profiles`/`v2_uploads`, reduced to what the
     /// client depends on: stored exact responses replayed by idempotency key,
     /// one lease per profile, exact-offset PATCH, READY before commit.
@@ -5294,6 +5299,11 @@ mod tests {
         on_list: Option<String>,
         /// SQL another ledger writer runs when a snapshot object is served.
         on_snapshot: Option<String>,
+        /// Trust evidence served only to a request naming its signer: the
+        /// signer's public key and containers, by signing key ID.
+        named: HashMap<[u8; 32], Named>,
+        /// The signers each trust evidence request named, while `named` is set.
+        asked: Vec<Vec<[u8; 32]>>,
     }
 
     fn take(list: &mut Vec<&'static str>, tag: &str) -> bool {
@@ -5848,6 +5858,24 @@ mod tests {
             let body = f.refused_body.clone().unwrap_or(b"refused".to_vec());
             return reply(status, &[("retry-after", "0".into())], body);
         }
+        if tag == "trust-evidence" && !f.named.is_empty() {
+            let asked: Vec<[u8; 32]> = uri
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .filter_map(|kv| kv.strip_prefix("signer="))
+                .map(|s| crate::fleet_client::decode_hex32(s, "signer").unwrap())
+                .collect();
+            let mut page = TenantTrustEvidencePageV2::parse(&f.pages).unwrap();
+            for s in &asked {
+                if let Some((pk, more)) = f.named.get(s) {
+                    page.signing_public_keys.push(*pk);
+                    page.containers.extend(more.iter().cloned());
+                }
+            }
+            f.asked.push(asked);
+            return reply(200, &[], page.encode());
+        }
         let r = f.route(&method, &parts, &headers, &body);
         if take(&mut f.lose, tag) {
             return reply(503, &[], Vec::new());
@@ -6066,6 +6094,7 @@ mod tests {
                 NOW,
                 &mut db,
                 "https://fleet.test",
+                true,
             )
             .unwrap()
             .expect("the grant verifies");
@@ -7872,6 +7901,7 @@ mod tests {
                 NOW,
                 &mut db,
                 "https://fleet.test",
+                true,
             )
             .unwrap();
             assert!(opened.is_some(), "generation {generation} verifies");
@@ -8720,6 +8750,7 @@ mod tests {
             NOW,
             &mut db,
             "https://fleet.test",
+            true,
         )
         .unwrap()
         .expect("generation 2 verifies");
@@ -10933,6 +10964,67 @@ mod tests {
 
     fn serve(w: &World, p: &[TenantTrustEvidencePageV2]) {
         w.fake().pages = p[0].encode();
+    }
+
+    /// Execution note 2 (U1b): a walk whose evidence would first count a
+    /// custodian's revocation reads it again as a closure listing, which
+    /// names the signers of the heads it walks as well, so a head whose
+    /// signer's approval the server serves only when asked for still
+    /// verifies.
+    #[test]
+    fn a_walk_that_triggers_the_closure_still_verifies_its_new_heads() {
+        let w = world();
+        let mut only_named = author_pages(&w, T0 + 300 * DAY, false, false);
+        let served = only_named[0].containers.len();
+        let k = committer(&w, &mut only_named, 0x20, T0 + 300 * DAY);
+        let k_records = only_named[0].containers.split_off(served);
+        let heads = chain_of(&w, &[&w.me.sk, &k]);
+        let d = second(&w);
+        pin_at(&w, &d, &heads, 1);
+
+        // The server now serves custodian E, which this device appointed and
+        // then revoked, and K's approval only to a request naming K.
+        let mut p = author_pages(&w, T0 + 300 * DAY, false, false);
+        revoker(&w, &mut p, 0x30, T0 + 300 * DAY, None);
+        let e = Ed25519SigningKey::from_bytes(&[0x30; 32]);
+        let revoke = TenantCapabilityGrantV2 {
+            common: common(0x40),
+            subject: device_subject(&w.me),
+            scope_kind: CapabilityScopeKind::Tenant,
+            scope_id: TENANT,
+            capability: Capability::DeviceRevoke,
+        };
+        let at = T0 + DAY / 2;
+        let revocation = DeviceRevocationV2 {
+            common: CommonFields {
+                issued_at_ms: at,
+                not_before_ms: at,
+                ..common(0x41)
+            },
+            subject_account_id: [0x30; 16],
+            subject_device_id: [0x31; 16],
+            subject_signing_key_id: key_id_of(&e),
+            subject_hpke_key_id: [0x30; 32],
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        p[0].containers.extend([
+            build_record(&w.me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &revoke.encode()),
+            build_record(&w.me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ]);
+        serve(&w, &p);
+        w.fake()
+            .named
+            .insert(key_id_of(&k), (k.verifying_key().to_bytes(), k_records));
+
+        w.pull(&d.path().join("out")).unwrap();
+        available_at(&w, 2, heads[1]);
+        assert!(ledger::withdrawn(&w.db(), &w.dev.pin.0, &key_id_of(&e)).unwrap());
+        let asked = w.fake().asked.clone();
+        assert_eq!(asked.len(), 2, "the walk's read, then the closure");
+        assert!(
+            asked[1].contains(&key_id_of(&k)),
+            "the closure names the walked head's signer"
+        );
     }
 
     /// A link at the version above `below`, chained on it.

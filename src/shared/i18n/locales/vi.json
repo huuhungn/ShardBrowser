@@ -369,6 +369,8 @@
   "recovery.rootGrantMissing": "Máy chủ nhóm không giữ quyền khoá gốc của thiết bị này ở trạng thái đã xác nhận và đang hiệu lực",
   "recovery.importedCollectFailed": "Đã nhập gói khôi phục, nhưng nhận khoá đội máy thất bại; hãy bấm Nhận quyền giữ khoá để thử lại: {error}",
   "fleet.trustEvidenceRefused": "Bằng chứng tin cậy của máy chủ nhóm không xác minh được thiết bị này là mốc khởi tạo và người giữ khóa của tenant",
+  "fleet.trustClosureTooLarge": "Bằng chứng tin cậy của máy chủ nhóm thu hồi một thiết bị giữ khoá gốc, và việc kiểm tra mọi thiết bị mà nó đã duyệt cần hơn 64 thiết bị trong một yêu cầu, điều phiên bản này chưa làm được. Đồng bộ nhóm trên thiết bị này tạm dừng cho tới một phiên bản sau; chưa có gì bị thay đổi.",
+  "fleet.trustClosureNeeded": "Bằng chứng tin cậy của máy chủ nhóm thu hồi một thiết bị giữ khoá gốc và phải được đọc lại cùng mọi thiết bị mà nó đã duyệt; chưa có gì bị thay đổi. Hãy thử lại.",
   "fleet.refusedSession": "Máy chủ nhóm từ chối mở phiên cho thiết bị này ({status}): {detail}",
   "fleet.sessionBindingMismatch": "Máy chủ nhóm yêu cầu thiết bị này chứng minh một phiên không khớp với khóa, đơn vị hoặc tài khoản của nó; chưa có gì được mở hay ký",
   "fleet.sessionProofFailed": "Thiết bị này không mở được thử thách phiên của máy chủ nhóm bằng khóa của chính nó; chưa có gì được ký",
