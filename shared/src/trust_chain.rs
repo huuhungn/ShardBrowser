@@ -514,6 +514,34 @@ impl TrustChain {
             })
     }
 
+    /// [`Self::approval_valid_at`] for exactly one subject: an approval of
+    /// `signing`, valid at `t` and covering `scope`, whose subject names
+    /// exactly `hpke`, `device` and `account` (sequence K step 11: a fleet key
+    /// goes only to keys a signed approval names).
+    pub fn approves_keys(
+        &self,
+        signing: &KeyId,
+        hpke: &[u8; 32],
+        device: &[u8; 16],
+        account: &[u8; 16],
+        scope: Scope,
+        t: u64,
+    ) -> bool {
+        self.approvals_of(signing, t).any(|a| {
+            let p = &a.payload;
+            (
+                p.subject_hpke_key_id,
+                p.subject_device_id,
+                p.subject_account_id,
+            ) == (*hpke, *device, *account)
+                && match (approval_scope(p), scope) {
+                    (Scope::Tenant, _) => true,
+                    (Scope::Fleet(f), Scope::Fleet(g)) => f == g,
+                    _ => false,
+                }
+        })
+    }
+
     /// The scope a `device.revoke` must cover to revoke `key` (ADR 0002 Q-13
     /// issuer rule, as the server files it): the fleet when every usable
     /// approval of `key` from an allowed issuer names that one fleet,
@@ -1027,6 +1055,52 @@ mod tests {
         assert!(c.approval_valid_at(&d.key(), Scope::Fleet([5; 16]), t));
         assert!(!c.approval_valid_at(&d.key(), Scope::Fleet([6; 16]), t));
         assert!(!c.approval_valid_at(&d.key(), Scope::Tenant, t));
+    }
+
+    /// A fleet key goes only to the exact keys an approval names: the same
+    /// signing key with another HPKE key, device or account is not approved,
+    /// nor is another fleet, nor a time outside the approval's window.
+    #[test]
+    fn approves_keys_needs_the_exact_subject_keys() {
+        let (a0, b, d) = (Device::new(1), Device::new(2), Device::new(4));
+        let mut evidence = tenant(&a0, &b);
+        let a = DeviceApprovalV2 {
+            common: common(70, T0 + DAY, T0 + 365 * DAY),
+            subject_account_id: [9; 16],
+            subject_device_id: d.id,
+            subject_signing_key_id: d.key(),
+            subject_hpke_key_id: [4; 32],
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: [5; 16],
+        };
+        evidence.push(build_record(&a0.sk, DOMAIN_DEVICE_APPROVAL, &a.encode()));
+        let c = chain(page(&[&a0, &b, &d], evidence)).unwrap();
+        let t = T0 + 2 * DAY;
+        let fleet = Scope::Fleet([5; 16]);
+        let approves = |hpke: [u8; 32], device: [u8; 16], account: [u8; 16], scope, t| {
+            c.approves_keys(&d.key(), &hpke, &device, &account, scope, t)
+        };
+        assert!(approves([4; 32], d.id, [9; 16], fleet, t));
+        assert!(
+            !approves([5; 32], d.id, [9; 16], fleet, t),
+            "another HPKE key"
+        );
+        assert!(
+            !approves([4; 32], [5; 16], [9; 16], fleet, t),
+            "another device"
+        );
+        assert!(
+            !approves([4; 32], d.id, [8; 16], fleet, t),
+            "another account"
+        );
+        assert!(!approves([4; 32], d.id, [9; 16], Scope::Fleet([6; 16]), t));
+        assert!(
+            !approves([4; 32], d.id, [9; 16], fleet, T0 + 366 * DAY),
+            "expired"
+        );
+        assert!(!c.approves_keys(&b.key(), &[4; 32], &d.id, &[9; 16], fleet, t));
+        // A tenant approval covers every fleet.
+        assert!(c.approves_keys(&b.key(), &[2; 32], &b.id, &[9; 16], fleet, t));
     }
 
     #[test]

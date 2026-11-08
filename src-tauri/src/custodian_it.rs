@@ -277,8 +277,12 @@ fn tenant_server(slot: u16, slug: &str) -> (Server, String) {
          cargo build --manifest-path server/Cargo.toml",
         bin.display()
     );
-    // Its own range, below the Linux ephemeral ports, one slot per test.
-    let port = 26100 + (std::process::id() % 300) as u16 + slot * 400;
+    // Its own range, below the Linux ephemeral ports, one slot per test: the
+    // highest slot, 21, ends at most at 20500 + 299 + 21 * 400 = 29199, below
+    // 32768 and clear of OmniRoute's 20128-20132. The range overlaps the
+    // `fleet_enrollment_it` (21500) and `fleet_sync_it` (24900) bases, which
+    // is safe only because cargo runs test binaries one at a time.
+    let port = 20500 + (std::process::id() % 300) as u16 + slot * 400;
     let (data, identity) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     Server::cli(data.path(), identity.path(), &["identity", "init"], "");
     let created = Server::cli(
@@ -1331,6 +1335,323 @@ fn the_journey_writes_one_audit_row_per_mutation() {
     );
 }
 
+/// The audit rows the rotation test watches, with their counts.
+fn rotation_audit(h: &Harness) -> Vec<(String, i64)> {
+    [
+        "capability.grant",
+        "fleet.key_generation.create",
+        "fleet.key_grant.create",
+        "fleet.key_grant.ack",
+        "fleet.key_generation.activate",
+        "device.approve",
+        "device.revoke",
+        "*",
+    ]
+    .into_iter()
+    .map(|action| {
+        let filter = match action {
+            "*" => "action <> 'auth.device_session'".to_string(),
+            a => format!("action = '{a}'"),
+        };
+        let n = h.server.count(&format!(
+            "SELECT count(*) FROM v2_audit_events WHERE {filter}"
+        ));
+        (action.to_string(), n)
+    })
+    .collect()
+}
+
+/// Sequence K end to end (v0.2.3 plan, R2): custodian A rotates generation 0
+/// to 1 after revoking C, resuming after a crash right after its create
+/// request was saved; member B gets generation 1, C gets nothing; B collects
+/// it, pulls a head A pushed under 0, and pushes under 1, which A pulls.
+#[test]
+fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
+    let rt = runtime();
+    let Journey {
+        b,
+        h,
+        b_id,
+        a_profile,
+        b_profile,
+        profile_id,
+    } = shared_profile(17, "r2-rotate", &rt);
+    let (user, pass) = account();
+
+    // 1. C enrolls and A approves it, then A revokes it as retired.
+    let c_device = fresh_device("c", h.server.url(), h.tenant.clone());
+    let c_id = call(
+        &rt,
+        crate::team_enroll_device("third".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id.clone(), code.sas),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_revoke_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            c_id.clone(),
+            "retired".into(),
+        ),
+    )
+    .unwrap();
+
+    // 2. A pushes version 3 under generation 0; B does not pull it.
+    let udd = crate::profile::user_data_dir(&a_profile).unwrap();
+    std::fs::write(
+        udd.join("Preferences"),
+        b"{\"from\":\"a, before rotation\"}",
+    )
+    .unwrap();
+    let pushed = call(
+        &rt,
+        crate::sync_cmd::profile_sync_push(
+            a_profile.clone(),
+            String::new(),
+            2,
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(pushed.version, 3);
+    let a_files = files(&a_profile);
+    let before = rotation_audit(&h);
+
+    // 3. A rotates; the run stops right after saving its create request,
+    // then the command resumes it.
+    let c = crate::team_config::load().unwrap();
+    let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+    let device = crate::fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &crate::fleet_custody::CredentialFkekStore,
+    };
+    let root = crate::root_bootstrap::load().unwrap();
+    let pin = crate::bootstrap_anchor(&c).unwrap();
+    let me = crate::recipient(&c).unwrap();
+    let err = with_session(&rt, &h, async |client, access| {
+        let now = crate::root_bootstrap::now_ms();
+        let mut db = crate::team::db::Db::open().unwrap();
+        let mut ledger = crate::fleet_custody::Ledger {
+            db: &mut db,
+            pin: &pin,
+        };
+        let mut state = crate::fleet_custody::load().unwrap();
+        let mut save = |s: &crate::fleet_custody::FleetCustodyState| {
+            crate::fleet_custody::save(s)?;
+            if s.rotation
+                .as_ref()
+                .is_some_and(|r| !r.create_request.is_empty())
+            {
+                anyhow::bail!("crash")
+            }
+            Ok(())
+        };
+        crate::fleet_custody::rotate_fleet(
+            client,
+            access,
+            &device,
+            &root,
+            &mut ledger,
+            |g| Ok(crate::verified_fleet_key(&h.tenant, &pin, &me, g, now)?.unwrap()),
+            now,
+            &mut state,
+            &mut save,
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(err.to_string().contains("crash"), "{err}");
+    assert_eq!(
+        h.server
+            .count("SELECT count(*) FROM v2_fleet_key_generations WHERE generation = 1"),
+        0,
+        "nothing was sent after the save"
+    );
+    let status = call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let rotation = status.rotation.expect("the rotation");
+    assert_eq!(
+        (
+            rotation.generation,
+            rotation.phase,
+            rotation.members_filed,
+            rotation.members_refused,
+            rotation.members_skipped
+        ),
+        (1, crate::fleet_custody::RotationPhase::Done, 1, 0, 0)
+    );
+    assert!(status.export_due && !status.setup_key_held);
+    let state = |g: i64| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_key_generations WHERE generation = {g} AND state = '{}'",
+            if g == 0 { "RETIRED" } else { "ACTIVE" }
+        ))
+    };
+    assert_eq!((state(0), state(1)), (1, 1));
+    assert_eq!(
+        h.server
+            .count("SELECT count(*) FROM v2_fleet_key_generations WHERE generation = 1"),
+        1,
+        "one key for generation 1"
+    );
+    let now = crate::root_bootstrap::now_ms();
+    let held: Vec<u64> = crate::fleet_keys::load()
+        .unwrap()
+        .keys_newest_first(&h.tenant, |_, _| true)
+        .into_iter()
+        .map(|(_, g)| g)
+        .collect();
+    assert_eq!(held, [1, 0]);
+    for g in [0, 1] {
+        assert!(
+            crate::verified_fleet_key(&h.tenant, &pin, &me, g, now)
+                .unwrap()
+                .is_some(),
+            "A holds generation {g} verified"
+        );
+    }
+    // Unvalidated assumption 1 against the server's evidence: A's own
+    // rotation grant is activation evidence of generation 1 under root 0.
+    let ledger = crate::team::db::Db::open().unwrap();
+    let activations: i64 = ledger
+        .conn
+        .query_row(
+            "SELECT count(*) FROM trust_fleet_activations
+              WHERE generation = 1 AND recipient_root_generation = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(activations, 1);
+    drop(ledger);
+
+    // 4. B has a generation-1 grant, C none; C's grant reads as none through
+    // A's session, and C's own collect is refused at its session.
+    let grants_of = |id: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE generation = 1 AND lower(hex(subject_device_id)) = '{id}'"
+        ))
+    };
+    assert_eq!((grants_of(&b_id), grants_of(&c_id)), (1, 0));
+    let read = with_session(&rt, &h, async |client, access| {
+        client
+            .read_fleet_device_grant(access, &h.tenant, 1, &c_id)
+            .await
+            .unwrap()
+    });
+    assert!(read.is_none());
+    act_as(c_device.config.path(), c_device.data.path(), "c");
+    let refused = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap_err();
+    assert!(
+        refused.contains("the device is revoked and holds no live approval"),
+        "{refused}"
+    );
+
+    // 5. B collects generation 1, pulls the head under 0 and pushes under 1;
+    // A pulls it.
+    b.act_as_b();
+    let report = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(
+        (&report["fleet_opened"], &report["newest_fleet_generation"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{report}"
+    );
+    let after = rotation_audit(&h);
+    call(
+        &rt,
+        crate::sync_cmd::profile_sync_pull(
+            b_profile.clone(),
+            String::new(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(files(&b_profile), a_files);
+    let udd = crate::profile::user_data_dir(&b_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"b, under 1\"}").unwrap();
+    let pushed = call(
+        &rt,
+        crate::sync_cmd::profile_sync_push(
+            b_profile.clone(),
+            String::new(),
+            3,
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(pushed.version, 4);
+    let b_files = files(&b_profile);
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT key_generation FROM v2_snapshots
+              WHERE lower(hex(profile_id)) = '{profile_id}' AND version = 4"
+        )),
+        1
+    );
+    h.act_as_a();
+    call(
+        &rt,
+        crate::sync_cmd::profile_sync_pull(
+            a_profile.clone(),
+            String::new(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(files(&a_profile), b_files);
+
+    // 6. The rotation's audit rows, through B's collect: S0, the create,
+    // A's three grants and B's, their four acks, and the activation.
+    let delta: Vec<(String, i64)> = before
+        .iter()
+        .zip(&after)
+        .map(|((a, x), (_, y))| (a.clone(), y - x))
+        .collect();
+    let expected: Vec<(String, i64)> = [
+        ("capability.grant", 1),
+        ("fleet.key_generation.create", 1),
+        ("fleet.key_grant.create", 4),
+        ("fleet.key_grant.ack", 4),
+        ("fleet.key_generation.activate", 1),
+        ("device.approve", 0),
+        ("device.revoke", 0),
+        ("*", 11),
+    ]
+    .into_iter()
+    .map(|(a, n)| (a.to_string(), n))
+    .collect();
+    assert_eq!(delta, expected);
+}
+
 /// A fresh device with roots of its own, its credentials in `namespace`,
 /// acting now and connected to `url` for `tenant`.
 fn fresh_device(namespace: &str, url: String, tenant: String) -> Member {
@@ -2131,9 +2452,10 @@ fn session_token(text: &str) -> Option<&str> {
 
 /// Re-runs this test binary on the journey worker below, and scans what it
 /// printed, every command reply and the devices' state files for the
-/// account password, the recovery passphrase, the fleet key, the root key,
-/// both HPKE private keys, every seed and any session token (plan v0.2.2a
-/// section 8; v0.2.2b S2 adds the import, S3 the export again).
+/// account password, the recovery passphrase, both generations of the fleet
+/// key, the root key, both HPKE private keys, every seed and any session
+/// token (plan v0.2.2a section 8; v0.2.2b S2 adds the import, S3 the export
+/// again, v0.2.3 R2 the rotation and its state).
 #[test]
 fn the_journey_leaks_no_secret_to_output_state_or_replies() {
     assert_eq!(
@@ -2169,8 +2491,8 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         .collect();
     assert_eq!(
         secrets.len(),
-        8,
-        "the FKEK, the TRK, two HPKE private keys and both devices' four seeds"
+        9,
+        "both FKEKs, the TRK, two HPKE private keys and both devices' four seeds"
     );
     secrets.push(PASSWORD.into());
     secrets.push(PASSPHRASE.into());
@@ -2257,7 +2579,7 @@ fn keep_state(dir: &std::path::Path, device: &str) {
 }
 
 /// The journey the leak scan watches: the S3 journey, A's revoke of B, A's
-/// export of its recovery bundle again, B's refused collect and a fresh
+/// rotation of the fleet key, A's export of its recovery bundle again, B's refused collect and a fresh
 /// device's import of that bundle. Each reply and each device's state files go to the
 /// scan directory; the secrets to look for go to the side file.
 #[test]
@@ -2272,8 +2594,14 @@ fn the_journey_leak_scan_worker() {
         crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into()),
     )
     .unwrap();
+    call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
 
     let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
+    let rotated = crate::credential::load(&format!("fleet-key.{}.1", h.tenant)).unwrap();
     let c = crate::team_config::load().unwrap();
     let (a_sk, _) = shardx_core::grants::derive_keypair(&c.hpke_seed().unwrap());
     let a_signing_seed = c.signing_key().unwrap().to_bytes();
@@ -2317,6 +2645,7 @@ fn the_journey_leak_scan_worker() {
         secrets,
         [
             hex(&*fkek),
+            hex(&*rotated),
             hex(&*trk),
             hex(&a_sk),
             hex(&b_sk),

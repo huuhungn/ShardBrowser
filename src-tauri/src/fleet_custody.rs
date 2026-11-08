@@ -22,20 +22,21 @@ use zeroize::Zeroizing;
 
 use shardx_core::approval_receipt::{
     device_approve_request_hash, DeviceApprovalReceiptV2, MAX_FLEET_RECOVERY_GRANT_TTL_MS,
+    MAX_FLEET_ROTATION_GRANT_TTL_MS,
 };
 use shardx_core::authz_record::{
     build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
     DeviceApprovalV2, DeviceHpkeGrantV2, DeviceRevocationReason, DeviceRevocationV2, GrantSubject,
-    Payload, RecoveryGrantV2, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
+    Payload, RecoveryGrantV2, RotationGrantV2, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
     DOMAIN_DEVICE_REVOCATION, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_FLEET_KEY_GRANT_RECOVERY,
-    DOMAIN_TENANT_CAPABILITY_GRANT,
+    DOMAIN_FLEET_KEY_GRANT_ROTATION, DOMAIN_TENANT_CAPABILITY_GRANT,
 };
 use shardx_core::fleet_grants::{fkek_key_id, generate_fkek};
 use shardx_core::fleet_lifecycle::{
     FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant, FleetKeyGenerationActivateV2,
     FleetKeyGenerationActivatedV2, FleetKeyGenerationCreateV2, FleetKeyGenerationCreatedV2,
     FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
-    RECORD_TYPE_FLEET_GENERATION_ACTIVATED, RECORD_TYPE_FLEET_GENERATION_CREATED,
+    FleetRotation, RECORD_TYPE_FLEET_GENERATION_ACTIVATED, RECORD_TYPE_FLEET_GENERATION_CREATED,
     RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
 };
 use shardx_core::grants::{derive_keypair, seal_device_fkek};
@@ -45,7 +46,10 @@ use shardx_core::mutation::{
     IdempotentMutationRequestV2, OperationKind, RECORD_TYPE_DEVICE_REVOKED,
 };
 use shardx_core::signing::Ed25519SigningKey;
-use shardx_core::trust_chain::{join_sas, join_sas_display, Binding};
+use shardx_core::trust_chain::{
+    join_sas, join_sas_display, Binding, Scope, TrustChain, CLOCK_TOLERANCE_MS,
+};
+use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
 
 use crate::fleet_client::{decode_hex, decode_hex16, decode_hex32, hex, FleetClient, TenantDevice};
 use crate::root_bootstrap::{
@@ -133,6 +137,14 @@ pub struct FleetCustodyState {
     /// this device is its custodian without a saved create request.
     #[serde(default)]
     pub imported: bool,
+    /// Rotate fleet key (sequence K): the latest rotation, kept once done or
+    /// expired until the next one starts.
+    #[serde(default)]
+    pub rotation: Option<FleetRotationState>,
+    /// Set by a finished rotation: the recovery bundle no longer opens the
+    /// newest fleet key.
+    #[serde(default)]
+    pub export_due: bool,
 }
 
 impl std::fmt::Debug for FleetCustodyState {
@@ -145,6 +157,7 @@ impl std::fmt::Debug for FleetCustodyState {
                 "created",
                 &(!self.create_request.is_empty() || self.imported),
             )
+            .field("rotation", &self.rotation)
             .finish_non_exhaustive()
     }
 }
@@ -164,11 +177,25 @@ fn setup_ref(tenant_hex: &str, nonce: &str) -> String {
     format!("fleet-setup.{}.{nonce}", tenant_hex.to_ascii_lowercase())
 }
 
-fn own_setup_ref(state: &FleetCustodyState) -> Result<String> {
-    if !nonce_ok(&state.fkek_nonce) {
+/// The nonce and id fields of one run's setup key: Create fleet key's, or
+/// the saved rotation's (sequence K step 3).
+type SetupKey = fn(&mut FleetCustodyState) -> (&mut String, &mut String);
+
+fn bootstrap_key(s: &mut FleetCustodyState) -> (&mut String, &mut String) {
+    (&mut s.fkek_nonce, &mut s.fkek_key_id)
+}
+
+fn rotation_key(s: &mut FleetCustodyState) -> (&mut String, &mut String) {
+    let r = s.rotation.get_or_insert_with(Default::default);
+    (&mut r.fkek_nonce, &mut r.fkek_key_id)
+}
+
+fn own_setup_ref(state: &mut FleetCustodyState, slot: SetupKey) -> Result<String> {
+    let nonce = slot(state).0.clone();
+    if !nonce_ok(&nonce) {
         return Err(corrupt());
     }
-    Ok(setup_ref(&state.tenant_id, &state.fkek_nonce))
+    Ok(setup_ref(&state.tenant_id, &nonce))
 }
 
 /// Step 3: the fleet key is held before anything names it.
@@ -182,16 +209,18 @@ fn own_setup_ref(state: &FleetCustodyState) -> Result<String> {
 fn hold_fkek(
     vault: &dyn FkekStore,
     state: &mut FleetCustodyState,
+    slot: SetupKey,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    if state.fkek_nonce.is_empty() {
+    if slot(state).0.is_empty() {
         let nonce = hex(&random::<16>()?);
-        commit(state, save, |s| s.fkek_nonce = nonce)?;
+        commit(state, save, |s| *slot(s).0 = nonce)?;
     }
-    let name = own_setup_ref(state)?;
+    let name = own_setup_ref(state, slot)?;
+    let saved = slot(state).1.clone();
     let key = match vault.load(&name) {
         Ok(key) => key,
-        Err(e) if is_missing(&e) && state.fkek_key_id.is_empty() => {
+        Err(e) if is_missing(&e) && saved.is_empty() => {
             let key = generate_fkek();
             vault.store(&name, &key)?;
             key
@@ -199,9 +228,9 @@ fn hold_fkek(
         Err(e) => return Err(e),
     };
     let id = hex(&fkek_key_id(&key));
-    if state.fkek_key_id.is_empty() {
-        commit(state, save, |s| s.fkek_key_id = id)?;
-    } else if state.fkek_key_id != id {
+    if saved.is_empty() {
+        commit(state, save, |s| *slot(s).1 = id)?;
+    } else if saved != id {
         return Err(corrupt());
     }
     Ok(key)
@@ -212,13 +241,14 @@ fn hold_fkek(
 fn release_fkek(
     vault: &dyn FkekStore,
     state: &mut FleetCustodyState,
+    slot: SetupKey,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
-    if state.fkek_nonce.is_empty() {
+    if slot(state).0.is_empty() {
         return Ok(());
     }
-    vault.forget(&own_setup_ref(state)?)?;
-    commit(state, save, |s| s.fkek_nonce.clear())
+    vault.forget(&own_setup_ref(state, slot)?)?;
+    commit(state, save, |s| slot(s).0.clear())
 }
 
 /// This custodian's own operating grants (plan OQ5): `fleet.manage` and the
@@ -268,34 +298,28 @@ fn container_hash(container: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| corrupt())
 }
 
-/// Steps 3 and 4: holds the key, then builds generation 0 and every request
-/// that files, acknowledges and activates it, and saves them together. The
-/// TRK is opened from the root self-grant only to seal the recovery grant.
-fn prepare(
+/// Two containers with their replay IDs, and a root generation.
+type OwnGrants = ((Vec<u8>, [u8; 16]), (Vec<u8>, [u8; 16]), u64);
+
+/// This device's own grants of `fkek` as `generation`: its `DeviceHpkeGrant`
+/// and the `RecoveryGrant` under the root of its self-grant, each with its
+/// replay ID, and that root's generation. The TRK is opened from the root
+/// self-grant only to seal the recovery grant.
+fn own_fleet_grants(
     cx: &Context16,
     device: &FleetDevice<'_>,
     root: &BootstrapState,
-    state: &mut FleetCustodyState,
-    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
-) -> Result<()> {
-    let fkek = hold_fkek(device.vault, state, save)?;
+    generation: &FleetGenerationRef,
+    fkek: &[u8; 32],
+    now: u64,
+) -> Result<OwnGrants> {
     let (hpke_secret, hpke_public) = derive_keypair(device.hpke_seed);
     let (root_grant, _) = own_grant(&unhex_vec(&root.self_grant)?, device.signer)?;
-    let generation = FleetGenerationRef {
-        tenant_id: cx.tenant,
-        server_instance_id: cx.instance,
-        restore_epoch: cx.epoch,
-        fleet_id: cx.tenant,
-        generation: 0,
-        fkek_key_id: fkek_key_id(&fkek),
-    };
-    let now = now_ms();
-
     let mut grant = DeviceHpkeGrantV2 {
         common: cx.common(random()?, now),
         fleet_id: generation.fleet_id,
         fkek_key_id: generation.fkek_key_id,
-        generation: 0,
+        generation: generation.generation,
         subject_account_id: cx.account,
         subject_device_id: cx.device,
         subject_signing_key_id: cx.signing_key_id,
@@ -303,8 +327,7 @@ fn prepare(
         hpke_encapped_key_bytes: Vec::new(),
         hpke_wrapped_fleet_key_bytes: Vec::new(),
     };
-    seal_device_fkek(&hpke_public, &mut grant, &fkek).map_err(|_| corrupt())?;
-    let device_replay = grant.common.replay_id;
+    seal_device_fkek(&hpke_public, &mut grant, fkek).map_err(|_| corrupt())?;
     let device_grant = build_record(
         device.signer,
         DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
@@ -317,7 +340,7 @@ fn prepare(
         common,
         fleet_id: generation.fleet_id,
         fkek_key_id: generation.fkek_key_id,
-        generation: 0,
+        generation: generation.generation,
         recipient_root_key_id: root_grant.root_key_id,
         recipient_root_generation: root_grant.root_generation,
         root_wrap_nonce_bytes: [0; 12],
@@ -325,15 +348,76 @@ fn prepare(
     };
     {
         let trk = root_grant.open_trk(&hpke_secret).map_err(|_| corrupt())?;
-        recovery.seal(&trk, &fkek).map_err(|_| corrupt())?;
+        recovery.seal(&trk, fkek).map_err(|_| corrupt())?;
     }
-    let recovery_replay = recovery.common.replay_id;
     let recovery_grant = build_record(
         device.signer,
         DOMAIN_FLEET_KEY_GRANT_RECOVERY,
         &recovery.encode(),
     );
+    Ok((
+        (device_grant, grant.common.replay_id),
+        (recovery_grant, recovery.common.replay_id),
+        root_grant.root_generation,
+    ))
+}
 
+/// Step 4's requests for `create`: the create, one filing and one ack per
+/// grant of `grants` (variant, replay ID, exact container), in that order,
+/// and the activation that restates the terms.
+fn generation_requests(
+    cx: &Context16,
+    create: &FleetKeyGenerationCreateV2,
+    grants: &[(FleetGrantVariant, [u8; 16], &[u8])],
+) -> Result<(String, Vec<String>, Vec<String>, String)> {
+    let request = |kind, payload: Vec<u8>| cx.request(kind, payload).map(|r| hex(&r));
+    let mut filings = Vec::new();
+    let mut acks = Vec::new();
+    for (variant, replay, container) in grants {
+        let filing = FleetKeyGrantCreateV2::new(
+            create.terms.generation,
+            *variant,
+            *replay,
+            container_hash(container)?,
+            container.to_vec(),
+        );
+        filings.push(request(OperationKind::FleetGrantCreate, filing.encode())?);
+        let ack = FleetKeyGrantAckV2 {
+            grant: filing.grant,
+        };
+        acks.push(request(OperationKind::FleetGrantAck, ack.encode())?);
+    }
+    let activate = FleetKeyGenerationActivateV2 {
+        terms: create.terms,
+    };
+    Ok((
+        request(OperationKind::FleetGenerationCreate, create.encode())?,
+        filings,
+        acks,
+        request(OperationKind::FleetGenerationActivate, activate.encode())?,
+    ))
+}
+
+/// Steps 3 and 4: holds the key, then builds generation 0 and every request
+/// that files, acknowledges and activates it, and saves them together.
+fn prepare(
+    cx: &Context16,
+    device: &FleetDevice<'_>,
+    root: &BootstrapState,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let fkek = hold_fkek(device.vault, state, bootstrap_key, save)?;
+    let generation = FleetGenerationRef {
+        tenant_id: cx.tenant,
+        server_instance_id: cx.instance,
+        restore_epoch: cx.epoch,
+        fleet_id: cx.tenant,
+        generation: 0,
+        fkek_key_id: fkek_key_id(&fkek),
+    };
+    let ((device_grant, device_replay), (recovery_grant, recovery_replay), root_generation) =
+        own_fleet_grants(cx, device, root, &generation, &fkek, now_ms())?;
     let terms = FleetGenerationTerms {
         generation,
         required_device_grant_count: 1,
@@ -346,49 +430,24 @@ fn prepare(
     };
     let create = FleetKeyGenerationCreateV2 {
         terms,
-        root_generation: root_grant.root_generation,
+        root_generation,
     };
-    let filing = |variant, replay, container: &[u8]| -> Result<FleetKeyGrantCreateV2> {
-        Ok(FleetKeyGrantCreateV2::new(
-            generation,
-            variant,
-            replay,
-            container_hash(container)?,
-            container.to_vec(),
-        ))
-    };
-    let device_filing = filing(FleetGrantVariant::DeviceHpke, device_replay, &device_grant)?;
-    let recovery_filing = filing(
-        FleetGrantVariant::Recovery,
-        recovery_replay,
-        &recovery_grant,
+    let (create, filings, acks, activate) = generation_requests(
+        cx,
+        &create,
+        &[
+            (FleetGrantVariant::DeviceHpke, device_replay, &device_grant),
+            (
+                FleetGrantVariant::Recovery,
+                recovery_replay,
+                &recovery_grant,
+            ),
+        ],
     )?;
-    let request = |kind, payload: Vec<u8>| cx.request(kind, payload).map(|r| hex(&r));
-    let requests = [
-        request(OperationKind::FleetGenerationCreate, create.encode())?,
-        request(OperationKind::FleetGrantCreate, device_filing.encode())?,
-        request(OperationKind::FleetGrantCreate, recovery_filing.encode())?,
-        request(
-            OperationKind::FleetGrantAck,
-            FleetKeyGrantAckV2 {
-                grant: device_filing.grant,
-            }
-            .encode(),
-        )?,
-        request(
-            OperationKind::FleetGrantAck,
-            FleetKeyGrantAckV2 {
-                grant: recovery_filing.grant,
-            }
-            .encode(),
-        )?,
-        request(
-            OperationKind::FleetGenerationActivate,
-            FleetKeyGenerationActivateV2 { terms }.encode(),
-        )?,
-    ];
+    let [device_filing, recovery_filing]: [String; 2] =
+        filings.try_into().map_err(|_| corrupt())?;
+    let [device_ack, recovery_ack]: [String; 2] = acks.try_into().map_err(|_| corrupt())?;
     commit(state, save, |s| {
-        let [create, device_filing, recovery_filing, device_ack, recovery_ack, activate] = requests;
         s.device_grant = hex(&device_grant);
         s.recovery_grant = hex(&recovery_grant);
         s.create_request = create;
@@ -397,6 +456,103 @@ fn prepare(
         s.device_ack_request = device_ack;
         s.recovery_ack_request = recovery_ack;
         s.activate_request = activate;
+    })
+}
+
+/// Sequence K steps 3 and 4: holds the new key, whose ID is not N's, then
+/// builds N+1 in rotation mode with its device, recovery and rotation grants
+/// (required set: this device alone, Q-44), every request that creates,
+/// files, acknowledges and activates it, and the deadline, and saves them
+/// together.
+fn prepare_rotation(
+    cx: &Context16,
+    device: &FleetDevice<'_>,
+    root: &BootstrapState,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let fkek = hold_fkek(device.vault, state, rotation_key, save)?;
+    let r = state.rotation.clone().ok_or_else(corrupt)?;
+    let previous_fkek_key_id =
+        decode_hex32(&r.previous_fkek_key_id, "fkek_key_id").map_err(|_| corrupt())?;
+    let generation = FleetGenerationRef {
+        tenant_id: cx.tenant,
+        server_instance_id: cx.instance,
+        restore_epoch: cx.epoch,
+        fleet_id: cx.tenant,
+        generation: r.generation,
+        fkek_key_id: fkek_key_id(&fkek),
+    };
+    if generation.fkek_key_id == previous_fkek_key_id {
+        return Err(corrupt());
+    }
+    let ((device_grant, device_replay), (recovery_grant, recovery_replay), root_generation) =
+        own_fleet_grants(cx, device, root, &generation, &fkek, now)?;
+    let set_hash =
+        fleet_device_grant_set_hash(&[container_hash(&device_grant)?]).ok_or_else(mismatch)?;
+    let recovery_hash = container_hash(&recovery_grant)?;
+    let mut common = cx.common(random()?, now);
+    common.not_after_ms = common.not_before_ms + MAX_FLEET_ROTATION_GRANT_TTL_MS;
+    let issued_at_ms = common.issued_at_ms;
+    let rotation = RotationGrantV2 {
+        common,
+        fleet_id: generation.fleet_id,
+        fkek_key_id: generation.fkek_key_id,
+        generation: r.generation,
+        previous_fkek_key_id,
+        previous_generation: r.previous_generation,
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: set_hash,
+        recovery_grant_signed_container_hash: recovery_hash,
+        activation_not_before_ms: issued_at_ms,
+    };
+    let rotation_grant = build_record(
+        device.signer,
+        DOMAIN_FLEET_KEY_GRANT_ROTATION,
+        &rotation.encode(),
+    );
+    let create = FleetKeyGenerationCreateV2 {
+        terms: FleetGenerationTerms {
+            generation,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: set_hash,
+            recovery_grant_signed_container_hash: recovery_hash,
+            rotation: Some(FleetRotation {
+                previous_generation: r.previous_generation,
+                previous_fkek_key_id,
+                rotation_grant_signed_container_hash: container_hash(&rotation_grant)?,
+            }),
+        },
+        root_generation,
+    };
+    let (create, filings, acks, activate) = generation_requests(
+        cx,
+        &create,
+        &[
+            (FleetGrantVariant::DeviceHpke, device_replay, &device_grant),
+            (
+                FleetGrantVariant::Recovery,
+                recovery_replay,
+                &recovery_grant,
+            ),
+            (
+                FleetGrantVariant::Rotation,
+                rotation.common.replay_id,
+                &rotation_grant,
+            ),
+        ],
+    )?;
+    commit(state, save, |s| {
+        let r = s.rotation.get_or_insert_with(Default::default);
+        r.device_grant = hex(&device_grant);
+        r.recovery_grant = hex(&recovery_grant);
+        r.rotation_grant = hex(&rotation_grant);
+        r.create_request = create;
+        r.grant_requests = filings;
+        r.ack_requests = acks;
+        r.activate_request = activate;
+        r.deadline_ms = Some(rotation.common.not_after_ms);
     })
 }
 
@@ -853,17 +1009,49 @@ fn build_member(
         ],
         now,
     )?;
+    Ok(MemberApproval {
+        first_seen_ms,
+        approval: hex(&build_record(
+            signer,
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        )),
+        capability_grants: grants,
+        grant_request: member_grant(
+            cx,
+            signer,
+            (account, device),
+            (signing, hpke, hpke_pk),
+            fkek,
+            generation,
+            now,
+        )?,
+    })
+}
+
+/// The request filing the `DeviceHpkeGrant` of `fkek` as `generation` of
+/// this custodian's fleet for `(account, device)` under `(signing, hpke)`,
+/// sealed to the HPKE key `hpke_pk`.
+fn member_grant(
+    cx: &Context16,
+    signer: &Ed25519SigningKey,
+    (account, device): ([u8; 16], [u8; 16]),
+    (signing, hpke, hpke_pk): ([u8; 32], [u8; 32], [u8; 32]),
+    fkek: &[u8; 32],
+    generation: u64,
+    now: u64,
+) -> Result<String> {
     let generation = FleetGenerationRef {
         tenant_id: cx.tenant,
         server_instance_id: cx.instance,
         restore_epoch: cx.epoch,
-        fleet_id: fleet,
+        fleet_id: cx.tenant,
         generation,
         fkek_key_id: fkek_key_id(fkek),
     };
     let mut grant = DeviceHpkeGrantV2 {
         common: cx.common(random()?, now),
-        fleet_id: fleet,
+        fleet_id: generation.fleet_id,
         fkek_key_id: generation.fkek_key_id,
         generation: generation.generation,
         subject_account_id: account,
@@ -882,16 +1070,10 @@ fn build_member(
         container_hash(&container)?,
         container,
     );
-    Ok(MemberApproval {
-        first_seen_ms,
-        approval: hex(&build_record(
-            signer,
-            DOMAIN_DEVICE_APPROVAL,
-            &approval.encode(),
-        )),
-        capability_grants: grants,
-        grant_request: hex(&cx.request(OperationKind::FleetGrantCreate, filing.encode())?),
-    })
+    Ok(hex(&cx.request(
+        OperationKind::FleetGrantCreate,
+        filing.encode(),
+    )?))
 }
 
 /// The facts this custodian's records name, once `state` holds its own
@@ -932,6 +1114,14 @@ pub async fn approve_member(
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
     let cx = custodian(me, state)?;
+    // ADR 0002 Q-48: a device approved now would get no N+1 grant.
+    if state
+        .rotation
+        .as_ref()
+        .is_some_and(|r| r.phase.unfinished())
+    {
+        bail!(crate::errcode::code("fleet.rotationInProgress"));
+    }
     let fleet = hex(&cx.tenant);
     see_devices(std::slice::from_ref(row), pin, now, state, save)?;
     let id = row.device_id.to_ascii_lowercase();
@@ -1142,14 +1332,619 @@ pub async fn revoke_member(
 /// `fleet_client` fills `code` only from the reply's top-level JSON, and
 /// escapes `|` and `]` in every value, so no echoed text forges a field.
 fn outside_window(e: &anyhow::Error) -> bool {
+    refused_with(e, 403, Some("REVOCATION_OUTSIDE_WINDOW"))
+}
+
+/// Whether `e` is the custody refusal with `status` and, when given, the
+/// top-level `code`, read from the marker's own fields as [`outside_window`]
+/// reads them.
+fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -> bool {
     let text = e.to_string();
     let open = "[[shardx:fleet.refusedCustody|";
     text.find(open)
         .and_then(|i| text[i + open.len()..].split("]]").next())
         .is_some_and(|args| {
             let fields: Vec<&str> = args.split('|').collect();
-            fields.contains(&"status=403") && fields.contains(&"code=REVOCATION_OUTSIDE_WINDOW")
+            fields.contains(&format!("status={status}").as_str())
+                && code.is_none_or(|c| fields.contains(&format!("code={c}").as_str()))
         })
+}
+
+// ---- Rotate fleet key (sequence K, ADR 0002 D-9) ----
+
+/// The most signers one trust evidence request may name (`MAX_SIGNERS`,
+/// `server/src/routes/v2_trust.rs`).
+const MAX_SIGNERS: usize = 64;
+
+/// Where a rotation stands.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RotationPhase {
+    /// Steps 1-9: N+1 is not known to be ACTIVE.
+    #[default]
+    Preparing,
+    /// Step 10 is done: N+1 is ACTIVE and this device holds it.
+    Activated,
+    /// Step 12: the members' grants are filed or recorded.
+    Done,
+    /// It can no longer activate, and the server showed N still ACTIVE.
+    Expired,
+}
+
+impl RotationPhase {
+    /// While a rotation is unfinished, approvals wait (ADR 0002 Q-48).
+    fn unfinished(self) -> bool {
+        matches!(self, Self::Preparing | Self::Activated)
+    }
+}
+
+/// What one rotation keeps, hex-encoded, written before each request leaves
+/// the device. No key is among it.
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct FleetRotationState {
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub previous_generation: u64,
+    #[serde(default)]
+    pub previous_fkek_key_id: String,
+    /// The server's restore epoch when the rotation started.
+    #[serde(default)]
+    pub restore_epoch: u64,
+    /// Step 2: this device's `key.rotate` over the fleet (Q-51).
+    #[serde(default)]
+    pub rotate_grant: String,
+    /// Names the rotation's setup key, as `FleetCustodyState::fkek_nonce`.
+    #[serde(default)]
+    pub fkek_nonce: String,
+    #[serde(default)]
+    pub fkek_key_id: String,
+    #[serde(default)]
+    pub device_grant: String,
+    #[serde(default)]
+    pub recovery_grant: String,
+    #[serde(default)]
+    pub rotation_grant: String,
+    #[serde(default)]
+    pub create_request: String,
+    /// The device, recovery and rotation grant filings, in that order.
+    #[serde(default)]
+    pub grant_requests: Vec<String>,
+    /// Their acks, in the same order.
+    #[serde(default)]
+    pub ack_requests: Vec<String>,
+    #[serde(default)]
+    pub activate_request: String,
+    /// The end of the rotation grant's window, saved with step 4.
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub phase: RotationPhase,
+    /// Step 11: the filing of each member's N+1 grant, per lower-case
+    /// device id.
+    #[serde(default)]
+    pub member_grants: BTreeMap<String, String>,
+    /// Step 12: `filed`, `refused` or `skipped:<reason>`, per device id.
+    #[serde(default)]
+    pub member_results: BTreeMap<String, String>,
+    #[serde(default)]
+    pub activated_at_ms: u64,
+}
+
+impl std::fmt::Debug for FleetRotationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FleetRotationState")
+            .field("generation", &self.generation)
+            .field("phase", &self.phase)
+            .field("fkek_key_id", &self.fkek_key_id)
+            .field("deadline_ms", &self.deadline_ms)
+            .field("member_results", &self.member_results)
+            .finish_non_exhaustive()
+    }
+}
+
+fn rotation_mut(s: &mut FleetCustodyState) -> &mut FleetRotationState {
+    s.rotation.get_or_insert_with(Default::default)
+}
+
+/// The trust ledger a rotation evaluates evidence in, and this device's pin.
+pub struct Ledger<'a> {
+    pub db: &'a mut crate::team::db::Db,
+    pub pin: &'a (Binding, [u8; 32]),
+}
+
+impl Ledger<'_> {
+    fn evaluate(
+        &mut self,
+        pages: &[TenantTrustEvidencePageV2],
+        now: u64,
+    ) -> Result<(Vec<TenantTrustEvidencePageV2>, TrustChain)> {
+        crate::team::ledger::evaluate(self.db, &self.pin.0, &self.pin.1, pages, now)?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.trustEvidenceRefused")))
+    }
+}
+
+/// Runs, or resumes, Rotate fleet key (sequence K) through step 9 under the
+/// device session `access`, at `now`. At Start, `previous_key` gives this
+/// device's verified key of the ACTIVE generation N. `Ok` means N+1 is
+/// ACTIVE: the command then releases the setup key and collects N+1 (step
+/// 10) and runs [`grant_members`]. `save` persists `state`; every step that
+/// builds new bytes saves them before sending, and a failed save stops the
+/// run.
+///
+/// An expired rotation does not refuse Start: a new one is built, and the
+/// server's create refusal `FLEET_GENERATION_EXISTS` (N+1 is still
+/// PREPARING, Q-24) ends it `expired` again with `fleet.rotationStuck`. A
+/// rotation whose N+1 never reached the server (its create never filed, or
+/// undone by a restore) so starts over.
+#[allow(clippy::too_many_arguments)]
+pub async fn rotate_fleet(
+    client: &FleetClient,
+    access: &str,
+    device: &FleetDevice<'_>,
+    root: &BootstrapState,
+    ledger: &mut Ledger<'_>,
+    previous_key: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let ours = root.tenant_id.eq_ignore_ascii_case(device.tenant_id)
+        && root.device_id.eq_ignore_ascii_case(device.device_id);
+    if !root.activated || !ours {
+        bail!(crate::errcode::code("fleet.notCustodian"));
+    }
+    let cx = custodian(device, state)?;
+
+    // 1. The server is the one this custody began on; a restore of it is
+    // the expiry decision's.
+    let id = client.server_identity(access).await?;
+    let instance =
+        decode_hex16(&id.server_instance_id, "server_instance_id").map_err(|_| mismatch())?;
+    let epoch = u64::try_from(id.restore_epoch).map_err(|_| mismatch())?;
+    if instance != cx.instance {
+        bail!(crate::errcode::code("fleet.custodyServerChanged"));
+    }
+    let fleet = hex(&cx.tenant);
+    match state
+        .rotation
+        .as_ref()
+        .map(|r| (r.phase, r.deadline_ms, r.restore_epoch))
+    {
+        Some((RotationPhase::Activated, ..)) => return Ok(()),
+        // Only once step 4 saved the deadline: nothing of N+1 is on the
+        // server before.
+        Some((RotationPhase::Preparing, Some(deadline), saved))
+            if now >= deadline || saved != epoch =>
+        {
+            return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+        }
+        Some((RotationPhase::Preparing, ..)) => {}
+        _ => {
+            let previous = client
+                .active_fleet_generation(access, device.tenant_id, &fleet)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst"))
+                })?;
+            let key = previous_key(previous)?;
+            let pages = client.trust_evidence(access, device.tenant_id).await?;
+            let (_, chain) = ledger.evaluate(&pages, now)?;
+            if !chain.approval_valid_at(&cx.signing_key_id, Scope::Fleet(cx.tenant), now) {
+                bail!(crate::errcode::code(
+                    "fleet.rotationCustodianApprovalExpired"
+                ));
+            }
+            let generation = previous.checked_add(1).ok_or_else(mismatch)?;
+            commit(state, save, |s| {
+                s.rotation = Some(FleetRotationState {
+                    generation,
+                    previous_generation: previous,
+                    previous_fkek_key_id: hex(&fkek_key_id(&key)),
+                    restore_epoch: epoch,
+                    ..Default::default()
+                })
+            })?;
+            eprintln!("[rotation] start: generation {previous} to {generation}");
+        }
+    }
+    let cx = Context16 {
+        epoch: state.rotation.as_ref().ok_or_else(corrupt)?.restore_epoch,
+        ..cx
+    };
+
+    // 2. S0, filed whole.
+    if rotation_mut(state).rotate_grant.is_empty() {
+        let me = GrantSubject::Device {
+            account_id: cx.account,
+            device_id: cx.device,
+            signing_key_id: cx.signing_key_id,
+            hpke_key_id: cx.hpke_key_id,
+        };
+        let rotate = (Capability::KeyRotate, CapabilityScopeKind::Fleet, cx.tenant);
+        let grant = capability_grants(&cx, device.signer, &me, [rotate], now)?
+            .pop()
+            .ok_or_else(corrupt)?;
+        commit(state, save, |s| rotation_mut(s).rotate_grant = grant)?;
+    }
+    let grant = unhex_vec(&rotation_mut(state).rotate_grant)?;
+    if client.file_capability_grant(access, &grant).await? != grant {
+        return Err(mismatch());
+    }
+
+    // 3 and 4. Nothing is built again once the create request is saved.
+    if rotation_mut(state).create_request.is_empty() {
+        prepare_rotation(&cx, device, root, now, state, save)?;
+    }
+    let r = state.rotation.clone().ok_or_else(corrupt)?;
+
+    // 5. N+1, now PREPARING.
+    let create = saved_request(&r.create_request)?;
+    let expected = FleetKeyGenerationCreateV2::parse(&create.canonical_payload_bytes)
+        .map_err(|_| corrupt())?;
+    let stored = match client
+        .create_fleet_generation(access, &fleet, &create.encode())
+        .await
+    {
+        // Another create made N+1, and no route discards it (Q-24).
+        Err(e) if refused_with(&e, 409, Some("FLEET_GENERATION_EXISTS")) => {
+            expire(device.vault, state, save)?;
+            bail!(crate::errcode::code("fleet.rotationStuck"));
+        }
+        stored => stored?,
+    };
+    let created = FleetKeyGenerationCreatedV2::parse(&stored_payload(
+        &stored,
+        &create,
+        RECORD_TYPE_FLEET_GENERATION_CREATED,
+    )?)
+    .map_err(|_| mismatch())?;
+    if created.create != expected {
+        return Err(mismatch());
+    }
+
+    // 6 and 7. A 403 is the server's window check: the expiry decision.
+    let sends = r.grant_requests.iter().map(|s| (s, false));
+    for (saved, ack) in sends.chain(r.ack_requests.iter().map(|s| (s, true))) {
+        match send_grant(client, access, &fleet, r.generation, saved, ack).await {
+            Err(e) if refused_with(&e, 403, None) => {
+                return expiry_decision(client, access, device, &fleet, now, Some(e), state, save)
+                    .await;
+            }
+            sent => sent?,
+        }
+    }
+
+    // 8 and 9. Activation is due from `issued_at`: refused before it, only
+    // a skewed clock can be early.
+    if now >= r.deadline_ms.ok_or_else(corrupt)? {
+        return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+    }
+    match activate(client, access, &fleet, &r).await {
+        Err(e) if refused_with(&e, 409, Some("FLEET_GRANTS_INCOMPLETE")) => {
+            bail!(crate::errcode::code("fleet.rotationNotYetDue"))
+        }
+        activated => activated,
+    }
+}
+
+/// Sends the saved grant filing, or with `ack` the saved ack, of
+/// `generation`, and checks that the stored reply names exactly its grant.
+async fn send_grant(
+    client: &FleetClient,
+    access: &str,
+    fleet: &str,
+    generation: u64,
+    saved: &str,
+    ack: bool,
+) -> Result<()> {
+    let request = saved_request(saved)?;
+    let payload = &request.canonical_payload_bytes;
+    let (sent, answered) = if ack {
+        let grant = FleetKeyGrantAckV2::parse(payload)
+            .map_err(|_| corrupt())?
+            .grant;
+        let stored = client
+            .ack_fleet_grant(access, fleet, generation, &request.encode())
+            .await?;
+        let acked = FleetKeyGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        (grant, acked.grant)
+    } else {
+        let grant = FleetKeyGrantCreateV2::parse(payload)
+            .map_err(|_| corrupt())?
+            .grant;
+        let stored = client
+            .file_fleet_grant(access, fleet, generation, &request.encode())
+            .await?;
+        let created = FleetKeyGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        (grant, created.grant)
+    };
+    if sent != answered {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+/// Step 9: the saved activation, sent as saved; the stored reply restates
+/// exactly its terms. A replay of one the server stored gets that reply.
+async fn activate(
+    client: &FleetClient,
+    access: &str,
+    fleet: &str,
+    r: &FleetRotationState,
+) -> Result<()> {
+    let activate = saved_request(&r.activate_request)?;
+    let terms = FleetKeyGenerationActivateV2::parse(&activate.canonical_payload_bytes)
+        .map_err(|_| corrupt())?
+        .terms;
+    let stored = client
+        .activate_fleet_generation(access, fleet, r.generation, &activate.encode())
+        .await?;
+    let activated = FleetKeyGenerationActivatedV2::parse(&stored_payload(
+        &stored,
+        &activate,
+        RECORD_TYPE_FLEET_GENERATION_ACTIVATED,
+    )?)
+    .map_err(|_| mismatch())?;
+    if activated.terms != terms {
+        return Err(mismatch());
+    }
+    eprintln!("[rotation] step 9: generation {} ACTIVE", r.generation);
+    Ok(())
+}
+
+/// The expiry decision (Q-49), past the deadline, after a server restore,
+/// or on `refused`, a 403 to a rotation filing or ack: the server decides,
+/// never this device's clock alone. N+1 ACTIVE: the saved activation is
+/// resent, and only the server's stored reply for exactly its terms goes on
+/// to step 10 (`Ok`). N ACTIVE: `expired`, except that `refused` is returned
+/// as it is while `now` is before the deadline by more than the clock
+/// tolerance. Anything else changes nothing.
+#[allow(clippy::too_many_arguments)]
+async fn expiry_decision(
+    client: &FleetClient,
+    access: &str,
+    device: &FleetDevice<'_>,
+    fleet: &str,
+    now: u64,
+    refused: Option<anyhow::Error>,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let r = state.rotation.clone().ok_or_else(corrupt)?;
+    let unknown = || anyhow::anyhow!(crate::errcode::code("fleet.rotationStateUnknown"));
+    let active = client
+        .active_fleet_generation(access, device.tenant_id, fleet)
+        .await?;
+    eprintln!(
+        "[rotation] expiry decision: generation {}, server ACTIVE {active:?}",
+        r.generation
+    );
+    if active == Some(r.generation) {
+        return activate(client, access, fleet, &r)
+            .await
+            .map_err(|_| unknown());
+    }
+    if active != Some(r.previous_generation) {
+        return Err(unknown());
+    }
+    if let Some(e) = refused {
+        if r.deadline_ms
+            .is_some_and(|d| now < d.saturating_sub(CLOCK_TOLERANCE_MS))
+        {
+            return Err(e);
+        }
+    }
+    expire(device.vault, state, save)?;
+    bail!(crate::errcode::code("fleet.rotationExpired"))
+}
+
+/// Phase `expired`: the setup key is released first; N stays ACTIVE.
+fn expire(
+    vault: &dyn FkekStore,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    release_fkek(vault, state, rotation_key, save)?;
+    commit(state, save, |s| {
+        rotation_mut(s).phase = RotationPhase::Expired
+    })?;
+    eprintln!("[rotation] expired");
+    Ok(())
+}
+
+/// Step 10, before the verified collect of N+1: the rotation's setup key
+/// goes, as Create fleet key's does.
+pub fn release_rotation_key(
+    vault: &dyn FkekStore,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    if state.rotation.is_none() {
+        return Ok(());
+    }
+    release_fkek(vault, state, rotation_key, save)
+}
+
+/// Step 10, once the verified collect kept N+1: phase `activated`.
+pub fn rotation_collected(
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    commit(state, save, |s| {
+        let r = rotation_mut(s);
+        r.phase = RotationPhase::Activated;
+        r.activated_at_ms = now;
+    })
+}
+
+/// Whether `saved`, an approval this custodian signed under `vk`, is in
+/// force at `now`, covers `fleet` and names exactly these keys (Q-45).
+fn approval_names(
+    saved: &str,
+    vk: &[u8; 32],
+    (account, device): ([u8; 16], [u8; 16]),
+    (signing, hpke, _): &([u8; 32], [u8; 32], [u8; 32]),
+    fleet: [u8; 16],
+    now: u64,
+) -> bool {
+    let Ok(bytes) = unhex_vec(saved) else {
+        return false;
+    };
+    let Ok(Payload::DeviceApproval(a)) = AuthorizationRecord::parse(&bytes)
+        .and_then(|r| r.verify_signature(vk))
+        .map(|v| v.payload().clone())
+    else {
+        return false;
+    };
+    let subject = (
+        a.subject_account_id,
+        a.subject_device_id,
+        a.subject_signing_key_id,
+        a.subject_hpke_key_id,
+    );
+    a.common.not_before_ms <= now
+        && now < a.common.not_after_ms
+        && subject == (account, device, *signing, *hpke)
+        && (matches!(a.approval_scope_kind, ApprovalScopeKind::Tenant)
+            || a.approval_scope_id == fleet)
+}
+
+/// Sequence K steps 11 and 12 under the device session `access`, at `now`,
+/// once N+1 is ACTIVE and `fkek` is this device's verified key of it.
+///
+/// A listed active device other than this one gets a `DeviceHpkeGrant` of
+/// N+1, built once and saved before it is filed, only when its exact keys
+/// are named by an approval this custodian saved, verifying under its key
+/// and in force now, or by an approval valid now in the chain of fresh
+/// evidence for exactly the listed signers (Q-45); and only when it is not
+/// in `revocations`, not reported revoked and its signing key is not
+/// withdrawn. The server's list is a hint: an evidence fetch that fails
+/// stops the step before anything is filed, and never falls back to it. A
+/// refused filing is recorded `refused`, an ineligible device
+/// `skipped:<reason>`.
+#[allow(clippy::too_many_arguments)]
+pub async fn grant_members(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    ledger: &mut Ledger<'_>,
+    fkek: &[u8; 32],
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let r = state
+        .rotation
+        .clone()
+        .filter(|r| r.phase == RotationPhase::Activated)
+        .ok_or_else(corrupt)?;
+    let cx = Context16 {
+        epoch: r.restore_epoch,
+        ..custodian(me, state)?
+    };
+    let fleet = hex(&cx.tenant);
+    let rows = client.list_tenant_devices(access, me.tenant_id).await?;
+    let mut results = BTreeMap::new();
+    let mut listed = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|r| r.status == "active" && !r.device_id.eq_ignore_ascii_case(me.device_id))
+    {
+        let id = row.device_id.to_ascii_lowercase();
+        let ids = decode_hex16(&row.account_id, "account_id")
+            .and_then(|a| Ok((a, decode_hex16(&id, "device_id")?)));
+        match (ids, listed_keys(row)) {
+            (Ok(ids), Ok(keys)) => listed.push((id, ids, keys)),
+            _ => {
+                results.insert(id, "skipped:keys".to_string());
+            }
+        }
+    }
+
+    let vk = me.signer.verifying_key().to_bytes();
+    let mut eligible = Vec::new();
+    for batch in listed.chunks(MAX_SIGNERS) {
+        let signers: Vec<[u8; 32]> = batch.iter().map(|(_, _, k)| k.0).collect();
+        let pages = client
+            .trust_evidence_of(access, me.tenant_id, &signers)
+            .await?;
+        let (seen, chain) = ledger.evaluate(&pages, now)?;
+        crate::team::ledger::record(ledger.db, &ledger.pin.0, &seen, &chain, None, now)?;
+        for (id, ids, keys) in batch {
+            let skip =
+                if state.revocations.contains_key(id) || chain.reported_revoked_at(&keys.0, now) {
+                    Some("revoked")
+                } else if crate::team::ledger::withdrawn(ledger.db, &ledger.pin.0, &keys.0)? {
+                    Some("withdrawn")
+                } else if state
+                    .members
+                    .get(id)
+                    .is_some_and(|m| approval_names(&m.approval, &vk, *ids, keys, cx.tenant, now))
+                    || chain.approves_keys(
+                        &keys.0,
+                        &keys.1,
+                        &ids.1,
+                        &ids.0,
+                        Scope::Fleet(cx.tenant),
+                        now,
+                    )
+                {
+                    None
+                } else {
+                    Some("no-approval")
+                };
+            match skip {
+                Some(why) => {
+                    results.insert(id.clone(), format!("skipped:{why}"));
+                }
+                None => eligible.push((id.clone(), *ids, *keys)),
+            }
+        }
+    }
+
+    for (id, ids, keys) in eligible {
+        let saved = rotation_mut(state).member_grants.get(&id).cloned();
+        let filing = match saved {
+            Some(filing) => filing,
+            None => {
+                let built = member_grant(&cx, me.signer, ids, keys, fkek, r.generation, now)?;
+                commit(state, save, |s| {
+                    rotation_mut(s)
+                        .member_grants
+                        .insert(id.clone(), built.clone());
+                })?;
+                built
+            }
+        };
+        let filed = send_grant(client, access, &fleet, r.generation, &filing, false).await;
+        results.insert(
+            id,
+            if filed.is_ok() { "filed" } else { "refused" }.to_string(),
+        );
+    }
+    for (id, result) in &results {
+        eprintln!("[rotation] member {id}: {result}");
+    }
+    commit(state, save, |s| {
+        s.export_due = true;
+        let r = rotation_mut(s);
+        r.member_results = results;
+        r.phase = RotationPhase::Done;
+    })?;
+    eprintln!("[rotation] done: generation {}", r.generation);
+    Ok(())
 }
 
 /// Set while Create fleet key runs in this process; the single-instance
@@ -1183,13 +1978,28 @@ pub struct FleetCustodyStatus {
     pub setup_key_held: bool,
     /// The public id of the fleet key, once it was made.
     pub fkek_key_id: String,
+    /// The latest fleet key rotation, if any.
+    pub rotation: Option<RotationStatus>,
+    /// A finished rotation asks for the recovery bundle to be exported again.
+    pub export_due: bool,
+}
+
+/// How far the latest rotation got: no secret of it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct RotationStatus {
+    pub generation: u64,
+    pub phase: RotationPhase,
+    pub deadline_ms: Option<u64>,
+    pub members_filed: usize,
+    pub members_refused: usize,
+    pub members_skipped: usize,
 }
 
 /// Releases the setup key of the state on disk once generation 0 is active,
 /// before the verified collect: no later step reads it.
 pub fn release(vault: &dyn FkekStore) -> Result<()> {
     let mut state = load()?;
-    release_fkek(vault, &mut state, &mut |s| save(s))
+    release_fkek(vault, &mut state, bootstrap_key, &mut |s| save(s))
 }
 
 /// The saved progress.
@@ -1200,6 +2010,23 @@ pub fn status() -> Result<FleetCustodyStatus> {
         created: !s.create_request.is_empty() || s.imported,
         setup_key_held: !s.fkek_nonce.is_empty(),
         fkek_key_id: s.fkek_key_id,
+        rotation: s.rotation.map(|r| {
+            let count = |what: &str| {
+                r.member_results
+                    .values()
+                    .filter(|v| v.starts_with(what))
+                    .count()
+            };
+            RotationStatus {
+                generation: r.generation,
+                phase: r.phase,
+                deadline_ms: r.deadline_ms,
+                members_filed: count("filed"),
+                members_refused: count("refused"),
+                members_skipped: count("skipped"),
+            }
+        }),
+        export_due: s.export_due,
     })
 }
 
@@ -1364,7 +2191,8 @@ pub(crate) mod tests {
     pub(crate) type Reply = dyn Fn(&str, &[u8]) -> (u16, Vec<u8>) + Send + Sync;
 
     /// A server on this machine that records every request as
-    /// `"METHOD /path"` and its body, and answers with `reply`.
+    /// `"METHOD /path"`, or `"METHOD /path?query"`, and its body, and
+    /// answers with `reply`.
     pub(crate) async fn mock(reply: Arc<Reply>) -> (FleetClient, Seen) {
         use axum::http::{Method, StatusCode, Uri};
         let seen: Seen = Arc::default();
@@ -1373,7 +2201,10 @@ pub(crate) mod tests {
             move |method: Method, uri: Uri, body: axum::body::Bytes| {
                 let (log, reply) = (log.clone(), reply.clone());
                 async move {
-                    let call = format!("{method} {}", uri.path());
+                    let call = match uri.query() {
+                        Some(q) => format!("{method} {}?{q}", uri.path()),
+                        None => format!("{method} {}", uri.path()),
+                    };
                     log.lock().unwrap().push((call.clone(), body.to_vec()));
                     let (status, body) = reply(&call, &body);
                     (StatusCode::from_u16(status).unwrap(), body)
@@ -1483,11 +2314,11 @@ pub(crate) mod tests {
                 bail!("crash")
             }
         };
-        assert!(hold_fkek(&CredentialFkekStore, &mut state, &mut crash).is_err());
+        assert!(hold_fkek(&CredentialFkekStore, &mut state, bootstrap_key, &mut crash).is_err());
         assert!(state.fkek_key_id.is_empty() && !state.fkek_nonce.is_empty());
         let first = held(&state);
         let vault = Counting(AtomicUsize::new(0));
-        let key = hold_fkek(&vault, &mut state, &mut |_| Ok(())).unwrap();
+        let key = hold_fkek(&vault, &mut state, bootstrap_key, &mut |_| Ok(())).unwrap();
         assert_eq!(*key, *first);
         assert_eq!(vault.0.load(Ordering::SeqCst), 0, "no second key");
         assert_eq!(state.fkek_key_id, hex(&fkek_key_id(&first)));
@@ -1503,7 +2334,10 @@ pub(crate) mod tests {
         let vault = Counting(AtomicUsize::new(0));
         let stops = |want: &str| {
             let mut s = state.clone();
-            let err = hold_fkek(&vault, &mut s, &mut |_| bail!("nothing is saved")).unwrap_err();
+            let err = hold_fkek(&vault, &mut s, bootstrap_key, &mut |_| {
+                bail!("nothing is saved")
+            })
+            .unwrap_err();
             assert!(err.to_string().contains(want), "{err}");
         };
 
@@ -1932,7 +2766,7 @@ pub(crate) mod tests {
             (G::None, Some("fleet.custodyReplyMismatch")),
             (G::Opened(1), Some("fleet.custodyReplyMismatch")),
         ] {
-            let got = crate::setup_collect_error(fleet.clone());
+            let got = crate::setup_collect_error(fleet.clone(), 0);
             match want {
                 None => assert_eq!(got, None, "{fleet:?}"),
                 Some(want) => {
@@ -3064,5 +3898,1262 @@ pub(crate) mod tests {
             .block_on(client.revoke_device("v2a.x", &"11".repeat(16), b"request"))
             .unwrap_err();
         assert!(outside_window(&error), "{error}");
+    }
+
+    // ---- Rotate fleet key (sequence K) ----
+
+    use crate::team::db::Db;
+    use shardx_core::fleet_lifecycle::FleetGrantTarget;
+
+    /// This custodian's verified key of N = 0, and the N+1 key it holds
+    /// after step 10, in the member tests.
+    const OLD_FKEK: [u8; 32] = [0x44; 32];
+    const NEW_FKEK: [u8; 32] = [0x67; 32];
+
+    /// A member device listed active, by `i`.
+    fn peer(i: u16) -> TenantDevice {
+        let mut seed = [0x5c; 32];
+        seed[..2].copy_from_slice(&i.to_le_bytes());
+        let signer = Ed25519SigningKey::from_bytes(&seed);
+        seed[2] = 0x5d;
+        let (_, pk) = derive_keypair(&seed);
+        let vk = signer.verifying_key().to_bytes();
+        let mut id = [0xd0; 16];
+        id[..2].copy_from_slice(&i.to_le_bytes());
+        TenantDevice {
+            device_id: hex(&id),
+            account_id: hex(&[4; 16]),
+            status: "active".into(),
+            label_hex: String::new(),
+            signing_public_key: hex(&vk),
+            hpke_public_key: hex(&pk),
+            signing_key_id: hex(&signing_key_id(&vk)),
+            hpke_key_id: hex(&hpke_key_id(&pk)),
+        }
+    }
+
+    /// This custodian's fleet approval of `row`'s listed keys, from `from`
+    /// until `until`.
+    fn approval_of(f: &Fixture, row: &TenantDevice, from: u64, until: u64) -> Vec<u8> {
+        let (signing, hpke, _) = listed_keys(row).unwrap();
+        let mut common = f.cx.common(random().unwrap(), from);
+        common.not_after_ms = until;
+        let a = DeviceApprovalV2 {
+            common,
+            subject_account_id: decode_hex16(&row.account_id, "a").unwrap(),
+            subject_device_id: decode_hex16(&row.device_id, "d").unwrap(),
+            subject_signing_key_id: signing,
+            subject_hpke_key_id: hpke,
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: f.cx.tenant,
+        };
+        build_record(&f.signer, DOMAIN_DEVICE_APPROVAL, &a.encode())
+    }
+
+    /// The custodian's own evidence, built at `at`: its D1 approval, ending
+    /// at `ends`, its root self-grant and its six capability grants.
+    fn own_evidence(f: &Fixture, at: u64, ends: u64) -> Vec<Vec<u8>> {
+        let mut common = f.cx.common([8; 16], at);
+        common.not_after_ms = ends;
+        let approval = DeviceApprovalV2 {
+            common,
+            subject_account_id: f.cx.account,
+            subject_device_id: f.cx.device,
+            subject_signing_key_id: f.cx.signing_key_id,
+            subject_hpke_key_id: f.cx.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: f.cx.tenant,
+        };
+        let (_, pk) = derive_keypair(&f.seed);
+        let me = GrantSubject::Device {
+            account_id: f.cx.account,
+            device_id: f.cx.device,
+            signing_key_id: f.cx.signing_key_id,
+            hpke_key_id: f.cx.hpke_key_id,
+        };
+        let mut out = vec![
+            build_record(&f.signer, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            crate::root_bootstrap::self_grant(&f.cx, &f.signer, &pk, &TRK, [8; 16], at).unwrap(),
+        ];
+        let grants = capability_grants(&f.cx, &f.signer, &me, own_grants(&f.cx, f.cx.tenant), at);
+        out.extend(grants.unwrap().iter().map(|g| unhex_vec(g).unwrap()));
+        out
+    }
+
+    /// Per signer: its public key and the containers served for it.
+    type BySigner = BTreeMap<[u8; 32], ([u8; 32], Vec<Vec<u8>>)>;
+    type Refuse = Box<dyn Fn(&str, &[u8]) -> Option<(u16, &'static str)> + Send>;
+
+    /// The server a rotation runs against: the fixture's identity at
+    /// `epoch`, `active` ACTIVE, every create, filing, ack and activation
+    /// answered with the stored response the server keeps (an activation
+    /// makes its generation ACTIVE), `devices` listed, and the evidence of
+    /// the custodian plus, per signer asked for, its key and `by_signer`.
+    /// `refuse` answers a request with a status and code instead.
+    #[derive(Default)]
+    struct Rot {
+        tenant: [u8; 16],
+        instance: [u8; 16],
+        epoch: u64,
+        active: Option<u64>,
+        lose_activation: bool,
+        devices: Vec<TenantDevice>,
+        custodian_pk: [u8; 32],
+        base: Vec<Vec<u8>>,
+        by_signer: BySigner,
+        evidence_down: bool,
+        refuse: Option<Refuse>,
+    }
+
+    fn stored(body: &[u8], record_type: &str, payload: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+        let req = IdempotentMutationRequestV2::parse(body).unwrap();
+        IdempotentStoredResponseV2 {
+            operation_kind: req.operation_kind,
+            idempotency_key: req.idempotency_key,
+            exact_request_hash: req.canonical_request_hash(),
+            response_record_type: record_type.into(),
+            canonical_response_payload_bytes: payload(&req.canonical_payload_bytes),
+            server_instance_id: req.server_instance_id,
+            restore_epoch: req.restore_epoch,
+            committed_at_ms: 1,
+            receipt_id: [0; 16],
+        }
+        .encode()
+    }
+
+    impl Rot {
+        fn answer(&mut self, call: &str, body: &[u8]) -> (u16, Vec<u8>) {
+            if let Some((status, code)) = self.refuse.as_ref().and_then(|f| f(call, body)) {
+                return (
+                    status,
+                    serde_json::to_vec(&serde_json::json!({ "code": code })).unwrap(),
+                );
+            }
+            let json = |v: serde_json::Value| (200, serde_json::to_vec(&v).unwrap());
+            let post = call.starts_with("POST ");
+            match call {
+                "GET /v2/server-identity" => json(serde_json::json!({
+                    "server_instance_id": hex(&self.instance),
+                    "restore_epoch": self.epoch,
+                })),
+                c if c.ends_with("/key-generation") => match self.active {
+                    Some(g) => json(serde_json::json!({ "generation": g })),
+                    None => (200, b"null".to_vec()),
+                },
+                "POST /v2/capability-grants" => (201, body.to_vec()),
+                c if post && c.ends_with("/key-generations") => {
+                    let reply = stored(body, RECORD_TYPE_FLEET_GENERATION_CREATED, |p| {
+                        FleetKeyGenerationCreatedV2 {
+                            create: FleetKeyGenerationCreateV2::parse(p).unwrap(),
+                            created_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.ends_with("/grants") => {
+                    let reply = stored(body, RECORD_TYPE_FLEET_GRANT_CREATED, |p| {
+                        let filing = FleetKeyGrantCreateV2::parse(p).unwrap();
+                        let target = match filing.grant.grant_variant {
+                            FleetGrantVariant::DeviceHpke => {
+                                let r = AuthorizationRecord::parse(
+                                    &filing.exact_signed_grant_container_bytes,
+                                )
+                                .unwrap();
+                                let g =
+                                    DeviceHpkeGrantV2::parse(r.canonical_payload_bytes()).unwrap();
+                                FleetGrantTarget::Device {
+                                    subject_device_id: g.subject_device_id,
+                                }
+                            }
+                            FleetGrantVariant::Recovery => FleetGrantTarget::Root {
+                                recipient_root_generation: 0,
+                            },
+                            FleetGrantVariant::Rotation => FleetGrantTarget::Rotation,
+                        };
+                        FleetKeyGrantCreatedV2 {
+                            grant: filing.grant,
+                            target,
+                            created_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.ends_with("/ack") => (201, acked(body)),
+                c if post && c.ends_with("/activate") => {
+                    let mut generation = 0;
+                    let reply = stored(body, RECORD_TYPE_FLEET_GENERATION_ACTIVATED, |p| {
+                        let terms = FleetKeyGenerationActivateV2::parse(p).unwrap().terms;
+                        generation = terms.generation.generation;
+                        FleetKeyGenerationActivatedV2 {
+                            terms,
+                            activated_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    self.active = Some(generation);
+                    if std::mem::take(&mut self.lose_activation) {
+                        return (503, Vec::new());
+                    }
+                    (201, reply)
+                }
+                c if c.ends_with("/devices") => {
+                    let devices: Vec<serde_json::Value> = self
+                        .devices
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "device_id": r.device_id, "account_id": r.account_id,
+                                "status": r.status, "label_hex": r.label_hex,
+                                "signing_key_id": r.signing_key_id, "hpke_key_id": r.hpke_key_id,
+                                "signing_public_key": r.signing_public_key,
+                                "hpke_public_key": r.hpke_public_key,
+                            })
+                        })
+                        .collect();
+                    json(serde_json::json!({ "devices": devices }))
+                }
+                c if c.contains("/trust-evidence") && !self.evidence_down => {
+                    let query = c.split_once('?').map_or("", |(_, q)| q);
+                    let mut containers = self.base.clone();
+                    let mut keys = vec![self.custodian_pk];
+                    for signer in query.split('&').filter_map(|kv| kv.strip_prefix("signer=")) {
+                        let signer = decode_hex32(signer, "signer").unwrap();
+                        if let Some((pk, more)) = self.by_signer.get(&signer) {
+                            keys.push(*pk);
+                            containers.extend(more.iter().cloned());
+                        }
+                    }
+                    let page = TenantTrustEvidencePageV2 {
+                        server_instance_id: self.instance,
+                        tenant_id: self.tenant,
+                        server_now_ms: now_ms(),
+                        page_index: 0,
+                        next_cursor: Vec::new(),
+                        signing_public_keys: keys,
+                        containers,
+                        revocations: Vec::new(),
+                        device_revocations: Vec::new(),
+                    };
+                    (200, page.encode())
+                }
+                _ => (500, Vec::new()),
+            }
+        }
+    }
+
+    /// A custodian that created generation 0, its ledger pinned, against a
+    /// rotation server `edit` sets up.
+    struct Rig {
+        rt: tokio::runtime::Runtime,
+        client: FleetClient,
+        seen: Seen,
+        rot: Arc<Mutex<Rot>>,
+        db: Db,
+        now: u64,
+    }
+
+    fn rig(f: &Fixture, edit: impl FnOnce(&mut Rot)) -> Rig {
+        save(&f.prepared()).unwrap();
+        let now = now_ms();
+        let mut rot = Rot {
+            tenant: f.cx.tenant,
+            instance: f.cx.instance,
+            active: Some(0),
+            custodian_pk: f.signer.verifying_key().to_bytes(),
+            base: own_evidence(f, now, now + 365 * DAY_MS),
+            ..Default::default()
+        };
+        edit(&mut rot);
+        let rot = Arc::new(Mutex::new(rot));
+        let answer = rot.clone();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(Arc::new(move |call: &str, body: &[u8]| {
+            answer.lock().unwrap().answer(call, body)
+        })));
+        let db = Db::open_at(&f._dir.path().join("team-ledger.db")).unwrap();
+        let (binding, anchor) = f.pin();
+        crate::team::ledger::pin_anchor(
+            &db,
+            &binding,
+            &anchor,
+            crate::team::ledger::BOOTSTRAP,
+            now,
+        )
+        .unwrap();
+        Rig {
+            rt,
+            client,
+            seen,
+            rot,
+            db,
+            now,
+        }
+    }
+
+    impl Rig {
+        fn rotate(&mut self, f: &Fixture, now: u64) -> Result<()> {
+            self.rotate_with(
+                f,
+                &CredentialFkekStore,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut |s| save(s),
+            )
+        }
+
+        fn rotate_with(
+            &mut self,
+            f: &Fixture,
+            vault: &dyn FkekStore,
+            previous: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
+            now: u64,
+            save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+        ) -> Result<()> {
+            let mut state = load()?;
+            let pin = f.pin();
+            let mut ledger = Ledger {
+                db: &mut self.db,
+                pin: &pin,
+            };
+            self.rt.block_on(rotate_fleet(
+                &self.client,
+                "access",
+                &f.device(vault),
+                &f.root,
+                &mut ledger,
+                previous,
+                now,
+                &mut state,
+                save,
+            ))
+        }
+
+        fn members(&mut self, f: &Fixture, now: u64) -> Result<()> {
+            let mut state = load()?;
+            let pin = f.pin();
+            let mut ledger = Ledger {
+                db: &mut self.db,
+                pin: &pin,
+            };
+            self.rt.block_on(grant_members(
+                &self.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &mut ledger,
+                &NEW_FKEK,
+                now,
+                &mut state,
+                &mut |s| save(s),
+            ))
+        }
+
+        /// The next requests ending in `suffix` are refused with `status`
+        /// and `code`.
+        fn refuse(&self, suffix: &'static str, status: u16, code: &'static str) {
+            self.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+                (call.starts_with("POST ") && call.ends_with(suffix)).then_some((status, code))
+            }));
+        }
+
+        fn allow(&self) {
+            self.rot.lock().unwrap().refuse = None;
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(c, _)| c.clone())
+                .collect()
+        }
+
+        /// Every body sent to a route ending in `suffix`, in order.
+        fn bodies(&self, suffix: &str) -> Vec<Vec<u8>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c.starts_with("POST ") && c.ends_with(suffix))
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+
+        fn clear(&self) {
+            self.seen.lock().unwrap().clear();
+        }
+    }
+
+    fn rotation() -> FleetRotationState {
+        load().unwrap().rotation.expect("a saved rotation")
+    }
+
+    fn rotation_key_held() -> Option<Zeroizing<[u8; 32]>> {
+        let s = load().unwrap();
+        let r = s.rotation.as_ref()?;
+        (!r.fkek_nonce.is_empty()).then(|| {
+            CredentialFkekStore
+                .load(&setup_ref(&s.tenant_id, &r.fkek_nonce))
+                .unwrap()
+        })
+    }
+
+    /// Step 10 as the command runs it, without its collect.
+    fn collected(now: u64) {
+        let mut state = load().unwrap();
+        release_rotation_key(&CredentialFkekStore, &mut state, &mut |s| save(s)).unwrap();
+        rotation_collected(now, &mut state, &mut |s| save(s)).unwrap();
+    }
+
+    fn has(e: &anyhow::Error, code: &str) -> bool {
+        e.to_string().contains(code)
+    }
+
+    /// No secret request left the device: only reads.
+    fn only_reads(calls: &[String]) -> bool {
+        calls.iter().all(|c| c.starts_with("GET "))
+    }
+
+    #[test]
+    fn the_rotate_capability_grant_is_key_rotate_on_this_fleet_for_this_device() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        let r = rotation();
+        let grant = unhex_vec(&r.rotate_grant).unwrap();
+        let verified = AuthorizationRecord::parse(&grant)
+            .unwrap()
+            .verify_signature(f.signer.verifying_key().as_bytes())
+            .unwrap();
+        let Payload::TenantCapabilityGrant(g) = verified.payload().clone() else {
+            panic!("a capability grant")
+        };
+        assert_eq!(
+            (g.capability, g.scope_kind, g.scope_id),
+            (
+                Capability::KeyRotate,
+                CapabilityScopeKind::Fleet,
+                f.cx.tenant
+            )
+        );
+        assert_eq!(
+            g.subject,
+            GrantSubject::Device {
+                account_id: f.cx.account,
+                device_id: f.cx.device,
+                signing_key_id: f.cx.signing_key_id,
+                hpke_key_id: f.cx.hpke_key_id,
+            }
+        );
+        assert_eq!(rig.bodies("/v2/capability-grants"), [grant]);
+        // Filed before the create in rotation mode needs it.
+        let calls = rig.calls();
+        let at = |s: &str| calls.iter().position(|c| c.ends_with(s)).unwrap();
+        assert!(at("/v2/capability-grants") < at("/key-generations"));
+    }
+
+    #[test]
+    fn a_rotation_builds_terms_one_generation_up_under_a_new_key() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1), "N+1 is ACTIVE");
+        let r = rotation();
+        let key = rotation_key_held().expect("held until step 10");
+        let create = payload(&r.create_request, FleetKeyGenerationCreateV2::parse);
+        let t = create.terms;
+        let old_id = fkek_key_id(&OLD_FKEK);
+        assert_eq!(
+            (
+                t.generation.generation,
+                t.generation.fleet_id,
+                create.root_generation
+            ),
+            (1, f.cx.tenant, 0)
+        );
+        assert_eq!(t.generation.fkek_key_id, fkek_key_id(&key));
+        assert_ne!(t.generation.fkek_key_id, old_id);
+        assert_eq!(hex(&t.generation.fkek_key_id), r.fkek_key_id);
+        let containers =
+            [&r.device_grant, &r.recovery_grant, &r.rotation_grant].map(|c| unhex_vec(c).unwrap());
+        let [device_grant, recovery_grant, rotation_grant] = &containers;
+        assert_eq!(t.required_device_grant_count, 1);
+        assert_eq!(
+            t.required_device_grant_set_hash,
+            fleet_device_grant_set_hash(&[container_hash(device_grant).unwrap()]).unwrap()
+        );
+        assert_eq!(
+            t.recovery_grant_signed_container_hash,
+            container_hash(recovery_grant).unwrap()
+        );
+        assert_eq!(
+            t.rotation,
+            Some(FleetRotation {
+                previous_generation: 0,
+                previous_fkek_key_id: old_id,
+                rotation_grant_signed_container_hash: container_hash(rotation_grant).unwrap(),
+            })
+        );
+
+        let verified = |c: &[u8]| {
+            AuthorizationRecord::parse(c)
+                .unwrap()
+                .verify_signature(f.signer.verifying_key().as_bytes())
+                .unwrap()
+                .payload()
+                .clone()
+        };
+        let Payload::RotationGrant(g) = verified(rotation_grant) else {
+            panic!("a rotation grant")
+        };
+        assert_eq!((g.generation, g.previous_generation), (1, 0));
+        assert_eq!(
+            (g.fkek_key_id, g.previous_fkek_key_id),
+            (fkek_key_id(&key), old_id)
+        );
+        assert_eq!(g.required_device_grant_count, 1);
+        assert_eq!(
+            g.required_device_grant_set_hash,
+            t.required_device_grant_set_hash
+        );
+        assert_eq!(
+            g.recovery_grant_signed_container_hash,
+            t.recovery_grant_signed_container_hash
+        );
+        assert_eq!(g.activation_not_before_ms, g.common.issued_at_ms);
+        assert_eq!(g.common.not_after_ms - g.common.not_before_ms, 30 * DAY_MS);
+        assert_eq!(r.deadline_ms, Some(g.common.not_after_ms));
+        let Payload::DeviceHpkeGrant(d) = verified(device_grant) else {
+            panic!("a device grant")
+        };
+        let (sk, _) = derive_keypair(&f.seed);
+        assert_eq!(
+            *shardx_core::grants::open_device_fkek(&sk, &d).unwrap(),
+            *key
+        );
+        let Payload::RecoveryGrant(rec) = verified(recovery_grant) else {
+            panic!("a recovery grant")
+        };
+        assert_eq!(*rec.open_fkek(&TRK).unwrap(), *key);
+
+        // The filings carry those containers, in order, the acks name the
+        // same grants, and the activation restates the terms.
+        let variants = [
+            FleetGrantVariant::DeviceHpke,
+            FleetGrantVariant::Recovery,
+            FleetGrantVariant::Rotation,
+        ];
+        assert_eq!((r.grant_requests.len(), r.ack_requests.len()), (3, 3));
+        for i in 0..3 {
+            let filing = payload(&r.grant_requests[i], FleetKeyGrantCreateV2::parse);
+            assert_eq!(filing.exact_signed_grant_container_bytes, containers[i]);
+            assert_eq!(filing.grant.grant_variant, variants[i]);
+            assert_eq!(filing.grant.generation, t.generation);
+            let ack = payload(&r.ack_requests[i], FleetKeyGrantAckV2::parse);
+            assert_eq!(ack.grant, filing.grant);
+        }
+        let activate = payload(&r.activate_request, FleetKeyGenerationActivateV2::parse);
+        assert_eq!(activate.terms, t);
+    }
+
+    #[test]
+    fn a_rotation_resumes_after_each_failed_save_with_byte_identical_requests() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let vault = Counting(AtomicUsize::new(0));
+        let now = rig.now;
+        // Each save fails once, the first time it is reached; the next run
+        // resumes from what the saves before it kept.
+        let mut kept = 0;
+        let mut failed = std::collections::BTreeSet::new();
+        loop {
+            let result = rig.rotate_with(
+                &f,
+                &vault,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut |s| {
+                    if failed.insert(kept) {
+                        bail!("disk-full")
+                    }
+                    save(s)?;
+                    kept += 1;
+                    Ok(())
+                },
+            );
+            match result {
+                Err(e) if has(&e, "disk-full") => continue,
+                result => break result.unwrap(),
+            }
+        }
+        assert_eq!(failed.len(), 5, "start, S0, nonce, key id, step 4");
+        assert_eq!(vault.0.load(Ordering::SeqCst), 1, "one setup key");
+        let r = rotation();
+        let distinct = |suffix: &str| {
+            let mut b = rig.bodies(suffix);
+            b.sort();
+            b.dedup();
+            b
+        };
+        let saved = |list: &[String]| {
+            let mut v: Vec<Vec<u8>> = list.iter().map(|s| unhex_vec(s).unwrap()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            distinct("/key-generations"),
+            saved(std::slice::from_ref(&r.create_request))
+        );
+        assert_eq!(distinct("/grants"), saved(&r.grant_requests));
+        assert_eq!(distinct("/ack"), saved(&r.ack_requests));
+        assert_eq!(
+            distinct("/activate"),
+            saved(std::slice::from_ref(&r.activate_request))
+        );
+        assert_eq!(
+            distinct("/capability-grants"),
+            saved(std::slice::from_ref(&r.rotate_grant))
+        );
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1));
+    }
+
+    #[test]
+    fn a_rotation_never_holds_two_setup_keys_for_one_generation() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let bootstrap_nonce = load().unwrap().fkek_nonce;
+        let vault = Counting(AtomicUsize::new(0));
+        let now = rig.now;
+        // The key is held, then the save of its id fails.
+        let err = rig
+            .rotate_with(
+                &f,
+                &vault,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut |s| {
+                    if s.rotation
+                        .as_ref()
+                        .is_some_and(|r| !r.fkek_key_id.is_empty())
+                    {
+                        bail!("disk-full")
+                    }
+                    save(s)
+                },
+            )
+            .unwrap_err();
+        assert!(has(&err, "disk-full"));
+        let first = rotation_key_held().expect("held under the rotation's nonce");
+        assert_eq!(vault.0.load(Ordering::SeqCst), 1);
+        rig.rotate_with(
+            &f,
+            &vault,
+            |_| Ok(Zeroizing::new(OLD_FKEK)),
+            now,
+            &mut |s| save(s),
+        )
+        .unwrap();
+        rig.rotate_with(
+            &f,
+            &vault,
+            |_| Ok(Zeroizing::new(OLD_FKEK)),
+            now,
+            &mut |s| save(s),
+        )
+        .unwrap();
+        assert_eq!(vault.0.load(Ordering::SeqCst), 1, "the held key is reused");
+        let r = rotation();
+        let create = payload(&r.create_request, FleetKeyGenerationCreateV2::parse);
+        assert_eq!(create.terms.generation.fkek_key_id, fkek_key_id(&first));
+        let state = load().unwrap();
+        assert_eq!(
+            state.fkek_nonce, bootstrap_nonce,
+            "Create fleet key's is its own"
+        );
+        assert_ne!(r.fkek_nonce, bootstrap_nonce);
+    }
+
+    #[test]
+    fn a_rotation_refuses_without_the_verified_active_key() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let now = rig.now;
+        let err = rig
+            .rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| bail!(crate::errcode::code("fleet.rotationNeedsFleetKey")),
+                now,
+                &mut |s| save(s),
+            )
+            .unwrap_err();
+        assert!(has(&err, "fleet.rotationNeedsFleetKey"), "{err}");
+        assert!(load().unwrap().rotation.is_none());
+        assert!(only_reads(&rig.calls()));
+    }
+
+    #[test]
+    fn a_rotation_refuses_on_another_server() {
+        let f = fixture();
+        let mut rig = rig(&f, |r| r.instance = [0xee; 16]);
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.custodyServerChanged"), "{err}");
+        assert_eq!(rig.calls(), ["GET /v2/server-identity"]);
+        assert!(load().unwrap().rotation.is_none());
+    }
+
+    #[test]
+    fn a_member_cannot_rotate() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        save(&f.state()).unwrap();
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.notCustodian"), "{err}");
+        assert!(rig.calls().is_empty());
+    }
+
+    #[test]
+    fn a_rotation_refuses_when_the_custodians_approval_expired() {
+        let f = fixture();
+        let now = now_ms();
+        let mut rig = rig(&f, |r| {
+            r.base = own_evidence(&f, now - 2 * DAY_MS, now - DAY_MS)
+        });
+        let err = rig.rotate(&f, now).unwrap_err();
+        assert!(has(&err, "fleet.rotationCustodianApprovalExpired"), "{err}");
+        assert!(load().unwrap().rotation.is_none());
+        assert!(only_reads(&rig.calls()));
+    }
+
+    /// Approve is not refused as `fleet.rotationInProgress`: it reaches the
+    /// server, which this mock refuses.
+    fn approve_allowed(rig: &Rig, f: &Fixture) {
+        let (row, _) = joiner();
+        let err = approve(&rig.rt, f, &rig.client, &row, &f.code(&row), now_ms());
+        assert!(!err.contains("fleet.rotationInProgress"), "{err}");
+        assert!(err.contains("fleet.refusedCustody"), "{err}");
+    }
+
+    /// Start again: the server still has N+1 PREPARING, so its create is
+    /// refused `FLEET_GENERATION_EXISTS`, and the new setup key goes.
+    fn start_is_stuck(rig: &mut Rig, f: &Fixture) {
+        rig.refuse("/key-generations", 409, "FLEET_GENERATION_EXISTS");
+        let err = rig.rotate(f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.rotationStuck"), "{err}");
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+        assert!(rotation_key_held().is_none(), "the new setup key went too");
+        rig.allow();
+    }
+
+    #[test]
+    fn an_expired_rotation_releases_its_setup_key_and_lets_approvals_resume() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/activate", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let held = rotation_key_held().expect("held");
+        let name = setup_ref(&f.tenant, &rotation().fkek_nonce);
+        let deadline = rotation().deadline_ms.unwrap();
+        rig.clear();
+
+        let err = rig.rotate(&f, deadline).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{err}");
+        assert!(only_reads(&rig.calls()), "no activation is sent");
+        assert!(rig.calls().iter().any(|c| c.ends_with("/key-generation")));
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+        assert!(is_missing(&CredentialFkekStore.load(&name).unwrap_err()));
+        assert!(rotation_key_held().is_none());
+        drop(held);
+        rig.allow();
+        approve_allowed(&rig, &f);
+        start_is_stuck(&mut rig, &f);
+    }
+
+    #[test]
+    fn a_rotation_resumed_past_its_deadline_before_filing_expires_without_sending() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/grants", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        assert_eq!(rig.bodies("/key-generations").len(), 1, "created");
+        let deadline = rotation().deadline_ms.unwrap();
+        rig.allow();
+        rig.clear();
+
+        let err = rig.rotate(&f, deadline + 1).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{err}");
+        let calls = rig.calls();
+        assert!(only_reads(&calls), "{calls:?}");
+        assert!(calls
+            .iter()
+            .all(|c| c == "GET /v2/server-identity" || c.ends_with("/key-generation")));
+        assert!(rotation_key_held().is_none());
+        approve_allowed(&rig, &f);
+        start_is_stuck(&mut rig, &f);
+    }
+
+    #[test]
+    fn a_resume_after_the_deadline_of_a_lost_activation_reply_continues_to_member_grants() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = rig(&f, |r| {
+            r.lose_activation = true;
+            r.devices = vec![b.clone()];
+        });
+        let mut state = load().unwrap();
+        state.members.insert(
+            b.device_id.clone(),
+            MemberApproval {
+                approval: hex(&approval_of(&f, &b, rig.now, rig.now + 365 * DAY_MS)),
+                ..Default::default()
+            },
+        );
+        save(&state).unwrap();
+        assert!(rig.rotate(&f, rig.now).is_err(), "the reply is lost");
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1));
+        let deadline = rotation().deadline_ms.unwrap();
+
+        rig.rotate(&f, deadline + 1).unwrap();
+        let r = rotation();
+        assert_eq!(r.phase, RotationPhase::Preparing);
+        assert!(rotation_key_held().is_some(), "released only at step 10");
+        assert_eq!(
+            rig.bodies("/activate").len(),
+            2,
+            "the saved activation, resent"
+        );
+        collected(deadline + 1);
+        assert!(rotation_key_held().is_none());
+        assert_eq!(rotation().phase, RotationPhase::Activated);
+
+        rig.members(&f, deadline + 1).unwrap();
+        let r = rotation();
+        assert_eq!(r.phase, RotationPhase::Done);
+        assert_eq!(r.member_results[&b.device_id], "filed");
+        // Unvalidated assumption 2: the member grant, outside the required
+        // set, is filed only after the activation.
+        let calls = rig.calls();
+        let last_activate = calls
+            .iter()
+            .rposition(|c| c.ends_with("/activate"))
+            .unwrap();
+        let member = unhex_vec(&r.member_grants[&b.device_id]).unwrap();
+        let filed = rig
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|(c, body)| c.ends_with("/grants") && *body == member)
+            .unwrap();
+        assert!(filed > last_activate);
+    }
+
+    #[test]
+    fn a_rotation_filing_refused_403_past_the_deadline_runs_the_expiry_decision() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/grants", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let deadline = rotation().deadline_ms.unwrap();
+        // The server's clock is past the window, this one is not yet.
+        rig.refuse("/grants", 403, "");
+        let err = rig.rotate(&f, deadline - 1_000).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{err}");
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+        assert!(rotation_key_held().is_none());
+    }
+
+    #[test]
+    fn a_rotation_filing_refused_403_before_the_deadline_is_returned_unchanged() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/grants", 403, "");
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(refused_with(&err, 403, None), "{err}");
+        assert!(!has(&err, "fleet.rotation"), "{err}");
+        assert_eq!(rotation().phase, RotationPhase::Preparing);
+        assert!(rotation_key_held().is_some());
+        assert!(rig.calls().iter().any(|c| c.ends_with("/key-generation")));
+    }
+
+    #[test]
+    fn an_expiry_decision_with_an_unexpected_active_generation_changes_nothing() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/grants", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let deadline = rotation().deadline_ms.unwrap();
+        let path = crate::store::fleet_custody_path().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for active in [Some(5), None] {
+            rig.rot.lock().unwrap().active = active;
+            let err = rig.rotate(&f, deadline).unwrap_err();
+            assert!(has(&err, "fleet.rotationStateUnknown"), "{active:?}: {err}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{active:?}");
+            assert!(rotation_key_held().is_some());
+        }
+    }
+
+    #[test]
+    fn a_rotation_left_preparing_across_a_restore_epoch_is_expired() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/activate", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        rig.allow();
+        rig.rot.lock().unwrap().epoch = 1;
+        rig.clear();
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{err}");
+        assert!(only_reads(&rig.calls()));
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+        assert!(rotation_key_held().is_none());
+    }
+
+    #[test]
+    fn an_activation_not_yet_due_before_the_deadline_is_retryable() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/activate", 409, "FLEET_GRANTS_INCOMPLETE");
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.rotationNotYetDue"), "{err}");
+        assert_eq!(rotation().phase, RotationPhase::Preparing);
+        assert!(rotation_key_held().is_some());
+        rig.allow();
+        rig.rotate(&f, rig.now).unwrap();
+        assert_eq!(rig.rot.lock().unwrap().active, Some(1));
+    }
+
+    /// A rotation at step 11, N+1 ACTIVE, against a server listing `rows`.
+    fn at_members(f: &Fixture, rows: Vec<TenantDevice>) -> Rig {
+        let rig = rig(f, |r| {
+            r.active = Some(1);
+            r.devices = rows;
+        });
+        let mut state = load().unwrap();
+        state.rotation = Some(FleetRotationState {
+            generation: 1,
+            phase: RotationPhase::Activated,
+            ..Default::default()
+        });
+        save(&state).unwrap();
+        rig
+    }
+
+    fn save_approval(f: &Fixture, row: &TenantDevice, from: u64, until: u64) {
+        let mut state = load().unwrap();
+        state.members.insert(
+            row.device_id.clone(),
+            MemberApproval {
+                approval: hex(&approval_of(f, row, from, until)),
+                ..Default::default()
+            },
+        );
+        save(&state).unwrap();
+    }
+
+    fn results() -> Vec<(String, String)> {
+        rotation().member_results.into_iter().collect()
+    }
+
+    #[test]
+    fn member_grants_skip_a_saved_approval_outside_its_window() {
+        let f = fixture();
+        let (b, c) = (peer(1), peer(2));
+        let mut rig = at_members(&f, vec![b.clone(), c.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now - 400 * DAY_MS, now - DAY_MS);
+        save_approval(&f, &c, now, now + 365 * DAY_MS);
+        rig.members(&f, now).unwrap();
+        assert_eq!(
+            results(),
+            [
+                (b.device_id.clone(), "skipped:no-approval".to_string()),
+                (c.device_id.clone(), "filed".to_string()),
+            ]
+        );
+        assert_eq!(rig.bodies("/grants").len(), 1);
+        let filing = payload(
+            &rotation().member_grants[&c.device_id],
+            FleetKeyGrantCreateV2::parse,
+        );
+        assert_eq!(filing.grant.generation.generation, 1);
+        assert_eq!(filing.grant.generation.fkek_key_id, fkek_key_id(&NEW_FKEK));
+    }
+
+    #[test]
+    fn member_grants_ask_evidence_for_the_listed_signers_in_batches_of_64() {
+        let f = fixture();
+        let rows: Vec<TenantDevice> = (1..=70).map(peer).collect();
+        let mut rig = at_members(&f, rows.clone());
+        let now = rig.now;
+        let mut state = load().unwrap();
+        for row in &rows {
+            state.members.insert(
+                row.device_id.clone(),
+                MemberApproval {
+                    approval: hex(&approval_of(&f, row, now, now + 365 * DAY_MS)),
+                    ..Default::default()
+                },
+            );
+        }
+        save(&state).unwrap();
+        rig.members(&f, now).unwrap();
+        let asked: Vec<Vec<String>> = rig
+            .calls()
+            .iter()
+            .filter(|c| c.contains("/trust-evidence"))
+            .map(|c| {
+                c.split_once('?')
+                    .map_or("", |(_, q)| q)
+                    .split('&')
+                    .filter_map(|kv| kv.strip_prefix("signer=").map(str::to_owned))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(asked.iter().map(Vec::len).collect::<Vec<_>>(), [64, 6]);
+        let mut all: Vec<String> = asked.concat();
+        all.sort();
+        let mut listed: Vec<String> = rows.iter().map(|r| r.signing_key_id.clone()).collect();
+        listed.sort();
+        assert_eq!(all, listed, "exactly the listed signers");
+        assert_eq!(rig.bodies("/grants").len(), 70);
+        assert!(results().iter().all(|(_, r)| r == "filed"));
+    }
+
+    #[test]
+    fn member_grants_skip_a_revoked_device_the_server_lists_as_active() {
+        let f = fixture();
+        let c = peer(3);
+        let mut rig = at_members(&f, vec![c.clone()]);
+        let now = rig.now;
+        save_approval(&f, &c, now, now + 365 * DAY_MS);
+        let mut state = load().unwrap();
+        state.revocations.insert(c.device_id.clone(), "00".into());
+        save(&state).unwrap();
+        rig.members(&f, now).unwrap();
+        assert_eq!(
+            results(),
+            [(c.device_id.clone(), "skipped:revoked".to_string())]
+        );
+        assert!(rig.bodies("/grants").is_empty());
+        assert!(rotation().member_grants.is_empty(), "nothing is built");
+    }
+
+    #[test]
+    fn member_grants_refuse_a_listed_key_no_signed_approval_names() {
+        let f = fixture();
+        let b = peer(1);
+        // The server swaps in an HPKE key of its own for B.
+        let other = peer(9);
+        let swapped = TenantDevice {
+            hpke_public_key: other.hpke_public_key.clone(),
+            hpke_key_id: other.hpke_key_id.clone(),
+            ..b.clone()
+        };
+        let mut rig = at_members(&f, vec![swapped]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        let approval = approval_of(&f, &b, now, now + 365 * DAY_MS);
+        let signing = decode_hex32(&b.signing_key_id, "s").unwrap();
+        let pk = decode_hex32(&b.signing_public_key, "pk").unwrap();
+        rig.rot
+            .lock()
+            .unwrap()
+            .by_signer
+            .insert(signing, (pk, vec![approval]));
+        rig.members(&f, now).unwrap();
+        assert_eq!(
+            results(),
+            [(b.device_id.clone(), "skipped:no-approval".to_string())]
+        );
+        assert!(rig.bodies("/grants").is_empty());
+    }
+
+    #[test]
+    fn member_grants_use_a_chain_approval_when_no_saved_approval_exists() {
+        let f = fixture();
+        let (b, d) = (peer(1), peer(4));
+        let mut rig = at_members(&f, vec![b.clone(), d.clone()]);
+        let now = rig.now;
+        // An imported custodian: no saved create request, no saved approvals.
+        let mut state = load().unwrap();
+        state.imported = true;
+        state.create_request.clear();
+        state.members.clear();
+        save(&state).unwrap();
+        let signing = decode_hex32(&b.signing_key_id, "s").unwrap();
+        let pk = decode_hex32(&b.signing_public_key, "pk").unwrap();
+        let approval = approval_of(&f, &b, now, now + 365 * DAY_MS);
+        rig.rot
+            .lock()
+            .unwrap()
+            .by_signer
+            .insert(signing, (pk, vec![approval]));
+        rig.members(&f, now).unwrap();
+        assert_eq!(
+            results(),
+            [
+                (b.device_id.clone(), "filed".to_string()),
+                (d.device_id.clone(), "skipped:no-approval".to_string()),
+            ]
+        );
+        assert_eq!(rig.bodies("/grants").len(), 1);
+    }
+
+    #[test]
+    fn member_grants_skip_self_pending_and_record_server_refusals() {
+        let f = fixture();
+        let me = TenantDevice {
+            device_id: f.device.clone(),
+            ..peer(5)
+        };
+        let pending = TenantDevice {
+            status: "pending".into(),
+            ..peer(6)
+        };
+        let b = peer(1);
+        let mut rig = at_members(&f, vec![me, pending, b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.refuse("/grants", 409, "SUBJECT_NOT_ELIGIBLE");
+        rig.members(&f, now).unwrap();
+        assert_eq!(results(), [(b.device_id.clone(), "refused".to_string())]);
+        let state = load().unwrap();
+        assert_eq!(state.rotation.unwrap().phase, RotationPhase::Done);
+        assert!(state.export_due);
+        let status = status().unwrap();
+        let r = status.rotation.unwrap();
+        assert_eq!(
+            (
+                r.generation,
+                r.members_filed,
+                r.members_refused,
+                r.members_skipped
+            ),
+            (1, 0, 1, 0)
+        );
+        assert!(status.export_due);
+    }
+
+    #[test]
+    fn member_grants_stop_without_fresh_evidence() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = at_members(&f, vec![b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.rot.lock().unwrap().evidence_down = true;
+        let err = rig.members(&f, now).unwrap_err();
+        assert!(has(&err, "fleet.refusedCustody"), "{err}");
+        assert!(only_reads(&rig.calls()), "nothing is filed");
+        let r = rotation();
+        assert_eq!(r.phase, RotationPhase::Activated);
+        assert!(r.member_grants.is_empty() && r.member_results.is_empty());
+    }
+
+    #[test]
+    fn an_unfinished_rotation_cannot_be_started_again() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let vault = Counting(AtomicUsize::new(0));
+        rig.refuse("/key-generations", 503, "");
+        let now = rig.now;
+        let run = |rig: &mut Rig| {
+            rig.rotate_with(
+                &f,
+                &vault,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut |s| save(s),
+            )
+        };
+        assert!(run(&mut rig).is_err());
+        let first = rotation();
+        assert!(run(&mut rig).is_err());
+        let second = rotation();
+        assert_eq!(
+            (first.generation, &first.fkek_nonce, &first.create_request),
+            (
+                second.generation,
+                &second.fkek_nonce,
+                &second.create_request
+            )
+        );
+        assert_eq!(vault.0.load(Ordering::SeqCst), 1);
+        let starts = rig
+            .calls()
+            .iter()
+            .filter(|c| c.contains("/trust-evidence"))
+            .count();
+        assert_eq!(starts, 1, "the second run resumed");
+        assert_eq!(rig.bodies("/key-generations").len(), 2);
+    }
+
+    #[test]
+    fn approving_a_device_while_a_rotation_is_unfinished_is_refused() {
+        let f = fixture();
+        let rig = rig(&f, |_| {});
+        let (row, _) = joiner();
+        for phase in [RotationPhase::Preparing, RotationPhase::Activated] {
+            let mut state = load().unwrap();
+            state.rotation = Some(FleetRotationState {
+                generation: 1,
+                phase,
+                ..Default::default()
+            });
+            save(&state).unwrap();
+            let err = approve(&rig.rt, &f, &rig.client, &row, &f.code(&row), now_ms());
+            assert!(err.contains("fleet.rotationInProgress"), "{phase:?}: {err}");
+            assert!(rig.calls().is_empty(), "{phase:?}");
+        }
+        for phase in [RotationPhase::Done, RotationPhase::Expired] {
+            let mut state = load().unwrap();
+            state.rotation.as_mut().unwrap().phase = phase;
+            save(&state).unwrap();
+            approve_allowed(&rig, &f);
+        }
+    }
+
+    #[test]
+    fn the_rotation_state_holds_no_key_bytes() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = rig(&f, |r| r.devices = vec![b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.rotate(&f, now).unwrap();
+        let key = hex(&*rotation_key_held().unwrap());
+        collected(now);
+        rig.members(&f, now).unwrap();
+        let state = load().unwrap();
+        let r = state.rotation.clone().unwrap();
+        assert_eq!(r.phase, RotationPhase::Done);
+        let file = std::fs::read_to_string(crate::store::fleet_custody_path().unwrap()).unwrap();
+        let debug = format!("{state:?}");
+        assert!(file.contains(&r.fkek_key_id) && debug.contains(&r.fkek_key_id));
+        for text in [&file, &debug] {
+            for (secret, what) in [
+                (&key, "the new fleet key"),
+                (&hex(&OLD_FKEK), "the old fleet key"),
+                (&hex(&NEW_FKEK), "the key members get"),
+                (&hex(&TRK), "the TRK"),
+                (&hex(&f.seed), "the HPKE seed"),
+                (&hex(&f.signer.to_bytes()), "the signing seed"),
+            ] {
+                assert!(!text.contains(secret.as_str()), "{what}");
+            }
+        }
+        for saved in [
+            &r.create_request,
+            &r.rotate_grant,
+            &r.device_grant,
+            &r.activate_request,
+            &r.member_grants[&b.device_id],
+        ] {
+            assert!(!debug.contains(saved.as_str()));
+        }
     }
 }
