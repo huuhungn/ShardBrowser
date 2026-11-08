@@ -132,7 +132,7 @@ The v0.2.3 slice (release v2.9.0) rotates the fleet key with no server change; r
 | **Q-46 Lazy re-seal** (D-9, trust chain) | **Old snapshots stay under their generation; the next push seals under N+1.** Retained envelopes are never rewritten (L2494). A pull reads a head under any generation whose grant re-verifies, under the generation floor (freshness amendment in the trust chain); seals stay on the newest verified generation. After a rotation the Team page lists the profiles bound on the custodian's device whose pinned head is under an older generation and asks the custodian to push each once; a device without the key of an older head gets `sync.headUnderRetiredKey`. Costs a and b are stated in the freshness amendment. Tests `a_pull_restores_a_head_sealed_under_an_older_generation_after_rotation`, `a_device_without_the_old_key_gets_head_under_retired_key`, `profiles_under_an_older_key_lists_bindings_below_the_highest_generation` (confirmed in R1-R4). Rejected: eager or bulk re-seal (v2.10) | none (L2494) |
 | **Q-47 Rotation trigger** (C-1, Q-20) | **Manual, with an advisory banner.** A custodian starts the rotation by hand (Resume while one is unfinished). The `rotation_required` banner, tiered as Q-20, is derived on the custodian's device from its own signed revocations and the known holders of the ACTIVE generation (its saved grants or ledger holdings), never from a server flag (C-1), and never rotates by itself. Tests `rotation_required_is_routine_after_a_retired_revoke_and_clears_after_rotation`, `rotation_required_is_urgent_after_a_lost_revoke` (confirmed in R1-R4) | none |
 | **Q-48 Approvals during a rotation** (D-9) | **Refused while a rotation is unfinished** (`fleet.rotationInProgress`, phases `preparing` and `activated`); allowed again at `done` or `expired`. Test `approving_a_device_while_a_rotation_is_unfinished_is_refused` (confirmed in R1-R4) | none |
-| **Q-49 A rotation that can no longer activate** (Q-24, Q-28) | **Terminal phase `expired`, entered only after the server shows N still ACTIVE.** The setup key is released, N stays ACTIVE, approvals resume, and no new rotation can start (`fleet.rotationStuck`) until a v2.10 server route discards the PREPARING generation. Sequence K, expiry decision; tests `an_expired_rotation_releases_its_setup_key_and_lets_approvals_resume`, `a_resume_after_the_deadline_of_a_lost_activation_reply_continues_to_member_grants` (confirmed in R1-R4). Rejected: declaring `expired` on the local clock alone (strands every member when the activation reply was lost) | none |
+| **Q-49 A rotation that can no longer activate** (Q-24, Q-28) | **Terminal phase `expired`, entered only after the server shows N still ACTIVE.** The setup key is released, N stays ACTIVE, approvals resume, and a later Start tries again: it fails with `fleet.rotationStuck` (releasing its new setup key, back to `expired`) when the server answers the create with `409 FLEET_GENERATION_EXISTS`, which only another create can cause since a re-sent create gets its stored reply; a fleet whose N+1 never reached the server (or was undone by a restore) rotates normally. A truly stuck PREPARING generation waits for a v2.10 discard route. Sequence K, expiry decision; tests `an_expired_rotation_releases_its_setup_key_and_lets_approvals_resume`, `a_resume_after_the_deadline_of_a_lost_activation_reply_continues_to_member_grants` (confirmed in R1-R4). Rejected: declaring `expired` on the local clock alone (strands every member when the activation reply was lost) | none |
 | **Q-50 `compromised` revoke reason** (Q-18) | **Not offered yet.** Revoke reasons stay `retired` and `lost`, so the Q-18 freeze cannot be started from the UI in v2.9.0 (v2.10 follow-up) | none |
 | **Q-51 Scope of the rotating custodian's `key.rotate`** (D-2) | **Fleet scope, one grant per rotation**, filed for this device and saved in the rotation state (sequence K step 2). Deliberate: fleet scope is what the rotation create and the ledger's activation check ask for; v2.10 root rotation needs a tenant-scoped grant (`server/src/routes/v2_root.rs:514`) and files its own. Test `the_rotate_capability_grant_is_key_rotate_on_this_fleet_for_this_device` (confirmed in R1-R4) | none |
 
@@ -1485,8 +1485,10 @@ confirmed in R1-R4).
 1. **Start or resume.** The server identity must match the custody state.
    Start needs N ACTIVE on the server, N as the highest verified generation in
    the key store and the ledger, and this custodian's own approval valid now;
-   a saved unfinished rotation is resumed instead; a saved `expired` one
-   refuses Start (`fleet.rotationStuck`). Resume skips these checks.
+   a saved unfinished rotation is resumed instead; after a saved `expired`
+   one, Start builds a new rotation and returns `fleet.rotationStuck` only if
+   the server answers its create with `409 FLEET_GENERATION_EXISTS`. Resume
+   skips these checks.
 2. **S0.** One `key.rotate` capability grant, fleet scope, for this device,
    saved in the rotation state (Q-51).
 3. **Setup key** with a key ID distinct from N's.
@@ -1517,7 +1519,7 @@ ACTIVE means the activation may already have happened (a lost reply): the
 launcher re-sends the saved activate and continues at step 10 only when the
 server returns the stored reply with matching terms; otherwise it stops with
 `fleet.rotationStateUnknown`. N ACTIVE enters `expired`: the setup key is released, N
-stays ACTIVE, approvals resume (Q-48) and Start stays refused. Anything else
+stays ACTIVE, approvals resume (Q-48) and a later Start tries again (step 1). Anything else
 stops with `fleet.rotationStateUnknown` and changes nothing. The launcher never
 declares `expired` on its own clock alone. Tests
 `a_rotation_resumed_past_its_deadline_before_filing_expires_without_sending`,
