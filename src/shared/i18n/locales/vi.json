@@ -369,6 +369,7 @@
   "recovery.deviceNotActive": "Máy chủ nhóm không liệt kê thiết bị giữ khoá gốc trong gói là đang hoạt động với đúng các khoá của gói",
   "recovery.approvalExpired": "Thiết bị giữ khoá gốc trong gói này không còn lượt duyệt hiệu lực trên máy chủ nhóm",
   "recovery.rootGrantMissing": "Máy chủ nhóm không giữ quyền khoá gốc của thiết bị này ở trạng thái đã xác nhận và đang hiệu lực",
+  "recovery.rootGrantIssuerNotCustodian": "Bằng chứng tin cậy không xác nhận thiết bị giữ khoá gốc trong gói này hiện là người giữ khoá, nên không thể tin quyền khoá gốc của nó",
   "recovery.importedCollectFailed": "Đã nhập gói khôi phục, nhưng nhận khoá đội máy thất bại; hãy bấm Nhận quyền giữ khoá để thử lại: {error}",
   "fleet.trustEvidenceRefused": "Bằng chứng tin cậy của máy chủ nhóm không xác minh được thiết bị này là mốc khởi tạo và người giữ khóa của tenant",
   "fleet.trustClosureTooLarge": "Bằng chứng tin cậy của máy chủ nhóm thu hồi một thiết bị giữ khoá gốc, và việc kiểm tra mọi thiết bị mà nó đã duyệt cần hơn 64 thiết bị trong một yêu cầu, điều phiên bản này chưa làm được. Đồng bộ nhóm trên thiết bị này tạm dừng cho tới một phiên bản sau; chưa có gì bị thay đổi.",

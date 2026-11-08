@@ -1,8 +1,10 @@
 //! Import recovery bundle (v0.2.2b plan, section 4.I).
 //!
 //! On a fresh device, or on the root custodian's own machine after its keys
-//! were lost, a v3 recovery bundle restores the root custodian device itself:
-//! its IDs, both key seeds and its first root self-grant. The server sees its
+//! were lost, a v3 or v4 recovery bundle restores the root custodian device
+//! itself: its IDs, both key seeds and its current root grant (v3: its first
+//! root self-grant; v4: the grant another custodian, or itself, issued it,
+//! ADR 0002 Q-53, whose custody the trust chain must count). The server sees its
 //! existing ACTIVE row with every grant it filed, and every member keeps the
 //! anchor it pinned, so no server route is involved.
 //!
@@ -28,7 +30,7 @@ use shardx_core::signing::Ed25519SigningKey;
 
 use crate::fleet_client::{decode_hex16, hex, AccountDeviceStatus, AccountLogin, FleetClient};
 use crate::fleet_custody::FleetCustodyState;
-use crate::root_bootstrap::{now_ms, own_grant, unhex_vec, BootstrapState};
+use crate::root_bootstrap::{now_ms, unhex_vec, verified_root_grant, BootstrapState};
 use crate::team_config::TeamConfig;
 
 /// One state write of step 6. Each goes through the caller's `save`, which
@@ -196,20 +198,20 @@ fn check_listing(
     Ok(())
 }
 
-/// Step 5: the server reads the bundle's self-grant back exactly,
-/// acknowledged under an ACTIVE root generation, and it opens to the
-/// bundle's TRK. Export again (section 4.X step 3) runs it too.
+/// Step 5: the server reads the bundle's root grant, signed by `issuer`,
+/// back exactly, acknowledged under an ACTIVE root generation, and it opens
+/// to the bundle's TRK. Export again (section 4.X step 3) runs it too.
 pub(crate) async fn check_root_grant(
     client: &FleetClient,
     access: &str,
     tenant: &str,
     container: &[u8],
-    signer: &Ed25519SigningKey,
+    issuer: &[u8; 32],
     hpke_secret: &[u8],
     trk: &[u8; 32],
 ) -> Result<()> {
     let missing = || anyhow!(crate::errcode::code("recovery.rootGrantMissing"));
-    let (grant, grant_ref) = own_grant(container, signer).map_err(|_| missing())?;
+    let (grant, grant_ref) = verified_root_grant(container, issuer).map_err(|_| missing())?;
     let descriptor = client
         .read_root_grant(
             access,
@@ -225,16 +227,54 @@ pub(crate) async fn check_root_grant(
                 e
             }
         })?;
-    let live = TenantRootGrantDescriptorV2::parse(&descriptor, signer.verifying_key().as_bytes())
-        .is_ok_and(|d| {
-            d.record().record().exact_signed_container_bytes() == container
-                && matches!(d.grant_state(), RootGrantState::Acknowledged)
-                && matches!(d.generation_state(), RootGenerationState::Active)
-                && matches!(d.record().payload(), Payload::TenantRootKeyGrant(g)
+    let live = TenantRootGrantDescriptorV2::parse(&descriptor, issuer).is_ok_and(|d| {
+        d.record().record().exact_signed_container_bytes() == container
+            && matches!(d.grant_state(), RootGrantState::Acknowledged)
+            && matches!(d.generation_state(), RootGenerationState::Active)
+            && matches!(d.record().payload(), Payload::TenantRootKeyGrant(g)
                     if g.open_trk(hpke_secret).is_ok_and(|opened| *opened == *trk))
-        });
+    });
     if !live {
         return Err(missing());
+    }
+    Ok(())
+}
+
+/// Q-53, before step 5 for a v4 bundle: fresh trust evidence, read through
+/// the closure path (Q-58) and evaluated to the bundle's anchor (which
+/// `check_pin` held equal to a pinned one), counts `subject` as a custodian
+/// now. The offline check proved only that the grant's issuer signed it. The
+/// evaluation is not recorded: the collect after the import records its own.
+async fn check_custodian(
+    client: &FleetClient,
+    access: &str,
+    tenant: &str,
+    bundle: &Bundle<'_>,
+    subject: [u8; 32],
+) -> Result<()> {
+    let pin = (
+        shardx_core::trust_chain::Binding {
+            server_instance_id: bundle.header.server_instance_id,
+            tenant_id: bundle.header.tenant_id,
+        },
+        bundle.plaintext.bootstrap_anchor_signing_key_id,
+    );
+    let now = now_ms();
+    let mut db = crate::team::db::Db::open()?;
+    let (pages, _) = crate::team::ledger::closure_evidence(
+        client,
+        access,
+        tenant,
+        &mut db,
+        &pin,
+        &[subject],
+        now,
+    )
+    .await?;
+    let counted = crate::team::ledger::evaluate(&db, &pin.0, &pin.1, &pages, now)?
+        .is_some_and(|(_, chain)| chain.custodian_now(&subject, now));
+    if !counted {
+        bail!(crate::errcode::code("recovery.rootGrantIssuerNotCustodian"));
     }
     Ok(())
 }
@@ -320,13 +360,21 @@ pub(crate) async fn import(
             .map_err(session_refusal),
     )?;
     let access = session.access_token.as_str();
+    let own = signer.verifying_key().to_bytes();
     let checked = async {
+        if custodian.root_grant_issuer.is_some() {
+            let subject = signing_key_id(&own);
+            logged(
+                "custody",
+                check_custodian(&client, access, &tenant, bundle, subject).await,
+            )?;
+        }
         check_root_grant(
             &client,
             access,
             &tenant,
-            &custodian.first_self_grant,
-            &signer,
+            &custodian.root_grant,
+            custodian.root_grant_issuer.as_ref().unwrap_or(&own),
             &hpke_secret,
             &bundle.plaintext.trk,
         )
@@ -381,7 +429,11 @@ fn write(
     let ours =
         |t: &str, d: &str| t.eq_ignore_ascii_case(&tenant) && d.eq_ignore_ascii_case(&device);
     let anchor = hex(&bundle.plaintext.bootstrap_anchor_signing_key_id);
-    let self_grant = hex(&custodian.first_self_grant);
+    // v3 restores the first self-grant, v4 the current grant and its issuer.
+    let (self_grant, root_grant, root_grant_issuer) = match &custodian.root_grant_issuer {
+        None => (hex(&custodian.root_grant), String::new(), String::new()),
+        Some(issuer) => (String::new(), hex(&custodian.root_grant), hex(issuer)),
+    };
     let instance = hex(&bundle.header.server_instance_id);
 
     // `team.json` may have changed during the network steps (Enroll, a new
@@ -401,6 +453,10 @@ fn write(
     let root = crate::root_bootstrap::load()?;
     let same_root = ours(&root.tenant_id, &root.device_id)
         && root.self_grant.eq_ignore_ascii_case(&self_grant)
+        && root.root_grant.eq_ignore_ascii_case(&root_grant)
+        && root
+            .root_grant_issuer
+            .eq_ignore_ascii_case(&root_grant_issuer)
         && root.anchor.eq_ignore_ascii_case(&anchor);
     if root_on_disk && !same_root {
         bail!(crate::errcode::code("fleet.custodyOtherDevice"));
@@ -424,6 +480,8 @@ fn write(
             server_instance_id: instance.clone(),
             restore_epoch,
             self_grant,
+            root_grant,
+            root_grant_issuer,
             anchor,
             activated: true,
             recovery_path: bundle.path.to_string_lossy().into_owned(),
@@ -595,7 +653,8 @@ mod tests {
                         device_id: DEVICE,
                         signing_key_seed: SIGNING_SEED.into(),
                         hpke_key_seed: HPKE_SEED.into(),
-                        first_self_grant: self.self_grant.clone(),
+                        root_grant: self.self_grant.clone(),
+                        root_grant_issuer: None,
                     }),
                 },
             }
@@ -933,7 +992,7 @@ mod tests {
                 "v2a.access",
                 &hex(&TENANT),
                 &f.self_grant,
-                &signer(),
+                &signer().verifying_key().to_bytes(),
                 &hpke_secret,
                 &TRK,
             ))
@@ -1246,7 +1305,7 @@ mod tests {
                 "v2a.fixture",
                 &hex(&TENANT),
                 &f.self_grant,
-                &signer(),
+                &signer().verifying_key().to_bytes(),
                 &hpke_secret,
                 &TRK,
             ));
@@ -1297,6 +1356,269 @@ mod tests {
             "invalid bundle reached the server"
         );
         assert!(f.files() == before, "invalid bundle changed state");
+    }
+
+    /// A tenant anchored at `A0` whose custody `issuer` gave this device
+    /// (the bundle's): the trust evidence the server serves, and this
+    /// device's grant. `A0` issues only when `issuer` is `A0`; any other
+    /// issuer holds no custody. With `revoked`, this device then revoked
+    /// `A0` (the hand-over's last step).
+    struct HandOver {
+        anchor: [u8; 32],
+        issuer: [u8; 32],
+        grant: Vec<u8>,
+        page: shardx_core::trust_evidence::TenantTrustEvidencePageV2,
+    }
+
+    fn hand_over(issuer_seed: [u8; 32], revoked: bool) -> HandOver {
+        use shardx_core::authz_record::{
+            build_record, ApprovalScopeKind, Capability, CapabilityScopeKind, DeviceApprovalV2,
+            DeviceRevocationReason, DeviceRevocationV2, GrantSubject, DOMAIN_DEVICE_APPROVAL,
+            DOMAIN_DEVICE_REVOCATION,
+        };
+        let now = now_ms();
+        let context = |seed: &[u8; 32], device: [u8; 16], hpke: &[u8; 32]| {
+            let (_, pk) = derive_keypair(hpke);
+            Context16 {
+                tenant: TENANT,
+                instance: INSTANCE,
+                epoch: 0,
+                account: ACCOUNT,
+                device,
+                signing_key_id: signing_key_id(
+                    Ed25519SigningKey::from_bytes(seed)
+                        .verifying_key()
+                        .as_bytes(),
+                ),
+                hpke_key_id: hpke_key_id(&pk),
+            }
+        };
+        let approval = |by: &Ed25519SigningKey, cx: &Context16, replay: [u8; 16]| {
+            let a = DeviceApprovalV2 {
+                common: cx.common(replay, now),
+                subject_account_id: cx.account,
+                subject_device_id: cx.device,
+                subject_signing_key_id: cx.signing_key_id,
+                subject_hpke_key_id: cx.hpke_key_id,
+                approval_scope_kind: ApprovalScopeKind::Tenant,
+                approval_scope_id: TENANT,
+            };
+            build_record(by, DOMAIN_DEVICE_APPROVAL, &a.encode())
+        };
+        let a0_seed = [0xa0; 32];
+        let a0 = Ed25519SigningKey::from_bytes(&a0_seed);
+        let cx_a0 = context(&a0_seed, [0xa1; 16], &[0xa2; 32]);
+        let (_, a0_hpke) = derive_keypair(&[0xa2; 32]);
+        let issuer = Ed25519SigningKey::from_bytes(&issuer_seed);
+        let me = context(&SIGNING_SEED, DEVICE, &HPKE_SEED);
+        let (_, my_hpke) = derive_keypair(&HPKE_SEED);
+        let grant = crate::root_bootstrap::tests::existing_grant(
+            &issuer, &me, &my_hpke, &TRK, 0, [0x41; 16], now,
+        );
+        let subject_of = |cx: &Context16| GrantSubject::Device {
+            account_id: cx.account,
+            device_id: cx.device,
+            signing_key_id: cx.signing_key_id,
+            hpke_key_id: cx.hpke_key_id,
+        };
+        // A0 approves devices under its own capability grants.
+        let own = crate::fleet_custody::own_grants(&cx_a0, TENANT);
+        let a0_grants =
+            crate::fleet_custody::capability_grants(&cx_a0, &a0, &subject_of(&cx_a0), own, now);
+        let mut containers = vec![
+            approval(&a0, &cx_a0, [0x40; 16]),
+            crate::root_bootstrap::self_grant(&cx_a0, &a0, &a0_hpke, &TRK, [0x40; 16], now)
+                .unwrap(),
+            approval(&issuer, &me, [0x41; 16]),
+            grant.clone(),
+        ];
+        containers.extend(a0_grants.unwrap().iter().map(|g| unhex_vec(g).unwrap()));
+        let mut device_revocations = Vec::new();
+        if revoked {
+            let revoke = [(
+                Capability::DeviceRevoke,
+                CapabilityScopeKind::Tenant,
+                TENANT,
+            )];
+            let grants = crate::fleet_custody::capability_grants(
+                &me,
+                &signer(),
+                &subject_of(&me),
+                revoke,
+                now,
+            );
+            containers.extend(grants.unwrap().iter().map(|g| unhex_vec(g).unwrap()));
+            let revocation = DeviceRevocationV2 {
+                common: me.common([0x42; 16], now),
+                subject_account_id: cx_a0.account,
+                subject_device_id: cx_a0.device,
+                subject_signing_key_id: cx_a0.signing_key_id,
+                subject_hpke_key_id: cx_a0.hpke_key_id,
+                reason_code: DeviceRevocationReason::Retired,
+            };
+            containers.push(build_record(
+                &signer(),
+                DOMAIN_DEVICE_REVOCATION,
+                &revocation.encode(),
+            ));
+            device_revocations.push(shardx_core::trust_evidence::RevokedDevice {
+                device_id: cx_a0.device,
+                revoked_at_ms: now,
+            });
+        }
+        let mut keys = vec![
+            a0.verifying_key().to_bytes(),
+            signer().verifying_key().to_bytes(),
+        ];
+        if issuer_seed != a0_seed {
+            keys.push(issuer.verifying_key().to_bytes());
+        }
+        HandOver {
+            anchor: cx_a0.signing_key_id,
+            issuer: issuer.verifying_key().to_bytes(),
+            grant,
+            page: shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+                server_instance_id: INSTANCE,
+                tenant_id: TENANT,
+                server_now_ms: now,
+                page_index: 0,
+                next_cursor: Vec::new(),
+                signing_public_keys: keys,
+                containers,
+                revocations: Vec::new(),
+                device_revocations,
+            },
+        }
+    }
+
+    /// Imports `h`'s v4 bundle of this device on a fresh device, against a
+    /// server that serves `h`'s evidence and reads the grant back
+    /// acknowledged; returns the result, the requests the server saw, and
+    /// whether the config root is as it was before.
+    fn import_v4(f: &Fixture, h: &HandOver) -> (Result<()>, Vec<String>, bool) {
+        let rt = runtime();
+        let ordinary = server(me(INSTANCE, ACCOUNT, "active", key_ids()), (500, ""));
+        let challenge = crate::fleet_client::tests::session_challenge(
+            TENANT,
+            INSTANCE,
+            ACCOUNT,
+            [1; 16],
+            DEVICE,
+            &signer(),
+            &HPKE_SEED,
+        );
+        let record = AuthorizationRecord::parse(&h.grant)
+            .unwrap()
+            .verify_signature(&h.issuer)
+            .unwrap();
+        let descriptor = TenantRootGrantDescriptorV2::new(
+            record,
+            RootGrantState::Acknowledged,
+            RootGenerationState::Active,
+        )
+        .unwrap()
+        .encode();
+        let page = h.page.encode();
+        let reply: Arc<Reply> = Arc::new(move |call: &str, body: &[u8]| match call {
+            CHALLENGE => (200, challenge.clone()),
+            "POST /v2/auth/device-session-proofs" => (
+                200,
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": "s",
+                    "class": "full",
+                    "access_token": "v2a.x",
+                    "access_expires_at_ms": 1,
+                    "refresh_token": "v2r.x",
+                    "absolute_expires_at_ms": 2,
+                }))
+                .unwrap(),
+            ),
+            c if c.contains("/trust-evidence") => (200, page.clone()),
+            c if c.contains("/root-key-generations/") => (200, descriptor.clone()),
+            c if c.ends_with("/key-generation") => (200, b"null".to_vec()),
+            _ => ordinary(call, body),
+        });
+        let (client, seen): (FleetClient, Seen) = rt.block_on(mock(reply));
+        let mut c = f.connected(client.base_url());
+        let mut bundle = f.bundle();
+        bundle.plaintext.bootstrap_anchor_signing_key_id = h.anchor;
+        let custodian = bundle.plaintext.root_custodian.as_mut().unwrap();
+        custodian.root_grant = h.grant.clone();
+        custodian.root_grant_issuer = Some(h.issuer);
+        let before = f.files();
+        let result = rt.block_on(import(&mut c, &bundle, "owner", "pw", &mut save));
+        let calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
+        (result, calls, f.files() == before)
+    }
+
+    /// Q-53: the v4 bundle of a custodian `A0` appointed opens and imports:
+    /// the root state names `A0` as the anchor and holds the current grant
+    /// and its issuer, with no first self-grant.
+    #[test]
+    fn a_v4_bundle_of_a_non_anchor_custodian_opens_and_imports() {
+        let f = fixture();
+        let h = hand_over([0xa0; 32], false);
+        let (result, calls, _) = import_v4(&f, &h);
+        result.unwrap();
+        let reads = calls.iter().filter(|c| c.contains("/trust-evidence"));
+        assert_eq!(
+            reads.count(),
+            1,
+            "no closure without a revocation: {calls:?}"
+        );
+        let root = crate::root_bootstrap::load().unwrap();
+        assert!(root.activated);
+        assert_eq!(root.anchor, hex(&h.anchor));
+        assert_eq!(root.root_grant, hex(&h.grant));
+        assert_eq!(root.root_grant_issuer, hex(&h.issuer));
+        assert!(root.self_grant.is_empty());
+        let saved = crate::team_config::load().unwrap();
+        assert!(saved.device_id.eq_ignore_ascii_case(&hex(&DEVICE)));
+        assert_eq!(saved.signing_key().unwrap().to_bytes(), SIGNING_SEED);
+        let (grant, container, issuer) =
+            crate::root_bootstrap::current_root_grant(&root, &signer()).unwrap();
+        assert_eq!(
+            (grant.root_generation, container, issuer),
+            (0, h.grant, h.issuer)
+        );
+    }
+
+    /// Q-53: a grant from a key the chain never counted as a custodian is
+    /// refused before anything is written, though it opens offline.
+    #[test]
+    fn a_v4_bundle_whose_issuer_is_not_a_custodian_is_refused() {
+        let f = fixture();
+        let h = hand_over([0x58; 32], false);
+        let (result, _, unchanged) = import_v4(&f, &h);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            crate::errcode::has_code(&err, "recovery.rootGrantIssuerNotCustodian"),
+            "{err}"
+        );
+        assert!(unchanged);
+        assert!(!crate::store::custody_bootstrap_path().unwrap().exists());
+    }
+
+    /// Q-53, D-5: once the new custodian revoked `A0`, its v4 bundle still
+    /// imports: the chain counted `A0`'s grant while `A0` held custody, and
+    /// the evaluation that first counts `A0`'s revocation runs through the
+    /// closure path.
+    #[test]
+    fn a_v4_bundle_of_a_handed_over_custodian_imports_after_the_issuer_is_revoked() {
+        let f = fixture();
+        let h = hand_over([0xa0; 32], true);
+        let (result, calls, _) = import_v4(&f, &h);
+        result.unwrap();
+        let reads = calls.iter().filter(|c| c.contains("/trust-evidence"));
+        assert_eq!(reads.count(), 2, "the closure listing was read: {calls:?}");
+        let root = crate::root_bootstrap::load().unwrap();
+        assert_eq!(root.root_grant, hex(&h.grant));
+        assert_eq!(root.anchor, hex(&h.anchor));
     }
 
     /// A wrong passphrase, or a file that is not there, says only that the

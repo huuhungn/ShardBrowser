@@ -53,8 +53,8 @@ use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
 
 use crate::fleet_client::{decode_hex, decode_hex16, decode_hex32, hex, FleetClient, TenantDevice};
 use crate::root_bootstrap::{
-    commit, corrupt, is_missing, mismatch, nonce_ok, now_ms, own_grant, random, stored_payload,
-    unhex_vec, BootstrapState, Context16,
+    commit, corrupt, current_root_grant, is_missing, mismatch, nonce_ok, now_ms, random,
+    stored_payload, unhex_vec, BootstrapState, Context16,
 };
 
 /// Where the fleet key lives from its creation until the generation is
@@ -305,9 +305,9 @@ fn container_hash(container: &[u8]) -> Result<[u8; 32]> {
 type OwnGrants = ((Vec<u8>, [u8; 16]), (Vec<u8>, [u8; 16]), u64);
 
 /// This device's own grants of `fkek` as `generation`: its `DeviceHpkeGrant`
-/// and the `RecoveryGrant` under the root of its self-grant, each with its
-/// replay ID, and that root's generation. The TRK is opened from the root
-/// self-grant only to seal the recovery grant.
+/// and the `RecoveryGrant` under the root of its current root grant (Q-52),
+/// each with its replay ID, and that root's generation. The TRK is opened
+/// from that grant only to seal the recovery grant.
 fn own_fleet_grants(
     cx: &Context16,
     device: &FleetDevice<'_>,
@@ -317,7 +317,7 @@ fn own_fleet_grants(
     now: u64,
 ) -> Result<OwnGrants> {
     let (hpke_secret, hpke_public) = derive_keypair(device.hpke_seed);
-    let (root_grant, _) = own_grant(&unhex_vec(&root.self_grant)?, device.signer)?;
+    let (root_grant, _, _) = current_root_grant(root, device.signer)?;
     let mut grant = DeviceHpkeGrantV2 {
         common: cx.common(random()?, now),
         fleet_id: generation.fleet_id,
@@ -4771,6 +4771,43 @@ pub(crate) mod tests {
         let calls = rig.calls();
         let at = |s: &str| calls.iter().position(|c| c.ends_with(s)).unwrap();
         assert!(at("/v2/capability-grants") < at("/key-generations"));
+    }
+
+    /// Q-52: a custodian whose current root grant is of root generation 1
+    /// names root generation 1 in its rotation's create and files its
+    /// recovery grant under it, sealed to the TRK that grant delivers.
+    #[test]
+    fn rotate_fleet_files_its_recovery_grant_under_root_generation_1() {
+        let mut f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let a0 = Ed25519SigningKey::from_bytes(&[0xa0; 32]);
+        let (_, pk) = derive_keypair(&f.seed);
+        let grant = crate::root_bootstrap::tests::existing_grant(
+            &a0, &f.cx, &pk, &TRK, 1, [8; 16], rig.now,
+        );
+        f.root.self_grant.clear();
+        f.root.root_grant = hex(&grant);
+        f.root.root_grant_issuer = hex(&a0.verifying_key().to_bytes());
+        rig.rotate(&f, rig.now).unwrap();
+        let r = rotation();
+        let create = payload(&r.create_request, FleetKeyGenerationCreateV2::parse);
+        assert_eq!(create.root_generation, 1);
+        let container = unhex_vec(&r.recovery_grant).unwrap();
+        let verified = AuthorizationRecord::parse(&container)
+            .unwrap()
+            .verify_signature(f.signer.verifying_key().as_bytes())
+            .unwrap();
+        let Payload::RecoveryGrant(g) = verified.payload().clone() else {
+            panic!("a recovery grant")
+        };
+        assert_eq!(g.recipient_root_generation, 1);
+        assert_eq!(*g.open_fkek(&TRK).unwrap(), *rotation_key_held().unwrap());
+        let filed = rig.bodies("/grants").iter().any(|body| {
+            let request = IdempotentMutationRequestV2::parse(body).unwrap();
+            FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
+                .is_ok_and(|filing| filing.exact_signed_grant_container_bytes == container)
+        });
+        assert!(filed, "the recovery grant was filed");
     }
 
     #[test]
