@@ -238,6 +238,51 @@ pub struct Statuses {
     pub alerts: Vec<CustodianAlert>,
 }
 
+/// A bound profile whose head here is sealed under an older fleet key.
+#[derive(Debug, PartialEq, serde::Serialize)]
+pub struct OlderKeyProfile {
+    pub profile_id: String,
+    pub key_generation: u64,
+}
+
+/// The bindings of `pin`'s tenant whose pinned or pushed head names a
+/// generation below the highest this device verified for its fleet, read
+/// from the team database alone. Only a binding with `base_version > 0`
+/// counts: its `key_generation` came from that head's manifest (`pin`, a
+/// commit), as [`walk`]'s floor does, while a join's version-0 row holds the
+/// highest verified generation. A restore transition keeps the previous
+/// head's generation until the next pin.
+pub(crate) fn under_older_key(pin: &Binding) -> Result<Vec<OlderKeyProfile>> {
+    if !Db::path()?.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let db = Db::open()?;
+    let rows: Vec<(String, String, i64)> = db
+        .conn
+        .prepare(
+            "SELECT local_profile_id, fleet_id, key_generation FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND base_version > 0
+             ORDER BY local_profile_id",
+        )?
+        .query_map(
+            params![hex(&pin.server_instance_id), hex(&pin.tenant_id)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::new();
+    for (profile_id, fleet, generation) in rows {
+        let fleet = decode_hex16(&fleet, "fleet_id")?;
+        let generation = generation as u64;
+        if ledger::highest_generation(&db, pin, &fleet)?.is_some_and(|h| generation < h) {
+            out.push(OlderKeyProfile {
+                profile_id,
+                key_generation: generation,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Every binding's state and every custodian alert, read from the team
 /// database alone: no network, and no pending revert swap is settled here
 /// (one shows as the pinned head, `AVAILABLE`). No team database means none.
@@ -11477,6 +11522,50 @@ mod tests {
         assert_eq!(noise(&out), noise(&w.udd));
         let head = w.fake().head.unwrap();
         available_at(&w, 1, head);
+    }
+
+    /// R4: the older-key list names a binding whose pinned head is under a
+    /// generation below the highest verified; a version-0 row (a join's,
+    /// which carries no head) is never listed, whatever its column says.
+    #[test]
+    fn profiles_under_an_older_key_lists_bindings_below_the_highest_generation() {
+        let w = world();
+        push_next(&w);
+        let older = || under_older_key(&w.dev.pin.0).unwrap();
+        assert!(older().is_empty(), "the head is under the highest");
+        rotate(&w);
+        assert_eq!(
+            older(),
+            [OlderKeyProfile {
+                profile_id: LOCAL.into(),
+                key_generation: GEN
+            }]
+        );
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET remote_version = 0, base_version = 0,
+                   last_observed_head_hash = NULL",
+                [],
+            )
+            .unwrap();
+        assert!(older().is_empty(), "a version-0 row");
+    }
+
+    /// R4's deciding test: a push with nothing changed is not short-cut; it
+    /// seals a new head under the newest generation, so Pull and push needs
+    /// no forced re-seal, and the profile leaves the older-key list.
+    #[test]
+    fn a_clean_profile_push_reseals_under_the_newest_generation() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        assert_eq!(w.count("SELECT dirty FROM profile_bindings"), 0);
+        assert_eq!(w.push().unwrap().version, 2);
+        let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&2]).unwrap();
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+        assert_eq!(p.key_generation, GEN + 1);
+        assert!(under_older_key(&w.dev.pin.0).unwrap().is_empty());
     }
 
     /// The generation floor: a valid head under `GEN` advancing over a pin

@@ -338,6 +338,8 @@ const teamStatusFixture = () => (firstDevice
 // `teamRefuse=<command>[,<command>]` makes those team commands refuse the way
 // the backend does, before anything changes.
 const teamRefusals = new Set((params.get("teamRefuse") ?? "").split(",").filter(Boolean));
+// `teamRefuseCode=<code>` makes them refuse with that code instead.
+const teamRefusalCode = params.get("teamRefuseCode");
 const TEAM_REFUSAL: Record<string, string> = {
   profile_sync_publish: "sync.commitBlockedCompromised",
   profile_sync_push: "sync.remoteAhead",
@@ -377,7 +379,34 @@ let custodyBootstrap = foreignRoot
       anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID,
     }
     : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
-let fleetCustody = { started: false, created: false, setup_key_held: false, fkek_key_id: "" };
+type FleetRotation = {
+  generation: number; phase: "preparing" | "activated" | "done" | "expired"; deadline_ms: number | null;
+  members_filed: number; members_refused: number; members_skipped: number;
+};
+let fleetCustody: {
+  started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
+  rotation_required: "urgent" | "routine" | null; export_due: boolean;
+} = {
+  started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
+  export_due: false,
+};
+// The highest fleet key generation this device kept.
+let teamGeneration = 0;
+// `teamRotation=unfinished` or `expired`: A created the fleet key and saved a
+// rotation to generation 1 that is still preparing, or can no longer activate.
+const teamRotation = params.get("teamRotation");
+if (teamDevice === "a" && teamRotation) {
+  fleetCustody = {
+    ...fleetCustody, started: true, created: true, fkek_key_id: "fk".repeat(32),
+    rotation: {
+      generation: 1, phase: teamRotation === "expired" ? "expired" : "preparing", deadline_ms: Date.UTC(2099, 0, 31),
+      members_filed: 0, members_refused: 0, members_skipped: 0,
+    },
+  };
+  teamMe.collected = true;
+}
+// The generation of the head each binding here last accepted.
+const teamKeyGenOf = new Map<string, number>();
 
 // "team-device-a" and "team-device-b": two devices of one fleet. Each page keeps
 // its own bindings, pin and fleet key; the server they share is the
@@ -385,6 +414,7 @@ let fleetCustody = { started: false, created: false, setup_key_held: false, fkek
 // version a device accepted. No device holds a fleet key until it collected one.
 type TeamServerHead = {
   remote_profile_id: string; version: number; label: string | null; quarantine: string | null; revert_available: boolean;
+  key_generation: number;
 };
 const teamServer = <T = TeamServerHead>(op: string, args: object) =>
   (window as unknown as { e2eTeamServer: (op: string, device: string, args: object) => Promise<T> })
@@ -392,6 +422,7 @@ const teamServer = <T = TeamServerHead>(op: string, args: object) =>
 const teamRemoteOf = new Map<string, string>();
 /** Apply a head the server answered with: a quarantine keeps the pin, anything else is accepted. */
 const teamSettle = (b: TeamProfileStatus, head: TeamServerHead) => {
+  if (!head.quarantine) teamKeyGenOf.set(b.profile_id, head.key_generation);
   const patch: Partial<TeamProfileStatus> = head.quarantine
     ? { sync_state: "QUARANTINED", last_error_code: head.quarantine, revert_available: head.revert_available }
     : {
@@ -422,7 +453,9 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     reason?: string; anchor?: string; label?: string; path?: string; oldDeviceLost?: boolean;
   };
   const id = String(args.profileId ?? args.localProfileId ?? "");
-  const head = () => ({ remote_profile_id: teamRemoteOf.get(id), pin: teamBound(payload).remote_version });
+  const head = () => ({
+    remote_profile_id: teamRemoteOf.get(id), pin: teamBound(payload).remote_version, generation: teamGeneration,
+  });
   const me = { device_id: teamMe.device_id };
   if (TEAM_SYNC.has(cmd)) {
     await teamServer("live", me);
@@ -439,7 +472,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     case "team_fleet_key_setup":
       teamCustodian();
       await teamServer("fleetKey", me);
-      fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
+      fleetCustody = { ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
       teamMe.collected = true; // the setup ends with the verified collect
       return fleetCustody;
     case "team_devices": {
@@ -463,6 +496,9 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       if (first === undefined || Date.now() - first > TEAM_WINDOW_MS) teamRefuse("fleet.approvalWindowClosed");
       if (args.sas !== teamSas(target)) teamRefuse("fleet.joinCodeMismatch");
       if (!teamMe.collected) teamRefuse("fleet.createFleetKeyFirst");
+      if (fleetCustody.rotation?.phase === "preparing" || fleetCustody.rotation?.phase === "activated") {
+        teamRefuse("fleet.rotationInProgress");
+      }
       await teamServer("approve", { ...me, target });
       return null;
     }
@@ -472,8 +508,36 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
       // As the launcher: no saved Create fleet key, no revoke.
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
-      await teamServer("revoke", { ...me, target: args.deviceId });
+      {
+        // As the launcher: only a revoked holder of the current key asks for a rotation.
+        const { held } = await teamServer<{ held: boolean }>("revoke", { ...me, target: args.deviceId });
+        if (held && fleetCustody.rotation_required !== "urgent") {
+          fleetCustody = { ...fleetCustody, rotation_required: args.reason === "lost" ? "urgent" : "routine" };
+        }
+      }
       return null;
+    case "team_fleet_key_rotate": {
+      teamCustodian();
+      if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
+      if (fleetCustody.rotation?.phase === "expired") teamRefuse("fleet.rotationStuck");
+      if (!teamMe.collected) teamRefuse("fleet.rotationNeedsFleetKey");
+      const r = await teamServer<{ generation: number; filed: number; refused: number; skipped: number }>("rotate", me);
+      teamGeneration = r.generation; // the run ends with the verified collect of the new key
+      fleetCustody = {
+        ...fleetCustody,
+        rotation: {
+          generation: r.generation, phase: "done", deadline_ms: fleetCustody.rotation?.deadline_ms ?? null,
+          members_filed: r.filed, members_refused: r.refused, members_skipped: r.skipped,
+        },
+        rotation_required: null,
+        export_due: true,
+      };
+      return fleetCustody;
+    }
+    case "team_profiles_under_older_key":
+      return teamProfiles.profiles
+        .filter((b) => b.remote_version > 0 && (teamKeyGenOf.get(b.profile_id) ?? teamGeneration) < teamGeneration)
+        .map((b) => ({ profile_id: b.profile_id, key_generation: teamKeyGenOf.get(b.profile_id) }));
     case "team_join_code":
       try { teamWindowOpen(); } catch (e) {
         // As the launcher: an expired code says when Enroll again would be refused,
@@ -521,10 +585,11 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         started: true, this_device: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
         root_key_id: TEAM_ROOT_KEY_ID,
       };
-      fleetCustody = { started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
+      fleetCustody = { ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
       return {
         grants: 0, opened: 0, failed: 0, newest_generation: null, fleet_opened: 1, fleet_failed: 0,
-        newest_fleet_generation: 0, fleet_grants_waiting: 0, fleet_refusal: null, can_sync_without_passphrase: false,
+        newest_fleet_generation: 0, fleet_grants_waiting: 0, fleet_refusal: null, fleet_enroll_again: false,
+        can_sync_without_passphrase: false,
       };
     }
     case "team_export_recovery_bundle":
@@ -532,16 +597,23 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       await teamServer("live", me);
       if (!teamMe.collected) teamRefuse("fleet.recoveryExportNeedsFleetKey");
       document.documentElement.dataset.e2eExportPath = String(args.path ?? "");
+      fleetCustody = { ...fleetCustody, export_due: false };
       return null;
     case "team_collect_custody": {
-      const { granted } = await teamServer<{ granted: boolean }>("collect", me);
-      // A grant is kept only once this device pins the anchor to verify it against.
-      const kept = granted && teamMe.pinned;
-      if (kept) teamMe.collected = true;
+      const { granted, generation } = await teamServer<{ granted: boolean; generation: number }>("collect", me);
+      // A grant is kept only once this device pins the anchor to verify it against,
+      // and only one generation above the newest it kept (Q-27).
+      const missed = granted && teamMe.collected && generation > teamGeneration + 1;
+      const kept = granted && teamMe.pinned && !missed;
+      if (kept) {
+        teamMe.collected = true;
+        teamGeneration = generation;
+      }
       return {
         grants: 0, opened: 0, failed: 0, newest_generation: null,
-        fleet_opened: kept ? 1 : 0, fleet_failed: 0, newest_fleet_generation: kept ? 0 : null,
-        fleet_grants_waiting: granted && !kept ? 1 : 0, fleet_refusal: null, can_sync_without_passphrase: false,
+        fleet_opened: kept ? 1 : 0, fleet_failed: missed ? 1 : 0, newest_fleet_generation: kept ? generation : null,
+        fleet_grants_waiting: granted && !kept ? 1 : 0, fleet_refusal: null, fleet_enroll_again: missed,
+        can_sync_without_passphrase: false,
       };
     }
     case "team_fleet_profiles":
@@ -550,7 +622,9 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         bound_to: [...teamRemoteOf].find(([, r]) => r === h.remote_profile_id)?.[0] ?? null,
       }));
     case "profile_sync_publish": {
-      const h = await teamServer("publish", { label: profiles.find((p) => p.id === id)?.name ?? null });
+      const h = await teamServer("publish", {
+        label: profiles.find((p) => p.id === id)?.name ?? null, generation: teamGeneration,
+      });
       teamRemoteOf.set(id, h.remote_profile_id);
       teamProfiles.profiles.push(teamBinding(id, "CHECKED_OUT", { remote_version: h.version, lease_expires_at: teamLease }));
       return { profile_id: h.remote_profile_id, fencing_token: 1, lease_expires_at_ms: 4_070_908_800_000 };
@@ -581,7 +655,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     return null;
   }
   if (teamRefusals.has(cmd)) {
-    throw new Error(`[[shardx:${TEAM_REFUSAL[cmd] ?? "sync.remoteAhead"}]]`);
+    throw new Error(`[[shardx:${teamRefusalCode ?? TEAM_REFUSAL[cmd] ?? "sync.remoteAhead"}]]`);
   }
   if (teamDevice) {
     const answer = await teamDeviceCommand(cmd, payload);
@@ -964,6 +1038,8 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return "5e".repeat(16);
     case "team_fleet_custody_status":
       return fleetCustody;
+    case "team_profiles_under_older_key":
+      return [];
     // Copies, as IPC would: a later change must not reach the UI unless it refetches.
     case "team_profiles_status":
       if (Number(params.get("teamStatusDelay") ?? 0) > 0) await wait(Number(params.get("teamStatusDelay")));

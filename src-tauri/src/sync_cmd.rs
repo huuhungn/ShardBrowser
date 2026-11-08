@@ -531,6 +531,18 @@ pub async fn team_profiles_status() -> Result<team::sync::Statuses, String> {
     team::sync::statuses(now_ms()).map_err(|e| format!("{e:#}"))
 }
 
+/// The bound profiles whose head here is still under an older fleet key, for
+/// the push prompt after a rotation (`team::sync::under_older_key`): no
+/// server is asked. A device that pins no anchor has none.
+#[tauri::command]
+pub async fn team_profiles_under_older_key() -> Result<Vec<team::sync::OlderKeyProfile>, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    let Some(pin) = crate::pinned_anchor(&c) else {
+        return Ok(Vec::new());
+    };
+    team::sync::under_older_key(&pin.0).map_err(|e| format!("{e:#}"))
+}
+
 /// Every profile this device's fleet lists, with its label opened and the
 /// local profile bound to it here, if any (`team::sync::labels`), in a device
 /// session the account `username` and `password` open for this call only.

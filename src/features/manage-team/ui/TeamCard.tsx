@@ -7,7 +7,7 @@ import {
   teamEnrollDevice, teamCollectCustody, useTeam,
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
-  teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle,
+  teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle, teamFleetCustodyStatus,
   type TeamStatus, type CustodyBootstrapStatus, type CustodyResult,
 } from "../../../entities/team";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -69,6 +69,7 @@ export function TeamCard() {
   const [keyPass2, setKeyPass2] = useState("");
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
   const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
+  const [exportDue, setExportDue] = useState(false);
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -76,6 +77,9 @@ export function TeamCard() {
     teamCustodyBootstrapStatus()
       .then((b) => { setBoot(b); setBootUnreadable(false); })
       .catch(() => { setBoot(null); setBootUnreadable(true); });
+  // A finished fleet key rotation asks for the recovery bundle again.
+  const loadExportDue = () =>
+    teamFleetCustodyStatus().then((f) => setExportDue(f.export_due)).catch(() => {});
 
   const refresh = () => {
     teamStatus().then((s) => {
@@ -84,6 +88,7 @@ export function TeamCard() {
       setTenant(s.tenant_id);
     }).catch(() => {});
     void loadBoot();
+    void loadExportDue();
   };
   useEffect(() => { refresh(); }, []);
 
@@ -194,6 +199,7 @@ export function TeamCard() {
     setPassphrase("");
     setPassphrase2("");
     setRootKeyIdRecorded(false);
+    void loadExportDue();
     toast.ok(t("team.recovery.exported", { path }));
   });
 
@@ -251,6 +257,8 @@ export function TeamCard() {
     }
     if (r.fleet_refusal) {
       toast.err(t("team.fleetKeySubstituted"));
+    } else if (r.fleet_enroll_again) {
+      toast.err(t("fleet.enrollAgainMissedRotations"));
     } else if (r.fleet_failed > 0) {
       toast.err(t("team.fleetKeyFailed"));
     } else if (r.fleet_grants_waiting > 0) {
@@ -627,7 +635,7 @@ export function TeamCard() {
                     <TeamDevices
                       account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
                       hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
-                      onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); }}
+                      onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); void loadExportDue(); }}
                     />
                   ) : st.has_fleet_key ? (
                     <p data-testid="team-joined" className="m-0 text-paragraph-xs text-text-sub-600">
@@ -647,6 +655,11 @@ export function TeamCard() {
                   ))}
                   {st.can_sync && boot?.this_device && boot.activated && (
                     <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
+                      {exportDue && (
+                        <p data-testid="team-export-due" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.rotation.exportDue")}
+                        </p>
+                      )}
                       <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>
                       <Input
                         label={t("team.recoveryPassphrase")}

@@ -2533,8 +2533,8 @@ async fn team_bootstrap_custody(
 
 /// Export the recovery bundle again (v0.2.2b plan, section 4.X) to `path`,
 /// sealed under `passphrase`: this root custodian device with every verified
-/// fleet key it holds. Nothing is filed and no state file changes. The
-/// password is used for one login and never stored.
+/// fleet key it holds. Nothing is filed; success ends a rotation's re-export
+/// prompt. The password is used for one login and never stored.
 #[tauri::command]
 async fn team_export_recovery_bundle(
     username: String,
@@ -2551,6 +2551,7 @@ async fn team_export_recovery_bundle(
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
     let fleet_hex = sync_cmd::fleet_id(&c);
     let fkeks = fleet_keys::verified_keys(&fleet_hex).map_err(|e| e.to_string())?;
+    let newest = fkeks.iter().map(|(g, _)| *g).max();
     let (client, session) = open_session(&c, &username, &password).await?;
     let access = session.access_token.as_str();
     let recovery = root_bootstrap::RecoveryExport {
@@ -2564,7 +2565,14 @@ async fn team_export_recovery_bundle(
     .map_err(|e| e.to_string());
     client.end_session(access).await;
     match &result {
-        Ok(()) => eprintln!("[recovery] export: ok"),
+        Ok(()) => {
+            eprintln!("[recovery] export: ok");
+            // The bundle opens every generation it carries: a rotation's
+            // re-export prompt ends.
+            if let Err(e) = newest.map_or(Ok(()), fleet_custody::exported) {
+                eprintln!("[recovery] export prompt: not cleared ({e:#})");
+            }
+        }
         Err(e) => eprintln!(
             "[recovery] export: refused {}",
             recovery_import::error_code(e)
@@ -2573,10 +2581,44 @@ async fn team_export_recovery_bundle(
     result
 }
 
-/// How far this device's Create fleet key got.
+/// How far this device's Create fleet key got, and whether a revocation
+/// asks for a fleet key rotation.
 #[tauri::command]
 fn team_fleet_custody_status() -> Result<fleet_custody::FleetCustodyStatus, String> {
-    fleet_custody::status().map_err(|e| e.to_string())
+    let mut status = fleet_custody::status().map_err(|e| e.to_string())?;
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    // Advisory (ADR 0002 C-1): a ledger that does not read shows no banner.
+    status.rotation_required = rotation_required(&c).unwrap_or_else(|e| {
+        eprintln!("[rotation] banner: unreadable ({e:#})");
+        None
+    });
+    Ok(status)
+}
+
+/// [`fleet_custody::rotation_required`] for this root custodian, against
+/// the highest fleet generation its ledger verified; none elsewhere.
+fn rotation_required(
+    c: &team_config::TeamConfig,
+) -> anyhow::Result<Option<fleet_custody::RotationRequired>> {
+    let Some(pin) = bootstrap_anchor(c) else {
+        return Ok(None);
+    };
+    let state = fleet_custody::load()?;
+    if state.revocations.is_empty() {
+        return Ok(None);
+    }
+    let fleet = fleet_client::decode_hex16(&sync_cmd::fleet_id(c), "fleet_id")?;
+    let db = team::db::Db::open()?;
+    let Some(active) = team::ledger::highest_generation(&db, &pin.0, &fleet)? else {
+        return Ok(None);
+    };
+    let issuer = c.signing_key()?.verifying_key().to_bytes();
+    // A holding that does not read counts as held.
+    let held =
+        |key: &[u8; 32]| team::ledger::holds(&db, &pin.0, key, &fleet, active).unwrap_or(true);
+    Ok(fleet_custody::rotation_required(
+        &state, &issuer, active, held,
+    ))
 }
 
 /// Create the fleet key as the tenant's root custodian, or resume it (plan
@@ -2903,7 +2945,7 @@ async fn team_fleet_key_rotate(
     .await;
     client.end_session(access).await;
     result?;
-    fleet_custody::status().map_err(|e| e.to_string())
+    team_fleet_custody_status()
 }
 
 /// Revokes the tenant's device `device_id` as `reason`, `retired` or `lost`
@@ -7786,6 +7828,7 @@ pub fn run() {
             sync_cmd::profile_sync_pull,
             sync_cmd::profile_sync_status,
             sync_cmd::team_profiles_status,
+            sync_cmd::team_profiles_under_older_key,
             sync_cmd::team_fleet_profiles,
             sync_cmd::team_join_profile,
             sync_cmd::team_unbind_profile,

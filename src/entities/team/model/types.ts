@@ -95,6 +95,8 @@ export type CustodyResult = {
   fleet_grants_waiting: number;
   /** `KEY_SUBSTITUTION_DETECTED` when this device already holds another key for that generation. */
   fleet_refusal: string | null;
+  /** The grant is more than one generation above the newest kept: this device missed rotations and must enroll again. */
+  fleet_enroll_again: boolean;
   /** Always false: the passphrase path is legacy only. */
   can_sync_without_passphrase: boolean;
 };
@@ -108,6 +110,30 @@ export type FleetCustodyStatus = {
   setup_key_held: boolean;
   /** The public id of the fleet key, once it was made. */
   fkek_key_id: string;
+  /** The latest fleet key rotation, if any. */
+  rotation: FleetRotationStatus | null;
+  /** A revocation of a device that held the current fleet key asks for a rotation (ADR 0002 Q-20). */
+  rotation_required: "urgent" | "routine" | null;
+  /** A finished rotation asks for the recovery bundle to be exported again. */
+  export_due: boolean;
+};
+
+/** How far the latest fleet key rotation got; no secret. */
+export type FleetRotationStatus = {
+  generation: number;
+  /** `preparing` and `activated` are unfinished; `expired` can no longer activate. */
+  phase: "preparing" | "activated" | "done" | "expired";
+  /** When the rotation can no longer activate, once known. */
+  deadline_ms: number | null;
+  members_filed: number;
+  members_refused: number;
+  members_skipped: number;
+};
+
+/** A bound profile whose head here is still sealed under an older fleet key. */
+export type OlderKeyProfile = {
+  profile_id: string;
+  key_generation: number;
 };
 
 /** A device of the tenant, as `team_devices` lists it for the root custodian. */

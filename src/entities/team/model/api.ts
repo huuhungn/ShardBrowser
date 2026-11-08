@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus, TeamFleetProfile,
-  FleetCustodyStatus, TeamDevice, TeamJoinCode, TeamRevokeReason,
+  FleetCustodyStatus, TeamDevice, TeamJoinCode, TeamRevokeReason, OlderKeyProfile,
 } from "./types";
 
 export const teamStatus = () => invoke<TeamStatus>("team_status");
@@ -94,6 +94,17 @@ export const teamFleetCustodyStatus = () =>
  */
 export const teamFleetKeySetup = (username: string, password: string) =>
   invoke<FleetCustodyStatus>("team_fleet_key_setup", { username, password });
+
+/**
+ * Rotate the fleet key as the root custodian, or resume the rotation. The
+ * password is used for one login and never stored.
+ */
+export const teamFleetKeyRotate = (username: string, password: string) =>
+  invoke<FleetCustodyStatus>("team_fleet_key_rotate", { username, password });
+
+/** Bound profiles still under an older fleet key; no server is asked. */
+export const teamProfilesUnderOlderKey = () =>
+  invoke<OlderKeyProfile[]>("team_profiles_under_older_key");
 
 /** The tenant's devices with the code each must show, for the root custodian. */
 export const teamDevices = (username: string, password: string) =>

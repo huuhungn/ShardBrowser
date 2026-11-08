@@ -130,12 +130,12 @@ the right model to keep.
 | `v2_tenant_root_key_grants` table | The exact plan 7.2 shape since migration 0016; spike rows stay read-only in `v2_legacy_tenant_root_key_grants` |
 | `POST /v2/tenants/:tenant/root-key-generations` | S6 bootstrap: the D1 device's setup session files its signed `FirstRootSelfGrant` and generation 0 in `PREPARING`, as one exact idempotent mutation |
 | `GET /v2/tenants/:tenant/devices/:device/root-key-grants` | Returns a device's sealed grants of an `ACTIVE` generation only, and only to that device's own v2 session; a v1 token gets 403. The tenant trust evidence still serves every sealed root grant to the tenant's device sessions, because clients derive `rotation_required` from them (ADR 0002); a grant opens only with its recipient's HPKE key |
-| Root custody setup | "Set up root custody" on the tenant's first device: root generation 0 and its self grant, acknowledged and activated, and the recovery bundle written locally. Rotation is not implemented |
-| Fleet key | "Create fleet key" on the root custodian: fleet generation 0, its device and recovery grants, acknowledged and activated. The key is kept only once a verified collect opens it. A setup left unfinished until its saved requests expire (one year) leaves the generation `PREPARING` with no route to finish or discard it; that waits for fleet key rotation |
+| Root custody setup | "Set up root custody" on the tenant's first device: root generation 0 and its self grant, acknowledged and activated, and the recovery bundle written locally. Root key rotation is not implemented |
+| Fleet key | "Create fleet key" on the root custodian: fleet generation 0, its device and recovery grants, acknowledged and activated. The key is kept only once a verified collect opens it. A setup left unfinished until its saved requests expire (one year) leaves the generation `PREPARING` with no route to finish or discard it; no server route discards it yet |
 | Approving a device | The custodian's device list shows each pending device's code, computed from the custodian's pin and the listed key IDs, with both full key IDs and the anchor one click away. Approve needs the "code matches" box ticked and is refused more than ten minutes after this computer first saw the row. It files the device's fleet-scoped approval, its three profile capability grants and its fleet key grant |
 | Joining | The new device's "Show join code" works for ten minutes after its own enrollment, by its own clock. "Codes match" pins the anchor (A0), and "Collect key custody" keeps the fleet key once its grant verifies against that pin. An expired code offers "Enroll again"; the old row stays on the server until a custodian revokes it |
 | Revocation | Revoke on the device list, as retired or lost. `compromised` is not offered |
-| Fleet key rotation | Not implemented: a revoked device keeps generation 0 (see below) |
+| Fleet key rotation | "Rotate fleet key" on the root custodian (2.9.0): see "Fleet key rotation" below. Root key rotation is not implemented |
 | Recovery bundle | A v3 bundle (2.8.0) holds the root custodian's device identity, the root key and, when exported again after the fleet key exists, the team's verified fleet keys; a bundle from 2.7.x holds only the root key and cannot restore the team |
 | Approvals and grants | Run one year, with no renewal |
 
@@ -177,13 +177,17 @@ Revoking a device:
 
 It does not:
 
-- **Recall the fleet key the device holds.** Until rotation ships, generation 0
-  stays `ACTIVE`. The device can decrypt every snapshot it downloaded and any
-  later snapshot ciphertext that leaks to it, because new snapshots still use
-  its key. It cannot fetch them through the server.
+- **Recall the fleet key the device holds.** Its generation stays `ACTIVE`
+  until the custodian rotates the fleet key. Until then the device can decrypt
+  every snapshot it downloaded and any later snapshot ciphertext that leaks to
+  it, because new snapshots still use its key. It cannot fetch them through
+  the server. After a rotation it still reads whatever was sealed under the
+  keys it held.
 - Delete profiles already pulled to its disk.
-- Rotate keys. The fleet becomes `rotation_required`, which is advisory for
-  `retired` and `lost`.
+- Rotate keys. The custodian's Team page shows a banner when a revoked device
+  held the current fleet key: urgent for `lost` (or a saved revocation that
+  does not verify), routine for `retired`. It is advisory and clears once the
+  fleet key is rotated.
 - Survive a server that hides the revocation.
 - Change anything else that is still shared. Both machines use the one tenant
   account, and its password is unchanged. The revoked machine can still sign
@@ -329,7 +333,7 @@ Roughly the sequence the constraints force:
    device can open its own grant.
 2. ~~**Root generation lifecycle.**~~ Done for generation 0: root custody setup
    creates, acknowledges and activates it, with the `FirstRootSelfGrant`
-   uniqueness the plan specifies. Rotation is not implemented.
+   uniqueness the plan specifies. Root key rotation is not implemented.
 3. ~~**Grant keys at enrollment.**~~ Done as approval: the root custodian
    approves a new device after comparing its join code, which files the
    device's fleet key grant. The device receives the fleet key, not the TRK.
@@ -343,10 +347,56 @@ Roughly the sequence the constraints force:
    (ADR 0004): seeds and cached fleet keys go to Credential Manager, with the
    key file as the fallback. Keychain and kernel keyring are not wired up.
 
-Still to come: root and fleet key rotation (a revoked device keeps generation
-0), moving root custody to a new device row so a lost machine or an old bundle
-stops being a root custodian, and renewal of approvals and grants, which run
-one year.
+Still to come: root key rotation, moving root custody to a new device row so a
+lost machine or an old bundle stops being a root custodian, renewal of
+approvals and grants, which run one year, and re-sealing every profile under a
+new fleet key at once.
+
+### Fleet key rotation
+
+From 2.9.0 the root custodian rotates the fleet key with "Rotate fleet key" on
+the Team page. The run creates generation N+1 with this device as its only
+required holder, files its device, recovery and rotation grants, acknowledges
+and activates them (the server retires N in the same step), collects N+1
+verified, then grants N+1 to every member a signed approval names, minus
+revoked or withdrawn devices. Every request is saved before it is sent, so an
+interrupted run resumes with "Resume fleet key rotation". Approvals wait while
+a rotation is unfinished. The new generation must activate within 30 days; a
+rotation that runs out of time, or is caught by a server restore before it
+activated, expires: the team keeps generation N and approvals work again, but
+no new rotation can start until a later version can discard the stuck
+generation on the server.
+
+Re-sealing is lazy. Old snapshots stay under the key they were sealed with;
+a pull reads them while this device holds that key with a grant still in
+force, and the next push seals under the newest key. Generations never go
+down along a profile's chain: a head under an older key than its profile
+already uses is refused. Two costs follow:
+
+- A device approved after a rotation, or restored from a recovery bundle,
+  cannot read a profile that was not pushed again under the new key. It is
+  told to ask a member who still holds the old key to push it once.
+- A profile left under a retired key becomes unreadable for every device once
+  the old key's device grants end (one year from each grant), since a retired
+  generation's grants are never renewed.
+
+The custodian's Team page lists "Profiles still under an older key" (those
+bound on its own device whose last pinned or pushed head is below the newest
+generation it verified), each with "Pull and push": a push that seals under
+the newest key, preceded by a pull only when the server says the local copy
+is behind its head, since a pull restores over local data. A refused pull
+pushes nothing. After a server restore a row
+keeps the previous head's generation until the next pull. A finished rotation
+also asks for the recovery bundle to be exported again, since an earlier
+bundle does not open the new key.
+
+Members pick up the new key with "Collect key custody"; a push or pull refused
+under the old key says so. A member offline across two rotations cannot take
+the newest key and must be revoked and enroll again. A member the server
+refused, or one without a valid signed approval, is skipped and enrolls again
+the same way. Rotation does not cut off a stolen root machine or a leaked
+recovery bundle: both open the new key's recovery grant. That needs root key
+rotation.
 
 ## Threat model, stated plainly
 
@@ -418,7 +468,8 @@ What does not hold:
 - Recalling keys from a revoked device. Revocation cuts the device off the
   server, but it keeps the fleet key it already holds; see "Revocation: what
   it does and does not protect".
-- Forward secrecy across rotations. There are no rotations.
+- Forward secrecy across rotations. A fleet key rotation protects only what is
+  pushed afterwards; old snapshots stay under the keys a revoked device held.
 - Device key confidentiality against code running as the same Windows user,
   which can ask Credential Manager and DPAPI too, or against local disk access
   on other platforms.

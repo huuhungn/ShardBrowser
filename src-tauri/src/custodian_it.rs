@@ -1404,6 +1404,13 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
         ),
     )
     .unwrap();
+    // C held generation 0 through A's approval: a routine banner (Q-20).
+    assert_eq!(
+        crate::team_fleet_custody_status()
+            .unwrap()
+            .rotation_required,
+        Some(crate::fleet_custody::RotationRequired::Routine)
+    );
 
     // 2. A pushes version 3 under generation 0; B does not pull it.
     let udd = crate::profile::user_data_dir(&a_profile).unwrap();
@@ -1505,6 +1512,19 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
         (1, crate::fleet_custody::RotationPhase::Done, 1, 0, 0)
     );
     assert!(status.export_due && !status.setup_key_held);
+    assert_eq!(
+        status.rotation_required, None,
+        "C has no generation 1 grant"
+    );
+    // A's profile is still under generation 0 until it is pushed again.
+    let older = || {
+        call(&rt, crate::sync_cmd::team_profiles_under_older_key())
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.profile_id, p.key_generation))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(older(), [(a_profile.clone(), 0)]);
     let rotation = crate::fleet_custody::load().unwrap().rotation.unwrap();
     assert!(rotation.fkek_nonce.is_empty() && device.vault.load(&setup_ref).is_err());
     let state = |g: i64| {
@@ -1637,6 +1657,7 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
     )
     .unwrap();
     assert_eq!(files(&a_profile), b_files);
+    assert!(older().is_empty(), "A pinned B's head under generation 1");
 
     // 6. The rotation's audit rows, through B's collect: S0, the create,
     // A's three grants and B's, their four acks, and the activation.
