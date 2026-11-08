@@ -2172,17 +2172,14 @@ async fn team_enroll_device(
 
     let client =
         fleet_client::FleetClient::new(&c.server_url, &c.token).map_err(|e| e.to_string())?;
+    let tenant_id = c.tenant_id.clone();
+    let login = fleet_client::AccountLogin {
+        tenant_id: &tenant_id,
+        username: username.trim(),
+        password: &password,
+    };
     let enrolled = client
-        .enroll_device(
-            &fleet_client::AccountLogin {
-                tenant_id: &c.tenant_id,
-                username: username.trim(),
-                password: &password,
-            },
-            &signer,
-            &hpke_public,
-            label.trim().as_bytes(),
-        )
+        .enroll_device(&login, &signer, &hpke_public, label.trim().as_bytes())
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2236,8 +2233,89 @@ async fn team_enroll_device(
     if stored.verifying_key().to_bytes() != signer.verifying_key().to_bytes() {
         return Err(crate::errcode::code("fleet.deviceKeyMismatch"));
     }
+    if let Err(error) = forget_revoked_identities(&client, &login, &c).await {
+        eprintln!("[team] old credentials stay: {error}");
+    }
 
     team_config::status().map_err(|e| e.to_string())
+}
+
+/// Forgets the `device-signing`/`device-hpke` credentials of an old identity
+/// that a `team.json.unreadable-*` copy names, only while `login`'s `/v2/me`
+/// lists that device `revoked`: the server's word decides this local deletion
+/// and nothing else. Best effort, after an enrollment: the caller logs a
+/// failure, the copies stay, and a `pending` or unlisted device keeps its
+/// credentials.
+async fn forget_revoked_identities(
+    client: &fleet_client::FleetClient,
+    login: &fleet_client::AccountLogin<'_>,
+    c: &team_config::TeamConfig,
+) -> anyhow::Result<()> {
+    let config = store::team_config_path()?;
+    let Some(dir) = config.parent() else {
+        return Ok(());
+    };
+    let mut asked = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(dir)? {
+        let copy = entry?.path();
+        let is_copy = copy
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("team.json.unreadable-"));
+        if !is_copy {
+            continue;
+        }
+        // Recovery import copies `team.json` unparsed: one copy that does not
+        // read stops nothing. Only the path is logged, never the content.
+        let old = match std::fs::read(&copy) {
+            Ok(body) => match serde_json::from_slice::<team_config::TeamConfig>(&body) {
+                Ok(old) => old,
+                Err(_) => {
+                    eprintln!("[team] copy {} skipped: not a team config", copy.display());
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("[team] copy {} skipped: {:?}", copy.display(), e.kind());
+                continue;
+            }
+        };
+        // Only an identity of this server and tenant is this login's to ask about.
+        if old.device_id.is_empty()
+            || old.device_id.eq_ignore_ascii_case(&c.device_id)
+            || old.server_url != c.server_url
+            || !old.tenant_id.eq_ignore_ascii_case(&c.tenant_id)
+            || !asked.insert(old.device_id.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let listed = client.account_device_status(login, &old.device_id).await?;
+        if listed.device.is_none_or(|d| d.status != "revoked") {
+            continue;
+        }
+        for (kind, reference) in [
+            ("device-signing", &old.signing_credential_ref),
+            ("device-hpke", &old.hpke_credential_ref),
+        ] {
+            // Only the name enrollment gave that device's key, never one in use.
+            if *reference != format!("{kind}.{}", old.device_id)
+                || *reference == c.signing_credential_ref
+                || *reference == c.hpke_credential_ref
+            {
+                continue;
+            }
+            match credential::forget(reference) {
+                Ok(()) => eprintln!(
+                    "[team] forgot revoked device {}'s {kind} key",
+                    old.device_id
+                ),
+                Err(e) => eprintln!(
+                    "[team] revoked device {}'s {kind} key stays: {e}",
+                    old.device_id
+                ),
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---- ProxyShard billing API ----
@@ -2795,6 +2873,8 @@ async fn team_approve_device(
             verified_fleet_key(&fleet_hex, &pin, &me, generation, now)?
                 .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
         };
+        let withdrawn =
+            |key: &[u8; 32]| team::ledger::withdrawn(&team::db::Db::open()?, &pin.0, key);
         let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
         fleet_custody::approve_member(
             &client,
@@ -2804,6 +2884,7 @@ async fn team_approve_device(
             row,
             &sas,
             fleet_key,
+            withdrawn,
             now,
             &mut state,
             &mut |s| fleet_custody::save(s),
@@ -2875,6 +2956,7 @@ async fn team_fleet_key_rotate(
     let result = async {
         let error = |e: anyhow::Error| e.to_string();
         let now = root_bootstrap::now_ms();
+        let started = std::time::Instant::now();
         let save = &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
         let mut state = fleet_custody::load().map_err(error)?;
         // Start needs N verified here, and N as the ledger's highest.
@@ -2900,7 +2982,7 @@ async fn team_fleet_key_rotate(
                 &root,
                 &mut ledger,
                 previous_key,
-                now,
+                || now + started.elapsed().as_millis() as u64,
                 &mut state,
                 save,
             )
@@ -7320,6 +7402,132 @@ mod custody_tests {
                 );
             }
         }
+    }
+
+    /// v2.8.1 nit 2: what the e2e mock fakes for an unfinished root setup,
+    /// started and this device's but not activated, is what the backend
+    /// reports for one, and its expired join code never offers Enroll again,
+    /// before any call to the server.
+    #[test]
+    fn team_join_code_refuses_enroll_again_for_this_devices_unfinished_root_setup() {
+        let rt = runtime();
+        let (url, calls) = me_server(&rt, "pending");
+        let _j = joiner(&url, root_bootstrap::now_ms() - 60 * MINUTE);
+        root_bootstrap::save(&root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&JOINER),
+            server_instance_id: hex(&INSTANCE),
+            ..Default::default()
+        })
+        .unwrap();
+        let status = serde_json::to_value(root_bootstrap::status().unwrap()).unwrap();
+        let flag = |name: &str| status[name].as_bool();
+        assert_eq!(
+            (flag("started"), flag("this_device"), flag("activated")),
+            (Some(true), Some(true), Some(false))
+        );
+        let err = rt
+            .block_on(team_join_code("u".into(), "p".into()))
+            .unwrap_err();
+        assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+        assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock());
+    }
+
+    /// The device ID the enrollment mock assigns.
+    const ENROLLED: [u8; 16] = [0x6c; 16];
+
+    /// Login, challenge and proof as `fleet_client::tests::enrollment`
+    /// answers them (tenant `[4; 16]`, account `[5; 16]`), and a `/v2/me`
+    /// listing `JOINER` as `old`, or an unreadable listing for an empty `old`.
+    fn enroll_reply(call: &str, body: serde_json::Value, old: &str) -> serde_json::Value {
+        if call == "GET /v2/me" {
+            if old.is_empty() {
+                return serde_json::json!({});
+            }
+            return serde_json::json!({
+                "account_id": hex(&[5; 16]),
+                "devices": [{"device_id": hex(&JOINER), "status": old}],
+            });
+        }
+        let finish = serde_json::json!({
+            "device_id": hex(&ENROLLED), "account_id": hex(&[5; 16]), "signing_key_id": "",
+        });
+        fleet_client::tests::enrollment(call, body, finish)
+    }
+
+    /// `JOINER` of tenant `[4; 16]` at `url`, its `team.json` copied aside
+    /// and its identity cleared, as Reset leaves a device: its credentials.
+    fn reset_joiner(url: &str) -> (Joiner, [String; 2]) {
+        let j = joiner(url, root_bootstrap::now_ms());
+        let mut c = team_config::load().unwrap();
+        c.tenant_id = hex(&[4; 16]);
+        team_config::save(&c).unwrap();
+        team_config::preserve_unreadable().unwrap();
+        let refs = clear_identity(&mut c);
+        team_config::save(&c).unwrap();
+        assert_eq!(refs[0], format!("device-signing.{}", hex(&JOINER)));
+        (j, refs)
+    }
+
+    fn enroll(rt: &tokio::runtime::Runtime, copies: usize) {
+        let status = rt
+            .block_on(team_enroll_device("l".into(), "u".into(), "p".into()))
+            .unwrap();
+        assert!(status.is_enrolled);
+        assert_eq!(team_config::load().unwrap().device_id, hex(&ENROLLED));
+        assert_eq!(team_json_copies(), copies, "the copies stay");
+    }
+
+    /// v2.8.1 nit 3: after an enrollment, the old identity a copy names loses
+    /// its credentials only when `/v2/me` lists it revoked; pending keeps them.
+    #[test]
+    fn enrollment_forgets_the_old_identitys_credentials_only_when_the_server_lists_it_revoked() {
+        let rt = runtime();
+        let url =
+            fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "revoked"));
+        let (_j, refs) = reset_joiner(&url);
+        // A copy that is not a team config, as recovery import may leave,
+        // is skipped and stops nothing.
+        let team_json = store::team_config_path().unwrap();
+        std::fs::write(
+            team_json.with_extension("json.unreadable-0"),
+            b"{not a team config",
+        )
+        .unwrap();
+        enroll(&rt, 2);
+        for r in &refs {
+            let gone = credential::load(r).unwrap_err().to_string();
+            assert!(gone.contains("credential.missing"), "{r}: {gone}");
+        }
+        drop(_j);
+
+        let url =
+            fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "pending"));
+        let (_j, refs) = reset_joiner(&url);
+        enroll(&rt, 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+    }
+
+    /// v2.8.1 nit 3: neither a forget the store refuses nor a listing that
+    /// does not read fails the enrollment; what was not forgotten stays.
+    #[test]
+    fn a_failed_credential_forget_does_not_fail_the_enrollment() {
+        let rt = runtime();
+        let url =
+            fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, "revoked"));
+        let (_j, refs) = reset_joiner(&url);
+        credential::fail_next_call(&refs[0]);
+        enroll(&rt, 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert!(credential::load(&refs[1]).is_err());
+        drop(_j);
+
+        let url = fleet_client::tests::json_server(&rt, |call, body| enroll_reply(call, body, ""));
+        let (_j, refs) = reset_joiner(&url);
+        enroll(&rt, 1);
+        assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
+        assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
     }
 
     /// R3-D5: the UI treats a root state as this device's only when it names

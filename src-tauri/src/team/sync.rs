@@ -198,7 +198,7 @@ fn spool(name: &str) -> Result<std::path::PathBuf> {
 // database needs write access to the config root. Restore bindings from the
 // server once the Team profile UI records them.
 pub(crate) fn is_published(local: &str) -> Result<bool> {
-    if !Db::path()?.exists() {
+    if !Db::path()?.try_exists()? {
         return Ok(false);
     }
     is_bound(&Db::open()?.conn, local)
@@ -287,7 +287,7 @@ pub(crate) fn under_older_key(pin: &Binding) -> Result<Vec<OlderKeyProfile>> {
 /// database alone: no network, and no pending revert swap is settled here
 /// (one shows as the pinned head, `AVAILABLE`). No team database means none.
 pub(crate) fn statuses(now: u64) -> Result<Statuses> {
-    if !Db::path()?.exists() {
+    if !Db::path()?.try_exists()? {
         return Ok(Statuses::default());
     }
     let db = Db::open()?;
@@ -1747,6 +1747,7 @@ fn readable_key(
         .ok_or_else(|| {
             if crate::fleet_key_needs_recollect(db, &dev.pin, fleet, generation) {
                 anyhow!(code("sync.fleetKeyRecollect"))
+            // A ledger error only picks the code: the read is refused either way.
             } else if matches!(
                 ledger::highest_generation(db, &dev.pin.0, fleet),
                 Ok(Some(h)) if generation < h
@@ -2033,7 +2034,7 @@ pub(crate) fn beside(udd: &Path, suffix: &str) -> std::path::PathBuf {
 /// dropped and nothing is created. Without a row nothing happens, so a
 /// staging dir a revert left before `finish` is never swapped in.
 pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
-    if !Db::path()?.exists() {
+    if !Db::path()?.try_exists()? {
         return Ok(());
     }
     let db = Db::open()?;
@@ -2047,16 +2048,16 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
     }
     let (staging, old) = (beside(udd, REVERT_STAGING), beside(udd, REVERT_OLD));
     let swapped = (|| -> std::io::Result<()> {
-        if staging.exists() {
-            if udd.exists() {
-                if old.exists() {
+        if staging.try_exists()? {
+            if udd.try_exists()? {
+                if old.try_exists()? {
                     std::fs::remove_dir_all(&old)?;
                 }
                 std::fs::rename(udd, &old)?;
             }
             std::fs::rename(&staging, udd)?;
         }
-        if old.exists() {
+        if old.try_exists()? {
             std::fs::remove_dir_all(&old)?;
         }
         Ok(())
@@ -2081,10 +2082,14 @@ pub(crate) fn settle_revert_swap(local: &str, udd: &Path) -> Result<()> {
 /// restores `P` again.
 pub(crate) fn discard_revert_staging(local: &str, udd: &Path) -> Result<()> {
     remove_beside(udd, &UNPACK_LEFTOVERS)?;
-    if !SWAP_DIRS.iter().any(|suffix| beside(udd, suffix).exists()) {
+    let mut swap_left = false;
+    for suffix in SWAP_DIRS {
+        swap_left |= beside(udd, suffix).try_exists()?;
+    }
+    if !swap_left {
         return Ok(());
     }
-    if Db::path()?.exists() {
+    if Db::path()?.try_exists()? {
         let needed: bool = Db::open()?.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM profile_bindings b JOIN operations o
                ON o.local_profile_id = b.local_profile_id AND o.lease_id = b.lease_id
@@ -2115,7 +2120,7 @@ const UNPACK_LEFTOVERS: [&str; 2] = [".revert-staging.incoming", ".revert-stagin
 fn remove_beside(udd: &Path, suffixes: &[&str]) -> Result<()> {
     for suffix in suffixes {
         let dir = beside(udd, suffix);
-        if dir.exists() {
+        if dir.try_exists()? {
             std::fs::remove_dir_all(&dir)?;
         }
     }
@@ -2247,7 +2252,7 @@ async fn revert_inner(
     // An upload resumes only over its staged `P`; one gone (a profile
     // deleted under the lease) is restored again, byte for byte, by the walk.
     let base = match base {
-        Some(base) if uploaded && staging.exists() => base,
+        Some(base) if uploaded && staging.try_exists()? => base,
         _ => {
             let walk = async {
                 let head = listed(client, access, &mut db, &b).await?;
@@ -4035,9 +4040,17 @@ pub(crate) fn unbind(local: &str, server_url: &str, now: u64) -> Result<Vec<u8>>
 /// a release that names no binding (with any release already pending), sent
 /// best effort by the next publish, push or pull, and lapses at its TTL
 /// otherwise; the binding then drops it as a sent release would. No team
-/// database, or one that does not open, has no binding this could drop.
+/// database, or one that does not open, has no binding this could drop; one
+/// whose existence cannot be checked refuses the removal
+/// (`team.trustLedgerUnreadable`), so nothing is removed.
 pub(crate) fn unbind_removed(local: &str) -> Result<()> {
-    if !Db::path()?.exists() {
+    // An unknown existence may hide a readable binding, so it fails closed as
+    // the v2.8.1 state checks do; a database that exists but does not open
+    // holds no binding this launcher could read or release, as before.
+    if !Db::path()?
+        .try_exists()
+        .context(code("team.trustLedgerUnreadable"))?
+    {
         return Ok(());
     }
     let mut db = match Db::open() {
@@ -4718,12 +4731,12 @@ fn pin(
 /// snapshot carries: `unpack` keeps the os_crypt key and the browser-level
 /// state only from the directory it unpacks over, and the swap replaces `udd`.
 fn fresh_staging(udd: &Path, staging: &Path) -> Result<()> {
-    if staging.exists() {
+    if staging.try_exists()? {
         std::fs::remove_dir_all(staging)?;
     }
     std::fs::create_dir_all(staging)?;
     let live = udd.join("Local State");
-    if live.exists() {
+    if live.try_exists()? {
         std::fs::copy(&live, staging.join("Local State"))?;
     }
     Ok(())
@@ -11553,7 +11566,7 @@ mod tests {
     }
 
     /// R4's deciding test: a push with nothing changed is not short-cut; it
-    /// seals a new head under the newest generation, so Pull and push needs
+    /// seals a new head under the newest generation, so the older-key Push needs
     /// no forced re-seal, and the profile leaves the older-key list.
     #[test]
     fn a_clean_profile_push_reseals_under_the_newest_generation() {
@@ -11618,7 +11631,9 @@ mod tests {
 
     /// The floor is never applied to a head that joins the open run: a
     /// withdrawn signer's head under `GEN` above `P` under `GEN + 1` still
-    /// quarantines, and an `R` under `GEN + 1` over it is accepted.
+    /// quarantines, and an `R` under `GEN + 1` over it is accepted. Before
+    /// the revocation the same head stops the pull: the ADR's "stops pulls
+    /// until revoked; revert then skips it".
     #[test]
     fn a_revoked_signers_lower_generation_head_still_reverts() {
         let w = world();
@@ -11633,6 +11648,13 @@ mod tests {
         serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
         let d = second(&w);
         rotate(&w);
+        // While `A` is still valid, its head under `GEN` stops the pull and
+        // nothing is pinned.
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let err = w.pull(&d.path().join("valid")).unwrap_err();
+        assert!(has(&err, "sync.headBelowKeyGeneration"), "{err:#}");
+        untouched_at(&w, 0);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
         w.fake().listed = Some((2, Some(heads[1])));
         let err = w.pull(&d.path().join("first")).unwrap_err();
         assert!(has(&err, "sync.signerRevokedAtP"), "{err:#}");
@@ -13041,6 +13063,23 @@ mod tests {
         crate::store::set_config_root(Some(fresh.path().to_path_buf()));
         settle_revert_swap(LOCAL, &udd).unwrap();
         assert!(!Db::path().unwrap().exists());
+    }
+
+    /// v2.8.1 leftover: a team database whose existence cannot be checked is
+    /// an error, never a device with no team database.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_parent_is_an_error_not_an_absent_file() {
+        let _w = world();
+        let fresh = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(fresh.path().to_path_buf()));
+        // `team-sync` is a regular file: `stat` of the database below it
+        // fails with ENOTDIR, which `exists()` reads as absent.
+        std::fs::write(fresh.path().join("team-sync"), b"not a directory").unwrap();
+        assert!(is_published(LOCAL).is_err());
+        assert!(statuses(T0).is_err());
+        let err = unbind_removed(LOCAL).unwrap_err();
+        assert!(has(&err, "team.trustLedgerUnreadable"), "{err:#}");
     }
 
     #[test]

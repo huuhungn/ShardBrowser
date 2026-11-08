@@ -817,7 +817,8 @@ fn prove_unlocked(w: &Places) -> Result<()> {
 /// opened has no flow to protect and keeps starting local profiles.
 pub(crate) fn in_flow(local: &str) -> bool {
     match Db::path() {
-        Ok(path) if path.exists() => Db::open()
+        // A database whose existence cannot be checked is opened, and fails.
+        Ok(path) if path.try_exists().unwrap_or(true) => Db::open()
             .and_then(|db| journal::flow_taken(&db, local))
             .unwrap_or(false),
         _ => false,
@@ -1172,7 +1173,7 @@ pub(crate) fn roll_back_clone(journal_id: &str) -> Result<CloneDone> {
 /// Whether a downgrade or restore journal is recorded that a move of the data
 /// root would strand: its saved paths point into the current folder.
 pub(crate) fn journals_exist() -> Result<bool> {
-    if !Db::path()?.exists() {
+    if !Db::path()?.try_exists()? {
         return Ok(false);
     }
     let count: i64 = Db::open()?.conn.query_row(
@@ -1197,7 +1198,7 @@ pub struct Resumed {
 /// Finishes (or rolls back) every open clone journal. A journal of the
 /// pre-v2 restore flow is reported, not touched.
 pub(crate) fn resume_open() -> Result<Vec<Resumed>> {
-    if !Db::path()?.exists() {
+    if !Db::path()?.try_exists()? {
         return Ok(Vec::new());
     }
     let open = journal::downgrade_open(&Db::open()?)?;
@@ -1243,7 +1244,7 @@ pub(crate) fn unbind_profile(local: &str, server_url: &str, now: u64) -> Result<
     valid_id(local)?;
     refuse_while_migrating()?;
     let _claim = profile::begin_user_mutation([local], &code("downgrade.actionUnbind"))?;
-    if Db::path()?.exists() && journal::flow_taken(&Db::open()?, local)? {
+    if Db::path()?.try_exists()? && journal::flow_taken(&Db::open()?, local)? {
         bail!(code("downgrade.flowTaken"));
     }
     // A revert's `R` lands in the profile first; a staging dir left over is
@@ -1293,7 +1294,7 @@ pub(crate) fn readiness() -> Result<Readiness> {
         "downgrade.blockRunning",
         crate::process::Tracker::shared().running().len() as u64,
     );
-    if Db::path()?.exists() {
+    if Db::path()?.try_exists()? {
         let db = Db::open()?;
         let count = |sql: &str| -> Result<u64> {
             Ok(db.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)

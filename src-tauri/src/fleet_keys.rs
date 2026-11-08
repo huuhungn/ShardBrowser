@@ -169,14 +169,8 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_key(h: &str) -> Result<[u8; 32]> {
-    if !h.len().is_multiple_of(2) {
-        anyhow::bail!(crate::errcode::code("fleetKeys.notValidHex"));
-    }
-    let raw: Vec<u8> = (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16))
-        .collect::<std::result::Result<_, _>>()
-        .context(crate::errcode::code("fleetKeys.notValidHex"))?;
+    let raw = crate::fleet_client::decode_hex(h)
+        .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleetKeys.notValidHex")))?;
     let arr: [u8; 32] = raw
         .as_slice()
         .try_into()
@@ -186,7 +180,7 @@ fn decode_key(h: &str) -> Result<[u8; 32]> {
 
 pub fn load() -> Result<FleetKeyStore> {
     let path = store::fleet_keys_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(FleetKeyStore::default());
     }
     let mut stored = read(&path)?;
@@ -237,7 +231,7 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
     {
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let path = store::fleet_keys_path()?;
-        let mut s = if path.exists() {
+        let mut s = if path.try_exists()? {
             read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?
         } else {
             FleetKeyStore::default()
@@ -272,7 +266,7 @@ pub fn collect(fleet_id: &str, generation: u64, key: &[u8; 32]) -> Result<bool> 
 /// Read as `collect` reads it: the file is never rewritten.
 pub fn verified_keys(fleet_id: &str) -> Result<Vec<(u64, Zeroizing<[u8; 32]>)>> {
     let path = store::fleet_keys_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(Vec::new());
     }
     let s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
@@ -297,7 +291,7 @@ pub fn verified_keys(fleet_id: &str) -> Result<Vec<(u64, Zeroizing<[u8; 32]>)>> 
 pub fn protect() -> Result<bool> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = store::fleet_keys_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(false);
     }
     let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
@@ -331,7 +325,7 @@ pub fn protect() -> Result<bool> {
 pub fn unindex_unopenable(fleet_id: &str) -> Result<Vec<u64>> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let path = store::fleet_keys_path()?;
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(Vec::new());
     }
     let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
@@ -698,5 +692,51 @@ mod tests {
         assert!(moved);
         assert!(!second.contains("dpapi:"), "{second}");
         assert_eq!(after, vec![([0x5A; 32], 1)]);
+    }
+
+    /// v2.8.1 nit 4: a stored key with a multi-byte character is refused,
+    /// never sliced inside the character.
+    #[test]
+    fn decode_key_refuses_non_ascii_without_panicking() {
+        for h in ["\u{20ac}a", "a\u{e9}0"] {
+            let err = std::panic::catch_unwind(|| decode_key(h))
+                .expect("decode_key panicked")
+                .unwrap_err();
+            assert!(
+                crate::errcode::has_code(&err.to_string(), "fleetKeys.notValidHex"),
+                "{err}"
+            );
+        }
+    }
+
+    /// v2.8.1 leftover: a fleet key file whose existence cannot be checked
+    /// is an error for every reader and writer, never an empty store.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_parent_is_an_error_not_an_absent_file() {
+        let _guard = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        // The file's path runs through a regular file: `stat` fails with
+        // ENOTDIR, which `exists()` reads as absent.
+        fs::write(dir.path().join("not-a-dir"), b"").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("not-a-dir").join("fleet-keys.json"),
+            store::fleet_keys_path().unwrap(),
+        )
+        .unwrap();
+        let results = [
+            load().map(drop),
+            collect("ab", 1, &[0x61; 32]).map(drop),
+            verified_keys("ab").map(drop),
+            protect().map(drop),
+            unindex_unopenable("ab").map(drop),
+        ];
+        store::set_config_root(None);
+        for (i, r) in results.into_iter().enumerate() {
+            assert!(r.is_err(), "{i}");
+        }
     }
 }

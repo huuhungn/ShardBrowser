@@ -361,11 +361,16 @@ and activates them (the server retires N in the same step), collects N+1
 verified, then grants N+1 to every member a signed approval names, minus
 revoked or withdrawn devices. Every request is saved before it is sent, so an
 interrupted run resumes with "Resume fleet key rotation". Approvals wait while
-a rotation is unfinished. The new generation must activate within 30 days; a
+a rotation is unfinished. An approval interrupted before a rotation resumes
+under the new generation, and every resume sends its saved fleet grant only
+to a device the rotation did not skip, this custodian did not revoke and whose
+key the trust ledger does not hold withdrawn. The new generation must activate within 30 days; a
 rotation that runs out of time, or is caught by a server restore before it
-activated, expires: the team keeps generation N and approvals work again, but
-no new rotation can start until a later version can discard the stuck
-generation on the server.
+activated, expires: the team keeps generation N and approvals work again.
+Rotate stays available: when N+1 never reached the server, or a restore
+removed it, the next rotation starts over; when the server still holds N+1
+as PREPARING, that rotation ends expired again as stuck until a later version
+can discard that generation on the server.
 
 Re-sealing is lazy. Old snapshots stay under the key they were sealed with;
 a pull reads them while this device holds that key with a grant still in
@@ -382,13 +387,16 @@ already uses is refused. Two costs follow:
 
 The custodian's Team page lists "Profiles still under an older key" (those
 bound on its own device whose last pinned or pushed head is below the newest
-generation it verified), each with "Pull and push": a push that seals under
-the newest key, preceded by a pull only when the server says the local copy
-is behind its head, since a pull restores over local data. A refused pull
-pushes nothing. After a server restore a row
+generation it verified), each with "Push": a push that seals under the newest
+key. It never pulls: when the server says the local copy is behind its head,
+nothing is pushed and the row asks to pull the profile from the profile list
+first, since a pull replaces local changes this device has not pushed. The
+list reloads after a Check in, Pull or Unbind there. After a server restore a row
 keeps the previous head's generation until the next pull. A finished rotation
 also asks for the recovery bundle to be exported again, since an earlier
-bundle does not open the new key.
+bundle does not open the new key. Known limitation: an export that finishes
+while another custody action (listing, approving or revoking devices) holds
+the custody lock leaves that prompt up; exporting again clears it.
 
 Members pick up the new key with "Collect key custody"; a push or pull refused
 under the old key says so. A member offline across two rotations cannot take
@@ -483,7 +491,8 @@ What does not hold:
 - Secrecy of the account password or a session token against a hostile team
   server. The launcher keeps them out of its own logs, state and error
   strings, and removes the forms of them it recognizes from a server's refusal
-  text; a refused login keeps only the server's error code. A server that
+  text; a refused login keeps only the server's error code, and a device list
+  naming a device or account ID equal to the password is refused. A server that
   received the password or a token can still return it in an encoding the
   launcher does not recognize. The account password protects that account at
   that server only, so use a password unique to it.

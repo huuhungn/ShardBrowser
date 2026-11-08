@@ -513,8 +513,6 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   let generation = 0;
   // The generation each head was sealed under.
   const sealed = new Map<string, number>();
-  // A pull of these profiles is refused with the code given.
-  const refusePull = new Map<string, string>();
   let enrolled = 0;
   const row = (id: unknown) => devices.find((d) => d.device_id === id);
   // A device session: a revoked device is refused, as v2_auth refuses it.
@@ -598,11 +596,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       sealed.set(id, g ?? 0);
       return reply(id);
     },
-    pull: (_device, { remote_profile_id }) => {
-      const code = refusePull.get(String(remote_profile_id));
-      if (code) throw new Error(`[[shardx:${code}]]`);
-      return reply(String(remote_profile_id));
-    },
+    pull: (_device, { remote_profile_id }) => reply(String(remote_profile_id)),
     // Check-in is the checkout inside push: it takes the lease when free and releases it.
     push: (device, args) => {
       const { remote_profile_id, pin } = args;
@@ -625,7 +619,6 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   return {
     heads,
     devices,
-    refusePull,
     call: (op: string, device: string, args: Args) => ops[op](device, args),
     /** A device whose key is later proven revoked checks in a new head. */
     revokedCheckIn: (id: string) => Object.assign(head(id), { version: head(id).version + 1, revoked: true }),
@@ -836,13 +829,13 @@ test("an unfinished rotation shows Resume and its deadline, and refuses Approve 
   await expect(row).toContainText("Active");
 });
 
-test("an expired rotation shows the stuck notice, keeps Rotate off, and Approve works", async ({ page: a }) => {
+test("an expired rotation shows the stuck notice, keeps Rotate on to try again, and Approve works", async ({ page: a }) => {
   const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "pending", granted: false }]);
   const card = await teamDevicePage(a, "a", server, false, "&teamRotation=expired");
   await expect(card.getByTestId("team-rotation-status")).toContainText("expired before it was activated");
   await expect(card.getByTestId("team-rotation-status")).not.toContainText("Finish it before");
   await cardSignIn(a);
-  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeDisabled();
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeEnabled();
   const row = await listDevices(a, "Machine C");
   await cardSignIn(a);
   await row.getByLabel("The code on the other device matches").check();
@@ -858,7 +851,7 @@ test("a pull refused as under a retired key shows why", async ({ page }) => {
   await expect(page.getByText("[[shardx:")).toHaveCount(0);
 });
 
-test("after a rotation the custodian pulls and pushes profiles under an older key, and a member follows the new key", async ({
+test("after a rotation the custodian pushes profiles under an older key, and a member follows the new key", async ({
   page: a, browser, baseURL, viewport,
 }) => {
   test.slow();
@@ -895,18 +888,20 @@ test("after a rotation the custodian pulls and pushes profiles under an older ke
   });
 
   const id = [...server.heads.keys()][0];
-  await test.step("behind B's version, a refused pull keeps the row with its error and pushes nothing", async () => {
-    server.refusePull.set(id, "sync.pushPending");
+  await test.step("behind B's version, Push says to pull first and neither pulls nor pushes", async () => {
     await cardSignIn(a);
-    await older.getByRole("button", { name: "Pull and push" }).click();
-    await expect(older).toContainText("A push of this profile has not finished.");
+    await older.getByRole("button", { name: "Push", exact: true }).click();
+    await expect(older).toContainText("This device's copy is behind the team server, so nothing was pushed.");
     expect(server.heads.get(id)?.version).toBe(2);
-    server.refusePull.delete(id);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
   });
 
-  await test.step("behind B's version, Pull and push pulls it, then pushes under generation 1", async () => {
+  await test.step("pulled from the profile list, the copy is pushed under generation 1", async () => {
+    await click(a, rowA, "Pull");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@2"]);
+    await expect(older).toContainText("Generation 0");
     await cardSignIn(a);
-    await older.getByRole("button", { name: "Pull and push" }).click();
+    await older.getByRole("button", { name: "Push", exact: true }).click();
     await expect(a.getByText("Beta Research is now under the newest fleet key.")).toBeVisible();
     await expect(a.getByTestId("team-older-key")).toHaveCount(0);
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@3"]);
@@ -932,20 +927,18 @@ test("after a rotation the custodian pulls and pushes profiles under an older ke
     await expect(b.getByText("The fleet key grant for this device failed its check", { exact: false })).toHaveCount(0);
   });
 
-  await test.step("a copy that is not behind is pushed without a pull, so local data is never pulled over", async () => {
+  await test.step("a Check in from the profile list takes the row off the older-key list", async () => {
     // Behind B's version 4: pulled, then pushed as version 5 under generation 3.
+    await click(a, rowA, "Pull");
     await cardSignIn(a);
-    await older.getByRole("button", { name: "Pull and push" }).click();
+    await older.getByRole("button", { name: "Push", exact: true }).click();
     await expect(a.getByTestId("team-older-key")).toHaveCount(0);
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@5"]);
     await rotateOn(a);
     await expect(older).toContainText("Generation 3");
-    server.refusePull.set(id, "sync.pushPending");
-    await cardSignIn(a);
-    await older.getByRole("button", { name: "Pull and push" }).click();
-    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+    await click(a, rowA, "Check in");
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@6"]);
-    server.refusePull.delete(id);
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
   });
   await b.context().close();
 });

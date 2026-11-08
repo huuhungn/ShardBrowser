@@ -1099,7 +1099,8 @@ fn custodian(me: &FleetDevice<'_>, state: &FleetCustodyState) -> Result<Context1
 /// Runs, or resumes, Approve of `row` (section 4.A) under the device session
 /// `access`. A device with saved requests gets exactly those resent: the
 /// window, code and key checks gate only building new ones. `fleet_key`
-/// gives the verified FKEK of the fleet's ACTIVE generation.
+/// gives the verified FKEK of the fleet's ACTIVE generation; `withdrawn`
+/// tells whether the trust ledger holds a signing key withdrawn.
 #[allow(clippy::too_many_arguments)]
 pub async fn approve_member(
     client: &FleetClient,
@@ -1109,6 +1110,7 @@ pub async fn approve_member(
     row: &TenantDevice,
     sas: &str,
     fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+    withdrawn: impl Fn(&[u8; 32]) -> Result<bool>,
     now: u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
@@ -1166,6 +1168,14 @@ pub async fn approve_member(
     };
     let replay = approved.common.replay_id;
     let subject = decode_hex16(&id, "device_id")?;
+    let not_pending = || crate::errcode::code("fleet.deviceNotPending");
+    // Resumed: nothing is resent to a device revoked here or whose key the
+    // ledger holds withdrawn.
+    if first_seen.is_none()
+        && (state.revocations.contains_key(&id) || withdrawn(&approved.subject_signing_key_id)?)
+    {
+        bail!(not_pending());
+    }
     let receipt =
         DeviceApprovalReceiptV2::parse(&client.approve_device(access, &id, &approval).await?)
             .map_err(|_| mismatch())?;
@@ -1199,28 +1209,29 @@ pub async fn approve_member(
     let mut grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
         .map_err(|_| corrupt())?
         .grant;
-    // Resumed after a rotation: the saved grant names a generation below the
-    // server's ACTIVE one, so one for the ACTIVE generation is built once and
-    // saved, unless the rotation's member step filed it or found the device
-    // ineligible, or this custodian revoked it.
+    // Resumed: before a saved grant is resent, or one for a newer ACTIVE
+    // generation is built once and saved, the device must still be eligible
+    // for the grant's generation: not found ineligible or filed by that
+    // rotation's member step (revoked here or withdrawn is refused above). A
+    // saved grant may already be a rebuilt one, so this runs every resume.
     if first_seen.is_none() {
         let active = client
             .active_fleet_generation(access, me.tenant_id, &fleet)
             .await?;
-        if let Some(active) = active.filter(|g| *g > grant.generation.generation) {
-            let rotation = state.rotation.as_ref().filter(|r| r.generation == active);
-            let not_pending = || crate::errcode::code("fleet.deviceNotPending");
-            match rotation
-                .and_then(|r| r.member_results.get(&id))
-                .map(String::as_str)
-            {
-                Some("filed") => return Ok(()),
-                // The rotation found it ineligible (revoked, withdrawn, no
-                // approval) or the server refused it.
-                Some(_) => bail!(not_pending()),
-                None if state.revocations.contains_key(&id) => bail!(not_pending()),
-                None => {}
-            }
+        let rebuild = active.filter(|g| *g > grant.generation.generation);
+        let target = rebuild.unwrap_or(grant.generation.generation);
+        let rotation = state.rotation.as_ref().filter(|r| r.generation == target);
+        match rotation
+            .and_then(|r| r.member_results.get(&id))
+            .map(String::as_str)
+        {
+            Some("filed") => return Ok(()),
+            // The rotation found it ineligible (revoked, withdrawn, no
+            // approval) or the server refused it.
+            Some(_) => bail!(not_pending()),
+            None => {}
+        }
+        if let Some(active) = rebuild {
             let keys = listed_keys(row)?;
             if (keys.0, keys.1)
                 != (
@@ -1591,7 +1602,7 @@ impl Ledger<'_> {
 }
 
 /// Runs, or resumes, Rotate fleet key (sequence K) through step 9 under the
-/// device session `access`, at `now`. At Start, `previous_key` gives this
+/// device session `access`, `clock` giving the time. At Start, `previous_key` gives this
 /// device's verified key of the ACTIVE generation N. `Ok` means N+1 is
 /// ACTIVE: the command then releases the setup key and collects N+1 (step
 /// 10) and runs [`grant_members`]. `save` persists `state`; every step that
@@ -1611,16 +1622,23 @@ pub async fn rotate_fleet(
     root: &BootstrapState,
     ledger: &mut Ledger<'_>,
     previous_key: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
-    now: u64,
+    clock: impl Fn() -> u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
+    let now = clock();
     let ours = root.tenant_id.eq_ignore_ascii_case(device.tenant_id)
         && root.device_id.eq_ignore_ascii_case(device.device_id);
     if !root.activated || !ours {
         bail!(crate::errcode::code("fleet.notCustodian"));
     }
     let cx = custodian(device, state)?;
+    // The deadline is checked at each send's time, not this call's: a wait
+    // for the server may cross it.
+    let past = |s: &FleetCustodyState| {
+        let deadline = s.rotation.as_ref().and_then(|r| r.deadline_ms);
+        deadline.is_some_and(|d| clock() >= d)
+    };
 
     // 1. The server is the one this custody began on; a restore of it is
     // the expiry decision's.
@@ -1651,9 +1669,10 @@ pub async fn rotate_fleet(
         // Only once step 4 saved the deadline: nothing of N+1 is on the
         // server before.
         Some((RotationPhase::Preparing, Some(deadline), saved))
-            if now >= deadline || saved != epoch =>
+            if clock() >= deadline || saved != epoch =>
         {
-            return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+            return expiry_decision(client, access, device, &fleet, clock(), None, state, save)
+                .await;
         }
         Some((RotationPhase::Preparing, ..)) => {}
         _ => {
@@ -1718,6 +1737,9 @@ pub async fn rotate_fleet(
     }
 
     // 5. N+1, now PREPARING.
+    if past(state) {
+        return expiry_decision(client, access, device, &fleet, clock(), None, state, save).await;
+    }
     let create = saved_request(&r.create_request)?;
     let expected = FleetKeyGenerationCreateV2::parse(&create.canonical_payload_bytes)
         .map_err(|_| corrupt())?;
@@ -1745,8 +1767,13 @@ pub async fn rotate_fleet(
     // 6 and 7. A 403 is the server's window check: the expiry decision.
     let sends = r.grant_requests.iter().map(|s| (s, false));
     for (saved, ack) in sends.chain(r.ack_requests.iter().map(|s| (s, true))) {
+        if past(state) {
+            return expiry_decision(client, access, device, &fleet, clock(), None, state, save)
+                .await;
+        }
         match send_grant(client, access, &fleet, r.generation, saved, ack).await {
             Err(e) if refused_with(&e, 403, None) => {
+                let now = clock();
                 return expiry_decision(client, access, device, &fleet, now, Some(e), state, save)
                     .await;
             }
@@ -1756,8 +1783,8 @@ pub async fn rotate_fleet(
 
     // 8 and 9. Activation is due from `issued_at`: refused before it, only
     // a skewed clock can be early.
-    if now >= r.deadline_ms.ok_or_else(corrupt)? {
-        return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+    if clock() >= r.deadline_ms.ok_or_else(corrupt)? {
+        return expiry_decision(client, access, device, &fleet, clock(), None, state, save).await;
     }
     match activate(client, access, &fleet, &r).await {
         Err(e) if refused_with(&e, 409, Some("FLEET_GRANTS_INCOMPLETE")) => {
@@ -2209,7 +2236,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::fleet_keys;
     use shardx_core::mutation::IdempotentStoredResponseV2;
-    use std::sync::atomic::{AtomicU16, AtomicUsize};
+    use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     const DAY_MS: u64 = 86_400_000;
@@ -3086,6 +3113,7 @@ pub(crate) mod tests {
             row,
             sas,
             |_| Ok(Zeroizing::new(FKEK)),
+            |_| Ok(false),
             now,
             &mut state,
             &mut |s| save(s),
@@ -3219,6 +3247,55 @@ pub(crate) mod tests {
                 !reply.to_ascii_lowercase().contains(&body),
                 "the IPC reply leaked the token body as {echoed}"
             );
+        }
+    }
+
+    /// A hex account password is also a well-formed ID: a server that got it
+    /// at login and lists it as a device or account ID is refused before
+    /// state, IPC or a log sees it, in either case.
+    #[test]
+    fn a_listed_id_equal_to_the_account_password_is_refused() {
+        let f = fixture();
+        let rt = runtime();
+        let password = crate::fleet_client::random_id_hex();
+        for (account, echoed) in [
+            (false, password.clone()),
+            (false, password.to_ascii_uppercase()),
+            (true, password.clone()),
+        ] {
+            let (mut row, _) = joiner();
+            if account {
+                row.account_id = echoed;
+            } else {
+                row.device_id = echoed;
+            }
+            let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+                "device_id": row.device_id, "account_id": row.account_id,
+                "status": row.status, "label_hex": row.label_hex,
+                "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+                "signing_public_key": row.signing_public_key,
+                "hpke_public_key": row.hpke_public_key,
+            }] }))
+            .unwrap();
+            let (client, _) = rt.block_on(mock(Arc::new(move |call: &str, _: &[u8]| match call {
+                c if c.ends_with("/devices") => (200, body.clone()),
+                _ => (401, Vec::new()),
+            })));
+            let login = crate::fleet_client::AccountLogin {
+                tenant_id: &f.tenant,
+                username: "owner",
+                password: &password,
+            };
+            // The login is refused, but the server got the password.
+            assert!(rt
+                .block_on(client.server_identity_with_login(&login))
+                .is_err());
+            let err = rt
+                .block_on(client.list_tenant_devices("v2a.access", &f.tenant))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fleet.badReplyCustody"), "{account}: {err}");
+            assert!(!err.to_ascii_lowercase().contains(&password), "{account}");
         }
     }
 
@@ -4378,7 +4455,7 @@ pub(crate) mod tests {
                 f,
                 &CredentialFkekStore,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
         }
@@ -4388,7 +4465,7 @@ pub(crate) mod tests {
             f: &Fixture,
             vault: &dyn FkekStore,
             previous: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
-            now: u64,
+            clock: impl Fn() -> u64,
             save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
         ) -> Result<()> {
             let mut state = load()?;
@@ -4404,7 +4481,7 @@ pub(crate) mod tests {
                 &f.root,
                 &mut ledger,
                 previous,
-                now,
+                clock,
                 &mut state,
                 save,
             ))
@@ -4653,7 +4730,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if failed.insert(kept) {
                         bail!("disk-full")
@@ -4712,7 +4789,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if s.rotation
                         .as_ref()
@@ -4731,7 +4808,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            now,
+            move || now,
             &mut |s| save(s),
         )
         .unwrap();
@@ -4739,7 +4816,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            now,
+            move || now,
             &mut |s| save(s),
         )
         .unwrap();
@@ -4765,7 +4842,7 @@ pub(crate) mod tests {
                 &f,
                 &CredentialFkekStore,
                 |_| bail!(crate::errcode::code("fleet.rotationNeedsFleetKey")),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
             .unwrap_err();
@@ -4872,6 +4949,52 @@ pub(crate) mod tests {
         assert!(rotation_key_held().is_none());
         approve_allowed(&rig, &f);
         start_is_stuck(&mut rig, &f);
+    }
+
+    /// A resume started just before the deadline whose wait for `slow`
+    /// crosses it, the clock moving past it while the server answers: the
+    /// next request after that reply reads ACTIVE, and nothing else is sent.
+    fn a_deadline_crossed_during(slow: &'static str, filed_before: usize) {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/activate", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let deadline = rotation().deadline_ms.unwrap();
+        let clock = Arc::new(AtomicU64::new(deadline - 1));
+        let moved = clock.clone();
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            if call.ends_with(slow) {
+                moved.store(deadline, Ordering::SeqCst);
+            }
+            None
+        }));
+        rig.clear();
+        let err = rig
+            .rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                move || clock.load(Ordering::SeqCst),
+                &mut |s| save(s),
+            )
+            .unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{slow}: {err}");
+        let calls = rig.calls();
+        let slow_at = calls.iter().position(|c| c.ends_with(slow)).unwrap();
+        assert!(
+            calls[slow_at + 1].ends_with("/key-generation"),
+            "{slow}: {calls:?}"
+        );
+        assert!(only_reads(&calls[slow_at + 1..]), "{slow}: {calls:?}");
+        assert_eq!(rig.bodies("/grants").len(), filed_before, "{slow}");
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+    }
+
+    #[test]
+    fn a_deadline_crossed_while_waiting_for_the_server_runs_the_expiry_decision() {
+        a_deadline_crossed_during("/v2/server-identity", 0);
+        a_deadline_crossed_during("/capability-grants", 0);
+        a_deadline_crossed_during("/grants", 1);
     }
 
     #[test]
@@ -5003,7 +5126,7 @@ pub(crate) mod tests {
                 &f,
                 &CredentialFkekStore,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if s.rotation
                         .as_ref()
@@ -5051,7 +5174,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            later,
+            move || later,
             &mut |s| save(s),
         )
         .unwrap();
@@ -5452,7 +5575,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
         };
@@ -5518,6 +5641,7 @@ pub(crate) mod tests {
                 1 => Ok(Zeroizing::new(NEW_FKEK)),
                 _ => bail!("no verified key of generation {generation}"),
             },
+            |key| crate::team::ledger::withdrawn(&rig.db, &f.pin().0, key),
             now_ms(),
             &mut state,
             &mut |s| save(s),
@@ -5617,12 +5741,57 @@ pub(crate) mod tests {
             let err = approve_on(&rig, &f, &row, "").unwrap_err();
             assert!(has(&err, "fleet.deviceNotPending"), "{revoked_here}: {err}");
             assert!(rig.bodies("/grants").is_empty(), "{revoked_here}");
+            assert!(
+                !revoked_here || only_reads(&rig.calls()),
+                "nothing is resent"
+            );
             assert_eq!(
                 load().unwrap().members[&id].grant_request,
                 saved.grant_request,
                 "{revoked_here}"
             );
         }
+    }
+
+    /// A rebuilt N+1 grant saved, then the device revoked before it went out:
+    /// the next resume, ACTIVE now naming the saved grant, sends it nowhere.
+    #[test]
+    fn a_saved_rebuilt_grant_is_not_sent_once_the_device_is_revoked() {
+        let f = fixture();
+        let (rig, row, _) = approval_across_a_rotation(&f, None);
+        let id = row.device_id.to_ascii_lowercase();
+        rig.refuse("/grants", 503, "");
+        assert!(approve_on(&rig, &f, &row, "").is_err());
+        let rebuilt = load().unwrap().members[&id].grant_request.clone();
+        let filing = payload(&rebuilt, FleetKeyGrantCreateV2::parse);
+        assert_eq!(filing.grant.generation.generation, 1);
+        let mut state = load().unwrap();
+        state.revocations.insert(id.clone(), "00".into());
+        save(&state).unwrap();
+        rig.allow();
+        rig.clear();
+        let err = approve_on(&rig, &f, &row, "").unwrap_err();
+        assert!(has(&err, "fleet.deviceNotPending"), "{err}");
+        assert!(only_reads(&rig.calls()), "nothing is resent");
+        assert_eq!(load().unwrap().members[&id].grant_request, rebuilt);
+    }
+
+    /// No member result names the device, but the ledger holds its key
+    /// withdrawn: no N+1 grant is built or sent.
+    #[test]
+    fn an_approval_resumed_after_a_rotation_refuses_a_key_the_ledger_holds_withdrawn() {
+        let f = fixture();
+        let (rig, row, saved) = approval_across_a_rotation(&f, None);
+        let key = decode_hex32(&row.signing_key_id, "signing_key_id").unwrap();
+        crate::team::ledger::distrust_key(&rig.db, &f.pin().0, &key, now_ms()).unwrap();
+        let err = approve_on(&rig, &f, &row, "").unwrap_err();
+        assert!(has(&err, "fleet.deviceNotPending"), "{err}");
+        assert!(only_reads(&rig.calls()), "nothing is resent");
+        let id = row.device_id.to_ascii_lowercase();
+        assert_eq!(
+            load().unwrap().members[&id].grant_request,
+            saved.grant_request
+        );
     }
 
     #[test]

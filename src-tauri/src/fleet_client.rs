@@ -817,9 +817,15 @@ impl FleetClient {
         // the free text left reaches the UI, so a hostile server cannot hand
         // back the bearer it just received through it.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyCustody"));
+        let passwords = self.passwords();
         for d in &mut body.devices {
             for id in [&d.device_id, &d.account_id] {
                 decode_hex16(id, "device").map_err(|_| bad())?;
+                // A hex password is a well-formed ID: an ID is identity, so
+                // one equal to it is refused rather than redacted.
+                if passwords.iter().any(|p| p.eq_ignore_ascii_case(id)) {
+                    return Err(bad());
+                }
             }
             let key = |s: &str| decode_hex32(s, "key").map_err(|_| bad());
             key(&d.signing_key_id)?;
@@ -842,7 +848,6 @@ impl FleetClient {
             }
             (d.signing_key_id, d.hpke_key_id) = ids;
         }
-        let passwords = self.passwords();
         let mut secrets = vec![access_token];
         secrets.extend(passwords.iter().map(|p| p.as_str()));
         Ok(body
@@ -2411,7 +2416,7 @@ pub(crate) mod tests {
 
     /// A loopback team server answering `answer(method and path, JSON body)`
     /// with 200 and its JSON, on `rt`.
-    fn json_server(
+    pub(crate) fn json_server(
         rt: &tokio::runtime::Runtime,
         answer: fn(&str, serde_json::Value) -> serde_json::Value,
     ) -> String {
@@ -2479,7 +2484,7 @@ pub(crate) mod tests {
 
     /// Login, challenge and proof as a v2 server answers them, the proof
     /// finishing with `finish`.
-    fn enrollment(
+    pub(crate) fn enrollment(
         call: &str,
         body: serde_json::Value,
         finish: serde_json::Value,

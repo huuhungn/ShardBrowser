@@ -1474,7 +1474,7 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
             &root,
             &mut ledger,
             |g| Ok(crate::verified_fleet_key(&h.tenant, &pin, &me, g, now)?.unwrap()),
-            now,
+            || now,
             &mut state,
             &mut save,
         )
