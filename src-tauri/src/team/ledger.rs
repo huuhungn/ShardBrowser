@@ -983,7 +983,6 @@ pub fn closure_signers(
 /// server's word. Listings are never concatenated: more than the server's
 /// 64 signers fail closed with `fleet.trustClosureTooLarge` (a multi-listing
 /// closure is v2.11's).
-#[allow(clippy::too_many_arguments)]
 pub async fn closure_evidence(
     client: &FleetClient,
     access: &str,
