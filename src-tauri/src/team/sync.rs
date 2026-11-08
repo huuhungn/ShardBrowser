@@ -11092,6 +11092,10 @@ mod tests {
             asked[1].contains(&key_id_of(&k)),
             "the closure names the walked head's signer"
         );
+        assert!(
+            asked[1].contains(&key_id_of(&w.me.sk)),
+            "the closure names the pinned version 1's signer"
+        );
     }
 
     /// A link at the version above `below`, chained on it.
