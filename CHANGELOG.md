@@ -12,8 +12,8 @@ unchanged.
 - The team server is unchanged: a 2.8.x server works with launcher 2.9.0.
 - After a rotation, export the recovery bundle again. A bundle exported
   before the rotation does not open the newest fleet key.
-- After a rotation, use Pull and push once on every profile the Team page
-  lists under an older key. Devices approved or restored after the rotation
+- After a rotation, use Push once on every profile the Team page lists under
+  an older key. Devices approved or restored after the rotation
   cannot read a head until it is pushed again, and a head left under the old
   key becomes unreadable for every device when the old key's grants end, one
   year after each was issued.
@@ -27,7 +27,9 @@ unchanged.
 - **Rotate fleet key.** The root custodian rotates the team's fleet key from
   the Team page. The new key must be activated within 30 days; an unfinished
   rotation offers Resume fleet key rotation, and approvals wait until it is
-  done. Only snapshots pushed from then on are protected.
+  done. After a rotation expires, Rotate fleet key stays available; it stays
+  stuck only while the team server still holds the unfinished key. Only
+  snapshots pushed from then on are protected.
 - **Banner after a revoke.** While a revoked device still holds the current
   fleet key, the Team page asks to rotate: urgently for a lost device, or one
   whose saved revocation cannot be checked, and when convenient for a retired
@@ -43,9 +45,10 @@ unchanged.
 - **Clear messages for members.** A push or pull refused because the fleet key
   rotated says to press Collect key custody. A device that missed two
   rotations is told to have a custodian revoke it and enroll again.
-- **Profiles still under an older key.** The Team page lists them with Pull and
-  push, which pushes first and pulls only when the server's copy is ahead, so
-  local changes are never pulled over.
+- **Profiles still under an older key.** The Team page lists them with Push,
+  which only pushes. If this device's copy is behind the server, it says to
+  Pull the profile from the profile list first (pulling replaces local changes
+  on this device), then push again.
 - **Export the recovery bundle again.** After a rotation the Team page prompts
   the root custodian to export the recovery bundle again.
 - **Revoke confirmation.** The revoke confirmation now says that the device
@@ -60,6 +63,14 @@ unchanged.
   identity as revoked.
 - **Hex keys.** A stored hex key with non-ASCII characters is refused with an
   error instead of crashing the launcher.
+- **Resumed approvals across a rotation.** An approval resumed across a
+  rotation never resends anything for a device revoked on this device, or
+  whose signing key the trust ledger records as withdrawn.
+- **Account password in a server listing.** A device or account ID in a server
+  listing that equals the account password is refused, and is never logged or
+  saved.
+- **Rotation deadline.** The rotation checks its 30-day deadline again after
+  each wait on the team server.
 
 ### Known limitations
 
@@ -119,6 +130,9 @@ unchanged.
   rotation (expired approval, changed keys, no signed approval) must be
   revoked and enroll again, as before. A member already granted in an earlier
   run may show as skipped when a resumed run finds it no longer eligible.
+- **Re-export prompt.** The prompt to export the recovery bundle again can stay
+  after an export that finished while another custody action was running.
+  Exporting again clears it.
 - **Server restore.** A server restore after a rotation is not covered by a
   test.
 - **Reset of a pending device.** Credentials left by a Reset of a pending

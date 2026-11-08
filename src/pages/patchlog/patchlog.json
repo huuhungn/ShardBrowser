@@ -15,7 +15,7 @@
           "blocks": [
             {
               "type": "p",
-              "text": "Rotate fleet key makes a new fleet key and grants it automatically to every device with a signed approval; revoked devices get nothing. A device that is offline collects it later with Collect key custody. The new key must be activated within 30 days, an unfinished rotation offers Resume fleet key rotation, and approvals wait until it is done."
+              "text": "Rotate fleet key makes a new fleet key and grants it automatically to every device with a signed approval; revoked devices get nothing. A device that is offline collects it later with Collect key custody. The new key must be activated within 30 days, an unfinished rotation offers Resume fleet key rotation, and approvals wait until it is done. After a rotation expires, Rotate fleet key stays available; it stays stuck only while the team server still holds the unfinished key."
             },
             {
               "type": "p",
@@ -23,7 +23,7 @@
             },
             {
               "type": "note",
-              "text": "After a rotation, export the recovery bundle again (the Team page reminds you) and use Pull and push once on every profile listed under an older key. Finish a rotation before going back to 2.8.x. The team server does not need an update."
+              "text": "After a rotation, export the recovery bundle again (the Team page reminds you) and use Push once on every profile listed under an older key. Finish a rotation before going back to 2.8.x. The team server does not need an update."
             }
           ]
         },
@@ -40,7 +40,7 @@
             },
             {
               "type": "p",
-              "text": "The Team page lists the profiles still under an older key, with Pull and push: it pushes first and pulls only when the server copy is ahead, so local changes are never pulled over. Members whose key rotated see a message to press Collect key custody, and a device that missed two rotations is told to enroll again."
+              "text": "The Team page lists the profiles still under an older key, with Push, which only pushes. If this device's copy is behind the server, it says to Pull the profile from the profile list first (pulling replaces local changes on this device), then push again. Members whose key rotated see a message to press Collect key custody, and a device that missed two rotations is told to enroll again."
             }
           ]
         },
@@ -54,6 +54,10 @@
             {
               "type": "p",
               "text": "The revoke confirmation now says the device keeps the fleet key it holds until you rotate it. A team state file whose existence cannot be checked is an error instead of a missing file. After a device enrolls again, the saved credentials of its revoked old identity are forgotten. A stored hex key with non-ASCII characters is refused with an error instead of crashing the launcher."
+            },
+            {
+              "type": "p",
+              "text": "An approval resumed across a rotation never resends anything for a device revoked on this device, or whose signing key the trust ledger records as withdrawn. A device or account ID in a server listing that equals the account password is refused, and is never logged or saved. The rotation checks its 30-day deadline again after each wait on the team server."
             }
           ]
         }
