@@ -136,6 +136,22 @@ The v0.2.3 slice (release v2.9.0) rotates the fleet key with no server change; r
 | **Q-50 `compromised` revoke reason** (Q-18) | **Not offered yet.** Revoke reasons stay `retired` and `lost`, so the Q-18 freeze cannot be started from the UI in v2.9.0 (v2.10 follow-up) | none |
 | **Q-51 Scope of the rotating custodian's `key.rotate`** (D-2) | **Fleet scope, one grant per rotation**, filed for this device and saved in the rotation state (sequence K step 2). Deliberate: fleet scope is what the rotation create and the ledger's activation check ask for; v2.10 root rotation needs a tenant-scoped grant (`server/src/routes/v2_root.rs:514`) and files its own. Cost: each Start retried on a stuck fleet (Q-49) files one more `key.rotate` grant. Test `the_rotate_capability_grant_is_key_rotate_on_this_fleet_for_this_device` (confirmed in R1-R4) | none |
 
+### Decided on 2026-11-09 (v2.10 hand-over slice)
+
+The owner decided on 2026-11-09 that v2.10 is launcher-only, with no server change: bulk re-seal, root self-renewal at half-life, `compromised` for member devices, and moving root custody to a new device row. Root key rotation and one batched server update follow in v2.11. Steps cite the hand-over sequence H (D-5, "Root custody hand-over"). A test named here is planned in the slice's stories U1 to U7 and is confirmed when its story merges.
+
+**Re-sequenced again.** Root key rotation, a server-side discard of a stuck PREPARING generation (an offline server command run with the server stopped, owner decision 2026-11-09; not an online route), and renewal of other devices' records (D-6 renewal step 2) move to v2.11. Every earlier "v2.10" in this ADR that names one of them now reads v2.11: root rotation in Q-18 (and its stalled-rotation rule), Q-51, D-5 "Re-sequenced" and the stolen-key note under "Anchor loss"; the discard route in Q-24, Q-49 and D-9 "Limits in v2.9.0"; Q-28 relies on that route too. The 'discard route' in Q-24, Q-49 and D-9 reads as that command. The v2.10 items that earlier rows defer are delivered here: bulk re-seal (Q-46 and the freshness amendment) is Q-54, and `compromised` (Q-50) is Q-57 for member rows only.
+
+| Choice | Decision | Plan lines |
+|---|---|---|
+| **Q-52 Current own root grant** (D-5, trust chain) | **Keep the current own root grant beside the bootstrap state.** `BootstrapState` gains `root_grant` and `root_grant_issuer` (the issuer's public signing key). Every custody path reads the current grant through one check (`current_root_grant`): own fleet grants, Rotate, Export, Import, the bundle fingerprint and the anchor gate of Devices, Rotate and Export. The check verifies the grant under its issuer key and refuses a grant to another key. Until a renewal (Q-55) or a hand-over (Q-56) replaces it, the current grant is the first self-grant, so a 2.9.0 state reads unchanged. Export takes `bootstrap_anchor_signing_key_id` from the saved anchor, not from the custodian's own key, and the header's root generation from the grant. A 2.9.x launcher ignores the new fields, and its own-grant check fails closed for a custodian that is not the anchor. Tests `the_current_root_grant_refuses_a_grant_to_another_key`, `export_again_succeeds_for_a_custodian_of_root_generation_1`, `rotate_fleet_files_its_recovery_grant_under_root_generation_1`, `the_v4_bundle_names_the_saved_anchor_not_the_custodian`, `a_root_state_with_a_current_grant_never_prints_it` (confirmed in U4). Rejected: a separate `root_custody.json` (two files every gate reads); team DB rows (a schema migration) | none |
+| **Q-53 Recovery bundle plaintext v4** (D-5) | **v4 carries the current root grant and its issuer.** Format in D-5, "Amendment: plaintext v4". Offline, the grant must verify under the bundle's issuer key, name the header's tenant, instance, `root_key_id` and `root_generation` and this subject, and open with `hpke_key_seed` to the bundle's TRK. Online, at import, fresh trust evidence evaluated to the pinned anchor (or the bundle's anchor when nothing is pinned) must count the subject key as a custodian now (`recovery.rootGrantIssuerNotCustodian` otherwise), and the server's read-back must match. While Q-58 branch A is in force, that evaluation goes through the closure evaluation. **Version written:** v3 while the current grant is the first self-grant, v4 otherwise; readers open v2, v3 and v4, dispatching on `domain`. 2.9.x cannot open a v4 bundle. Tests `a_v4_golden_vector_reads_back_exactly`, `a_v4_bundle_whose_grant_names_another_subject_is_refused`, `a_v4_self_issued_existing_grant_opens`, `a_v3_bundle_still_opens_and_a_v4_domain_takes_only_version_4`, `a_v4_bundle_of_a_non_anchor_custodian_opens_and_imports`, `a_v4_bundle_whose_issuer_is_not_a_custodian_is_refused`, `a_v4_bundle_of_a_handed_over_custodian_imports_after_the_issuer_is_revoked`, `export_writes_v3_while_the_first_self_grant_is_current` (confirmed in U4). Rejected: carrying evidence pages in the bundle (large and stale); keeping v3 (invalid after a hand-over: the new custodian is not the anchor and holds no `FirstRootSelfGrant`); always writing v4 (2.9.x could then read no 2.10 export) | none (amends this ADR's D-5 v3 amendment: the v3 subject check applies to v3 only) |
+| **Q-54 Bulk re-seal** (amends Q-46, D-9) | **One owner-triggered "Re-seal all profiles" on the root custodian** (`team_reseal_all`, under the custody lock). It re-seals every listed head that is under a generation below ACTIVE or, during a hand-over, signed by the outgoing custodian (sequence H step 5). The head's ciphertext is opened with the key that reads it and sealed under the verified ACTIVE key through the sync operations journal, signed by this custodian, committed once and pinned, with no profile folder and no restore. A profile not bound here gets a temporary `reseal:` binding row, which statuses, labels, Join, downgrade readiness and the older-key list never show, and which the run removes at its end. If the U1 spike shows that a head cannot be re-sealed from its ciphertext, the run joins the profile into a staging folder and pushes it instead, with the same outcomes. **Skips, listed:** a profile in use (running, leased, dirty or behind), in error, quarantined, or under a generation this device does not hold. A run never closes an open run of withdrawn heads, and never re-seals a head it did not accept. The outcome is saved before each step, so a resumed run never commits twice for one profile. A Q-18 block refuses the run. Lazy re-seal (Q-46) stays as it is; retained snapshots below the heads are never rewritten (L2494). **Cost:** every re-sealed profile moves up one version, so a member with unpushed changes must Pull first, which replaces those changes. Tests `a_reseal_moves_every_listed_head_to_the_active_generation_signed_by_the_custodian`, `a_reseal_needs_no_profile_folder`, `a_reseal_never_closes_an_open_run`, `a_reseal_crash_after_commit_resumes_without_a_second_commit`, `a_head_signed_by_the_outgoing_custodian_is_resealed_even_under_the_active_generation`, `reseal_rows_are_absent_from_statuses_labels_downgrade_readiness_and_the_older_key_list`, real server `reseal_all_moves_every_head_and_a_new_device_reads_them_against_a_real_server` (confirmed in U3) | none (L2494 unchanged: only heads are re-sealed) |
+| **Q-55 Root self-renewal** (amends D-6 renewal step 1 and "Clocks") | **The root custodian renews its own records at half-life, on the server's clock.** Order: its capability grants (365 days), then a self-approval (730 days), then an `ExistingRootGrant` to itself for the ACTIVE root, linking that approval (730 days), then `ROOT_GRANT_ACK`, then its own `DeviceHpkeGrant` of the ACTIVE fleet generation (365 days) and a verified collect of it. Times: `T = min(local now, server_now_ms) - CLOCK_SKEW_MS`, where `server_now_ms` comes from the trust-evidence page fetched in the same step, not from `GET /v2/me`. A record is due when `T >= not_before_ms + (not_after_ms - not_before_ms) / 2`. The approval and the root grant run `not_before_ms = T` to exactly `T + 730 days`, the server's cap (`MAX_DEVICE_APPROVAL_TTL_MS`; the server refuses anything longer). Each request is built once, saved and resent byte-identical. **Triggers:** the first step of every custodian command with a session; a best-effort step after every sync command with a session, which checks due-ness from local records first, fetches evidence only when a record is due or within the clock-skew margin, and never changes that command's result; a "Renew custody" action; warnings at 75%. Renewal is skipped while the custody lock is busy, and never runs on a custodian that handed custody over (Q-56). **Lapse:** `fleet.custodyLapsed` only when the chain evaluated at `server_now_ms` no longer counts this device as a custodian and a filing returns 403; any other 403 is returned as it is. Renewing other devices' records waits for v2.11, which needs the server change in D-6 renewal step 3. Tests `a_due_custodian_renews_capabilities_approval_root_grant_and_device_grant_in_order`, `a_renewal_takes_its_times_from_the_servers_clock`, `a_fast_local_clock_never_declares_a_lapse`, `a_730_day_renewal_window_is_exactly_the_server_cap`, `a_renewal_crosses_the_old_expiry_with_no_gap`, `a_failed_renewal_never_fails_the_push`, `a_member_offline_past_the_old_root_grant_end_refuses_the_self_renewal` (characterizes sticky lapse, D-6 (b)), real server `the_root_custodian_renews_itself_and_keeps_custody_against_a_real_server` (confirmed in U5). Rejected: a background timer (it would need the stored password); manual renewal only | none (within L406-L408) |
+| **Q-56 Root custody hand-over** (D-5, D-6 step 5) | **Custody moves to a newly joined device in the order of sequence H (D-5).** The old root approves the new device "as root custodian" (step 1), which needs every listed head under ACTIVE first (`fleet.handoverNeedsReseal`). The new device accepts only a root grant its own chain counts (step 2, `fleet.handoverIssuerNotCustodian`). It exports a v4 bundle before it may rotate (step 3), rotates without granting N+1 to the outgoing custodian (step 4), re-seals (step 5, Q-54) and exports again (step 6). Only then, and only while Q-58 branch A is in force, it revokes the old root as `retired` or `lost` behind a live readiness check run on every send (step 7). The old root refuses every custody action once it appointed (`fleet.custodyHandedOver`), and may cancel only before the new device rotates (`fleet.handoverPastRotation`). One hand-over runs at a time. **Departure from owner decision 2 ("then reset"):** a revoked device cannot open a session to read its own signed revocation, and Reset on the server's unsigned listing is refused, so in v2.10 the old machine stays inert, still holding its seeds; Reset and a wipe come in v2.11 in both branches (step 8). **B's own grant of N** (step 2) depends on gate G3 (U1): if the server refuses it, B keeps only A's grant of N and loses N at the revoke, a cost then recorded with the Known limitations. **Q-26 at the revoke:** every device that counts the old root's revocation drops the fleet keys that the old root's grants delivered. Re-sealed heads, later pushes and the new custodian's own grant of N stay readable; snapshots below the heads under those generations do not. Tests `appoint_refuses_while_a_head_is_under_a_retired_generation`, `accept_refuses_a_root_grant_the_chain_does_not_count`, `accept_builds_its_own_grant_of_n_only_after_collecting_n`, `rotate_is_refused_before_the_first_v4_export`, `the_new_custodians_rotation_skips_the_outgoing_custodian`, `revoking_the_appointee_after_its_rotation_is_refused`, `the_old_root_stays_inert_after_the_hand_over`; branch A `the_old_root_revoke_is_refused_until_every_head_is_resealed`, `a_lost_old_root_that_keeps_pushing_after_the_reseal_can_be_revoked`, `a_saved_old_root_revocation_rechecks_readiness_on_resend`, `after_the_old_roots_revoke_the_new_custodian_still_reads_generation_n`; branch B `the_checklist_stops_before_revoking_the_old_root_until_v2_11`; real server `root_custody_moves_to_a_new_device_and_the_team_keeps_every_profile_against_a_real_server` (confirmed in U6, U7). Rejected: rotating the root first (a server change, v2.11); promoting an existing member (needs approval renewal of an active device, a server change); re-keying on the same machine; a free cancel (strands the fleet once only the new device holds N+1, Q-26); Reset on the unsigned listing (a hostile server could make the root reset itself) | none (follows D-6 renewal step 5, re-key) |
+| **Q-57 `compromised` for member devices** (amends Q-50; Q-18) | **Offered for rows that are not custodians.** Revoke offers `retired`, `lost` and `compromised` for a member row. It refuses `compromised` before anything is sent when fresh evidence evaluated to the pin counts the row's key as a custodian, and always for this device and for an outgoing custodian. The UI does not offer it on a custodian row. A counted `compromised` revocation starts the Q-18 block on every generation the device held, until a rotation and a collect. Tests `revoke_reason_accepts_compromised`, `a_compromised_revoke_of_a_custodian_row_is_refused_before_anything_is_sent`, `a_member_revoked_as_compromised_blocks_pushes_until_a_rotation_and_collect`, `the_old_root_revoke_refuses_compromised` (branch A) (confirmed in U2, U6). `compromised` for a custodian row waits for v2.11 root rotation, the only rotation that lifts a root-level block | none |
+| **Q-58 Member trust after a custodian revocation** (trust chain, rule 1 and "Order"; Q-19) | **A closure evaluation, fired only when a custodian key's revocation would be counted.** Without it, a device that counts the old root's revocation drops every member approval the old root issued that it first sees afterwards (sticky proven revocation; containers first seen before the count, or in the counting evaluation itself, keep their standing). A device joining after the revoke, an imported custodian, or a member that never walked a peer would then distrust members' heads, and the next rotation would grant no old member. **Rule:** the client first evaluates the unscoped evidence without recording it. If that evaluation would count a `DeviceRevocationV2`, not yet counted, of a key that ever held custody (a root grant subject), the client instead makes **one** evidence request that names every known device signer. Those are the subjects of every `DeviceHpkeGrant` in the unscoped evidence, the listed rows on a custodian session, the signers of every local binding's pinned head, and, when a walk triggered the closure, the signers of the heads being walked. It evaluates and records that single complete listing, so every member approval is first seen in the counting evaluation. Pages are never concatenated. The ledger enforces it: recording refuses to count such a revocation outside a closure listing. A fleet key opened in that evaluation keeps that listing as its stored evidence. A first evaluation with no such revocation needs no closure. **Limits:** at most 64 named signers per request, so a larger closure fails closed (`fleet.trustClosureTooLarge`, nothing recorded) and that device stays blocked until v2.11's multi-listing helper. A member the server omits from the evidence is distrusted and must enroll again (a denial of service only, the C-1 bound). A member still on 2.9.x when the old root is revoked distrusts peers it has not seen and must enroll again. Each closure logs a `[closure]` line with the signer count and no key material. **Branches (gate G6, decided in U1b):** **branch A**, G6 passes: the closure ships, and sequence H step 7 (revoking the old root) ships with it. **Branch B**, G6 cannot be met without a server change: the probes merge ignored with the reason, no closure ships, Accept uses a plain ledger evaluation, the hand-over ends after step 6, and the old root stays an active custodian row, switched off, until v2.11 lets the new custodian re-approve members (`team.handover.revokeInV211`). In both branches the old machine's Reset is v2.11 (Q-56). **Branch in force:** set by U1b; until it merges, neither the closure nor the revoke of an old root ships. Tests `a_device_first_evaluating_after_the_old_roots_revocation_trusts_a_members_head`, `a_device_that_counted_the_old_roots_revocation_accepts_a_member_approval_it_first_sees_later`, `a_rotation_after_the_hand_over_grants_every_pre_hand_over_member`, `the_closure_evaluates_one_named_signer_listing`, `more_than_64_closure_signers_fail_closed`, `a_first_evaluation_without_a_custodian_revocation_needs_no_closure`, `record_refuses_to_count_a_custodian_revocation_outside_a_closure`, `a_walk_that_triggers_the_closure_still_verifies_its_new_heads`, `a_member_the_server_omits_from_the_closure_is_untrusted`, real server `members_stay_trusted_by_a_device_that_joins_after_a_custodian_revocation_against_a_real_server` (confirmed in U1b). Rejected: accepting the cutoff; exempting containers issued before the revocation's `issued_at_ms` (Q-19 (A) rejects an `issued_at` cutoff, because the issuer chooses it) | none (uses the existing "Order" rule; Q-19 (A) unchanged) |
+
 ### Rows (approved by the user on 2026-10-25)
 
 | Item | Approved choice | Plan lines | Depends on |
@@ -1063,6 +1079,40 @@ opens with `hpke_key_seed` to the bundle's TRK. Bootstrap step 3 reuses a
 saved, unpinned bundle only when it is v3 and names this device; otherwise it
 exports again.
 
+**Amendment: plaintext v4 carries the current root grant (decided 2026-11-09;
+v2.10 hand-over slice, Q-52, Q-53).** A root custodian whose current root
+grant is not its first self-grant (after a renewal, Q-55, or a hand-over,
+Q-56) writes plaintext v4; while the current grant is the first self-grant it
+keeps writing v3. The header and the file format stay v2.
+
+```text
+RecoveryBundlePlaintextV4 (closed map) = RecoveryBundlePlaintextV2 with
+  domain           tstr  "shardx.recovery.bundle-plaintext.v4"
+  version          U16   4
+  root_custodian   closed map
+    account_id                    Uuid16
+    device_id                     Uuid16
+    signing_key_seed              Bytes(32,32)    Ed25519 seed of the root custodian device
+    hpke_key_seed                 Bytes(32,32)    HPKE IKM of that device
+    root_grant                    Bytes(1,131072) exact current root grant container
+    root_grant_issuer_public_key  Bytes(32,32)    Ed25519 public key that signed it
+```
+
+The v4 domain must carry this `root_custodian` and takes only version 4. The
+subject need not be the anchor; `bootstrap_anchor_signing_key_id` stays the
+tenant's pinned anchor `A0`. After decrypt, a v4 bundle is refused unless
+`root_grant` verifies under `root_grant_issuer_public_key`, names the header's
+tenant, instance, `root_key_id` and `root_generation` with this subject
+account, device and signing key, and opens with `hpke_key_seed` to the
+bundle's TRK. The offline check cannot show that the issuer was a custodian,
+so import also evaluates fresh trust evidence to the pinned anchor (or to the
+bundle's anchor when this device pins none) and requires the subject key to
+count as a custodian now (`recovery.rootGrantIssuerNotCustodian`), before it
+reads the server's row back as for v3. A v4 bundle therefore still imports
+after its issuer was revoked, as long as the chain counted the grant (test
+`a_v4_bundle_of_a_handed_over_custodian_imports_after_the_issuer_is_revoked`,
+confirmed in U4).
+
 Exposure, accepted by the owner: a v3 bundle plus its passphrase **is** the
 root custodian device. The account password is not a separate factor (one
 owner account per tenant, no password change in v2). Rotating the TRK or a
@@ -1080,6 +1130,92 @@ fleet rotation only (D-9, sequence K). Fleet rotation does not cut off a stolen
 root machine or a leaked v3 bundle: both are the root custodian, which opens
 the N+1 `RecoveryGrant` under the TRK (sequence K step 4 wraps it under the
 ACTIVE root).
+
+**Amended 2026-11-09 (v2.10 hand-over slice, Q-55, Q-56, Q-58).** The custody
+move ships in v2.10 without root rotation, which moves to v2.11. Two things
+follow:
+- Renewal (Q-55) keeps the root row's records running past 365 days, so the
+  hand-over is the way to end that row's custody.
+- The cut-off the hand-over gives is **server-enforced until v2.11**. The TRK
+  is unchanged, and trust evidence serves every `RecoveryGrant` to any device
+  session. Until its row is revoked, the old root, holding the TRK, can open
+  every fleet key, N+1 included, even though the new custodian's rotation
+  files no N+1 device grant to it (sequence H step 4). Once the row is
+  revoked, the server refuses its sessions and every bundle naming it
+  (`recovery.deviceNotActive`). Anyone holding the old TRK and server data (a
+  hostile server, a copy of the database) can still open every fleet key until
+  v2.11 rotates the root.
+
+In Q-58 branch B the old row is not revoked in v2.10: it stays a root
+custodian until v2.11, and its machine and every bundle it exported must be
+kept offline.
+
+**Root custody hand-over: sequence H (decided 2026-11-09; v2.10 hand-over slice, Q-56).**
+
+A is the root custodian (`A0`, or a later custodian), B a device that enrolled
+and joined normally and pinned `A0` by its join code (Q-12). The fleet has
+ACTIVE generation N, and no other hand-over is in progress. Every request is
+built once, saved before it is sent and resent byte-identical, so every step
+resumes after a crash.
+
+1. **A: Appoint** ("Approve as root custodian", under the custody lock).
+   Refused with `fleet.handoverNeedsReseal` unless A's last re-seal run
+   (Q-54) finished for the ACTIVE generation and a live check shows every
+   listed head under ACTIVE, because B can never hold a retired generation.
+   After the usual code, key and window checks, A files a tenant-scoped
+   approval (Q-22), an `ExistingRootGrant` of the ACTIVE root (sealed to B's
+   listed HPKE key and linked to that approval), both running exactly 730
+   days from the Q-55 clock (`not_before_ms = min(local now, server_now_ms) -
+   CLOCK_SKEW_MS`), and B's fleet grant of N. A files no profile capability grants for B;
+   B issues its own as a custodian. Once the root grant is filed, A records the
+   hand-over. From then on A refuses Approve, Rotate, Re-seal, Export and
+   renewal (`fleet.custodyHandedOver`). A may still revoke B, which cancels the
+   hand-over, but only while the server's ACTIVE generation is at most N and
+   it lists no PREPARING generation created after the appointment
+   (`fleet.handoverPastRotation`).
+2. **B: Accept.** B saves its requests before the first send. It fetches its
+   root grant, evaluates trust evidence to its pin (through the closure
+   evaluation in Q-58 branch A, a plain ledger evaluation in branch B), and
+   requires the grant to be counted for its key, to name its keys and to open
+   to the TRK (`fleet.handoverIssuerNotCustodian`). Then it acks, writes its
+   root state (anchor still the pinned `A0`, the current root grant and its
+   issuer, Q-52), files its own capability grants and collects A's grant of N
+   verified. Only after that collect does it build, file, ack and collect its
+   own `DeviceHpkeGrant` of N, so its key of N survives Q-26 when A is revoked.
+3. **B: Export a v4 bundle** (Q-53). Rotate stays refused until this export
+   exists, so a lost B can be restored from it.
+4. **B: Rotate the fleet key** to N+1 (sequence K). The member grant step
+   skips A (`skipped:outgoing-custodian`), so an unmodified A receives no N+1
+   device grant; its pushes under N then fail with 409. From here A's cancel
+   is refused.
+5. **B: Re-seal all profiles** (Q-54) with A as the outgoing custodian, so a
+   head A signed is re-sealed even when it is already under N+1.
+6. **B: Export the v4 bundle again**, now holding N+1.
+7. **Q-58 branch A only. B: Revoke A** as `retired` or `lost`; `compromised`
+   is refused (Q-57). Before the first send and before every resend, B checks
+   steps 3 to 6 for the current ACTIVE generation and runs a live readiness
+   check over the server's listing, its own bindings and the re-seal run.
+   `retired` needs zero blockers. `lost` may proceed when every blocker is a
+   head A signed at a version above the one the re-seal committed for that
+   profile, and only when the user confirms that exact list; right after the
+   revoke, B reverts each listed profile. A refusal is
+   `fleet.handoverNotReady` with the missing step or the blocking profiles. A
+   resend whose outgoing row already reads revoked only fetches the stored
+   reply (a lost reply). The confirm states that every member must run 2.10
+   and have synced once since the hand-over began.
+8. **A stays inert; Reset in v2.11 (both branches).** A revoked device cannot
+   open a session, so it cannot read its own signed revocation, and Reset on
+   the server's unsigned listing is refused. A keeps refusing Reset (it holds
+   root state) and every custody command, and the Team page says it was handed
+   over and can be switched off. A cancelled appointee stays inert the same
+   way.
+
+**Consequences.** At step 7, Q-26 withdraws on every device that counts A's
+revocation the fleet keys A's grants delivered. Heads re-sealed in step 5,
+later pushes and B's own grant of N stay readable; snapshots below the heads
+under those generations do not. Every bundle A exported stops working at
+step 7 (`recovery.deviceNotActive`). In branch B, steps 1 to 6 run, A's row stays
+active and must be kept switched off, and the revoke waits for v2.11.
 
 **Fallback encrypted key file (new; for W7/G2-48; own header per round-2 minor 5).**
 `<config_root>/team-sync/keys-fallback.bin` is one closed canonical map with the
@@ -1201,6 +1337,23 @@ once `now >= not_before_ms + (not_after_ms - not_before_ms) / 2`.
 - Acceptance needs no extra rule: `not_before_ms <= server_now` is already L408.
 - Clients take `issued_at_ms` and `not_before_ms` from the server clock, through an additive `server_now_ms` field in `GET /v2/me` (new; L1123 lists the endpoint without a body).
 - Client-side window checks use the local clock with a 300 s tolerance (new).
+
+**Amended 2026-11-09 (v2.10 hand-over slice, Q-55, Q-56).**
+- **Step 1** runs on the root custodian in the order of Q-55: capability
+  grants, self-approval, `ExistingRootGrant` to itself and its ack, then its
+  own `DeviceHpkeGrant` of the ACTIVE fleet generation and a verified collect.
+  The approval and the root grant run exactly 730 days. Steps 2 and 3
+  (renewing other devices) wait for the v2.11 server change.
+- **Clocks for renewal** come from the trust-evidence page fetched in the same
+  step (`server_now_ms`), as `min(local now, server_now_ms) - CLOCK_SKEW_MS`.
+  A lapse is declared only when the chain evaluated at `server_now_ms` and a
+  403 from a filing agree, never on the local clock alone.
+- **Step 5 (re-key) is the root custody hand-over**, sequence H (D-5): the
+  fresh key pair enrolls and joins as a new device, the old custodian
+  appoints it, and the old row is revoked only
+  after the new custodian rotated, re-sealed and exported (Q-58 branch A; in
+  branch B the revoke waits for v2.11). A root custodian's key age therefore
+  restarts with the hand-over.
 
 ### Exposure of a stolen key (honest bound; round-2 B4)
 
@@ -1779,7 +1932,7 @@ display  = 32 lowercase hex digits in 8 groups of 4
   - reported revocations cut it off sooner.
 
   A server-supplied "new anchor" is never accepted.
-- **Suspected stolen custodian key, server trusted.** Revoke the device (Q-13), rotate the root and the affected fleets (D-5, D-9), and distrust the key on every device (D-6 (d)). Root rotation arrives in v2.10; until then a fleet rotation alone does not cut off a stolen custodian key (D-5, "Re-sequenced").
+- **Suspected stolen custodian key, server trusted.** Revoke the device (Q-13), rotate the root and the affected fleets (D-5, D-9), and distrust the key on every device (D-6 (d)). Root rotation arrives in v2.10; until then a fleet rotation alone does not cut off a stolen custodian key (D-5, "Re-sequenced"). For a suspected stolen **root** custodian, use the hand-over, sequence H (D-5): the server refuses to revoke the last custodian of the ACTIVE root, so a new custodian must hold custody before the old row can be revoked.
 - **Suspected stolen custodian key, server distrusted.** Distrust the key on every device. If the server cannot be trusted afterwards, abandon the tenant and recover through Q-14.
 - **Every device lost, or every custodian lapsed.** The plan offers no way back into the old tenant:
   - `FirstRootSelfGrant` is one-time (L1073);
