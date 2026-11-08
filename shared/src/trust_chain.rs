@@ -1503,6 +1503,27 @@ mod tests {
         assert!(!c.reported_revoked_at(&m.key(), T0 + 50 * DAY));
     }
 
+    /// v2.10 U1 gate G1 (hand-over): a device without history whose first
+    /// evidence already holds the old root's revocation still counts the
+    /// custodian A0 appointed before it, and B's approval from A0 still holds.
+    #[test]
+    fn a_device_without_history_counts_a_custodian_appointed_before_the_old_root_was_revoked() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let mut p = page(&[&a0, &b], tenant(&a0, &b));
+        p.device_revocations.push(RevokedDevice {
+            device_id: a0.id,
+            revoked_at_ms: T0 + 10 * DAY,
+        });
+        let c = chain(p).unwrap();
+        let later = T0 + 50 * DAY;
+        assert!(
+            !c.custodian_now(&a0.key(), later),
+            "the old root is cut off"
+        );
+        assert!(c.custodian_now(&b.key(), later), "B keeps its custody");
+        assert!(c.approval_valid_at(&b.key(), Scope::Tenant, later));
+    }
+
     /// Rule 6: a key's device is the one its approval from an allowed issuer
     /// names, never another device nor one only a self-approval names.
     #[test]
