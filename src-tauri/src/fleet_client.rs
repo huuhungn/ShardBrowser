@@ -2411,7 +2411,7 @@ pub(crate) mod tests {
 
     /// A loopback team server answering `answer(method and path, JSON body)`
     /// with 200 and its JSON, on `rt`.
-    fn json_server(
+    pub(crate) fn json_server(
         rt: &tokio::runtime::Runtime,
         answer: fn(&str, serde_json::Value) -> serde_json::Value,
     ) -> String {
@@ -2479,7 +2479,7 @@ pub(crate) mod tests {
 
     /// Login, challenge and proof as a v2 server answers them, the proof
     /// finishing with `finish`.
-    fn enrollment(
+    pub(crate) fn enrollment(
         call: &str,
         body: serde_json::Value,
         finish: serde_json::Value,

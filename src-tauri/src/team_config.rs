@@ -394,12 +394,9 @@ pub fn status() -> Result<TeamStatus> {
 }
 
 fn decode_hex32(s: &str) -> Result<[u8; 32]> {
-    anyhow::ensure!(s.len() == 64, "expected 64 hex characters");
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)?;
-    }
-    Ok(out)
+    crate::fleet_client::decode_hex(s)
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("expected 64 hex characters"))
 }
 
 #[cfg(test)]
@@ -818,5 +815,18 @@ mod tests {
         );
         assert!(saved.signing_key_seed.is_empty() && !saved.signing_credential_ref.is_empty());
         assert_eq!(saved.hpke_seed().unwrap(), [0x22; 32]);
+    }
+
+    /// v2.8.1 nit 4: a seed with a multi-byte character is refused, never
+    /// sliced inside the character.
+    #[test]
+    fn decode_hex32_refuses_non_ascii_without_panicking() {
+        let tainted = format!("\u{20ac}{}", "a".repeat(61));
+        assert_eq!(tainted.len(), 64);
+        for s in [tainted.as_str(), "+f"] {
+            std::panic::catch_unwind(|| decode_hex32(s))
+                .expect("decode_hex32 panicked")
+                .unwrap_err();
+        }
     }
 }
