@@ -667,6 +667,23 @@ impl FleetClient {
         .await
     }
 
+    /// Files an `ExistingRootGrant` or `RotationGrant` of root `generation`.
+    /// Returns the exact stored response.
+    pub async fn file_root_grant(
+        &self,
+        access_token: &str,
+        tenant_id: &str,
+        generation: u64,
+        request: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.post_cbor(
+            &format!("/v2/tenants/{tenant_id}/root-key-generations/{generation}/grants"),
+            access_token,
+            request,
+        )
+        .await
+    }
+
     /// Reads one root grant back as its exact `TenantRootGrantDescriptorV2`.
     pub async fn read_root_grant(
         &self,

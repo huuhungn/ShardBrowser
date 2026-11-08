@@ -254,7 +254,10 @@ fn release_fkek(
 /// This custodian's own operating grants (plan OQ5): `fleet.manage` and the
 /// profile capabilities on the fleet, device approval and revocation
 /// tenant-wide.
-fn own_grants(cx: &Context16, fleet: [u8; 16]) -> [(Capability, CapabilityScopeKind, [u8; 16]); 6] {
+pub(crate) fn own_grants(
+    cx: &Context16,
+    fleet: [u8; 16],
+) -> [(Capability, CapabilityScopeKind, [u8; 16]); 6] {
     use CapabilityScopeKind::{Fleet, Tenant};
     [
         (Capability::FleetManage, Fleet, fleet),
@@ -267,7 +270,7 @@ fn own_grants(cx: &Context16, fleet: [u8; 16]) -> [(Capability, CapabilityScopeK
 }
 
 /// The capability grants `list` names for `subject`, signed by `signer`.
-fn capability_grants(
+pub(crate) fn capability_grants(
     cx: &Context16,
     signer: &Ed25519SigningKey,
     subject: &GrantSubject,
@@ -1032,7 +1035,7 @@ fn build_member(
 /// The request filing the `DeviceHpkeGrant` of `fkek` as `generation` of
 /// this custodian's fleet for `(account, device)` under `(signing, hpke)`,
 /// sealed to the HPKE key `hpke_pk`.
-fn member_grant(
+pub(crate) fn member_grant(
     cx: &Context16,
     signer: &Ed25519SigningKey,
     (account, device): ([u8; 16], [u8; 16]),
@@ -4713,6 +4716,103 @@ pub(crate) mod tests {
         }
         let activate = payload(&r.activate_request, FleetKeyGenerationActivateV2::parse);
         assert_eq!(activate.terms, t);
+    }
+
+    /// v2.10 U1 gate G4: the root custodian that rotated 0 to 1 to 2, each
+    /// generation collected through its own verified grant, still holds every
+    /// one of them: each is in the fleet key store as verified and its kept
+    /// grant reverifies now, so it can open a head under any generation it
+    /// rotated through.
+    #[test]
+    fn the_root_custodian_holds_every_generation_it_rotated_through() {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        let now = rig.now;
+        let (fleet, pin) = (f.cx.tenant, f.pin());
+        let me = shardx_core::trust_chain::Recipient {
+            account_id: f.cx.account,
+            device_id: f.cx.device,
+            signing_key_id: f.cx.signing_key_id,
+            hpke_key_id: f.cx.hpke_key_id,
+        };
+        let (sk, pk) = derive_keypair(&f.seed);
+        let base = rig.rot.lock().unwrap().base.clone();
+        let keep = |db: &mut Db, container: Vec<u8>, generation: u64| {
+            let page = TenantTrustEvidencePageV2 {
+                server_instance_id: f.cx.instance,
+                tenant_id: f.cx.tenant,
+                server_now_ms: now,
+                page_index: 0,
+                next_cursor: Vec::new(),
+                signing_public_keys: vec![f.signer.verifying_key().to_bytes()],
+                containers: [base.clone(), vec![container.clone()]].concat(),
+                revocations: Vec::new(),
+                device_revocations: Vec::new(),
+            };
+            let key = crate::open_fleet_grant(
+                &container,
+                &[page],
+                &pin,
+                &me,
+                &fleet,
+                generation,
+                &sk,
+                now,
+                db,
+                "https://fleet.test",
+            )
+            .unwrap()
+            .expect("the own grant verifies");
+            assert!(fleet_keys::collect(&hex(&fleet), generation, &key).unwrap());
+            key
+        };
+        let ids = (f.cx.account, f.cx.device);
+        let keys = (
+            f.cx.signing_key_id,
+            f.cx.hpke_key_id,
+            pk.try_into().unwrap(),
+        );
+        let first = member_grant(&f.cx, &f.signer, ids, keys, &OLD_FKEK, 0, now).unwrap();
+        let first =
+            payload(&first, FleetKeyGrantCreateV2::parse).exact_signed_grant_container_bytes;
+        let mut held = vec![keep(&mut rig.db, first, 0)];
+        for generation in [1, 2] {
+            let previous = held.last().unwrap().clone();
+            rig.rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| Ok(previous),
+                move || now,
+                &mut |s| save(s),
+            )
+            .unwrap();
+            let r = rotation();
+            assert_eq!(r.generation, generation);
+            let key = rotation_key_held().expect("held until step 10");
+            let opened = keep(&mut rig.db, unhex_vec(&r.device_grant).unwrap(), generation);
+            assert_eq!(*opened, *key);
+            collected(now);
+            let mut s = load().unwrap();
+            s.rotation.as_mut().unwrap().phase = RotationPhase::Done;
+            save(&s).unwrap();
+            held.push(opened);
+        }
+
+        let verified = fleet_keys::verified_keys(&hex(&fleet)).unwrap();
+        let generations: Vec<u64> = verified.iter().map(|(g, _)| *g).collect();
+        assert_eq!(generations, [0, 1, 2]);
+        for (g, key) in held.iter().enumerate() {
+            let g = g as u64;
+            assert_eq!(*verified[g as usize].1, **key, "generation {g}");
+            assert!(
+                crate::fleet_key_verifies(&rig.db, &pin, &me, &fleet, g, key, now).unwrap(),
+                "generation {g} reverifies"
+            );
+        }
+        assert_eq!(
+            crate::team::ledger::highest_generation(&rig.db, &pin.0, &fleet).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
