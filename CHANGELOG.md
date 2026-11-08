@@ -1,5 +1,144 @@
 # Changelog
 
+## v2.9.0
+
+A Team release: the root custodian can rotate the team's fleet key, so a
+revoked device cannot read snapshots pushed from then on. Heads pushed under
+the old key stay readable. The browser engine and the team server are
+unchanged.
+
+### Upgrade notes
+
+- The team server is unchanged: a 2.8.x server works with launcher 2.9.0.
+- After a rotation, export the recovery bundle again. A bundle exported
+  before the rotation does not open the newest fleet key.
+- After a rotation, use Push once on every profile the Team page lists under
+  an older key. Devices approved or restored after the rotation
+  cannot read a head until it is pushed again, and a head left under the old
+  key becomes unreadable for every device when the old key's grants end, one
+  year after each was issued.
+- Finish a rotation before downgrading. Do not downgrade a device that rotated
+  the fleet key, or that collected a rotated key, to 2.8.x: 2.8.x refuses
+  heads under older keys as stale, drops the rotation state and orphans its
+  setup key.
+
+### Team
+
+- **Rotate fleet key.** The root custodian rotates the team's fleet key from
+  the Team page. The new key must be activated within 30 days; an unfinished
+  rotation offers Resume fleet key rotation, and approvals wait until it is
+  done. After a rotation expires, Rotate fleet key stays available; it stays
+  stuck only while the team server still holds the unfinished key. Only
+  snapshots pushed from then on are protected.
+- **Banner after a revoke.** While a revoked device still holds the current
+  fleet key, the Team page asks to rotate: urgently for a lost device, or one
+  whose saved revocation cannot be checked, and when convenient for a retired
+  one.
+- **Members get the new key automatically.** A rotation grants the new key to
+  every device with a signed approval. Revoked devices are not granted, and a
+  device that is offline collects the key later with Collect key custody.
+- **Old heads stay readable.** Pull reads heads sealed under an older fleet
+  key as long as that key's grant still verifies.
+- **Generation floor.** Each profile refuses a head under an older fleet key
+  than the one it already uses, so a revoked device cannot write under the old
+  key once the profile has moved to the new one.
+- **Clear messages for members.** A push or pull refused because the fleet key
+  rotated says to press Collect key custody. A device that missed two
+  rotations is told to have a custodian revoke it and enroll again.
+- **Profiles still under an older key.** The Team page lists them with Push,
+  which only pushes. If this device's copy is behind the server, it says to
+  Pull the profile from the profile list first (pulling replaces local changes
+  on this device), then push again.
+- **Export the recovery bundle again.** After a rotation the Team page prompts
+  the root custodian to export the recovery bundle again.
+- **Revoke confirmation.** The revoke confirmation now says that the device
+  keeps the fleet key it holds until the fleet key is rotated.
+
+### Fixed
+
+- **State file checks.** A team state file or folder whose existence cannot be
+  checked is an error instead of a missing one.
+- **Old credentials forgotten.** After a device enrolls again, the saved
+  credentials of its old identity are forgotten once the server lists that
+  identity as revoked.
+- **Hex keys.** A stored hex key with non-ASCII characters is refused with an
+  error instead of crashing the launcher.
+- **Resumed approvals across a rotation.** An approval resumed across a
+  rotation never resends anything for a device revoked on this device, or
+  whose signing key the trust ledger records as withdrawn.
+- **Account password in a server listing.** A device or account ID in a server
+  listing that equals the account password is refused, and is never logged or
+  saved.
+- **Rotation deadline.** The rotation checks its 30-day deadline again after
+  each wait on the team server.
+
+### Known limitations
+
+- **Heads not pushed again.** A device approved after a rotation, or restored
+  from a recovery bundle, cannot read a head that was not pushed again under
+  the new key. The older-key list covers only profiles bound on the root
+  custodian's own device.
+- **Old keys end with their grants.** A head left under a retired key becomes
+  unreadable for every device once the old key's device grants end (365 days
+  from each grant). Grants of a retired key cannot be renewed; bulk re-sealing
+  comes later.
+- **Root machine and recovery bundle.** Rotating the fleet key does not cut off
+  a stolen root custodian machine or a leaked recovery bundle: both can open
+  the new key. Root key rotation and moving custody come later.
+- **Old snapshots.** Snapshots stay under the keys they were sealed with, and a
+  revoked device can read any of them that leaks to it.
+- **Hidden revocations.** A device revoked while the server hides its
+  revocation can still write under the old key to a profile that has not moved
+  to the new key. The generation floor stops it once that profile is pushed
+  under the new key.
+- **Retired keys from a hostile server.** A hostile server can serve a valid
+  member's head under a retired key that is not older than the head before it,
+  and readers accept it.
+- **Expired rotations.** A rotation that expires (30 days) or is undone by a
+  server restore before activation leaves the team on the old key, and
+  approvals work again. A new rotation can start, unless the server still
+  holds the unfinished key as `PREPARING`: then starting is refused with
+  `FLEET_GENERATION_EXISTS`, and each retry files one extra `key.rotate`
+  grant. Discarding it needs a later server version.
+- **Back-to-back rotations.** Starting a rotation replaces the member results
+  of the previous one. If the new rotation then expires, a revoked device
+  known to hold the previous key only from those results can lose its banner.
+- **Member grant errors.** If a member's grant keeps failing with a server
+  error, the rotation stays activated but unfinished, and approvals stay
+  refused until the grant goes through.
+- **Two missed rotations.** A member offline across two rotations must enroll
+  again.
+- **No compromised reason.** Revoke has no `compromised` reason, so the Team
+  page cannot freeze the team after a compromise.
+- **Members learn of a new key late.** A member learns of a new fleet key only
+  on Collect key custody or from a push or pull error.
+- **Banner source.** The banner is derived on the root custodian's device from
+  its own signed revocations and known key holders, plus its trust ledger.
+- **Imported custodian.** A root custodian restored from a recovery bundle
+  starts with no saved revocations and a fresh trust ledger. If the server
+  hides a revocation, the rotation can still grant the new key to that device.
+- **Pending devices revoked later.** A device still pending during a rotation
+  and revoked afterwards by another custodian relies on the server to refuse
+  it when an approval is resumed across the rotation.
+- **A valid member under an older key.** A still-valid member's head under an
+  older key than its profile already uses stops pulls of that profile (fail
+  closed, nothing pinned) until the member is revoked; Revert then skips it.
+- **Older-key list.** The list reads the generation of the local binding:
+  profiles not bound on the root custodian's device are missing, and after a
+  server restore a row keeps the previous generation until the next pin.
+- **Refused or skipped members.** A member refused or skipped during a
+  rotation (expired approval, changed keys, no signed approval) must be
+  revoked and enroll again, as before. A member already granted in an earlier
+  run may show as skipped when a resumed run finds it no longer eligible.
+- **Re-export prompt.** The prompt to export the recovery bundle again can stay
+  after an export that finished while another custody action was running.
+  Exporting again clears it.
+- **Server restore.** A server restore after a rotation is not covered by a
+  test.
+- **Reset of a pending device.** Credentials left by a Reset of a pending
+  device stay; only the credentials of a revoked old identity are forgotten.
+- The 2.8.x limitations about the server URL and renewal still apply.
+
 ## v2.8.1
 
 A Team fix release: the launcher checks the team server's answers more

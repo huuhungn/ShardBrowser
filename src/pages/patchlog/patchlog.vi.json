@@ -1,6 +1,67 @@
 {
   "releases": [
     {
+      "version": "2.9.0",
+      "date": "2026-11-08",
+      "entries": [
+        {
+          "id": "team-fleet-key-rotation",
+          "title": "Xoay khoá đội máy",
+          "lead": "Root custodian có thể xoay khoá đội máy ngay trên trang Team, để thiết bị đã bị thu hồi không đọc được các snapshot đẩy lên từ lúc đó.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Rotate fleet key tạo khoá đội máy mới và tự cấp cho mọi thiết bị có phê duyệt đã ký; thiết bị đã bị thu hồi không nhận được gì. Thiết bị đang ngoại tuyến sẽ nhận khoá sau bằng Collect key custody. Khoá mới phải được kích hoạt trong vòng 30 ngày, lượt xoay còn dở hiện nút Resume fleet key rotation, và việc phê duyệt thiết bị phải chờ đến khi xoay xong. Khi một lượt xoay hết hạn, nút Rotate fleet key vẫn dùng được; nó chỉ bị kẹt khi server nhóm vẫn còn giữ khoá chưa hoàn tất."
+            },
+            {
+              "type": "p",
+              "text": "Sau khi thu hồi, trang Team hiện thông báo nhắc xoay khoá khi thiết bị bị thu hồi vẫn giữ khoá hiện tại: khẩn cấp nếu thiết bị bị mất, làm khi tiện nếu thiết bị đã ngừng dùng. Xoay khoá không có tác dụng ngược: chỉ các snapshot đẩy lên từ lúc đó mới được bảo vệ."
+            },
+            {
+              "type": "note",
+              "text": "Sau khi xoay khoá, hãy export recovery bundle lại (trang Team sẽ nhắc) và bấm Đẩy lên một lần cho mỗi profile còn nằm dưới khoá cũ. Hãy xoay xong trước khi hạ về bản 2.8.x. Server nhóm không cần cập nhật."
+            }
+          ]
+        },
+        {
+          "id": "team-old-generations",
+          "title": "Snapshot dưới khoá cũ vẫn đọc được",
+          "lead": "Pull mở được head đẩy lên dưới khoá đội máy trước đó, và từ chối head quay về khoá cũ hơn.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Head được niêm phong dưới khoá đội máy cũ vẫn pull được khi grant của khoá đó còn xác minh được. Mỗi profile ghi nhớ khoá mới nhất nó đã dùng và từ chối head dưới khoá cũ hơn, nên thiết bị đã bị thu hồi không ghi được bằng khoá cũ khi profile đã chuyển sang khoá mới."
+            },
+            {
+              "type": "p",
+              "text": "Trang Team liệt kê các profile còn nằm dưới khoá cũ, kèm nút Đẩy lên, nút này chỉ đẩy lên. Nếu bản trên máy này cũ hơn bản trên server, launcher sẽ nhắc pull profile đó từ danh sách profile trước (pull sẽ thay thế các thay đổi trên máy này), rồi đẩy lên lại. Thành viên có khoá đã được xoay sẽ thấy lời nhắc bấm Collect key custody, và thiết bị đã lỡ hai lượt xoay khoá sẽ được báo phải enroll lại."
+            }
+          ]
+        },
+        {
+          "id": "team-rotation-fixes",
+          "title": "Các sửa lỗi nhỏ cho Team",
+          "lead": "Lời xác nhận thu hồi rõ hơn và kiểm tra trạng thái trên máy chặt hơn.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Lời xác nhận thu hồi giờ nói rõ thiết bị vẫn giữ khoá đội máy cho đến khi bạn xoay khoá. Tệp trạng thái nhóm không kiểm tra được sự tồn tại giờ bị báo lỗi chứ không bị coi là không có. Sau khi một thiết bị enroll lại, thông tin đăng nhập đã lưu của danh tính cũ đã bị thu hồi sẽ được xoá. Khoá lưu dạng hex có ký tự ngoài ASCII giờ bị từ chối kèm thông báo lỗi, không còn làm launcher dừng đột ngột."
+            },
+            {
+              "type": "p",
+              "text": "Một phê duyệt được tiếp tục qua lượt xoay khoá không bao giờ gửi lại gì cho thiết bị đã bị thu hồi trên máy này, hoặc có khoá ký mà sổ tin cậy ghi là đã rút lại. ID thiết bị hoặc ID tài khoản trong danh sách của server mà trùng với mật khẩu tài khoản sẽ bị từ chối, và không bao giờ được ghi log hay lưu lại. Lượt xoay kiểm tra lại hạn 30 ngày sau mỗi lần chờ server nhóm."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.8.1",
       "date": "2026-11-07",
       "entries": [
