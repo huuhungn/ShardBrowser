@@ -1168,6 +1168,14 @@ pub async fn approve_member(
     };
     let replay = approved.common.replay_id;
     let subject = decode_hex16(&id, "device_id")?;
+    let not_pending = || crate::errcode::code("fleet.deviceNotPending");
+    // Resumed: nothing is resent to a device revoked here or whose key the
+    // ledger holds withdrawn.
+    if first_seen.is_none()
+        && (state.revocations.contains_key(&id) || withdrawn(&approved.subject_signing_key_id)?)
+    {
+        bail!(not_pending());
+    }
     let receipt =
         DeviceApprovalReceiptV2::parse(&client.approve_device(access, &id, &approval).await?)
             .map_err(|_| mismatch())?;
@@ -1204,7 +1212,7 @@ pub async fn approve_member(
     // Resumed: before a saved grant is resent, or one for a newer ACTIVE
     // generation is built once and saved, the device must still be eligible
     // for the grant's generation: not found ineligible or filed by that
-    // rotation's member step, not revoked here, its key not withdrawn. A
+    // rotation's member step (revoked here or withdrawn is refused above). A
     // saved grant may already be a rebuilt one, so this runs every resume.
     if first_seen.is_none() {
         let active = client
@@ -1213,7 +1221,6 @@ pub async fn approve_member(
         let rebuild = active.filter(|g| *g > grant.generation.generation);
         let target = rebuild.unwrap_or(grant.generation.generation);
         let rotation = state.rotation.as_ref().filter(|r| r.generation == target);
-        let not_pending = || crate::errcode::code("fleet.deviceNotPending");
         match rotation
             .and_then(|r| r.member_results.get(&id))
             .map(String::as_str)
@@ -1222,11 +1229,6 @@ pub async fn approve_member(
             // The rotation found it ineligible (revoked, withdrawn, no
             // approval) or the server refused it.
             Some(_) => bail!(not_pending()),
-            None if state.revocations.contains_key(&id)
-                || withdrawn(&approved.subject_signing_key_id)? =>
-            {
-                bail!(not_pending())
-            }
             None => {}
         }
         if let Some(active) = rebuild {
@@ -5739,6 +5741,10 @@ pub(crate) mod tests {
             let err = approve_on(&rig, &f, &row, "").unwrap_err();
             assert!(has(&err, "fleet.deviceNotPending"), "{revoked_here}: {err}");
             assert!(rig.bodies("/grants").is_empty(), "{revoked_here}");
+            assert!(
+                !revoked_here || only_reads(&rig.calls()),
+                "nothing is resent"
+            );
             assert_eq!(
                 load().unwrap().members[&id].grant_request,
                 saved.grant_request,
@@ -5766,7 +5772,7 @@ pub(crate) mod tests {
         rig.clear();
         let err = approve_on(&rig, &f, &row, "").unwrap_err();
         assert!(has(&err, "fleet.deviceNotPending"), "{err}");
-        assert!(rig.bodies("/grants").is_empty());
+        assert!(only_reads(&rig.calls()), "nothing is resent");
         assert_eq!(load().unwrap().members[&id].grant_request, rebuilt);
     }
 
@@ -5780,7 +5786,7 @@ pub(crate) mod tests {
         crate::team::ledger::distrust_key(&rig.db, &f.pin().0, &key, now_ms()).unwrap();
         let err = approve_on(&rig, &f, &row, "").unwrap_err();
         assert!(has(&err, "fleet.deviceNotPending"), "{err}");
-        assert!(rig.bodies("/grants").is_empty());
+        assert!(only_reads(&rig.calls()), "nothing is resent");
         let id = row.device_id.to_ascii_lowercase();
         assert_eq!(
             load().unwrap().members[&id].grant_request,
