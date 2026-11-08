@@ -1108,7 +1108,7 @@ pub async fn approve_member(
     pin: &(Binding, [u8; 32]),
     row: &TenantDevice,
     sas: &str,
-    fleet_key: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
+    fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
     now: u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
@@ -1157,13 +1157,14 @@ pub async fn approve_member(
 
     // 4. The approval, the three capability grants, then the fleet grant.
     let approval = unhex_vec(&m.approval)?;
-    let replay = match AuthorizationRecord::parse(&approval)
+    let approved = match AuthorizationRecord::parse(&approval)
         .and_then(|r| r.verify_signature(me.signer.verifying_key().as_bytes()))
         .map(|v| v.payload().clone())
     {
-        Ok(Payload::DeviceApproval(a)) => a.common.replay_id,
+        Ok(Payload::DeviceApproval(a)) => a,
         _ => return Err(corrupt()),
     };
+    let replay = approved.common.replay_id;
     let subject = decode_hex16(&id, "device_id")?;
     let receipt =
         DeviceApprovalReceiptV2::parse(&client.approve_device(access, &id, &approval).await?)
@@ -1194,10 +1195,48 @@ pub async fn approve_member(
             return Err(mismatch());
         }
     }
-    let filing = saved_request(&m.grant_request)?;
-    let grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
+    let mut filing = saved_request(&m.grant_request)?;
+    let mut grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
         .map_err(|_| corrupt())?
         .grant;
+    // Resumed after a rotation: the saved grant names a generation the
+    // server no longer has ACTIVE, so one for the ACTIVE generation is built
+    // once and saved, unless the rotation's member step already filed it.
+    if first_seen.is_none() {
+        let active = client
+            .active_fleet_generation(access, me.tenant_id, &fleet)
+            .await?;
+        if let Some(active) = active.filter(|g| *g != grant.generation.generation) {
+            let rotation = state.rotation.as_ref().filter(|r| r.generation == active);
+            if rotation
+                .and_then(|r| r.member_results.get(&id))
+                .is_some_and(|v| v == "filed")
+            {
+                return Ok(());
+            }
+            let keys = listed_keys(row)?;
+            if (keys.0, keys.1)
+                != (
+                    approved.subject_signing_key_id,
+                    approved.subject_hpke_key_id,
+                )
+            {
+                bail!(crate::errcode::code("fleet.deviceKeysMismatch"));
+            }
+            let ids = (approved.subject_account_id, approved.subject_device_id);
+            let fkek = fleet_key(active)?;
+            let built = member_grant(&cx, me.signer, ids, keys, &fkek, active, now)?;
+            commit(state, save, |s| {
+                if let Some(m) = s.members.get_mut(&id) {
+                    m.grant_request = built.clone();
+                }
+            })?;
+            filing = saved_request(&built)?;
+            grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
+                .map_err(|_| corrupt())?
+                .grant;
+        }
+    }
     let stored = client
         .file_fleet_grant(
             access,
@@ -4028,6 +4067,8 @@ pub(crate) mod tests {
         by_signer: BySigner,
         evidence_down: bool,
         refuse: Option<Refuse>,
+        /// Approvals get a receipt; otherwise they are refused.
+        approves: bool,
     }
 
     fn stored(body: &[u8], record_type: &str, payload: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
@@ -4066,6 +4107,39 @@ pub(crate) mod tests {
                     None => (200, b"null".to_vec()),
                 },
                 "POST /v2/capability-grants" => (201, body.to_vec()),
+                c if post && self.approves && c.ends_with("/approve") => {
+                    let record = AuthorizationRecord::parse(body).unwrap();
+                    let verified = record.verify_signature(&self.custodian_pk).unwrap();
+                    let Payload::DeviceApproval(a) = verified.payload().clone() else {
+                        panic!("not an approval");
+                    };
+                    // The fixture's account and device approve.
+                    let actor = ([4; 16], [5; 16]);
+                    let receipt = DeviceApprovalReceiptV2 {
+                        server_instance_id: self.instance,
+                        restore_epoch: self.epoch,
+                        tenant_id: self.tenant,
+                        actor_account_id: actor.0,
+                        actor_device_id: actor.1,
+                        subject_device_id: a.subject_device_id,
+                        approval_replay_id: a.common.replay_id,
+                        request_hash: device_approve_request_hash(
+                            &self.instance,
+                            self.epoch,
+                            &self.tenant,
+                            &actor.0,
+                            &actor.1,
+                            &a.subject_device_id,
+                            body,
+                        ),
+                        approval_payload_sha256: [0; 32],
+                        approval_signed_container_hash: [0; 32],
+                        approval_outer_sha256: [0; 32],
+                        confirmation_id: None,
+                        committed_at_ms: 1,
+                    };
+                    (200, receipt.encode())
+                }
                 c if post && c.ends_with("/key-generations") => {
                     let reply = stored(body, RECORD_TYPE_FLEET_GENERATION_CREATED, |p| {
                         FleetKeyGenerationCreatedV2 {
@@ -5233,6 +5307,130 @@ pub(crate) mod tests {
             save(&state).unwrap();
             approve_allowed(&rig, &f);
         }
+    }
+
+    /// Approve of `row` against the rig, the verified ACTIVE key being `key`.
+    fn approve_on(
+        rig: &Rig,
+        f: &Fixture,
+        row: &TenantDevice,
+        sas: &str,
+        key: [u8; 32],
+    ) -> Result<()> {
+        let mut state = load().unwrap();
+        rig.rt.block_on(approve_member(
+            &rig.client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            &f.pin(),
+            row,
+            sas,
+            |_| Ok(Zeroizing::new(key)),
+            now_ms(),
+            &mut state,
+            &mut |s| save(s),
+        ))
+    }
+
+    /// An approval built and saved under generation 0 whose approve reply
+    /// was lost, then a rotation to 1 that finished, its member step having
+    /// recorded `result` for the device, if anything. The rig, the device
+    /// and its saved requests.
+    fn approval_across_a_rotation(
+        f: &Fixture,
+        result: Option<&str>,
+    ) -> (Rig, TenantDevice, MemberApproval) {
+        let rig = rig(f, |r| r.approves = true);
+        let (row, _) = joiner();
+        rig.refuse("/approve", 503, "");
+        assert!(approve_on(&rig, f, &row, &f.code(&row), FKEK).is_err());
+        let id = row.device_id.to_ascii_lowercase();
+        let saved = load().unwrap().members[&id].clone();
+        let filing = payload(&saved.grant_request, FleetKeyGrantCreateV2::parse);
+        assert_eq!(filing.grant.generation.generation, 0);
+        rig.allow();
+        rig.rot.lock().unwrap().active = Some(1);
+        let mut state = load().unwrap();
+        state.rotation = Some(FleetRotationState {
+            generation: 1,
+            phase: RotationPhase::Done,
+            member_results: result.map(|r| (id, r.to_string())).into_iter().collect(),
+            ..Default::default()
+        });
+        save(&state).unwrap();
+        rig.clear();
+        (rig, row, saved)
+    }
+
+    /// The approval and capability grants `saved` holds went out once each,
+    /// byte for byte.
+    fn resent_as_saved(rig: &Rig, saved: &MemberApproval) {
+        assert_eq!(
+            rig.bodies("/approve"),
+            [unhex_vec(&saved.approval).unwrap()]
+        );
+        let grants: Vec<Vec<u8>> = saved
+            .capability_grants
+            .iter()
+            .map(|g| unhex_vec(g).unwrap())
+            .collect();
+        assert_eq!(rig.bodies("/capability-grants"), grants);
+    }
+
+    #[test]
+    fn an_approval_saved_before_a_rotation_files_its_fleet_grant_under_the_active_generation() {
+        let f = fixture();
+        let (rig, row, saved) = approval_across_a_rotation(&f, None);
+        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        resent_as_saved(&rig, &saved);
+        let id = row.device_id.to_ascii_lowercase();
+        let rebuilt = load().unwrap().members[&id].grant_request.clone();
+        let filing = payload(&rebuilt, FleetKeyGrantCreateV2::parse);
+        assert_eq!(
+            (
+                filing.grant.generation.generation,
+                filing.grant.generation.fkek_key_id
+            ),
+            (1, fkek_key_id(&NEW_FKEK))
+        );
+        let filed = rig.bodies("/grants");
+        assert_eq!(filed, [saved_request(&rebuilt).unwrap().encode()]);
+        // Built once: a later resume resends the same bytes.
+        rig.clear();
+        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        assert_eq!(rig.bodies("/grants"), filed);
+    }
+
+    #[test]
+    fn an_approval_resumed_after_a_rotation_does_not_file_a_second_grant() {
+        let f = fixture();
+        let (rig, row, saved) = approval_across_a_rotation(&f, Some("filed"));
+        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        resent_as_saved(&rig, &saved);
+        assert!(rig.bodies("/grants").is_empty(), "the rotation filed it");
+        let id = row.device_id.to_ascii_lowercase();
+        assert_eq!(
+            load().unwrap().members[&id].grant_request,
+            saved.grant_request
+        );
+    }
+
+    /// The N+1 grant a resume builds is sealed only to the keys the saved
+    /// approval names: a listing that swapped the HPKE key gets nothing.
+    #[test]
+    fn an_approval_resumed_after_a_rotation_refuses_a_swapped_listed_key() {
+        let f = fixture();
+        let (rig, mut row, saved) = approval_across_a_rotation(&f, None);
+        let other = peer(1);
+        (row.hpke_public_key, row.hpke_key_id) = (other.hpke_public_key, other.hpke_key_id);
+        let err = approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap_err();
+        assert!(has(&err, "fleet.deviceKeysMismatch"), "{err}");
+        assert!(rig.bodies("/grants").is_empty());
+        let id = row.device_id.to_ascii_lowercase();
+        assert_eq!(
+            load().unwrap().members[&id].grant_request,
+            saved.grant_request
+        );
     }
 
     #[test]
