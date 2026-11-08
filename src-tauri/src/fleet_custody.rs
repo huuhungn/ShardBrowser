@@ -5570,6 +5570,20 @@ pub(crate) mod tests {
     /// stands for the outgoing root A0; the custodian here is the anchor.
     #[test]
     fn a_rotation_after_the_hand_over_grants_every_pre_hand_over_member() {
+        rotation_after_the_hand_over(true);
+    }
+
+    /// U1b review: the same rotation with no collect before it, so the
+    /// member step's own evidence read is the one that first counts X's
+    /// revocation, through the closure path, and still grants M N+1.
+    #[test]
+    fn a_rotation_whose_member_step_first_counts_the_hand_over_grants_every_member() {
+        rotation_after_the_hand_over(false);
+    }
+
+    /// [`a_rotation_after_the_hand_over_grants_every_pre_hand_over_member`],
+    /// with the collect after the import when `collect_first`.
+    fn rotation_after_the_hand_over(collect_first: bool) {
         use shardx_core::authz_record::{
             RootGrantVariant, TenantRootKeyGrantV2, DOMAIN_TENANT_ROOT_KEY_GRANT,
         };
@@ -5665,26 +5679,29 @@ pub(crate) mod tests {
         // The collect after the import reads and records its evidence as
         // `collect_fleet_grant` does.
         let pin = f.pin();
-        let (pages, closure) = rig
-            .rt
-            .block_on(crate::team::ledger::closure_evidence(
-                &rig.client,
-                "access",
-                &f.tenant,
-                &mut rig.db,
-                &pin,
-                &[],
-                now,
-            ))
-            .unwrap();
-        let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &pages, now)
-            .unwrap()
-            .unwrap();
-        crate::team::ledger::record(&mut rig.db, &pin.0, &seen, &chain, None, closure, now)
-            .unwrap();
-        assert!(crate::team::ledger::withdrawn(&rig.db, &pin.0, &cx_x.signing_key_id).unwrap());
+        if collect_first {
+            let (pages, closure) = rig
+                .rt
+                .block_on(crate::team::ledger::closure_evidence(
+                    &rig.client,
+                    "access",
+                    &f.tenant,
+                    &mut rig.db,
+                    &pin,
+                    &[],
+                    now,
+                ))
+                .unwrap();
+            let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &pages, now)
+                .unwrap()
+                .unwrap();
+            crate::team::ledger::record(&mut rig.db, &pin.0, &seen, &chain, None, closure, now)
+                .unwrap();
+            assert!(crate::team::ledger::withdrawn(&rig.db, &pin.0, &cx_x.signing_key_id).unwrap());
+        }
 
         rig.members(&f, now).unwrap();
+        assert!(crate::team::ledger::withdrawn(&rig.db, &pin.0, &cx_x.signing_key_id).unwrap());
         assert_eq!(results(), [(m.device_id.clone(), "filed".to_string())]);
     }
 
