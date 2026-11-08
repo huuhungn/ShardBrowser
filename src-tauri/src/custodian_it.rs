@@ -1255,7 +1255,7 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
     let (seen, chain) = crate::team::ledger::evaluate(&ledger, &binding, &anchor, &pages, now)
         .unwrap()
         .expect("the evidence verifies to A's anchor");
-    crate::team::ledger::record(&mut ledger, &binding, &seen, &chain, None, now).unwrap();
+    crate::team::ledger::record(&mut ledger, &binding, &seen, &chain, None, false, now).unwrap();
     assert!(crate::team::ledger::withdrawn(&ledger, &binding, &b_signing).unwrap());
 
     // 5, continued. Retired is advisory: generation 0 is not blocked, and A
@@ -2732,27 +2732,22 @@ fn context16(instance: [u8; 16]) -> crate::root_bootstrap::Context16 {
     }
 }
 
-/// v2.10 U1 gate G3 (D11): root custodian A approves B tenant-wide and files
+/// What [`appoint`] leaves: the appointee, its device ID and context.
+struct Appointed {
+    b: Member,
+    b_id: String,
+    cx_b: crate::root_bootstrap::Context16,
+}
+
+/// v2.10 U1 (D11), with root custodian A acting: a fresh device B, its
+/// credentials in `namespace`, enrolls; A approves it tenant-wide and files
 /// an `ExistingRootGrant` of the ACTIVE root to it, with B's grant of the
-/// ACTIVE fleet generation N; B acknowledges the root grant, files its six
-/// own capability grants, collects and acknowledges A's grant of N, then
-/// files and acknowledges its own grant of N, which the server accepts. The
-/// `root-key-grants` listing shape B reads is recorded on the way.
-#[test]
-fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_a_real_server() {
+/// ACTIVE fleet generation N; B pins A0, reads its root grant from the
+/// listing and the evidence, acknowledges it and files its six own
+/// capability grants. B is left acting.
+fn appoint(rt: &tokio::runtime::Runtime, h: &Harness, namespace: &str) -> Appointed {
     use shardx_core::authz_record::*;
-    use shardx_core::fleet_lifecycle::{
-        FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
-        RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
-    };
     use shardx_core::mutation::*;
-    let rt = runtime();
-    let h = custodian_at(V210_PORT_BASE, 0, "v210-appoint", &rt);
-    call(
-        &rt,
-        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
-    )
-    .unwrap();
     let fleet = h.tenant.clone();
     let tenant16 = crate::fleet_client::decode_hex16(&h.tenant, "tenant").unwrap();
     let root = crate::root_bootstrap::load().unwrap();
@@ -2771,21 +2766,21 @@ fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_
     };
 
     // B enrolls and reads its join code.
-    let b = fresh_device("b", h.server.url(), h.tenant.clone());
+    let b = fresh_device(namespace, h.server.url(), h.tenant.clone());
     let b_id = call(
-        &rt,
+        rt,
         crate::team_enroll_device("appointee".into(), OWNER.into(), PASSWORD.into()),
     )
     .unwrap()
     .device_id;
-    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    let code = call(rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
     let cx_b = context16(instance);
 
     // 1. A: the tenant approval, the root grant sealed to B's listed HPKE
     // key, and B's grant of N, each filed and read back.
     h.act_as_a();
     let now = crate::root_bootstrap::now_ms();
-    with_session(&rt, &h, async |client, access| {
+    with_session(rt, h, async |client, access| {
         let row = client
             .list_tenant_devices(access, &h.tenant)
             .await
@@ -2863,18 +2858,17 @@ fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_
 
     // 2. B pins A0, reads its root grant from the listing and the evidence,
     // acknowledges it and files its six own capability grants.
-    b.act_as_b();
+    act_as(b.config.path(), b.data.path(), namespace);
     call(
-        &rt,
+        rt,
         crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
     )
     .unwrap();
     let b_config = crate::team_config::load().unwrap();
     let b_signer = b_config.signing_key().unwrap();
-    let (b_hpke_sk, b_hpke_pk) =
-        shardx_core::grants::derive_keypair(&b_config.hpke_seed().unwrap());
+    let (b_hpke_sk, _) = shardx_core::grants::derive_keypair(&b_config.hpke_seed().unwrap());
     let a_vk = a_signer.verifying_key().to_bytes();
-    with_session(&rt, &h, async |client, access| {
+    with_session(rt, h, async |client, access| {
         // The listing: one grant, with its variant, generation and HPKE wrap
         // only. `RootKeyGrant` keeps no container, so the grant to
         // acknowledge comes from the trust evidence.
@@ -2935,6 +2929,40 @@ fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_
             assert_eq!(client.file_capability_grant(access, &g).await.unwrap(), g);
         }
     });
+    Appointed { b, b_id, cx_b }
+}
+
+/// v2.10 U1 gate G3 (D11): root custodian A approves B tenant-wide and files
+/// an `ExistingRootGrant` of the ACTIVE root to it, with B's grant of the
+/// ACTIVE fleet generation N; B acknowledges the root grant, files its six
+/// own capability grants, collects and acknowledges A's grant of N, then
+/// files and acknowledges its own grant of N, which the server accepts. The
+/// `root-key-grants` listing shape B reads is recorded on the way.
+#[test]
+fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_a_real_server() {
+    use shardx_core::fleet_lifecycle::{
+        FleetKeyGrantAckV2, FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
+        RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
+    };
+    use shardx_core::mutation::*;
+    let rt = runtime();
+    let h = custodian_at(V210_PORT_BASE, 0, "v210-appoint", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let fleet = h.tenant.clone();
+    let fkek = crate::credential::load(&format!("fleet-key.{fleet}.0")).unwrap();
+    let request = |cx: &crate::root_bootstrap::Context16, kind, payload: Vec<u8>| {
+        let bytes = cx.request(kind, payload).unwrap();
+        (IdempotentMutationRequestV2::parse(&bytes).unwrap(), bytes)
+    };
+    let Appointed { b: _b, b_id, cx_b } = appoint(&rt, &h, "b");
+    let b_config = crate::team_config::load().unwrap();
+    let b_signer = b_config.signing_key().unwrap();
+    let (_, b_hpke_pk) = shardx_core::grants::derive_keypair(&b_config.hpke_seed().unwrap());
+    let now = crate::root_bootstrap::now_ms();
 
     // 3. B collects A's grant of N and acknowledges it.
     let report = call(
@@ -3032,4 +3060,165 @@ fn the_appointed_custodian_files_its_own_grant_of_the_active_generation_against_
         .unwrap()
         .issuer_signing_key_id();
     assert_eq!(issuer, cx_b.signing_key_id, "B's own grant behind N");
+}
+
+/// v2.10 U1b gate G6 (D12): member M shares a profile with root custodian
+/// A0 and pushed its head; A0 appoints B (as U1 does) and B revokes A0. D,
+/// enrolled afterwards and approved by B, joins and pulls M's head: D's
+/// first evaluation counts A0's revocation in a closure listing, so M's
+/// A0-issued approval keeps its standing and the walk trusts M's head.
+#[test]
+fn members_stay_trusted_by_a_device_that_joins_after_a_custodian_revocation_against_a_real_server()
+{
+    let rt = runtime();
+    let Journey {
+        b: _m,
+        h,
+        a_profile,
+        profile_id,
+        ..
+    } = shared_profile_at(V210_PORT_BASE, 0, "v210-closure", &rt);
+    let (user, pass) = account();
+    // A pulled M's version 2 last: these are M's files.
+    let m_files = files(&a_profile);
+    let a_id = crate::team_config::load().unwrap().device_id;
+
+    // 1. A0 appoints B, which collects A0's grant of N.
+    let Appointed { b, cx_b, .. } = appoint(&rt, &h, "c");
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let (b_fkek, generation) = crate::fleet_keys::load()
+        .unwrap()
+        .active_key(&h.tenant)
+        .expect("B holds N");
+    assert_eq!(generation, 0);
+    // B runs custody as an imported custodian does: its state names it.
+    let c = crate::team_config::load().unwrap();
+    let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+    let device = crate::fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &crate::fleet_custody::CredentialFkekStore,
+    };
+    let mut state = crate::fleet_custody::FleetCustodyState {
+        tenant_id: c.tenant_id.clone(),
+        device_id: c.device_id.clone(),
+        server_instance_id: hex(&cx_b.instance),
+        imported: true,
+        ..Default::default()
+    };
+    let pin = crate::pinned_anchor(&c).expect("B pinned A0");
+
+    // 2. B revokes A0 as retired.
+    with_session(&rt, &h, async |client, access| {
+        let rows = client.list_tenant_devices(access, &h.tenant).await.unwrap();
+        let row = rows.iter().find(|r| r.device_id == a_id).expect("A0's row");
+        crate::fleet_custody::revoke_member(
+            client,
+            access,
+            &device,
+            row,
+            shardx_core::authz_record::DeviceRevocationReason::Retired,
+            crate::root_bootstrap::now_ms(),
+            &mut state,
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    });
+    let revoked = h.server.count(&format!(
+        "SELECT count(*) FROM v2_devices WHERE lower(hex(id)) = '{a_id}' AND status = 'revoked'"
+    ));
+    assert_eq!(revoked, 1, "A0 is revoked");
+
+    // 3. D enrolls after the revocation, and B approves it with its grant
+    // of N.
+    let d = fresh_device("d", h.server.url(), h.tenant.clone());
+    let d_id = call(
+        &rt,
+        crate::team_enroll_device("late".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    act_as(b.config.path(), b.data.path(), "c");
+    with_session(&rt, &h, async |client, access| {
+        let rows = client.list_tenant_devices(access, &h.tenant).await.unwrap();
+        let row = rows.iter().find(|r| r.device_id == d_id).expect("D's row");
+        crate::fleet_custody::approve_member(
+            client,
+            access,
+            &device,
+            &pin,
+            row,
+            &code.sas,
+            |_| Ok(zeroize::Zeroizing::new(b_fkek)),
+            |_| Ok(false),
+            crate::root_bootstrap::now_ms(),
+            &mut state,
+            &mut |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    });
+
+    // 4. D pins A0, collects N from B's grant, then joins M's profile and
+    // pulls M's head.
+    act_as(d.config.path(), d.data.path(), "d");
+    call(
+        &rt,
+        crate::team_join_confirm(
+            OWNER.into(),
+            PASSWORD.into(),
+            code.anchor.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let (d_fkek, _) = crate::fleet_keys::load()
+        .unwrap()
+        .active_key(&h.tenant)
+        .expect("D holds N");
+    assert_eq!(d_fkek, b_fkek);
+    let tenant = crate::fleet_client::decode_hex16(&h.tenant, "t").unwrap();
+    {
+        let db = crate::team::db::Db::open().unwrap();
+        let (binding, anchor, _) = crate::team::ledger::tenant_pin(&db, &tenant)
+            .unwrap()
+            .expect("D's pin");
+        assert!(
+            crate::team::ledger::withdrawn(&db, &binding, &anchor).unwrap(),
+            "D counted A0's revocation"
+        );
+    }
+    let d_profile = local_profile("Shared", 4);
+    std::fs::remove_dir_all(crate::profile::user_data_dir(&d_profile).unwrap()).unwrap();
+    call(
+        &rt,
+        crate::sync_cmd::team_join_profile(
+            profile_id.clone(),
+            d_profile.clone(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::sync_cmd::profile_sync_pull(d_profile.clone(), String::new(), user, pass),
+    )
+    .unwrap();
+    assert_eq!(files(&d_profile), m_files, "D reads M's head");
+    assert_eq!(pinned_version(&d_profile), 2);
 }

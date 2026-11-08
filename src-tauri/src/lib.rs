@@ -3551,8 +3551,22 @@ async fn collect_fleet_grant(
         Err(e) => Err(e.to_string()),
     };
     let pin = pinned_anchor(c);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     let pages = match (&grant, &pin) {
-        (Ok(Some(_)), Some(_)) => Some(client.trust_evidence(access, &c.tenant_id).await),
+        (Ok(Some(_)), Some(pin)) => Some(
+            team::ledger::closure_evidence(
+                client,
+                access,
+                &c.tenant_id,
+                &mut ledger,
+                pin,
+                &[],
+                now,
+            )
+            .await,
+        ),
         _ => None,
     };
     let Some((container, acknowledged)) = grant? else {
@@ -3562,15 +3576,12 @@ async fn collect_fleet_grant(
         return Ok(FleetGrant::Waiting);
     };
     // Root custody is still reported when only the evidence fetch failed.
-    let pages = match pages {
+    let (pages, closure) = match pages {
         Ok(pages) => pages,
         Err(e) => return Ok(FleetGrant::Unfetched(e.to_string())),
     };
     let me = recipient(c).map_err(|e| e.to_string())?;
     let fleet = fleet_client::decode_hex16(&fleet_id, "fleet_id").map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
     let fkek = open_fleet_grant(
         &container,
         &pages,
@@ -3582,6 +3593,7 @@ async fn collect_fleet_grant(
         now,
         &mut ledger,
         &c.server_url,
+        closure,
     )?;
     let kept = match fkek {
         None if missed_rotations(&ledger, &pin.0, &fleet, generation)? => {
@@ -3715,7 +3727,8 @@ fn bootstrap_anchor(
 /// evidence as this device's history lets it see it: sticky revocations,
 /// local distrust, sticky lapse taken from history first (Q-25) and the
 /// cached key age. Each evaluation that
-/// reaches the anchor is recorded, with the grant it opened (G2-35).
+/// reaches the anchor is recorded, with the grant it opened (G2-35);
+/// `closure` says `pages` is a closure listing (`ledger::closure_evidence`).
 #[allow(clippy::too_many_arguments)]
 fn open_fleet_grant(
     container: &[u8],
@@ -3728,6 +3741,7 @@ fn open_fleet_grant(
     now: u64,
     ledger: &mut team::db::Db,
     server_url: &str,
+    closure: bool,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, String> {
     use team::ledger;
     let failed = |e: anyhow::Error| {
@@ -3758,7 +3772,14 @@ fn open_fleet_grant(
         container,
         pages,
     });
-    ledger::record(ledger, binding, &seen, &chain, opened, now).map_err(failed)?;
+    ledger::record(ledger, binding, &seen, &chain, opened, closure, now).map_err(|e| {
+        // D12: kept as is, so it never reads as an unreadable ledger.
+        if crate::errcode::has_code(&e.to_string(), "fleet.trustClosureNeeded") {
+            e.to_string()
+        } else {
+            failed(e)
+        }
+    })?;
     Ok(fkek)
 }
 
@@ -4314,6 +4335,7 @@ mod custody_tests {
                 now,
                 &mut ledger,
                 "https://fleet.test",
+                true,
             )
             .unwrap()
         };
@@ -4549,6 +4571,7 @@ mod custody_tests {
             now,
             &mut ledger,
             "https://fleet.test",
+            true,
         )
         .unwrap()
         .map(|k| *k)
@@ -4577,6 +4600,57 @@ mod custody_tests {
             .unwrap();
         let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// D12 (U1b): a fleet key opened in the evaluation that counts custodian
+    /// D's revocation, a closure listing, keeps that listing as its pages and
+    /// reverifies from them. Outside a closure the same evaluation opens and
+    /// records nothing.
+    #[test]
+    fn a_fleet_key_opened_in_a_closure_evaluation_reverifies_from_its_stored_pages() {
+        let me = me();
+        let fkek = [0x5a; 32];
+        let grant = fleet_grant(&me, shardx_core::fleet_grants::fkek_key_id(&fkek), &fkek);
+        let revocation = revoke_d(&me, |_| {});
+        let pages = with_d(
+            &me,
+            evidence(&me, grant.clone()),
+            Some(T0 + 300 * DAY),
+            vec![revocation.clone()],
+        );
+        let (_dir, path) = ledger_at();
+        let pin = (BINDING, me.to.signing_key_id);
+        let open = |closure| {
+            let mut ledger = team::db::Db::open_at(&path).unwrap();
+            open_fleet_grant(
+                &grant,
+                &pages,
+                &pin,
+                &me.to,
+                &FLEET,
+                1,
+                &me.hpke_sk,
+                T0 + DAY,
+                &mut ledger,
+                "https://fleet.test",
+                closure,
+            )
+        };
+        let refused = open(false).unwrap_err();
+        assert!(refused.contains("fleet.trustClosureNeeded"), "{refused}");
+        assert!(proven(&path).is_empty(), "nothing recorded");
+
+        assert_eq!(open(true).unwrap().as_deref(), Some(&fkek));
+        assert_eq!(proven(&path), [(hex(&d_id()), "DEVICE_REVOCATION".into())]);
+        let db = team::db::Db::open_at(&path).unwrap();
+        let (_, kept) = team::ledger::fleet_key_grant(&db, &BINDING, &pin.1, &FLEET, 1)
+            .unwrap()
+            .expect("the grant is kept");
+        assert!(
+            kept[0].containers.contains(&revocation),
+            "the closure listing is the kept one"
+        );
+        assert!(fleet_key_verifies(&db, &pin, &me.to, &FLEET, 1, &fkek, T0 + 2 * DAY).unwrap());
     }
 
     /// D-6 (e) across reopens: once this device counts a signed revocation of
@@ -5674,6 +5748,7 @@ mod custody_tests {
             T0 + DAY,
             &mut ledger,
             "https://fleet.test",
+            true,
         )
         .unwrap()
         .map(|k| *k);

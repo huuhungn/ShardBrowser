@@ -369,6 +369,8 @@
   "recovery.rootGrantMissing": "The team server does not hold this device's root key grant as acknowledged and active",
   "recovery.importedCollectFailed": "The recovery bundle was imported, but collecting the fleet key failed; run Collect key custody to try again: {error}",
   "fleet.trustEvidenceRefused": "The team server's trust evidence does not verify to this device as the tenant's bootstrap anchor and custodian",
+  "fleet.trustClosureTooLarge": "The team server's trust evidence revokes a root custodian, and checking every device it approved needs more than 64 devices in one request, which this version cannot do. Team sync stays paused on this device until a later version; nothing was changed.",
+  "fleet.trustClosureNeeded": "The team server's trust evidence revokes a root custodian and must be read again with every device it approved; nothing was changed. Try again.",
   "fleet.refusedSession": "The team server refused to open a session for this device ({status}): {detail}",
   "fleet.sessionBindingMismatch": "The team server asked this device to prove a session that does not match its keys, tenant or account; nothing was opened or signed",
   "fleet.sessionProofFailed": "This device could not open the team server's session challenge with its own key; nothing was signed",

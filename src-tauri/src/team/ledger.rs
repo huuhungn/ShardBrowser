@@ -42,6 +42,11 @@
 //!   `DeviceRevocationV2`, signed by that key and dropped as first seen after
 //!   the count, is kept once per key in `trust_custodian_alerts`
 //!   (`custodian.renewed_after_revocation`).
+//! - **Closure** (D12, ADR 0002 Q-58): a not-yet-counted revocation of a key
+//!   that held custody counts only in a closure listing, one evidence
+//!   listing naming every known device signer ([`closure_evidence`]), so the
+//!   approvals that custodian issued are first seen in the counting
+//!   evaluation and keep their standing ("Order").
 //!
 //! Not here yet: the other custodian change events of D-6 (a), and the
 //! acknowledgement of any, whose wording follows the Q-17 UX review.
@@ -61,7 +66,7 @@ use shardx_core::trust_chain::{
 use shardx_core::trust_evidence::{RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2};
 
 use super::db::Db;
-use crate::fleet_client::{decode_hex16, decode_hex32, hex};
+use crate::fleet_client::{decode_hex16, decode_hex32, hex, FleetClient};
 
 type Keys = BTreeMap<[u8; 32], [u8; 32]>;
 
@@ -866,22 +871,183 @@ pub fn commit_blocked(
     Ok(false)
 }
 
+/// D12: whether recording `seen`, evaluated as `chain`, at `now` would count
+/// a `DeviceRevocationV2` (rule 6) of a key that held custody, one `chain`
+/// counts a root grant of or this device's history keeps as a custodian, and
+/// that this device does not hold withdrawn yet.
+fn needs_closure(
+    conn: &rusqlite::Connection,
+    binding: &Binding,
+    seen: &[TenantTrustEvidencePageV2],
+    chain: &TrustChain,
+    now: u64,
+) -> Result<bool> {
+    let (instance, tenant) = ids(binding);
+    let keys = keys_of(seen);
+    for c in seen.iter().flat_map(|p| &p.containers) {
+        let Ok(r) = AuthorizationRecord::parse(c) else {
+            continue;
+        };
+        if r.payload_domain() != DOMAIN_DEVICE_REVOCATION {
+            continue;
+        }
+        // As `record_in` dates it: its first sighting, or this evaluation.
+        let first_seen: Option<i64> = conn
+            .query_row(
+                "SELECT first_seen_ms FROM trust_sightings
+                 WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signed_container_hash = ?3",
+                params![instance, tenant, hex(r.signed_container_hash())],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let first_seen = first_seen.map_or(now, |ms| ms as u64);
+        let Some(d) = counted(chain, binding, &keys, r, first_seen) else {
+            continue;
+        };
+        let key = d.subject_signing_key_id;
+        if withdrawn_in(conn, binding, &key)? {
+            continue;
+        }
+        let known: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM trust_custodian_keys
+               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)",
+            params![instance, tenant, hex(&key)],
+            |row| row.get(0),
+        )?;
+        if known || chain.custodians().any(|(k, _, _)| *k == key) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// D12: when `pages`, evaluated at `now` to `anchor` without being recorded,
+/// would count a not-yet-counted revocation of a key that held custody, the
+/// signers a closure listing names: the subject of every `DeviceHpkeGrant`
+/// they hold, which the server serves for every fleet grant of the tenant.
+/// `None` when no closure is needed, or when they do not verify, which the
+/// caller's own evaluation then refuses. Evaluating writes lapses and alerts
+/// as [`evaluate`] does; nothing else is recorded.
+pub fn closure_signers(
+    db: &Db,
+    binding: &Binding,
+    anchor: &[u8; 32],
+    pages: &[TenantTrustEvidencePageV2],
+    now: u64,
+) -> Result<Option<std::collections::BTreeSet<[u8; 32]>>> {
+    let Some((seen, chain)) = evaluate(db, binding, anchor, pages, now)? else {
+        return Ok(None);
+    };
+    if !needs_closure(&db.conn, binding, &seen, &chain, now)? {
+        return Ok(None);
+    }
+    let keys = keys_of(pages);
+    let subjects = pages
+        .iter()
+        .flat_map(|p| &p.containers)
+        .filter_map(|c| {
+            let r = AuthorizationRecord::parse(c).ok()?;
+            let pk = keys.get(r.issuer_signing_key_id())?;
+            let v = r.verify_signature(pk).ok()?;
+            match v.payload() {
+                Payload::DeviceHpkeGrant(g) => Some(g.subject_signing_key_id),
+                _ => None,
+            }
+        })
+        .collect();
+    Ok(Some(subjects))
+}
+
+/// D12 (ADR 0002 Q-58): the trust evidence of `tenant` naming `named`, read
+/// over the session `access`, as one complete listing for the caller to
+/// evaluate and record, and whether it is a closure listing. When recording
+/// the listing would count a not-yet-counted revocation of a key that held
+/// custody ([`closure_signers`]), it is read again, once, naming every known
+/// device signer: `named` (a walk's head signers), every fleet grant
+/// subject, the active rows a custodian session lists, and the signers of
+/// the heads this device's bindings pin. So each approval of those devices
+/// is first seen in the counting evaluation and keeps its standing. Names
+/// add evidence, never trust: the listing and the manifests are the
+/// server's word. Listings are never concatenated: more than the server's
+/// 64 signers fail closed with `fleet.trustClosureTooLarge` (a multi-listing
+/// closure is v2.11's).
+#[allow(clippy::too_many_arguments)]
+pub async fn closure_evidence(
+    client: &FleetClient,
+    access: &str,
+    tenant: &str,
+    db: &mut Db,
+    (binding, anchor): &(Binding, [u8; 32]),
+    named: &[[u8; 32]],
+    now: u64,
+) -> Result<(Vec<TenantTrustEvidencePageV2>, bool)> {
+    let pages = client.trust_evidence_of(access, tenant, named).await?;
+    let Some(mut signers) = closure_signers(db, binding, anchor, &pages, now)? else {
+        return Ok((pages, false));
+    };
+    signers.extend(named);
+    // Only a custodian session may list the devices: a refusal names none.
+    if let Ok(rows) = client.list_tenant_devices(access, tenant).await {
+        signers.extend(
+            rows.iter()
+                .filter(|r| r.status == "active")
+                .filter_map(|r| decode_hex32(&r.signing_key_id, "signing_key_id").ok()),
+        );
+    }
+    let (instance, tenant_hex) = ids(binding);
+    let pins: Vec<(String, i64)> = db
+        .conn
+        .prepare(
+            "SELECT remote_profile_id, remote_version FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_version > 0",
+        )?
+        .query_map(params![instance, tenant_hex], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (profile, version) in pins {
+        let profile = decode_hex16(&profile, "remote_profile_id")?;
+        let reply = client
+            .snapshot_manifest(access, &profile, version as u64)
+            .await?;
+        // A manifest the server no longer serves names no one.
+        if let Ok(m) = shardx_core::snapshot_v2::SignedSnapshotManifestV2::parse(&reply.body) {
+            signers.insert(*m.signer_signing_key_id());
+        }
+    }
+    let n = signers.len();
+    if n > crate::fleet_custody::MAX_SIGNERS {
+        eprintln!("[closure] a custodian revocation to count: {n} signers, refused");
+        anyhow::bail!(crate::errcode::code("fleet.trustClosureTooLarge"));
+    }
+    eprintln!("[closure] a custodian revocation to count: {n} signers");
+    let signers: Vec<[u8; 32]> = signers.into_iter().collect();
+    Ok((
+        client.trust_evidence_of(access, tenant, &signers).await?,
+        true,
+    ))
+}
+
 /// After `chain` evaluated `seen` (from [`evaluate`]), in one transaction:
 /// a new evaluation, the first sighting of every container, the reported
 /// revocations, every `DeviceRevocationV2` rule 6 counts, the custodian keys
 /// with their `first_not_before` and observed lapses, and, when a grant
 /// opened, its fleet's generation and the grant itself, also as a kept
-/// signed authorization record (`team::records`).
+/// signed authorization record (`team::records`). A not-yet-counted
+/// revocation of a key that held custody is counted only when `closure`
+/// says `seen` is a closure listing ([`closure_evidence`]); otherwise
+/// nothing is recorded and the error is `fleet.trustClosureNeeded`.
 pub fn record(
     db: &mut Db,
     binding: &Binding,
     seen: &[TenantTrustEvidencePageV2],
     chain: &TrustChain,
     opened: Option<Opened>,
+    closure: bool,
     now: u64,
 ) -> Result<()> {
     let tx = db.conn.transaction()?;
-    record_in(&tx, binding, seen, chain, opened, now)?;
+    record_in(&tx, binding, seen, chain, opened, closure, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -894,8 +1060,12 @@ pub fn record_in(
     seen: &[TenantTrustEvidencePageV2],
     chain: &TrustChain,
     opened: Option<Opened>,
+    closure: bool,
     now: u64,
 ) -> Result<()> {
+    if !closure && needs_closure(tx, binding, seen, chain, now)? {
+        anyhow::bail!(crate::errcode::code("fleet.trustClosureNeeded"));
+    }
     let (instance, tenant) = ids(binding);
     tx.execute(
         "INSERT INTO trust_evaluations(server_instance_id, tenant_id, evaluated_at_ms)
@@ -1900,6 +2070,7 @@ mod tests {
             T0 + DAY,
             db,
             "https://fleet.test",
+            true,
         )
         .unwrap();
         assert!(opened.is_some(), "generation {generation} verifies");
@@ -2086,7 +2257,7 @@ mod tests {
         assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
         let mut evaluate_at = |pages: &[TenantTrustEvidencePageV2], now| {
             let (seen, chain) = evaluate(&db, &B, &anchor, pages, now).unwrap().unwrap();
-            record(&mut db, &B, &seen, &chain, None, now).unwrap();
+            record(&mut db, &B, &seen, &chain, None, true, now).unwrap();
             chain
         };
         let before = evidence(&a, false, vec![a_approves.clone()]);
@@ -2147,5 +2318,426 @@ mod tests {
         };
         assert!(verifies(&k1), "the abandoned key still verifies as 1");
         assert!(!verifies(&k1b), "the new key under that number never does");
+    }
+
+    // ---- v2.10 hand-over: member trust after a custodian revocation (U1b, G6) ----
+
+    /// A0 approved `members` member devices for the fleet, let each commit to
+    /// it and granted each generation 0, then appointed B, and B revoked A0:
+    /// the evidence a server serves to every session, as it was before the
+    /// hand-over and after, and what it serves only for a named signer.
+    struct HandOver {
+        a: Custodian,
+        members: Vec<Ed25519SigningKey>,
+        before: Vec<Vec<u8>>,
+        after: Vec<Vec<u8>>,
+        named: Named,
+        keys: Vec<[u8; 32]>,
+    }
+
+    type Named = BTreeMap<[u8; 32], Vec<Vec<u8>>>;
+
+    fn hand_over(members: u16) -> HandOver {
+        let a = a0();
+        let b = Ed25519SigningKey::from_bytes(&[0x0b; 32]);
+        let device = |to: &shardx_core::trust_chain::Recipient| GrantSubject::Device {
+            account_id: to.account_id,
+            device_id: to.device_id,
+            signing_key_id: to.signing_key_id,
+            hpke_key_id: to.hpke_key_id,
+        };
+        let capability = |issuer: &Ed25519SigningKey, subject, replay, t, capability, fleet| {
+            let (scope_kind, scope_id) = if fleet {
+                (CapabilityScopeKind::Fleet, FLEET)
+            } else {
+                (CapabilityScopeKind::Tenant, B.tenant_id)
+            };
+            let g = TenantCapabilityGrantV2 {
+                common: live_from(replay, t),
+                subject,
+                scope_kind,
+                scope_id,
+                capability,
+            };
+            build_record(issuer, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let mut before = evidence(&a, false, Vec::new()).remove(0).containers;
+        before.push(capability(
+            &a.sk,
+            device(&a.to),
+            20,
+            T0,
+            Capability::DeviceApprove,
+            false,
+        ));
+        let mut named = Named::new();
+        let keys: Vec<Ed25519SigningKey> = (0..members)
+            .map(|i| {
+                let mut seed = [0x60; 32];
+                seed[..2].copy_from_slice(&i.to_le_bytes());
+                Ed25519SigningKey::from_bytes(&seed)
+            })
+            .collect();
+        for (i, m) in (0u16..).zip(&keys) {
+            let mut device_id = [0x61; 16];
+            device_id[..2].copy_from_slice(&i.to_le_bytes());
+            let to = shardx_core::trust_chain::Recipient {
+                account_id: a.to.account_id,
+                device_id,
+                signing_key_id: id(m),
+                // `device_grant` seals to A0's key: only the subject matters.
+                hpke_key_id: a.to.hpke_key_id,
+            };
+            let approval = DeviceApprovalV2 {
+                common: live(25),
+                subject_account_id: to.account_id,
+                subject_device_id: to.device_id,
+                subject_signing_key_id: to.signing_key_id,
+                subject_hpke_key_id: to.hpke_key_id,
+                approval_scope_kind: ApprovalScopeKind::Fleet,
+                approval_scope_id: FLEET,
+            };
+            let commit = capability(&a.sk, device(&to), 26, T0, Capability::ProfileCommit, true);
+            named.insert(
+                to.signing_key_id,
+                vec![
+                    build_record(&a.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+                    commit,
+                ],
+            );
+            before.push(device_grant(&a, &to, 0, &[0x30; 32], 27));
+        }
+        let me_b = shardx_core::trust_chain::Recipient {
+            account_id: a.to.account_id,
+            device_id: [0x0b; 16],
+            signing_key_id: id(&b),
+            hpke_key_id: [0x0c; 32],
+        };
+        let approval = DeviceApprovalV2 {
+            common: live_from(21, T0 + DAY),
+            subject_account_id: me_b.account_id,
+            subject_device_id: me_b.device_id,
+            subject_signing_key_id: me_b.signing_key_id,
+            subject_hpke_key_id: me_b.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: B.tenant_id,
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: live_from(22, T0 + 2 * DAY),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: me_b.account_id,
+            subject_device_id: me_b.device_id,
+            subject_signing_key_id: me_b.signing_key_id,
+            recipient_hpke_key_id: me_b.hpke_key_id,
+            subject_device_approval_replay_id: [21; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let revocation = DeviceRevocationV2 {
+            common: live_from(24, T0 + 4 * DAY),
+            subject_account_id: a.to.account_id,
+            subject_device_id: a.to.device_id,
+            subject_signing_key_id: a.to.signing_key_id,
+            subject_hpke_key_id: a.to.hpke_key_id,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        let mut after = before.clone();
+        after.extend([
+            build_record(&a.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(&a.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+            capability(
+                &b,
+                device(&me_b),
+                23,
+                T0 + 3 * DAY,
+                Capability::DeviceRevoke,
+                false,
+            ),
+            build_record(&b, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ]);
+        HandOver {
+            keys: vec![
+                a.sk.verifying_key().to_bytes(),
+                b.verifying_key().to_bytes(),
+            ],
+            a,
+            members: keys,
+            before,
+            after,
+            named,
+        }
+    }
+
+    /// What the server serves to every session, and per signer asked for.
+    type Served = std::sync::Arc<std::sync::Mutex<(Vec<Vec<u8>>, Named)>>;
+
+    /// This device, its ledger pinned to A0 in the join ceremony, against a
+    /// server serving `h`'s evidence from before the hand-over. The server
+    /// reports A0's device revoked once it serves a revocation.
+    struct Device {
+        rt: tokio::runtime::Runtime,
+        client: FleetClient,
+        seen: crate::fleet_custody::tests::Seen,
+        served: Served,
+        db: Db,
+        anchor: [u8; 32],
+        _dir: tempfile::TempDir,
+    }
+
+    fn device(h: &HandOver) -> Device {
+        let served: Served =
+            std::sync::Arc::new(std::sync::Mutex::new((h.before.clone(), h.named.clone())));
+        let (from, keys) = (served.clone(), h.keys.clone());
+        let revoked = h.a.to.device_id;
+        let reply = move |call: &str, _: &[u8]| {
+            let (base, named) = &*from.lock().unwrap();
+            let mut p = page(&[], base.clone());
+            p.signing_public_keys = keys.clone();
+            for s in call
+                .split_once('?')
+                .map_or("", |(_, q)| q)
+                .split('&')
+                .filter_map(|kv| kv.strip_prefix("signer="))
+            {
+                let signer = decode_hex32(s, "signer").unwrap();
+                p.containers
+                    .extend(named.get(&signer).cloned().unwrap_or_default());
+            }
+            if p.containers.iter().any(|c| {
+                AuthorizationRecord::parse(c)
+                    .is_ok_and(|r| r.payload_domain() == DOMAIN_DEVICE_REVOCATION)
+            }) {
+                p.device_revocations.push(RevokedDevice {
+                    device_id: revoked,
+                    revoked_at_ms: T0 + 4 * DAY,
+                });
+            }
+            (200, p.encode())
+        };
+        let rt = crate::fleet_custody::tests::runtime();
+        let (client, seen) = rt.block_on(crate::fleet_custody::tests::mock(std::sync::Arc::new(
+            reply,
+        )));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let anchor = h.a.to.signing_key_id;
+        assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
+        Device {
+            rt,
+            client,
+            seen,
+            served,
+            db,
+            anchor,
+            _dir: dir,
+        }
+    }
+
+    impl Device {
+        /// The server now serves `base`, and `named` per signer.
+        fn serve(&self, base: &[Vec<u8>], named: &Named) {
+            *self.served.lock().unwrap() = (base.to_vec(), named.clone());
+        }
+
+        /// One evidence read naming `named`, through the closure path.
+        fn fetch(
+            &mut self,
+            named: &[[u8; 32]],
+            now: u64,
+        ) -> Result<(Vec<TenantTrustEvidencePageV2>, bool)> {
+            let pin = (B, self.anchor);
+            self.rt.block_on(closure_evidence(
+                &self.client,
+                "t",
+                &hex(&B.tenant_id),
+                &mut self.db,
+                &pin,
+                named,
+                now,
+            ))
+        }
+
+        /// What a collect or a walk does with one read naming `named`: it
+        /// evaluates and records the listing. The chain it evaluated.
+        fn evaluate(&mut self, named: &[[u8; 32]], now: u64) -> Result<TrustChain> {
+            let (pages, closure) = self.fetch(named, now)?;
+            let (seen, chain) = evaluate(&self.db, &B, &self.anchor, &pages, now)?.unwrap();
+            record(&mut self.db, &B, &seen, &chain, None, closure, now)?;
+            Ok(chain)
+        }
+
+        /// The signers each evidence request named, sorted.
+        fn asked(&self) -> Vec<Vec<String>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c.contains("/trust-evidence"))
+                .map(|(c, _)| {
+                    let mut s: Vec<String> = c
+                        .split_once('?')
+                        .map_or("", |(_, q)| q)
+                        .split('&')
+                        .filter_map(|kv| kv.strip_prefix("signer=").map(str::to_owned))
+                        .collect();
+                    s.sort();
+                    s
+                })
+                .collect()
+        }
+
+        fn evaluations(&self) -> i64 {
+            self.db
+                .conn
+                .query_row("SELECT count(*) FROM trust_evaluations", [], |r| r.get(0))
+                .unwrap()
+        }
+    }
+
+    /// When the hand-over's evidence is served.
+    const AFTER: u64 = T0 + 5 * DAY;
+
+    /// A member's standing as a walk over its head checks it.
+    fn trusts(chain: &TrustChain, m: &Ed25519SigningKey, t: u64) -> bool {
+        chain.approval_valid_at(&id(m), Scope::Fleet(FLEET), t)
+            && chain.capability_at(&id(m), Capability::ProfileCommit, Scope::Fleet(FLEET), t)
+    }
+
+    /// Architect G1b: a device whose first evaluation comes after B revoked
+    /// A0 (a join, a collect, an import) counts the revocation in a closure,
+    /// so a member approved by A0 that it first walks later is trusted.
+    #[test]
+    fn a_device_first_evaluating_after_the_old_roots_revocation_trusts_a_members_head() {
+        let h = hand_over(1);
+        let mut d = device(&h);
+        d.serve(&h.after, &h.named);
+        d.evaluate(&[], AFTER).unwrap();
+        assert!(
+            withdrawn(&d.db, &B, &d.anchor).unwrap(),
+            "A0's revocation counted"
+        );
+        let m = &h.members[0];
+        let chain = d.evaluate(&[id(m)], AFTER + DAY).unwrap();
+        assert!(trusts(&chain, m, AFTER + DAY), "M's head is trusted");
+    }
+
+    /// Critic G6: a member device that evaluated before the hand-over counts
+    /// A0's revocation in a closure, so another member's A0-issued approval
+    /// it first sees afterwards was seen in the counting evaluation.
+    #[test]
+    fn a_device_that_counted_the_old_roots_revocation_accepts_a_member_approval_it_first_sees_later(
+    ) {
+        let h = hand_over(2);
+        let mut d = device(&h);
+        let chain = d.evaluate(&[id(&h.members[0])], T0 + DAY / 2).unwrap();
+        assert!(trusts(&chain, &h.members[0], T0 + DAY / 2));
+        d.serve(&h.after, &h.named);
+        d.evaluate(&[], AFTER).unwrap();
+        assert!(withdrawn(&d.db, &B, &d.anchor).unwrap());
+        let later = &h.members[1];
+        let chain = d.evaluate(&[id(later)], AFTER + DAY).unwrap();
+        assert!(
+            trusts(&chain, later, AFTER + DAY),
+            "the later approval stands"
+        );
+    }
+
+    /// D12: the closure is one listing naming every fleet grant subject the
+    /// unscoped evidence holds, evaluated and recorded as one evaluation.
+    #[test]
+    fn the_closure_evaluates_one_named_signer_listing() {
+        let h = hand_over(3);
+        let mut d = device(&h);
+        d.serve(&h.after, &h.named);
+        d.evaluate(&[], AFTER).unwrap();
+        let mut subjects: Vec<String> = h.members.iter().map(|m| hex(&id(m))).collect();
+        subjects.sort();
+        assert_eq!(d.asked(), [Vec::new(), subjects]);
+        assert_eq!(d.evaluations(), 1, "only the closure listing is recorded");
+        assert!(withdrawn(&d.db, &B, &d.anchor).unwrap());
+    }
+
+    /// D12 fails closed past the server's 64 signers: nothing is recorded
+    /// and no listing is read beyond the first. 64 signers still close.
+    #[test]
+    fn more_than_64_closure_signers_fail_closed() {
+        let h = hand_over(65);
+        let mut d = device(&h);
+        d.serve(&h.after, &h.named);
+        let err = d.fetch(&[], AFTER).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.trustClosureTooLarge"),
+            "{err:#}"
+        );
+        assert_eq!(d.asked(), [Vec::<String>::new()]);
+        assert_eq!(d.evaluations(), 0);
+        assert!(!withdrawn(&d.db, &B, &d.anchor).unwrap());
+
+        let h = hand_over(64);
+        let mut d = device(&h);
+        d.serve(&h.after, &h.named);
+        assert!(d.fetch(&[], AFTER).unwrap().1, "64 signers close");
+        let sizes: Vec<usize> = d.asked().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [0, 64]);
+    }
+
+    /// D12 costs nothing without a custodian revocation: a first evaluation
+    /// reads one unscoped listing, however many fleet grants it holds.
+    #[test]
+    fn a_first_evaluation_without_a_custodian_revocation_needs_no_closure() {
+        let h = hand_over(70);
+        let mut d = device(&h);
+        d.evaluate(&[], T0 + DAY / 2).unwrap();
+        assert_eq!(d.asked(), [Vec::<String>::new()]);
+        assert_eq!(d.evaluations(), 1);
+    }
+
+    /// Execution note 1: `record` refuses to count a not-yet-counted
+    /// revocation of a custodian key outside a closure listing, and records
+    /// nothing; the same listing flagged as a closure counts it.
+    #[test]
+    fn record_refuses_to_count_a_custodian_revocation_outside_a_closure() {
+        let h = hand_over(1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let anchor = h.a.to.signing_key_id;
+        assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
+        let mut pages = vec![page(&[], h.after.clone())];
+        pages[0].signing_public_keys = h.keys.clone();
+        let (seen, chain) = evaluate(&db, &B, &anchor, &pages, AFTER).unwrap().unwrap();
+        let err = record(&mut db, &B, &seen, &chain, None, false, AFTER).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.trustClosureNeeded"),
+            "{err:#}"
+        );
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM trust_evaluations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "nothing recorded");
+        assert!(!withdrawn(&db, &B, &anchor).unwrap());
+        record(&mut db, &B, &seen, &chain, None, true, AFTER).unwrap();
+        assert!(withdrawn(&db, &B, &anchor).unwrap());
+    }
+
+    /// The C-1 bound (section 9): a member the server omits from the closure
+    /// listing is first seen after the count and stays untrusted; it must
+    /// enroll again.
+    #[test]
+    fn a_member_the_server_omits_from_the_closure_is_untrusted() {
+        let h = hand_over(1);
+        let mut d = device(&h);
+        d.serve(&h.after, &Named::new());
+        d.evaluate(&[], AFTER).unwrap();
+        assert!(withdrawn(&d.db, &B, &d.anchor).unwrap());
+        d.serve(&h.after, &h.named);
+        let m = &h.members[0];
+        let chain = d.evaluate(&[id(m)], AFTER + DAY).unwrap();
+        assert!(
+            !trusts(&chain, m, AFTER + DAY),
+            "the omitted member is untrusted"
+        );
     }
 }
