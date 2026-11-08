@@ -4,9 +4,12 @@ import Badge, { type BadgeColor } from "../../../shared/ui/Badge";
 import { toast } from "../../../shared/model/toast";
 import { confirmModal } from "../../../shared/model/confirm";
 import { useT } from "../../../shared/i18n";
+import { safeUiError } from "../../../shared/lib/utils";
+import { useProfile } from "../../../entities/profile";
 import {
   teamFleetCustodyStatus, teamFleetKeySetup, teamDevices, teamApproveDevice, teamRevokeDevice,
-  type FleetCustodyStatus, type TeamDevice, type TeamRevokeReason,
+  teamFleetKeyRotate, teamProfilesUnderOlderKey, teamPull, teamCheckIn, useTeamProfiles,
+  type FleetCustodyStatus, type TeamDevice, type TeamRevokeReason, type OlderKeyProfile,
 } from "../../../entities/team";
 
 /** The account login TeamCard holds; `take` hands over the password and clears it. */
@@ -50,8 +53,15 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   const [full, setFull] = useState<Set<string>>(new Set());
   const [reasons, setReasons] = useState<Record<string, TeamRevokeReason>>({});
   const [now, setNow] = useState(Date.now());
+  const [older, setOlder] = useState<OlderKeyProfile[]>([]);
+  const [olderErrors, setOlderErrors] = useState<Record<string, string>>({});
+  const profiles = useProfile((s) => s.profiles);
+  const refreshBindings = useTeamProfiles((s) => s.refresh);
+  const loadOlder = () => teamProfilesUnderOlderKey().then(setOlder).catch(() => {});
+  const nameOf = (id: string) => profiles.find((x) => x.id === id)?.name ?? id;
   useEffect(() => {
     teamFleetCustodyStatus().then(setFleet).catch(() => {});
+    void loadOlder();
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
@@ -92,6 +102,55 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
     }
   });
 
+  const rotation = fleet?.rotation ?? null;
+  const unfinished = rotation?.phase === "preparing" || rotation?.phase === "activated";
+  const stuck = rotation?.phase === "expired";
+  const rotate = async () => {
+    const ok = await confirmModal({
+      title: t("team.rotation.confirmTitle"),
+      message: `${t("team.rotation.confirm")} ${t("team.rotation.retroactive")}`,
+      buttons: [
+        { label: t("common.cancel"), value: false },
+        { label: t(unfinished ? "team.rotation.resume" : "team.rotation.rotate"), value: true, danger: true },
+      ],
+    });
+    if (ok !== true) return;
+    await run("rotate", async () => {
+      const [u, p] = login();
+      try {
+        const next = await teamFleetKeyRotate(u, p);
+        setFleet(next);
+        toast.ok(t("team.rotation.done", { n: next.rotation?.generation ?? 0 }));
+        const refused = next.rotation?.members_refused ?? 0;
+        if (refused > 0) toast.err(t("team.rotation.membersRefused", { n: refused }));
+      } catch (e) {
+        // Whatever step it reached is saved; show where the next try resumes.
+        teamFleetCustodyStatus().then(setFleet).catch(() => {});
+        throw e;
+      } finally {
+        onFleetKey();
+        void loadOlder();
+      }
+    });
+  };
+
+  // Pull first, so a copy behind the remote head does not fail its base; a
+  // refused pull pushes nothing and keeps the row with its error.
+  const repush = (o: OlderKeyProfile) => run(`repush:${o.profile_id}`, async () => {
+    const [u, p] = login();
+    try {
+      await teamPull(o.profile_id, u, p);
+      await teamCheckIn(o.profile_id, u, p);
+      setOlderErrors(({ [o.profile_id]: _, ...rest }) => rest);
+      toast.ok(t("team.rotation.repushed", { name: nameOf(o.profile_id) }));
+    } catch (e) {
+      setOlderErrors((m) => ({ ...m, [o.profile_id]: safeUiError(e) }));
+    } finally {
+      void loadOlder();
+      void refreshBindings();
+    }
+  });
+
   const list = () => run("devices", async () => {
     const [u, p] = login();
     setRows(await teamDevices(u, p));
@@ -119,6 +178,8 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
       const [u, p] = login();
       await teamRevokeDevice(u, p, r.device_id, reason);
       mark(r.device_id, "revoked");
+      // A revoked holder of the current fleet key raises the rotation banner.
+      teamFleetCustodyStatus().then(setFleet).catch(() => {});
       toast.ok(t("team.devices.revoked", { label: r.label }));
     });
   };
@@ -152,6 +213,75 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
             </Button>
           </div>
         </>
+      )}
+
+      {done && (
+        <div data-testid="team-rotation" className="flex flex-col gap-2">
+          {fleet?.rotation_required && !unfinished && (
+            <p
+              data-testid="team-rotation-banner"
+              className={`m-0 text-paragraph-xs ${fleet.rotation_required === "urgent" ? "text-state-error-base" : "text-text-sub-600"}`}
+            >
+              {t(fleet.rotation_required === "urgent" ? "team.rotation.bannerUrgent" : "team.rotation.bannerRoutine")}
+            </p>
+          )}
+          {rotation && (unfinished || stuck) && (
+            <p data-testid="team-rotation-status" className="m-0 text-paragraph-xs text-state-error-base">
+              {t(stuck ? "team.rotation.expired" : "team.rotation.unfinished", { n: rotation.generation })}
+              {unfinished && rotation.deadline_ms != null
+                && ` ${t("team.rotation.deadline", { date: new Date(rotation.deadline_ms).toLocaleString() })}`}
+            </p>
+          )}
+          {rotation?.phase === "done" && (
+            <p data-testid="team-rotation-status" className="m-0 text-paragraph-xs text-text-sub-600">
+              {t("team.rotation.done", { n: rotation.generation })}{" "}
+              {t("team.rotation.members", {
+                filed: rotation.members_filed, refused: rotation.members_refused, skipped: rotation.members_skipped,
+              })}
+            </p>
+          )}
+          <div>
+            <Button
+              size="small" mode="stroke"
+              disabled={!!busy || !account.signedIn || stuck || !(ready || unfinished)}
+              onClick={() => { void rotate(); }}
+            >
+              {busy === "rotate"
+                ? t("team.rotation.busy")
+                : t(unfinished ? "team.rotation.resume" : "team.rotation.rotate")}
+            </Button>
+          </div>
+          {older.length > 0 && (
+            <div data-testid="team-older-key" className="flex flex-col gap-1.5">
+              <span className="text-label-xs text-text-strong-950">{t("team.rotation.olderTitle")}</span>
+              <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.rotation.olderCost")}</p>
+              {older.map((o) => (
+                <div
+                  key={o.profile_id}
+                  data-testid="team-older-key-profile"
+                  className="flex flex-col gap-1 rounded-10 px-3 py-2 ring-1 ring-inset ring-stroke-soft-200"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-label-xs text-text-strong-950">{nameOf(o.profile_id)}</span>
+                    <span className="text-paragraph-xs text-text-soft-400">
+                      {t("team.rotation.olderGeneration", { n: o.key_generation })}
+                    </span>
+                    <Button
+                      size="xsmall" mode="stroke"
+                      disabled={!!busy || !account.signedIn}
+                      onClick={() => { void repush(o); }}
+                    >
+                      {t("team.rotation.pullAndPush")}
+                    </Button>
+                  </div>
+                  {olderErrors[o.profile_id] && (
+                    <p className="m-0 text-paragraph-xs text-state-error-base">{olderErrors[o.profile_id]}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       <div>

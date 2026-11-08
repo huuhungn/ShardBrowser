@@ -486,7 +486,13 @@ test("a refused action shows the localized error and keeps the row", async ({ pa
 });
 
 type TeamHead = { version: number; label: string | null; holder: string | null; revoked: boolean };
-type TeamDeviceRow = { device_id: string; label: string; status: "pending" | "active" | "revoked"; granted: boolean };
+type TeamDeviceRow = {
+  device_id: string; label: string; status: "pending" | "active" | "revoked"; granted: boolean;
+  /** The fleet generation its grant is for. */
+  generation?: number;
+  /** The server refuses it a grant for a rotated key. */
+  refuses?: boolean;
+};
 
 /**
  * The one team server both devices of the journey talk to, through the
@@ -497,11 +503,18 @@ type TeamDeviceRow = { device_id: string; label: string; status: "pending" | "ac
  * It also lists the tenant's devices: A, the active root custodian, plus any
  * in `more`. Enrolling files a pending row; approving one grants it the fleet
  * key once A created it, and revoking one refuses its sessions from then on.
+ * A rotation grants the next generation to every active device but A's
+ * refused ones; a push sealed under an older generation is refused.
  */
 function fakeTeamServer(more: TeamDeviceRow[] = []) {
   const heads = new Map<string, TeamHead>();
   const devices: TeamDeviceRow[] = [{ device_id: "aa".repeat(16), label: "Machine A", status: "active", granted: false }, ...more];
   let fleetKey = false;
+  let generation = 0;
+  // The generation each head was sealed under.
+  const sealed = new Map<string, number>();
+  // A pull of these profiles is refused with the code given.
+  const refusePull = new Map<string, string>();
   let enrolled = 0;
   const row = (id: unknown) => devices.find((d) => d.device_id === id);
   // A device session: a revoked device is refused, as v2_auth refuses it.
@@ -522,11 +535,12 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
     const h = head(id);
     return {
       remote_profile_id: id, version: h.version, label: h.label,
-      quarantine: h.revoked ? "SIGNER_REVOKED" : null, revert_available: h.revoked,
+      quarantine: h.revoked ? "SIGNER_REVOKED" : null, revert_available: h.revoked, key_generation: sealed.get(id) ?? 0,
     };
   };
   type Args = {
     label?: string | null; remote_profile_id?: string; pin?: number | null; device_id?: string; target?: string;
+    generation?: number;
   };
   const ops: Record<string, (device: string, args: Args) => unknown> = {
     enroll: (_device, { label }) => {
@@ -541,7 +555,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       return devices.map(({ device_id: id, label, status }) => ({ device_id: id, label, status }));
     },
     fleetKey: (_device, { device_id }) => {
-      live(device_id).granted = true;
+      Object.assign(live(device_id), { granted: true, generation });
       fleetKey = true;
       return null;
     },
@@ -549,28 +563,55 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       live(device_id);
       const d = row(target);
       if (d?.status !== "pending") throw new Error("[[shardx:fleet.deviceNotPending]]");
-      Object.assign(d, { status: "active", granted: fleetKey });
+      Object.assign(d, { status: "active", granted: fleetKey, generation });
       return null;
     },
     revoke: (_device, { device_id, target }) => {
       live(device_id);
+      const held = !!row(target)?.granted;
       Object.assign(row(target) ?? {}, { status: "revoked", granted: false });
-      return null;
+      return { held };
     },
-    collect: (_device, { device_id }) => ({ granted: live(device_id).granted }),
+    rotate: (_device, { device_id }) => {
+      live(device_id);
+      generation += 1;
+      let [filed, refused, skipped] = [0, 0, 0];
+      for (const d of devices) {
+        if (d.status === "revoked") skipped += 1;
+        if (d.status !== "active") continue;
+        if (d.device_id !== device_id && d.refuses) refused += 1;
+        else {
+          Object.assign(d, { granted: true, generation });
+          if (d.device_id !== device_id) filed += 1;
+        }
+      }
+      return { generation, filed, refused, skipped };
+    },
+    collect: (_device, { device_id }) => {
+      const d = live(device_id);
+      return { granted: d.granted, generation: d.generation ?? 0 };
+    },
     list: () => [...heads.keys()].map(reply),
-    publish: (device, { label }) => {
+    publish: (device, { label, generation: g }) => {
       const id = `d${heads.size + 1}`.repeat(16);
       heads.set(id, { version: 0, label: label ?? null, holder: device, revoked: false });
+      sealed.set(id, g ?? 0);
       return reply(id);
     },
-    pull: (_device, { remote_profile_id }) => reply(String(remote_profile_id)),
+    pull: (_device, { remote_profile_id }) => {
+      const code = refusePull.get(String(remote_profile_id));
+      if (code) throw new Error(`[[shardx:${code}]]`);
+      return reply(String(remote_profile_id));
+    },
     // Check-in is the checkout inside push: it takes the lease when free and releases it.
-    push: (device, { remote_profile_id, pin }) => {
+    push: (device, args) => {
+      const { remote_profile_id, pin } = args;
       const h = head(String(remote_profile_id));
       if (h.holder && h.holder !== device) throw new Error(`lease held by device ${h.holder}`);
       if (h.revoked || pin !== h.version) throw new Error("[[shardx:sync.remoteAhead]]");
+      if ((args.generation ?? 0) < generation) throw new Error("[[shardx:sync.fleetKeyRotated]]");
       Object.assign(h, { version: h.version + 1, holder: null });
+      sealed.set(String(remote_profile_id), args.generation ?? 0);
       return reply(String(remote_profile_id));
     },
     // Not modelled: the caller's pin, the lease, and proven vs reported-only revocation.
@@ -584,6 +625,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   return {
     heads,
     devices,
+    refusePull,
     call: (op: string, device: string, args: Args) => ops[op](device, args),
     /** A device whose key is later proven revoked checks in a new head. */
     revokedCheckIn: (id: string) => Object.assign(head(id), { version: head(id).version + 1, revoked: true }),
@@ -702,6 +744,195 @@ async function admitB(a: Page, b: Page) {
     await expect(b.getByTestId("team-joined")).toContainText("holds a verified fleet key");
   });
 }
+
+/** Revokes the custodian's device row labelled `label` as `reason`, through its confirm dialog. */
+async function revokeAs(a: Page, label: string, reason: "Retired" | "Lost") {
+  const row = await listDevices(a, label);
+  await cardSignIn(a);
+  if (reason === "Lost") {
+    await row.getByRole("combobox", { name: "Reason" }).click();
+    await a.getByRole("option", { name: "Lost" }).click();
+  }
+  await row.getByRole("button", { name: "Revoke" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).not.toContainText("until key rotation ships");
+  await expect(dialog).toContainText("until you rotate the fleet key: rotate it after revoking.");
+  await dialog.getByRole("button", { name: "Revoke" }).click();
+  await expect(row).toContainText("Revoked");
+}
+
+/** Rotates the fleet key on A through the confirm dialog, which warns that rotation does not reach back. */
+async function rotateOn(a: Page, button = "Rotate fleet key") {
+  await cardClick(a, button);
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("must be activated within 30 days");
+  await expect(dialog).toContainText("keys and data a revoked device already copied cannot be revoked retroactively");
+  await dialog.getByRole("button", { name: button }).click();
+}
+
+test("a revoke raises the rotation banner by reason, and a rotation clears it and asks for a new recovery bundle", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 },
+    { device_id: "c2".repeat(16), label: "Machine D", status: "active", granted: true, generation: 0 },
+    { device_id: "c3".repeat(16), label: "Machine E", status: "active", granted: false },
+    { device_id: "c4".repeat(16), label: "Machine F", status: "active", granted: true, generation: 0, refuses: true },
+  ]);
+  const card = await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  const banner = card.getByTestId("team-rotation-banner");
+
+  await test.step("a revoked device that held no fleet key raises no banner", async () => {
+    await revokeAs(a, "Machine E", "Retired");
+    await expect(banner).toHaveCount(0);
+  });
+
+  await test.step("routine after a retired holder, urgent after a lost one", async () => {
+    await revokeAs(a, "Machine C", "Retired");
+    await expect(banner).toContainText("A retired device still holds the team's current fleet key.");
+    await revokeAs(a, "Machine D", "Lost");
+    await expect(banner).toContainText("A revoked device that was lost");
+  });
+
+  await test.step("the rotation clears the banner, reports refused members and asks for a new bundle", async () => {
+    await expect(card.getByTestId("team-export-due")).toHaveCount(0);
+    await rotateOn(a);
+    await expect(a.getByText("Fleet key rotated to generation 1.").first()).toBeVisible();
+    await expect(a.getByText("The team server refused the new fleet key for 1 device(s).")).toBeVisible();
+    await expect(banner).toHaveCount(0);
+    await expect(card.getByTestId("team-rotation-status"))
+      .toContainText("New key granted to 0 device(s); refused by the server for 1; skipped for 3.");
+    await expect(card.getByTestId("team-export-due")).toContainText("Export the recovery bundle again.");
+  });
+
+  await test.step("exporting the recovery bundle ends the prompt", async () => {
+    const out = card.getByTestId("team-export");
+    await cardSignIn(a);
+    await out.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+    await out.getByLabel("Recovery passphrase again").fill("correct horse");
+    await out.getByLabel("I recorded this root key fingerprint").check();
+    await out.getByRole("button", { name: "Export recovery bundle" }).click();
+    await expect(a.getByText("Recovery bundle exported to C:\\Users\\Example\\shardx-recovery.shxrecovery.")).toBeVisible();
+    await expect(card.getByTestId("team-export-due")).toHaveCount(0);
+  });
+});
+
+test("an unfinished rotation shows Resume and its deadline, and refuses Approve until it is done", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "pending", granted: false }]);
+  const card = await teamDevicePage(a, "a", server, false, "&teamRotation=unfinished");
+  await expect(card.getByTestId("team-rotation-status")).toContainText("The fleet key rotation to generation 1 is unfinished.");
+  await expect(card.getByTestId("team-rotation-status")).toContainText("Finish it before");
+  const row = await listDevices(a, "Machine C");
+  await cardSignIn(a);
+  await row.getByLabel("The code on the other device matches").check();
+  await row.getByRole("button", { name: "Approve" }).click();
+  await expect(a.getByText("A fleet key rotation is unfinished. Finish it before approving a device.")).toBeVisible();
+  expect(server.devices.find((d) => d.label === "Machine C")?.status).toBe("pending");
+
+  await rotateOn(a, "Resume fleet key rotation");
+  await expect(card.getByTestId("team-rotation-status")).toContainText("Fleet key rotated to generation 1.");
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeVisible();
+  await cardSignIn(a);
+  await row.getByRole("button", { name: "Approve" }).click();
+  await expect(row).toContainText("Active");
+});
+
+test("an expired rotation shows the stuck notice, keeps Rotate off, and Approve works", async ({ page: a }) => {
+  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "pending", granted: false }]);
+  const card = await teamDevicePage(a, "a", server, false, "&teamRotation=expired");
+  await expect(card.getByTestId("team-rotation-status")).toContainText("expired before it was activated");
+  await expect(card.getByTestId("team-rotation-status")).not.toContainText("Finish it before");
+  await cardSignIn(a);
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeDisabled();
+  const row = await listDevices(a, "Machine C");
+  await cardSignIn(a);
+  await row.getByLabel("The code on the other device matches").check();
+  await row.getByRole("button", { name: "Approve" }).click();
+  await expect(row).toContainText("Active");
+});
+
+test("a pull refused as under a retired key shows why", async ({ page }) => {
+  const row = await teamPage(page, "&teamRefuse=profile_sync_pull&teamRefuseCode=sync.headUnderRetiredKey");
+  await teamSignIn(page);
+  await row("VN Automation 001").getByRole("button", { name: "Pull" }).click();
+  await expect(page.getByText("This snapshot is under an older team key this device does not hold.")).toBeVisible();
+  await expect(page.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("after a rotation the custodian pulls and pushes profiles under an older key, and a member follows the new key", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  test.slow();
+  const server = fakeTeamServer();
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server);
+  await teamDevicePage(b, "b", server);
+  await admitB(a, b);
+  const rowA = a.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const rowB = b.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const click = async (page: Page, row: ReturnType<Page["getByTestId"]>, name: string) => {
+    await teamSignIn(page);
+    await row.getByRole("button", { name, exact: true }).click();
+  };
+  const older = a.getByTestId("team-older-key-profile").filter({ hasText: "Beta Research" });
+
+  await test.step("A publishes under generation 0, B joins and checks in, A stays behind", async () => {
+    await click(a, rowA, "Publish");
+    await click(a, rowA, "Check in");
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+    await teamSignIn(b);
+    await b.getByTestId("team-fleet").getByRole("button", { name: "Show fleet profiles" }).click();
+    await teamSignIn(b);
+    await b.getByTestId("team-fleet-profile").filter({ hasText: "Beta Research" }).getByRole("button", { name: "Join" }).click();
+    await click(b, rowB, "Check in");
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@2"]);
+  });
+
+  await test.step("A rotates; its profile still under generation 0 is listed", async () => {
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+    await rotateOn(a);
+    await expect(older).toContainText("Generation 0");
+    await expect(a.getByTestId("team-older-key")).toContainText("cannot read these profiles");
+  });
+
+  const id = [...server.heads.keys()][0];
+  await test.step("a refused pull keeps the row with its error and pushes nothing", async () => {
+    server.refusePull.set(id, "sync.pushPending");
+    await cardSignIn(a);
+    await older.getByRole("button", { name: "Pull and push" }).click();
+    await expect(older).toContainText("A push of this profile has not finished.");
+    expect(server.heads.get(id)?.version).toBe(2);
+    server.refusePull.delete(id);
+  });
+
+  await test.step("Pull and push pulls B's version first, then pushes under generation 1", async () => {
+    await cardSignIn(a);
+    await older.getByRole("button", { name: "Pull and push" }).click();
+    await expect(a.getByText("Beta Research is now under the newest fleet key.")).toBeVisible();
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@3"]);
+  });
+
+  await test.step("B's check-in under the old key is refused; B collects generation 1 and checks in", async () => {
+    await click(b, rowB, "Pull");
+    await click(b, rowB, "Check in");
+    await expect(b.getByText("The team's fleet key was rotated", { exact: false })).toBeVisible();
+    await cardClick(b, "Collect key custody");
+    await expect(b.getByText("Fleet key collected (generation 1).")).toBeVisible();
+    await click(b, rowB, "Check in");
+    await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@4"]);
+  });
+
+  await test.step("two more rotations later, B is told to enroll again", async () => {
+    await rotateOn(a);
+    await expect(a.getByText("Fleet key rotated to generation 2.").first()).toBeVisible();
+    await rotateOn(a);
+    await expect(a.getByText("Fleet key rotated to generation 3.").first()).toBeVisible();
+    await cardClick(b, "Collect key custody");
+    await expect(b.getByText("This device missed more than one fleet key rotation", { exact: false })).toBeVisible();
+    await expect(b.getByText("The fleet key grant for this device failed its check", { exact: false })).toHaveCount(0);
+  });
+  await b.context().close();
+});
 
 // The two-machine gate (Plan:2388), each step a test.step below:
 //   publish               = S5 publish on A
