@@ -8079,6 +8079,73 @@ mod tests {
         assert!(w.blocked(GEN), "retired never replaces compromised");
     }
 
+    /// U2 (Q-57): a member revoked as `compromised`, the reason Revoke now
+    /// offers for a member row, blocks pushes under the key it held; the
+    /// custodian's rotation, once this device collects the new key, lets
+    /// pushes seal again.
+    #[test]
+    fn a_member_revoked_as_compromised_blocks_pushes_until_a_rotation_and_collect() {
+        let reason = crate::fleet_custody::revoke_reason("compromised").unwrap();
+        let me = me();
+        let capability = |replay, capability| {
+            let g = TenantCapabilityGrantV2 {
+                common: common(replay),
+                subject: device_subject(&me),
+                scope_kind: CapabilityScopeKind::Tenant,
+                scope_id: TENANT,
+                capability,
+            };
+            build_record(&me.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let approval = DeviceApprovalV2 {
+            common: common(0x79),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: REVOKED,
+            subject_hpke_key_id: [0x78; 32],
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: TENANT,
+        };
+        let revocation = DeviceRevocationV2 {
+            common: common(30),
+            subject_account_id: [6; 16],
+            subject_device_id: [0x77; 16],
+            subject_signing_key_id: REVOKED,
+            subject_hpke_key_id: [0x78; 32],
+            reason_code: reason,
+        };
+        let mut evidence = vec![
+            capability(15, Capability::DeviceRevoke),
+            capability(16, Capability::DeviceApprove),
+            build_record(&me.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(&me.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode()),
+        ];
+        let w = world();
+        w.collect(2, &[0x52; 32], 70, evidence.clone());
+        assert!(w.blocked(2), "the member may hold generation 2");
+        let err = w.push().unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(w.sent("POST", "/checkout").is_empty(), "before checkout");
+
+        // The rotation: generation 3, activated under root 0, which the
+        // member never held, and never granted to it.
+        evidence.push(key_rotate(&me));
+        evidence.extend(activation(&me, 3, &[0x53; 32], 0, 61, None));
+        w.collect(3, &[0x53; 32], 72, evidence);
+        assert!(!w.blocked(3), "the new key is not exposed");
+        assert!(w.blocked(2), "the old one stays blocked");
+        // The collect keeps the key it opened (`keep_fleet_key`), and the
+        // server's checkout now names generation 3.
+        assert!(crate::fleet_keys::collect(&hex(&FLEET), 3, &[0x53; 32]).unwrap());
+        {
+            let mut f = w.fake();
+            f.generation = Some(3);
+            f.fkek_key_id = Some(shardx_core::fleet_grants::fkek_key_id(&[0x53; 32]));
+        }
+        let pushed = w.push().unwrap();
+        assert_eq!(pushed.version, 1);
+    }
+
     /// B3, Q-18 "In-flight commits": a COMMIT persisted while its upload is
     /// still OPEN, chunks unsent, when a compromise is counted, is aborted:
     /// no chunk, finalize or commit is sent, the upload is ABORTED, the

@@ -381,7 +381,7 @@ let custodyBootstrap = foreignRoot
     : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
 type FleetRotation = {
   generation: number; phase: "preparing" | "activated" | "done" | "expired"; deadline_ms: number | null;
-  members_filed: number; members_refused: number; members_skipped: number;
+  members_filed: number; members_refused: number; members_skipped: number; failing_member: string | null;
 };
 let fleetCustody: {
   started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
@@ -400,7 +400,7 @@ if (teamDevice === "a" && teamRotation) {
     ...fleetCustody, started: true, created: true, fkek_key_id: "fk".repeat(32),
     rotation: {
       generation: 1, phase: teamRotation === "expired" ? "expired" : "preparing", deadline_ms: Date.UTC(2099, 0, 31),
-      members_filed: 0, members_refused: 0, members_skipped: 0,
+      members_filed: 0, members_refused: 0, members_skipped: 0, failing_member: null,
     },
   };
   teamMe.collected = true;
@@ -443,6 +443,23 @@ const teamWindowOpen = () => {
   if (!teamMe.enrolled_at_ms || Date.now() > teamMe.enrolled_at_ms + TEAM_WINDOW_MS) teamRefuse("fleet.joinCodeExpired");
 };
 const teamCustodian = () => { if (!custodyBootstrap.activated) teamRefuse("fleet.notCustodian"); };
+/**
+ * Collect key custody's fleet grant: kept only once this device pins the
+ * anchor to verify it against, and only one generation above the newest it
+ * kept (Q-27).
+ */
+async function teamCollect() {
+  const { granted, generation } = await teamServer<{ granted: boolean; generation: number }>(
+    "collect", { device_id: teamMe.device_id },
+  );
+  const missed = granted && teamMe.collected && generation > teamGeneration + 1;
+  const kept = granted && teamMe.pinned && !missed;
+  if (kept) {
+    teamMe.collected = true;
+    teamGeneration = generation;
+  }
+  return { granted, generation, missed, kept };
+}
 const TEAM_SYNC = new Set([
   "team_fleet_profiles", "profile_sync_publish", "team_join_profile", "profile_sync_pull", "profile_sync_push",
   "profile_sync_revert",
@@ -451,6 +468,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
   const args = (payload ?? {}) as {
     profileId?: string; remoteProfileId?: string; localProfileId?: string; deviceId?: string; sas?: string;
     reason?: string; anchor?: string; label?: string; path?: string; oldDeviceLost?: boolean;
+    skipMember?: string | null;
   };
   const id = String(args.profileId ?? args.localProfileId ?? "");
   const head = () => ({
@@ -477,7 +495,9 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return fleetCustody;
     case "team_devices": {
       teamCustodian();
-      const rows = await teamServer<{ device_id: string; label: string; status: string }[]>("devices", me);
+      const rows = await teamServer<{ device_id: string; label: string; status: string; custodian: boolean }[]>(
+        "devices", me,
+      );
       return rows.map((r) => {
         if (r.status === "pending" && !teamFirstSeen.has(r.device_id)) teamFirstSeen.set(r.device_id, Date.now());
         const first = r.status === "pending" ? teamFirstSeen.get(r.device_id) : undefined;
@@ -504,15 +524,20 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     }
     case "team_revoke_device":
       teamCustodian();
-      if (args.reason !== "retired" && args.reason !== "lost") teamRefuse("fleet.revokeReasonUnsupported");
+      if (!["retired", "lost", "compromised"].includes(String(args.reason))) teamRefuse("fleet.revokeReasonUnsupported");
       if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
       // As the launcher: no saved Create fleet key, no revoke.
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
+      // As the launcher (Q-57): fresh evidence counting the row as a custodian refuses `compromised`.
+      if (args.reason === "compromised") {
+        const rows = await teamServer<{ device_id: string; custodian: boolean }[]>("devices", me);
+        if (rows.find((r) => r.device_id === args.deviceId)?.custodian) teamRefuse("fleet.compromisedCustodian");
+      }
       {
         // As the launcher: only a revoked holder of the current key asks for a rotation.
         const { held } = await teamServer<{ held: boolean }>("revoke", { ...me, target: args.deviceId });
         if (held && fleetCustody.rotation_required !== "urgent") {
-          fleetCustody = { ...fleetCustody, rotation_required: args.reason === "lost" ? "urgent" : "routine" };
+          fleetCustody = { ...fleetCustody, rotation_required: args.reason === "retired" ? "routine" : "urgent" };
         }
       }
       return null;
@@ -521,14 +546,25 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
       if (fleetCustody.rotation?.phase === "expired") teamRefuse("fleet.rotationStuck");
       if (!teamMe.collected) teamRefuse("fleet.rotationNeedsFleetKey");
-      const r = await teamServer<{ generation: number; filed: number; refused: number; skipped: number }>("rotate", me);
-      teamGeneration = r.generation; // the run ends with the verified collect of the new key
+      const skip = args.skipMember ?? null;
+      // As the launcher: only the member whose grant keeps failing can be skipped.
+      if (skip && skip !== fleetCustody.rotation?.failing_member) teamRefuse("fleet.rotationSkipRefused");
+      const r = await teamServer<{
+        generation: number; filed: number; refused: number; skipped: number; failing: string | null;
+      }>("rotate", { ...me, skip });
+      teamGeneration = r.generation; // the new key is collected before the members' grants
+      const rotation = {
+        generation: r.generation, deadline_ms: fleetCustody.rotation?.deadline_ms ?? null,
+        members_filed: r.filed, members_refused: r.refused, members_skipped: r.skipped,
+      };
+      if (r.failing) {
+        // A member's grant failed with an error a resend may cure: the rotation stays activated.
+        fleetCustody = { ...fleetCustody, rotation: { ...rotation, phase: "activated", failing_member: r.failing } };
+        teamRefuse("fleet.refusedCustody|status=503|detail=unavailable");
+      }
       fleetCustody = {
         ...fleetCustody,
-        rotation: {
-          generation: r.generation, phase: "done", deadline_ms: fleetCustody.rotation?.deadline_ms ?? null,
-          members_filed: r.filed, members_refused: r.refused, members_skipped: r.skipped,
-        },
+        rotation: { ...rotation, phase: "done", failing_member: null },
         rotation_required: null,
         export_due: true,
       };
@@ -600,15 +636,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       fleetCustody = { ...fleetCustody, export_due: false };
       return null;
     case "team_collect_custody": {
-      const { granted, generation } = await teamServer<{ granted: boolean; generation: number }>("collect", me);
-      // A grant is kept only once this device pins the anchor to verify it against,
-      // and only one generation above the newest it kept (Q-27).
-      const missed = granted && teamMe.collected && generation > teamGeneration + 1;
-      const kept = granted && teamMe.pinned && !missed;
-      if (kept) {
-        teamMe.collected = true;
-        teamGeneration = generation;
-      }
+      const { granted, generation, missed, kept } = await teamCollect();
       return {
         grants: 0, opened: 0, failed: 0, newest_generation: null,
         fleet_opened: kept ? 1 : 0, fleet_failed: missed ? 1 : 0, newest_fleet_generation: kept ? generation : null,
@@ -640,8 +668,21 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return 4096;
     case "profile_sync_push":
     case "profile_sync_revert": {
-      const h = await teamServer(cmd === "profile_sync_push" ? "push" : "revert", head());
-      return teamPushResult(teamSettle(teamBound(payload), h).remote_version);
+      const op = cmd === "profile_sync_push" ? "push" : "revert";
+      let h: TeamServerHead;
+      let collected: number | null = null;
+      try {
+        h = await teamServer(op, head());
+      } catch (e) {
+        // As the launcher: refused under a rotated key, it collects once and, once a key was kept, runs again once.
+        if (!String(e).includes("sync.fleetKeyRotated")) throw e;
+        const c = await teamCollect();
+        if (!c.kept) throw e;
+        collected = c.generation;
+        h = await teamServer(op, head());
+      }
+      const result = teamPushResult(teamSettle(teamBound(payload), h).remote_version);
+      return collected === null ? result : { ...result, collected_generation: collected };
     }
   }
   return undefined;

@@ -130,8 +130,13 @@ export function TeamProfiles() {
     return t("team.action.publishCancelled");
   }, false);
 
+  /** A sync the server refused under a rotated fleet key collected the new key and ran again. */
+  const collected = (r: { collected_generation?: number } | null) => {
+    if (r?.collected_generation != null) toast.info(t("team.fleetKeyCollected", { n: r.collected_generation }));
+  };
+
   const checkIn = (id: string) => run(`checkIn:${id}`, async (pw) => {
-    await teamCheckIn(id, username.trim(), pw);
+    collected(await teamCheckIn(id, username.trim(), pw));
     return t("team.action.checkedIn");
   });
 
@@ -143,7 +148,7 @@ export function TeamProfiles() {
   const revert = async (id: string) => {
     if (!(await ask(t("team.action.revertTitle"), t("team.action.revertConfirm"), t("team.action.revert")))) return;
     await run(`revert:${id}`, async (pw) => {
-      await teamRevert(id, username.trim(), pw);
+      collected(await teamRevert(id, username.trim(), pw));
       return t("team.action.reverted");
     });
   };

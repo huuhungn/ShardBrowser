@@ -294,6 +294,18 @@ fn hold_lapses(
     Ok(())
 }
 
+/// Whether an evaluation recorded here counted `key` as a root custodian's,
+/// at any time (D-6 (a)).
+pub fn held_custody(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {
+    let (instance, tenant) = ids(binding);
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM trust_custodian_keys
+           WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3)",
+        params![instance, tenant, hex(key)],
+        |row| row.get(0),
+    )?)
+}
+
 /// Q-26: whether `key` is now proven revoked (rule 6) or locally distrusted,
 /// whenever that was learned.
 pub fn withdrawn(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<bool> {

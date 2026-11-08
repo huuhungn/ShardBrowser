@@ -38,6 +38,10 @@ pub struct PushResult {
     /// SHA-256 of the container, hex — matches the digest a local backup of
     /// the same profile state would report.
     pub sha256: String,
+    /// The fleet key generation collected because the server refused this
+    /// push under a rotated key, before it ran again ([`after_collect`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collected_generation: Option<u64>,
 }
 
 /// A profile the team server now holds at version 0.
@@ -129,23 +133,27 @@ pub async fn profile_sync_push(
     }
     if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
         let (client, session, dev) = published_session(&c, username, password).await?;
-        let started = std::time::Instant::now();
-        let pushed = team::sync::push(
-            &client,
-            &session.access_token,
-            &dev,
-            &profile_id,
-            &udd,
-            now_ms(),
-            &|| started.elapsed(),
+        let (client, access) = (&client, session.access_token.as_str());
+        let (dev, local, udd) = (&dev, profile_id.as_str(), udd.as_path());
+        let pushed = after_collect(
+            move || async move {
+                let started = std::time::Instant::now();
+                team::sync::push(client, access, dev, local, udd, now_ms(), &|| {
+                    started.elapsed()
+                })
+                .await
+                .map_err(|e| format!("{e:#}"))
+            },
+            crate::collect_after_refusal(client, &c, access),
         )
         .await;
-        client.end_session(&session.access_token).await;
-        let p = pushed.map_err(|e| format!("{e:#}"))?;
+        client.end_session(access).await;
+        let (p, collected_generation) = pushed?;
         return Ok(PushResult {
             version: p.version as i64,
             container_bytes: p.ciphertext_size,
             sha256: fleet_client::hex(&p.ciphertext_sha256),
+            collected_generation,
         });
     }
 
@@ -194,6 +202,7 @@ pub async fn profile_sync_push(
         version,
         container_bytes: sealed.info.file_bytes,
         sha256: sealed.info.sha256,
+        collected_generation: None,
     })
 }
 
@@ -216,23 +225,27 @@ pub async fn profile_sync_revert(
     profile::load_raw(&profile_id).map_err(|_| crate::errcode::code("profile.noSuchProfile"))?;
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     let (client, session, dev) = published_session(&c, username, password).await?;
-    let started = std::time::Instant::now();
-    let reverted = team::sync::revert(
-        &client,
-        &session.access_token,
-        &dev,
-        &profile_id,
-        &udd,
-        now_ms(),
-        &|| started.elapsed(),
+    let (client, access) = (&client, session.access_token.as_str());
+    let (dev, local, udd) = (&dev, profile_id.as_str(), udd.as_path());
+    let reverted = after_collect(
+        move || async move {
+            let started = std::time::Instant::now();
+            team::sync::revert(client, access, dev, local, udd, now_ms(), &|| {
+                started.elapsed()
+            })
+            .await
+            .map_err(|e| format!("{e:#}"))
+        },
+        crate::collect_after_refusal(client, &c, access),
     )
     .await;
-    client.end_session(&session.access_token).await;
-    let p = reverted.map_err(|e| format!("{e:#}"))?;
+    client.end_session(access).await;
+    let (p, collected_generation) = reverted?;
     Ok(PushResult {
         version: p.version as i64,
         container_bytes: p.ciphertext_size,
         sha256: fleet_client::hex(&p.ciphertext_sha256),
+        collected_generation,
     })
 }
 
@@ -373,17 +386,21 @@ pub async fn profile_sync_pull(
     let udd = profile::user_data_dir(&profile_id).map_err(|e| e.to_string())?;
     if team::sync::is_published(&profile_id).map_err(|e| e.to_string())? {
         let (client, session, dev) = published_session(&c, username, password).await?;
-        let pulled = team::sync::pull(
-            &client,
-            &session.access_token,
-            &dev,
-            &profile_id,
-            &udd,
-            now_ms(),
+        let (client, access) = (&client, session.access_token.as_str());
+        let (dev, local, udd) = (&dev, profile_id.as_str(), udd.as_path());
+        // shortcut: the pull reply has no room to name a collected key, so the
+        // UI says nothing of it; return it once the reply becomes a record.
+        let pulled = after_collect(
+            move || async move {
+                team::sync::pull(client, access, dev, local, udd, now_ms())
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            },
+            crate::collect_after_refusal(client, &c, access),
         )
         .await;
-        client.end_session(&session.access_token).await;
-        return pulled.map_err(|e| format!("{e:#}"));
+        client.end_session(access).await;
+        return pulled.map(|(bytes, _)| bytes);
     }
 
     let client =
@@ -460,6 +477,40 @@ async fn published_session(
         .await
         .map_err(|e| e.to_string())?;
     Ok((client, session, team::sync::Device { signer, me, pin }))
+}
+
+/// v2.9.0 "Members learn of a new key late": runs the published sync `op`;
+/// when the server refused it as made under a fleet key a rotation retired,
+/// or this device holds no verified key for it, the key is collected once
+/// (`collect`, Collect key custody's fleet step) and, only if that kept a
+/// key, `op` runs once more and its result is returned unchanged, with the
+/// generation collected. Any other refusal, or a collect that kept nothing
+/// (two rotations missed, a refused grant, a busy custody lock), returns the
+/// first refusal.
+async fn after_collect<T, F>(
+    op: impl Fn() -> F,
+    collect: impl std::future::Future<Output = Result<crate::FleetGrant, String>>,
+) -> Result<(T, Option<u64>), String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let refused = match op().await {
+        Ok(t) => return Ok((t, None)),
+        Err(e) => e,
+    };
+    if !["sync.fleetKeyRotated", "sync.noVerifiedFleetKey"]
+        .iter()
+        .any(|code| crate::errcode::has_code(&refused, code))
+    {
+        return Err(refused);
+    }
+    match collect.await {
+        Ok(crate::FleetGrant::Opened(generation)) => {
+            eprintln!("[sync] fleet key generation {generation} collected after a refusal");
+            op().await.map(|t| (t, Some(generation)))
+        }
+        _ => Err(refused),
+    }
 }
 
 /// `Some(blocked)` once this device pins an anchor and holds the verified key
@@ -668,6 +719,82 @@ pub async fn team_downgrade_resume() -> Result<Vec<team::downgrade::Resumed>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ROTATED: &str = "[[shardx:sync.fleetKeyRotated]]";
+
+    type Collected = Result<(u64, Option<u64>), String>;
+
+    /// Runs [`after_collect`] over `answers`, one per call of the operation,
+    /// with a collect that answers `collected`; and how often each ran.
+    fn collect_run(
+        answers: Vec<Result<u64, String>>,
+        collected: Result<crate::FleetGrant, String>,
+    ) -> (Collected, usize, usize) {
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        let (calls, collects) = (
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        );
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(after_collect(
+                || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let answer = answers.lock().unwrap().next().expect("no more calls");
+                    async move { answer }
+                },
+                async {
+                    collects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    collected
+                },
+            ));
+        (result, calls.into_inner(), collects.into_inner())
+    }
+
+    /// v2.9.0 "Members learn of a new key late": a published push, pull or
+    /// revert the server refused as made under a rotated fleet key collects
+    /// the new key and runs once more; any other refusal collects nothing.
+    #[test]
+    fn a_push_refused_as_fleet_key_rotated_collects_and_retries_once() {
+        let opened = || Ok(crate::FleetGrant::Opened(2));
+        let (result, calls, collects) = collect_run(vec![Err(ROTATED.into()), Ok(7)], opened());
+        assert_eq!(result, Ok((7, Some(2))));
+        assert_eq!((calls, collects), (2, 1));
+        // No key yet for the head: the same.
+        let none = "[[shardx:sync.noVerifiedFleetKey]]".to_string();
+        let (result, calls, _) = collect_run(vec![Err(none), Ok(8)], opened());
+        assert_eq!((result, calls), (Ok((8, Some(2))), 2));
+        // Anything else is returned as it is, nothing collected.
+        let other = "[[shardx:sync.remoteAhead]]".to_string();
+        let (result, calls, collects) = collect_run(vec![Err(other.clone())], opened());
+        assert_eq!((result, calls, collects), (Err(other), 1, 0));
+    }
+
+    #[test]
+    fn a_second_refusal_after_the_collect_is_returned_unchanged() {
+        let second = format!("{ROTATED} again");
+        let (result, calls, collects) = collect_run(
+            vec![Err(ROTATED.into()), Err(second.clone())],
+            Ok(crate::FleetGrant::Opened(2)),
+        );
+        assert_eq!((result, calls, collects), (Err(second), 2, 1));
+    }
+
+    /// A collect that keeps no key (two rotations missed, a refused grant,
+    /// the custody lock busy) is not followed by a retry: the first refusal
+    /// is returned.
+    #[test]
+    fn a_collect_two_generations_up_is_not_retried() {
+        for collected in [
+            Ok(crate::FleetGrant::MissedRotations),
+            Ok(crate::FleetGrant::Failed),
+            Err("[[shardx:fleet.custodyBusy]]".to_string()),
+        ] {
+            let (result, calls, collects) = collect_run(vec![Err(ROTATED.into())], collected);
+            assert_eq!((result, calls, collects), (Err(ROTATED.into()), 1, 1));
+        }
+    }
 
     #[test]
     fn profile_ref_is_sixteen_bytes_of_hex() {
