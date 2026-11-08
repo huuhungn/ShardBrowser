@@ -822,7 +822,8 @@ fn refused(client: &FleetClient, access: &str, reply: &Exact) -> anyhow::Error {
         return anyhow!(code("sync.authRequired"));
     }
     // A request under a generation a rotation retired: Collect fetches N+1.
-    if refusal_of(reply).0.as_deref() == Some("FLEET_GENERATION_NOT_ACTIVE") {
+    if reply.status == 409 && refusal_of(reply).0.as_deref() == Some("FLEET_GENERATION_NOT_ACTIVE")
+    {
         return anyhow!(code("sync.fleetKeyRotated"));
     }
     let detail: String = client

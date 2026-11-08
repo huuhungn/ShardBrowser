@@ -1199,20 +1199,27 @@ pub async fn approve_member(
     let mut grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
         .map_err(|_| corrupt())?
         .grant;
-    // Resumed after a rotation: the saved grant names a generation the
-    // server no longer has ACTIVE, so one for the ACTIVE generation is built
-    // once and saved, unless the rotation's member step already filed it.
+    // Resumed after a rotation: the saved grant names a generation below the
+    // server's ACTIVE one, so one for the ACTIVE generation is built once and
+    // saved, unless the rotation's member step filed it or found the device
+    // ineligible, or this custodian revoked it.
     if first_seen.is_none() {
         let active = client
             .active_fleet_generation(access, me.tenant_id, &fleet)
             .await?;
-        if let Some(active) = active.filter(|g| *g != grant.generation.generation) {
+        if let Some(active) = active.filter(|g| *g > grant.generation.generation) {
             let rotation = state.rotation.as_ref().filter(|r| r.generation == active);
-            if rotation
+            let not_pending = || crate::errcode::code("fleet.deviceNotPending");
+            match rotation
                 .and_then(|r| r.member_results.get(&id))
-                .is_some_and(|v| v == "filed")
+                .map(String::as_str)
             {
-                return Ok(());
+                Some("filed") => return Ok(()),
+                // The rotation found it ineligible (revoked, withdrawn, no
+                // approval) or the server refused it.
+                Some(_) => bail!(not_pending()),
+                None if state.revocations.contains_key(&id) => bail!(not_pending()),
+                None => {}
             }
             let keys = listed_keys(row)?;
             if (keys.0, keys.1)
@@ -5310,13 +5317,7 @@ pub(crate) mod tests {
     }
 
     /// Approve of `row` against the rig, the verified ACTIVE key being `key`.
-    fn approve_on(
-        rig: &Rig,
-        f: &Fixture,
-        row: &TenantDevice,
-        sas: &str,
-        key: [u8; 32],
-    ) -> Result<()> {
+    fn approve_on(rig: &Rig, f: &Fixture, row: &TenantDevice, sas: &str) -> Result<()> {
         let mut state = load().unwrap();
         rig.rt.block_on(approve_member(
             &rig.client,
@@ -5325,7 +5326,11 @@ pub(crate) mod tests {
             &f.pin(),
             row,
             sas,
-            |_| Ok(Zeroizing::new(key)),
+            |generation| match generation {
+                0 => Ok(Zeroizing::new(FKEK)),
+                1 => Ok(Zeroizing::new(NEW_FKEK)),
+                _ => bail!("no verified key of generation {generation}"),
+            },
             now_ms(),
             &mut state,
             &mut |s| save(s),
@@ -5343,7 +5348,7 @@ pub(crate) mod tests {
         let rig = rig(f, |r| r.approves = true);
         let (row, _) = joiner();
         rig.refuse("/approve", 503, "");
-        assert!(approve_on(&rig, f, &row, &f.code(&row), FKEK).is_err());
+        assert!(approve_on(&rig, f, &row, &f.code(&row)).is_err());
         let id = row.device_id.to_ascii_lowercase();
         let saved = load().unwrap().members[&id].clone();
         let filing = payload(&saved.grant_request, FleetKeyGrantCreateV2::parse);
@@ -5381,7 +5386,7 @@ pub(crate) mod tests {
     fn an_approval_saved_before_a_rotation_files_its_fleet_grant_under_the_active_generation() {
         let f = fixture();
         let (rig, row, saved) = approval_across_a_rotation(&f, None);
-        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        approve_on(&rig, &f, &row, "").unwrap();
         resent_as_saved(&rig, &saved);
         let id = row.device_id.to_ascii_lowercase();
         let rebuilt = load().unwrap().members[&id].grant_request.clone();
@@ -5397,15 +5402,47 @@ pub(crate) mod tests {
         assert_eq!(filed, [saved_request(&rebuilt).unwrap().encode()]);
         // Built once: a later resume resends the same bytes.
         rig.clear();
-        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        approve_on(&rig, &f, &row, "").unwrap();
         assert_eq!(rig.bodies("/grants"), filed);
+        // An ACTIVE generation below the saved one rebuilds nothing: the
+        // saved grant goes out as it is and stays saved.
+        rig.rot.lock().unwrap().active = Some(0);
+        rig.clear();
+        approve_on(&rig, &f, &row, "").unwrap();
+        assert_eq!(rig.bodies("/grants"), filed);
+        assert_eq!(load().unwrap().members[&id].grant_request, rebuilt);
+    }
+
+    /// A resume never grants N+1 to a device the rotation found ineligible
+    /// or this custodian revoked, whatever the listing says.
+    #[test]
+    fn an_approval_resumed_after_a_rotation_refuses_a_revoked_device() {
+        for revoked_here in [false, true] {
+            let f = fixture();
+            let result = (!revoked_here).then_some("skipped:revoked");
+            let (rig, row, saved) = approval_across_a_rotation(&f, result);
+            let id = row.device_id.to_ascii_lowercase();
+            if revoked_here {
+                let mut state = load().unwrap();
+                state.revocations.insert(id.clone(), "00".into());
+                save(&state).unwrap();
+            }
+            let err = approve_on(&rig, &f, &row, "").unwrap_err();
+            assert!(has(&err, "fleet.deviceNotPending"), "{revoked_here}: {err}");
+            assert!(rig.bodies("/grants").is_empty(), "{revoked_here}");
+            assert_eq!(
+                load().unwrap().members[&id].grant_request,
+                saved.grant_request,
+                "{revoked_here}"
+            );
+        }
     }
 
     #[test]
     fn an_approval_resumed_after_a_rotation_does_not_file_a_second_grant() {
         let f = fixture();
         let (rig, row, saved) = approval_across_a_rotation(&f, Some("filed"));
-        approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap();
+        approve_on(&rig, &f, &row, "").unwrap();
         resent_as_saved(&rig, &saved);
         assert!(rig.bodies("/grants").is_empty(), "the rotation filed it");
         let id = row.device_id.to_ascii_lowercase();
@@ -5423,7 +5460,7 @@ pub(crate) mod tests {
         let (rig, mut row, saved) = approval_across_a_rotation(&f, None);
         let other = peer(1);
         (row.hpke_public_key, row.hpke_key_id) = (other.hpke_public_key, other.hpke_key_id);
-        let err = approve_on(&rig, &f, &row, "", NEW_FKEK).unwrap_err();
+        let err = approve_on(&rig, &f, &row, "").unwrap_err();
         assert!(has(&err, "fleet.deviceKeysMismatch"), "{err}");
         assert!(rig.bodies("/grants").is_empty());
         let id = row.device_id.to_ascii_lowercase();
