@@ -3247,6 +3247,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// A hex account password is also a well-formed ID: a server that got it
+    /// at login and lists it as a device or account ID is refused before
+    /// state, IPC or a log sees it, in either case.
+    #[test]
+    fn a_listed_id_equal_to_the_account_password_is_refused() {
+        let f = fixture();
+        let rt = runtime();
+        let password = crate::fleet_client::random_id_hex();
+        for (account, echoed) in [
+            (false, password.clone()),
+            (false, password.to_ascii_uppercase()),
+            (true, password.clone()),
+        ] {
+            let (mut row, _) = joiner();
+            if account {
+                row.account_id = echoed;
+            } else {
+                row.device_id = echoed;
+            }
+            let body = serde_json::to_vec(&serde_json::json!({ "devices": [{
+                "device_id": row.device_id, "account_id": row.account_id,
+                "status": row.status, "label_hex": row.label_hex,
+                "signing_key_id": row.signing_key_id, "hpke_key_id": row.hpke_key_id,
+                "signing_public_key": row.signing_public_key,
+                "hpke_public_key": row.hpke_public_key,
+            }] }))
+            .unwrap();
+            let (client, _) = rt.block_on(mock(Arc::new(move |call: &str, _: &[u8]| match call {
+                c if c.ends_with("/devices") => (200, body.clone()),
+                _ => (401, Vec::new()),
+            })));
+            let login = crate::fleet_client::AccountLogin {
+                tenant_id: &f.tenant,
+                username: "owner",
+                password: &password,
+            };
+            // The login is refused, but the server got the password.
+            assert!(rt
+                .block_on(client.server_identity_with_login(&login))
+                .is_err());
+            let err = rt
+                .block_on(client.list_tenant_devices("v2a.access", &f.tenant))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fleet.badReplyCustody"), "{account}: {err}");
+            assert!(!err.to_ascii_lowercase().contains(&password), "{account}");
+        }
+    }
+
     /// A bearer body is also a well-formed key ID, but no listed key hashes
     /// to it: neither the IPC reply nor any saved state may carry it.
     #[test]

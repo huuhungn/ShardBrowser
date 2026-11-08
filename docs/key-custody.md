@@ -486,7 +486,8 @@ What does not hold:
 - Secrecy of the account password or a session token against a hostile team
   server. The launcher keeps them out of its own logs, state and error
   strings, and removes the forms of them it recognizes from a server's refusal
-  text; a refused login keeps only the server's error code. A server that
+  text; a refused login keeps only the server's error code, and a device list
+  naming a device or account ID equal to the password is refused. A server that
   received the password or a token can still return it in an encoding the
   launcher does not recognize. The account password protects that account at
   that server only, so use a password unique to it.

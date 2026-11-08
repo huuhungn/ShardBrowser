@@ -817,9 +817,15 @@ impl FleetClient {
         // the free text left reaches the UI, so a hostile server cannot hand
         // back the bearer it just received through it.
         let bad = || anyhow!(crate::errcode::code("fleet.badReplyCustody"));
+        let passwords = self.passwords();
         for d in &mut body.devices {
             for id in [&d.device_id, &d.account_id] {
                 decode_hex16(id, "device").map_err(|_| bad())?;
+                // A hex password is a well-formed ID: an ID is identity, so
+                // one equal to it is refused rather than redacted.
+                if passwords.iter().any(|p| p.eq_ignore_ascii_case(id)) {
+                    return Err(bad());
+                }
             }
             let key = |s: &str| decode_hex32(s, "key").map_err(|_| bad());
             key(&d.signing_key_id)?;
@@ -842,7 +848,6 @@ impl FleetClient {
             }
             (d.signing_key_id, d.hpke_key_id) = ids;
         }
-        let passwords = self.passwords();
         let mut secrets = vec![access_token];
         secrets.extend(passwords.iter().map(|p| p.as_str()));
         Ok(body
