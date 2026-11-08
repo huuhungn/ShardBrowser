@@ -895,7 +895,7 @@ test("after a rotation the custodian pulls and pushes profiles under an older ke
   });
 
   const id = [...server.heads.keys()][0];
-  await test.step("a refused pull keeps the row with its error and pushes nothing", async () => {
+  await test.step("behind B's version, a refused pull keeps the row with its error and pushes nothing", async () => {
     server.refusePull.set(id, "sync.pushPending");
     await cardSignIn(a);
     await older.getByRole("button", { name: "Pull and push" }).click();
@@ -904,7 +904,7 @@ test("after a rotation the custodian pulls and pushes profiles under an older ke
     server.refusePull.delete(id);
   });
 
-  await test.step("Pull and push pulls B's version first, then pushes under generation 1", async () => {
+  await test.step("behind B's version, Pull and push pulls it, then pushes under generation 1", async () => {
     await cardSignIn(a);
     await older.getByRole("button", { name: "Pull and push" }).click();
     await expect(a.getByText("Beta Research is now under the newest fleet key.")).toBeVisible();
@@ -930,6 +930,22 @@ test("after a rotation the custodian pulls and pushes profiles under an older ke
     await cardClick(b, "Collect key custody");
     await expect(b.getByText("This device missed more than one fleet key rotation", { exact: false })).toBeVisible();
     await expect(b.getByText("The fleet key grant for this device failed its check", { exact: false })).toHaveCount(0);
+  });
+
+  await test.step("a copy that is not behind is pushed without a pull, so local data is never pulled over", async () => {
+    // Behind B's version 4: pulled, then pushed as version 5 under generation 3.
+    await cardSignIn(a);
+    await older.getByRole("button", { name: "Pull and push" }).click();
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@5"]);
+    await rotateOn(a);
+    await expect(older).toContainText("Generation 3");
+    server.refusePull.set(id, "sync.pushPending");
+    await cardSignIn(a);
+    await older.getByRole("button", { name: "Pull and push" }).click();
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@6"]);
+    server.refusePull.delete(id);
   });
   await b.context().close();
 });

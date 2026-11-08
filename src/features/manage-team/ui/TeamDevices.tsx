@@ -134,13 +134,19 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
     });
   };
 
-  // Pull first, so a copy behind the remote head does not fail its base; a
-  // refused pull pushes nothing and keeps the row with its error.
+  // Push first: a pull restores over local data, so it runs only when the
+  // server says this copy is behind; a refused pull pushes nothing and keeps
+  // the row with its error.
   const repush = (o: OlderKeyProfile) => run(`repush:${o.profile_id}`, async () => {
     const [u, p] = login();
     try {
-      await teamPull(o.profile_id, u, p);
-      await teamCheckIn(o.profile_id, u, p);
+      try {
+        await teamCheckIn(o.profile_id, u, p);
+      } catch (e) {
+        if (!String(e).includes("sync.remoteAhead")) throw e;
+        await teamPull(o.profile_id, u, p);
+        await teamCheckIn(o.profile_id, u, p);
+      }
       setOlderErrors(({ [o.profile_id]: _, ...rest }) => rest);
       toast.ok(t("team.rotation.repushed", { name: nameOf(o.profile_id) }));
     } catch (e) {

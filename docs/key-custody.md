@@ -382,9 +382,10 @@ already uses is refused. Two costs follow:
 
 The custodian's Team page lists "Profiles still under an older key" (those
 bound on its own device whose last pinned or pushed head is below the newest
-generation it verified), each with "Pull and push": a pull first, so a copy
-behind the remote head does not fail its base, then a push that seals under
-the newest key. A refused pull pushes nothing. After a server restore a row
+generation it verified), each with "Pull and push": a push that seals under
+the newest key, preceded by a pull only when the server says the local copy
+is behind its head, since a pull restores over local data. A refused pull
+pushes nothing. After a server restore a row
 keeps the previous head's generation until the next pull. A finished rotation
 also asks for the recovery bundle to be exported again, since an earlier
 bundle does not open the new key.
