@@ -394,7 +394,9 @@ first, since a pull replaces local changes this device has not pushed. The
 list reloads after a Check in, Pull or Unbind there. After a server restore a row
 keeps the previous head's generation until the next pull. A finished rotation
 also asks for the recovery bundle to be exported again, since an earlier
-bundle does not open the new key.
+bundle does not open the new key. Known limitation: an export that finishes
+while another custody action (listing, approving or revoking devices) holds
+the custody lock leaves that prompt up; exporting again clears it.
 
 Members pick up the new key with "Collect key custody"; a push or pull refused
 under the old key says so. A member offline across two rotations cannot take
