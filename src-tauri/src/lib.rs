@@ -2873,6 +2873,8 @@ async fn team_approve_device(
             verified_fleet_key(&fleet_hex, &pin, &me, generation, now)?
                 .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
         };
+        let withdrawn =
+            |key: &[u8; 32]| team::ledger::withdrawn(&team::db::Db::open()?, &pin.0, key);
         let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
         fleet_custody::approve_member(
             &client,
@@ -2882,6 +2884,7 @@ async fn team_approve_device(
             row,
             &sas,
             fleet_key,
+            withdrawn,
             now,
             &mut state,
             &mut |s| fleet_custody::save(s),

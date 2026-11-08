@@ -1099,7 +1099,8 @@ fn custodian(me: &FleetDevice<'_>, state: &FleetCustodyState) -> Result<Context1
 /// Runs, or resumes, Approve of `row` (section 4.A) under the device session
 /// `access`. A device with saved requests gets exactly those resent: the
 /// window, code and key checks gate only building new ones. `fleet_key`
-/// gives the verified FKEK of the fleet's ACTIVE generation.
+/// gives the verified FKEK of the fleet's ACTIVE generation; `withdrawn`
+/// tells whether the trust ledger holds a signing key withdrawn.
 #[allow(clippy::too_many_arguments)]
 pub async fn approve_member(
     client: &FleetClient,
@@ -1109,6 +1110,7 @@ pub async fn approve_member(
     row: &TenantDevice,
     sas: &str,
     fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+    withdrawn: impl Fn(&[u8; 32]) -> Result<bool>,
     now: u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
@@ -1199,28 +1201,35 @@ pub async fn approve_member(
     let mut grant = FleetKeyGrantCreateV2::parse(&filing.canonical_payload_bytes)
         .map_err(|_| corrupt())?
         .grant;
-    // Resumed after a rotation: the saved grant names a generation below the
-    // server's ACTIVE one, so one for the ACTIVE generation is built once and
-    // saved, unless the rotation's member step filed it or found the device
-    // ineligible, or this custodian revoked it.
+    // Resumed: before a saved grant is resent, or one for a newer ACTIVE
+    // generation is built once and saved, the device must still be eligible
+    // for the grant's generation: not found ineligible or filed by that
+    // rotation's member step, not revoked here, its key not withdrawn. A
+    // saved grant may already be a rebuilt one, so this runs every resume.
     if first_seen.is_none() {
         let active = client
             .active_fleet_generation(access, me.tenant_id, &fleet)
             .await?;
-        if let Some(active) = active.filter(|g| *g > grant.generation.generation) {
-            let rotation = state.rotation.as_ref().filter(|r| r.generation == active);
-            let not_pending = || crate::errcode::code("fleet.deviceNotPending");
-            match rotation
-                .and_then(|r| r.member_results.get(&id))
-                .map(String::as_str)
+        let rebuild = active.filter(|g| *g > grant.generation.generation);
+        let target = rebuild.unwrap_or(grant.generation.generation);
+        let rotation = state.rotation.as_ref().filter(|r| r.generation == target);
+        let not_pending = || crate::errcode::code("fleet.deviceNotPending");
+        match rotation
+            .and_then(|r| r.member_results.get(&id))
+            .map(String::as_str)
+        {
+            Some("filed") => return Ok(()),
+            // The rotation found it ineligible (revoked, withdrawn, no
+            // approval) or the server refused it.
+            Some(_) => bail!(not_pending()),
+            None if state.revocations.contains_key(&id)
+                || withdrawn(&approved.subject_signing_key_id)? =>
             {
-                Some("filed") => return Ok(()),
-                // The rotation found it ineligible (revoked, withdrawn, no
-                // approval) or the server refused it.
-                Some(_) => bail!(not_pending()),
-                None if state.revocations.contains_key(&id) => bail!(not_pending()),
-                None => {}
+                bail!(not_pending())
             }
+            None => {}
+        }
+        if let Some(active) = rebuild {
             let keys = listed_keys(row)?;
             if (keys.0, keys.1)
                 != (
@@ -3086,6 +3095,7 @@ pub(crate) mod tests {
             row,
             sas,
             |_| Ok(Zeroizing::new(FKEK)),
+            |_| Ok(false),
             now,
             &mut state,
             &mut |s| save(s),
@@ -5518,6 +5528,7 @@ pub(crate) mod tests {
                 1 => Ok(Zeroizing::new(NEW_FKEK)),
                 _ => bail!("no verified key of generation {generation}"),
             },
+            |key| crate::team::ledger::withdrawn(&rig.db, &f.pin().0, key),
             now_ms(),
             &mut state,
             &mut |s| save(s),
@@ -5623,6 +5634,47 @@ pub(crate) mod tests {
                 "{revoked_here}"
             );
         }
+    }
+
+    /// A rebuilt N+1 grant saved, then the device revoked before it went out:
+    /// the next resume, ACTIVE now naming the saved grant, sends it nowhere.
+    #[test]
+    fn a_saved_rebuilt_grant_is_not_sent_once_the_device_is_revoked() {
+        let f = fixture();
+        let (rig, row, _) = approval_across_a_rotation(&f, None);
+        let id = row.device_id.to_ascii_lowercase();
+        rig.refuse("/grants", 503, "");
+        assert!(approve_on(&rig, &f, &row, "").is_err());
+        let rebuilt = load().unwrap().members[&id].grant_request.clone();
+        let filing = payload(&rebuilt, FleetKeyGrantCreateV2::parse);
+        assert_eq!(filing.grant.generation.generation, 1);
+        let mut state = load().unwrap();
+        state.revocations.insert(id.clone(), "00".into());
+        save(&state).unwrap();
+        rig.allow();
+        rig.clear();
+        let err = approve_on(&rig, &f, &row, "").unwrap_err();
+        assert!(has(&err, "fleet.deviceNotPending"), "{err}");
+        assert!(rig.bodies("/grants").is_empty());
+        assert_eq!(load().unwrap().members[&id].grant_request, rebuilt);
+    }
+
+    /// No member result names the device, but the ledger holds its key
+    /// withdrawn: no N+1 grant is built or sent.
+    #[test]
+    fn an_approval_resumed_after_a_rotation_refuses_a_key_the_ledger_holds_withdrawn() {
+        let f = fixture();
+        let (rig, row, saved) = approval_across_a_rotation(&f, None);
+        let key = decode_hex32(&row.signing_key_id, "signing_key_id").unwrap();
+        crate::team::ledger::distrust_key(&rig.db, &f.pin().0, &key, now_ms()).unwrap();
+        let err = approve_on(&rig, &f, &row, "").unwrap_err();
+        assert!(has(&err, "fleet.deviceNotPending"), "{err}");
+        assert!(rig.bodies("/grants").is_empty());
+        let id = row.device_id.to_ascii_lowercase();
+        assert_eq!(
+            load().unwrap().members[&id].grant_request,
+            saved.grant_request
+        );
     }
 
     #[test]

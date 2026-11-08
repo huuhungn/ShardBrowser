@@ -361,7 +361,10 @@ and activates them (the server retires N in the same step), collects N+1
 verified, then grants N+1 to every member a signed approval names, minus
 revoked or withdrawn devices. Every request is saved before it is sent, so an
 interrupted run resumes with "Resume fleet key rotation". Approvals wait while
-a rotation is unfinished. The new generation must activate within 30 days; a
+a rotation is unfinished. An approval interrupted before a rotation resumes
+under the new generation, and every resume sends its saved fleet grant only
+to a device the rotation did not skip, this custodian did not revoke and whose
+key the trust ledger does not hold withdrawn. The new generation must activate within 30 days; a
 rotation that runs out of time, or is caught by a server restore before it
 activated, expires: the team keeps generation N and approvals work again, but
 no new rotation can start until a later version can discard the stuck
