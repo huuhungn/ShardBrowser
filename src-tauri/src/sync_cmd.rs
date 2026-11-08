@@ -761,14 +761,20 @@ mod tests {
         let (result, calls, collects) = collect_run(vec![Err(ROTATED.into()), Ok(7)], opened());
         assert_eq!(result, Ok((7, Some(2))));
         assert_eq!((calls, collects), (2, 1));
-        // No key yet for the head: the same.
-        let none = "[[shardx:sync.noVerifiedFleetKey]]".to_string();
-        let (result, calls, _) = collect_run(vec![Err(none), Ok(8)], opened());
-        assert_eq!((result, calls), (Ok((8, Some(2))), 2));
         // Anything else is returned as it is, nothing collected.
         let other = "[[shardx:sync.remoteAhead]]".to_string();
         let (result, calls, collects) = collect_run(vec![Err(other.clone())], opened());
         assert_eq!((result, calls, collects), (Err(other), 1, 0));
+    }
+
+    /// A pull of a head under a key this device does not hold yet collects
+    /// it and pulls once more, as a push does.
+    #[test]
+    fn a_pull_of_a_head_under_a_key_not_held_collects_and_retries_once() {
+        let none = "[[shardx:sync.noVerifiedFleetKey]]".to_string();
+        let (result, calls, collects) =
+            collect_run(vec![Err(none), Ok(4096)], Ok(crate::FleetGrant::Opened(2)));
+        assert_eq!((result, calls, collects), (Ok((4096, Some(2))), 2, 1));
     }
 
     #[test]
