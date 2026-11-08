@@ -3,6 +3,63 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.9.0",
+      "date": "2026-11-08",
+      "entries": [
+        {
+          "id": "team-fleet-key-rotation",
+          "title": "Rotate fleet key",
+          "lead": "The root custodian can rotate the fleet key from the Team page, so a revoked device cannot read snapshots pushed from then on.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Rotate fleet key makes a new fleet key and grants it automatically to every device with a signed approval; revoked devices get nothing. A device that is offline collects it later with Collect key custody. The new key must be activated within 30 days, an unfinished rotation offers Resume fleet key rotation, and approvals wait until it is done."
+            },
+            {
+              "type": "p",
+              "text": "After a revoke, a banner asks to rotate while the revoked device still holds the current key: urgently for a lost device, when convenient for a retired one. Rotation does not reach back: only snapshots pushed from then on are protected."
+            },
+            {
+              "type": "note",
+              "text": "After a rotation, export the recovery bundle again (the Team page reminds you) and use Pull and push once on every profile listed under an older key. Finish a rotation before going back to 2.8.x. The team server does not need an update."
+            }
+          ]
+        },
+        {
+          "id": "team-old-generations",
+          "title": "Snapshots under an older key stay readable",
+          "lead": "Pull opens heads pushed under an earlier fleet key, and refuses a head that goes back to an older key.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A head sealed under an older fleet key still pulls while that key's grant verifies. Each profile remembers the newest key it has used and refuses a head under an older one, so a revoked device cannot write under the old key once the profile has moved on."
+            },
+            {
+              "type": "p",
+              "text": "The Team page lists the profiles still under an older key, with Pull and push: it pushes first and pulls only when the server copy is ahead, so local changes are never pulled over. Members whose key rotated see a message to press Collect key custody, and a device that missed two rotations is told to enroll again."
+            }
+          ]
+        },
+        {
+          "id": "team-rotation-fixes",
+          "title": "Smaller Team fixes",
+          "lead": "Clearer revoke text and stricter checks of local state.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The revoke confirmation now says the device keeps the fleet key it holds until you rotate it. A team state file whose existence cannot be checked is an error instead of a missing file. After a device enrolls again, the saved credentials of its revoked old identity are forgotten. A stored hex key with non-ASCII characters is refused with an error instead of crashing the launcher."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.8.1",
       "date": "2026-11-07",
       "entries": [
