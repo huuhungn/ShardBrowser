@@ -448,15 +448,23 @@ fn write(
         bail!(crate::errcode::code("recovery.deviceHasIdentity"));
     }
 
-    // A6: a root state on disk is kept only when it is this one.
+    // A6: a root state on disk is kept only when it is this one: its current
+    // grant (Q-52) and that grant's issuer, empty for this device's own key,
+    // are the bundle's. A renewed state keeps its first self-grant beside it.
     let root_on_disk = crate::store::custody_bootstrap_path()?.try_exists()?;
     let root = crate::root_bootstrap::load()?;
+    let own = hex(&Ed25519SigningKey::from_bytes(&custodian.signing_key_seed)
+        .verifying_key()
+        .to_bytes());
+    let (disk_grant, disk_issuer) = if root.root_grant.is_empty() {
+        (&root.self_grant, &own)
+    } else {
+        (&root.root_grant, &root.root_grant_issuer)
+    };
+    let bundle_issuer = custodian.root_grant_issuer.map_or(own.clone(), |k| hex(&k));
     let same_root = ours(&root.tenant_id, &root.device_id)
-        && root.self_grant.eq_ignore_ascii_case(&self_grant)
-        && root.root_grant.eq_ignore_ascii_case(&root_grant)
-        && root
-            .root_grant_issuer
-            .eq_ignore_ascii_case(&root_grant_issuer)
+        && disk_grant.eq_ignore_ascii_case(&hex(&custodian.root_grant))
+        && disk_issuer.eq_ignore_ascii_case(&bundle_issuer)
         && root.anchor.eq_ignore_ascii_case(&anchor);
     if root_on_disk && !same_root {
         bail!(crate::errcode::code("fleet.custodyOtherDevice"));
@@ -1081,6 +1089,59 @@ mod tests {
         let bundle = f.bundle();
         let custodian = bundle.plaintext.root_custodian.as_ref().unwrap();
         write(c, &bundle, custodian, 0, fleet_active, &mut save)
+    }
+
+    /// A6 by the current grant (Q-52): a renewed root state keeps its first
+    /// self-grant beside the self-issued renewal it holds now (U5), so its
+    /// own v4 bundle of that renewal imports over it, and a v3 bundle of the
+    /// replaced first self-grant does not.
+    #[test]
+    fn a_v4_bundle_reimports_over_a_renewed_root_state_that_keeps_its_first_self_grant() {
+        let f = fixture();
+        let mut c = f.connected("http://127.0.0.1:9");
+        written(&f, &mut c, true).unwrap();
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        let me = Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: ACCOUNT,
+            device: DEVICE,
+            signing_key_id: signing_key_id(signer().verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&pk),
+        };
+        let own = signer().verifying_key().to_bytes();
+        let renewed = crate::root_bootstrap::tests::existing_grant(
+            &signer(),
+            &me,
+            &pk,
+            &TRK,
+            0,
+            [8; 16],
+            now_ms(),
+        );
+        let mut root = crate::root_bootstrap::load().unwrap();
+        assert!(!root.self_grant.is_empty());
+        root.root_grant = hex(&renewed);
+        root.root_grant_issuer = hex(&own);
+        crate::root_bootstrap::save(&root).unwrap();
+
+        let mut bundle = f.bundle();
+        let custodian = bundle.plaintext.root_custodian.as_mut().unwrap();
+        custodian.root_grant = renewed;
+        custodian.root_grant_issuer = Some(own);
+        let custodian = bundle.plaintext.root_custodian.as_ref().unwrap();
+        write(&mut c, &bundle, custodian, 0, true, &mut save).unwrap();
+        assert_eq!(
+            crate::root_bootstrap::load().unwrap().root_grant,
+            root.root_grant
+        );
+
+        let err = written(&f, &mut c, true).unwrap_err().to_string();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.custodyOtherDevice"),
+            "{err}"
+        );
     }
 
     /// A6: a root state of another tenant, device, self-grant or anchor is
