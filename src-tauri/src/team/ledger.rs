@@ -1697,4 +1697,285 @@ mod tests {
         assert_eq!(n("SELECT count(*) FROM accounts"), 1);
         assert_eq!(n("SELECT count(*) FROM device_state"), 1);
     }
+
+    // ---- v0.2.3 fleet key rotation: the analysis assumptions ----
+
+    const FLEET: [u8; 16] = [4; 16];
+    const T0: u64 = 1_800_000_000_000;
+    const DAY: u64 = 86_400_000;
+
+    fn live(replay: u8) -> CommonFields {
+        CommonFields {
+            not_after_ms: T0 + 300 * DAY,
+            ..common(replay, T0)
+        }
+    }
+
+    /// The bootstrap custodian A0 of `B`.
+    struct Custodian {
+        sk: Ed25519SigningKey,
+        hpke_sk: zeroize::Zeroizing<Vec<u8>>,
+        hpke_pk: Vec<u8>,
+        to: shardx_core::trust_chain::Recipient,
+    }
+
+    fn a0() -> Custodian {
+        let sk = Ed25519SigningKey::from_bytes(&[1; 32]);
+        let (hpke_sk, hpke_pk) = shardx_core::grants::derive_keypair(&[7; 32]);
+        let to = shardx_core::trust_chain::Recipient {
+            account_id: [6; 16],
+            device_id: [5; 16],
+            signing_key_id: id(&sk),
+            hpke_key_id: shardx_core::keys::hpke_key_id(&hpke_pk),
+        };
+        Custodian {
+            sk,
+            hpke_sk,
+            hpke_pk,
+            to,
+        }
+    }
+
+    /// A0's D1 approval, root self-grant and fleet-scoped `fleet.manage`,
+    /// with the fleet-scoped `key.rotate` the rotation files (S0) when
+    /// `rotate`, and `extra`.
+    fn evidence(
+        a: &Custodian,
+        rotate: bool,
+        extra: Vec<Vec<u8>>,
+    ) -> Vec<TenantTrustEvidencePageV2> {
+        let to = &a.to;
+        let approval = DeviceApprovalV2 {
+            common: live(10),
+            subject_account_id: to.account_id,
+            subject_device_id: to.device_id,
+            subject_signing_key_id: to.signing_key_id,
+            subject_hpke_key_id: to.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: B.tenant_id,
+        };
+        let root = TenantRootKeyGrantV2 {
+            common: live(11),
+            variant: RootGrantVariant::FirstRootSelfGrant,
+            root_key_id: [8; 32],
+            root_generation: 0,
+            subject_account_id: to.account_id,
+            subject_device_id: to.device_id,
+            subject_signing_key_id: to.signing_key_id,
+            recipient_hpke_key_id: to.hpke_key_id,
+            subject_device_approval_replay_id: [10; 16],
+            hpke_encapped_key_bytes: [3; 32],
+            hpke_wrapped_trk_bytes: [4; 48],
+        };
+        let capability = |replay, capability| {
+            let g = TenantCapabilityGrantV2 {
+                common: live(replay),
+                subject: GrantSubject::Device {
+                    account_id: to.account_id,
+                    device_id: to.device_id,
+                    signing_key_id: to.signing_key_id,
+                    hpke_key_id: to.hpke_key_id,
+                },
+                scope_kind: CapabilityScopeKind::Fleet,
+                scope_id: FLEET,
+                capability,
+            };
+            build_record(&a.sk, DOMAIN_TENANT_CAPABILITY_GRANT, &g.encode())
+        };
+        let mut containers = vec![
+            build_record(&a.sk, DOMAIN_DEVICE_APPROVAL, &approval.encode()),
+            build_record(&a.sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &root.encode()),
+            capability(12, Capability::FleetManage),
+        ];
+        if rotate {
+            containers.push(capability(13, Capability::KeyRotate));
+        }
+        containers.extend(extra);
+        vec![page(&[&a.sk], containers)]
+    }
+
+    /// A0's grant of `fkek` as `generation` of `FLEET` to `to`.
+    fn device_grant(
+        a: &Custodian,
+        to: &shardx_core::trust_chain::Recipient,
+        generation: u64,
+        fkek: &[u8; 32],
+        replay: u8,
+    ) -> Vec<u8> {
+        let mut g = DeviceHpkeGrantV2 {
+            common: live(replay),
+            fleet_id: FLEET,
+            fkek_key_id: shardx_core::fleet_grants::fkek_key_id(fkek),
+            generation,
+            subject_account_id: to.account_id,
+            subject_device_id: to.device_id,
+            subject_signing_key_id: to.signing_key_id,
+            recipient_hpke_key_id: to.hpke_key_id,
+            hpke_encapped_key_bytes: Vec::new(),
+            hpke_wrapped_fleet_key_bytes: Vec::new(),
+        };
+        // Sealed to A0: only the subject matters for a holding.
+        shardx_core::grants::seal_device_fkek(&a.hpke_pk, &mut g, fkek).unwrap();
+        build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &g.encode())
+    }
+
+    /// A0's `RecoveryGrant` of `generation` (key `fkek`) under root 0, and
+    /// its own `RotationGrant` from the generation before (key `previous`)
+    /// that binds it, as sequence K step 4 builds them.
+    fn rotation(
+        a: &Custodian,
+        generation: u64,
+        fkek: &[u8; 32],
+        previous: &[u8; 32],
+    ) -> Vec<Vec<u8>> {
+        let fkek_key_id = shardx_core::fleet_grants::fkek_key_id(fkek);
+        let recovery = RecoveryGrantV2 {
+            common: live(60),
+            fleet_id: FLEET,
+            fkek_key_id,
+            generation,
+            recipient_root_key_id: [8; 32],
+            recipient_root_generation: 0,
+            root_wrap_nonce_bytes: [1; 12],
+            wrapped_fleet_key_bytes: [2; 48],
+        };
+        let recovery = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &recovery.encode());
+        let grant = RotationGrantV2 {
+            common: live(61),
+            fleet_id: FLEET,
+            fkek_key_id,
+            generation,
+            previous_fkek_key_id: shardx_core::fleet_grants::fkek_key_id(previous),
+            previous_generation: generation - 1,
+            required_device_grant_count: 1,
+            required_device_grant_set_hash: [0; 32],
+            recovery_grant_signed_container_hash: *AuthorizationRecord::parse(&recovery)
+                .unwrap()
+                .signed_container_hash(),
+            activation_not_before_ms: T0,
+        };
+        let grant = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &grant.encode());
+        vec![recovery, grant]
+    }
+
+    /// A0 collects its grant of `generation` (key `fkek`) from `pages`, as
+    /// a new evaluation, through the launcher's own verified open.
+    fn collect(
+        db: &mut Db,
+        a: &Custodian,
+        generation: u64,
+        fkek: &[u8; 32],
+        replay: u8,
+        mut pages: Vec<TenantTrustEvidencePageV2>,
+    ) {
+        let grant = device_grant(a, &a.to, generation, fkek, replay);
+        pages[0].containers.push(grant.clone());
+        let opened = crate::open_fleet_grant(
+            &grant,
+            &pages,
+            &(B, a.to.signing_key_id),
+            &a.to,
+            &FLEET,
+            generation,
+            &a.hpke_sk,
+            T0 + DAY,
+            db,
+            "https://fleet.test",
+        )
+        .unwrap();
+        assert!(opened.is_some(), "generation {generation} verifies");
+    }
+
+    /// Unvalidated assumption 1 (v0.2.3 analysis), first half: the evidence
+    /// of a rotation by the custodian itself, with its fleet-scoped
+    /// `key.rotate`, is activation evidence of the new generation under the
+    /// root its recovery grant names. Without `key.rotate` it is none.
+    #[test]
+    fn a_custodians_own_rotation_grant_records_the_activation() {
+        let a = a0();
+        let (k0, k1) = ([0x30; 32], [0x31; 32]);
+        let activations = |rotate: bool| -> Vec<(i64, String, i64)> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+            collect(&mut db, &a, 0, &k0, 40, evidence(&a, rotate, vec![]));
+            let more = rotation(&a, 1, &k1, &k0);
+            collect(&mut db, &a, 1, &k1, 41, evidence(&a, rotate, more));
+            let rows = db
+                .conn
+                .prepare(
+                    "SELECT generation, fkek_key_id, recipient_root_generation
+                     FROM trust_fleet_activations",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        let k1_id = hex(&shardx_core::fleet_grants::fkek_key_id(&k1));
+        assert_eq!(activations(true), [(1, k1_id, 0)]);
+        assert!(
+            activations(false).is_empty(),
+            "no key.rotate, no activation"
+        );
+    }
+
+    /// Unvalidated assumption 1, second half (ADR 0002 Q-18): a key revoked
+    /// as `compromised` that holds N blocks commits under N, but not under
+    /// N+1 once the custodian rotated by its own `RotationGrant` and this
+    /// device verified N+1 after counting the revocation.
+    #[test]
+    fn a_compromised_holder_of_n_blocks_n_but_not_the_rotated_n_plus_1() {
+        let a = a0();
+        let x = shardx_core::trust_chain::Recipient {
+            device_id: [0x77; 16],
+            signing_key_id: [0x77; 32],
+            ..a.to
+        };
+        let (k0, k1) = ([0x30; 32], [0x31; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let to_x = device_grant(&a, &x, 0, &k0, 42);
+        collect(&mut db, &a, 0, &k0, 40, evidence(&a, true, vec![to_x]));
+        let counted: i64 = db
+            .conn
+            .query_row(
+                "SELECT verified_evaluation FROM trust_fleet_key_grants WHERE generation = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let revocation = DeviceRevocationV2 {
+            common: live(30),
+            subject_account_id: x.account_id,
+            subject_device_id: x.device_id,
+            subject_signing_key_id: x.signing_key_id,
+            subject_hpke_key_id: x.hpke_key_id,
+            reason_code: DeviceRevocationReason::Compromised,
+        };
+        let container = build_record(&a.sk, DOMAIN_DEVICE_REVOCATION, &revocation.encode());
+        let (i, t) = ids(&B);
+        db.conn
+            .execute(
+                "INSERT INTO trust_proven_revocations
+                 VALUES (?1, ?2, ?3, 'DEVICE_REVOCATION', ?4, 0, ?5)",
+                params![i, t, hex(&x.signing_key_id), counted, container],
+            )
+            .unwrap();
+        let anchor = a.to.signing_key_id;
+        let blocked = |db: &Db, g| commit_blocked(db, &B, &anchor, &FLEET, g).unwrap();
+        assert!(blocked(&db, 0), "X holds N");
+
+        collect(
+            &mut db,
+            &a,
+            1,
+            &k1,
+            41,
+            evidence(&a, true, rotation(&a, 1, &k1, &k0)),
+        );
+        assert!(blocked(&db, 0), "N stays blocked");
+        assert!(!blocked(&db, 1), "the rotated N+1 is not");
+    }
 }

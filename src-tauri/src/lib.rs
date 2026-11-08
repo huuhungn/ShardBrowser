@@ -2640,7 +2640,7 @@ async fn team_fleet_key_setup(
         // that still reports it PENDING_ACK cannot fail setup after the keep.
         let (device_sk, _) = shardx_core::grants::derive_keypair(&hpke_seed);
         let fleet = collect_fleet_grant(&client, &c, access, &device_sk, false).await?;
-        match setup_collect_error(fleet) {
+        match setup_collect_error(fleet, 0) {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -2749,20 +2749,8 @@ async fn team_approve_device(
             .ok_or_else(|| crate::errcode::code("fleet.deviceNotListed"))?;
         let now = root_bootstrap::now_ms();
         let fleet_hex = sync_cmd::fleet_id(&c);
-        // Only a key whose grant still verifies to this device's pin is
-        // handed on, as sync reads it (`team::sync::readable_key`).
         let fleet_key = |generation: u64| {
-            let fleet = fleet_client::decode_hex16(&fleet_hex, "fleet_id")?;
-            let ledger = team::db::Db::open()?;
-            fleet_keys::load()?
-                .keys_newest_first(&fleet_hex, |_, _| true)
-                .into_iter()
-                .find(|(k, g)| {
-                    *g == generation
-                        && fleet_key_verifies(&ledger, &pin, &me, &fleet, *g, k, now)
-                            .unwrap_or(false)
-                })
-                .map(|(k, _)| zeroize::Zeroizing::new(k))
+            verified_fleet_key(&fleet_hex, &pin, &me, generation, now)?
                 .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
         };
         let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
@@ -2784,6 +2772,138 @@ async fn team_approve_device(
     .await;
     client.end_session(access).await;
     result
+}
+
+/// This device's key of `generation` of the fleet `fleet_hex`, only while its
+/// grant still verifies to the pin, as sync reads it
+/// (`team::sync::readable_key`).
+fn verified_fleet_key(
+    fleet_hex: &str,
+    pin: &(shardx_core::trust_chain::Binding, [u8; 32]),
+    me: &shardx_core::trust_chain::Recipient,
+    generation: u64,
+    now: u64,
+) -> anyhow::Result<Option<zeroize::Zeroizing<[u8; 32]>>> {
+    let fleet = fleet_client::decode_hex16(fleet_hex, "fleet_id")?;
+    let ledger = team::db::Db::open()?;
+    Ok(fleet_keys::load()?
+        .keys_newest_first(fleet_hex, |_, _| true)
+        .into_iter()
+        .find(|(k, g)| {
+            *g == generation
+                && fleet_key_verifies(&ledger, pin, me, &fleet, *g, k, now).unwrap_or(false)
+        })
+        .map(|(k, _)| zeroize::Zeroizing::new(k)))
+}
+
+/// Rotate the fleet key as the tenant's root custodian, or resume the
+/// rotation (sequence K, ADR 0002 D-9): N+1 is created with this device as
+/// its required set and activated (N retires), the setup key is released,
+/// N+1 is collected verified, then granted to every member a signed approval
+/// names (Q-45). The password is used for one login and never stored.
+#[tauri::command]
+async fn team_fleet_key_rotate(
+    username: String,
+    password: String,
+) -> Result<fleet_custody::FleetCustodyStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if !c.can_receive_custody() {
+        return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
+    }
+    let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let me = recipient(&c).map_err(|e| e.to_string())?;
+    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let device = fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &fleet_custody::CredentialFkekStore,
+    };
+    let fleet_hex = sync_cmd::fleet_id(&c);
+    let result = async {
+        let error = |e: anyhow::Error| e.to_string();
+        let now = root_bootstrap::now_ms();
+        let save = &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
+        let mut state = fleet_custody::load().map_err(error)?;
+        // Start needs N verified here, and N as the ledger's highest.
+        let previous_key = |generation: u64| {
+            let fleet = fleet_client::decode_hex16(&fleet_hex, "fleet_id")?;
+            let db = team::db::Db::open()?;
+            let highest = team::ledger::highest_generation(&db, &pin.0, &fleet)?;
+            drop(db);
+            verified_fleet_key(&fleet_hex, &pin, &me, generation, now)?
+                .filter(|_| highest == Some(generation))
+                .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.rotationNeedsFleetKey")))
+        };
+        {
+            let mut db = team::db::Db::open().map_err(error)?;
+            let mut ledger = fleet_custody::Ledger {
+                db: &mut db,
+                pin: &pin,
+            };
+            fleet_custody::rotate_fleet(
+                &client,
+                access,
+                &device,
+                &root,
+                &mut ledger,
+                previous_key,
+                now,
+                &mut state,
+                save,
+            )
+            .await
+            .map_err(error)?;
+        }
+        let generation = state.rotation.as_ref().map_or(0, |r| r.generation);
+        let activated = Some(fleet_custody::RotationPhase::Activated);
+        // 10. As Create fleet key: the setup key goes first, then only the
+        // verified collect keeps N+1; `fleet_keys` keeps N too.
+        if state.rotation.as_ref().map(|r| r.phase) != activated {
+            fleet_custody::release_rotation_key(device.vault, &mut state, save).map_err(error)?;
+            let (device_sk, _) = shardx_core::grants::derive_keypair(&seed);
+            let fleet = collect_fleet_grant(&client, &c, access, &device_sk, false).await?;
+            if let Some(error) = setup_collect_error(fleet, generation) {
+                return Err(error);
+            }
+            fleet_custody::rotation_collected(now, &mut state, save).map_err(error)?;
+        }
+        // 11 and 12.
+        let fkek = verified_fleet_key(&fleet_hex, &pin, &me, generation, now)
+            .map_err(error)?
+            .ok_or_else(|| crate::errcode::code("fleet.rotationNeedsFleetKey"))?;
+        let mut db = team::db::Db::open().map_err(error)?;
+        let mut ledger = fleet_custody::Ledger {
+            db: &mut db,
+            pin: &pin,
+        };
+        fleet_custody::grant_members(
+            &client,
+            access,
+            &device,
+            &mut ledger,
+            &fkek,
+            now,
+            &mut state,
+            save,
+        )
+        .await
+        .map_err(error)
+    }
+    .await;
+    client.end_session(access).await;
+    result?;
+    fleet_custody::status().map_err(|e| e.to_string())
 }
 
 /// Revokes the tenant's device `device_id` as `reason`, `retired` or `lost`
@@ -3345,13 +3465,14 @@ async fn collect_fleet_grant(
     Ok(kept)
 }
 
-/// Why Create fleet key stops when its verified collect did not keep
-/// generation 0; `None` once it did. Only a grant the evidence refused reads
-/// as refused evidence: an evidence fetch that failed keeps its own error.
-fn setup_collect_error(fleet: FleetGrant) -> Option<String> {
+/// Why Create fleet key, or Rotate fleet key for its new generation, stops
+/// when its verified collect did not keep `generation`; `None` once it did.
+/// Only a grant the evidence refused reads as refused evidence: an evidence
+/// fetch that failed keeps its own error.
+fn setup_collect_error(fleet: FleetGrant, generation: u64) -> Option<String> {
     let code = |key| Some(crate::errcode::code(key));
     match fleet {
-        FleetGrant::Opened(0) => None,
+        FleetGrant::Opened(g) if g == generation => None,
         FleetGrant::Unfetched(error) => Some(error),
         FleetGrant::Failed => code("fleet.trustEvidenceRefused"),
         FleetGrant::Substituted => code("fleet.keySubstitutionDetected"),
@@ -7535,6 +7656,7 @@ pub fn run() {
             team_export_recovery_bundle,
             team_fleet_custody_status,
             team_fleet_key_setup,
+            team_fleet_key_rotate,
             team_devices,
             team_approve_device,
             team_revoke_device,

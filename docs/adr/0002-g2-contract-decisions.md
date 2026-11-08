@@ -64,7 +64,7 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 | Choice | Decision | Plan lines |
 |---|---|---|
 | **Q-23 Issuer of `ROOT_GRANT_REVOKE`** (L947) | **An ACTIVE root custodian only**, the D-2 issuer rule as implemented: a custodian of the tenant's ACTIVE root generation, signing in with its session, may revoke any root grant of that tenant, including its own. The server refuses a revoke that would leave the ACTIVE root with no other custodian (`LAST_ROOT_CUSTODIAN`). No separate capability is added. Rejected: a dedicated `root.revoke` capability (more records for no new guarantee, since custodians already hold the TRK) | none (confirms L947) |
-| **Q-24 A generation stuck before activation** (L949, S6) | **Never re-filed.** If the creator's `FirstRootSelfGrant` or `FirstFleetSelfGrant` is revoked before it is acknowledged, that generation can never activate: no second self-grant is accepted for it, and the creator does not regain the right to file one. Recovery is a new generation (a root rotation, or the next fleet generation). Rejected: allowing a re-filed self-grant, which would let a revoked device regain a key the revoke meant to withhold. **v2.9.0 limit (2026-11-08):** no route discards the stuck PREPARING generation, so the next root or fleet generation (always ACTIVE + 1) cannot be created until a v2.10 discard route; see D-9, "Limits in v2.9.0" | none (narrows S6) |
+| **Q-24 A generation stuck before activation** (L949, S6) | **Never re-filed.** If the creator's `FirstRootSelfGrant` or `FirstFleetSelfGrant` is revoked before it is acknowledged, that generation can never activate: no second self-grant is accepted for it, and the creator does not regain the right to file one. Recovery is a new generation (a root rotation, or the next fleet generation). Rejected: allowing a re-filed self-grant, which would let a revoked device regain a key the revoke meant to withhold. **v2.9.0 limit (2026-11-08):** no route discards a stuck PREPARING generation, so while it stays PREPARING on the server the next root or fleet generation (always ACTIVE + 1) cannot be created (the create gets `409 FLEET_GENERATION_EXISTS`) until a v2.10 discard route; a fleet rotation whose create never landed, or whose N+1 a restore removed, is not blocked and a later Start rotates normally (Q-49); see D-9, "Limits in v2.9.0" | none (narrows S6) |
 
 ### Decided on 2026-10-29 (strict defaults chosen by the user)
 
@@ -73,7 +73,7 @@ Every amends, reinterprets or extends entry still needs the Architect + Critic p
 | **Q-25 When a lapse is observed** (D-6 (b)) | **From history, before new evidence.** At each evaluation the client first evaluates the containers it has already sighted, records `observed_lapsed_at_ms` for every ledger key whose known window has ended, and only then accepts the new containers. A lapse is never taken from the evidence that is being accepted, so for a key this device has already counted, a server cannot slip a backdated grant from the lapsed key into the evaluation that would record the lapse, or keep the key alive by sending a self-extension first. **Limit:** a key the device never counted (the server withheld its root grant for its whole window, or the device was offline throughout) has no history to lapse from, so a backdated grant arriving together with that root grant is accepted; this is the D-6 no-history bound, and the D-6 (a) custodian events (Q-17) are what reveal it. A key that is merely absent from the evidence is not lapsed; only a key whose window from counted evidence has ended is. **Cost:** a valid renewal that this device first sees after the key's window ended is refused like a forged one; the custodian must be re-appointed by another custodian (D-6 (b)). Rejected: recording the lapse in the accepting evaluation (an independent security review showed the backdating attack above) | none (sharpens D-6 (b)) |
 | **Q-26 Local distrust and collected fleet keys** (D-6 (d), Q-19) | **Distrust also withdraws keys.** When a fleet key is about to be used, the client re-evaluates the grant that delivered it (G2-35) and drops the key if that grant's issuer is now locally distrusted or proven revoked (rule 6), even though the grant was first seen before. This is a narrow exception to Q-19 (A) for key material only: every other record first seen before the distrust or the revocation keeps its standing. It withdraws keys from the delivering grant's direct issuer only: a key appointed by the distrusted key before the distrust keeps its standing (Q-19 (A)) and can still deliver keys until it is itself distrusted or revoked. Rejected: keeping Q-19 (A) for keys, which leaves local distrust, the only mitigation for a device with no history, unable to remove a key already collected | none (narrows Q-19 (A) for keys) |
 | **Q-27 A device offline across several fleet rotations** | **Fail closed.** A device accepts a fleet generation only one step above the highest it has verified (or any generation on first sighting). A device that missed two or more rotations refuses the newer generation and must be enrolled again. Rejected: walking the `RotationGrant` chain to catch up (more design for a rare case) | none |
-| **Q-28 A generation left PREPARING across a restore** (D-1, Q-1) | **Fail closed.** A root or fleet generation still PREPARING at restore epoch `E` does not activate at `E+1`, and no new grant can be filed into it, because new grants carry the generation's epoch. The custodian creates a new generation after the restore. Rejected: letting an older-epoch generation activate after a restore. **v2.9.0 limit (2026-11-08):** for a fleet, the new generation cannot be created while N+1 stays PREPARING, because no route discards it (Q-24) and a new generation must be previous + 1; see D-9, "Limits in v2.9.0" | none |
+| **Q-28 A generation left PREPARING across a restore** (D-1, Q-1) | **Fail closed.** A root or fleet generation still PREPARING at restore epoch `E` does not activate at `E+1`, and no new grant can be filed into it, because new grants carry the generation's epoch. The custodian creates a new generation after the restore. Rejected: letting an older-epoch generation activate after a restore. **v2.9.0 limit (2026-11-08):** for a fleet, the new generation cannot be created only while N+1 is still PREPARING on the server, because no route discards it (Q-24) and a new generation must be previous + 1; if the restore removed N+1, or its create never landed, a later Start rotates normally (Q-49); see D-9, "Limits in v2.9.0" | none |
 
 ### Decided on 2026-10-29 (G2 evidence scope chosen by the user)
 
@@ -132,9 +132,9 @@ The v0.2.3 slice (release v2.9.0) rotates the fleet key with no server change; r
 | **Q-46 Lazy re-seal** (D-9, trust chain) | **Old snapshots stay under their generation; the next push seals under N+1.** Retained envelopes are never rewritten (L2494). A pull reads a head under any generation whose grant re-verifies, under the generation floor (freshness amendment in the trust chain); seals stay on the newest verified generation. After a rotation the Team page lists the profiles bound on the custodian's device whose pinned head is under an older generation and asks the custodian to push each once; a device without the key of an older head gets `sync.headUnderRetiredKey`. Costs a and b are stated in the freshness amendment. Tests `a_pull_restores_a_head_sealed_under_an_older_generation_after_rotation`, `a_device_without_the_old_key_gets_head_under_retired_key`, `profiles_under_an_older_key_lists_bindings_below_the_highest_generation` (confirmed in R1-R4). Rejected: eager or bulk re-seal (v2.10) | none (L2494) |
 | **Q-47 Rotation trigger** (C-1, Q-20) | **Manual, with an advisory banner.** A custodian starts the rotation by hand (Resume while one is unfinished). The `rotation_required` banner, tiered as Q-20, is derived on the custodian's device from its own signed revocations and the known holders of the ACTIVE generation (its saved grants or ledger holdings), never from a server flag (C-1), and never rotates by itself. Tests `rotation_required_is_routine_after_a_retired_revoke_and_clears_after_rotation`, `rotation_required_is_urgent_after_a_lost_revoke` (confirmed in R1-R4) | none |
 | **Q-48 Approvals during a rotation** (D-9) | **Refused while a rotation is unfinished** (`fleet.rotationInProgress`, phases `preparing` and `activated`); allowed again at `done` or `expired`. Test `approving_a_device_while_a_rotation_is_unfinished_is_refused` (confirmed in R1-R4) | none |
-| **Q-49 A rotation that can no longer activate** (Q-24, Q-28) | **Terminal phase `expired`, entered only after the server shows N still ACTIVE.** The setup key is released, N stays ACTIVE, approvals resume, and no new rotation can start (`fleet.rotationStuck`) until a v2.10 server route discards the PREPARING generation. Sequence K, expiry decision; tests `an_expired_rotation_releases_its_setup_key_and_lets_approvals_resume`, `a_resume_after_the_deadline_of_a_lost_activation_reply_continues_to_member_grants` (confirmed in R1-R4). Rejected: declaring `expired` on the local clock alone (strands every member when the activation reply was lost) | none |
+| **Q-49 A rotation that can no longer activate** (Q-24, Q-28) | **Terminal phase `expired`, entered only after the server shows N still ACTIVE.** The setup key is released, N stays ACTIVE, approvals resume, and a later Start tries again: it fails with `fleet.rotationStuck` (releasing its new setup key, back to `expired`) when the server answers the create with `409 FLEET_GENERATION_EXISTS`, which only another create can cause since a re-sent create gets its stored reply; a fleet whose N+1 never reached the server (or was undone by a restore) rotates normally. A truly stuck PREPARING generation waits for a v2.10 discard route. Sequence K, expiry decision; tests `an_expired_rotation_releases_its_setup_key_and_lets_approvals_resume`, `a_resume_after_the_deadline_of_a_lost_activation_reply_continues_to_member_grants`, `a_start_after_an_expired_rotation_whose_create_never_landed_rotates` (confirmed in R1-R4). Rejected: declaring `expired` on the local clock alone (strands every member when the activation reply was lost) | none |
 | **Q-50 `compromised` revoke reason** (Q-18) | **Not offered yet.** Revoke reasons stay `retired` and `lost`, so the Q-18 freeze cannot be started from the UI in v2.9.0 (v2.10 follow-up) | none |
-| **Q-51 Scope of the rotating custodian's `key.rotate`** (D-2) | **Fleet scope, one grant per rotation**, filed for this device and saved in the rotation state (sequence K step 2). Deliberate: fleet scope is what the rotation create and the ledger's activation check ask for; v2.10 root rotation needs a tenant-scoped grant (`server/src/routes/v2_root.rs:514`) and files its own. Test `the_rotate_capability_grant_is_key_rotate_on_this_fleet_for_this_device` (confirmed in R1-R4) | none |
+| **Q-51 Scope of the rotating custodian's `key.rotate`** (D-2) | **Fleet scope, one grant per rotation**, filed for this device and saved in the rotation state (sequence K step 2). Deliberate: fleet scope is what the rotation create and the ledger's activation check ask for; v2.10 root rotation needs a tenant-scoped grant (`server/src/routes/v2_root.rs:514`) and files its own. Cost: each Start retried on a stuck fleet (Q-49) files one more `key.rotate` grant. Test `the_rotate_capability_grant_is_key_rotate_on_this_fleet_for_this_device` (confirmed in R1-R4) | none |
 
 ### Rows (approved by the user on 2026-10-25)
 
@@ -1485,8 +1485,12 @@ confirmed in R1-R4).
 1. **Start or resume.** The server identity must match the custody state.
    Start needs N ACTIVE on the server, N as the highest verified generation in
    the key store and the ledger, and this custodian's own approval valid now;
-   a saved unfinished rotation is resumed instead; a saved `expired` one
-   refuses Start (`fleet.rotationStuck`). Resume skips these checks.
+   a saved unfinished rotation is resumed instead; after a saved `expired`
+   one, Start builds a new rotation and returns `fleet.rotationStuck` only if
+   the server answers its create with `409 FLEET_GENERATION_EXISTS`. Resume
+   skips these checks. A rotation stopped before step 4 whose saved restore
+   epoch differs from the server's releases its setup key and starts over
+   (test `a_rotation_stopped_before_step_4_across_a_restore_epoch_starts_over`).
 2. **S0.** One `key.rotate` capability grant, fleet scope, for this device,
    saved in the rotation state (Q-51).
 3. **Setup key** with a key ID distinct from N's.
@@ -1502,8 +1506,10 @@ confirmed in R1-R4).
 10. Release the setup key and collect the own N+1, verified; the key store keeps
     N and N+1. Phase `activated`.
 11. **Member grants** per Q-45, each built once and saved before it is filed; a
-    server refusal is recorded `refused`, an ineligible device `skipped` with a
-    reason.
+    server refusal (4xx other than 401, 408 or 429) is recorded `refused`, an
+    ineligible device `skipped` with a reason; any other error stops in phase
+    `activated`, and a resume re-sends the saved filing (test
+    `member_grants_resume_after_a_transport_failure_with_the_saved_filing`).
 12. Phase `done`; the custodian is prompted to export the recovery bundle again
     and to push the profiles still under N (Q-46).
 
@@ -1517,7 +1523,7 @@ ACTIVE means the activation may already have happened (a lost reply): the
 launcher re-sends the saved activate and continues at step 10 only when the
 server returns the stored reply with matching terms; otherwise it stops with
 `fleet.rotationStateUnknown`. N ACTIVE enters `expired`: the setup key is released, N
-stays ACTIVE, approvals resume (Q-48) and Start stays refused. Anything else
+stays ACTIVE, approvals resume (Q-48) and a later Start tries again (step 1). Anything else
 stops with `fleet.rotationStateUnknown` and changes nothing. The launcher never
 declares `expired` on its own clock alone. Tests
 `a_rotation_resumed_past_its_deadline_before_filing_expires_without_sending`,
@@ -1528,14 +1534,17 @@ R1-R4).
 
 **Limits in v2.9.0.**
 - Q-24: no route discards a PREPARING generation, so a rotation that ends
-  `expired` leaves N+1 PREPARING and blocks every later rotation of that fleet
-  until a v2.10 server route discards it.
+  `expired` with N+1 still PREPARING on the server blocks later rotations of
+  that fleet (Start gets `409 FLEET_GENERATION_EXISTS`, `fleet.rotationStuck`)
+  until a v2.10 server route discards it; if the create never landed, Start
+  rotates normally (Q-49).
 - Q-27: members pick up N+1 with Collect, one step up; a member offline across
   two rotations must enroll again (`fleet.enrollAgainMissedRotations`; test
   `a_grant_two_generations_up_asks_to_enroll_again`, confirmed in R1-R4).
 - Q-28: a rotation caught by a server restore before activation cannot
-  activate and ends `expired`; Q-28's "creates a new generation after the
-  restore" is not possible for that fleet until the v2.10 discard (Q-24).
+  activate and ends `expired`; a later Start rotates normally when the restore
+  removed N+1, and is blocked as in Q-24 only while N+1 is still PREPARING on
+  the server.
 - Costs a and b of lazy re-seal (trust chain, "Fleet generation freshness").
 - Fleet rotation alone does not cut off a stolen root machine or a leaked v3
   bundle (D-5).
