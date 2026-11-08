@@ -170,6 +170,25 @@ pub fn highest_generation(db: &Db, binding: &Binding, fleet_id: &[u8; 16]) -> Re
     Ok(g.map(|g| g as u64))
 }
 
+/// Whether evidence this device evaluated shows `key` holding generation
+/// `generation` of `fleet_id` (C-1, `trust_key_holdings`).
+pub fn holds(
+    db: &Db,
+    binding: &Binding,
+    key: &[u8; 32],
+    fleet_id: &[u8; 16],
+    generation: u64,
+) -> Result<bool> {
+    let (instance, tenant) = ids(binding);
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM trust_key_holdings
+           WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3
+             AND fleet_id = ?4 AND generation = ?5)",
+        params![instance, tenant, hex(key), hex(fleet_id), wire(generation)?],
+        |r| r.get(0),
+    )?)
+}
+
 /// Holds `key` as distrusted from now on (D-6 (d)): its records first seen
 /// after the latest evaluation are ignored. The binding must be pinned. The
 /// Team settings action that calls this follows the Q-17 UX review.

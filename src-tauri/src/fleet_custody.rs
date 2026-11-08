@@ -1266,19 +1266,90 @@ pub async fn approve_member(
 
 /// ADR 0002 D-6: a revocation runs at most the server's 30 days.
 const REVOCATION_VALIDITY_MS: u64 = 30 * 86_400_000;
-/// The `issued_at_ms` of the saved revocation request `saved`, signed here.
-#[cfg(test)]
-fn issued_at(saved: &str, signer: &Ed25519SigningKey) -> Result<u64> {
+/// The revocation in the saved request `saved`, signed by `issuer`.
+fn saved_revocation(saved: &str, issuer: &[u8; 32]) -> Result<DeviceRevocationV2> {
     let request = saved_request(saved)?;
     let sent =
         DeviceRevokeRequestV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
     match AuthorizationRecord::parse(&sent.exact_signed_revocation_container_bytes)
-        .and_then(|r| r.verify_signature(signer.verifying_key().as_bytes()))
+        .and_then(|r| r.verify_signature(issuer))
         .map(|v| v.payload().clone())
     {
-        Ok(Payload::DeviceRevocation(r)) => Ok(r.common.issued_at_ms),
+        Ok(Payload::DeviceRevocation(r)) => Ok(r),
         _ => Err(corrupt()),
     }
+}
+
+/// The `issued_at_ms` of the saved revocation request `saved`, signed here.
+#[cfg(test)]
+fn issued_at(saved: &str, signer: &Ed25519SigningKey) -> Result<u64> {
+    saved_revocation(saved, signer.verifying_key().as_bytes()).map(|r| r.common.issued_at_ms)
+}
+
+/// How urgently a revocation asks for a fleet key rotation (ADR 0002 Q-20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RotationRequired {
+    Routine,
+    Urgent,
+}
+
+/// D5 (B-1): the most urgent of this custodian's saved revocations whose
+/// device is a known holder of `active`, the highest fleet generation this
+/// device verified: a saved approval grant or rotation member grant for it
+/// names that device, or `held` (the ledger's holdings) says its signing key
+/// holds it. `lost`, or a revocation that does not verify under `issuer`
+/// (this device's key), is urgent; `retired` is routine. A rotation clears
+/// it: a revoked device gets no grant for the new generation.
+pub fn rotation_required(
+    state: &FleetCustodyState,
+    issuer: &[u8; 32],
+    active: u64,
+    held: impl Fn(&[u8; 32]) -> bool,
+) -> Option<RotationRequired> {
+    let granted = |id: &str| {
+        let approved = state.members.get(id).is_some_and(|m| {
+            saved_request(&m.grant_request)
+                .ok()
+                .and_then(|r| FleetKeyGrantCreateV2::parse(&r.canonical_payload_bytes).ok())
+                .is_some_and(|f| f.grant.generation.generation == active)
+        });
+        let rotated = state.rotation.as_ref().is_some_and(|r| {
+            r.generation == active && r.member_results.get(id).map(String::as_str) == Some("filed")
+        });
+        approved || rotated
+    };
+    state
+        .revocations
+        .iter()
+        .filter_map(|(id, saved)| match saved_revocation(saved, issuer) {
+            Ok(r) if granted(id) || held(&r.subject_signing_key_id) => Some(match r.reason_code {
+                DeviceRevocationReason::Retired => RotationRequired::Routine,
+                _ => RotationRequired::Urgent,
+            }),
+            Ok(_) => None,
+            Err(_) => granted(id).then_some(RotationRequired::Urgent),
+        })
+        .max()
+}
+
+/// Ends the re-export prompt of a finished rotation once a recovery bundle
+/// holding `newest`, the newest generation it carries, was written. Skipped
+/// while another custody run holds the state: a rotation sets it again.
+pub fn exported(newest: u64) -> Result<()> {
+    let Ok(_running) = begin() else {
+        return Ok(());
+    };
+    let mut state = load()?;
+    let covered = state
+        .rotation
+        .as_ref()
+        .is_none_or(|r| r.generation <= newest);
+    if state.export_due && covered {
+        state.export_due = false;
+        save(&state)?;
+    }
+    Ok(())
 }
 
 /// The reasons Revoke offers (section 4.R): `retired` and `lost` only.
@@ -2053,6 +2124,8 @@ pub struct FleetCustodyStatus {
     pub rotation: Option<RotationStatus>,
     /// A finished rotation asks for the recovery bundle to be exported again.
     pub export_due: bool,
+    /// Set by the command from [`rotation_required`]; `status` leaves it out.
+    pub rotation_required: Option<RotationRequired>,
 }
 
 /// How far the latest rotation got: no secret of it.
@@ -2098,6 +2171,7 @@ pub fn status() -> Result<FleetCustodyStatus> {
             }
         }),
         export_due: s.export_due,
+        rotation_required: None,
     })
 }
 
@@ -5214,6 +5288,119 @@ pub(crate) mod tests {
             (1, 0, 1, 0)
         );
         assert!(status.export_due);
+    }
+
+    // ---- Rotation banner and re-export prompt (R4) ----
+
+    /// `row` revoked as `reason` and saved here (its reply lost), after this
+    /// custodian saved its fleet grant for `generation`.
+    fn revoked(f: &Fixture, row: &TenantDevice, generation: u64, reason: DeviceRevocationReason) {
+        let mut state = f.prepared();
+        let keys = listed_keys(row).unwrap();
+        let ids = (
+            decode_hex16(&row.account_id, "account_id").unwrap(),
+            decode_hex16(&row.device_id, "device_id").unwrap(),
+        );
+        let grant = member_grant(&f.cx, &f.signer, ids, keys, &FKEK, generation, now_ms()).unwrap();
+        state.members.insert(
+            row.device_id.to_ascii_lowercase(),
+            MemberApproval {
+                grant_request: grant,
+                ..Default::default()
+            },
+        );
+        save(&state).unwrap();
+        let rt = runtime();
+        let (client, _) = rt.block_on(mock(refuse_all()));
+        revoke(&rt, f, &client, row, reason, now_ms());
+    }
+
+    fn tier(
+        f: &Fixture,
+        active: u64,
+        held: impl Fn(&[u8; 32]) -> bool,
+    ) -> Option<RotationRequired> {
+        let issuer = f.signer.verifying_key().to_bytes();
+        rotation_required(&load().unwrap(), &issuer, active, held)
+    }
+
+    #[test]
+    fn rotation_required_is_routine_after_a_retired_revoke_and_clears_after_rotation() {
+        let f = fixture();
+        let b = peer(1);
+        revoked(&f, &b, 0, DeviceRevocationReason::Retired);
+        assert_eq!(tier(&f, 0, |_| false), Some(RotationRequired::Routine));
+        // Generation 1 is active and the member step skipped the revoked device.
+        let mut state = load().unwrap();
+        state.rotation = Some(FleetRotationState {
+            generation: 1,
+            phase: RotationPhase::Done,
+            member_results: [(b.device_id.clone(), "skipped:revoked".into())].into(),
+            ..Default::default()
+        });
+        save(&state).unwrap();
+        assert_eq!(tier(&f, 1, |_| false), None);
+        // Had the member step filed it a grant, the banner would stay.
+        let mut state = load().unwrap();
+        let r = state.rotation.as_mut().unwrap();
+        r.member_results.insert(b.device_id.clone(), "filed".into());
+        save(&state).unwrap();
+        assert_eq!(tier(&f, 1, |_| false), Some(RotationRequired::Routine));
+    }
+
+    #[test]
+    fn rotation_required_is_urgent_after_a_lost_revoke() {
+        let f = fixture();
+        let (b, c) = (peer(1), peer(2));
+        revoked(&f, &b, 0, DeviceRevocationReason::Retired);
+        let mut retired = load().unwrap();
+        revoked(&f, &c, 0, DeviceRevocationReason::Lost);
+        let lost = load().unwrap();
+        retired.members.extend(lost.members);
+        retired.revocations.extend(lost.revocations);
+        save(&retired).unwrap();
+        assert_eq!(tier(&f, 0, |_| false), Some(RotationRequired::Urgent));
+        // Known only from the ledger's holdings: the same tiers.
+        let mut state = load().unwrap();
+        state.members.clear();
+        save(&state).unwrap();
+        assert_eq!(tier(&f, 0, |_| false), None);
+        let c_key = listed_keys(&c).unwrap().0;
+        assert_eq!(tier(&f, 0, |k| *k == c_key), Some(RotationRequired::Urgent));
+        // A saved revocation that does not verify is urgent while its
+        // device is known to hold the active generation.
+        let mut state = retired;
+        let id = b.device_id.to_ascii_lowercase();
+        state.revocations.insert(id, "00".into());
+        state.revocations.remove(&c.device_id.to_ascii_lowercase());
+        save(&state).unwrap();
+        assert_eq!(tier(&f, 0, |_| false), Some(RotationRequired::Urgent));
+    }
+
+    #[test]
+    fn a_revoked_device_that_held_no_active_grant_raises_no_banner() {
+        let f = fixture();
+        let b = peer(1);
+        // Its saved grant names generation 0; generation 1 is active.
+        revoked(&f, &b, 0, DeviceRevocationReason::Lost);
+        assert_eq!(tier(&f, 1, |_| false), None);
+        assert_eq!(tier(&f, 0, |_| false), Some(RotationRequired::Urgent));
+    }
+
+    #[test]
+    fn export_due_is_set_by_a_rotation_and_cleared_by_an_export() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = at_members(&f, vec![b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.members(&f, now).unwrap();
+        assert!(status().unwrap().export_due);
+        // A bundle holding only generation 0 does not open generation 1.
+        exported(0).unwrap();
+        assert!(status().unwrap().export_due);
+        exported(1).unwrap();
+        assert!(!status().unwrap().export_due);
     }
 
     #[test]
