@@ -109,7 +109,15 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   const unfinished = rotation?.phase === "preparing" || rotation?.phase === "activated";
   const stuck = rotation?.phase === "expired";
   const rotate = async (skipMember?: string) => {
-    const ok = await confirmModal({
+    // Skipping is its own decision: the member must be revoked and enroll again.
+    const ok = await confirmModal(skipMember ? {
+      title: t("team.rotation.skipMember"),
+      message: t("team.rotation.skipConfirm", { id: skipMember.slice(0, 8) }),
+      buttons: [
+        { label: t("common.cancel"), value: false },
+        { label: t("team.rotation.skipMember"), value: true, danger: true },
+      ],
+    } : {
       title: t("team.rotation.confirmTitle"),
       message: `${t("team.rotation.confirm")} ${t("team.rotation.retroactive")}`,
       buttons: [

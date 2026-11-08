@@ -1519,6 +1519,7 @@
   "team.rotation.membersRefused": "The team server refused the new fleet key for {n} device(s). Revoke each and enroll it again.",
   "team.rotation.failingMember": "The team server keeps failing the new fleet key grant of device {id}. Skip it to finish the rotation; that device must then be revoked and enroll again.",
   "team.rotation.skipMember": "Skip member",
+  "team.rotation.skipConfirm": "Device {id} gets no key from this rotation, which then finishes. It can no longer read profiles pushed under the new key: revoke it and have it enroll again. This cannot be undone.",
   "team.rotation.olderTitle": "Profiles still under an older key",
   "team.rotation.olderCost": "Devices approved after a rotation, or restored from a recovery bundle, cannot read these profiles, and they become unreadable for every device once the old key's grants end. Push each one once to seal it under the newest key.",
   "team.rotation.olderGeneration": "Generation {n}",

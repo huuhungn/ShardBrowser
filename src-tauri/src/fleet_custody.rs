@@ -1430,7 +1430,10 @@ pub async fn revoke_member(
                 let ledger = custody.as_deref_mut().ok_or_else(refused)?;
                 let pages = client.trust_evidence(access, me.tenant_id).await?;
                 let (_, chain) = ledger.evaluate(&pages, now)?;
-                if chain.custodians().any(|(k, ..)| *k == signing) {
+                // As strict as the Team page, which reads the ledger.
+                if chain.custodians().any(|(k, ..)| *k == signing)
+                    || crate::team::ledger::held_custody(ledger.db, &ledger.pin.0, &signing)?
+                {
                     return Err(refused());
                 }
             }
@@ -1602,9 +1605,13 @@ pub struct FleetRotationState {
     #[serde(default)]
     pub member_results: BTreeMap<String, String>,
     /// The member whose grant filing last failed with an error a resend
-    /// may cure, until the run is done; empty when none.
+    /// may cure, until the run is done or its filing goes through; empty
+    /// when none.
     #[serde(default)]
     pub failing_member: String,
+    /// How many runs in a row `failing_member`'s filing failed so.
+    #[serde(default)]
+    pub failing_runs: u32,
     /// Members the custodian chose to leave without the new key, per device
     /// id: recorded `skipped:custodian`.
     #[serde(default)]
@@ -1616,6 +1623,21 @@ pub struct FleetRotationState {
     pub previous_holders: BTreeSet<String>,
     #[serde(default)]
     pub activated_at_ms: u64,
+}
+
+/// Runs in a row a member's grant filing must fail before the custodian
+/// may skip it: one timeout never offers the irreversible skip.
+const SKIP_AFTER_FAILED_RUNS: u32 = 2;
+
+impl FleetRotationState {
+    /// The member [`skip_member`] may leave out: its filing failed in
+    /// [`SKIP_AFTER_FAILED_RUNS`] runs in a row of this activated rotation.
+    fn skippable(&self) -> Option<&str> {
+        (self.phase == RotationPhase::Activated
+            && self.failing_runs >= SKIP_AFTER_FAILED_RUNS
+            && !self.failing_member.is_empty())
+        .then_some(self.failing_member.as_str())
+    }
 }
 
 impl std::fmt::Debug for FleetRotationState {
@@ -1703,9 +1725,15 @@ pub async fn rotate_fleet(
     // Stopped before step 4 across a server restore: nothing of N+1 is on
     // the server, and the saved requests name the old epoch, so it starts
     // over.
+    let mut restarted = None;
     if state.rotation.as_ref().is_some_and(|r| {
         r.phase == RotationPhase::Preparing && r.deadline_ms.is_none() && r.restore_epoch != epoch
     }) {
+        // The holders it kept from the rotation before still hold that key.
+        restarted = state
+            .rotation
+            .as_ref()
+            .map(|r| (r.previous_generation, r.previous_holders.clone()));
         release_fkek(device.vault, state, rotation_key, save)?;
         commit(state, save, |s| s.rotation = None)?;
         eprintln!("[rotation] restarted after a server restore before step 4");
@@ -1741,14 +1769,15 @@ pub async fn rotate_fleet(
                 ));
             }
             let generation = previous.checked_add(1).ok_or_else(mismatch)?;
-            let previous_holders = match &state.rotation {
-                Some(r) if r.generation == previous => r
+            let previous_holders = match (&state.rotation, restarted) {
+                (Some(r), _) if r.generation == previous => r
                     .member_results
                     .iter()
                     .filter(|(_, result)| *result == "filed")
                     .map(|(id, _)| id.clone())
                     .collect(),
-                Some(r) if r.previous_generation == previous => r.previous_holders.clone(),
+                (Some(r), _) if r.previous_generation == previous => r.previous_holders.clone(),
+                (None, Some((generation, holders))) if generation == previous => holders,
                 _ => BTreeSet::new(),
             };
             commit(state, save, |s| {
@@ -2172,11 +2201,27 @@ pub async fn grant_members(
             Ok(()) => "filed",
             Err(e) if refused_for_good(&e) => "refused",
             Err(e) => {
-                // Named for the custodian, who may skip it ([`skip_member`]).
-                commit(state, save, |s| rotation_mut(s).failing_member = id.clone())?;
+                // Counted for the custodian, who may skip it once it keeps
+                // failing ([`skip_member`]).
+                commit(state, save, |s| {
+                    let r = rotation_mut(s);
+                    r.failing_runs = if r.failing_member == id {
+                        r.failing_runs.saturating_add(1)
+                    } else {
+                        1
+                    };
+                    r.failing_member = id.clone();
+                })?;
                 return Err(e);
             }
         };
+        if rotation_mut(state).failing_member == id {
+            commit(state, save, |s| {
+                let r = rotation_mut(s);
+                r.failing_member.clear();
+                r.failing_runs = 0;
+            })?;
+        }
         results.insert(id, result.to_string());
     }
     for (id, result) in &results {
@@ -2187,14 +2232,15 @@ pub async fn grant_members(
         let r = rotation_mut(s);
         r.member_results = results;
         r.failing_member.clear();
+        r.failing_runs = 0;
         r.phase = RotationPhase::Done;
     })?;
     eprintln!("[rotation] done: generation {}", r.generation);
     Ok(())
 }
 
-/// The custodian leaves `device_id`, the member whose grant filing keeps
-/// failing in the activated rotation, without the new key: the next run
+/// The custodian leaves `device_id`, the member whose grant filing failed
+/// in two runs in a row of the activated rotation, without the new key: the next run
 /// records it `skipped:custodian` and finishes. It must then be revoked and
 /// enroll again, as a refused member must.
 pub fn skip_member(
@@ -2206,7 +2252,8 @@ pub fn skip_member(
     let failing = state
         .rotation
         .as_ref()
-        .is_some_and(|r| r.phase == RotationPhase::Activated && r.failing_member == id);
+        .and_then(FleetRotationState::skippable)
+        == Some(id.as_str());
     if !failing {
         bail!(crate::errcode::code("fleet.rotationSkipRefused"));
     }
@@ -2305,8 +2352,7 @@ pub fn status() -> Result<FleetCustodyStatus> {
                 members_filed: count("filed"),
                 members_refused: count("refused"),
                 members_skipped: count("skipped"),
-                failing_member: Some(r.failing_member)
-                    .filter(|m| !m.is_empty() && r.phase == RotationPhase::Activated),
+                failing_member: r.skippable().map(str::to_owned),
             }
         }),
         export_due: s.export_due,
@@ -5894,7 +5940,7 @@ pub(crate) mod tests {
 
     /// The tenant approval and existing-root grant this custodian files for
     /// `row`, so fresh evidence counts `row`'s key as a custodian.
-    fn appoint(rig: &Rig, f: &Fixture, row: &TenantDevice, now: u64) {
+    fn appoint(rig: &Rig, f: &Fixture, row: &TenantDevice, replay: u8, now: u64) {
         use shardx_core::authz_record::{
             RootGrantVariant, TenantRootKeyGrantV2, DOMAIN_TENANT_ROOT_KEY_GRANT,
         };
@@ -5902,7 +5948,7 @@ pub(crate) mod tests {
         let account = decode_hex16(&row.account_id, "account_id").unwrap();
         let device = decode_hex16(&row.device_id, "device_id").unwrap();
         let approval = DeviceApprovalV2 {
-            common: f.cx.common([0x50; 16], now),
+            common: f.cx.common([replay; 16], now),
             subject_account_id: account,
             subject_device_id: device,
             subject_signing_key_id: signing,
@@ -5911,7 +5957,7 @@ pub(crate) mod tests {
             approval_scope_id: f.cx.tenant,
         };
         let root = TenantRootKeyGrantV2 {
-            common: f.cx.common([0x51; 16], now),
+            common: f.cx.common([replay + 1; 16], now),
             variant: RootGrantVariant::ExistingRootGrant,
             root_key_id: [8; 32],
             root_generation: 0,
@@ -5919,7 +5965,7 @@ pub(crate) mod tests {
             subject_device_id: device,
             subject_signing_key_id: signing,
             recipient_hpke_key_id: hpke,
-            subject_device_approval_replay_id: [0x50; 16],
+            subject_device_approval_replay_id: [replay; 16],
             hpke_encapped_key_bytes: [3; 32],
             hpke_wrapped_trk_bytes: [4; 48],
         };
@@ -5933,7 +5979,8 @@ pub(crate) mod tests {
     }
 
     /// D10 (Q-57): `compromised` is refused for a row whose key fresh
-    /// evidence counts as a custodian, and without evidence to check it
+    /// evidence counts as a custodian, or that the ledger here once counted
+    /// so (what the Team page reads), and without evidence to check it
     /// against, before any request is saved or sent; a member row is revoked
     /// as `compromised`.
     #[test]
@@ -5942,8 +5989,29 @@ pub(crate) mod tests {
         let (x, m) = (peer(1), peer(2));
         let mut rig = rig(&f, |_| {});
         let now = rig.now;
-        appoint(&rig, &f, &x, now);
+        appoint(&rig, &f, &x, 0x50, now);
         let pin = f.pin();
+        // Y held custody in an evaluation recorded here, then the server
+        // stopped serving its root grant.
+        let y = peer(3);
+        let served = rig.rot.lock().unwrap().base.len();
+        appoint(&rig, &f, &y, 0x60, now);
+        let pages = rig
+            .rt
+            .block_on(rig.client.trust_evidence("access", &f.tenant))
+            .unwrap();
+        let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &pages, now)
+            .unwrap()
+            .unwrap();
+        crate::team::ledger::record(&mut rig.db, &pin.0, &seen, &chain, None, false, now).unwrap();
+        let y_key = listed_keys(&y).unwrap().0;
+        assert!(crate::team::ledger::held_custody(&rig.db, &pin.0, &y_key).unwrap());
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            rot.base.truncate(served);
+            rot.base_keys.pop();
+        }
+        rig.clear();
         let revoke_as_compromised = |rig: &mut Rig, row: &TenantDevice, checked: bool| {
             let mut state = load().unwrap();
             let mut ledger = Ledger {
@@ -5962,8 +6030,8 @@ pub(crate) mod tests {
                 &mut |s| save(s),
             ))
         };
-        for checked in [true, false] {
-            let err = revoke_as_compromised(&mut rig, &x, checked).unwrap_err();
+        for (row, checked) in [(&x, true), (&x, false), (&y, true)] {
+            let err = revoke_as_compromised(&mut rig, row, checked).unwrap_err();
             assert!(has(&err, "fleet.compromisedCustodian"), "{err}");
             assert!(load().unwrap().revocations.is_empty(), "nothing saved");
             let posts: Vec<String> = rig
@@ -5988,10 +6056,10 @@ pub(crate) mod tests {
             .any(|c| c.starts_with("POST ") && c.contains(&m.device_id)));
     }
 
-    /// v2.9.0 "Member grant errors": a member whose grant filing keeps
-    /// failing is named in the status; once the custodian skips it, the
-    /// rotation finishes without it and nothing more is sent for it. Only the
-    /// failing member can be skipped.
+    /// v2.9.0 "Member grant errors": a member whose grant filing failed in
+    /// two runs in a row is named in the status (one failure is not); once
+    /// the custodian skips it, the rotation finishes without it and nothing
+    /// more is sent for it. Only that member can be skipped.
     #[test]
     fn a_member_skipped_by_the_custodian_lets_the_rotation_finish() {
         let f = fixture();
@@ -6009,6 +6077,15 @@ pub(crate) mod tests {
         }));
         assert!(rig.members(&f, now).is_err());
         assert_eq!(rotation().phase, RotationPhase::Activated);
+        assert_eq!(status().unwrap().rotation.unwrap().failing_member, None);
+        let mut state = load().unwrap();
+        let err = skip_member(&mut state, &b.device_id, &mut |s| save(s)).unwrap_err();
+        assert!(
+            has(&err, "fleet.rotationSkipRefused"),
+            "after one failure: {err}"
+        );
+
+        assert!(rig.members(&f, now).is_err());
         let failing = status().unwrap().rotation.unwrap().failing_member;
         assert_eq!(failing.as_deref(), Some(b.device_id.as_str()));
 
@@ -6055,6 +6132,47 @@ pub(crate) mod tests {
         let err = rig.rotate(&f, deadline).unwrap_err();
         assert!(has(&err, "fleet.rotationExpired"), "{err}");
         assert_eq!(rotation().phase, RotationPhase::Expired);
+        assert_eq!(tier(&f, 1, |_| false), Some(RotationRequired::Routine));
+    }
+
+    /// The same across a rotation that stopped before step 4 and starts over
+    /// after a server restore: the restarted one keeps the holders.
+    #[test]
+    fn a_revoked_holder_keeps_its_banner_across_a_rotation_restarted_by_a_restore() {
+        let f = fixture();
+        let b = peer(1);
+        let mut rig = at_members(&f, vec![b.clone()]);
+        let now = rig.now;
+        save_approval(&f, &b, now, now + 365 * DAY_MS);
+        rig.members(&f, now).unwrap();
+        let rt = runtime();
+        let (client, _) = rt.block_on(mock(refuse_all()));
+        revoke(&rt, &f, &client, &b, DeviceRevocationReason::Retired, now);
+
+        // The setup key's id is never saved: stopped before step 4.
+        let err = rig
+            .rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                move || now,
+                &mut |s| {
+                    if s.rotation
+                        .as_ref()
+                        .is_some_and(|r| !r.fkek_key_id.is_empty())
+                    {
+                        bail!("disk-full")
+                    }
+                    save(s)
+                },
+            )
+            .unwrap_err();
+        assert!(has(&err, "disk-full"));
+        assert_eq!(tier(&f, 1, |_| false), Some(RotationRequired::Routine));
+        rig.rot.lock().unwrap().epoch = 1;
+        rig.refuse("/activate", 503, "");
+        assert!(rig.rotate(&f, now).is_err());
+        assert_eq!(rotation().restore_epoch, 1, "started over");
         assert_eq!(tier(&f, 1, |_| false), Some(RotationRequired::Routine));
     }
 

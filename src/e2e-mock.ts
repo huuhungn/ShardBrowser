@@ -392,6 +392,8 @@ let fleetCustody: {
 };
 // The highest fleet key generation this device kept.
 let teamGeneration = 0;
+// The member whose grant failed in the latest runs of an activated rotation, and in how many in a row.
+let teamFailing: { id: string; runs: number } | null = null;
 // `teamRotation=unfinished` or `expired`: A created the fleet key and saved a
 // rotation to generation 1 that is still preparing, or can no longer activate.
 const teamRotation = params.get("teamRotation");
@@ -558,10 +560,14 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         members_filed: r.filed, members_refused: r.refused, members_skipped: r.skipped,
       };
       if (r.failing) {
-        // A member's grant failed with an error a resend may cure: the rotation stays activated.
-        fleetCustody = { ...fleetCustody, rotation: { ...rotation, phase: "activated", failing_member: r.failing } };
+        // A member's grant failed with an error a resend may cure: the rotation stays activated,
+        // and the member is offered for Skip only after two runs in a row.
+        teamFailing = { id: r.failing, runs: teamFailing?.id === r.failing ? teamFailing.runs + 1 : 1 };
+        const failing_member = teamFailing.runs >= 2 ? r.failing : null;
+        fleetCustody = { ...fleetCustody, rotation: { ...rotation, phase: "activated", failing_member } };
         teamRefuse("fleet.refusedCustody|status=503|detail=unavailable");
       }
+      teamFailing = null;
       fleetCustody = {
         ...fleetCustody,
         rotation: { ...rotation, phase: "done", failing_member: null },

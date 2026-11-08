@@ -867,12 +867,17 @@ test("a rotation held up by a member's failing grant finishes once the custodian
   await cardClick(a, "Create fleet key");
   await rotateOn(a);
   const failing = card.getByTestId("team-rotation-failing");
-  await expect(failing).toContainText(`keeps failing the new fleet key grant of device ${"c6".repeat(4)}`);
   await expect(card.getByTestId("team-rotation-status")).toContainText("is unfinished");
+  // One failure may be a timeout: Skip is offered only once a resume fails too.
+  await expect(failing).toHaveCount(0);
+  await rotateOn(a, "Resume fleet key rotation");
+  await expect(failing).toContainText(`keeps failing the new fleet key grant of device ${"c6".repeat(4)}`);
 
   await cardSignIn(a);
   await failing.getByRole("button", { name: "Skip member" }).click();
-  await a.getByRole("dialog").getByRole("button", { name: "Resume fleet key rotation" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("revoke it and have it enroll again");
+  await dialog.getByRole("button", { name: "Skip member" }).click();
   await expect(card.getByTestId("team-rotation-status"))
     .toContainText("New key granted to 1 device(s); refused by the server for 0; skipped for 1.");
   await expect(failing).toHaveCount(0);
