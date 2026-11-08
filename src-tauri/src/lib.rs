@@ -2956,6 +2956,7 @@ async fn team_fleet_key_rotate(
     let result = async {
         let error = |e: anyhow::Error| e.to_string();
         let now = root_bootstrap::now_ms();
+        let started = std::time::Instant::now();
         let save = &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
         let mut state = fleet_custody::load().map_err(error)?;
         // Start needs N verified here, and N as the ledger's highest.
@@ -2981,7 +2982,7 @@ async fn team_fleet_key_rotate(
                 &root,
                 &mut ledger,
                 previous_key,
-                now,
+                || now + started.elapsed().as_millis() as u64,
                 &mut state,
                 save,
             )

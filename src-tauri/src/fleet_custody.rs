@@ -1600,7 +1600,7 @@ impl Ledger<'_> {
 }
 
 /// Runs, or resumes, Rotate fleet key (sequence K) through step 9 under the
-/// device session `access`, at `now`. At Start, `previous_key` gives this
+/// device session `access`, `clock` giving the time. At Start, `previous_key` gives this
 /// device's verified key of the ACTIVE generation N. `Ok` means N+1 is
 /// ACTIVE: the command then releases the setup key and collects N+1 (step
 /// 10) and runs [`grant_members`]. `save` persists `state`; every step that
@@ -1620,10 +1620,11 @@ pub async fn rotate_fleet(
     root: &BootstrapState,
     ledger: &mut Ledger<'_>,
     previous_key: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
-    now: u64,
+    clock: impl Fn() -> u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
+    let now = clock();
     let ours = root.tenant_id.eq_ignore_ascii_case(device.tenant_id)
         && root.device_id.eq_ignore_ascii_case(device.device_id);
     if !root.activated || !ours {
@@ -1632,11 +1633,9 @@ pub async fn rotate_fleet(
     let cx = custodian(device, state)?;
     // The deadline is checked at each send's time, not this call's: a wait
     // for the server may cross it.
-    let started = std::time::Instant::now();
-    let at = || now + started.elapsed().as_millis() as u64;
     let past = |s: &FleetCustodyState| {
         let deadline = s.rotation.as_ref().and_then(|r| r.deadline_ms);
-        deadline.is_some_and(|d| at() >= d)
+        deadline.is_some_and(|d| clock() >= d)
     };
 
     // 1. The server is the one this custody began on; a restore of it is
@@ -1668,9 +1667,10 @@ pub async fn rotate_fleet(
         // Only once step 4 saved the deadline: nothing of N+1 is on the
         // server before.
         Some((RotationPhase::Preparing, Some(deadline), saved))
-            if at() >= deadline || saved != epoch =>
+            if clock() >= deadline || saved != epoch =>
         {
-            return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+            return expiry_decision(client, access, device, &fleet, clock(), None, state, save)
+                .await;
         }
         Some((RotationPhase::Preparing, ..)) => {}
         _ => {
@@ -1736,7 +1736,7 @@ pub async fn rotate_fleet(
 
     // 5. N+1, now PREPARING.
     if past(state) {
-        return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+        return expiry_decision(client, access, device, &fleet, clock(), None, state, save).await;
     }
     let create = saved_request(&r.create_request)?;
     let expected = FleetKeyGenerationCreateV2::parse(&create.canonical_payload_bytes)
@@ -1766,11 +1766,12 @@ pub async fn rotate_fleet(
     let sends = r.grant_requests.iter().map(|s| (s, false));
     for (saved, ack) in sends.chain(r.ack_requests.iter().map(|s| (s, true))) {
         if past(state) {
-            return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+            return expiry_decision(client, access, device, &fleet, clock(), None, state, save)
+                .await;
         }
         match send_grant(client, access, &fleet, r.generation, saved, ack).await {
             Err(e) if refused_with(&e, 403, None) => {
-                let now = at();
+                let now = clock();
                 return expiry_decision(client, access, device, &fleet, now, Some(e), state, save)
                     .await;
             }
@@ -1780,8 +1781,8 @@ pub async fn rotate_fleet(
 
     // 8 and 9. Activation is due from `issued_at`: refused before it, only
     // a skewed clock can be early.
-    if at() >= r.deadline_ms.ok_or_else(corrupt)? {
-        return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+    if clock() >= r.deadline_ms.ok_or_else(corrupt)? {
+        return expiry_decision(client, access, device, &fleet, clock(), None, state, save).await;
     }
     match activate(client, access, &fleet, &r).await {
         Err(e) if refused_with(&e, 409, Some("FLEET_GRANTS_INCOMPLETE")) => {
@@ -2233,7 +2234,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::fleet_keys;
     use shardx_core::mutation::IdempotentStoredResponseV2;
-    use std::sync::atomic::{AtomicU16, AtomicUsize};
+    use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     const DAY_MS: u64 = 86_400_000;
@@ -4452,7 +4453,7 @@ pub(crate) mod tests {
                 f,
                 &CredentialFkekStore,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
         }
@@ -4462,7 +4463,7 @@ pub(crate) mod tests {
             f: &Fixture,
             vault: &dyn FkekStore,
             previous: impl FnOnce(u64) -> Result<Zeroizing<[u8; 32]>>,
-            now: u64,
+            clock: impl Fn() -> u64,
             save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
         ) -> Result<()> {
             let mut state = load()?;
@@ -4478,7 +4479,7 @@ pub(crate) mod tests {
                 &f.root,
                 &mut ledger,
                 previous,
-                now,
+                clock,
                 &mut state,
                 save,
             ))
@@ -4727,7 +4728,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if failed.insert(kept) {
                         bail!("disk-full")
@@ -4786,7 +4787,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if s.rotation
                         .as_ref()
@@ -4805,7 +4806,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            now,
+            move || now,
             &mut |s| save(s),
         )
         .unwrap();
@@ -4813,7 +4814,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            now,
+            move || now,
             &mut |s| save(s),
         )
         .unwrap();
@@ -4839,7 +4840,7 @@ pub(crate) mod tests {
                 &f,
                 &CredentialFkekStore,
                 |_| bail!(crate::errcode::code("fleet.rotationNeedsFleetKey")),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
             .unwrap_err();
@@ -4949,23 +4950,32 @@ pub(crate) mod tests {
     }
 
     /// A resume started just before the deadline whose wait for `slow`
-    /// crosses it: the next request after that reply reads ACTIVE, and
-    /// nothing else is sent.
+    /// crosses it, the clock moving past it while the server answers: the
+    /// next request after that reply reads ACTIVE, and nothing else is sent.
     fn a_deadline_crossed_during(slow: &'static str, filed_before: usize) {
         let f = fixture();
         let mut rig = rig(&f, |_| {});
         rig.refuse("/activate", 503, "");
         assert!(rig.rotate(&f, rig.now).is_err());
         let deadline = rotation().deadline_ms.unwrap();
-        let first = AtomicBool::new(true);
+        let clock = Arc::new(AtomicU64::new(deadline - 1));
+        let moved = clock.clone();
         rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
-            if call.ends_with(slow) && first.swap(false, Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(1_200));
+            if call.ends_with(slow) {
+                moved.store(deadline, Ordering::SeqCst);
             }
             None
         }));
         rig.clear();
-        let err = rig.rotate(&f, deadline - 1_000).unwrap_err();
+        let err = rig
+            .rotate_with(
+                &f,
+                &CredentialFkekStore,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                move || clock.load(Ordering::SeqCst),
+                &mut |s| save(s),
+            )
+            .unwrap_err();
         assert!(has(&err, "fleet.rotationExpired"), "{slow}: {err}");
         let calls = rig.calls();
         let slow_at = calls.iter().position(|c| c.ends_with(slow)).unwrap();
@@ -5114,7 +5124,7 @@ pub(crate) mod tests {
                 &f,
                 &CredentialFkekStore,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| {
                     if s.rotation
                         .as_ref()
@@ -5162,7 +5172,7 @@ pub(crate) mod tests {
             &f,
             &vault,
             |_| Ok(Zeroizing::new(OLD_FKEK)),
-            later,
+            move || later,
             &mut |s| save(s),
         )
         .unwrap();
@@ -5563,7 +5573,7 @@ pub(crate) mod tests {
                 &f,
                 &vault,
                 |_| Ok(Zeroizing::new(OLD_FKEK)),
-                now,
+                move || now,
                 &mut |s| save(s),
             )
         };
