@@ -8,7 +8,7 @@ import { safeUiError } from "../../../shared/lib/utils";
 import { useProfile } from "../../../entities/profile";
 import {
   teamFleetCustodyStatus, teamFleetKeySetup, teamDevices, teamApproveDevice, teamRevokeDevice,
-  teamFleetKeyRotate, teamProfilesUnderOlderKey, teamPull, teamCheckIn, useTeamProfiles,
+  teamFleetKeyRotate, teamProfilesUnderOlderKey, teamCheckIn, useTeamProfiles,
   type FleetCustodyStatus, type TeamDevice, type TeamRevokeReason, type OlderKeyProfile,
 } from "../../../entities/team";
 
@@ -56,15 +56,18 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   const [older, setOlder] = useState<OlderKeyProfile[]>([]);
   const [olderErrors, setOlderErrors] = useState<Record<string, string>>({});
   const profiles = useProfile((s) => s.profiles);
+  const bindings = useTeamProfiles((s) => s.status);
   const refreshBindings = useTeamProfiles((s) => s.refresh);
   const loadOlder = () => teamProfilesUnderOlderKey().then(setOlder).catch(() => {});
   const nameOf = (id: string) => profiles.find((x) => x.id === id)?.name ?? id;
   useEffect(() => {
     teamFleetCustodyStatus().then(setFleet).catch(() => {});
-    void loadOlder();
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+  // A Check in, Pull or Unbind from the profile list refreshes the bindings,
+  // and may move a profile off an older key.
+  useEffect(() => { void loadOlder(); }, [bindings]);
 
   // The journal says how far Create fleet key got; whether the key is usable
   // now is team_status's live check. Approve hands that key on.
@@ -134,23 +137,17 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
     });
   };
 
-  // Push first: a pull restores over local data, so it runs only when the
-  // server says this copy is behind; a refused pull pushes nothing and keeps
-  // the row with its error.
+  // Push only: a copy the server says is behind may hold unpushed changes a
+  // pull would replace, so the user pulls it from the profile list first.
   const repush = (o: OlderKeyProfile) => run(`repush:${o.profile_id}`, async () => {
     const [u, p] = login();
     try {
-      try {
-        await teamCheckIn(o.profile_id, u, p);
-      } catch (e) {
-        if (!String(e).includes("sync.remoteAhead")) throw e;
-        await teamPull(o.profile_id, u, p);
-        await teamCheckIn(o.profile_id, u, p);
-      }
+      await teamCheckIn(o.profile_id, u, p);
       setOlderErrors(({ [o.profile_id]: _, ...rest }) => rest);
       toast.ok(t("team.rotation.repushed", { name: nameOf(o.profile_id) }));
     } catch (e) {
-      setOlderErrors((m) => ({ ...m, [o.profile_id]: safeUiError(e) }));
+      const behind = String(e).includes("sync.remoteAhead");
+      setOlderErrors((m) => ({ ...m, [o.profile_id]: behind ? t("team.rotation.behind") : safeUiError(e) }));
     } finally {
       void loadOlder();
       void refreshBindings();
@@ -277,7 +274,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
                       disabled={!!busy || !account.signedIn}
                       onClick={() => { void repush(o); }}
                     >
-                      {t("team.rotation.pullAndPush")}
+                      {t("team.rotation.push")}
                     </Button>
                   </div>
                   {olderErrors[o.profile_id] && (

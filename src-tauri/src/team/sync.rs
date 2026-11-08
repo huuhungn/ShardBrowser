@@ -11566,7 +11566,7 @@ mod tests {
     }
 
     /// R4's deciding test: a push with nothing changed is not short-cut; it
-    /// seals a new head under the newest generation, so Pull and push needs
+    /// seals a new head under the newest generation, so the older-key Push needs
     /// no forced re-seal, and the profile leaves the older-key list.
     #[test]
     fn a_clean_profile_push_reseals_under_the_newest_generation() {
