@@ -398,9 +398,10 @@ Roughly the sequence the constraints force:
 7. **Fleet key rotation.** Done in 2.9.0 (see below).
 
 In development for v2.10, with no server change (ADR 0002 Q-52 to Q-58):
-moving root custody to a new device row so a lost machine or an old bundle
-stops being a root custodian, the root custodian renewing its own approval
-and grants, and re-sealing every profile under the newest fleet key at once.
+moving root custody to a new device row, the root custodian renewing its own
+approval and grants, and re-sealing every profile under the newest fleet key
+at once. Once the old row is revoked (v2.10 if gate G6 passes, otherwise
+v2.11), a lost machine or an old bundle stops being a root custodian.
 
 Still to come in v2.11, with one batched server update: root key rotation,
 renewal of members' approvals and grants (which run one year), discarding a
@@ -480,8 +481,9 @@ member but not to the outgoing custodian (`skipped:outgoing-custodian`).
 
 In development for v2.10 (ADR 0002 Q-56, Q-58, D-5 sequence H). It moves root
 custody from the current root machine A to a new device B, which is how a
-custodian re-keys before its key age (1095 days) and how a lost machine or an
-old bundle stops being a root custodian. No server change is needed.
+custodian re-keys before its key age (1095 days). Once the old row is revoked
+(v2.10 if gate G6 passes, otherwise v2.11), a lost machine or an old bundle
+stops being a root custodian. No server change is needed.
 
 1. B enrolls and joins like any member, comparing the join code.
 2. On A, **Approve as root custodian**. It is refused
@@ -531,6 +533,8 @@ What the hand-over does not do:
   heads, later pushes and B's own key of N stay readable; older snapshots
   below the heads do not.
 - **Run two at once.** One hand-over at a time.
+
+## Threat model, stated plainly
 
 The team server is trusted for RBAC and coordination (who belongs to a
 tenant, leases, version fencing). It is **not** trusted for key distribution:
@@ -601,8 +605,8 @@ What does not hold:
   server, but it keeps the fleet key it already holds; see "Revocation: what
   it does and does not protect".
 - From v2.10, a cryptographic cut-off of an old root after a hand-over. Its
-  cut-off is server-enforced until v2.11 rotates the root key; see "Root
-  custody hand-over".
+  cut-off is server-enforced until v2.11 rotates the root key (in branch B,
+  none until the v2.11 revoke); see "Root custody hand-over".
 - From v2.10, trust in a member the server leaves out of the evidence when a
   custodian is revoked: that member is distrusted and enrolls again. A server
   can deny service this way, not forge trust.
