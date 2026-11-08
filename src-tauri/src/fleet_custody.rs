@@ -1630,6 +1630,14 @@ pub async fn rotate_fleet(
         bail!(crate::errcode::code("fleet.notCustodian"));
     }
     let cx = custodian(device, state)?;
+    // The deadline is checked at each send's time, not this call's: a wait
+    // for the server may cross it.
+    let started = std::time::Instant::now();
+    let at = || now + started.elapsed().as_millis() as u64;
+    let past = |s: &FleetCustodyState| {
+        let deadline = s.rotation.as_ref().and_then(|r| r.deadline_ms);
+        deadline.is_some_and(|d| at() >= d)
+    };
 
     // 1. The server is the one this custody began on; a restore of it is
     // the expiry decision's.
@@ -1660,9 +1668,9 @@ pub async fn rotate_fleet(
         // Only once step 4 saved the deadline: nothing of N+1 is on the
         // server before.
         Some((RotationPhase::Preparing, Some(deadline), saved))
-            if now >= deadline || saved != epoch =>
+            if at() >= deadline || saved != epoch =>
         {
-            return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+            return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
         }
         Some((RotationPhase::Preparing, ..)) => {}
         _ => {
@@ -1727,6 +1735,9 @@ pub async fn rotate_fleet(
     }
 
     // 5. N+1, now PREPARING.
+    if past(state) {
+        return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+    }
     let create = saved_request(&r.create_request)?;
     let expected = FleetKeyGenerationCreateV2::parse(&create.canonical_payload_bytes)
         .map_err(|_| corrupt())?;
@@ -1754,8 +1765,12 @@ pub async fn rotate_fleet(
     // 6 and 7. A 403 is the server's window check: the expiry decision.
     let sends = r.grant_requests.iter().map(|s| (s, false));
     for (saved, ack) in sends.chain(r.ack_requests.iter().map(|s| (s, true))) {
+        if past(state) {
+            return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
+        }
         match send_grant(client, access, &fleet, r.generation, saved, ack).await {
             Err(e) if refused_with(&e, 403, None) => {
+                let now = at();
                 return expiry_decision(client, access, device, &fleet, now, Some(e), state, save)
                     .await;
             }
@@ -1765,8 +1780,8 @@ pub async fn rotate_fleet(
 
     // 8 and 9. Activation is due from `issued_at`: refused before it, only
     // a skewed clock can be early.
-    if now >= r.deadline_ms.ok_or_else(corrupt)? {
-        return expiry_decision(client, access, device, &fleet, now, None, state, save).await;
+    if at() >= r.deadline_ms.ok_or_else(corrupt)? {
+        return expiry_decision(client, access, device, &fleet, at(), None, state, save).await;
     }
     match activate(client, access, &fleet, &r).await {
         Err(e) if refused_with(&e, 409, Some("FLEET_GRANTS_INCOMPLETE")) => {
@@ -4882,6 +4897,43 @@ pub(crate) mod tests {
         assert!(rotation_key_held().is_none());
         approve_allowed(&rig, &f);
         start_is_stuck(&mut rig, &f);
+    }
+
+    /// A resume started just before the deadline whose wait for `slow`
+    /// crosses it: the next request after that reply reads ACTIVE, and
+    /// nothing else is sent.
+    fn a_deadline_crossed_during(slow: &'static str, filed_before: usize) {
+        let f = fixture();
+        let mut rig = rig(&f, |_| {});
+        rig.refuse("/activate", 503, "");
+        assert!(rig.rotate(&f, rig.now).is_err());
+        let deadline = rotation().deadline_ms.unwrap();
+        let first = AtomicBool::new(true);
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            if call.ends_with(slow) && first.swap(false, Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1_200));
+            }
+            None
+        }));
+        rig.clear();
+        let err = rig.rotate(&f, deadline - 1_000).unwrap_err();
+        assert!(has(&err, "fleet.rotationExpired"), "{slow}: {err}");
+        let calls = rig.calls();
+        let slow_at = calls.iter().position(|c| c.ends_with(slow)).unwrap();
+        assert!(
+            calls[slow_at + 1].ends_with("/key-generation"),
+            "{slow}: {calls:?}"
+        );
+        assert!(only_reads(&calls[slow_at + 1..]), "{slow}: {calls:?}");
+        assert_eq!(rig.bodies("/grants").len(), filed_before, "{slow}");
+        assert_eq!(rotation().phase, RotationPhase::Expired);
+    }
+
+    #[test]
+    fn a_deadline_crossed_while_waiting_for_the_server_runs_the_expiry_decision() {
+        a_deadline_crossed_during("/v2/server-identity", 0);
+        a_deadline_crossed_during("/capability-grants", 0);
+        a_deadline_crossed_during("/grants", 1);
     }
 
     #[test]
