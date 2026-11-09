@@ -3743,6 +3743,13 @@ fn reset_root_device(
     if root.trk_ref.starts_with("tenant-root.") {
         let _ = credential::forget(&root.trk_ref);
     }
+    if let Some(r) = root
+        .root_rotation
+        .as_ref()
+        .filter(|r| !r.trk_nonce.is_empty())
+    {
+        let _ = credential::forget(&root_bootstrap::trk_ref(&root.tenant_id, &r.trk_nonce));
+    }
     fleet_keys::forget_fleet(&sync_cmd::fleet_id(&now)).map_err(e)?;
     fleet_custody::forget_all().map_err(e)?;
     match std::fs::remove_file(store::custody_bootstrap_path().map_err(e)?) {
@@ -8700,6 +8707,13 @@ mod custody_tests {
         credential::store(&trk, &[0x5e; 32]).unwrap();
         let mut root = root_bootstrap::load().unwrap();
         (root.trk_nonce, root.trk_ref) = (hex(&[0x5e; 16]), trk.clone());
+        // An unfinished root rotation holds its new TRK under its own nonce.
+        let next_trk = root_bootstrap::trk_ref(&root.tenant_id, &hex(&[0x6f; 16]));
+        credential::store(&next_trk, &[0x6f; 32]).unwrap();
+        root.root_rotation = Some(crate::root_rotation::RootRotation {
+            trk_nonce: hex(&[0x6f; 16]),
+            ..Default::default()
+        });
         root_bootstrap::save(&root).unwrap();
         assert!(fleet_keys::collect(&hex(&TENANT), 1, &[0x31; 32]).unwrap());
         assert!(fleet_keys::collect(&hex(&TENANT), 2, &[0x32; 32]).unwrap());
@@ -8710,6 +8724,10 @@ mod custody_tests {
             .unwrap();
         assert_cleared(refs, false);
         assert!(credential::load(&trk).is_err(), "the TRK is forgotten");
+        assert!(
+            credential::load(&next_trk).is_err(),
+            "the rotation TRK is forgotten"
+        );
         assert!(!fleet_keys::load()
             .unwrap()
             .fleets
