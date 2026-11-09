@@ -3600,7 +3600,12 @@ async fn team_enroll_again(
         return Err(crate::errcode::code("fleet.setAccountFirst"));
     }
     let refused = || crate::errcode::code("fleet.enrollAgainRefused");
-    if own_root_state(&c).map_err(|e| e.to_string())? {
+    // v2.11 RS: a root device resets only after a hand-over, on its signed
+    // revocation; a live custodian is refused unasked.
+    let root_device = own_root_state(&c).map_err(|e| e.to_string())?;
+    if root_device
+        && !fleet_custody::may_reset_root(&fleet_custody::load().map_err(|e| e.to_string())?)
+    {
         return Err(refused());
     }
     let client =
@@ -3627,6 +3632,9 @@ async fn team_enroll_again(
     {
         return Err(crate::errcode::code("fleet.enrollAgainOtherAccount"));
     }
+    if root_device {
+        return reset_root_device(c, &me);
+    }
     let status = me.device.map(|d| d.status);
     // Only an active device's pin decides, so only its ledger is read.
     let pinned = status.as_deref() == Some("active")
@@ -3638,12 +3646,7 @@ async fn team_enroll_again(
     // import, Enroll, a new connection): only the identity checked above is
     // cleared, as import's write does.
     let now = team_config::load().map_err(|e| e.to_string())?;
-    let unchanged = now.server_url == c.server_url
-        && now.tenant_id == c.tenant_id
-        && now.device_id == c.device_id
-        && now.signing_credential_ref == c.signing_credential_ref
-        && now.hpke_credential_ref == c.hpke_credential_ref;
-    if !unchanged || own_root_state(&now).map_err(|e| e.to_string())? {
+    if !same_identity(&now, &c) || own_root_state(&now).map_err(|e| e.to_string())? {
         return Err(crate::errcode::code("fleet.identityChanged"));
     }
     c = now;
@@ -3672,6 +3675,72 @@ async fn team_enroll_again(
         let _ = credential::forget(reference);
     }
     team_config::status().map_err(|e| e.to_string())
+}
+
+/// Whether `now` still names the identity of `c`.
+fn same_identity(now: &team_config::TeamConfig, c: &team_config::TeamConfig) -> bool {
+    now.server_url == c.server_url
+        && now.tenant_id == c.tenant_id
+        && now.device_id == c.device_id
+        && now.signing_credential_ref == c.signing_credential_ref
+        && now.hpke_credential_ref == c.hpke_credential_ref
+}
+
+/// v2.11 RS (ADR 0002 Q-63): Reset of this root device once the ticket
+/// listing `me` serves its signed revocation from the issuer it trusts
+/// ([`fleet_custody::reset_revocation_holds`]). Every TRK, every fleet key
+/// generation, the root and custody state and the signing and HPKE
+/// credentials go; nothing is kept, as the revocation is signed. The pin
+/// stays, so the machine can Join again.
+fn reset_root_device(
+    c: team_config::TeamConfig,
+    me: &fleet_client::AccountDeviceStatus,
+) -> Result<team_config::TeamStatus, String> {
+    let e = |e: anyhow::Error| e.to_string();
+    let device = me
+        .device
+        .as_ref()
+        .filter(|d| d.status == "revoked")
+        .ok_or_else(|| crate::errcode::code("fleet.resetNeedsSignedRevocation"))?;
+    let root = root_bootstrap::load().map_err(e)?;
+    let custody = fleet_custody::load().map_err(e)?;
+    let own = c.signing_key().map_err(e)?.verifying_key().to_bytes();
+    let listed: Vec<(&str, &str)> = me
+        .listed
+        .iter()
+        .filter(|d| !d.revocation.is_empty())
+        .map(|d| {
+            (
+                d.revocation.as_str(),
+                d.revocation_issuer_public_key.as_str(),
+            )
+        })
+        .collect();
+    let revocation = (
+        device.revocation.as_str(),
+        device.revocation_issuer_public_key.as_str(),
+    );
+    fleet_custody::reset_revocation_holds(&custody, &root, &own, revocation, &listed).map_err(e)?;
+    let mut now = team_config::load().map_err(e)?;
+    if !same_identity(&now, &c) || !own_root_state(&now).map_err(e)? {
+        return Err(crate::errcode::code("fleet.identityChanged"));
+    }
+    eprintln!("[recovery] reset of a revoked root device: its keys and custody go");
+    if root.trk_ref.starts_with("tenant-root.") {
+        let _ = credential::forget(&root.trk_ref);
+    }
+    fleet_keys::forget_fleet(&sync_cmd::fleet_id(&now)).map_err(e)?;
+    fleet_custody::forget_all().map_err(e)?;
+    match std::fs::remove_file(store::custody_bootstrap_path().map_err(e)?) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.to_string()),
+        _ => {}
+    }
+    let refs = clear_identity(&mut now);
+    team_config::save(&now).map_err(e)?;
+    for reference in refs.iter().filter(|r| !r.is_empty()) {
+        let _ = credential::forget(reference);
+    }
+    team_config::status().map_err(e)
 }
 
 /// Import a recovery bundle (v0.2.2b plan, section 4.I): this device becomes
@@ -3847,7 +3916,59 @@ pub(crate) async fn renew_custody(
     )
     .await?;
     fleet_custody::prompt_unexported_renewal()?;
+    renew_members_quietly(client, c, access, &pin).await;
     Ok(outcome)
+}
+
+/// v2.11 MR: the member renewal pass after this custodian's own renewal
+/// step ([`fleet_custody::renew_members`]), best effort: a failure is
+/// logged by its code and never fails the command or sync that ran it.
+async fn renew_members_quietly(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+    pin: &(shardx_core::trust_chain::Binding, [u8; 32]),
+) {
+    let renewed = async {
+        let signer = c.signing_key()?;
+        let seed = zeroize::Zeroizing::new(c.hpke_seed()?);
+        let me = recipient(c)?;
+        let fleet_hex = sync_cmd::fleet_id(c);
+        let now = root_bootstrap::now_ms();
+        let device = fleet_custody::FleetDevice {
+            tenant_id: &c.tenant_id,
+            device_id: &c.device_id,
+            account_id: &c.account_id,
+            signer: &signer,
+            hpke_seed: &seed,
+            vault: &fleet_custody::CredentialFkekStore,
+        };
+        let fleet_key = |generation: u64| {
+            verified_fleet_key(&fleet_hex, pin, &me, generation, now)?
+                .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
+        };
+        let mut db = team::db::Db::open()?;
+        let mut ledger = fleet_custody::Ledger { db: &mut db, pin };
+        let mut state = fleet_custody::load()?;
+        fleet_custody::renew_members(
+            client,
+            access,
+            &device,
+            &mut ledger,
+            fleet_key,
+            now,
+            &mut state,
+            &mut |s| fleet_custody::save(s),
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = renewed {
+        eprintln!(
+            "[members] renewal failed {}",
+            recovery_import::error_code(&e.to_string())
+        );
+    }
 }
 
 /// Logs a renewal step that did something, or failed, by its error code.
@@ -3918,6 +4039,10 @@ async fn team_renew_custody(
     }
     bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
     let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    // v2.11 MR: Renew custody also looks at every member now.
+    let mut custody = fleet_custody::load().map_err(|e| e.to_string())?;
+    custody.member_renewal.checked_ms = 0;
+    fleet_custody::save(&custody).map_err(|e| e.to_string())?;
     let (client, session) = open_session(&c, &username, &password).await?;
     let access = session.access_token.as_str();
     let renewed = renew_custody(&client, &c, access).await;
@@ -8080,6 +8205,440 @@ mod custody_tests {
         enroll(&rt, 1);
         assert_eq!(*credential::load(&refs[0]).unwrap(), [7; 32]);
         assert_eq!(*credential::load(&refs[1]).unwrap(), [8; 32]);
+    }
+
+    // ---- v2.11 RS: Reset of a revoked root device (ADR 0002 Q-63) ----
+
+    /// The appointee B of the joiner's hand-over, the old root O of the
+    /// joiner's accepted hand-over, and a key the joiner never trusted.
+    const B_SEED: [u8; 32] = [0x2b; 32];
+    const OLD_SEED: [u8; 32] = [0x2a; 32];
+    const STRANGER_SEED: [u8; 32] = [0x2c; 32];
+
+    fn key_of(seed: &[u8; 32]) -> shardx_core::signing::Ed25519SigningKey {
+        shardx_core::signing::Ed25519SigningKey::from_bytes(seed)
+    }
+
+    fn id_of(seed: &[u8; 32]) -> [u8; 32] {
+        shardx_core::keys::signing_key_id(key_of(seed).verifying_key().as_bytes())
+    }
+
+    /// The joiner's own signing and HPKE key IDs (its seeds are `[7; 32]`
+    /// and `[8; 32]`).
+    fn joiner_keys() -> ([u8; 32], [u8; 32]) {
+        let (_, pk) = shardx_core::grants::derive_keypair(&[8; 32]);
+        (id_of(&[7; 32]), shardx_core::keys::hpke_key_id(&pk))
+    }
+
+    /// A revocation signed by `by` at `at` of `device` under `key`.
+    fn signed_revocation(
+        by: &[u8; 32],
+        at: u64,
+        (tenant, device, key): ([u8; 16], [u8; 16], [u8; 32]),
+    ) -> Vec<u8> {
+        use shardx_core::authz_record::{
+            build_record, CommonFields, DeviceRevocationReason, DeviceRevocationV2,
+            DOMAIN_DEVICE_REVOCATION,
+        };
+        let r = DeviceRevocationV2 {
+            common: CommonFields {
+                replay_id: [at as u8; 16],
+                tenant_id: tenant,
+                issued_at_ms: at,
+                not_before_ms: at,
+                not_after_ms: at + DAY,
+                server_instance_id: INSTANCE,
+                restore_epoch: 0,
+            },
+            subject_account_id: [6; 16],
+            subject_device_id: device,
+            subject_signing_key_id: key,
+            subject_hpke_key_id: joiner_keys().1,
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        build_record(&key_of(by), DOMAIN_DEVICE_REVOCATION, &r.encode())
+    }
+
+    /// The joiner's revocation signed by `by` at `at`.
+    fn joiner_revoked_by(by: &[u8; 32], at: u64) -> Vec<u8> {
+        signed_revocation(by, at, (TENANT, JOINER, joiner_keys().0))
+    }
+
+    /// A listed device: revoked by `revocation` from `issuer` when given.
+    fn listed(
+        device: [u8; 16],
+        key: [u8; 32],
+        by: Option<(&[u8; 32], Vec<u8>)>,
+    ) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "device_id": hex(&device),
+            "status": if by.is_some() { "revoked" } else { "active" },
+            "signing_key_id": hex(&key),
+            "hpke_key_id": hex(&[1; 32]),
+        });
+        if let Some((issuer, exact)) = by {
+            row["revocation"] = hex(&exact).into();
+            row["revocation_issuer_public_key"] =
+                hex(key_of(issuer).verifying_key().as_bytes()).into();
+        }
+        row
+    }
+
+    /// A server whose ticket listing names `devices`; every call is seen.
+    fn listing_server(
+        rt: &tokio::runtime::Runtime,
+        devices: Vec<serde_json::Value>,
+    ) -> (fleet_client::FleetClient, fleet_custody::tests::Seen) {
+        let reply: std::sync::Arc<fleet_custody::tests::Reply> =
+            std::sync::Arc::new(move |call, _| {
+                let body = match call {
+                    "POST /v2/auth/login" => serde_json::json!({
+                        "ticket": "v2t.fixture", "ticket_id": hex(&[1; 16]),
+                        "account_id": hex(&[6; 16]), "server_instance_id": hex(&INSTANCE),
+                        "restore_epoch": 0
+                    }),
+                    "GET /v2/me" => serde_json::json!({
+                        "kind": "pre_device", "account_id": hex(&[6; 16]), "devices": devices,
+                    }),
+                    _ => serde_json::json!({}),
+                };
+                (200, serde_json::to_vec(&body).unwrap())
+            });
+        rt.block_on(fleet_custody::tests::mock(reply))
+    }
+
+    /// The joiner's activated root state, with `custody` as its custody.
+    fn root_device_here(custody: fleet_custody::FleetCustodyState) {
+        root_bootstrap::save(&root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&JOINER),
+            server_instance_id: hex(&INSTANCE),
+            anchor: hex(&id_of(&OLD_SEED)),
+            activated: true,
+            ..Default::default()
+        })
+        .unwrap();
+        fleet_custody::save(&fleet_custody::FleetCustodyState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&JOINER),
+            server_instance_id: hex(&INSTANCE),
+            ..custody
+        })
+        .unwrap();
+    }
+
+    /// The joiner as an old root that appointed B: its saved appointment
+    /// approval of B's keys, signed by the joiner.
+    fn handed_over_to_b() -> fleet_custody::FleetCustodyState {
+        use shardx_core::authz_record::{
+            build_record, ApprovalScopeKind, CommonFields, DeviceApprovalV2, DOMAIN_DEVICE_APPROVAL,
+        };
+        let b = hex(&[0x0b; 16]);
+        let approval = DeviceApprovalV2 {
+            common: CommonFields {
+                replay_id: [0x0b; 16],
+                tenant_id: TENANT,
+                issued_at_ms: T0,
+                not_before_ms: T0,
+                not_after_ms: T0 + 730 * DAY,
+                server_instance_id: INSTANCE,
+                restore_epoch: 0,
+            },
+            subject_account_id: [6; 16],
+            subject_device_id: [0x0b; 16],
+            subject_signing_key_id: id_of(&B_SEED),
+            subject_hpke_key_id: [1; 32],
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: TENANT,
+        };
+        let approval = build_record(
+            &key_of(&[7; 32]),
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        );
+        fleet_custody::FleetCustodyState {
+            handed_over_to: b.clone(),
+            handed_over_generation: 1,
+            members: [(
+                b,
+                fleet_custody::MemberApproval {
+                    approval: hex(&approval),
+                    root_grant: "00".into(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// The joiner as the appointee of O's hand-over, accepted at generation
+    /// 1; `rotated` once its own rotation activated generation 2.
+    fn accepted_from_old(rotated: bool) -> fleet_custody::FleetCustodyState {
+        fleet_custody::FleetCustodyState {
+            handover: Some(fleet_custody::Handover {
+                outgoing: hex(&id_of(&OLD_SEED)),
+                accepted_generation: 1,
+                phase: "granted".into(),
+                root_grant_issuer: hex(key_of(&OLD_SEED).verifying_key().as_bytes()),
+                rotated_generation: if rotated { 2 } else { 0 },
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Reset of the joiner with its root `custody`, the server listing
+    /// `devices`: the reply and the calls seen.
+    fn root_reset(
+        custody: fleet_custody::FleetCustodyState,
+        devices: Vec<serde_json::Value>,
+    ) -> (
+        Result<team_config::TeamStatus, String>,
+        Vec<String>,
+        Joiner,
+        [String; 2],
+    ) {
+        let rt = runtime();
+        let (client, seen) = listing_server(&rt, devices);
+        let j = joiner(client.base_url(), root_bootstrap::now_ms());
+        root_device_here(custody);
+        let refs = refs();
+        let reply = rt.block_on(team_enroll_again("u".into(), "p".into()));
+        let calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
+        (reply, calls, j, refs)
+    }
+
+    fn joiner_listed(by: Option<(&[u8; 32], Vec<u8>)>) -> serde_json::Value {
+        listed(JOINER, joiner_keys().0, by)
+    }
+
+    /// Nothing was wiped: the identity and the root state are still here.
+    fn untouched(refs: &[String; 2]) {
+        assert!(team_config::load().unwrap().is_enrolled());
+        assert!(own_root_state(&team_config::load().unwrap()).unwrap());
+        for r in refs {
+            assert!(credential::load(r).is_ok(), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_handed_over_root_resets_on_its_signed_revocation() {
+        let revoked = joiner_revoked_by(&B_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![joiner_listed(Some((&B_SEED, revoked)))],
+        );
+        reply.unwrap();
+        assert_cleared(refs, false);
+        assert!(!own_root_state(&team_config::load().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn a_cancelled_appointee_resets_on_its_signed_revocation() {
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            accepted_from_old(false),
+            vec![joiner_listed(Some((&OLD_SEED, revoked)))],
+        );
+        reply.unwrap();
+        assert_cleared(refs, false);
+    }
+
+    fn refused_unsigned(reply: Result<team_config::TeamStatus, String>) {
+        let err = reply.unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.resetNeedsSignedRevocation"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reset_refuses_a_root_device_without_a_revocation_field() {
+        // Listed revoked by a 2.10 server, or still active.
+        for row in [
+            serde_json::json!({"device_id": hex(&JOINER), "status": "revoked"}),
+            joiner_listed(None),
+        ] {
+            let (reply, calls, _j, refs) = root_reset(handed_over_to_b(), vec![row]);
+            refused_unsigned(reply);
+            assert!(calls.contains(&"GET /v2/me".to_string()));
+            untouched(&refs);
+        }
+    }
+
+    #[test]
+    fn reset_refuses_a_revocation_signed_by_an_unknown_key() {
+        let revoked = joiner_revoked_by(&STRANGER_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![joiner_listed(Some((&STRANGER_SEED, revoked.clone())))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+        drop(_j);
+        // Served under a key it was not signed by.
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![joiner_listed(Some((&B_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+    }
+
+    #[test]
+    fn reset_refuses_a_revocation_naming_another_device_or_key() {
+        let (_, key) = (JOINER, joiner_keys().0);
+        for subject in [
+            (TENANT, [0x0c; 16], key),
+            (TENANT, JOINER, id_of(&STRANGER_SEED)),
+            ([0x0d; 16], JOINER, key),
+        ] {
+            let revoked = signed_revocation(&B_SEED, T0 + DAY, subject);
+            let (reply, _, _j, refs) = root_reset(
+                handed_over_to_b(),
+                vec![joiner_listed(Some((&B_SEED, revoked)))],
+            );
+            refused_unsigned(reply);
+            untouched(&refs);
+        }
+    }
+
+    #[test]
+    fn reset_refuses_a_cancel_after_the_appointee_rotated() {
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            accepted_from_old(true),
+            vec![joiner_listed(Some((&OLD_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+    }
+
+    /// A stolen former custodian key (here the pinned anchor and the old root
+    /// of another hand-over) plus a hostile server never wipe a root device.
+    #[test]
+    fn reset_refuses_a_revocation_from_a_former_custodian_key() {
+        // The old root trusts only B; O is its pinned anchor.
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![joiner_listed(Some((&OLD_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+        drop(_j);
+        // The appointee trusts only O, never the device it was appointed by
+        // another custodian key.
+        let revoked = joiner_revoked_by(&B_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            accepted_from_old(false),
+            vec![joiner_listed(Some((&B_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+    }
+
+    #[test]
+    fn reset_refuses_a_revocation_signed_after_the_issuer_was_revoked() {
+        // B itself was revoked at T0 + DAY; its revocation of the joiner
+        // carries a later time.
+        let b_revoked = signed_revocation(
+            &STRANGER_SEED,
+            T0 + DAY,
+            (TENANT, [0x0b; 16], id_of(&B_SEED)),
+        );
+        let revoked = joiner_revoked_by(&B_SEED, T0 + 2 * DAY);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![
+                listed(
+                    [0x0b; 16],
+                    id_of(&B_SEED),
+                    Some((&STRANGER_SEED, b_revoked.clone())),
+                ),
+                joiner_listed(Some((&B_SEED, revoked))),
+            ],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+        drop(_j);
+        // Signed before B's revocation, it still resets.
+        let revoked = joiner_revoked_by(&B_SEED, T0);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![
+                listed(
+                    [0x0b; 16],
+                    id_of(&B_SEED),
+                    Some((&STRANGER_SEED, b_revoked)),
+                ),
+                joiner_listed(Some((&B_SEED, revoked))),
+            ],
+        );
+        reply.unwrap();
+        assert_cleared(refs, false);
+    }
+
+    #[test]
+    fn reset_wipes_trk_fleet_keys_root_state_custody_and_seeds() {
+        let rt = runtime();
+        let revoked = joiner_revoked_by(&B_SEED, T0 + DAY);
+        let (client, _) = listing_server(&rt, vec![joiner_listed(Some((&B_SEED, revoked)))]);
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        pin_here();
+        let mut c = team_config::load().unwrap();
+        c.fleet_id = hex(&TENANT);
+        team_config::save(&c).unwrap();
+        root_device_here(handed_over_to_b());
+        let trk = format!("tenant-root.{}.{}", hex(&TENANT), hex(&[0x5e; 16]));
+        credential::store(&trk, &[0x5e; 32]).unwrap();
+        let mut root = root_bootstrap::load().unwrap();
+        (root.trk_nonce, root.trk_ref) = (hex(&[0x5e; 16]), trk.clone());
+        root_bootstrap::save(&root).unwrap();
+        assert!(fleet_keys::collect(&hex(&TENANT), 1, &[0x31; 32]).unwrap());
+        assert!(fleet_keys::collect(&hex(&TENANT), 2, &[0x32; 32]).unwrap());
+        let held = fleet_keys::load().unwrap().fleets[&hex(&TENANT)].clone();
+        let refs = refs();
+
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert_cleared(refs, false);
+        assert!(credential::load(&trk).is_err(), "the TRK is forgotten");
+        assert!(!fleet_keys::load()
+            .unwrap()
+            .fleets
+            .contains_key(&hex(&TENANT)));
+        for reference in held.credential_refs.values() {
+            assert!(credential::load(reference).is_err(), "{reference}");
+        }
+        assert!(!store::custody_bootstrap_path().unwrap().exists());
+        assert!(!store::fleet_custody_path().unwrap().exists());
+        assert_eq!(
+            join_pin(),
+            Some((BINDING_J, [0x0a; 32], "JOIN".to_string())),
+            "the pin stays"
+        );
+        assert_eq!(team_json_copies(), 0, "a signed revocation keeps nothing");
+    }
+
+    #[test]
+    fn a_live_root_custodian_still_never_resets() {
+        // Whatever the server lists, signed or not.
+        let revoked = joiner_revoked_by(&B_SEED, T0 + DAY);
+        let (reply, calls, _j, refs) = root_reset(
+            fleet_custody::FleetCustodyState::default(),
+            vec![joiner_listed(Some((&B_SEED, revoked)))],
+        );
+        let err = reply.unwrap_err();
+        assert!(err.contains("fleet.enrollAgainRefused"), "{err}");
+        assert!(calls.is_empty(), "no server is asked");
+        untouched(&refs);
     }
 
     /// R3-D5: the UI treats a root state as this device's only when it names

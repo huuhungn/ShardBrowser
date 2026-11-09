@@ -1372,8 +1372,8 @@ test("team-old-root-inert: a root custodian that handed over runs no custody act
   const card = await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
   const notice = card.getByTestId("team-handed-over");
   await expect(notice).toContainText("Root custody was handed to device b1b1b1b1. This computer runs no custody actions any more.");
-  await expect(notice).toContainText("this computer can be switched off");
-  await expect(notice).toContainText("Reset of this computer comes in v2.11");
+  await expect(notice).toContainText("revoked this computer, reset it below");
+  await expect(notice.getByRole("button", { name: "Reset this device" })).toBeVisible();
   for (const name of ["Rotate fleet key", "Re-seal all profiles", "Create fleet key", "Export recovery bundle", "Renew custody"]) {
     await expect(card.getByRole("button", { name })).toHaveCount(0);
   }
@@ -1395,6 +1395,51 @@ test("team-old-root-inert: a root custodian that handed over runs no custody act
   await expect(notice).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeVisible();
   await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("reset the old root: a handed-over root resets only once the server lists it revoked", async ({ page: a }) => {
+  const server = fakeTeamServer([{ ...activeB, custodian: true }], B_ID);
+  const card = await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
+  const reset = card.getByTestId("team-handed-over").getByRole("button", { name: "Reset this device" });
+  await expect(reset).toBeDisabled();
+  await cardSignIn(a);
+  await reset.click();
+  await expect(a.getByText("This root device can be reset only once the team server lists it revoked")).toBeVisible();
+  await expect(card.getByTestId("team-handed-over")).toBeVisible();
+
+  // The new custodian revoked it: the signed revocation lets it reset.
+  server.devices.find((d) => d.label === "Machine A")!.status = "revoked";
+  await cardSignIn(a);
+  await reset.click();
+  await expect(a.getByText("This device's identity was cleared. Enroll it again for a new join code.")).toBeVisible();
+  await expect(card.getByTestId("team-handed-over")).toHaveCount(0);
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("member renewal: each member shows its approval end, warns from 75%, and a 2.10 server is named", async ({ page: a }) => {
+  const machineC: TeamDeviceRow = { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 };
+  const server = fakeTeamServer([machineC]);
+  const card = await teamDevicePage(a, "a", server, false, "&teamMemberApproval=late&teamMembers=server-too-old");
+  const row = await listDevices(a, "Machine C");
+  await expect(row.getByTestId("team-device-approval")).toContainText("Approval ends");
+  await expect(row.getByTestId("team-device-approval")).toContainText("renew custody now");
+  await expect(card.getByTestId("team-members-server-update")).toContainText(
+    "The team server is too old to renew member devices' approvals.",
+  );
+  // This computer's own row shows no member approval.
+  await expect(a.getByTestId("team-device").filter({ hasText: "Machine A" }).getByTestId("team-device-approval"))
+    .toHaveCount(0);
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("member renewal: a member early in its approval shows its end without a warning", async ({ page: a }) => {
+  const machineC: TeamDeviceRow = { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 };
+  const server = fakeTeamServer([machineC]);
+  const card = await teamDevicePage(a, "a", server);
+  const row = await listDevices(a, "Machine C");
+  await expect(row.getByTestId("team-device-approval")).toContainText("Approval ends");
+  await expect(row.getByTestId("team-device-approval")).not.toContainText("renew custody now");
+  await expect(card.getByTestId("team-members-server-update")).toHaveCount(0);
 });
 
 // The two-machine gate (Plan:2388), each step a test.step below:

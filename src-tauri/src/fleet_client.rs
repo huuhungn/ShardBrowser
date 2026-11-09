@@ -62,6 +62,8 @@ pub struct AccountDeviceStatus {
     pub ticket_server_instance_id: String,
     pub restore_epoch: u64,
     pub device: Option<ListedAccountDevice>,
+    /// Every device the listing names, `device` among them.
+    pub listed: Vec<ListedAccountDevice>,
 }
 
 /// A device of the ticket's account as `GET /v2/me` lists it, key IDs in hex.
@@ -73,6 +75,13 @@ pub struct ListedAccountDevice {
     pub signing_key_id: String,
     #[serde(default)]
     pub hpke_key_id: String,
+    /// For a revoked device, a 2.11 server's exact signed revocation of it
+    /// and its issuer's signing public key, hex (ADR 0002 Q-63); empty
+    /// otherwise.
+    #[serde(default)]
+    pub revocation: String,
+    #[serde(default)]
+    pub revocation_issuer_public_key: String,
 }
 
 /// A write claim on one profile, plus the fencing token ordering writers.
@@ -1137,8 +1146,10 @@ impl FleetClient {
         Ok(AccountDeviceStatus {
             device: me
                 .devices
-                .into_iter()
-                .find(|d| d.device_id.eq_ignore_ascii_case(device_id)),
+                .iter()
+                .find(|d| d.device_id.eq_ignore_ascii_case(device_id))
+                .cloned(),
+            listed: me.devices,
             account_id: me.account_id,
             ticket_account_id: ticket.account_id.clone(),
             server_instance_id: me.server_instance_id,

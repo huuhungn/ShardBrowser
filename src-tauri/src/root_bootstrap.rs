@@ -55,7 +55,7 @@ const DAY_MS: u64 = 86_400_000;
 /// custodian ledger (W6).
 const VALIDITY_MS: u64 = 365 * DAY_MS;
 /// Backdated so a server clock slightly behind this one accepts it.
-const CLOCK_SKEW_MS: u64 = 60_000;
+pub(crate) const CLOCK_SKEW_MS: u64 = 60_000;
 const _: () = assert!(VALIDITY_MS <= shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS);
 
 /// Where the TRK lives while the bootstrap runs, under the reference

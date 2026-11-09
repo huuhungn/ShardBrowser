@@ -373,6 +373,29 @@ pub fn unindex_unopenable(fleet_id: &str) -> Result<Vec<u64>> {
     Ok(removed)
 }
 
+/// Drops every key of `fleet_id` (v2.11 RS: a revoked root device is
+/// wiped): the file first, so it never names a forgotten key, then each key
+/// in the credential store, best effort.
+pub fn forget_fleet(fleet_id: &str) -> Result<()> {
+    let refs = {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let path = store::fleet_keys_path()?;
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        let mut s = read(&path)?.map_keys(|v| Ok(dpapi::reveal(v)))?;
+        let Some(f) = s.fleets.remove(fleet_id) else {
+            return Ok(());
+        };
+        write(&s)?;
+        f.credential_refs
+    };
+    for reference in refs.values() {
+        let _ = crate::credential::forget(reference);
+    }
+    Ok(())
+}
+
 /// Write `s` with its keys protected. Callers hold `WRITE_LOCK`.
 fn write(s: &FleetKeyStore) -> Result<()> {
     let path = store::fleet_keys_path()?;

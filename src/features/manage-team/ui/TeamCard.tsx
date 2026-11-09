@@ -681,7 +681,7 @@ export function TeamCard() {
                     <TeamDevices
                       account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
                       hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
-                      handedOverTo={handedOverTo} handover={handover}
+                      handedOverTo={handedOverTo} handover={handover} onReset={reset}
                       onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); void loadExportDue(); }}
                     />
                   ) : st.has_fleet_key ? (

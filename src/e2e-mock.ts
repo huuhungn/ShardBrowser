@@ -406,9 +406,18 @@ let fleetCustody: {
   rotation_required: "urgent" | "routine" | null; export_due: boolean; export_reason: "rotation" | "renewal";
   reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
   handed_over_to: string; handover: HandoverStatus | null;
+  members_need_server_update: boolean; member_renewal_failed: string;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
   export_due: false, export_reason: "rotation", reseal: null, handed_over_to: "", handover: null,
+  // `teamMembers=server-too-old`: the last member renewal met a 2.10 server.
+  members_need_server_update: params.get("teamMembers") === "server-too-old", member_renewal_failed: "",
+};
+// v2.11 member renewal: each active member's approval window as the last pass saw it;
+// with `teamMemberApproval=late` it is past 75% of its life.
+const teamMemberWindow = (): [number, number] => {
+  const from = Date.now() - (params.get("teamMemberApproval") === "late" ? 300 : 10) * DAY_MS;
+  return [from, from + 365 * DAY_MS];
 };
 // The fleet generation A was at when it appointed B: its cancel is refused once the server is past it.
 let teamHandedOverGeneration = 0;
@@ -539,6 +548,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         return {
           ...r, account_id: "ac".repeat(16), ...teamKeyIds(r.device_id), sas: teamSas(r.device_id),
           approve_until_ms: first === undefined ? null : first + TEAM_WINDOW_MS,
+          approval_window_ms: r.status === "active" && r.device_id !== teamMe.device_id ? teamMemberWindow() : null,
         };
       });
     }
@@ -729,8 +739,13 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     case "team_enroll_again": {
       const status = await teamServer<string | null>("status", me);
       const allowed = status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned);
-      // As the launcher: this device's root state refuses it, activated or not.
-      if (custodyBootstrap.this_device || !allowed) teamRefuse("fleet.enrollAgainRefused");
+      // As the launcher: this device's root state refuses it, activated or not, unless
+      // it handed custody over and the server serves its signed revocation (v2.11).
+      if (custodyBootstrap.this_device && fleetCustody.handed_over_to) {
+        if (status !== "revoked") teamRefuse("fleet.resetNeedsSignedRevocation");
+        custodyBootstrap = { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "", ...noRenewal };
+        fleetCustody = { ...fleetCustody, started: false, created: false, fkek_key_id: "", handed_over_to: "" };
+      } else if (custodyBootstrap.this_device || !allowed) teamRefuse("fleet.enrollAgainRefused");
       teamMe = { ...teamMe, device_id: "", enrolled_at_ms: 0, collected: false };
       teamSeeds = null;
       return teamStatusFixture();
