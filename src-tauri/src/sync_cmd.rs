@@ -147,6 +147,7 @@ pub async fn profile_sync_push(
             crate::collect_after_refusal(client, &c, access),
         )
         .await;
+        let pushed = renewing(pushed, crate::renew_quietly(client, &c, access)).await;
         client.end_session(access).await;
         let (p, collected_generation) = pushed?;
         return Ok(PushResult {
@@ -239,6 +240,7 @@ pub async fn profile_sync_revert(
         crate::collect_after_refusal(client, &c, access),
     )
     .await;
+    let reverted = renewing(reverted, crate::renew_quietly(client, &c, access)).await;
     client.end_session(access).await;
     let (p, collected_generation) = reverted?;
     Ok(PushResult {
@@ -288,6 +290,8 @@ pub async fn profile_sync_publish(
         now_ms(),
     )
     .await;
+    let renewal = crate::renew_quietly(&client, &c, &session.access_token);
+    let published = renewing(published, renewal).await;
     client.end_session(&session.access_token).await;
     let p = published.map_err(|e| format!("{e:#}"))?;
     Ok(PublishResult {
@@ -399,6 +403,7 @@ pub async fn profile_sync_pull(
             crate::collect_after_refusal(client, &c, access),
         )
         .await;
+        let pulled = renewing(pulled, crate::renew_quietly(client, &c, access)).await;
         client.end_session(access).await;
         return pulled.map(|(bytes, _)| bytes);
     }
@@ -513,6 +518,17 @@ where
     }
 }
 
+/// D9: once a published sync command ran, a root custodian renews its
+/// records when due, in that command's session (`crate::renew_quietly`).
+/// Best effort: whatever the renewal does, `result` comes back unchanged.
+async fn renewing<T>(
+    result: T,
+    renewal: impl std::future::Future<Output = anyhow::Result<crate::root_bootstrap::RenewalOutcome>>,
+) -> T {
+    let _ = renewal.await;
+    result
+}
+
 /// `Some(blocked)` once this device pins an anchor and holds the verified key
 /// `team::sync` seals under, `blocked` when Q-18 refuses sealing under it
 /// ([`team::sync::verified_key_blocked`]). Any error reads as `None`, and no
@@ -607,6 +623,11 @@ pub async fn team_fleet_profiles(
     let fleet = fleet_client::decode_hex16(&fleet_id(&c), "fleet_id").map_err(|e| e.to_string())?;
     let (client, session, dev) = published_session(&c, username, password).await?;
     let listed = team::sync::labels(&client, &session.access_token, &dev, fleet, now_ms()).await;
+    let listed = renewing(
+        listed,
+        crate::renew_quietly(&client, &c, &session.access_token),
+    )
+    .await;
     client.end_session(&session.access_token).await;
     listed.map_err(|e| format!("{e:#}"))
 }
@@ -644,6 +665,11 @@ pub async fn team_join_profile(
         remote,
         &udd,
         now_ms(),
+    )
+    .await;
+    let joined = renewing(
+        joined,
+        crate::renew_quietly(&client, &c, &session.access_token),
     )
     .await;
     client.end_session(&session.access_token).await;
@@ -800,6 +826,58 @@ mod tests {
             let (result, calls, collects) = collect_run(vec![Err(ROTATED.into())], collected);
             assert_eq!((result, calls, collects), (Err(ROTATED.into()), 1, 1));
         }
+    }
+
+    /// D9: a due root custodian renews in the session of a published push,
+    /// and the push's result comes back unchanged.
+    #[test]
+    fn a_due_custodian_renews_during_a_push() {
+        use crate::root_bootstrap::tests::{renewal_fixture, DAY, START};
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        let pushed: Result<u64, String> = Ok(7);
+        assert_eq!(rt.block_on(renewing(pushed, f.renew_at(now))), Ok(7));
+        assert!(f.state.renewal.as_ref().is_some_and(|r| r.done));
+        assert!(f
+            .posts()
+            .iter()
+            .any(|(c, _)| c.contains("/root-key-generations/0/grants")));
+    }
+
+    /// D9: a renewal that fails leaves the push's result, success or
+    /// refusal, exactly as it was.
+    #[test]
+    fn a_failed_renewal_never_fails_the_push() {
+        use crate::root_bootstrap::tests::{renewal_fixture, DAY, START};
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        for status in [403, 500] {
+            for pushed in [Ok(7), Err(ROTATED.to_string())] {
+                let mut f = renewal_fixture(&rt, now);
+                f.server.lock().unwrap().refuse = Some(("/capability-grants", status));
+                let result = rt.block_on(renewing(pushed.clone(), f.renew_at(now)));
+                assert_eq!(result, pushed);
+                assert!(!f.state.renewal.unwrap().done, "the renewal did fail");
+            }
+        }
+        let failed = async { Err(anyhow::anyhow!("[[shardx:fleet.custodyLapsed]]")) };
+        assert_eq!(rt.block_on(renewing(Ok::<u64, String>(7), failed)), Ok(7));
+    }
+
+    /// C-minor 4: a custodian whose records are not half through their life
+    /// asks the server nothing after a push, not even for trust evidence.
+    #[test]
+    fn a_push_fetches_no_evidence_when_nothing_is_due() {
+        use crate::root_bootstrap::tests::{renewal_fixture, DAY, START};
+        let rt = crate::fleet_custody::tests::runtime();
+        let server = START + 300 * DAY;
+        let mut f = renewal_fixture(&rt, server);
+        let now = START + 100 * DAY;
+        let pushed: Result<u64, String> = Ok(7);
+        assert_eq!(rt.block_on(renewing(pushed, f.renew_at(now))), Ok(7));
+        assert!(f.seen.lock().unwrap().is_empty(), "{:?}", f.seen);
+        assert!(f.state.renewal.is_none());
     }
 
     #[test]

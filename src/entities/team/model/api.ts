@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  TeamStatus, CustodyResult, CustodyBootstrapStatus, TeamProfilesStatus, TeamFleetProfile,
+  TeamStatus, CustodyResult, CustodyBootstrapStatus, RenewalOutcome, TeamProfilesStatus, TeamFleetProfile,
   FleetCustodyStatus, TeamDevice, TeamJoinCode, TeamRevokeReason, OlderKeyProfile,
 } from "./types";
 
@@ -53,6 +53,13 @@ export const teamKeysUnlock = (passphrase: string) =>
 /** How far this device's first-device custody setup got. */
 export const teamCustodyBootstrapStatus = () =>
   invoke<CustodyBootstrapStatus>("team_custody_bootstrap_status");
+
+/**
+ * Renew this root custodian's own records now, or resume a renewal; only a
+ * due one runs. The password is used for one login and never stored.
+ */
+export const teamRenewCustody = (username: string, password: string) =>
+  invoke<RenewalOutcome>("team_renew_custody", { username, password });
 
 /**
  * Set up root custody as the tenant's first device, or resume it. The

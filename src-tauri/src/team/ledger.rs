@@ -161,6 +161,22 @@ pub fn tenant_pin(db: &Db, tenant_id: &[u8; 16]) -> Result<Option<(Binding, [u8;
 }
 
 /// The highest generation of `fleet_id` this device has verified.
+/// The cached `first_not_before` (D-6 (c)) of custodian key `key`, if the
+/// ledger counted it.
+pub fn first_not_before(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<Option<u64>> {
+    let (instance, tenant) = ids(binding);
+    let at: Option<i64> = db
+        .conn
+        .query_row(
+            "SELECT first_not_before_ms FROM trust_custodian_keys
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signing_key_id = ?3",
+            params![instance, tenant, hex(key)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(at.map(|at| at as u64))
+}
+
 pub fn highest_generation(db: &Db, binding: &Binding, fleet_id: &[u8; 16]) -> Result<Option<u64>> {
     let (instance, tenant) = ids(binding);
     let g: Option<i64> = db

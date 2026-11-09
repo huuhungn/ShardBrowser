@@ -70,7 +70,16 @@ export type CustodyBootstrapStatus = {
   anchor: string;
   /** The recovery fingerprint, the activated root's key ID; empty until then. */
   root_key_id: string;
+  /** When the earliest own custody record reaches half its life and renews; none before activation. */
+  renewal_due_ms: number | null;
+  /** When the earliest own custody record ends. */
+  custody_ends_ms: number | null;
+  /** When this device's key stops counting as a root custodian's. */
+  key_age_ends_ms: number | null;
 };
+
+/** What one root custody renewal step did. */
+export type RenewalOutcome = "not_custodian" | "handed_over" | "busy" | "not_due" | "renewed";
 
 /** What `team_collect_custody` found waiting on the server. */
 export type CustodyResult = {
@@ -116,6 +125,8 @@ export type FleetCustodyStatus = {
   rotation_required: "urgent" | "routine" | null;
   /** A finished rotation asks for the recovery bundle to be exported again. */
   export_due: boolean;
+  /** Why: a finished renewal replaced the exported root grant, else a rotation. */
+  export_reason: "rotation" | "renewal";
   /** The latest Re-seal all profiles run, if any. */
   reseal: ResealRun | null;
 };

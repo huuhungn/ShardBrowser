@@ -138,6 +138,44 @@ pub struct BootstrapState {
     /// The Ed25519 public key that signed `root_grant`.
     #[serde(default)]
     pub root_grant_issuer: String,
+    /// Root self-renewal (v2.10 4.R, ADR 0002 Q-55): the run in progress, or
+    /// the last one finished.
+    #[serde(default)]
+    pub renewal: Option<Renewal>,
+}
+
+/// One root self-renewal: every record and request, hex, built once and
+/// saved before the first is sent, so a resumed run resends the same bytes.
+/// No key is among it.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Renewal {
+    #[serde(default)]
+    pub capability_grants: Vec<String>,
+    #[serde(default)]
+    pub approval: String,
+    /// The `ExistingRootGrant` of the ACTIVE root to this device.
+    #[serde(default)]
+    pub root_grant: String,
+    #[serde(default)]
+    pub root_grant_request: String,
+    #[serde(default)]
+    pub ack_request: String,
+    /// Files this device's grant of fleet generation `generation`; empty
+    /// while the fleet had no ACTIVE generation.
+    #[serde(default)]
+    pub device_grant_request: String,
+    #[serde(default)]
+    pub device_ack_request: String,
+    #[serde(default)]
+    pub generation: u64,
+    /// The next step to send, saved once the one before it is answered: the
+    /// capability grants one by one, then the approval, the root grant, its
+    /// ack, the device grant, its ack and the collect.
+    #[serde(default)]
+    pub step: u8,
+    /// Every step was answered and the new records are the current ones.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl std::fmt::Debug for BootstrapState {
@@ -192,10 +230,13 @@ pub(crate) fn random<const N: usize>() -> Result<[u8; N]> {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    #[cfg(test)]
+    let now = now.saturating_sub(tests::CLOCK_BACK_MS.with(std::cell::Cell::get));
+    now
 }
 
 /// The facts every built record and request names.
@@ -260,7 +301,7 @@ pub(crate) fn self_grant(
     approval_replay_id: [u8; 16],
     now: u64,
 ) -> Result<Vec<u8>> {
-    let mut g = TenantRootKeyGrantV2 {
+    let g = TenantRootKeyGrantV2 {
         common: cx.common(random()?, now),
         variant: RootGrantVariant::FirstRootSelfGrant,
         root_key_id: root_key_id(trk),
@@ -273,6 +314,16 @@ pub(crate) fn self_grant(
         hpke_encapped_key_bytes: [0; 32],
         hpke_wrapped_trk_bytes: [0; 48],
     };
+    sealed_root_grant(signer, hpke_public_key, trk, g)
+}
+
+/// `g` with `trk` sealed to `hpke_public_key`, signed by `signer`.
+fn sealed_root_grant(
+    signer: &Ed25519SigningKey,
+    hpke_public_key: &[u8],
+    trk: &[u8; 32],
+    mut g: TenantRootKeyGrantV2,
+) -> Result<Vec<u8>> {
     let sealed = seal_trk(hpke_public_key, &g.scope(), trk)
         .map_err(|_| anyhow!(crate::errcode::code("fleet.custodySealFailed")))?;
     g.hpke_encapped_key_bytes = sealed
@@ -1060,9 +1111,10 @@ pub async fn export_again(
     hpke_seed: &[u8; 32],
     fkeks: Vec<(u64, Zeroizing<[u8; 32]>)>,
     recovery: &RecoveryExport<'_>,
-) -> Result<()> {
+) -> Result<String> {
     let state = load()?;
     let (grant, container, issuer) = current_root_grant(&state, signer)?;
+    let exported = root_grant_sha256(&state);
     let tenant_hex = hex(&grant.common.tenant_id);
     let active = client
         .active_fleet_generation(access, &tenant_hex, fleet_hex)
@@ -1112,7 +1164,7 @@ pub async fn export_again(
         grant.root_generation,
     );
     write_bundle(header, &plaintext, recovery, now_ms())?;
-    Ok(())
+    Ok(exported)
 }
 
 /// Files the activated generation 0, its self-grant and this device's
@@ -1151,10 +1203,19 @@ pub struct BootstrapStatus {
     /// `root_key_id` in hex: empty before activation or when the self-grant
     /// does not read under this device's key.
     pub root_key_id: String,
+    /// When this root custodian's earliest own record reaches half its life
+    /// and the next custodian command or sync renews them (4.R).
+    pub renewal_due_ms: Option<u64>,
+    /// When the earliest of those records ends.
+    pub custody_ends_ms: Option<u64>,
+    /// When this device's signing key stops counting as a custodian's
+    /// (`MAX_CUSTODIAN_KEY_AGE_MS`); only a hand-over moves custody past it.
+    pub key_age_ends_ms: Option<u64>,
 }
 
 impl BootstrapStatus {
     fn of(state: &BootstrapState) -> Self {
+        let (renewal_due_ms, custody_ends_ms, key_age_ends_ms) = renewal_times(state);
         Self {
             started: !state.tenant_id.is_empty(),
             this_device: !state.tenant_id.is_empty()
@@ -1166,8 +1227,31 @@ impl BootstrapStatus {
             recovery_path: state.recovery_path.clone(),
             anchor: state.anchor.clone(),
             root_key_id: root_key_id_of(state),
+            renewal_due_ms,
+            custody_ends_ms,
+            key_age_ends_ms,
         }
     }
+}
+
+/// [`BootstrapStatus`]'s renewal due time, custody end and key age end,
+/// from the records saved here; none before activation.
+fn renewal_times(state: &BootstrapState) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let own = crate::team_config::load().and_then(|c| c.signing_key());
+    let (true, Ok(own)) = (state.activated, own) else {
+        return (None, None, None);
+    };
+    let own = own.verifying_key().to_bytes();
+    let grants = crate::fleet_custody::load()
+        .map(|c| c.capability_grants)
+        .unwrap_or_default();
+    let windows = own_windows(state, &own, &grants, own_device_grant(state).as_deref());
+    let age = shardx_core::trust_chain::MAX_CUSTODIAN_KEY_AGE_MS;
+    (
+        renewal_due_ms(&windows),
+        windows.iter().map(|w| w.1).min(),
+        first_not_before(state, &own).map(|nb| nb + age),
+    )
 }
 
 /// The `root_key_id` of `state`'s current root grant ([`current_root_grant`]);
@@ -1205,6 +1289,602 @@ pub fn save(state: &BootstrapState) -> Result<()> {
     let path = crate::store::custody_bootstrap_path()?;
     crate::durable::write_private(&path, serde_json::to_string_pretty(state)?.as_bytes())?;
     Ok(())
+}
+
+// ---- Root self-renewal (v2.10 4.R, ADR 0002 Q-55) ----
+
+/// The approval and root grant a renewal files run exactly the server's cap
+/// (ADR 0002 D-6; the server refuses anything longer), so members offline
+/// for months still see a custodian; capability and device grants run a
+/// year.
+const RENEWED_VALIDITY_MS: u64 = 730 * DAY_MS;
+const _: () =
+    assert!(RENEWED_VALIDITY_MS == shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS);
+
+/// What one renewal step did.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenewalOutcome {
+    /// This device holds no activated root state of its tenant.
+    NotCustodian,
+    /// This custodian handed its custody over (4.H): it never renews.
+    HandedOver,
+    /// Another custody command holds the lock; the next one renews.
+    Busy,
+    NotDue,
+    Renewed,
+}
+
+/// The root custodian that renews, and its keys.
+pub(crate) struct RenewingDevice<'a> {
+    pub(crate) account_id: &'a str,
+    pub(crate) signer: &'a Ed25519SigningKey,
+    pub(crate) hpke_seed: &'a [u8; 32],
+}
+
+/// `(not_before_ms, not_after_ms)` of a saved container signed by `issuer`.
+/// One that does not verify is left out: it is checked where it is used.
+fn window_of(container: &[u8], issuer: &[u8; 32]) -> Option<(u64, u64)> {
+    let v = AuthorizationRecord::parse(container)
+        .and_then(|r| r.verify_signature(issuer))
+        .ok()?;
+    let c = v.payload().common();
+    Some((c.not_before_ms, c.not_after_ms))
+}
+
+/// The issuer of `state`'s current root grant: its saved issuer, else this
+/// device (`own`, its public key) for the first self-grant.
+fn root_issuer(state: &BootstrapState, own: &[u8; 32]) -> Option<[u8; 32]> {
+    if state.root_grant.is_empty() {
+        Some(*own)
+    } else {
+        unhex(&state.root_grant_issuer).ok()
+    }
+}
+
+/// The windows of this custodian's own records as saved here, each verified
+/// under its issuer: its current root grant, its approval, its capability
+/// grants (a finished renewal's, else `custody_grants`, Create fleet key's)
+/// and `device_grant`, its kept grant of the newest fleet generation when
+/// this device (`own`, its public key) issued it. A record not saved here (an
+/// import keeps no approval or capability grants) is left out.
+pub(crate) fn own_windows(
+    state: &BootstrapState,
+    own: &[u8; 32],
+    custody_grants: &[String],
+    device_grant: Option<&[u8]>,
+) -> Vec<(u64, u64)> {
+    let root = if state.root_grant.is_empty() {
+        &state.self_grant
+    } else {
+        &state.root_grant
+    };
+    let grants = match state.renewal.as_ref().filter(|r| r.done) {
+        Some(r) => r.capability_grants.as_slice(),
+        None => custody_grants,
+    };
+    let root = decode_hex(root).zip(root_issuer(state, own));
+    let mine = std::iter::once(&state.approval)
+        .chain(grants)
+        .filter_map(|h| decode_hex(h))
+        .chain(device_grant.map(<[u8]>::to_vec))
+        .map(|c| (c, *own));
+    root.into_iter()
+        .chain(mine)
+        .filter_map(|(c, issuer)| window_of(&c, &issuer))
+        .collect()
+}
+
+/// When the earliest of `windows` reaches half its life (4.R).
+pub(crate) fn renewal_due_ms(windows: &[(u64, u64)]) -> Option<u64> {
+    windows
+        .iter()
+        .map(|&(nb, na)| nb + na.saturating_sub(nb) / 2)
+        .min()
+}
+
+/// SHA-256 of `state`'s current root grant as saved, lower-case hex; empty
+/// when none is saved.
+pub(crate) fn root_grant_sha256(state: &BootstrapState) -> String {
+    use sha2::{Digest, Sha256};
+    let root = if state.root_grant.is_empty() {
+        &state.self_grant
+    } else {
+        &state.root_grant
+    };
+    decode_hex(root)
+        .map(|c| hex(&Sha256::digest(c)))
+        .unwrap_or_default()
+}
+
+/// A finished renewal replaced the root grant of the recovery bundle last
+/// exported, whose [`root_grant_sha256`] is `exported`.
+pub(crate) fn renewal_unexported(state: &BootstrapState, exported: &str) -> bool {
+    state.renewal.as_ref().is_some_and(|r| r.done) && root_grant_sha256(state) != exported
+}
+
+fn due(windows: &[(u64, u64)], t: u64) -> bool {
+    renewal_due_ms(windows).is_some_and(|d| t >= d)
+}
+
+/// The earliest `not_before_ms` of this custodian's root grants: those saved
+/// here, and the trust ledger's cached first one, which is all a custodian
+/// imported from a bundle exported after a renewal knows of the earlier ones.
+/// A ledger that does not exist is not created.
+fn first_not_before(state: &BootstrapState, own: &[u8; 32]) -> Option<u64> {
+    let first = decode_hex(&state.self_grant).and_then(|c| window_of(&c, own));
+    let current = decode_hex(&state.root_grant)
+        .zip(unhex(&state.root_grant_issuer).ok())
+        .and_then(|(c, issuer)| window_of(&c, &issuer));
+    let ledger = || -> Option<u64> {
+        let (binding, _) = pin_of(state).ok()?;
+        if !crate::team::db::Db::path().ok()?.try_exists().ok()? {
+            return None;
+        }
+        let db = crate::team::db::Db::open().ok()?;
+        crate::team::ledger::first_not_before(&db, &binding, &signing_key_id(own)).ok()?
+    };
+    first
+        .into_iter()
+        .chain(current)
+        .map(|w| w.0)
+        .chain(ledger())
+        .min()
+}
+
+/// The pin `state` names: its binding and anchor.
+fn pin_of(state: &BootstrapState) -> Result<(Binding, [u8; 32])> {
+    Ok((
+        Binding {
+            server_instance_id: decode_hex16(&state.server_instance_id, "server_instance_id")?,
+            tenant_id: decode_hex16(&state.tenant_id, "tenant_id")?,
+        },
+        unhex(&state.anchor)?,
+    ))
+}
+
+/// The grant of the newest fleet generation the trust ledger kept for this
+/// custodian (G2-35), if any. A ledger that does not exist is not created.
+pub(crate) fn own_device_grant(state: &BootstrapState) -> Option<Vec<u8>> {
+    let (binding, anchor) = pin_of(state).ok()?;
+    if !crate::team::db::Db::path().ok()?.try_exists().ok()? {
+        return None;
+    }
+    let db = crate::team::db::Db::open().ok()?;
+    let fleet = binding.tenant_id;
+    let generation = crate::team::ledger::highest_generation(&db, &binding, &fleet).ok()??;
+    let kept = crate::team::ledger::fleet_key_grant(&db, &binding, &anchor, &fleet, generation);
+    kept.ok()?.map(|(container, _)| container)
+}
+
+/// The facts this custodian's renewed records name.
+fn renewal_context(state: &BootstrapState, me: &RenewingDevice<'_>) -> Result<Context16> {
+    let (_, hpke_public) = derive_keypair(me.hpke_seed);
+    Ok(Context16 {
+        tenant: decode_hex16(&state.tenant_id, "tenant_id")?,
+        instance: decode_hex16(&state.server_instance_id, "server_instance_id")?,
+        epoch: state.restore_epoch,
+        account: decode_hex16(me.account_id, "account_id")?,
+        device: decode_hex16(&state.device_id, "device_id")?,
+        signing_key_id: signing_key_id(me.signer.verifying_key().as_bytes()),
+        hpke_key_id: hpke_key_id(&hpke_public),
+    })
+}
+
+/// 4.R: every record of one renewal at server time `t`, in the order they
+/// are sent: the six capability grants (a year), the tenant self-approval
+/// and the `ExistingRootGrant` of the ACTIVE root linking it (exactly 730
+/// days), its ack, and this device's grant of the fleet's ACTIVE generation
+/// (a year) with its ack. Each starts at `t`.
+async fn build_renewal(
+    client: &FleetClient,
+    access: &str,
+    cx: &Context16,
+    me: &RenewingDevice<'_>,
+    state: &BootstrapState,
+    t: u64,
+    fleet_key: &impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+) -> Result<Renewal> {
+    use shardx_core::authz_record::GrantSubject;
+    use shardx_core::fleet_lifecycle::{FleetKeyGrantAckV2, FleetKeyGrantCreateV2};
+    use shardx_core::mutation::TenantRootGrantCreateV2;
+    // `common` backdates by the skew: built at `start`, records begin at `t`.
+    let start = t + CLOCK_SKEW_MS;
+    let long = || -> Result<CommonFields> {
+        let mut common = cx.common(random()?, start);
+        common.not_after_ms = common.not_before_ms + RENEWED_VALIDITY_MS;
+        Ok(common)
+    };
+    let (hpke_secret, hpke_public) = derive_keypair(me.hpke_seed);
+    let hpke_pk: [u8; 32] = hpke_public.clone().try_into().map_err(|_| corrupt())?;
+    let subject = GrantSubject::Device {
+        account_id: cx.account,
+        device_id: cx.device,
+        signing_key_id: cx.signing_key_id,
+        hpke_key_id: cx.hpke_key_id,
+    };
+    let own = crate::fleet_custody::own_grants(cx, cx.tenant);
+    let capability_grants =
+        crate::fleet_custody::capability_grants(cx, me.signer, &subject, own, start)?;
+
+    let approval = DeviceApprovalV2 {
+        common: long()?,
+        subject_account_id: cx.account,
+        subject_device_id: cx.device,
+        subject_signing_key_id: cx.signing_key_id,
+        subject_hpke_key_id: cx.hpke_key_id,
+        approval_scope_kind: ApprovalScopeKind::Tenant,
+        approval_scope_id: cx.tenant,
+    };
+    let approval_replay = approval.common.replay_id;
+    let approval = build_record(me.signer, DOMAIN_DEVICE_APPROVAL, &approval.encode());
+
+    let (current, _, _) = current_root_grant(state, me.signer)?;
+    let trk = current.open_trk(&hpke_secret).map_err(|_| corrupt())?;
+    let grant = TenantRootKeyGrantV2 {
+        common: long()?,
+        variant: RootGrantVariant::ExistingRootGrant,
+        root_key_id: current.root_key_id,
+        root_generation: current.root_generation,
+        subject_account_id: cx.account,
+        subject_device_id: cx.device,
+        subject_signing_key_id: cx.signing_key_id,
+        recipient_hpke_key_id: cx.hpke_key_id,
+        subject_device_approval_replay_id: approval_replay,
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let root_grant = sealed_root_grant(me.signer, &hpke_public, &trk, grant)?;
+    let (_, grant_ref) = verified_root_grant(&root_grant, me.signer.verifying_key().as_bytes())?;
+    let filing = TenantRootGrantCreateV2 {
+        grant: grant_ref.clone(),
+        exact_signed_grant_container_bytes: root_grant.clone(),
+    };
+    let root_grant_request = cx.request(OperationKind::RootGrantCreate, filing.encode())?;
+    let ack_request = cx.request(
+        OperationKind::RootGrantAck,
+        TenantRootGrantAckV2 { grant: grant_ref }.encode(),
+    )?;
+
+    let fleet = hex(&cx.tenant);
+    let mut run = Renewal {
+        capability_grants,
+        approval: hex(&approval),
+        root_grant: hex(&root_grant),
+        root_grant_request: hex(&root_grant_request),
+        ack_request: hex(&ack_request),
+        ..Default::default()
+    };
+    if let Some(generation) = client
+        .active_fleet_generation(access, &fleet, &fleet)
+        .await?
+    {
+        let fkek = fleet_key(generation)?;
+        let keys = (cx.signing_key_id, cx.hpke_key_id, hpke_pk);
+        let filing = crate::fleet_custody::member_grant(
+            cx,
+            me.signer,
+            (cx.account, cx.device),
+            keys,
+            &fkek,
+            generation,
+            start,
+        )?;
+        let (request, _) = saved(&filing)?;
+        let grant = FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
+            .map_err(|_| corrupt())?
+            .grant;
+        let ack = cx.request(
+            OperationKind::FleetGrantAck,
+            FleetKeyGrantAckV2 { grant }.encode(),
+        )?;
+        run.device_grant_request = filing;
+        run.device_ack_request = hex(&ack);
+        run.generation = generation;
+    }
+    Ok(run)
+}
+
+/// The replay ID of the saved record `container`, signed by `issuer`.
+fn saved_replay(container: &[u8], issuer: &[u8; 32]) -> Result<[u8; 16]> {
+    AuthorizationRecord::parse(container)
+        .and_then(|r| r.verify_signature(issuer))
+        .map(|v| v.payload().common().replay_id)
+        .map_err(|_| corrupt())
+}
+
+/// The saved request `saved` and its exact bytes.
+fn saved(saved: &str) -> Result<(IdempotentMutationRequestV2, Vec<u8>)> {
+    let bytes = unhex_vec(saved)?;
+    let request = IdempotentMutationRequestV2::parse(&bytes).map_err(|_| corrupt())?;
+    Ok((request, bytes))
+}
+
+/// `run`'s own records are past half their life at `t`: the next renewal is
+/// due, and a grant not yet sent has ended or soon will.
+fn run_stale(run: &Renewal, own: &[u8; 32], t: u64) -> bool {
+    let windows: Vec<_> = run
+        .capability_grants
+        .iter()
+        .chain([&run.approval, &run.root_grant])
+        .filter_map(|h| decode_hex(h))
+        .filter_map(|c| window_of(&c, own))
+        .collect();
+    due(&windows, t)
+}
+
+/// Saves that the saved run's `step` is the next one to send.
+fn answered(
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+    step: usize,
+) -> Result<()> {
+    let step = u8::try_from(step).map_err(|_| corrupt())?;
+    commit(state, save, |s| {
+        if let Some(r) = s.renewal.as_mut() {
+            r.step = step;
+        }
+    })
+}
+
+/// Sends the saved run's records in order from its saved `step`, each
+/// checked against the reply that answers it and saved as answered before
+/// the next is sent, then `collect`s this device's new grant of
+/// `run.generation`. A rotation since the run was built granted this device
+/// the newer ACTIVE generation, so the device grant of the retired one is
+/// left out; so is one of a `stale` run, whose root grant was acked.
+#[allow(clippy::too_many_arguments)]
+async fn send_renewal(
+    client: &FleetClient,
+    access: &str,
+    cx: &Context16,
+    own: &[u8; 32],
+    stale: bool,
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+    collect: impl AsyncFnOnce(u64) -> Result<()>,
+) -> Result<()> {
+    use shardx_core::fleet_lifecycle::{
+        FleetKeyGrantAckedV2, FleetKeyGrantCreateV2, FleetKeyGrantCreatedV2,
+        RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
+    };
+    use shardx_core::mutation::{
+        TenantRootGrantCreateV2, TenantRootGrantCreatedV2, RECORD_TYPE_ROOT_GRANT_CREATED,
+    };
+    let run = state.renewal.clone().ok_or_else(corrupt)?;
+    let (n, from) = (run.capability_grants.len(), usize::from(run.step));
+    for (i, grant) in run.capability_grants.iter().enumerate().skip(from) {
+        let grant = unhex_vec(grant)?;
+        if client.file_capability_grant(access, &grant).await? != grant {
+            return Err(mismatch());
+        }
+        answered(state, save, i + 1)?;
+    }
+
+    if from <= n {
+        let approval = unhex_vec(&run.approval)?;
+        let replay = saved_replay(&approval, own)?;
+        let receipt = client
+            .approve_device(access, &hex(&cx.device), &approval)
+            .await?;
+        let r = DeviceApprovalReceiptV2::parse(&receipt).map_err(|_| mismatch())?;
+        let hash = device_approve_request_hash(
+            &cx.instance,
+            cx.epoch,
+            &cx.tenant,
+            &cx.account,
+            &cx.device,
+            &cx.device,
+            &approval,
+        );
+        if r.request_hash != hash
+            || (r.server_instance_id, r.restore_epoch, r.tenant_id)
+                != (cx.instance, cx.epoch, cx.tenant)
+            || (r.actor_account_id, r.actor_device_id) != (cx.account, cx.device)
+            || (r.subject_device_id, r.approval_replay_id) != (cx.device, replay)
+        {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 1)?;
+    }
+
+    let tenant = hex(&cx.tenant);
+    let (request, bytes) = saved(&run.root_grant_request)?;
+    let filing =
+        TenantRootGrantCreateV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
+    let generation = filing.grant.root_generation;
+    if from <= n + 1 {
+        let stored = client
+            .file_root_grant(access, &tenant, generation, &bytes)
+            .await?;
+        let created = TenantRootGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_ROOT_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if created.grant != filing.grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 2)?;
+    }
+    if from <= n + 2 {
+        let (request, bytes) = saved(&run.ack_request)?;
+        let replay = hex(&filing.grant.replay_id);
+        let stored = client
+            .ack_root_grant(access, &tenant, generation, &replay, &bytes)
+            .await?;
+        let acked = TenantRootGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_ROOT_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if acked.grant != filing.grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 3)?;
+    }
+
+    if stale
+        || run.device_grant_request.is_empty()
+        || client
+            .active_fleet_generation(access, &tenant, &tenant)
+            .await?
+            != Some(run.generation)
+    {
+        return Ok(());
+    }
+    let (request, bytes) = saved(&run.device_grant_request)?;
+    let grant = FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
+        .map_err(|_| corrupt())?
+        .grant;
+    if from <= n + 3 {
+        let stored = client
+            .file_fleet_grant(access, &tenant, run.generation, &bytes)
+            .await?;
+        let created = FleetKeyGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if created.grant != grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 4)?;
+    }
+    if from <= n + 4 {
+        let (request, bytes) = saved(&run.device_ack_request)?;
+        let stored = client
+            .ack_fleet_grant(access, &tenant, run.generation, &bytes)
+            .await?;
+        let acked = FleetKeyGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if acked.grant != grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 5)?;
+    }
+    collect(run.generation).await
+}
+
+/// 4.R's lapse rule: `pages`, evaluated to the saved anchor, no longer count
+/// this device's key as a custodian at the server's time `server_now`. Pages
+/// that do not verify prove nothing.
+fn lapsed(
+    state: &BootstrapState,
+    pages: &[shardx_core::trust_evidence::TenantTrustEvidencePageV2],
+    key: &[u8; 32],
+    server_now: u64,
+) -> bool {
+    let Ok((binding, anchor)) = pin_of(state) else {
+        return false;
+    };
+    Evidence::collect(&binding, pages)
+        .ok()
+        .and_then(|e| TrustChain::evaluate(e, Some(&anchor)).ok())
+        .is_some_and(|chain| !chain.custodian_now(key, server_now))
+}
+
+/// Root self-renewal (4.R) over this custodian's session `access`, under the
+/// custody lock the caller holds. A run in progress is resumed with its
+/// saved bytes at its saved step; once past half its own life it is built
+/// again if its root grant was never sent, else finished without its device
+/// grant. Otherwise nothing is asked of the server unless one of this
+/// custodian's own records ([`own_windows`]) reaches half its life at the
+/// local clock less the skew; then the server's time `T = min(local,
+/// server_now_ms) - CLOCK_SKEW_MS`, from fresh trust evidence, decides, and
+/// a due renewal is built at `T` and saved before anything is sent.
+/// `fleet_key` gives the verified key of a fleet generation; `collect` keeps
+/// this device's new grant of one. Once every step is answered the new root
+/// grant and approval become the current ones. A 403 is a lapse
+/// (`fleet.custodyLapsed`) only when the evidence no longer counts this
+/// device as a custodian at the server's time; any other error is returned
+/// as it is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn renew(
+    client: &FleetClient,
+    access: &str,
+    me: &RenewingDevice<'_>,
+    custody: &crate::fleet_custody::FleetCustodyState,
+    device_grant: Option<&[u8]>,
+    local_now: u64,
+    fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+    collect: impl AsyncFnOnce(u64) -> Result<()>,
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+) -> Result<RenewalOutcome> {
+    if !custody.handed_over_to.is_empty() {
+        return Ok(RenewalOutcome::HandedOver);
+    }
+    let resuming = state.renewal.as_ref().is_some_and(|r| !r.done);
+    let own = me.signer.verifying_key().to_bytes();
+    let windows = own_windows(state, &own, &custody.capability_grants, device_grant);
+    #[cfg(test)]
+    let forced = tests::RENEWAL_DUE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let forced = false;
+    let due = |t: u64| forced || due(&windows, t);
+    if !resuming && !due(local_now.saturating_sub(CLOCK_SKEW_MS)) {
+        return Ok(RenewalOutcome::NotDue);
+    }
+    let cx = renewal_context(state, me)?;
+    let pages = client.trust_evidence(access, &hex(&cx.tenant)).await?;
+    let server_now = pages.iter().map(|p| p.server_now_ms).max().unwrap_or(0);
+    // Without the server's time nothing is due, sent or lapsed.
+    if server_now == 0 {
+        return Err(mismatch());
+    }
+    let t = local_now.min(server_now).saturating_sub(CLOCK_SKEW_MS);
+    let open = state.renewal.as_ref().filter(|r| !r.done);
+    let stale = open.is_some_and(|r| run_stale(r, &own, t));
+    // A stale run whose root grant was never sent is built again.
+    let rebuild = stale && open.is_some_and(|r| usize::from(r.step) <= r.capability_grants.len());
+    if !resuming || rebuild {
+        if !due(t) {
+            return Ok(RenewalOutcome::NotDue);
+        }
+        let run = build_renewal(client, access, &cx, me, state, t, &fleet_key).await?;
+        commit(state, save, |s| s.renewal = Some(run))?;
+        eprintln!("[renewal] built at server time {t}");
+    }
+    let skip_device_grant = stale && !rebuild;
+    let sent = send_renewal(
+        client,
+        access,
+        &cx,
+        &own,
+        skip_device_grant,
+        state,
+        save,
+        collect,
+    );
+    if let Err(e) = sent.await {
+        if crate::fleet_custody::refused_with(&e, 403, None)
+            && lapsed(state, &pages, &cx.signing_key_id, server_now)
+        {
+            eprintln!("[renewal] lapsed at server time {server_now}");
+            bail!(crate::errcode::code("fleet.custodyLapsed"));
+        }
+        return Err(e);
+    }
+    let run = state.renewal.clone().ok_or_else(corrupt)?;
+    let issuer = hex(me.signer.verifying_key().as_bytes());
+    commit(state, save, |s| {
+        s.root_grant = run.root_grant.clone();
+        s.root_grant_issuer = issuer;
+        s.approval = run.approval.clone();
+        if let Some(r) = s.renewal.as_mut() {
+            r.done = true;
+        }
+    })?;
+    eprintln!("[renewal] renewed (fleet generation {})", run.generation);
+    Ok(RenewalOutcome::Renewed)
 }
 
 #[cfg(test)]
@@ -1927,7 +2607,11 @@ pub(crate) mod tests {
         ));
         let file = std::fs::read(&path);
         crate::store::set_config_root(None);
-        result.unwrap();
+        assert_eq!(
+            result.unwrap(),
+            root_grant_sha256(state),
+            "the exported grant"
+        );
         open(&file.unwrap(), "correct horse battery").unwrap()
     }
 
@@ -2686,5 +3370,857 @@ pub(crate) mod tests {
             "{err}"
         );
         assert_eq!(state.legacy_trk.as_str(), hex(&[0x51; 32]));
+    }
+
+    // ---- Root self-renewal (v2.10 4.R) ----
+
+    use std::sync::{Arc, Mutex};
+
+    thread_local! {
+        /// How far this thread's launcher clock ([`now_ms`]) runs behind the
+        /// real one: a real-server test backdates the records it builds.
+        pub(crate) static CLOCK_BACK_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Makes this thread's renewal steps due whatever the records say,
+        /// for a real-server journey whose records are all new.
+        pub(crate) static RENEWAL_DUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// When the renewal fixture's first records begin.
+    pub(crate) const START: u64 = 1_800_000_000_000;
+    pub(crate) const DAY: u64 = DAY_MS;
+    const FKEK: [u8; 32] = [0x5a; 32];
+
+    /// What the renewal server is told, and holds.
+    pub(crate) struct RenewalServer {
+        /// Its clock, as every evidence page states it.
+        pub(crate) now: u64,
+        pub(crate) active: Option<u64>,
+        /// The first call containing the text is answered with the status.
+        pub(crate) refuse: Option<(&'static str, u16)>,
+        /// The containers its trust evidence serves.
+        pub(crate) evidence: Vec<Vec<u8>>,
+    }
+
+    /// A root custodian whose own records, as the bootstrap and Create fleet
+    /// key build them, began at `START` and run a year, against a mock server.
+    pub(crate) struct Renewing {
+        pub(crate) state: BootstrapState,
+        pub(crate) custody: crate::fleet_custody::FleetCustodyState,
+        pub(crate) server: Arc<Mutex<RenewalServer>>,
+        pub(crate) client: FleetClient,
+        pub(crate) seen: crate::fleet_custody::tests::Seen,
+        pub(crate) collected: Arc<Mutex<Vec<u64>>>,
+        pub(crate) saves: usize,
+    }
+
+    fn me_subject(cx: &Context16) -> shardx_core::authz_record::GrantSubject {
+        shardx_core::authz_record::GrantSubject::Device {
+            account_id: cx.account,
+            device_id: cx.device,
+            signing_key_id: cx.signing_key_id,
+            hpke_key_id: cx.hpke_key_id,
+        }
+    }
+
+    fn renewal_reply(server: Arc<Mutex<RenewalServer>>) -> Arc<crate::fleet_custody::tests::Reply> {
+        use crate::fleet_custody::tests::stored;
+        use shardx_core::fleet_lifecycle::*;
+        use shardx_core::mutation::*;
+        Arc::new(move |call: &str, body: &[u8]| {
+            let mut s = server.lock().unwrap();
+            if let Some((_, status)) = s.refuse.filter(|(t, _)| call.contains(t)) {
+                s.refuse = None;
+                return (status, br#"{"code":"REFUSED"}"#.to_vec());
+            }
+            let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+            let post = call.starts_with("POST ");
+            // The server refuses a capability or fleet grant that has ended.
+            let ended = |container: &[u8]| window(container).1 <= s.now;
+            let refused = || (403, br#"{"code":"EXPIRED"}"#.to_vec());
+            match call {
+                c if c.contains("/trust-evidence") => {
+                    let page = shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+                        server_instance_id: cx.instance,
+                        tenant_id: cx.tenant,
+                        server_now_ms: s.now,
+                        page_index: 0,
+                        next_cursor: Vec::new(),
+                        signing_public_keys: vec![signer().verifying_key().to_bytes()],
+                        containers: s.evidence.clone(),
+                        revocations: Vec::new(),
+                        device_revocations: Vec::new(),
+                    };
+                    (200, page.encode())
+                }
+                c if c.ends_with("/key-generation") => match s.active {
+                    Some(g) => (200, format!(r#"{{"generation":{g}}}"#).into_bytes()),
+                    None => (200, b"null".to_vec()),
+                },
+                "POST /v2/capability-grants" if ended(body) => refused(),
+                "POST /v2/capability-grants" => (201, body.to_vec()),
+                c if post && c.ends_with("/approve") => {
+                    let a = approval_of(body);
+                    let receipt = DeviceApprovalReceiptV2 {
+                        server_instance_id: cx.instance,
+                        restore_epoch: 0,
+                        tenant_id: cx.tenant,
+                        actor_account_id: cx.account,
+                        actor_device_id: cx.device,
+                        subject_device_id: a.subject_device_id,
+                        approval_replay_id: a.common.replay_id,
+                        request_hash: device_approve_request_hash(
+                            &cx.instance,
+                            0,
+                            &cx.tenant,
+                            &cx.account,
+                            &cx.device,
+                            &a.subject_device_id,
+                            body,
+                        ),
+                        approval_payload_sha256: [0; 32],
+                        approval_signed_container_hash: [0; 32],
+                        approval_outer_sha256: [0; 32],
+                        confirmation_id: None,
+                        committed_at_ms: 1,
+                    };
+                    (200, receipt.encode())
+                }
+                c if post && c.contains("/root-key-generations/") && c.ends_with("/grants") => {
+                    let reply = stored(body, RECORD_TYPE_ROOT_GRANT_CREATED, |p| {
+                        TenantRootGrantCreatedV2 {
+                            grant: TenantRootGrantCreateV2::parse(p).unwrap().grant,
+                            grant_variant: "ExistingRootGrant",
+                            subject_device_id: cx.device,
+                            recipient_hpke_key_id: cx.hpke_key_id,
+                            created_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.contains("/root-key-generations/") && c.ends_with("/ack") => {
+                    let reply = stored(body, RECORD_TYPE_ROOT_GRANT_ACKED, |p| {
+                        TenantRootGrantAckedV2 {
+                            grant: TenantRootGrantAckV2::parse(p).unwrap().grant,
+                            acked_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.starts_with("POST /v2/fleets/") && c.ends_with("/grants") => {
+                    let request = IdempotentMutationRequestV2::parse(body).unwrap();
+                    let filing =
+                        FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes).unwrap();
+                    if ended(&filing.exact_signed_grant_container_bytes) {
+                        return refused();
+                    }
+                    let reply = stored(body, RECORD_TYPE_FLEET_GRANT_CREATED, |p| {
+                        FleetKeyGrantCreatedV2 {
+                            grant: FleetKeyGrantCreateV2::parse(p).unwrap().grant,
+                            target: FleetGrantTarget::Device {
+                                subject_device_id: cx.device,
+                            },
+                            created_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.starts_with("POST /v2/fleets/") && c.ends_with("/ack") => {
+                    let reply = stored(body, RECORD_TYPE_FLEET_GRANT_ACKED, |p| {
+                        FleetKeyGrantAckedV2 {
+                            grant: FleetKeyGrantAckV2::parse(p).unwrap().grant,
+                            acked_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                _ => (500, Vec::new()),
+            }
+        })
+    }
+
+    /// The renewal fixture on `rt`; the server's clock reads `server_now`.
+    pub(crate) fn renewal_fixture(rt: &tokio::runtime::Runtime, server_now: u64) -> Renewing {
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        // `common` backdates by the skew: built here, they begin at `START`.
+        let built = START + CLOCK_SKEW_MS;
+        let approval = self_approval(&cx, &signer(), built).unwrap();
+        let replay = approval_of(&approval).common.replay_id;
+        let grant = self_grant(&cx, &signer(), &pk, &[9; 32], replay, built).unwrap();
+        let own = crate::fleet_custody::own_grants(&cx, cx.tenant);
+        let grants =
+            crate::fleet_custody::capability_grants(&cx, &signer(), &me_subject(&cx), own, built)
+                .unwrap();
+        let state = BootstrapState {
+            tenant_id: hex(&cx.tenant),
+            device_id: hex(&cx.device),
+            server_instance_id: hex(&cx.instance),
+            approval: hex(&approval),
+            self_grant: hex(&grant),
+            activated: true,
+            anchor: hex(&cx.signing_key_id),
+            ..Default::default()
+        };
+        let custody = crate::fleet_custody::FleetCustodyState {
+            tenant_id: hex(&cx.tenant),
+            device_id: hex(&cx.device),
+            server_instance_id: hex(&cx.instance),
+            capability_grants: grants.clone(),
+            ..Default::default()
+        };
+        let mut evidence = vec![approval, grant];
+        evidence.extend(grants.iter().map(|g| unhex_vec(g).unwrap()));
+        let server = Arc::new(Mutex::new(RenewalServer {
+            now: server_now,
+            active: Some(0),
+            refuse: None,
+            evidence,
+        }));
+        let (client, seen) = rt.block_on(crate::fleet_custody::tests::mock(renewal_reply(
+            server.clone(),
+        )));
+        Renewing {
+            state,
+            custody,
+            server,
+            client,
+            seen,
+            collected: Arc::default(),
+            saves: 0,
+        }
+    }
+
+    impl Renewing {
+        /// One renewal step at the local clock `local_now`.
+        pub(crate) async fn renew_at(&mut self, local_now: u64) -> Result<RenewalOutcome> {
+            let (signer, account) = (signer(), hex(&[4; 16]));
+            let me = RenewingDevice {
+                account_id: &account,
+                signer: &signer,
+                hpke_seed: &HPKE_SEED,
+            };
+            let collected = self.collected.clone();
+            let saves = &mut self.saves;
+            renew(
+                &self.client,
+                "access",
+                &me,
+                &self.custody,
+                None,
+                local_now,
+                |_| Ok(Zeroizing::new(FKEK)),
+                async move |g| {
+                    collected.lock().unwrap().push(g);
+                    Ok(())
+                },
+                &mut self.state,
+                &mut |_| {
+                    *saves += 1;
+                    Ok(())
+                },
+            )
+            .await
+        }
+
+        /// Every POST so far, with its body.
+        pub(crate) fn posts(&self) -> Vec<(String, Vec<u8>)> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c.starts_with("POST "))
+                .cloned()
+                .collect()
+        }
+
+        /// The finished or saved renewal.
+        fn run(&self) -> Renewal {
+            self.state.renewal.clone().expect("a renewal")
+        }
+
+        /// The containers the renewal holds, for evidence.
+        fn renewed_records(&self) -> Vec<Vec<u8>> {
+            let r = self.run();
+            let mut out = vec![
+                unhex_vec(&r.approval).unwrap(),
+                unhex_vec(&r.root_grant).unwrap(),
+            ];
+            out.extend(r.capability_grants.iter().map(|g| unhex_vec(g).unwrap()));
+            out
+        }
+    }
+
+    /// The window of a container this device signed.
+    fn window(container: &[u8]) -> (u64, u64) {
+        window_of(container, signer().verifying_key().as_bytes()).expect("own record")
+    }
+
+    /// The containers a saved request files.
+    fn filed_container(saved: &str) -> Vec<u8> {
+        let (request, _) = super::saved(saved).unwrap();
+        shardx_core::fleet_lifecycle::FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
+            .unwrap()
+            .exact_signed_grant_container_bytes
+    }
+
+    fn short(call: &str) -> String {
+        let path = call.trim_start_matches("POST ");
+        let parts: Vec<&str> = path.split('/').collect();
+        match parts.as_slice() {
+            [.., "capability-grants"] => "capability".into(),
+            [.., "approve"] => "approve".into(),
+            [.., "root-key-generations", _, "grants"] => "root grant".into(),
+            [.., "root-key-generations", _, "grants", _, "ack"] => "root ack".into(),
+            [.., "key-generations", _, "grants"] => "device grant".into(),
+            [.., "key-generations", _, "ack"] => "device ack".into(),
+            _ => call.into(),
+        }
+    }
+
+    /// 4.R: a custodian past half its records' life renews them in D-6
+    /// order (capability grants, self-approval, `ExistingRootGrant`, its
+    /// ack, the device grant of the ACTIVE generation, its ack, the verified
+    /// collect), and only then makes the new records current.
+    #[test]
+    fn a_due_custodian_renews_capabilities_approval_root_grant_and_device_grant_in_order() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        let first = f.state.clone();
+        assert_eq!(
+            rt.block_on(f.renew_at(now)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        let order: Vec<String> = f.posts().iter().map(|(c, _)| short(c)).collect();
+        let mut want = vec!["capability".to_string(); 6];
+        want.extend(
+            [
+                "approve",
+                "root grant",
+                "root ack",
+                "device grant",
+                "device ack",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(order, want);
+        assert_eq!(*f.collected.lock().unwrap(), vec![0], "the collect of N");
+
+        let run = f.run();
+        assert!(run.done);
+        assert_eq!(f.state.root_grant, run.root_grant);
+        assert_eq!(f.state.approval, run.approval);
+        assert_eq!(
+            f.state.root_grant_issuer,
+            hex(signer().verifying_key().as_bytes())
+        );
+        assert_eq!(f.state.self_grant, first.self_grant, "kept beside it");
+        let (grant, _, issuer) = current_root_grant(&f.state, &signer()).unwrap();
+        assert_eq!(grant.variant, RootGrantVariant::ExistingRootGrant);
+        assert_eq!(issuer, signer().verifying_key().to_bytes());
+        let (old, _, _) = current_root_grant(&first, &signer()).unwrap();
+        assert_eq!(
+            (grant.root_key_id, grant.root_generation),
+            (old.root_key_id, old.root_generation)
+        );
+        let approval = approval_of(&unhex_vec(&run.approval).unwrap());
+        assert_eq!(
+            grant.subject_device_approval_replay_id,
+            approval.common.replay_id
+        );
+        let (sk, _) = derive_keypair(&HPKE_SEED);
+        assert_eq!(*grant.open_trk(&sk).unwrap(), [9; 32], "the same TRK");
+    }
+
+    /// A-MF5: the records start at `min(local, server) - CLOCK_SKEW_MS`, so
+    /// a local clock ahead of the server's never dates them into the future.
+    #[test]
+    fn a_renewal_takes_its_times_from_the_servers_clock() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let server = START + 200 * DAY;
+        for local in [server + 10 * DAY, server - DAY] {
+            let mut f = renewal_fixture(&rt, server);
+            assert_eq!(
+                rt.block_on(f.renew_at(local)).unwrap(),
+                RenewalOutcome::Renewed
+            );
+            let t = local.min(server) - CLOCK_SKEW_MS;
+            let run = f.run();
+            for record in f.renewed_records() {
+                assert_eq!(window(&record).0, t);
+            }
+            assert_eq!(window(&filed_container(&run.device_grant_request)).0, t);
+        }
+        // Due by the local clock only: the server's says not yet.
+        let mut f = renewal_fixture(&rt, START + 100 * DAY);
+        assert_eq!(
+            rt.block_on(f.renew_at(START + 300 * DAY)).unwrap(),
+            RenewalOutcome::NotDue
+        );
+        assert!(f.posts().is_empty());
+        assert!(f.state.renewal.is_none());
+    }
+
+    /// A-MF5: a local clock past the records' end proves no lapse: the
+    /// server's time decides, and a refusal is returned as it is.
+    #[test]
+    fn a_fast_local_clock_never_declares_a_lapse() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let mut f = renewal_fixture(&rt, START + 200 * DAY);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 403));
+        let err = rt
+            .block_on(f.renew_at(START + 900 * DAY))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("fleet.custodyLapsed"), "{err}");
+        assert!(err.contains("status=403"), "{err}");
+    }
+
+    /// 4.R: a lapse needs both: the chain evaluated at the server's time no
+    /// longer counts this device, and the server refused with 403.
+    #[test]
+    fn a_lapse_is_declared_only_when_the_chain_at_server_time_and_a_403_agree() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let ended = START + 400 * DAY;
+        let lapse = |status: u16| {
+            let mut f = renewal_fixture(&rt, ended);
+            f.server.lock().unwrap().refuse = Some(("/capability-grants", status));
+            rt.block_on(f.renew_at(ended)).unwrap_err().to_string()
+        };
+        assert!(lapse(403).contains("fleet.custodyLapsed"), "{}", lapse(403));
+        let other = lapse(500);
+        assert!(!other.contains("fleet.custodyLapsed"), "{other}");
+        assert!(other.contains("status=500"), "{other}");
+        // Before the end, the chain still counts this device.
+        let mut f = renewal_fixture(&rt, START + 200 * DAY);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 403));
+        let refused = rt.block_on(f.renew_at(START + 200 * DAY)).unwrap_err();
+        assert!(
+            !refused.to_string().contains("fleet.custodyLapsed"),
+            "{refused}"
+        );
+    }
+
+    /// 4.R: while the chain still counts this device at the server's time, a
+    /// 403 is the server's own refusal, returned unchanged.
+    #[test]
+    fn a_403_before_the_records_end_is_returned_unchanged() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/root-key-generations/", 403));
+        let err = rt.block_on(f.renew_at(now)).unwrap_err().to_string();
+        assert!(!err.contains("fleet.custodyLapsed"), "{err}");
+        assert!(
+            err.contains("fleet.refusedCustody") && err.contains("status=403"),
+            "{err}"
+        );
+        assert!(!f.run().done, "the run stays saved for a resume");
+    }
+
+    /// A-MF6: the renewed approval and root grant run 730 days, the
+    /// capability and device grants 365.
+    #[test]
+    fn renewed_custody_records_run_730_days() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        rt.block_on(f.renew_at(now)).unwrap();
+        let run = f.run();
+        let span = |c: &[u8]| {
+            let (nb, na) = window(c);
+            na - nb
+        };
+        assert_eq!(span(&unhex_vec(&run.approval).unwrap()), 730 * DAY);
+        assert_eq!(span(&unhex_vec(&run.root_grant).unwrap()), 730 * DAY);
+        assert_eq!(run.capability_grants.len(), 6);
+        for g in &run.capability_grants {
+            assert_eq!(span(&unhex_vec(g).unwrap()), 365 * DAY);
+        }
+        assert_eq!(span(&filed_container(&run.device_grant_request)), 365 * DAY);
+    }
+
+    /// 4.R: 730 days is exactly the server's cap for an approval and a root
+    /// grant (`MAX_DEVICE_APPROVAL_TTL_MS`); one millisecond more is refused.
+    #[test]
+    fn a_730_day_renewal_window_is_exactly_the_server_cap() {
+        assert_eq!(RENEWED_VALIDITY_MS, 63_072_000_000);
+        assert_eq!(
+            RENEWED_VALIDITY_MS,
+            shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS
+        );
+    }
+
+    /// Plan pre-mortem 5: the renewed grant counts from `T`, inside the old
+    /// window, so the chain counts this device across the old end.
+    #[test]
+    fn a_renewal_crosses_the_old_expiry_with_no_gap() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        rt.block_on(f.renew_at(now)).unwrap();
+        let old_end = window(&unhex_vec(&f.state.self_grant).unwrap()).1;
+        let mut evidence = f.server.lock().unwrap().evidence.clone();
+        evidence.extend(f.renewed_records());
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let page = shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+            server_now_ms: now,
+            page_index: 0,
+            next_cursor: Vec::new(),
+            signing_public_keys: vec![signer().verifying_key().to_bytes()],
+            containers: evidence,
+            revocations: Vec::new(),
+            device_revocations: Vec::new(),
+        };
+        let binding = Binding {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+        };
+        let chain = TrustChain::evaluate(
+            Evidence::collect(&binding, &[page]).unwrap(),
+            Some(&cx.signing_key_id),
+        )
+        .unwrap();
+        let t = now - CLOCK_SKEW_MS;
+        for at in [t, old_end - 1, old_end, old_end + DAY, t + 729 * DAY] {
+            assert!(chain.custodian_at(&cx.signing_key_id, at), "at {at}");
+        }
+        assert!(!chain.custodian_at(&cx.signing_key_id, t + 730 * DAY));
+    }
+
+    /// Each request is built once and saved before the first is sent: a run
+    /// that stopped resumes, even before it is due, at the step that was not
+    /// answered, resending the same bytes.
+    #[test]
+    fn renewal_resumes_each_step_with_byte_identical_requests() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/ack", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        let saved = f.run();
+        assert!(!saved.done);
+        let first = f.posts();
+        assert_eq!(short(&first.last().unwrap().0), "root ack");
+        f.seen.lock().unwrap().clear();
+
+        // Resumed later, and at a clock that would not be due.
+        assert_eq!(
+            rt.block_on(f.renew_at(START)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        let second = f.posts();
+        let order: Vec<String> = second.iter().map(|(c, _)| short(c)).collect();
+        assert_eq!(order, ["root ack", "device grant", "device ack"]);
+        assert_eq!(first.last(), second.first(), "byte-identical resend");
+        assert_eq!(
+            Renewal {
+                done: true,
+                step: 11,
+                ..saved
+            },
+            f.run(),
+            "nothing rebuilt"
+        );
+    }
+
+    /// One root grant per renewal: a resume goes on after the answered one,
+    /// and a finished renewal is not due again.
+    #[test]
+    fn a_renewal_never_files_two_root_grants() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/key-generations/0/grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        rt.block_on(f.renew_at(now)).unwrap();
+        for later in [now, now + DAY, now + 100 * DAY] {
+            assert_eq!(
+                rt.block_on(f.renew_at(later)).unwrap(),
+                RenewalOutcome::NotDue
+            );
+        }
+        let sent: Vec<Vec<u8>> = f
+            .posts()
+            .into_iter()
+            .filter(|(c, _)| short(c) == "root grant")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(sent.len(), 1, "filed once, never resent");
+    }
+
+    /// A run that stopped before its root grant was sent and then sat past
+    /// half its own life is dropped and built again at the server's time,
+    /// never resent with records that have ended.
+    #[test]
+    fn a_stale_unsent_renewal_is_rebuilt() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        let stale = f.run();
+        f.seen.lock().unwrap().clear();
+
+        let later = now + 400 * DAY;
+        f.server.lock().unwrap().now = later;
+        assert_eq!(
+            rt.block_on(f.renew_at(later)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        let run = f.run();
+        assert_ne!(run.capability_grants, stale.capability_grants, "rebuilt");
+        assert_eq!(
+            window(&unhex_vec(&run.root_grant).unwrap()).0,
+            later - CLOCK_SKEW_MS
+        );
+        let roots: Vec<_> = f
+            .posts()
+            .into_iter()
+            .filter(|(c, _)| short(c) == "root grant")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(roots.len(), 1, "one root grant");
+        assert_eq!(roots[0], saved(&run.root_grant_request).unwrap().1);
+    }
+
+    /// A run whose root grant was acked and then sat past half its own life
+    /// finishes without its device grant, which has ended or soon will: the
+    /// next renewal is due at once and grants the device again.
+    #[test]
+    fn a_renewal_past_its_root_ack_completes_without_its_expired_device_grant() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/key-generations/0/grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        let saved = f.run();
+        f.seen.lock().unwrap().clear();
+
+        let later = now + 400 * DAY;
+        f.server.lock().unwrap().now = later;
+        assert_eq!(
+            rt.block_on(f.renew_at(later)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        assert!(f.posts().is_empty(), "{:?}", f.posts());
+        assert!(f.collected.lock().unwrap().is_empty());
+        let run = f.run();
+        assert!(run.done);
+        assert_eq!(run.root_grant, saved.root_grant, "nothing rebuilt");
+        assert_eq!(f.state.root_grant, saved.root_grant);
+    }
+
+    /// A trust-evidence reply without the server's time proves nothing: no
+    /// request is sent and a refusal is never read as a lapse.
+    #[test]
+    fn a_reply_without_the_servers_time_is_never_a_lapse() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        f.seen.lock().unwrap().clear();
+
+        f.server.lock().unwrap().now = 0;
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 403));
+        let err = rt.block_on(f.renew_at(now)).unwrap_err().to_string();
+        assert!(!err.contains("fleet.custodyLapsed"), "{err}");
+        assert!(err.contains("fleet.custodyReplyMismatch"), "{err}");
+        assert!(f.posts().is_empty(), "{:?}", f.posts());
+    }
+
+    /// 4.H: a custodian that handed its custody over never renews.
+    #[test]
+    fn a_handed_over_root_never_renews() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 300 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.custody.handed_over_to = hex(&[0x99; 16]);
+        assert_eq!(
+            rt.block_on(f.renew_at(now)).unwrap(),
+            RenewalOutcome::HandedOver
+        );
+        assert!(f.seen.lock().unwrap().is_empty());
+        assert!(f.state.renewal.is_none());
+    }
+
+    /// D9: on sync the renewal never waits for the custody lock: while
+    /// another custody command holds it, the step is skipped, with no
+    /// request and nothing read.
+    #[test]
+    fn a_busy_custody_lock_skips_the_renewal() {
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let rt = crate::fleet_custody::tests::runtime();
+        let held = crate::fleet_custody::begin().unwrap();
+        // Nothing listens here.
+        let client = FleetClient::new("http://127.0.0.1:9", "t").unwrap();
+        let c = crate::team_config::TeamConfig::default();
+        let outcome = rt.block_on(crate::renew_quietly(&client, &c, "access"));
+        drop(held);
+        assert_eq!(outcome.unwrap(), RenewalOutcome::Busy);
+    }
+
+    /// F23, a known limitation: a member offline past the old root grant's
+    /// end holds the custodian lapsed, so a renewal it first sees afterwards
+    /// never counts there, though it was issued in time. A member that saw
+    /// the renewal before the old end keeps the custodian.
+    #[test]
+    fn a_member_offline_past_the_old_root_grant_end_refuses_the_self_renewal() {
+        use crate::team::{db::Db, ledger};
+        let rt = crate::fleet_custody::tests::runtime();
+        let renewed_at = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, renewed_at);
+        rt.block_on(f.renew_at(renewed_at)).unwrap();
+        let old = f.server.lock().unwrap().evidence.clone();
+        let mut both = old.clone();
+        both.extend(f.renewed_records());
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let binding = Binding {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+        };
+        let page = |containers: Vec<Vec<u8>>, now: u64| {
+            shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+                server_instance_id: cx.instance,
+                tenant_id: cx.tenant,
+                server_now_ms: now,
+                page_index: 0,
+                next_cursor: Vec::new(),
+                signing_public_keys: vec![signer().verifying_key().to_bytes()],
+                containers,
+                revocations: Vec::new(),
+                device_revocations: Vec::new(),
+            }
+        };
+        let anchor = cx.signing_key_id;
+        // A member's ledger: what it saw at `first`, then all at `back`.
+        let member = |back: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_at(&dir.path().join("m.db")).unwrap();
+            ledger::pin_anchor(&db, &binding, &anchor, ledger::JOIN, START).unwrap();
+            for (containers, now) in [(old.clone(), START + DAY), (both.clone(), back)] {
+                let pages = [page(containers, now)];
+                let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &pages, now)
+                    .unwrap()
+                    .expect("verifies");
+                ledger::record(&mut db, &binding, &seen, &chain, None, false, now).unwrap();
+            }
+            let pages = [page(both.clone(), START + 400 * DAY)];
+            let (_, chain) = ledger::evaluate(&db, &binding, &anchor, &pages, START + 400 * DAY)
+                .unwrap()
+                .unwrap();
+            chain.custodian_now(&anchor, START + 400 * DAY)
+        };
+        assert!(!member(START + 380 * DAY), "offline past the old end");
+        assert!(member(START + 250 * DAY), "back before the old end");
+    }
+
+    /// After a renewal Export again writes a v4 bundle with the renewed,
+    /// self-issued grant, after the import's own root grant check (step 5)
+    /// passed on it, and the bundle opens. The chain an import evaluates is
+    /// `a_renewal_crosses_the_old_expiry_with_no_gap`'s.
+    #[test]
+    fn a_renewal_exports_a_v4_bundle_whose_grant_passes_the_import_root_grant_check() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        rt.block_on(f.renew_at(now)).unwrap();
+        let grant = unhex_vec(&f.state.root_grant).unwrap();
+        let (header, plaintext) = export_again_from(&f.state, &grant, &signer());
+        assert_eq!(header.root_generation, 0);
+        let custodian = plaintext.root_custodian.unwrap();
+        assert_eq!(custodian.root_grant, grant);
+        assert_eq!(
+            custodian.root_grant_issuer,
+            Some(signer().verifying_key().to_bytes())
+        );
+        assert_eq!(
+            plaintext.bootstrap_anchor_signing_key_id,
+            custodian_cx([5; 16], &[9; 32]).0.signing_key_id
+        );
+    }
+
+    /// A custodian imported from a bundle exported after a renewal keeps only
+    /// the renewed grant; its key age still counts from the first root grant,
+    /// which the trust ledger remembers.
+    #[test]
+    fn an_imported_custodian_counts_its_key_age_from_the_ledgers_first_grant() {
+        use crate::team::{db::Db, ledger};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        rt.block_on(f.renew_at(now)).unwrap();
+        let imported = BootstrapState {
+            self_grant: String::new(),
+            renewal: None,
+            ..f.state.clone()
+        };
+        let own = signer().verifying_key().to_bytes();
+        let renewed = first_not_before(&imported, &own);
+
+        let mut evidence = f.server.lock().unwrap().evidence.clone();
+        evidence.extend(f.renewed_records());
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let (binding, anchor) = pin_of(&imported).unwrap();
+        let page = shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+            server_now_ms: now,
+            page_index: 0,
+            next_cursor: Vec::new(),
+            signing_public_keys: vec![own],
+            containers: evidence,
+            revocations: Vec::new(),
+            device_revocations: Vec::new(),
+        };
+        let mut db = Db::open().unwrap();
+        ledger::pin_anchor(&db, &binding, &anchor, ledger::BOOTSTRAP, now).unwrap();
+        let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &[page], now)
+            .unwrap()
+            .expect("verifies");
+        ledger::record(&mut db, &binding, &seen, &chain, None, false, now).unwrap();
+        drop(db);
+        let counted = first_not_before(&imported, &own);
+        crate::store::set_config_root(None);
+        assert_eq!(
+            renewed,
+            Some(now - CLOCK_SKEW_MS),
+            "the renewed grant alone"
+        );
+        assert_eq!(counted, Some(START), "the ledger's first grant");
+    }
+
+    /// No key is among the renewal state: not the seeds, the TRK or the
+    /// fleet key.
+    #[test]
+    fn the_renewal_state_holds_no_key_bytes() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/ack", 503));
+        let _ = rt.block_on(f.renew_at(now));
+        let mid = serde_json::to_string(&f.state).unwrap();
+        rt.block_on(f.renew_at(now)).unwrap();
+        let done = serde_json::to_string(&f.state).unwrap();
+        for text in [mid, done] {
+            for secret in [signer().to_bytes(), HPKE_SEED, [9; 32], FKEK] {
+                assert!(!text.contains(&hex(&secret)), "a key in the state");
+            }
+            assert!(text.contains("\"renewal\""));
+        }
     }
 }

@@ -362,34 +362,47 @@ const TEAM_ROOT_KEY_ID = "5e".repeat(32);
 // `teamRootJournal=foreign` or `foreign-unfinished`: another device's root
 // state, finished or not, that a connection change kept.
 const foreignRoot = params.get("teamRootJournal");
-let custodyBootstrap = foreignRoot
+const DAY_MS = 86_400_000;
+// A root custodian's own records as renewal reads them, renewed at `renewed`:
+// due half a year later, ending a year later.
+const renewalTimes = (renewed: number) => ({
+  renewal_due_ms: renewed + 182 * DAY_MS, custody_ends_ms: renewed + 365 * DAY_MS,
+  key_age_ends_ms: Date.now() + 900 * DAY_MS,
+});
+const noRenewal = { renewal_due_ms: null, custody_ends_ms: null, key_age_ends_ms: null };
+let custodyBootstrap: {
+  started: boolean; this_device: boolean; activated: boolean; recovery_path: string; anchor: string; root_key_id: string;
+  renewal_due_ms: number | null; custody_ends_ms: number | null; key_age_ends_ms: number | null;
+} = foreignRoot
   ? {
     started: true, this_device: false, activated: foreignRoot === "foreign",
     recovery_path: "C:\\Users\\Example\\old.shxrecovery", anchor: foreignRoot === "foreign" ? "0f".repeat(32) : "",
-    root_key_id: "",
+    root_key_id: "", ...noRenewal,
   }
   : scenario === "team-first-device-resume"
   ? {
     started: true, this_device: true, activated: false, recovery_path: "C:\\Users\\Example\\kept.shxrecovery", anchor: "",
-    root_key_id: "",
+    root_key_id: "", ...noRenewal,
   }
   : teamDevice === "a"
     ? {
       started: true, this_device: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery",
       anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID,
+      // With `teamRenewal=due` its records are past 75% of their life.
+      ...renewalTimes(Date.now() - (params.get("teamRenewal") === "due" ? 300 : 10) * DAY_MS),
     }
-    : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "" };
+    : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "", ...noRenewal };
 type FleetRotation = {
   generation: number; phase: "preparing" | "activated" | "done" | "expired"; deadline_ms: number | null;
   members_filed: number; members_refused: number; members_skipped: number; failing_member: string | null;
 };
 let fleetCustody: {
   started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
-  rotation_required: "urgent" | "routine" | null; export_due: boolean;
+  rotation_required: "urgent" | "routine" | null; export_due: boolean; export_reason: "rotation" | "renewal";
   reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
-  export_due: false, reseal: null,
+  export_due: false, export_reason: "rotation", reseal: null,
 };
 // The highest fleet key generation this device kept.
 let teamGeneration = 0;
@@ -574,6 +587,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         rotation: { ...rotation, phase: "done", failing_member: null },
         rotation_required: null,
         export_due: true,
+        export_reason: "rotation",
       };
       return fleetCustody;
     }
@@ -646,7 +660,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       teamSeeds = null;
       custodyBootstrap = {
         started: true, this_device: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
-        root_key_id: TEAM_ROOT_KEY_ID,
+        root_key_id: TEAM_ROOT_KEY_ID, ...renewalTimes(Date.now()),
       };
       fleetCustody = { ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
       return {
@@ -655,12 +669,21 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         can_sync_without_passphrase: false,
       };
     }
+    case "team_renew_custody": {
+      // As the launcher: only a due root custodian renews, then asks for the bundle again.
+      teamCustodian();
+      await teamServer("live", me);
+      if ((custodyBootstrap.renewal_due_ms ?? Infinity) > Date.now()) return "not_due";
+      custodyBootstrap = { ...custodyBootstrap, ...renewalTimes(Date.now()) };
+      fleetCustody = { ...fleetCustody, export_due: true, export_reason: "renewal" };
+      return "renewed";
+    }
     case "team_export_recovery_bundle":
       teamCustodian();
       await teamServer("live", me);
       if (!teamMe.collected) teamRefuse("fleet.recoveryExportNeedsFleetKey");
       document.documentElement.dataset.e2eExportPath = String(args.path ?? "");
-      fleetCustody = { ...fleetCustody, export_due: false };
+      fleetCustody = { ...fleetCustody, export_due: false, export_reason: "rotation" };
       return null;
     case "team_collect_custody": {
       const { granted, generation, missed, kept } = await teamCollect();
@@ -1198,6 +1221,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
         anchor: "a0".repeat(32),
         root_key_id: TEAM_ROOT_KEY_ID,
+        ...renewalTimes(Date.now()),
       };
       return custodyBootstrap;
     }

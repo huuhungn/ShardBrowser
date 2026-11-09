@@ -2636,6 +2636,8 @@ async fn team_export_recovery_bundle(
         path: std::path::Path::new(&path),
         passphrase: &passphrase,
     };
+    // A renewal first, so the bundle carries the renewed root grant.
+    let _ = renew_quietly(&client, &c, access).await;
     let result = root_bootstrap::export_again(
         &client, access, &fleet_hex, &signer, &seed, fkeks, &recovery,
     )
@@ -2643,11 +2645,11 @@ async fn team_export_recovery_bundle(
     .map_err(|e| e.to_string());
     client.end_session(access).await;
     match &result {
-        Ok(()) => {
+        Ok(grant) => {
             eprintln!("[recovery] export: ok");
-            // The bundle opens every generation it carries: a rotation's
-            // re-export prompt ends.
-            if let Err(e) = newest.map_or(Ok(()), fleet_custody::exported) {
+            // The bundle opens every generation it carries and holds the
+            // current root grant: a rotation's or renewal's prompt ends.
+            if let Err(e) = newest.map_or(Ok(()), |n| fleet_custody::exported(n, grant)) {
                 eprintln!("[recovery] export prompt: not cleared ({e:#})");
             }
         }
@@ -2656,7 +2658,7 @@ async fn team_export_recovery_bundle(
             recovery_import::error_code(e)
         ),
     }
-    result
+    result.map(drop)
 }
 
 /// How far this device's Create fleet key got, and whether a revocation
@@ -2812,6 +2814,10 @@ async fn team_devices(
     let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
     let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
     let (client, session) = open_session(&c, &username, &password).await?;
+    if let Err(e) = renew_first(&client, &c, &session.access_token).await {
+        client.end_session(&session.access_token).await;
+        return Err(e);
+    }
     let rows = client
         .list_tenant_devices(&session.access_token, &c.tenant_id)
         .await;
@@ -2871,6 +2877,7 @@ async fn team_approve_device(
         vault: &fleet_custody::CredentialFkekStore,
     };
     let result = async {
+        renew_first(&client, &c, access).await?;
         let rows = client
             .list_tenant_devices(access, &c.tenant_id)
             .await
@@ -2969,6 +2976,7 @@ async fn team_fleet_key_rotate(
     };
     let fleet_hex = sync_cmd::fleet_id(&c);
     let result = async {
+        renew_first(&client, &c, access).await?;
         let error = |e: anyhow::Error| e.to_string();
         let now = root_bootstrap::now_ms();
         let started = std::time::Instant::now();
@@ -3080,6 +3088,10 @@ async fn team_reseal_all(
         let guard = profile::begin_user_mutation([local], &action).ok()?;
         Some(Box::new(guard))
     };
+    if let Err(e) = renew_first(&client, &c, access).await {
+        client.end_session(access).await;
+        return Err(e);
+    }
     // shortcut: `outgoing` stays `None` until the hand-over (U6) saves one.
     let resealed = team::sync::reseal_all(
         &client,
@@ -3565,6 +3577,8 @@ async fn team_collect_custody(
         .await
         .map_err(|e| e.to_string())?;
     let access = session.access_token.as_str();
+    // Recovery must keep working: even a lapse only logs here.
+    log_renewal(&renew_custody(&client, &c, access).await);
     let result = async {
         let grants = client
             .root_key_grants(access, &c.tenant_id, &c.device_id)
@@ -3577,6 +3591,149 @@ async fn team_collect_custody(
     .await;
     client.end_session(access).await;
     result
+}
+
+/// v2.10 4.R: this root custodian's renewal step over the session `access`,
+/// under the custody lock the caller holds ([`root_bootstrap::renew`]). Any
+/// other device has nothing to renew. A finished renewal asks for the
+/// recovery bundle again: the saved one names the replaced root grant.
+pub(crate) async fn renew_custody(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+) -> anyhow::Result<root_bootstrap::RenewalOutcome> {
+    let Some(pin) = bootstrap_anchor(c) else {
+        return Ok(root_bootstrap::RenewalOutcome::NotCustodian);
+    };
+    fleet_custody::prompt_unexported_renewal()?;
+    let mut state = root_bootstrap::load()?;
+    let custody = fleet_custody::load()?;
+    let signer = c.signing_key()?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed()?);
+    let me = recipient(c)?;
+    let fleet_hex = sync_cmd::fleet_id(c);
+    let now = root_bootstrap::now_ms();
+    let device = root_bootstrap::RenewingDevice {
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+    };
+    let fleet_key = |generation: u64| {
+        verified_fleet_key(&fleet_hex, &pin, &me, generation, now)?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
+    };
+    let (device_sk, _) = shardx_core::grants::derive_keypair(&seed);
+    let collect = async |generation: u64| {
+        let kept = collect_fleet_grant(client, c, access, &device_sk, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        match setup_collect_error(kept, generation) {
+            Some(e) => Err(anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
+    };
+    let device_grant = root_bootstrap::own_device_grant(&state);
+    let outcome = root_bootstrap::renew(
+        client,
+        access,
+        &device,
+        &custody,
+        device_grant.as_deref(),
+        now,
+        fleet_key,
+        collect,
+        &mut state,
+        &mut |s| root_bootstrap::save(s),
+    )
+    .await?;
+    fleet_custody::prompt_unexported_renewal()?;
+    Ok(outcome)
+}
+
+/// Logs a renewal step that did something, or failed, by its error code.
+fn log_renewal(outcome: &anyhow::Result<root_bootstrap::RenewalOutcome>) {
+    match outcome {
+        Ok(
+            o @ (root_bootstrap::RenewalOutcome::Renewed | root_bootstrap::RenewalOutcome::Busy),
+        ) => {
+            eprintln!("[renewal] {o:?}")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "[renewal] failed {}",
+            recovery_import::error_code(&e.to_string())
+        ),
+    }
+}
+
+/// D9: the renewal step a custodian command runs first, under its custody
+/// lock. A lapse stops the command; any other renewal error is logged, and
+/// the next command or sync tries again.
+async fn renew_first(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+) -> Result<(), String> {
+    renewal_gate(renew_custody(client, c, access).await)
+}
+
+/// [`renew_first`]'s rule: only a lapse stops the command.
+fn renewal_gate(outcome: anyhow::Result<root_bootstrap::RenewalOutcome>) -> Result<(), String> {
+    if let Err(e) = &outcome {
+        if crate::errcode::has_code(&e.to_string(), "fleet.custodyLapsed") {
+            return Err(e.to_string());
+        }
+    }
+    log_renewal(&outcome);
+    Ok(())
+}
+
+/// D9 after a published sync or an export: the renewal step, best effort,
+/// skipped while another custody command holds the lock. The outcome is
+/// logged; callers never let it change their own result.
+pub(crate) async fn renew_quietly(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+) -> anyhow::Result<root_bootstrap::RenewalOutcome> {
+    let outcome = match fleet_custody::begin() {
+        Ok(_running) => renew_custody(client, c, access).await,
+        Err(_) => Ok(root_bootstrap::RenewalOutcome::Busy),
+    };
+    log_renewal(&outcome);
+    outcome
+}
+
+/// Renew custody (v2.10 4.R, the Team page's action): the root custodian's
+/// renewal step now. A renewal in progress resumes; otherwise only a due
+/// one runs. The password is used for one login and never stored.
+#[tauri::command]
+async fn team_renew_custody(
+    username: String,
+    password: String,
+) -> Result<root_bootstrap::RenewalOutcome, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let renewed = renew_custody(&client, &c, access).await;
+    client.end_session(access).await;
+    log_renewal(&renewed);
+    renewed.map_err(|e| {
+        let text = e.to_string();
+        if crate::errcode::has_code(&text, "fleet.custodyLapsed") {
+            text
+        } else {
+            crate::errcode::code_with(
+                "fleet.custodyRenewalFailed",
+                &[("code", recovery_import::error_code(&text))],
+            )
+        }
+    })
 }
 
 /// Collect key custody's fleet step for a published sync the server refused
@@ -4171,6 +4328,25 @@ mod custody_tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// D9: a custodian command stops on a lapse only; any other renewal
+    /// error is logged and the command goes on.
+    #[test]
+    fn renew_first_stops_only_on_a_lapse() {
+        use root_bootstrap::RenewalOutcome;
+        let failed = anyhow::anyhow!(crate::errcode::code_with(
+            "fleet.refusedCustody",
+            &[("status", "500")]
+        ));
+        assert_eq!(renewal_gate(Err(failed)), Ok(()));
+        assert_eq!(renewal_gate(Ok(RenewalOutcome::Renewed)), Ok(()));
+        let lapsed = anyhow::anyhow!(crate::errcode::code("fleet.custodyLapsed"));
+        let err = renewal_gate(Err(lapsed)).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.custodyLapsed"),
+            "{err}"
+        );
     }
 
     /// A collect that fails after an import says the import is done, and
@@ -8189,6 +8365,7 @@ pub fn run() {
             team_fleet_key_setup,
             team_fleet_key_rotate,
             team_reseal_all,
+            team_renew_custody,
             team_devices,
             team_approve_device,
             team_revoke_device,
