@@ -129,6 +129,30 @@ export type FleetCustodyStatus = {
   export_reason: "rotation" | "renewal";
   /** The latest Re-seal all profiles run, if any. */
   reseal: ResealRun | null;
+  /** The device this root custodian appointed as the new one (v2.10 hand-over); empty if none. */
+  handed_over_to: string;
+  /** The hand-over this device accepted as the new root custodian, if any. */
+  handover: HandoverStatus | null;
+};
+
+/** How far an accepted root custody hand-over got; no record of it. */
+export type HandoverStatus = {
+  /** The outgoing root custodian's signing key ID. */
+  outgoing: string;
+  /** The active fleet generation when the hand-over was accepted. */
+  accepted_generation: number;
+  /** `accepting`, `accepted`, `granted` (Accept finished) or `done` (the old root revoked). */
+  phase: string;
+  /** Checklist step 0: a recovery bundle was exported after Accept. */
+  first_exported: boolean;
+  /** Step 1: the generation this device's rotation activated. */
+  rotated_generation: number;
+  /** Step 2: the generation a finished re-seal ran for. */
+  resealed_generation: number;
+  /** Step 3: the newest generation the bundle exported after the re-seal holds. */
+  exported_generation: number;
+  /** The `lost` path's reverts per remote profile: `pending`, `reverted:<version>` or `error:<code>`. */
+  reverts: Record<string, string>;
 };
 
 /** One Re-seal all profiles run; no secret. */

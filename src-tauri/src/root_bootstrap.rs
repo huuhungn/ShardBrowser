@@ -1112,6 +1112,7 @@ pub async fn export_again(
     fkeks: Vec<(u64, Zeroizing<[u8; 32]>)>,
     recovery: &RecoveryExport<'_>,
 ) -> Result<String> {
+    crate::fleet_custody::refuse_handed_over(&crate::fleet_custody::load()?)?;
     let state = load()?;
     let (grant, container, issuer) = current_root_grant(&state, signer)?;
     let exported = root_grant_sha256(&state);
@@ -1297,7 +1298,7 @@ pub fn save(state: &BootstrapState) -> Result<()> {
 /// (ADR 0002 D-6; the server refuses anything longer), so members offline
 /// for months still see a custodian; capability and device grants run a
 /// year.
-const RENEWED_VALIDITY_MS: u64 = 730 * DAY_MS;
+pub(crate) const RENEWED_VALIDITY_MS: u64 = 730 * DAY_MS;
 const _: () =
     assert!(RENEWED_VALIDITY_MS == shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS);
 
@@ -1819,7 +1820,7 @@ pub(crate) async fn renew(
     state: &mut BootstrapState,
     save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<RenewalOutcome> {
-    if !custody.handed_over_to.is_empty() {
+    if crate::fleet_custody::refuse_handed_over(custody).is_err() {
         return Ok(RenewalOutcome::HandedOver);
     }
     let resuming = state.renewal.as_ref().is_some_and(|r| !r.done);

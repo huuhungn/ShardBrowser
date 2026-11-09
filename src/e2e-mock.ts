@@ -1,7 +1,7 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type {
-  TeamFleetProfile, TeamProfileStatus, TeamProfilesStatus,
+  TeamFleetProfile, TeamProfileStatus, TeamProfilesStatus, HandoverStatus,
 } from "./entities/team/model/types";
 
 type Profile = {
@@ -297,11 +297,16 @@ let teamConnection = teamDevice
 // This team device's own identity, pin and fleet key, as its team_config,
 // trust ledger and fleet key store hold them. A is the root custodian.
 type TeamMe = { device_id: string; enrolled_at_ms: number; pinned: boolean; collected: boolean };
+// `teamHandover=appointed`: on A, it appointed B ("b1"x16) as the new root
+// custodian (v2.10 hand-over); on B, B is that device, enrolled and joined.
+const teamHandover = params.get("teamHandover");
 let teamMe: TeamMe = teamDevice === "a"
   ? { device_id: "aa".repeat(16), enrolled_at_ms: 0, pinned: true, collected: false }
   : teamSeeds
     ? { device_id: "b0".repeat(16), enrolled_at_ms: 0, pinned: true, collected: true }
-    : { device_id: "", enrolled_at_ms: 0, pinned: false, collected: false };
+    : teamHandover === "appointed"
+      ? { device_id: "b1".repeat(16), enrolled_at_ms: 0, pinned: true, collected: true }
+      : { device_id: "", enrolled_at_ms: 0, pinned: false, collected: false };
 const teamStatusFixture = () => (firstDevice
   ? {
     server_url: "https://team.example.com",
@@ -400,10 +405,19 @@ let fleetCustody: {
   started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
   rotation_required: "urgent" | "routine" | null; export_due: boolean; export_reason: "rotation" | "renewal";
   reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
+  handed_over_to: string; handover: HandoverStatus | null;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
-  export_due: false, export_reason: "rotation", reseal: null,
+  export_due: false, export_reason: "rotation", reseal: null, handed_over_to: "", handover: null,
 };
+// The fleet generation A was at when it appointed B: its cancel is refused once the server is past it.
+let teamHandedOverGeneration = 0;
+if (teamDevice === "a" && teamHandover === "appointed") {
+  fleetCustody = {
+    ...fleetCustody, started: true, created: true, fkek_key_id: "fk".repeat(32), handed_over_to: "b1".repeat(16),
+  };
+  teamMe.collected = true;
+}
 // The highest fleet key generation this device kept.
 let teamGeneration = 0;
 // The member whose grant failed in the latest runs of an activated rotation, and in how many in a row.
@@ -459,6 +473,11 @@ const teamWindowOpen = () => {
   if (!teamMe.enrolled_at_ms || Date.now() > teamMe.enrolled_at_ms + TEAM_WINDOW_MS) teamRefuse("fleet.joinCodeExpired");
 };
 const teamCustodian = () => { if (!custodyBootstrap.activated) teamRefuse("fleet.notCustodian"); };
+/** As the launcher: a root custodian that appointed another device runs no custody command of its own. */
+const teamNotHandedOver = () => { if (fleetCustody.handed_over_to) teamRefuse("fleet.custodyHandedOver"); };
+/** 4.H step 7's refusal, naming the missing checklist `step` and the blocking `profiles`. */
+const teamNotReady = (step: string, profiles: string[] = []): never =>
+  teamRefuse(`fleet.handoverNotReady|step=${step}|profiles=${profiles.join(", ")}`);
 /**
  * Collect key custody's fleet grant: kept only once this device pins the
  * anchor to verify it against, and only one generation above the newest it
@@ -484,7 +503,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
   const args = (payload ?? {}) as {
     profileId?: string; remoteProfileId?: string; localProfileId?: string; deviceId?: string; sas?: string;
     reason?: string; anchor?: string; label?: string; path?: string; oldDeviceLost?: boolean;
-    skipMember?: string | null;
+    skipMember?: string | null; asCustodian?: boolean; acceptReverts?: string[] | null;
   };
   const id = String(args.profileId ?? args.localProfileId ?? "");
   const head = () => ({
@@ -525,9 +544,11 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     }
     case "team_approve_device": {
       teamCustodian();
+      const target = String(args.deviceId);
+      // As the launcher: after an appointment only that appointment resumes.
+      if (!(args.asCustodian && fleetCustody.handed_over_to === target)) teamNotHandedOver();
       // As the launcher: no saved Create fleet key, no approval.
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
-      const target = String(args.deviceId);
       const first = teamFirstSeen.get(target);
       if (first === undefined || Date.now() - first > TEAM_WINDOW_MS) teamRefuse("fleet.approvalWindowClosed");
       if (args.sas !== teamSas(target)) teamRefuse("fleet.joinCodeMismatch");
@@ -535,8 +556,32 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       if (fleetCustody.rotation?.phase === "preparing" || fleetCustody.rotation?.phase === "activated") {
         teamRefuse("fleet.rotationInProgress");
       }
-      await teamServer("approve", { ...me, target });
+      // Appoint (4.H step 1): the server refuses it while a head is under an older generation.
+      await teamServer("approve", { ...me, target, custodian: !!args.asCustodian });
+      if (args.asCustodian) {
+        fleetCustody = { ...fleetCustody, handed_over_to: target };
+        teamHandedOverGeneration = teamGeneration;
+      }
       return null;
+    }
+    case "team_custody_accept": {
+      // As the launcher: Accept needs the pinned anchor, then a root grant naming this device.
+      if (!teamMe.pinned) teamRefuse("fleet.handoverNoGrant");
+      const { outgoing, generation } = await teamServer<{ outgoing: string; generation: number }>("accept", me);
+      custodyBootstrap = {
+        started: true, this_device: true, activated: true, recovery_path: "", anchor: TEAM_ANCHOR,
+        root_key_id: TEAM_ROOT_KEY_ID, ...renewalTimes(Date.now()),
+      };
+      fleetCustody = {
+        ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32),
+        handover: {
+          outgoing, accepted_generation: generation, phase: "granted", first_exported: false, rotated_generation: 0,
+          resealed_generation: 0, exported_generation: 0, reverts: {},
+        },
+      };
+      teamMe.collected = true;
+      teamGeneration = generation;
+      return fleetCustody;
     }
     case "team_revoke_device":
       teamCustodian();
@@ -544,6 +589,42 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       if (args.deviceId === teamMe.device_id) teamRefuse("fleet.cannotRevokeSelf");
       // As the launcher: no saved Create fleet key, no revoke.
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
+      // As the launcher (D13): after an appointment only the appointee is revoked, which cancels the
+      // hand-over, and only until the server is past the appointment's generation.
+      if (fleetCustody.handed_over_to) {
+        if (args.deviceId !== fleetCustody.handed_over_to) teamRefuse("fleet.custodyHandedOver");
+        if (await teamServer<number>("generation", me) > teamHandedOverGeneration) teamRefuse("fleet.handoverPastRotation");
+        await teamServer("revoke", { ...me, target: args.deviceId });
+        fleetCustody = { ...fleetCustody, handed_over_to: "" };
+        return null;
+      }
+      {
+        const h = fleetCustody.handover;
+        const rows = await teamServer<{ device_id: string }[]>("devices", me);
+        const row = rows.find((r) => r.device_id === args.deviceId);
+        if (h && row && teamKeyIds(row.device_id).signing_key_id === h.outgoing) {
+          // 4.H step 7: the old root is revoked behind its checklist and the live heads.
+          if (args.reason === "compromised") teamRefuse("fleet.revokeOutgoingReason");
+          const active = await teamServer<number>("generation", me);
+          if (h.phase !== "granted" && h.phase !== "done") teamNotReady("accept");
+          if (!h.first_exported) teamNotReady("export");
+          if (h.rotated_generation !== active || active <= h.accepted_generation) teamNotReady("rotate");
+          if (h.resealed_generation !== active) teamNotReady("reseal");
+          if (h.exported_generation !== active) teamNotReady("export-again");
+          const blockers = await teamServer<{ profile: string; after_reseal: boolean }[]>("blockers", me);
+          const listed = blockers.map((b) => b.profile).sort();
+          const accepted = (args.acceptReverts ?? []).map((p) => p.toLowerCase()).sort();
+          const ready = args.reason === "retired"
+            ? !blockers.length
+            : blockers.every((b) => b.after_reseal) && accepted.join() === listed.join();
+          if (!ready) teamNotReady("heads", listed);
+          await teamServer("revoke", { ...me, target: args.deviceId });
+          const reverts: Record<string, string> = {};
+          for (const p of listed) reverts[p] = `reverted:${await teamServer<number>("undo", { remote_profile_id: p })}`;
+          fleetCustody = { ...fleetCustody, handover: { ...h, phase: "done", reverts } };
+          return null;
+        }
+      }
       // As the launcher (Q-57): fresh evidence counting the row as a custodian refuses `compromised`.
       if (args.reason === "compromised") {
         const rows = await teamServer<{ device_id: string; custodian: boolean }[]>("devices", me);
@@ -559,7 +640,10 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       return null;
     case "team_fleet_key_rotate": {
       teamCustodian();
+      teamNotHandedOver();
       if (!fleetCustody.created) teamRefuse("fleet.notCustodian");
+      // As the launcher (4.H steps 2-3): the new custodian rotates once it exported a bundle after Accept.
+      if (fleetCustody.handover && !fleetCustody.handover.first_exported) teamNotReady("export");
       if (fleetCustody.rotation?.phase === "expired") teamRefuse("fleet.rotationStuck");
       if (!teamMe.collected) teamRefuse("fleet.rotationNeedsFleetKey");
       const skip = args.skipMember ?? null;
@@ -588,12 +672,14 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         rotation_required: null,
         export_due: true,
         export_reason: "rotation",
+        handover: fleetCustody.handover && { ...fleetCustody.handover, rotated_generation: r.generation },
       };
       return fleetCustody;
     }
     case "team_reseal_all": {
       // As the launcher: only an activated root custodian holding the active key re-seals.
       if (!custodyBootstrap.activated) teamRefuse("sync.resealNotCustodian");
+      teamNotHandedOver();
       if (!teamMe.collected) teamRefuse("sync.noVerifiedFleetKey");
       const r = await teamServer<{ generation: number; profiles: Record<string, string> }>("reseal", me);
       for (const b of teamProfiles.profiles) {
@@ -608,6 +694,8 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       fleetCustody = {
         ...fleetCustody,
         reseal: { generation: r.generation, started_ms: Date.now(), ended_ms: Date.now(), profiles: r.profiles },
+        // 4.H step 5: a finished run (the mock leaves none pending) records its generation.
+        handover: fleetCustody.handover && { ...fleetCustody.handover, resealed_generation: r.generation },
       };
       return fleetCustody;
     }
@@ -672,19 +760,28 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     case "team_renew_custody": {
       // As the launcher: only a due root custodian renews, then asks for the bundle again.
       teamCustodian();
+      if (fleetCustody.handed_over_to) return "handed_over";
       await teamServer("live", me);
       if ((custodyBootstrap.renewal_due_ms ?? Infinity) > Date.now()) return "not_due";
       custodyBootstrap = { ...custodyBootstrap, ...renewalTimes(Date.now()) };
       fleetCustody = { ...fleetCustody, export_due: true, export_reason: "renewal" };
       return "renewed";
     }
-    case "team_export_recovery_bundle":
+    case "team_export_recovery_bundle": {
       teamCustodian();
+      teamNotHandedOver();
       await teamServer("live", me);
       if (!teamMe.collected) teamRefuse("fleet.recoveryExportNeedsFleetKey");
       document.documentElement.dataset.e2eExportPath = String(args.path ?? "");
-      fleetCustody = { ...fleetCustody, export_due: false, export_reason: "rotation" };
+      // 4.H steps 3 and 6: the first bundle after Accept, then one holding the re-sealed generation.
+      const h = fleetCustody.handover;
+      const handover = !h || (h.phase !== "granted" && h.phase !== "done") ? h
+        : !h.first_exported ? { ...h, first_exported: true }
+        : h.rotated_generation > h.accepted_generation && h.resealed_generation === h.rotated_generation
+          ? { ...h, exported_generation: teamGeneration } : h;
+      fleetCustody = { ...fleetCustody, export_due: false, export_reason: "rotation", handover };
       return null;
+    }
     case "team_collect_custody": {
       const { granted, generation, missed, kept } = await teamCollect();
       return {

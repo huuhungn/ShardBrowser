@@ -893,6 +893,7 @@ fn shared_profile_at(base: u16, slot: u16, slug: &str, rt: &tokio::runtime::Runt
             PASSWORD.into(),
             b_id.clone(),
             code.sas.clone(),
+            None,
         ),
     )
     .unwrap();
@@ -1098,6 +1099,7 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
             PASSWORD.into(),
             b_id.clone(),
             "retired".into(),
+            None,
         ),
     )
     .unwrap();
@@ -1321,7 +1323,7 @@ fn the_journey_writes_one_audit_row_per_mutation() {
     let Journey { h, b_id, .. } = shared_profile(4, "cs5-audit", &rt);
     call(
         &rt,
-        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into()),
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into(), None),
     )
     .unwrap();
     let counts: Vec<(&str, i64)> = [
@@ -1416,7 +1418,7 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
     call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
     call(
         &rt,
-        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id.clone(), code.sas),
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id.clone(), code.sas, None),
     )
     .unwrap();
     call(
@@ -1426,6 +1428,7 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
             PASSWORD.into(),
             c_id.clone(),
             "retired".into(),
+            None,
         ),
     )
     .unwrap();
@@ -1904,7 +1907,7 @@ fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_
     assert_eq!(row.sas, code.sas);
     call(
         &rt,
-        crate::team_approve_device(OWNER.into(), PASSWORD.into(), d_id, code.sas.clone()),
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), d_id, code.sas.clone(), None),
     )
     .unwrap();
     act_as(d.config.path(), d.data.path(), "d");
@@ -1990,7 +1993,13 @@ fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_
     let revoked_before = revokes();
     call(
         &rt,
-        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id.clone(), "lost".into()),
+        crate::team_revoke_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            "lost".into(),
+            None,
+        ),
     )
     .unwrap();
     assert_eq!(revokes(), revoked_before + 1);
@@ -2163,7 +2172,13 @@ fn a_reset_member_rejoins(slot: u16, slug: &str, unavailable: bool) {
     h.act_as_a();
     call(
         &rt,
-        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id.clone(), "lost".into()),
+        crate::team_revoke_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            "lost".into(),
+            None,
+        ),
     )
     .unwrap();
 
@@ -2214,6 +2229,7 @@ fn a_reset_member_rejoins(slot: u16, slug: &str, unavailable: bool) {
             PASSWORD.into(),
             new_id.clone(),
             code.sas.clone(),
+            None,
         ),
     )
     .unwrap();
@@ -2559,8 +2575,8 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         .collect();
     assert_eq!(
         secrets.len(),
-        9,
-        "both FKEKs, the TRK, two HPKE private keys and both devices' four seeds"
+        13,
+        "three FKEKs, the TRK, three HPKE private keys and three devices' six seeds"
     );
     secrets.push(PASSWORD.into());
     secrets.push(PASSPHRASE.into());
@@ -2586,6 +2602,9 @@ fn the_journey_leaks_no_secret_to_output_state_or_replies() {
         "c-team.json",
         "c-fleet-custody.json",
         "c-custody-bootstrap.json",
+        "e-team.json",
+        "e-fleet-custody.json",
+        "e-custody-bootstrap.json",
     ] {
         assert!(
             names.contains(&expected),
@@ -2646,20 +2665,38 @@ fn keep_state(dir: &std::path::Path, device: &str) {
     }
 }
 
-/// The journey the leak scan watches: the S3 journey, A's revoke of B, A's
-/// rotation of the fleet key, A's re-seal and renewal, A's export of its recovery bundle again, B's refused collect and a fresh
-/// device's import of that bundle. Each reply and each device's state files go to the
-/// scan directory; the secrets to look for go to the side file.
+/// The journey the leak scan watches: the S3 journey, A's push over B's
+/// version, A's revoke of B, A's rotation of the fleet key, A's re-seal and
+/// renewal, A's export of its recovery bundle again, B's refused collect, a
+/// fresh device C's import of that bundle, and C's hand-over of root custody
+/// to E (v2.10 U6): Appoint, Accept, both v4 exports, E's rotation and
+/// re-seal, and E's revoke of C. Each reply and each device's state files go
+/// to the scan directory; the secrets to look for go to the side file.
 #[test]
 #[ignore = "a worker of the_journey_leaks_no_secret_to_output_state_or_replies"]
 fn the_journey_leak_scan_worker() {
     let dir = std::path::PathBuf::from(std::env::var_os(SCAN_DIR).expect("run by the leak scan"));
     let secrets = std::env::var_os(SECRETS_FILE).expect("run by the leak scan");
     let rt = runtime();
-    let Journey { b, h, b_id, .. } = shared_profile(5, "cs5-leak", &rt);
+    let Journey {
+        b,
+        h,
+        b_id,
+        a_profile,
+        ..
+    } = shared_profile(5, "cs5-leak", &rt);
+    // v2.10 U6: the shared head is A's, so it can be re-sealed below.
+    let udd = crate::profile::user_data_dir(&a_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{}{}").unwrap();
+    let (user, pass) = account();
     call(
         &rt,
-        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into()),
+        crate::sync_cmd::profile_sync_push(a_profile, String::new(), 2, user, pass),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), b_id, "retired".into(), None),
     )
     .unwrap();
     call(
@@ -2667,12 +2704,11 @@ fn the_journey_leak_scan_worker() {
         crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
     )
     .unwrap();
-    // v2.10 U3: a re-seal run; the shared head, signed by the revoked B, is
-    // listed as quarantined.
+    // v2.10 U3: a re-seal run moves the shared head A signed.
     let resealed = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
     assert!(resealed
         .reseal
-        .is_some_and(|r| r.profiles.values().all(|o| o == "skipped:quarantined")));
+        .is_some_and(|r| r.profiles.values().all(|o| o == "resealed:4")));
     // v2.10 U5: a renewal, forced due (the journey's records are all new).
     crate::root_bootstrap::tests::RENEWAL_DUE.with(|d| d.set(true));
     let renewed = call(
@@ -2723,9 +2759,70 @@ fn the_journey_leak_scan_worker() {
     keep_state(&dir, "b");
 
     // A fresh device C imports A's bundle under its passphrase.
-    let _c = fresh_device("c", h.server.url(), h.tenant.clone());
+    let c_dev = fresh_device("c", h.server.url(), h.tenant.clone());
     import(&rt, &bundle).unwrap();
+    let c_id = crate::team_config::load().unwrap().device_id;
     keep_state(&dir, "c");
+
+    // v2.10 U6: C hands root custody to E, which revokes C at the end.
+    let e = fresh_device("e", h.server.url(), h.tenant.clone());
+    let e_id = call(
+        &rt,
+        crate::team_enroll_device("next".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    act_as(c_dev.config.path(), c_dev.data.path(), "c");
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            e_id,
+            code.sas.clone(),
+            Some(true),
+        ),
+    )
+    .unwrap();
+    keep_state(&dir, "c");
+    act_as(e.config.path(), e.data.path(), "e");
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_custody_accept(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    export(&rt, &config_path("e1.shardx-recovery")).unwrap();
+    call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap();
+    call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    export(&rt, &config_path("e2.shardx-recovery")).unwrap();
+    call(
+        &rt,
+        crate::team_revoke_device(OWNER.into(), PASSWORD.into(), c_id, "retired".into(), None),
+    )
+    .unwrap();
+    let e_config = crate::team_config::load().unwrap();
+    let e_signing_seed = e_config.signing_key().unwrap().to_bytes();
+    let e_hpke_seed = e_config.hpke_seed().unwrap();
+    let (e_sk, _) = shardx_core::grants::derive_keypair(&e_hpke_seed);
+    let rotated_again = crate::credential::load(&format!("fleet-key.{}.2", h.tenant)).unwrap();
+    keep_state(&dir, "e");
     std::fs::write(
         secrets,
         [
@@ -2738,6 +2835,10 @@ fn the_journey_leak_scan_worker() {
             hex(&a_hpke_seed),
             hex(&b_signing_seed),
             hex(&b_hpke_seed),
+            hex(&*rotated_again),
+            hex(&e_sk),
+            hex(&e_signing_seed),
+            hex(&e_hpke_seed),
         ]
         .join("\n"),
     )
@@ -3191,6 +3292,7 @@ fn members_stay_trusted_by_a_device_that_joins_after_a_custodian_revocation_agai
             &code.sas,
             |_| Ok(zeroize::Zeroizing::new(b_fkek)),
             |_| Ok(false),
+            None,
             crate::root_bootstrap::now_ms(),
             &mut state,
             &mut |_| Ok(()),
@@ -3411,7 +3513,7 @@ fn reseal_all_moves_every_head_and_a_new_device_reads_them_against_a_real_server
     call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
     call(
         &rt,
-        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id, code.sas.clone()),
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id, code.sas.clone(), None),
     )
     .unwrap();
     act_as(c_dev.config.path(), c_dev.data.path(), "c");
@@ -3601,6 +3703,7 @@ fn the_root_custodian_renews_itself_and_keeps_custody_against_a_real_server() {
             PASSWORD.into(),
             b_id.clone(),
             code.sas.clone(),
+            None,
         ),
     )
     .unwrap();
@@ -3652,4 +3755,455 @@ fn the_root_custodian_renews_itself_and_keeps_custody_against_a_real_server() {
     let rows = call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
     assert!(rows.iter().any(|r| r.device_id == b_id));
     assert_eq!(counts()[1], renewed[1], "no second renewal");
+}
+
+/// v2.10 U6 (4.H, branch A), port slot 4: root custodian A hands custody to
+/// a new device B in the enforced order, through the commands the UI calls.
+/// M, a member offline from step 1 to step 9, and D, approved by B after
+/// A's revocation, keep reading every profile; bundle 1 restores B holding
+/// only N and collects B's own N+1 grant; bundle 2 restores B on C, which
+/// rotates and grants M and D.
+#[test]
+fn root_custody_moves_to_a_new_device_and_the_team_keeps_every_profile_against_a_real_server() {
+    fn refused<T: std::fmt::Debug>(reply: Result<T, String>, code: &str) {
+        let err = reply.unwrap_err();
+        assert!(err.contains(code), "{code}: {err}");
+    }
+    let started = std::time::Instant::now();
+    let rt = runtime();
+    let Journey {
+        b: m,
+        h,
+        b_id: m_id,
+        a_profile,
+        b_profile: m_x,
+        profile_id: x_id,
+    } = shared_profile_at(V210_PORT_BASE, 4, "u6-handover", &rt);
+    let (user, pass) = account();
+    let push = |local: &str, base: i64| {
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_push(
+                local.into(),
+                String::new(),
+                base,
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+    };
+    let pull = |local: &str| {
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_pull(
+                local.into(),
+                String::new(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+    };
+    let publish = |name: &str, seed: u32| {
+        let local = local_profile(name, seed);
+        let published = call(
+            &rt,
+            crate::sync_cmd::profile_sync_publish(
+                local.clone(),
+                Some(name.into()),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(push(&local, 0).unwrap().version, 1);
+        (local, published.profile_id)
+    };
+    let join = |remote: &str, name: &str, seed: u32| {
+        let local = local_profile(name, seed);
+        std::fs::remove_dir_all(crate::profile::user_data_dir(&local).unwrap()).unwrap();
+        call(
+            &rt,
+            crate::sync_cmd::team_join_profile(
+                remote.into(),
+                local.clone(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        local
+    };
+    let rotate = || {
+        call(
+            &rt,
+            crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+        )
+    };
+    let revoke = |id: &str| {
+        call(
+            &rt,
+            crate::team_revoke_device(
+                OWNER.into(),
+                PASSWORD.into(),
+                id.into(),
+                "retired".into(),
+                None,
+            ),
+        )
+    };
+    let enroll = |label: &str| {
+        let id = call(
+            &rt,
+            crate::team_enroll_device(label.into(), OWNER.into(), PASSWORD.into()),
+        )
+        .unwrap()
+        .device_id;
+        let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+        (id, code)
+    };
+    let collect = || {
+        call(
+            &rt,
+            crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+        )
+        .unwrap();
+        crate::fleet_keys::load()
+            .unwrap()
+            .active_key(&h.tenant)
+            .map(|(_, g)| g)
+    };
+    let head_of = |id: &str| {
+        h.server.count(&format!(
+            "SELECT current_version FROM v2_profiles WHERE lower(hex(id)) = '{id}'"
+        ))
+    };
+    let generation_of = |id: &str| {
+        h.server.count(&format!(
+            "SELECT s.key_generation FROM v2_snapshots s
+               JOIN v2_profiles p ON p.tenant_id = s.tenant_id AND p.id = s.profile_id
+                AND p.current_version = s.version
+              WHERE lower(hex(p.id)) = '{id}'"
+        ))
+    };
+    let signer_of = |id: &str| {
+        use sqlx::Row;
+        h.server
+            .row(&format!(
+                "SELECT lower(hex(s.signing_key_id)) FROM v2_snapshots s
+                   JOIN v2_profiles p ON p.tenant_id = s.tenant_id AND p.id = s.profile_id
+                    AND p.current_version = s.version
+                  WHERE lower(hex(p.id)) = '{id}'"
+            ))
+            .get::<String, _>(0)
+    };
+    let key_of = || {
+        hex(&crate::recipient(&crate::team_config::load().unwrap())
+            .unwrap()
+            .signing_key_id)
+    };
+    let grants_of = |id: &str, generation: u64| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{id}' AND generation = {generation}"
+        ))
+    };
+
+    // 1. M publishes Y and A publishes W under generation 0; A rotates to
+    // N = 1 and pushes X twice above M's pin; A exports a v3 bundle; M
+    // collects N.
+    m.act_as_b();
+    let (y_m, y_id) = publish("Y", 11);
+    let y_files = files(&y_m);
+    h.act_as_a();
+    let a_id = crate::team_config::load().unwrap().device_id;
+    let (w_a, w_id) = publish("W", 12);
+    let w_files = files(&w_a);
+    rotate().unwrap();
+    let udd = crate::profile::user_data_dir(&a_profile).unwrap();
+    for base in [2, 3] {
+        std::fs::write(udd.join("Preferences"), format!("{{\"from\":\"a{base}\"}}")).unwrap();
+        assert_eq!(push(&a_profile, base).unwrap().version, base + 1);
+    }
+    let x_files = files(&a_profile);
+    let bundle0 = config_path("u6-v3.shardx-recovery");
+    export(&rt, &bundle0).unwrap();
+    // M collects N, then goes offline until step 9.
+    m.act_as_b();
+    assert_eq!(collect(), Some(1));
+
+    // 2. B enrolls; A's Appoint waits for the re-seal of W and Y; A
+    // re-seals, then appoints B, its save failing once after the root grant
+    // is filed; the resumed Appoint files nothing twice.
+    let b = fresh_device("n", h.server.url(), h.tenant.clone());
+    let (b_id, code) = enroll("next");
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    let appoint = || {
+        call(
+            &rt,
+            crate::team_approve_device(
+                OWNER.into(),
+                PASSWORD.into(),
+                b_id.clone(),
+                code.sas.clone(),
+                Some(true),
+            ),
+        )
+    };
+    refused(appoint(), "fleet.handoverNeedsReseal");
+    let run = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into()))
+        .unwrap()
+        .reseal
+        .unwrap();
+    assert_eq!(
+        (
+            run.profiles[&x_id].as_str(),
+            run.profiles[&y_id].as_str(),
+            run.profiles[&w_id].as_str()
+        ),
+        ("current", "resealed:2", "resealed:2")
+    );
+    let c = crate::team_config::load().unwrap();
+    let pin = crate::bootstrap_anchor(&c).unwrap();
+    let me = crate::recipient(&c).unwrap();
+    let root = crate::root_bootstrap::load().unwrap();
+    let signer = c.signing_key().unwrap();
+    let seed = c.hpke_seed().unwrap();
+    let err = with_session(&rt, &h, async |client, access| {
+        let rows = client
+            .list_tenant_devices(access, &c.tenant_id)
+            .await
+            .unwrap();
+        let row = rows.iter().find(|r| r.device_id == b_id).unwrap();
+        let device = crate::fleet_custody::FleetDevice {
+            tenant_id: &c.tenant_id,
+            device_id: &c.device_id,
+            account_id: &c.account_id,
+            signer: &signer,
+            hpke_seed: &seed,
+            vault: &crate::fleet_custody::CredentialFkekStore,
+        };
+        let now = crate::root_bootstrap::now_ms();
+        let fleet_hex = crate::sync_cmd::fleet_id(&c);
+        let mut state = crate::fleet_custody::load().unwrap();
+        let mut failed = false;
+        crate::fleet_custody::approve_member(
+            client,
+            access,
+            &device,
+            &pin,
+            row,
+            &code.sas,
+            |g| Ok(crate::verified_fleet_key(&fleet_hex, &pin, &me, g, now)?.expect("N")),
+            |_| Ok(false),
+            Some(&root),
+            now,
+            &mut state,
+            &mut |s| {
+                if !failed && !s.handed_over_to.is_empty() {
+                    failed = true;
+                    anyhow::bail!("save failed");
+                }
+                crate::fleet_custody::save(s)
+            },
+        )
+        .await
+        .unwrap_err()
+    });
+    assert_eq!(err.to_string(), "save failed");
+    assert!(crate::fleet_custody::load()
+        .unwrap()
+        .handed_over_to
+        .is_empty());
+    appoint().unwrap();
+    assert_eq!(crate::fleet_custody::load().unwrap().handed_over_to, b_id);
+    let of_b = |table: &str, extra: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM {table} WHERE lower(hex(subject_device_id)) = '{b_id}' {extra}"
+        ))
+    };
+    assert_eq!(
+        of_b("v2_device_approvals", "AND approval_scope_kind = 'tenant'"),
+        1
+    );
+    assert_eq!(of_b("v2_tenant_root_key_grants", ""), 1, "filed once");
+    assert_eq!(grants_of(&b_id, 1), 1);
+
+    // 3. B pins A0 and accepts: a crash between the root grant's ack and
+    // the root state write, then the resumed Accept.
+    act_as(b.config.path(), b.data.path(), "n");
+    call(
+        &rt,
+        crate::team_join_confirm(
+            OWNER.into(),
+            PASSWORD.into(),
+            code.anchor.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+    let bc = crate::team_config::load().unwrap();
+    let b_key = key_of();
+    let crashed = with_session(&rt, &h, async |client, access| {
+        crate::custody_accept(
+            client,
+            &bc,
+            access,
+            &bc.signing_key().unwrap(),
+            &bc.hpke_seed().unwrap(),
+            &crate::recipient(&bc).unwrap(),
+            &crate::pinned_anchor(&bc).unwrap(),
+            &mut |_| anyhow::bail!("crash"),
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(crashed.contains("crash"), "{crashed}");
+    assert!(!crate::root_bootstrap::load().unwrap().activated);
+    let status = call(
+        &rt,
+        crate::team_custody_accept(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(status.handover.unwrap().phase, "granted");
+    assert!(crate::root_bootstrap::load().unwrap().activated);
+    assert_eq!(of_b("v2_capability_grants", ""), 6, "B's own six");
+    assert_eq!(grants_of(&b_id, 1), 2, "A's grant of N and B's own");
+    assert_eq!(
+        of_b(
+            "v2_fleet_device_hpke_grants",
+            "AND generation = 1 AND acked_at IS NOT NULL"
+        ),
+        2
+    );
+
+    // 4. B's Rotate waits for its first v4 export; A cannot rotate.
+    refused(rotate(), "step=export");
+    let bundle1 = config_path("u6-b1.shardx-recovery");
+    export(&rt, &bundle1).unwrap();
+    h.act_as_a();
+    refused(rotate(), "fleet.custodyHandedOver");
+
+    // 5. B rotates to N + 1: M gets a grant of it, A none; A can no longer
+    // cancel.
+    act_as(b.config.path(), b.data.path(), "n");
+    rotate().unwrap();
+    assert_eq!(
+        (
+            grants_of(&a_id, 2),
+            grants_of(&m_id, 2),
+            grants_of(&b_id, 2)
+        ),
+        (0, 1, 1)
+    );
+    h.act_as_a();
+    refused(revoke(&b_id), "fleet.handoverPastRotation");
+
+    // 6. A's push under N is refused; B's revoke of A waits for the re-seal.
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"a, late\"}").unwrap();
+    assert!(push(&a_profile, 4).is_err());
+    assert_eq!(head_of(&x_id), 4, "nothing committed");
+    act_as(b.config.path(), b.data.path(), "n");
+    refused(revoke(&a_id), "step=reseal");
+
+    // 7. B re-seals every head under N + 1, then exports v4 again.
+    let run = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into()))
+        .unwrap()
+        .reseal
+        .unwrap();
+    assert_eq!(run.generation, 2);
+    for id in [&x_id, &y_id, &w_id] {
+        assert!(run.profiles[id].starts_with("resealed:"), "{run:?}");
+        assert_eq!(generation_of(id), 2);
+    }
+    let bundle2 = config_path("u6-b2.shardx-recovery");
+    export(&rt, &bundle2).unwrap();
+
+    // 8. B revokes A `retired`; A stays inert.
+    revoke(&a_id).unwrap();
+    let handover = crate::fleet_custody::load().unwrap().handover.unwrap();
+    assert_eq!(handover.phase, "done");
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap_err();
+    refused(
+        call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into())),
+        "fleet.enrollAgainRefused",
+    );
+    refused(rotate(), "fleet.custodyHandedOver");
+
+    // 9. M, offline since step 1, collects N + 1, pulls X, Y and W, and
+    // pushes X.
+    m.act_as_b();
+    let m_key = key_of();
+    assert_eq!(collect(), Some(2));
+    pull(&m_x).unwrap();
+    assert_eq!(files(&m_x), x_files);
+    pull(&y_m).unwrap();
+    assert_eq!(files(&y_m), y_files);
+    let m_w = join(&w_id, "W", 13);
+    assert_eq!(files(&m_w), w_files);
+    let m_udd = crate::profile::user_data_dir(&m_x).unwrap();
+    std::fs::write(m_udd.join("Preferences"), b"{\"from\":\"m\"}").unwrap();
+    let x_head = head_of(&x_id);
+    assert_eq!(push(&m_x, x_head).unwrap().version, x_head + 1);
+    let m_files = files(&m_x);
+
+    // 10. D joins after A's revoke, approved by B, and reads X and Y.
+    let d = fresh_device("d", h.server.url(), h.tenant.clone());
+    let (d_id, d_code) = enroll("late");
+    act_as(b.config.path(), b.data.path(), "n");
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            d_id.clone(),
+            d_code.sas.clone(),
+            None,
+        ),
+    )
+    .unwrap();
+    act_as(d.config.path(), d.data.path(), "d");
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), d_code.anchor, d_code.sas),
+    )
+    .unwrap();
+    assert_eq!(collect(), Some(2));
+    assert_eq!(files(&join(&x_id, "DX", 14)), m_files);
+    assert_eq!(files(&join(&y_id, "DY", 15)), y_files);
+
+    // 11. A's v3 bundle no longer restores anything; bundle 1, which holds
+    // only N, restores B on E, and E collects B's own grant of N + 1.
+    let _e = fresh_device("e", h.server.url(), h.tenant.clone());
+    refused(import(&rt, &bundle0), "recovery.deviceNotActive");
+    import(&rt, &bundle1).unwrap();
+    assert_eq!(collect(), Some(2));
+
+    // 12. Bundle 2 restores B on C, which lists the devices as the root
+    // custodian and rotates, granting M and D.
+    let _c = fresh_device("c", h.server.url(), h.tenant.clone());
+    import(&rt, &bundle2).unwrap();
+    collect();
+    let rows = call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    assert!(rows.iter().any(|r| r.device_id == d_id));
+    rotate().unwrap();
+    assert_eq!(
+        (
+            grants_of(&m_id, 3),
+            grants_of(&d_id, 3),
+            grants_of(&a_id, 3)
+        ),
+        (1, 1, 0)
+    );
+
+    // 13. Every head stays under N + 1, signed by M (X) or B (Y and W).
+    for (id, by) in [(&x_id, &m_key), (&y_id, &b_key), (&w_id, &b_key)] {
+        assert_eq!((generation_of(id), signer_of(id)), (2, by.clone()), "{id}");
+    }
+    eprintln!(
+        "[u6] the hand-over journey took {} s",
+        started.elapsed().as_secs()
+    );
 }

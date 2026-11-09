@@ -1,6 +1,80 @@
 {
   "releases": [
     {
+      "version": "2.10.0",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "team-root-handover",
+          "title": "Chuyển giao quyền giữ khoá gốc cho thiết bị mới",
+          "lead": "Quyền giữ khoá gốc có thể chuyển từ máy gốc hiện tại sang một thiết bị mới, theo thứ tự do trang Team bắt buộc.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trên máy root custodian, nút Duyệt làm thiết bị giữ khoá gốc chỉ định một thiết bị đã tham gia nhóm, sau khi Niêm phong lại mọi hồ sơ đã đưa mọi head về khoá đội máy đang dùng. Từ lúc đó máy gốc cũ từ chối mọi thao tác giữ khoá, và chỉ huỷ được bằng cách thu hồi thiết bị mới trước khi thiết bị đó xoay khoá."
+            },
+            {
+              "type": "p",
+              "text": "Trên thiết bị mới, Nhận quyền giữ khoá gốc chỉ giữ root grant khi chuỗi tin cậy của chính nó công nhận grant đó. Sau đó danh sách việc cần làm bắt buộc đúng thứ tự: Xuất gói khôi phục, Xoay khoá đội máy (không cấp cho máy gốc cũ), Niêm phong lại mọi hồ sơ, Xuất lại gói khôi phục, rồi thu hồi máy gốc cũ với lý do Ngừng dùng hoặc Bị mất. Khi thu hồi với lý do Bị mất, launcher liệt kê các profile máy gốc cũ đã đẩy lên sau lần niêm phong lại và hoàn tác chúng ngay sau khi thu hồi. Các thành viên vẫn giữ phê duyệt của mình khi máy gốc cũ bị thu hồi."
+            },
+            {
+              "type": "note",
+              "text": "Mọi thành viên nên chạy bản 2.10 và đồng bộ một lần trước khi máy gốc cũ bị thu hồi: thành viên còn ở bản 2.9.x sẽ phải enroll lại. Máy gốc cũ nằm im cho đến khi bản v2.11 có Reset; hãy tắt máy đó. Server nhóm không cần cập nhật."
+            }
+          ]
+        },
+        {
+          "id": "team-root-renewal",
+          "title": "Quyền giữ khoá gốc tự gia hạn",
+          "lead": "Root custodian tự gia hạn phê duyệt và các grant của mình khi đã đi được nửa thời hạn, nên quyền giữ khoá không còn hết sau một năm.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Việc gia hạn tính theo đồng hồ của server nhóm, chạy trước các thao tác giữ khoá và khi đồng bộ nhóm. Phê duyệt và root grant giờ có hạn hai năm. Trang Team hiện ngày đến hạn gia hạn, ngày hết quyền giữ khoá và ngày hết tuổi khoá, cảnh báo từ mốc 75%, và có nút Gia hạn quyền giữ khoá."
+            },
+            {
+              "type": "note",
+              "text": "Sau một lần gia hạn hoặc chuyển giao, Xuất gói khôi phục tạo gói bản v4, bản 2.9.x không mở được. Hãy xuất lại sau mỗi lần gia hạn (trang Team sẽ nhắc)."
+            }
+          ]
+        },
+        {
+          "id": "team-reseal-all",
+          "title": "Niêm phong lại mọi hồ sơ",
+          "lead": "Root custodian chuyển mọi head còn nằm dưới khoá đội máy cũ sang khoá mới nhất trong một lượt.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Niêm phong lại mọi hồ sơ làm việc trên bản sao ở server nhóm, không cần thư mục profile. Profile đang dùng, đang lỗi, bị cách ly hoặc nằm dưới khoá máy này không giữ sẽ được bỏ qua và liệt kê, và lượt chạy tiếp tục từ chỗ đã dừng. Mỗi profile được niêm phong lại tăng lên một phiên bản, nên thành viên có thay đổi chưa đẩy lên phải pull trước, việc này sẽ thay thế các thay đổi đó."
+            }
+          ]
+        },
+        {
+          "id": "team-handover-fixes",
+          "title": "Các sửa lỗi cho Team",
+          "lead": "Lý do Bị xâm phạm cho thiết bị thành viên, nút Bỏ qua thành viên và các sửa lỗi còn lại từ bản 2.9.0.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thu hồi giờ có lý do Bị xâm phạm cho thiết bị thành viên: cho đến khi khoá đội máy được xoay và mỗi thiết bị nhận khoá mới, không thiết bị nào đẩy lên hay xuất bản được dưới khoá hiện tại. Nếu server nhóm cứ báo lỗi khi cấp khoá mới cho một thành viên, nút Bỏ qua thành viên cho lượt xoay hoàn tất mà không có thành viên đó."
+            },
+            {
+              "type": "p",
+              "text": "Lượt đẩy lên, pull hoặc hoàn tác bị từ chối vì khoá đội máy đã xoay giờ tự nhận khoá mới và thử lại một lần. Thông báo về thiết bị đã bị thu hồi vẫn còn sau khi lượt xoay thứ hai hết hạn, và lời nhắc xuất lại gói khôi phục được xoá sau một lần xuất hoàn tất trong lúc thao tác giữ khoá khác đang chạy."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.9.0",
       "date": "2026-11-08",
       "entries": [

@@ -2625,6 +2625,7 @@ async fn team_export_recovery_bundle(
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
     bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    handed_over()?;
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
     let fleet_hex = sync_cmd::fleet_id(&c);
@@ -2652,6 +2653,16 @@ async fn team_export_recovery_bundle(
             if let Err(e) = newest.map_or(Ok(()), |n| fleet_custody::exported(n, grant)) {
                 eprintln!("[recovery] export prompt: not cleared ({e:#})");
             }
+            // v2.10 4.H steps 3 and 6 of an accepted hand-over.
+            let recorded = std::fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    let sha = shardx_core::recovery_bundle::recovery_bundle_sha256(&b);
+                    fleet_custody::handover_exported(newest.unwrap_or(0), &fleet_client::hex(&sha))
+                });
+            if let Err(e) = recorded {
+                eprintln!("[handover] export: not recorded ({e:#})");
+            }
         }
         Err(e) => eprintln!(
             "[recovery] export: refused {}",
@@ -2659,6 +2670,13 @@ async fn team_export_recovery_bundle(
         ),
     }
     result.map(drop)
+}
+
+/// v2.10 4.H step 1: a root custodian that appointed another device runs no
+/// custody command of its own, before any session is opened.
+fn handed_over() -> Result<(), String> {
+    let state = fleet_custody::load().map_err(|e| e.to_string())?;
+    fleet_custody::refuse_handed_over(&state).map_err(|e| e.to_string())
 }
 
 /// How far this device's Create fleet key got, and whether a revocation
@@ -2849,19 +2867,33 @@ async fn team_devices(
 /// Approves the pending device `device_id` once the user confirmed that it
 /// shows `sas` (section 4.A): its fleet-scoped approval, its three profile
 /// capability grants and its grant of the fleet key. A device with saved
-/// requests gets them resent as saved.
+/// requests gets them resent as saved. With `as_custodian` (v2.10 4.H step
+/// 1, Appoint) the device is approved tenant-wide and given an
+/// `ExistingRootGrant` of the ACTIVE root, once every head is under the
+/// ACTIVE generation (`fleet.handoverNeedsReseal`); this device then hands
+/// its custody over.
 #[tauri::command]
 async fn team_approve_device(
     username: String,
     password: String,
     device_id: String,
     sas: String,
+    as_custodian: Option<bool>,
 ) -> Result<(), String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
     }
     let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let as_custodian = as_custodian.unwrap_or(false);
+    let appointed = fleet_custody::resumes_appointment(
+        &fleet_custody::load().map_err(|e| e.to_string())?,
+        &device_id,
+    );
+    if !(as_custodian && appointed) {
+        handed_over()?;
+    }
+    let root = root_bootstrap::load().map_err(|e| e.to_string())?;
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
     let me = recipient(&c).map_err(|e| e.to_string())?;
@@ -2904,6 +2936,7 @@ async fn team_approve_device(
             &sas,
             fleet_key,
             withdrawn,
+            as_custodian.then_some(&root),
             now,
             &mut state,
             &mut |s| fleet_custody::save(s),
@@ -2914,6 +2947,100 @@ async fn team_approve_device(
     .await;
     client.end_session(access).await;
     result
+}
+
+/// v2.10 4.H step 2: accept the root custody the root custodian appointed
+/// this device to, or resume Accept ([`fleet_custody::accept_custody`]):
+/// the root grant from the evidence, its ack, the root state, the own
+/// capability grants, the verified collect of the accepted generation and
+/// then this device's own grant of it. The password is used for one login
+/// and never stored.
+#[tauri::command]
+async fn team_custody_accept(
+    username: String,
+    password: String,
+) -> Result<fleet_custody::FleetCustodyStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if !c.can_receive_custody() {
+        return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
+    }
+    let pin = pinned_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.handoverNoGrant"))?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let me = recipient(&c).map_err(|e| e.to_string())?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let result = custody_accept(&client, &c, access, &signer, &seed, &me, &pin, &mut |s| {
+        root_bootstrap::save(s)
+    })
+    .await;
+    client.end_session(access).await;
+    result?;
+    team_fleet_custody_status()
+}
+
+/// [`team_custody_accept`] over the session `access`, the root state
+/// written through `root_save`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn custody_accept(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+    signer: &shardx_core::signing::Ed25519SigningKey,
+    seed: &[u8; 32],
+    me: &shardx_core::trust_chain::Recipient,
+    pin: &(shardx_core::trust_chain::Binding, [u8; 32]),
+    root_save: &mut impl FnMut(&root_bootstrap::BootstrapState) -> anyhow::Result<()>,
+) -> Result<(), String> {
+    let device = fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer,
+        hpke_seed: seed,
+        vault: &fleet_custody::CredentialFkekStore,
+    };
+    let now = root_bootstrap::now_ms();
+    let fleet_hex = sync_cmd::fleet_id(c);
+    let fleet_key = |generation: u64| {
+        verified_fleet_key(&fleet_hex, pin, me, generation, now)?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))
+    };
+    let (device_sk, _) = shardx_core::grants::derive_keypair(seed);
+    let device_sk = &device_sk;
+    let collect = || async move {
+        match collect_fleet_grant(client, c, access, device_sk, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+        {
+            FleetGrant::Opened(g) => Ok(g),
+            other => Err(anyhow::anyhow!(setup_collect_error(other, u64::MAX)
+                .unwrap_or_else(|| crate::errcode::code(
+                    "fleet.custodyReplyMismatch"
+                )))),
+        }
+    };
+    let mut db = team::db::Db::open().map_err(|e| e.to_string())?;
+    let mut ledger = fleet_custody::Ledger { db: &mut db, pin };
+    let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+    fleet_custody::accept_custody(
+        client,
+        access,
+        &device,
+        &mut ledger,
+        fleet_key,
+        collect,
+        now,
+        &mut state,
+        &mut |s| fleet_custody::save(s),
+        root_save,
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// This device's key of `generation` of the fleet `fleet_hex`, only while its
@@ -2959,6 +3086,7 @@ async fn team_fleet_key_rotate(
         return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
     }
     let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    handed_over()?;
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
     let me = recipient(&c).map_err(|e| e.to_string())?;
@@ -3073,6 +3201,7 @@ async fn team_reseal_all(
     }
     let pin =
         bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("sync.resealNotCustodian"))?;
+    handed_over()?;
     let dev = team::sync::Device {
         signer: c.signing_key().map_err(|e| e.to_string())?,
         me: recipient(&c).map_err(|e| e.to_string())?,
@@ -3092,20 +3221,27 @@ async fn team_reseal_all(
         client.end_session(access).await;
         return Err(e);
     }
-    // shortcut: `outgoing` stays `None` until the hand-over (U6) saves one.
+    // 4.H step 5: an accepted hand-over re-seals the outgoing key's heads.
+    let outgoing = fleet_custody::load()
+        .map_err(|e| e.to_string())?
+        .handover
+        .map(|h| fleet_client::decode_hex32(&h.outgoing, "outgoing"))
+        .transpose()
+        .map_err(|e| e.to_string())?;
     let resealed = team::sync::reseal_all(
         &client,
         access,
         &dev,
         fleet,
-        None,
+        outgoing,
         &claim,
         root_bootstrap::now_ms(),
         &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s),
     )
     .await;
     client.end_session(access).await;
-    resealed.map_err(|e| format!("{e:#}"))?;
+    let run = resealed.map_err(|e| format!("{e:#}"))?;
+    fleet_custody::handover_resealed(&run).map_err(|e| e.to_string())?;
     team_fleet_custody_status()
 }
 
@@ -3113,18 +3249,29 @@ async fn team_reseal_all(
 /// for a member device, `compromised` (section 4.R, Q-57: checked against
 /// fresh evidence evaluated to this device's pin). A saved revocation is
 /// resent as saved. The device is cut off from the server, but keeps the
-/// fleet key it already holds (section 7).
+/// fleet key it already holds (section 7). After an appointment only the
+/// appointee may be revoked (the cancel, D13). The outgoing custodian of an
+/// accepted hand-over is revoked behind its checklist and live check (v2.10
+/// 4.H step 7, [`fleet_custody::revoke_outgoing`]); with `lost`,
+/// `accept_reverts` must list exactly the profiles it will revert.
 #[tauri::command]
 async fn team_revoke_device(
     username: String,
     password: String,
     device_id: String,
     reason: String,
+    accept_reverts: Option<Vec<String>>,
 ) -> Result<(), String> {
     let reason = fleet_custody::revoke_reason(&reason).map_err(|e| e.to_string())?;
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
         return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let appointed = fleet_custody::load()
+        .map_err(|e| e.to_string())?
+        .handed_over_to;
+    if !appointed.is_empty() && !appointed.eq_ignore_ascii_case(device_id.trim()) {
+        return Err(crate::errcode::code("fleet.custodyHandedOver"));
     }
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
@@ -3156,6 +3303,59 @@ async fn team_revoke_device(
             }
             _ => None,
         };
+        if let (Some(pin), Some(h)) = (&pin, &state.handover) {
+            if h.outgoing.eq_ignore_ascii_case(&row.signing_key_id) {
+                let dev = team::sync::Device {
+                    signer: c.signing_key().map_err(|e| e.to_string())?,
+                    me: recipient(&c).map_err(|e| e.to_string())?,
+                    pin: *pin,
+                };
+                let (client, dev) = (&client, &dev);
+                let revert = |remote: String| async move {
+                    let profile = fleet_client::decode_hex16(&remote, "remote_profile_id")?;
+                    let local = team::sync::bound_local(&pin.0, &profile)?.ok_or_else(|| {
+                        anyhow::anyhow!(crate::errcode::code("fleet.handoverRevertNotBound"))
+                    })?;
+                    let _claim = profile::begin_user_mutation(
+                        [&local],
+                        &crate::errcode::code("profile.actionRevertTeam"),
+                    )?;
+                    let udd = profile::user_data_dir(&local)?;
+                    let started = std::time::Instant::now();
+                    let pushed = team::sync::revert(
+                        client,
+                        access,
+                        dev,
+                        &local,
+                        &udd,
+                        root_bootstrap::now_ms(),
+                        &|| started.elapsed(),
+                    )
+                    .await?;
+                    anyhow::Ok(pushed.version)
+                };
+                let bound = |remote: &str| {
+                    let profile = fleet_client::decode_hex16(remote, "remote_profile_id")?;
+                    Ok(team::sync::bound_local(&pin.0, &profile)?.is_some())
+                };
+                return fleet_custody::revoke_outgoing(
+                    client,
+                    access,
+                    &device,
+                    pin,
+                    row,
+                    reason,
+                    accept_reverts.as_deref().unwrap_or_default(),
+                    bound,
+                    revert,
+                    root_bootstrap::now_ms(),
+                    &mut state,
+                    &mut |s| fleet_custody::save(s),
+                )
+                .await
+                .map_err(|e| e.to_string());
+            }
+        }
         let mut ledger = pin
             .as_ref()
             .zip(db.as_mut())
@@ -8368,6 +8568,7 @@ pub fn run() {
             team_renew_custody,
             team_devices,
             team_approve_device,
+            team_custody_accept,
             team_revoke_device,
             team_join_code,
             team_join_confirm,

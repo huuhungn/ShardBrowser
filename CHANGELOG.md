@@ -1,5 +1,178 @@
 # Changelog
 
+## v2.10.0
+
+A Team release: root custody can move to a new device in an enforced order,
+the root custodian renews its own custody records before they end, and Re-seal
+all profiles moves every profile head to the newest fleet key at once. Member
+devices can be revoked as compromised. The browser engine and the team server
+are unchanged.
+
+### Upgrade notes
+
+- The team server is unchanged: a 2.9.x server works with launcher 2.10.0.
+- Every member should run 2.10 before a hand-over, and sync once after it
+  begins and before the old root is revoked. A member still on 2.9.x when the
+  old root is revoked distrusts peers it has not seen and must enroll again.
+- 2.9.x cannot open a v4 recovery bundle. A root custodian writes v4 once a
+  renewal or a hand-over has replaced its first root grant.
+- Export the recovery bundle again after a renewal and after a hand-over (the
+  Team page asks). Once the old root is revoked, its bundles stop working.
+- Re-seal moves each profile it touches up one version, so a member with
+  unpushed changes to such a profile must Pull first, which replaces those
+  changes.
+- Do not downgrade to 2.9.x after a hand-over, a renewal or a re-seal: 2.9.x
+  ignores the current root grant and the re-seal, renewal and hand-over state.
+- After a hand-over, the old root machine stays inert until v2.11 adds Reset.
+  Keep it switched off.
+
+### Team
+
+- **Root custody hand-over.** On the root custodian, Approve as root custodian
+  appoints a device that has joined the team. It is refused until the
+  custodian's own Re-seal all profiles has left every profile head under the
+  active fleet key. From then on the old root refuses every custody action,
+  and it can cancel only by revoking the new device before that device
+  rotates. Appointing an already approved member is refused.
+- **Accept and checklist.** On the new device, Accept root custody keeps the
+  root grant only if its own trust chain counts it. A checklist then enforces
+  the order: Export recovery bundle, Rotate fleet key (with no grant to the old
+  root), Re-seal all profiles, Export recovery bundle again, and revoke the old
+  root as retired or lost. Every revoke re-checks these steps and every profile
+  head live.
+- **Lost old root.** Revoking the old root as lost accepts heads it pushed
+  after the re-seal. They are listed, each must be joined on the new device,
+  and they are reverted right after the revoke once you confirm that exact
+  list. A revert that fails is retried by the next revoke.
+- **Members stay trusted.** When a custodian is revoked, each device checks
+  every device it approved in one closure evaluation, so their approvals keep
+  standing.
+- **Root custody renewal.** The root custodian renews its own approval, root
+  grant, capability grants and fleet key grant at half-life, on the team
+  server's clock, before custody actions and during team sync. The approval and
+  the root grant now run two years. The Team page shows when renewal is due,
+  when custody ends and when the key age ends, warns from 75%, and offers Renew
+  custody.
+- **Re-seal all profiles.** The root custodian seals every profile head under
+  an older fleet key again under the active one, from the team server's copy,
+  without a profile folder. It skips and lists profiles in use, in error,
+  quarantined or under a key this device does not hold, and resumes where it
+  stopped after a crash without committing a head twice.
+- **Recovery bundle v4.** Once a renewal or a hand-over has replaced the first
+  root grant, Export recovery bundle writes v4, which carries the current root
+  grant. Import of a v4 bundle checks that the trust chain counts the bundle's
+  device as a custodian now.
+- **Compromised for members.** Revoke offers `compromised` for member devices.
+  Until the fleet key is rotated and each device collects the new one, no
+  device can push or publish under the current key. Custodian rows keep
+  retired and lost.
+- **Skip a failing member.** If the team server keeps failing one member's new
+  fleet key grant, Skip member finishes the rotation without it. That device
+  must then be revoked and enroll again.
+
+### Fixed
+
+- **Collect after a rotation.** A push, pull or revert refused because the
+  fleet key rotated collects the new key once and retries once when a key was
+  opened. Push and revert report the collected key.
+- **Back-to-back rotations.** A rotation keeps the key holders of the previous
+  one, so a revoked device's banner survives an expired second rotation.
+- **Re-export prompt.** The prompt to export the recovery bundle again clears
+  after an export that finished while another custody action was running.
+- **Second grant of the same key.** The acknowledgement of a second fleet key
+  grant for the same generation no longer collides with the first.
+
+### Known limitations
+
+- **Cut-off is server-enforced.** The root key is unchanged until root
+  rotation in v2.11, and the server hands every fleet key's recovery grant to
+  any device session. Until its row is revoked, the old root can open every
+  fleet key; afterwards anyone with the old root key and the server's data (a
+  hostile server, a copy of its database) still can.
+- **Old root stays inert until v2.11.** A revoked device cannot open a session
+  to read its own signed revocation, so the old root machine, or a cancelled
+  appointee, stays inert with its seeds and root state until v2.11 brings
+  Reset and the wipe of its seeds. Keep it switched off.
+- **Members still on 2.9.x.** A member still on 2.9.x when the old root is
+  revoked distrusts peers it has not seen and must enroll again.
+- **Closure limits.** The closure evaluation names every device ever granted a
+  fleet key, revoked and retired ones included. More than 64 fails closed
+  (`fleet.trustClosureTooLarge`) and team sync stays paused on that device
+  until v2.11. A member the server leaves out of the evidence is distrusted and
+  must enroll again (a denial of service, not forged trust).
+- **History below the heads.** Once the old root is revoked, the fleet keys its
+  grants delivered stop opening on every device that counts the revocation.
+  Re-sealed heads, later pushes and the new custodian's own key stay readable;
+  older snapshots below the heads do not.
+- **Restore from before the rotation.** A custodian restored from a recovery
+  bundle exported before its rotation loses the hand-over checklist and its
+  live checks. It must not revoke the old root by hand.
+- **Expired members block a hand-over.** A member whose 365-day approval ran
+  out and whose head is current blocks a hand-over until v2.11 renews members.
+- **Revoked appointee and a resumed Appoint.** If the appointee is revoked
+  during a crash window and the old root then resumes Approve as root
+  custodian, the old root refuses custody steps until it cancels again.
+- **Bundles and renewal.** A bundle exported before a renewal does not import
+  over the same device's renewed state. Export again after a renewal.
+- **Re-seal skips.** Profiles in use, in error or quarantined are skipped and
+  block revoking the old root until fixed; a stolen old root that keeps pushing
+  is handled by revoking it as lost with the listed reverts. A skip reason
+  whose message has placeholders shows them unfilled.
+- **Server listing trust.** A profile the server hides from every listing and
+  that no device here binds is not re-sealed or checked.
+- **Members' records still end.** Members' approvals and fleet key grants still
+  end after 365 days; renewing them needs the v2.11 server change. A member
+  offline past the old root grant's end treats the custodian as lapsed and must
+  be re-appointed or enroll again.
+- **Renewal needs use.** Renewal runs on custody actions and team sync, so a
+  custodian unused for half a year renews only on its next use; the warning
+  shows from 75%.
+- **Key age.** A root custodian's key counts for 1095 days unless custody is
+  handed over.
+- **No `compromised` for custodian rows** until v2.11.
+- **One hand-over at a time.** It can be cancelled only before the new device
+  rotates.
+- **Expired rotations.** A rotation that expires (30 days) or is undone by a
+  server restore before activation leaves the team on the old key. If the
+  server still holds the unfinished key as `PREPARING`, starting a rotation,
+  and so a hand-over, is refused with `FLEET_GENERATION_EXISTS`, and each retry
+  files one extra `key.rotate` grant. Discarding it comes with the v2.11
+  server.
+- **Old snapshots.** Snapshots stay under the keys they were sealed with, and a
+  revoked device can read any of them that leaks to it.
+- **Hidden revocations.** A device revoked while the server hides its
+  revocation can still write under the old key to a profile that has not moved
+  to the new key. The generation floor stops it once that profile is pushed
+  under the new key.
+- **Retired keys from a hostile server.** A hostile server can serve a valid
+  member's head under a retired key that is not older than the head before it,
+  and readers accept it.
+- **Two missed rotations.** A member offline across two rotations must enroll
+  again.
+- **Banner source.** The banner is derived on the root custodian's device from
+  its own signed revocations and known key holders, plus its trust ledger.
+- **Imported custodian.** A root custodian restored from a recovery bundle
+  starts with no saved revocations and a fresh trust ledger. If the server
+  hides a revocation, the rotation can still grant the new key to that device.
+- **Pending devices revoked later.** A device still pending during a rotation
+  and revoked afterwards by another custodian relies on the server to refuse
+  it when an approval is resumed across the rotation.
+- **A valid member under an older key.** A still-valid member's head under an
+  older key than its profile already uses stops pulls of that profile (fail
+  closed, nothing pinned) until the member is revoked; Revert then skips it.
+- **Older-key list.** The list reads the generation of the local binding:
+  profiles not bound on the root custodian's device are missing, and after a
+  server restore a row keeps the previous generation until the next pin.
+- **Refused or skipped members.** A member refused or skipped during a
+  rotation (expired approval, changed keys, no signed approval, Skip member)
+  must be revoked and enroll again. A member already granted in an earlier run
+  may show as skipped when a resumed run finds it no longer eligible.
+- **Server restore.** A server restore after a rotation is not covered by a
+  test.
+- **Reset of a pending device.** Credentials left by a Reset of a pending
+  device stay; only the credentials of a revoked old identity are forgotten.
+- The 2.8.x limitation about the server URL still applies.
+
 ## v2.9.0
 
 A Team release: the root custodian can rotate the team's fleet key, so a

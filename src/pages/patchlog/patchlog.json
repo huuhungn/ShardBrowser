@@ -3,6 +3,80 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.10.0",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "team-root-handover",
+          "title": "Hand root custody to a new device",
+          "lead": "Root custody can move from the current root machine to a new device, in an order the Team page enforces.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "On the root custodian, Approve as root custodian appoints a device that has joined the team, once Re-seal all profiles has left every profile head under the active fleet key. From then on the old root refuses every custody action, and it can cancel only by revoking the new device before that device rotates."
+            },
+            {
+              "type": "p",
+              "text": "On the new device, Accept root custody keeps the root grant only if its own trust chain counts it. A checklist then enforces the order: Export recovery bundle, Rotate fleet key (with no grant to the old root), Re-seal all profiles, Export recovery bundle again, and revoke the old root as retired or lost. Revoking it as lost lists the profiles it pushed after the re-seal and reverts them right after the revoke. Members keep their approvals when the old root is revoked."
+            },
+            {
+              "type": "note",
+              "text": "Every member should run 2.10 and sync once before the old root is revoked: a member still on 2.9.x must enroll again. The old root machine stays inert until v2.11 adds Reset; keep it switched off. The team server does not need an update."
+            }
+          ]
+        },
+        {
+          "id": "team-root-renewal",
+          "title": "Root custody renews itself",
+          "lead": "The root custodian renews its own approval and grants at half-life, so its custody no longer ends after a year.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Renewal runs on the team server's clock before custody actions and during team sync. The approval and the root grant now run two years. The Team page shows when renewal is due, when custody ends and when the key age ends, warns from 75%, and offers Renew custody."
+            },
+            {
+              "type": "note",
+              "text": "After a renewal or a hand-over, Export recovery bundle writes a v4 bundle, which 2.9.x cannot open. Export again after each renewal (the Team page asks)."
+            }
+          ]
+        },
+        {
+          "id": "team-reseal-all",
+          "title": "Re-seal all profiles",
+          "lead": "The root custodian moves every profile head under an older fleet key to the newest one in one run.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Re-seal all profiles works from the team server's copy, without a profile folder. It skips and lists profiles in use, in error, quarantined or under a key this device does not hold, and resumes where it stopped. Each re-sealed profile moves up one version, so a member with unpushed changes must Pull first, which replaces those changes."
+            }
+          ]
+        },
+        {
+          "id": "team-handover-fixes",
+          "title": "Team fixes",
+          "lead": "Compromised for member devices, Skip member, and fixes left over from 2.9.0.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Revoke offers Compromised for member devices: until the fleet key is rotated and each device collects the new one, no device can push or publish under the current key. If the team server keeps failing one member's new fleet key grant, Skip member finishes the rotation without it."
+            },
+            {
+              "type": "p",
+              "text": "A push, pull or revert refused because the fleet key rotated now collects the new key and retries once. A revoked device's banner survives an expired second rotation, and the prompt to export the recovery bundle again clears after an export that finished during another custody action."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.9.0",
       "date": "2026-11-08",
       "entries": [

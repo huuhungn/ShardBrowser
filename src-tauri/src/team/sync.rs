@@ -5493,6 +5493,188 @@ async fn reseal_one(
     }
 }
 
+/// Why a head keeps a root custody hand-over from going on (v2.10 4.H D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Blocked {
+    /// Bound here or named by a re-seal run, but the fleet does not list it.
+    Unlisted,
+    /// Sealed under a generation below the ACTIVE one.
+    OlderGeneration,
+    /// Signed by the outgoing custodian.
+    Outgoing,
+    /// Its head manifest does not verify under a key the trust chain counts
+    /// as a profile committer of this fleet: whatever it says is not read.
+    Untrusted,
+}
+
+/// One blocking head: its remote profile ID, version and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadBlocker {
+    pub profile: String,
+    pub version: u64,
+    pub why: Blocked,
+}
+
+/// v2.10 4.H (D7): the heads of every profile the fleet lists, this device
+/// binds or `also` names that are not sealed under `g`, or are signed by
+/// `outgoing`. The live listing decides, never a saved re-seal outcome; a
+/// bound or named profile the listing omits blocks. Each head manifest must
+/// verify under its signer's key, and the trust chain evaluated to `pin` at
+/// `now` must count that signer's fleet approval and profile commit grant;
+/// otherwise the head blocks as untrusted (a server cannot vouch for a head).
+/// Records nothing in the ledger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn custody_blockers(
+    client: &FleetClient,
+    access: &str,
+    pin: &(Binding, [u8; 32]),
+    fleet: [u8; 16],
+    g: u64,
+    outgoing: Option<[u8; 32]>,
+    also: &[String],
+    now: u64,
+) -> Result<Vec<HeadBlocker>> {
+    let binding = &pin.0;
+    let of = |profile| Bound {
+        local: String::new(),
+        server: String::new(),
+        instance: binding.server_instance_id,
+        tenant: binding.tenant_id,
+        fleet,
+        profile,
+        version: 0,
+        head: None,
+        epoch: 0,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    };
+    let mut heads = std::collections::BTreeMap::new();
+    fleet_pages(client, access, &of([0; 16]), |p| {
+        heads.insert(hex(&p.profile_id), p.clone());
+        true
+    })
+    .await?;
+    let mut ids: std::collections::BTreeSet<String> = heads.keys().cloned().collect();
+    let db = Db::open()?;
+    let bound: Vec<String> = db
+        .conn
+        .prepare(
+            "SELECT remote_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+               AND local_profile_id NOT GLOB 'reseal:*'",
+        )?
+        .query_map(
+            params![
+                hex(&binding.server_instance_id),
+                hex(&binding.tenant_id),
+                hex(&fleet)
+            ],
+            |r| r.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(db);
+    ids.extend(bound.into_iter().map(|id| id.to_ascii_lowercase()));
+    ids.extend(also.iter().map(|id| id.to_ascii_lowercase()));
+    let mut out = Vec::new();
+    let mut read = Vec::new();
+    for id in ids {
+        let blocked = |version, why| HeadBlocker {
+            profile: id.clone(),
+            version,
+            why,
+        };
+        let Some(p) = heads.get(&id) else {
+            out.push(blocked(0, Blocked::Unlisted));
+            continue;
+        };
+        if p.current_version == 0 {
+            continue;
+        }
+        let m = manifest(client, access, &of(p.profile_id), p.current_version).await?;
+        if Some(m.head_hash()) != p.current_signed_head_hash {
+            return Err(bad("current_signed_head_hash"));
+        }
+        read.push((id, p.profile_id, p.current_version, m));
+    }
+    let mut signers: Vec<[u8; 32]> = read.iter().map(|r| *r.3.signer_signing_key_id()).collect();
+    signers.sort();
+    signers.dedup();
+    if signers.len() > crate::fleet_custody::MAX_SIGNERS {
+        bail!(code("sync.walkTooManySigners"));
+    }
+    let mut db = Db::open()?;
+    let (pages, _) = ledger::closure_evidence(
+        client,
+        access,
+        &hex(&binding.tenant_id),
+        &mut db,
+        pin,
+        &signers,
+        now,
+    )
+    .await?;
+    let chain = ledger::evaluate(&db, binding, &pin.1, &pages, now)?.map(|(_, chain)| chain);
+    let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
+        .iter()
+        .flat_map(|p| &p.signing_public_keys)
+        .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
+        .collect();
+    for (id, profile, version, m) in read {
+        let signer = *m.signer_signing_key_id();
+        let trusted = chain.as_ref().is_some_and(|chain| {
+            let commits =
+                |scope| chain.capability_at(&signer, Capability::ProfileCommit, scope, now);
+            chain.approval_valid_at(&signer, Scope::Fleet(fleet), now)
+                && (commits(Scope::Profile(profile)) || commits(Scope::Fleet(fleet)))
+        });
+        // The listing's generation is the one the profile was published
+        // under; the verified head manifest names the one its head is under.
+        let head = keys
+            .get(&signer)
+            .filter(|_| trusted)
+            .and_then(|pk| m.verify_signature(pk).ok())
+            .map(|v| v.payload().clone())
+            .filter(|h| {
+                (h.tenant_id, h.fleet_id, h.profile_id) == (binding.tenant_id, fleet, profile)
+            });
+        let why = match head {
+            None => Some(Blocked::Untrusted),
+            Some(h) if h.key_generation < g => Some(Blocked::OlderGeneration),
+            Some(h) if outgoing == Some(h.signer_signing_key_id) => Some(Blocked::Outgoing),
+            Some(_) => None,
+        };
+        if let Some(why) = why {
+            out.push(HeadBlocker {
+                profile: id,
+                version,
+                why,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The local profile bound to `profile` under `binding`, if any, other than
+/// a re-seal row: what the hand-over's `lost` path reverts.
+pub(crate) fn bound_local(binding: &Binding, profile: &[u8; 16]) -> Result<Option<String>> {
+    let db = Db::open()?;
+    Ok(db
+        .conn
+        .query_row(
+            "SELECT local_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
+               AND local_profile_id NOT GLOB 'reseal:*'",
+            params![
+                hex(&binding.server_instance_id),
+                hex(&binding.tenant_id),
+                hex(profile)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Checks out the published `local` as a push does and keeps the lease: a
 /// lease another device holds, for the real-server tests.
 #[cfg(test)]
