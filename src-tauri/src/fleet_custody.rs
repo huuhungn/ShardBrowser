@@ -145,6 +145,33 @@ pub struct FleetCustodyState {
     /// newest fleet key.
     #[serde(default)]
     pub export_due: bool,
+    /// Re-seal all profiles (v2.10 4.S): the latest run, kept until the next
+    /// one starts.
+    #[serde(default)]
+    pub reseal: Option<ResealRun>,
+    /// The device this root custodian handed its custody to (v2.10 4.H step
+    /// 1, U6), lower-case; empty while it holds custody. Once it is set,
+    /// Re-seal all profiles refuses with `fleet.custodyHandedOver`.
+    #[serde(default)]
+    pub handed_over_to: String,
+}
+
+/// One run of Re-seal all profiles (v2.10 4.S). No key is among it.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResealRun {
+    /// The ACTIVE generation the run seals under.
+    pub generation: u64,
+    /// The outgoing custodian's signing key ID during a hand-over, hex.
+    #[serde(default)]
+    pub outgoing: String,
+    pub started_ms: u64,
+    /// Set once the run went through its list; `None` while it runs.
+    #[serde(default)]
+    pub ended_ms: Option<u64>,
+    /// Per remote profile ID: `walking`, `sealing:<version>:<head>`,
+    /// `resealed:<version>`, `current` or `skipped:<reason>`.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for FleetCustodyState {
@@ -158,6 +185,7 @@ impl std::fmt::Debug for FleetCustodyState {
                 &(!self.create_request.is_empty() || self.imported),
             )
             .field("rotation", &self.rotation)
+            .field("reseal", &self.reseal)
             .finish_non_exhaustive()
     }
 }
@@ -2308,6 +2336,8 @@ pub struct FleetCustodyStatus {
     pub export_due: bool,
     /// Set by the command from [`rotation_required`]; `status` leaves it out.
     pub rotation_required: Option<RotationRequired>,
+    /// The latest Re-seal all profiles run, if any.
+    pub reseal: Option<ResealRun>,
 }
 
 /// How far the latest rotation got: no secret of it.
@@ -2357,6 +2387,7 @@ pub fn status() -> Result<FleetCustodyStatus> {
         }),
         export_due: s.export_due,
         rotation_required: None,
+        reseal: s.reseal,
     })
 }
 

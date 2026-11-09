@@ -1338,7 +1338,8 @@ pub(crate) fn readiness() -> Result<Readiness> {
         block(
             "downgrade.blockUnfinishedBinding",
             count(
-                "SELECT count(*) FROM profile_bindings b WHERE NOT EXISTS (
+                "SELECT count(*) FROM profile_bindings b
+                 WHERE b.local_profile_id NOT GLOB 'reseal:*' AND NOT EXISTS (
                    SELECT 1 FROM downgrade_journals d
                    WHERE d.original_local_profile_id = b.local_profile_id
                      AND d.phase = 'COMPLETED')",

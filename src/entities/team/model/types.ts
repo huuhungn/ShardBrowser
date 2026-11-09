@@ -116,6 +116,19 @@ export type FleetCustodyStatus = {
   rotation_required: "urgent" | "routine" | null;
   /** A finished rotation asks for the recovery bundle to be exported again. */
   export_due: boolean;
+  /** The latest Re-seal all profiles run, if any. */
+  reseal: ResealRun | null;
+};
+
+/** One Re-seal all profiles run; no secret. */
+export type ResealRun = {
+  /** The active generation it seals under. */
+  generation: number;
+  started_ms: number;
+  /** Set once the run went through its list. */
+  ended_ms: number | null;
+  /** Per remote profile: `walking`, `sealing:…`, `resealed:<version>`, `current` or `skipped:<reason>`. */
+  profiles: Record<string, string>;
 };
 
 /** How far the latest fleet key rotation got; no secret. */

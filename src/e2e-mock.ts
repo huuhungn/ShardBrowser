@@ -386,9 +386,10 @@ type FleetRotation = {
 let fleetCustody: {
   started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
   rotation_required: "urgent" | "routine" | null; export_due: boolean;
+  reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
-  export_due: false,
+  export_due: false, reseal: null,
 };
 // The highest fleet key generation this device kept.
 let teamGeneration = 0;
@@ -573,6 +574,26 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         rotation: { ...rotation, phase: "done", failing_member: null },
         rotation_required: null,
         export_due: true,
+      };
+      return fleetCustody;
+    }
+    case "team_reseal_all": {
+      // As the launcher: only an activated root custodian holding the active key re-seals.
+      if (!custodyBootstrap.activated) teamRefuse("sync.resealNotCustodian");
+      if (!teamMe.collected) teamRefuse("sync.noVerifiedFleetKey");
+      const r = await teamServer<{ generation: number; profiles: Record<string, string> }>("reseal", me);
+      for (const b of teamProfiles.profiles) {
+        const remote = teamRemoteOf.get(b.profile_id);
+        const outcome = remote ? r.profiles[remote] : undefined;
+        // A bound copy re-sealed through its own binding moves with it.
+        if (outcome?.startsWith("resealed:")) {
+          b.remote_version = Number(outcome.slice("resealed:".length));
+          teamKeyGenOf.set(b.profile_id, r.generation);
+        }
+      }
+      fleetCustody = {
+        ...fleetCustody,
+        reseal: { generation: r.generation, started_ms: Date.now(), ended_ms: Date.now(), profiles: r.profiles },
       };
       return fleetCustody;
     }

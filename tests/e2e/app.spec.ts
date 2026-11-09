@@ -623,6 +623,23 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       sealed.set(String(remote_profile_id), args.generation ?? 0);
       return reply(String(remote_profile_id));
     },
+    // Re-seal all profiles: a free head under an older generation gets a new version under the newest one.
+    reseal: (device, { device_id }) => {
+      live(device_id);
+      const profiles: Record<string, string> = {};
+      for (const [id, h] of heads) {
+        if (h.version === 0 || (sealed.get(id) ?? 0) >= generation) profiles[id] = "current";
+        else if (h.holder && h.holder !== device) profiles[id] = "skipped:in-use";
+        else if (h.revoked) profiles[id] = "skipped:quarantined";
+        else if (h.label === "Untrusted") profiles[id] = "skipped:error:sync.signerUntrusted";
+        else {
+          h.version += 1;
+          sealed.set(id, generation);
+          profiles[id] = `resealed:${h.version}`;
+        }
+      }
+      return { generation, profiles };
+    },
     // Not modelled: the caller's pin, the lease, and proven vs reported-only revocation.
     revert: (_device, { remote_profile_id }) => {
       const h = head(String(remote_profile_id));
@@ -1015,6 +1032,51 @@ test("after a rotation the custodian pushes profiles under an older key, and a m
     await expect(a.getByTestId("team-older-key")).toHaveCount(0);
   });
   await b.context().close();
+});
+
+test("re-seal all profiles moves each free head under the newest key and lists the profiles it skips", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(a, "a", server);
+  const rowA = a.getByTestId("team-profile").filter({ hasText: "Beta Research" });
+  const results = card.getByTestId("team-reseal-profile");
+  await cardClick(a, "Create fleet key");
+
+  await test.step("A publishes and checks in under generation 0; another device holds a second profile", async () => {
+    for (const name of ["Publish", "Check in"]) {
+      await teamSignIn(a);
+      await rowA.getByRole("button", { name, exact: true }).click();
+    }
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
+    server.heads.set("e1".repeat(16), { version: 1, label: "Leased", holder: "b", revoked: false });
+    server.heads.set("e2".repeat(16), { version: 1, label: "Untrusted", holder: null, revoked: false });
+  });
+
+  await test.step("after a rotation the confirm warns members to pull first, and the run lists each outcome", async () => {
+    await rotateOn(a);
+    await cardClick(a, "Re-seal all profiles");
+    const dialog = a.getByRole("dialog");
+    await expect(dialog).toContainText("Members with unpushed changes must Pull first, which replaces their local changes.");
+    await expect(dialog).toContainText("Profiles in use, in error or quarantined are skipped and listed.");
+    await dialog.getByRole("button", { name: "Re-seal all profiles" }).click();
+    await expect(a.getByText("Re-seal finished: 1 re-sealed, 0 already current, 2 skipped.")).toBeVisible();
+    await expect(results).toHaveCount(3);
+    await expect(results.filter({ hasText: "Re-sealed (version 2)" })).toHaveCount(1);
+    await expect(results.filter({ hasText: "Skipped: in use, checked out or with unpushed changes" })).toHaveCount(1);
+    // An error shows its message, never the raw code.
+    await expect(results.filter({ hasText: "Skipped: The snapshot's signer is not trusted to commit this profile" }))
+      .toHaveCount(1);
+    await expect(results.filter({ hasText: "sync.signerUntrusted" })).toHaveCount(0);
+    await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@2"]);
+    await expect(a.getByTestId("team-older-key")).toHaveCount(0);
+  });
+
+  await test.step("a second run commits nothing new", async () => {
+    await cardClick(a, "Re-seal all profiles");
+    await a.getByRole("dialog").getByRole("button", { name: "Re-seal all profiles" }).click();
+    await expect(a.getByText("Re-seal finished: 0 re-sealed, 1 already current, 2 skipped.")).toBeVisible();
+    expect([...server.heads.values()].map((h) => h.version)).toEqual([2, 1, 1]);
+  });
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
 });
 
 // The two-machine gate (Plan:2388), each step a test.step below:

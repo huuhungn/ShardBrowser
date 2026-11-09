@@ -3048,6 +3048,55 @@ async fn team_fleet_key_rotate(
     team_fleet_custody_status()
 }
 
+/// Re-seal all profiles as the tenant's root custodian, or resume the run
+/// (v2.10 4.S, `team::sync::reseal_all`): every fleet head under an older
+/// fleet key is committed again under the active one, from its ciphertext;
+/// a profile in use, in error or quarantined is skipped and listed. Each
+/// bound profile is claimed against a launch for its step. The password is
+/// used for one login and never stored.
+#[tauri::command]
+async fn team_reseal_all(
+    username: String,
+    password: String,
+) -> Result<fleet_custody::FleetCustodyStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    let pin =
+        bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("sync.resealNotCustodian"))?;
+    let dev = team::sync::Device {
+        signer: c.signing_key().map_err(|e| e.to_string())?,
+        me: recipient(&c).map_err(|e| e.to_string())?,
+        pin,
+    };
+    let fleet = fleet_client::decode_hex16(&sync_cmd::fleet_id(&c), "fleet_id")
+        .map_err(|e| e.to_string())?;
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let action = crate::errcode::code("profile.actionPushToTeam");
+    let claim = |local: &str| -> Option<Box<dyn Send>> {
+        let guard = profile::begin_user_mutation([local], &action).ok()?;
+        Some(Box::new(guard))
+    };
+    // shortcut: `outgoing` stays `None` until the hand-over (U6) saves one.
+    let resealed = team::sync::reseal_all(
+        &client,
+        access,
+        &dev,
+        fleet,
+        None,
+        &claim,
+        root_bootstrap::now_ms(),
+        &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s),
+    )
+    .await;
+    client.end_session(access).await;
+    resealed.map_err(|e| format!("{e:#}"))?;
+    team_fleet_custody_status()
+}
+
 /// Revokes the tenant's device `device_id` as `reason`, `retired`, `lost` or,
 /// for a member device, `compromised` (section 4.R, Q-57: checked against
 /// fresh evidence evaluated to this device's pin). A saved revocation is
@@ -8139,6 +8188,7 @@ pub fn run() {
             team_fleet_custody_status,
             team_fleet_key_setup,
             team_fleet_key_rotate,
+            team_reseal_all,
             team_devices,
             team_approve_device,
             team_revoke_device,

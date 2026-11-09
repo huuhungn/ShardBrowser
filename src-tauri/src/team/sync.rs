@@ -65,6 +65,7 @@ use shardx_core::trust_chain::{Binding, Recipient, Scope};
 use super::{db::Db, ledger};
 use crate::errcode::{code, code_with};
 use crate::fleet_client::{decode_hex16, hex, Exact, FleetClient};
+use crate::fleet_custody::{FleetCustodyState, ResealRun};
 
 /// The pilot lease TTL (plan 10.1 L1398 proposes 90 s; uploads renew).
 const LEASE_TTL_SECONDS: u32 = 300;
@@ -262,6 +263,7 @@ pub(crate) fn under_older_key(pin: &Binding) -> Result<Vec<OlderKeyProfile>> {
         .prepare(
             "SELECT local_profile_id, fleet_id, key_generation FROM profile_bindings
              WHERE server_instance_id = ?1 AND tenant_id = ?2 AND base_version > 0
+               AND local_profile_id NOT GLOB 'reseal:*'
              ORDER BY local_profile_id",
         )?
         .query_map(
@@ -302,7 +304,8 @@ pub(crate) fn statuses(now: u64) -> Result<Statuses> {
                  WHERE s.server_instance_id = b.server_instance_id AND s.tenant_id = b.tenant_id
                    AND s.remote_profile_id = b.remote_profile_id AND s.resolution IS NULL),
                b.lease_id IS NOT NULL AND b.last_error_code IS 'SIGNER_REVOKED'
-             FROM profile_bindings b ORDER BY b.local_profile_id",
+             FROM profile_bindings b WHERE b.local_profile_id NOT GLOB 'reseal:*'
+             ORDER BY b.local_profile_id",
         )?
         .query_map([wire(now)?], |r| {
             Ok(ProfileStatus {
@@ -1855,8 +1858,6 @@ async fn source_withdrawn(
 #[derive(Clone, Copy)]
 enum Plain<'a> {
     Folder(&'a Path),
-    // U3's re-seal is the production caller; until then only its spike test.
-    #[cfg_attr(not(test), allow(dead_code))]
     Opened(&'a [u8]),
 }
 
@@ -2492,7 +2493,8 @@ pub(crate) async fn labels(
         .conn
         .prepare(
             "SELECT remote_profile_id, local_profile_id FROM profile_bindings
-             WHERE server_instance_id = ?1 AND tenant_id = ?2",
+             WHERE server_instance_id = ?1 AND tenant_id = ?2
+               AND local_profile_id NOT GLOB 'reseal:*'",
         )?
         .query_map(params![hex(&b.instance), hex(&b.tenant)], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -2551,18 +2553,40 @@ pub(crate) async fn join(
     udd: &Path,
     now: u64,
 ) -> Result<u64> {
+    // A re-seal's leftover row for this profile goes first (v2.10 4.S).
+    drop_reseal_row(&profile)?;
     let mut db = Db::open()?;
     // A local profile with an unfinished publish is bound by finishing it.
     if is_bound(&db.conn, local)? || pending_publish(&db, local)?.is_some() {
         bail!(code("sync.alreadyPublished"));
     }
+    bind(client, access, dev, &mut db, local, fleet, profile, now).await?;
+    drop(db);
+    pull(client, access, dev, local, udd, now).await
+}
+
+/// Binds `local` to `fleet`'s listed `profile` at version 0, as [`join`]
+/// describes, without pulling: a join's row, or a re-seal's (4.S).
+#[allow(clippy::too_many_arguments)]
+async fn bind(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    db: &mut Db,
+    local: &str,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    now: u64,
+) -> Result<()> {
     let mut b = unbound(local, dev, fleet, profile);
     // Checked before the server is asked, and again with the insert, so the
-    // UNIQUE constraint is never the error shown.
+    // UNIQUE constraint is never the error shown. A re-seal row is no binding
+    // here; a join removes a leftover one first.
     let taken = |c: &rusqlite::Connection| -> Result<()> {
         let taken: bool = c.query_row(
             "SELECT EXISTS (SELECT 1 FROM profile_bindings
-               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3)",
+               WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
+                 AND local_profile_id NOT GLOB 'reseal:*')",
             params![
                 hex(&dev.pin.0.server_instance_id),
                 hex(&dev.pin.0.tenant_id),
@@ -2576,11 +2600,11 @@ pub(crate) async fn join(
         Ok(())
     };
     taken(&db.conn)?;
-    let generation = ledger::highest_generation(&db, &dev.pin.0, &fleet)?
+    let generation = ledger::highest_generation(db, &dev.pin.0, &fleet)?
         .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
-    let fkek = verified_key(&db, dev, &fleet, generation, None, now)?;
+    let fkek = verified_key(db, dev, &fleet, generation, None, now)?;
     let fkek_key_id = shardx_core::fleet_grants::fkek_key_id(&fkek);
-    b.server = key_server(&db, &b, generation, &fkek_key_id)?;
+    b.server = key_server(db, &b, generation, &fkek_key_id)?;
     let (epoch, listed) = listing(client, access, &b).await?;
     let listed = listed.ok_or_else(|| anyhow!(code("sync.profileNotListed")))?;
     let accepted: Option<i64> = db
@@ -2631,8 +2655,7 @@ pub(crate) async fn join(
         )?;
         tx.commit()?;
     }
-    drop(db);
-    pull(client, access, dev, local, udd, now).await
+    Ok(())
 }
 
 /// Builds the request of a new publish and stores it, PENDING, unsent.
@@ -4552,9 +4575,10 @@ async fn walked(
     // ask for the signer of every head the walk reads.
     // shortcut: each manifest is read twice; pass them to `walk` if a long
     // walk shows up in profiling.
-    // shortcut: the server takes at most 64 signers (`MAX_SIGNERS`) and a
-    // page at most `MAX_PAGE_CONTAINERS` (1024) keys, both refused fail-closed;
-    // fetch the evidence in batches of signers once a walk can span more.
+    // shortcut: the server takes at most 64 signers (`MAX_SIGNERS`), so a
+    // walk naming more fails closed here, and a page at most
+    // `MAX_PAGE_CONTAINERS` (1024) keys, refused fail-closed; fetch the
+    // evidence in batches of signers once a walk can span more (v2.11).
     let mut signers = std::collections::BTreeSet::new();
     for v in b.version.max(1)..=head.current_version {
         signers.insert(
@@ -4562,6 +4586,9 @@ async fn walked(
                 .await?
                 .signer_signing_key_id(),
         );
+    }
+    if signers.len() > crate::fleet_custody::MAX_SIGNERS {
+        bail!(code("sync.walkTooManySigners"));
     }
     let signers: Vec<[u8; 32]> = signers.into_iter().collect();
     // D12: a closure this walk triggers names its head signers too.
@@ -5013,6 +5040,467 @@ pub(crate) async fn pull(
         pin(db, dev, &b, head, &p, &w.accepted, &w.read, lift, now)
     })
     .await
+}
+
+// ------------------------------------------------------------- re-seal ----
+
+/// The binding a re-seal makes for a listed profile no binding here names
+/// (v2.10 4.S): walked and pinned without a restore, removed once its
+/// outcome is final. Every reader that lists profiles leaves it out
+/// (`NOT GLOB 'reseal:*'`).
+fn reseal_row(profile: &[u8; 16]) -> String {
+    format!("reseal:{}", hex(profile))
+}
+
+/// The binding of `profile` under `dev`'s pinned instance and tenant, a
+/// re-seal row included: the UNIQUE constraint allows one.
+fn local_of(db: &Db, dev: &Device, profile: &[u8; 16]) -> Result<Option<String>> {
+    Ok(db
+        .conn
+        .query_row(
+            "SELECT local_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3",
+            params![
+                hex(&dev.pin.0.server_instance_id),
+                hex(&dev.pin.0.tenant_id),
+                hex(profile)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Whether `local` holds a lease or a pending operation: a push in flight.
+fn in_flight(db: &Db, local: &str) -> Result<bool> {
+    Ok(db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM profile_bindings
+             WHERE local_profile_id = ?1 AND lease_id IS NOT NULL)
+           OR EXISTS (SELECT 1 FROM operations
+             WHERE local_profile_id = ?1 AND state = 'PENDING')",
+        [local],
+        |r| r.get(0),
+    )?)
+}
+
+/// Removes the re-seal row of `profile` a run left, unless a push of it is
+/// in flight (`sync.resealInProgress`).
+fn drop_reseal_row(profile: &[u8; 16]) -> Result<()> {
+    let row = reseal_row(profile);
+    if !is_published(&row)? {
+        return Ok(());
+    }
+    if in_flight(&Db::open()?, &row)? {
+        bail!(code("sync.resealInProgress"));
+    }
+    unbind_removed(&row)
+}
+
+/// Removes every re-seal row whose profile has no pending outcome in `run`.
+fn drop_final_rows(run: &ResealRun) -> Result<()> {
+    let rows: Vec<String> = Db::open()?
+        .conn
+        .prepare(
+            "SELECT local_profile_id FROM profile_bindings
+             WHERE local_profile_id GLOB 'reseal:*'",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for row in rows {
+        let id = row.trim_start_matches("reseal:");
+        if run.profiles.get(id).is_some_and(|o| reseal_pending(o)) {
+            continue;
+        }
+        if let Err(e) = unbind_removed(&row) {
+            eprintln!("[reseal] profile {id}: row kept ({})", first_code(&e));
+        }
+    }
+    Ok(())
+}
+
+/// An outcome a later run resumes: `walking`, or `sealing:<version>:<head>`
+/// saved right before the head at `version` is sealed again.
+pub(crate) fn reseal_pending(outcome: &str) -> bool {
+    outcome == "walking" || outcome.starts_with("sealing:")
+}
+
+/// The version and head a `sealing:` outcome saved.
+fn sealing_base(outcome: &str) -> Option<(u64, [u8; 32])> {
+    let (v, h) = outcome.strip_prefix("sealing:")?.split_once(':')?;
+    Some((
+        v.parse().ok()?,
+        crate::fleet_client::decode_hex32(h, "head").ok()?,
+    ))
+}
+
+/// The first error code `e` carries, for a `skipped:error:<code>` outcome
+/// and the `[reseal]` log: a code, never the message.
+fn first_code(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    text.split("[[shardx:")
+        .nth(1)
+        .and_then(|r| r.split(['|', ']']).next())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+const IN_USE: &str = "skipped:in-use";
+const QUARANTINED: &str = "skipped:quarantined";
+
+/// Re-seal all profiles (v2.10 4.S) as the tenant's root custodian, or
+/// resume the run: every head this fleet lists or this device binds that is
+/// sealed under a generation below the highest verified one, `G`, or signed
+/// by `outgoing` (a hand-over's outgoing custodian) is opened from its
+/// ciphertext and committed again under `G` through the ops journal, with no
+/// profile folder; never a second commit for one profile, on resume either.
+/// A bound profile is held by `claim` for its step (`None`: running); one in
+/// use, in error or quarantined, or whose head no key here opens, is skipped
+/// and listed. Each outcome is saved through `save` before its step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reseal_all(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    fleet: [u8; 16],
+    outgoing: Option<[u8; 32]>,
+    claim: &(dyn Fn(&str) -> Option<Box<dyn Send>> + Sync),
+    now: u64,
+    save: &mut (dyn FnMut(&FleetCustodyState) -> Result<()> + Send),
+) -> Result<ResealRun> {
+    let started = std::time::Instant::now();
+    let root = crate::root_bootstrap::load()?;
+    let custodian = root.activated
+        && root
+            .tenant_id
+            .eq_ignore_ascii_case(&hex(&dev.pin.0.tenant_id))
+        && root.device_id.eq_ignore_ascii_case(&hex(&dev.me.device_id))
+        && crate::root_bootstrap::current_root_grant(&root, &dev.signer).is_ok();
+    if !custodian {
+        bail!(code("sync.resealNotCustodian"));
+    }
+    let mut state = crate::fleet_custody::load()?;
+    if !state.handed_over_to.is_empty() {
+        bail!(code("fleet.custodyHandedOver"));
+    }
+    let g = {
+        let db = Db::open()?;
+        let g = ledger::highest_generation(&db, &dev.pin.0, &fleet)?
+            .ok_or_else(|| anyhow!(code("sync.noVerifiedFleetKey")))?;
+        verified_key(&db, dev, &fleet, g, None, now)?;
+        if ledger::commit_blocked(&db, &dev.pin.0, &dev.pin.1, &fleet, g)? {
+            bail!(code("sync.commitBlockedCompromised"));
+        }
+        g
+    };
+    // A run of `G` with pending outcomes resumes its list; a new run lists
+    // what the fleet lists and this device binds, keeping what an earlier
+    // run left pending, and saves that list once.
+    let mut run = match state.reseal.take() {
+        Some(r) if r.generation == g && r.profiles.values().any(|o| reseal_pending(o)) => r,
+        previous => {
+            let mut ids = std::collections::BTreeSet::new();
+            fleet_pages(client, access, &unbound("", dev, fleet, [0; 16]), |p| {
+                ids.insert(hex(&p.profile_id));
+                true
+            })
+            .await?;
+            let db = Db::open()?;
+            let bound: Vec<String> = db
+                .conn
+                .prepare(
+                    "SELECT remote_profile_id FROM profile_bindings
+                     WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+                       AND local_profile_id NOT GLOB 'reseal:*'",
+                )?
+                .query_map(
+                    params![
+                        hex(&dev.pin.0.server_instance_id),
+                        hex(&dev.pin.0.tenant_id),
+                        hex(&fleet)
+                    ],
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            ids.extend(bound);
+            let mut profiles: std::collections::BTreeMap<String, String> = previous
+                .map(|r| r.profiles)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, o)| reseal_pending(o))
+                .collect();
+            for id in ids {
+                profiles.entry(id).or_insert_with(|| "walking".into());
+            }
+            ResealRun {
+                generation: g,
+                outgoing: outgoing.map(|k| hex(&k)).unwrap_or_default(),
+                started_ms: now,
+                ended_ms: None,
+                profiles,
+            }
+        }
+    };
+    run.ended_ms = None;
+    // A resumed run keeps the outgoing custodian it started with.
+    let outgoing = (!run.outgoing.is_empty())
+        .then(|| crate::fleet_client::decode_hex32(&run.outgoing, "outgoing"))
+        .transpose()?;
+    let ids: Vec<String> = run
+        .profiles
+        .iter()
+        .filter(|(_, o)| reseal_pending(o))
+        .map(|(id, _)| id.clone())
+        .collect();
+    eprintln!("[reseal] generation {g}: {} profiles to check", ids.len());
+    drop_final_rows(&run)?;
+    state.reseal = Some(run);
+    save(&state)?;
+    for id in ids {
+        let profile = decode_hex16(&id, "remote_profile_id")?;
+        let outcome_now = |s: &FleetCustodyState| {
+            s.reseal
+                .as_ref()
+                .and_then(|r| r.profiles.get(&id).cloned())
+                .unwrap_or_default()
+        };
+        let saved = outcome_now(&state);
+        let mut mark = |o: &str| -> Result<()> {
+            if let Some(r) = state.reseal.as_mut() {
+                r.profiles.insert(id.clone(), o.to_string());
+            }
+            save(&state)
+        };
+        let step = reseal_one(
+            client, access, dev, fleet, profile, g, outgoing, claim, &saved, now, &mut mark,
+        )
+        .await;
+        let outcome = match step {
+            Ok(o) => o,
+            Err(e) => {
+                let pending = outcome_now(&state);
+                let db = Db::open()?;
+                let flying = match local_of(&db, dev, &profile)? {
+                    Some(local) => in_flight(&db, &local)?,
+                    None => false,
+                };
+                eprintln!("[reseal] profile {id}: {}", first_code(&e));
+                // A push the journal resumes stays pending: the next run
+                // resends its stored requests.
+                if pending.starts_with("sealing:") && flying {
+                    pending
+                } else {
+                    format!("skipped:error:{}", first_code(&e))
+                }
+            }
+        };
+        eprintln!("[reseal] profile {id}: {outcome}");
+        if let Some(r) = state.reseal.as_mut() {
+            r.profiles.insert(id.clone(), outcome);
+        }
+        save(&state)?;
+    }
+    let mut run = state.reseal.clone().unwrap_or_default();
+    drop_final_rows(&run)?;
+    run.ended_ms = Some(now + started.elapsed().as_millis() as u64);
+    let left = run.profiles.values().filter(|o| reseal_pending(o)).count();
+    eprintln!("[reseal] generation {g}: done, {left} pending");
+    state.reseal = Some(run.clone());
+    save(&state)?;
+    Ok(run)
+}
+
+/// One profile of [`reseal_all`]: its outcome. An error before its push, or
+/// a push left in flight, is the caller's to file.
+#[allow(clippy::too_many_arguments)]
+async fn reseal_one(
+    client: &FleetClient,
+    access: &str,
+    dev: &Device,
+    fleet: [u8; 16],
+    profile: [u8; 16],
+    g: u64,
+    outgoing: Option<[u8; 32]>,
+    claim: &(dyn Fn(&str) -> Option<Box<dyn Send>> + Sync),
+    saved: &str,
+    now: u64,
+    mark: &mut (dyn FnMut(&str) -> Result<()> + Send),
+) -> Result<String> {
+    let mut db = Db::open()?;
+    let ours = saved.starts_with("sealing:");
+    let mut _held = None;
+    let local = match local_of(&db, dev, &profile)? {
+        Some(local) if !local.starts_with("reseal:") => {
+            let Some(guard) = claim(&local) else {
+                return Ok(IN_USE.into());
+            };
+            _held = Some(guard);
+            let b = bound(&db, &local)?;
+            let flying = in_flight(&db, &local)?;
+            if !(ours && flying) {
+                if b.state == "QUARANTINED" {
+                    return Ok(QUARANTINED.into());
+                }
+                if let Some(e) = &b.error {
+                    return Ok(format!("skipped:error:{e}"));
+                }
+                let changed: bool = db.conn.query_row(
+                    "SELECT dirty OR base_version < remote_version FROM profile_bindings
+                     WHERE local_profile_id = ?1",
+                    [&local],
+                    |r| r.get(0),
+                )?;
+                if flying || changed {
+                    return Ok(IN_USE.into());
+                }
+            }
+            local
+        }
+        Some(row) => row,
+        None => {
+            let row = reseal_row(&profile);
+            bind(client, access, dev, &mut db, &row, fleet, profile, now).await?;
+            row
+        }
+    };
+    let mut b = bound(&db, &local)?;
+    let plaintext = if ours && in_flight(&db, &local)? {
+        // A crash mid-push: the journal resumes as stored. The head it seals
+        // is still the pin, opened again for an upload not yet sealed.
+        let m = manifest(client, access, &b, b.version).await?;
+        if Some(m.head_hash()) != b.head {
+            return Err(bad("current_signed_head_hash"));
+        }
+        let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
+            .map_err(|_| bad("manifest"))?;
+        let fkek = readable_key(
+            &db,
+            dev,
+            &fleet,
+            p.key_generation,
+            Some(&p.fkek_key_id),
+            now,
+        )?;
+        opened(client, access, &b, &p, fkek).await?
+    } else {
+        if awaits_transition(&b) {
+            accept_transitions(client, access, dev, &mut db, &b, now).await?;
+            b = bound(&db, &local)?;
+        }
+        if b.state == "QUARANTINED" {
+            return Ok(QUARANTINED.into());
+        }
+        let head = match listed(client, access, &mut db, &b).await {
+            // A listing that shows a restore quarantines; it is accepted at once.
+            Err(_) if awaits_transition(&bound(&db, &local)?) => {
+                b = bound(&db, &local)?;
+                accept_transitions(client, access, dev, &mut db, &b, now).await?;
+                b = bound(&db, &local)?;
+                listed(client, access, &mut db, &b).await?
+            }
+            head => head?,
+        };
+        if head.current_version == 0 {
+            return Ok("current".into());
+        }
+        let w = match walked(client, access, &mut db, dev, &b, &head, now).await {
+            Ok(w) => w,
+            Err(_) if bound(&db, &local)?.state == "QUARANTINED" => return Ok(QUARANTINED.into()),
+            Err(e) => return Ok(format!("skipped:error:{}", first_code(&e))),
+        };
+        // Rule 6: an open run is a revert's to close, never a re-seal's.
+        if !w.open.is_empty() {
+            return Ok(QUARANTINED.into());
+        }
+        let Some((at, p)) = w.anchor else {
+            return Err(bad("manifest"));
+        };
+        // 4.S step 4: this run's commit, whose reply or state write was lost.
+        if let Some((v, h)) = sealing_base(saved) {
+            if at.version == v + 1
+                && at.previous == Some(h)
+                && at.signer == dev.me.signing_key_id
+                && p.key_generation == g
+            {
+                return Ok(format!("resealed:{}", at.version));
+            }
+        }
+        if p.key_generation >= g && outgoing != Some(at.signer) {
+            return Ok("current".into());
+        }
+        let Ok(fkek) = readable_key(
+            &db,
+            dev,
+            &fleet,
+            p.key_generation,
+            Some(&p.fkek_key_id),
+            now,
+        ) else {
+            return Ok("skipped:older-key-not-held".into());
+        };
+        if at.version != b.version {
+            // A bound copy behind the head holds data a pull would replace.
+            if !local.starts_with("reseal:") {
+                return Ok(IN_USE.into());
+            }
+            let lift = !w.accepted.is_empty();
+            pin(
+                &mut db,
+                dev,
+                &b,
+                (at.hash, at.signer),
+                &p,
+                &w.accepted,
+                &w.read,
+                lift,
+                now,
+            )?;
+            // No restore follows, so no swap is pending.
+            db.conn.execute(
+                "DELETE FROM revert_swaps WHERE local_profile_id = ?1",
+                [&local],
+            )?;
+            b = bound(&db, &local)?;
+        }
+        // A restore transition accepted above moves the pin and not
+        // `base_version`: the copy is then behind the head, and a commit on
+        // it would clear the mark that makes the next push ask for a Pull.
+        let behind: bool = db.conn.query_row(
+            "SELECT base_version < remote_version FROM profile_bindings
+             WHERE local_profile_id = ?1",
+            [&local],
+            |r| r.get(0),
+        )?;
+        if behind && !local.starts_with("reseal:") {
+            return Ok(IN_USE.into());
+        }
+        mark(&format!("sealing:{}:{}", at.version, hex(&at.hash)))?;
+        opened(client, access, &b, &p, fkek).await?
+    };
+    drop(db);
+    let started = std::time::Instant::now();
+    let clock = || started.elapsed();
+    let src = Plain::Opened(&plaintext);
+    match push_inner(client, access, dev, &local, src, now, &clock, None).await {
+        Ok(pushed) => Ok(format!("resealed:{}", pushed.version)),
+        Err(e) if in_flight(&Db::open()?, &local)? => Err(e),
+        Err(e) => {
+            let text = format!("{e:#}");
+            if text.contains("LEASE_HELD") || crate::errcode::has_code(&text, "sync.remoteAhead") {
+                Ok(IN_USE.into())
+            } else {
+                Ok(format!("skipped:error:{}", first_code(&e)))
+            }
+        }
+    }
+}
+
+/// Checks out the published `local` as a push does and keeps the lease: a
+/// lease another device holds, for the real-server tests.
+#[cfg(test)]
+pub(crate) async fn check_out(client: &FleetClient, access: &str, local: &str) -> Result<()> {
+    let mut db = Db::open()?;
+    let b = bound(&db, local)?;
+    let now = crate::root_bootstrap::now_ms();
+    checkout(client, access, &mut db, &b, false, now).await
 }
 
 #[cfg(test)]
@@ -11858,7 +12346,11 @@ mod tests {
                 .filter(|c| c.starts_with("POST") && c.ends_with(tail))
                 .count()
         };
-        assert_eq!((posts("/checkout"), posts("/commit")), (1, 1), "{calls:?}");
+        assert_eq!(
+            (posts("/checkout"), posts("/uploads"), posts("/commit")),
+            (1, 1, 1),
+            "{calls:?}"
+        );
         let m = SignedSnapshotManifestV2::parse(&w.fake().manifests[&2]).unwrap();
         let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
         assert_eq!((p.key_generation, p.base_version), (GEN + 1, 1));
@@ -11870,6 +12362,736 @@ mod tests {
         let out = d.path().join("out");
         w.pull(&out).unwrap();
         assert_eq!((marker(&out), noise(&out)), files);
+    }
+
+    // ------------------------------------------------ re-seal (v2.10 U3) ----
+
+    /// Makes this config root's device the tenant's root custodian: an
+    /// activated root state whose first self-grant names `w.me`.
+    fn make_custodian(w: &World) {
+        let cx = crate::root_bootstrap::Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: w.me.to.account_id,
+            device: w.me.to.device_id,
+            signing_key_id: w.me.to.signing_key_id,
+            hpke_key_id: w.me.to.hpke_key_id,
+        };
+        let grant = crate::root_bootstrap::self_grant(
+            &cx,
+            &w.me.sk,
+            &w.me.hpke_pk,
+            &[0x33; 32],
+            [0x44; 16],
+            NOW,
+        )
+        .unwrap();
+        crate::root_bootstrap::save(&crate::root_bootstrap::BootstrapState {
+            tenant_id: hex(&TENANT),
+            device_id: hex(&w.me.to.device_id),
+            server_instance_id: hex(&INSTANCE),
+            activated: true,
+            anchor: hex(&w.me.to.signing_key_id),
+            self_grant: hex(&grant),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// Lets every profile be claimed, as a stopped one is.
+    fn free(_: &str) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+
+    impl World {
+        fn reseal(&self, outgoing: Option<[u8; 32]>) -> Result<ResealRun> {
+            self.reseal_with(outgoing, &free, &mut |s| crate::fleet_custody::save(s))
+        }
+
+        fn reseal_with(
+            &self,
+            outgoing: Option<[u8; 32]>,
+            claim: &(dyn Fn(&str) -> Option<Box<dyn Send>> + Sync),
+            save: &mut (dyn FnMut(&FleetCustodyState) -> Result<()> + Send),
+        ) -> Result<ResealRun> {
+            self.rt.block_on(reseal_all(
+                &self.client,
+                "t",
+                &self.dev,
+                FLEET,
+                outgoing,
+                claim,
+                NOW,
+                save,
+            ))
+        }
+
+        /// How many `POST`s ending with `tail` the fake served.
+        fn posts(&self, tail: &str) -> usize {
+            self.sent("POST", tail).len()
+        }
+
+        /// The outcome the latest run saved for `PROFILE`.
+        fn outcome(&self) -> String {
+            crate::fleet_custody::load()
+                .unwrap()
+                .reseal
+                .unwrap()
+                .profiles[&hex(&PROFILE)]
+                .clone()
+        }
+
+        fn manifest_at(&self, v: u64) -> (SnapshotManifestV2, [u8; 32]) {
+            let m = SignedSnapshotManifestV2::parse(&self.fake().manifests[&v]).unwrap();
+            let p = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes()).unwrap();
+            (p, *m.signer_signing_key_id())
+        }
+    }
+
+    /// A custodian device with no binding of `PROFILE`, holding `GEN` and
+    /// `GEN + 1`, after `w` pushed what it holds: the config root.
+    fn unbound_custodian(w: &World) -> tempfile::TempDir {
+        let d = second(w);
+        rotate(w);
+        w.db()
+            .conn
+            .execute("DELETE FROM profile_bindings", [])
+            .unwrap();
+        make_custodian(w);
+        d
+    }
+
+    /// 4.S: a head another member signed under `GEN` is committed again
+    /// under `GEN + 1` by the custodian, from its ciphertext, through one
+    /// checkout, upload and commit; the re-seal row and its swap are gone
+    /// afterwards, and a device holding only `GEN + 1` reads the head.
+    #[test]
+    fn a_reseal_moves_every_listed_head_to_the_active_generation_signed_by_the_custodian() {
+        let w = world();
+        push_next(&w);
+        let files = (marker(&w.udd), noise(&w.udd));
+        relink(&w, &[(&author(), GEN)]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let _d = unbound_custodian(&w);
+        let before = w.fake().log.len();
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:2");
+        assert_eq!(run.generation, GEN + 1);
+        assert!(run.ended_ms.is_some());
+        let calls: Vec<String> = w.fake().log[before..]
+            .iter()
+            .map(|(c, _)| c.clone())
+            .collect();
+        let posts = |tail: &str| {
+            calls
+                .iter()
+                .filter(|c| c.starts_with("POST") && c.ends_with(tail))
+                .count()
+        };
+        assert_eq!(
+            (posts("/checkout"), posts("/uploads"), posts("/commit")),
+            (1, 1, 1),
+            "{calls:?}"
+        );
+        let (p, signer) = w.manifest_at(2);
+        assert_eq!((p.key_generation, p.base_version), (GEN + 1, 1));
+        assert_eq!(signer, w.me.to.signing_key_id);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        assert_eq!(w.count("SELECT count(*) FROM revert_swaps"), 0);
+        // A third device that holds only `GEN + 1`.
+        let third = second(&w);
+        rotate(&w);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        assert!(crate::fleet_keys::collect(&hex(&FLEET), GEN + 1, &K2).unwrap());
+        let out = third.path().join("out");
+        w.pull(&out).unwrap();
+        assert_eq!((marker(&out), noise(&out)), files);
+    }
+
+    /// A bound, clean profile at the head is re-sealed through its own
+    /// binding with its folder gone: nothing reads or writes it.
+    #[test]
+    fn a_reseal_needs_no_profile_folder() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        std::fs::remove_dir_all(&w.udd).unwrap();
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:2");
+        assert!(!w.udd.exists(), "no folder was made");
+        assert_eq!(w.manifest_at(2).0.key_generation, GEN + 1);
+        available_at(&w, 2, w.head_of(2));
+    }
+
+    #[test]
+    fn a_reseal_skips_a_quarantined_binding() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET sync_state = 'QUARANTINED',
+                   last_error_code = 'HEAD_ROLLBACK_DETECTED'",
+                [],
+            )
+            .unwrap();
+        let checkouts = w.posts("/checkout");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:quarantined");
+        assert_eq!(w.posts("/checkout"), checkouts);
+    }
+
+    /// Rule 6: a run of a withdrawn signer's heads open at the listed head
+    /// is a revert's to close; the re-seal lists it as quarantined and
+    /// commits nothing.
+    #[test]
+    fn a_reseal_never_closes_an_open_run() {
+        let w = world();
+        push_next(&w);
+        push_next(&w);
+        relink(&w, &[(&w.me.sk, GEN), (&author(), GEN)]);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let _d = unbound_custodian(&w);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, true, false));
+        let checkouts = w.posts("/checkout");
+        let commits = w.posts("/commit");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:quarantined");
+        assert_eq!(w.posts("/checkout"), checkouts);
+        assert_eq!(w.posts("/commit"), commits);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    #[test]
+    fn a_reseal_skips_an_untrusted_signers_head() {
+        let w = world();
+        push_next(&w);
+        relink(&w, &[(&author(), GEN)]);
+        let _d = unbound_custodian(&w);
+        let checkouts = w.posts("/checkout");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(
+            run.profiles[&hex(&PROFILE)],
+            "skipped:error:sync.signerUntrusted"
+        );
+        assert_eq!(w.posts("/checkout"), checkouts);
+    }
+
+    /// Another device's lease refuses the checkout: listed as in use, and
+    /// the re-seal row goes. A lease held here skips a bound profile.
+    #[test]
+    fn a_leased_profile_is_skipped_and_listed() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        w.fake().refused_body = Some(br#"{"code":"LEASE_HELD"}"#.to_vec());
+        w.fake().refuse.push(("checkout", 409));
+        let commits = w.posts("/commit");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use");
+        assert_eq!(w.posts("/commit"), commits);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+        drop(w);
+
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET lease_id = ?1, fencing_token = 1,
+                   lease_expires_at = '2030-01-01T00:00:00.000Z'",
+                [hex(&[0xaa; 16])],
+            )
+            .unwrap();
+        let checkouts = w.posts("/checkout");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use");
+        assert_eq!(w.posts("/checkout"), checkouts);
+    }
+
+    #[test]
+    fn a_dirty_or_behind_bound_profile_is_skipped_and_listed() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        let checkouts = w.posts("/checkout");
+        for sql in [
+            "UPDATE profile_bindings SET dirty = 1",
+            "UPDATE profile_bindings SET dirty = 0, base_version = 0",
+        ] {
+            w.db().conn.execute(sql, []).unwrap();
+            let run = w.reseal(None).unwrap();
+            assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use", "{sql}");
+        }
+        assert_eq!(w.posts("/checkout"), checkouts);
+    }
+
+    #[test]
+    fn a_running_profile_is_skipped() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        let running = |local: &str| (local != LOCAL).then(|| Box::new(()) as Box<dyn Send>);
+        let checkouts = w.posts("/checkout");
+        let run = w
+            .reseal_with(None, &running, &mut |s| crate::fleet_custody::save(s))
+            .unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use");
+        assert_eq!(w.posts("/checkout"), checkouts);
+    }
+
+    #[test]
+    fn a_head_already_under_the_active_generation_is_current() {
+        let w = world();
+        rotate(&w);
+        push_next(&w);
+        make_custodian(&w);
+        let commits = w.fake().commits;
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "current");
+        assert_eq!(w.fake().commits, commits);
+    }
+
+    /// D5: during a hand-over a head the outgoing custodian signed is sealed
+    /// again even under the active generation, so it no longer depends on
+    /// that key; without `outgoing` the same head is current.
+    #[test]
+    fn a_head_signed_by_the_outgoing_custodian_is_resealed_even_under_the_active_generation() {
+        let w = world();
+        rotate(&w);
+        push_next(&w);
+        relink(&w, &[(&author(), GEN + 1)]);
+        let _d = unbound_custodian(&w);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        assert_eq!(w.reseal(None).unwrap().profiles[&hex(&PROFILE)], "current");
+        let run = w.reseal(Some(key_id_of(&author()))).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:2");
+        assert_eq!(run.outgoing, hex(&key_id_of(&author())));
+        let (p, signer) = w.manifest_at(2);
+        assert_eq!(
+            (p.key_generation, signer),
+            (GEN + 1, w.me.to.signing_key_id)
+        );
+    }
+
+    /// U6's appointee: a head under a generation this device never held is
+    /// listed, not opened.
+    #[test]
+    fn a_head_under_a_generation_this_device_does_not_hold_is_skipped_older_key_not_held() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        assert!(crate::fleet_keys::collect(&hex(&FLEET), GEN + 1, &K2).unwrap());
+        let checkouts = w.posts("/checkout");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:older-key-not-held");
+        assert_eq!(w.posts("/checkout"), checkouts);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    /// A walk naming more signers than one evidence request takes fails
+    /// closed, before the evidence is asked for.
+    #[test]
+    fn a_walk_over_64_signers_is_skipped_with_its_error() {
+        let w = world();
+        push_next(&w);
+        let template = w.fake().manifests[&1].clone();
+        let mut below = None;
+        for v in 1..=65u64 {
+            w.fake().manifests.insert(v, template.clone());
+            let sk = Ed25519SigningKey::from_bytes(&[0x80 + v as u8; 32]);
+            let previous = below;
+            below = Some(resign(&w, v, &sk, |p| {
+                p.target_version = v;
+                p.base_version = v - 1;
+                p.previous_signed_head_hash = previous;
+            }));
+        }
+        let _d = unbound_custodian(&w);
+        let before = w.fake().log.len();
+        let run = w.reseal(None).unwrap();
+        assert_eq!(
+            run.profiles[&hex(&PROFILE)],
+            "skipped:error:sync.walkTooManySigners"
+        );
+        let evidence = w.fake().log[before..]
+            .iter()
+            .filter(|(c, _)| c.contains("trust-evidence"))
+            .count();
+        assert_eq!(evidence, 0, "no evidence was asked for");
+    }
+
+    /// Principle 3: a reply lost at each step leaves the profile pending;
+    /// the next run resends the stored request, byte for byte (the fake
+    /// answers a changed body under the same key `IDEMPOTENCY_MISMATCH`),
+    /// and the profile ends with one commit.
+    #[test]
+    fn a_reseal_resumes_each_step_with_byte_identical_requests() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        let before = w.sent("POST", "/checkout").len();
+        for lost in ["checkout", "upload", "upload", "commit"] {
+            w.fake().lose.push(lost);
+            let run = w.reseal(None).unwrap();
+            let outcome = &run.profiles[&hex(&PROFILE)];
+            assert!(outcome.starts_with("sealing:1:"), "{lost}: {outcome}");
+            assert!(w.fake().lose.is_empty(), "{lost} was sent");
+        }
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:2");
+        assert_eq!(w.fake().commits, 2, "v1 and the one re-seal");
+        assert_eq!(
+            w.sent("POST", "/checkout").len(),
+            before + 2,
+            "one, then its replay"
+        );
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    /// 4.S step 4: a crash after the commit, before its outcome is saved,
+    /// resumes as re-sealed with no second commit.
+    #[test]
+    fn a_reseal_crash_after_commit_resumes_without_a_second_commit() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        let mut crash = |s: &FleetCustodyState| {
+            let done = s
+                .reseal
+                .as_ref()
+                .is_some_and(|r| r.profiles[&hex(&PROFILE)].starts_with("resealed"));
+            if done {
+                bail!("crash");
+            }
+            crate::fleet_custody::save(s)
+        };
+        let err = w.reseal_with(None, &free, &mut crash).unwrap_err();
+        assert_eq!(err.to_string(), "crash");
+        assert!(w.outcome().starts_with("sealing:1:"));
+        let commits = w.fake().commits;
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:2");
+        assert_eq!(w.fake().commits, commits, "no second commit");
+        assert_eq!(w.fake().version, 2);
+        assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
+    }
+
+    #[test]
+    fn a_second_run_commits_nothing_new() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        assert_eq!(
+            w.reseal(None).unwrap().profiles[&hex(&PROFILE)],
+            "resealed:2"
+        );
+        let posts = w.sent("POST", "").len();
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "current");
+        assert_eq!(w.sent("POST", "").len(), posts, "nothing was written");
+    }
+
+    #[test]
+    fn a_reseal_under_a_q18_block_is_refused() {
+        let w = world();
+        push_next(&w);
+        make_custodian(&w);
+        w.db().conn.execute_batch(&a_compromise(&w)).unwrap();
+        let err = w.reseal(None).unwrap_err();
+        assert!(has(&err, "sync.commitBlockedCompromised"), "{err:#}");
+        assert!(crate::fleet_custody::load().unwrap().reseal.is_none());
+    }
+
+    #[test]
+    fn a_reseal_refuses_without_the_verified_active_key() {
+        let w = world();
+        push_next(&w);
+        make_custodian(&w);
+        crate::fleet_keys::save(&crate::fleet_keys::FleetKeyStore::default()).unwrap();
+        let before = w.fake().log.len();
+        let err = w.reseal(None).unwrap_err();
+        assert!(has(&err, "sync.noVerifiedFleetKey"), "{err:#}");
+        assert_eq!(w.fake().log.len(), before, "nothing was asked");
+    }
+
+    /// Only the root custodian re-seals: a member has no root state, and a
+    /// root state of another device is not this one's.
+    #[test]
+    fn a_member_cannot_reseal() {
+        let w = world();
+        push_next(&w);
+        let err = w.reseal(None).unwrap_err();
+        assert!(has(&err, "sync.resealNotCustodian"), "{err:#}");
+        make_custodian(&w);
+        let mut other = crate::root_bootstrap::load().unwrap();
+        other.device_id = hex(&[0x99; 16]);
+        crate::root_bootstrap::save(&other).unwrap();
+        let err = w.reseal(None).unwrap_err();
+        assert!(has(&err, "sync.resealNotCustodian"), "{err:#}");
+        assert!(crate::fleet_custody::load().unwrap().reseal.is_none());
+    }
+
+    #[test]
+    fn a_handed_over_root_cannot_reseal() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        make_custodian(&w);
+        let state = crate::fleet_custody::FleetCustodyState {
+            handed_over_to: hex(&[0x99; 16]),
+            ..Default::default()
+        };
+        crate::fleet_custody::save(&state).unwrap();
+        let err = w.reseal(None).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err:#}");
+        assert_eq!(w.fake().commits, 1);
+    }
+
+    /// The `reseal:` row a run holds is no profile of this device: no status,
+    /// no label binding, no downgrade blocker of its own and no older-key
+    /// entry. Its lease still blocks a downgrade.
+    #[test]
+    fn reseal_rows_are_absent_from_statuses_labels_downgrade_readiness_and_the_older_key_list() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        let unfinished = || {
+            crate::team::downgrade::readiness()
+                .unwrap()
+                .blockers
+                .iter()
+                .find(|b| b.code == "downgrade.blockUnfinishedBinding")
+                .map_or(0, |b| b.count)
+        };
+        let before = unfinished();
+        let head = w.head_of(1);
+        w.fake().others = vec![other(PROFILE2, 1, head)];
+        w.db()
+            .conn
+            .execute(
+                "INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                   tenant_id, account_id, device_id, fleet_id, remote_profile_id,
+                   remote_version, base_version, last_observed_head_hash,
+                   accepted_restore_epoch, fkek_key_id, key_generation, sync_state, dirty)
+                 SELECT ?1, server_id, server_instance_id, tenant_id, account_id, device_id,
+                   fleet_id, ?2, 1, 1, ?3, 0, fkek_key_id, ?4, 'AVAILABLE', 0
+                 FROM profile_bindings WHERE local_profile_id = ?5",
+                params![
+                    reseal_row(&PROFILE2),
+                    hex(&PROFILE2),
+                    head.to_vec(),
+                    GEN as i64,
+                    LOCAL
+                ],
+            )
+            .unwrap();
+        let ids: Vec<String> = statuses(NOW)
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|p| p.profile_id)
+            .collect();
+        assert_eq!(ids, [LOCAL]);
+        let older: Vec<String> = under_older_key(&w.dev.pin.0)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.profile_id)
+            .collect();
+        assert_eq!(older, [LOCAL]);
+        let bound: Vec<Option<String>> = w.labels().into_iter().map(|l| l.3).collect();
+        assert_eq!(bound, [Some(LOCAL.to_string()), None]);
+        assert_eq!(unfinished(), before);
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET lease_id = 'aa', fencing_token = 1,
+                   lease_expires_at = '2030-01-01T00:00:00.000Z'
+                 WHERE local_profile_id GLOB 'reseal:*'",
+                [],
+            )
+            .unwrap();
+        let leases = crate::team::downgrade::readiness()
+            .unwrap()
+            .blockers
+            .iter()
+            .find(|b| b.code == "downgrade.blockLease")
+            .map_or(0, |b| b.count);
+        assert_eq!(leases, 1, "a re-seal lease still blocks");
+    }
+
+    /// The UNIQUE row a crashed run left does not refuse a join of its
+    /// profile: the join removes it first. One still in flight refuses.
+    #[test]
+    fn a_leftover_reseal_row_does_not_block_join() {
+        let (w, d) = joinable();
+        let leftover = |lease: bool| {
+            w.db()
+                .conn
+                .execute(
+                    "INSERT INTO profile_bindings(local_profile_id, server_id,
+                       server_instance_id, tenant_id, account_id, device_id, fleet_id,
+                       remote_profile_id, remote_version, base_version, accepted_restore_epoch,
+                       fkek_key_id, key_generation, sync_state, dirty, lease_id, fencing_token,
+                       lease_expires_at)
+                     SELECT ?1, k.server_id, k.server_instance_id, k.tenant_id, d.account_id,
+                       k.device_id, k.fleet_id, ?2, 0, 0, 0, k.fkek_key_id, k.generation,
+                       'AVAILABLE', 0, ?3, ?4, ?5
+                     FROM fleet_key_state k
+                     JOIN device_state d USING (server_id, tenant_id, device_id)
+                     WHERE k.state = 'ACTIVE'",
+                    params![
+                        reseal_row(&PROFILE),
+                        hex(&PROFILE),
+                        lease.then_some("aa"),
+                        lease.then_some(1),
+                        lease.then_some("2030-01-01T00:00:00.000Z")
+                    ],
+                )
+                .unwrap();
+        };
+        leftover(true);
+        let out = d.path().join("joined");
+        let err = w.join(LOCAL, PROFILE, &out).unwrap_err();
+        assert!(has(&err, "sync.resealInProgress"), "{err:#}");
+        w.db()
+            .conn
+            .execute("DELETE FROM profile_bindings", [])
+            .unwrap();
+        leftover(false);
+        assert!(w.join(LOCAL, PROFILE, &out).unwrap() > 0);
+        assert_eq!(noise(&out), noise(&w.udd));
+        assert_eq!(
+            w.count("SELECT count(*) FROM profile_bindings WHERE local_profile_id GLOB 'reseal:*'"),
+            0
+        );
+    }
+
+    /// No key reaches the run's state or the spool: neither `FKEK`, `K2`
+    /// nor this device's seeds, raw or hex.
+    #[test]
+    fn the_reseal_state_and_spool_hold_no_key_bytes() {
+        let w = world();
+        push_next(&w);
+        let _d = unbound_custodian(&w);
+        w.fake().lose.push("commit");
+        w.reseal(None).unwrap();
+        let mut held = vec![std::fs::read(crate::store::fleet_custody_path().unwrap()).unwrap()];
+        let spool = crate::store::config_root()
+            .unwrap()
+            .join("team-sync")
+            .join("spool");
+        assert!(spool.read_dir().unwrap().count() > 0, "a spooled upload");
+        for f in spool.read_dir().unwrap() {
+            held.push(std::fs::read(f.unwrap().path()).unwrap());
+        }
+        w.reseal(None).unwrap();
+        held.push(std::fs::read(crate::store::fleet_custody_path().unwrap()).unwrap());
+        let secrets: Vec<Vec<u8>> = [
+            FKEK.to_vec(),
+            K2.to_vec(),
+            [1; 32].to_vec(),
+            [7; 32].to_vec(),
+        ]
+        .into_iter()
+        .flat_map(|k| [hex(&k).into_bytes(), k])
+        .collect();
+        for bytes in &held {
+            for s in &secrets {
+                assert!(
+                    !bytes.windows(s.len()).any(|x| x == s.as_slice()),
+                    "a key reached the re-seal state or spool"
+                );
+            }
+        }
+    }
+
+    /// A restore transition the re-seal accepts moves a bound pin to a head
+    /// another device committed, past the data this copy holds
+    /// (`base_version < remote_version`): the profile is skipped as in use
+    /// before it is marked for sealing or opened, nothing is sent, and the
+    /// copy stays behind so its next push asks for a Pull.
+    #[test]
+    fn a_bound_profile_whose_restore_transition_moves_the_pin_past_its_data_is_skipped() {
+        let w = world();
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        // A joined copy whose first pull never landed: no pin and no data.
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET remote_version = 0, base_version = 0,
+                   last_observed_head_hash = NULL",
+                [],
+            )
+            .unwrap();
+        w.fake().restore(1);
+        let leaves = [leaf(PROFILE, h2, h1)];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        rotate(&w);
+        make_custodian(&w);
+        let (checkouts, commits) = (w.posts("/checkout"), w.posts("/commit"));
+        let reads = w.sent("GET", "/snapshots/1").len();
+        let mut sealing = false;
+        let run = w
+            .reseal_with(None, &free, &mut |s| {
+                let p = s.reseal.as_ref().map(|r| r.profiles.get(&hex(&PROFILE)));
+                sealing |= p.flatten().is_some_and(|o| o.starts_with("sealing:"));
+                crate::fleet_custody::save(s)
+            })
+            .unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use");
+        assert!(!sealing, "never marked for sealing");
+        assert_eq!(w.sent("GET", "/snapshots/1").len(), reads, "never opened");
+        assert_eq!(
+            (w.posts("/checkout"), w.posts("/commit")),
+            (checkouts, commits)
+        );
+        let (_, _, epoch, version, _) = w.state(LOCAL);
+        assert_eq!((epoch, version), (1, 1), "the transition moved the pin");
+        assert_eq!(
+            w.count("SELECT base_version < remote_version FROM profile_bindings"),
+            1,
+            "still behind"
+        );
+    }
+
+    /// 4.S step 4 names this device's own commit only: a head on the saved
+    /// base under `G` that another device signed is current, not re-sealed.
+    #[test]
+    fn a_next_head_another_device_signed_on_the_saved_base_is_current() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        push_next(&w);
+        let heads = relink(&w, &[(&w.me.sk, GEN), (&author(), GEN + 1)]);
+        let _d = unbound_custodian(&w);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let pending = format!("sealing:1:{}", hex(&heads[0]));
+        crate::fleet_custody::save(&FleetCustodyState {
+            reseal: Some(ResealRun {
+                generation: GEN + 1,
+                profiles: [(hex(&PROFILE), pending)].into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let commits = w.posts("/commit");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "current");
+        assert_eq!(w.posts("/commit"), commits);
     }
 
     /// The generation floor: a valid head under `GEN` advancing over a pin

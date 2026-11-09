@@ -8,7 +8,7 @@ import { safeUiError } from "../../../shared/lib/utils";
 import { useProfile } from "../../../entities/profile";
 import {
   teamFleetCustodyStatus, teamFleetKeySetup, teamDevices, teamApproveDevice, teamRevokeDevice,
-  teamFleetKeyRotate, teamProfilesUnderOlderKey, teamCheckIn, useTeamProfiles,
+  teamFleetKeyRotate, teamProfilesUnderOlderKey, teamCheckIn, teamResealAll, useTeamProfiles,
   type FleetCustodyStatus, type TeamDevice, type TeamRevokeReason, type OlderKeyProfile,
 } from "../../../entities/team";
 
@@ -28,6 +28,20 @@ export const timeLeft = (until: number, now: number) => {
 };
 
 const STATUS_COLOR: Record<string, BadgeColor> = { pending: "warning", active: "success", revoked: "error" };
+
+/** A re-seal outcome the next run resumes. */
+const resealPending = (o: string) => o === "walking" || o.startsWith("sealing:");
+
+/** The locale key and values that describe a re-seal outcome (team/sync.rs `reseal_all`). */
+const resealOutcome = (o: string): [string, Record<string, string>?] => {
+  if (o.startsWith("resealed:")) return ["team.reseal.outcome.resealed", { n: o.slice("resealed:".length) }];
+  if (o === "current") return ["team.reseal.outcome.current"];
+  if (resealPending(o)) return ["team.reseal.outcome.pending"];
+  if (o === "skipped:in-use") return ["team.reseal.outcome.inUse"];
+  if (o === "skipped:quarantined") return ["team.reseal.outcome.quarantined"];
+  if (o === "skipped:older-key-not-held") return ["team.reseal.outcome.olderKeyNotHeld"];
+  return ["team.reseal.outcome.error", { code: o.replace(/^skipped:(error:)?/, "") }];
+};
 
 /**
  * The root custodian's fleet key and device list: approve a pending device
@@ -141,6 +155,39 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
       } finally {
         onFleetKey();
         void loadOlder();
+      }
+    });
+  };
+
+  const reseal = fleet?.reseal ?? null;
+  const resealUnfinished = !!reseal && Object.values(reseal.profiles).some(resealPending);
+  const resealAll = async () => {
+    const label = t(resealUnfinished ? "team.reseal.resume" : "team.reseal.run");
+    const ok = await confirmModal({
+      title: t("team.reseal.confirmTitle"),
+      message: t("team.reseal.confirm"),
+      buttons: [
+        { label: t("common.cancel"), value: false },
+        { label, value: true, danger: true },
+      ],
+    });
+    if (ok !== true) return;
+    await run("reseal", async () => {
+      const [u, p] = login();
+      try {
+        const next = await teamResealAll(u, p);
+        setFleet(next);
+        const outcomes = Object.values(next.reseal?.profiles ?? {});
+        const count = (prefix: string) => String(outcomes.filter((o) => o.startsWith(prefix)).length);
+        if (outcomes.some(resealPending)) toast.err(t("sync.resealIncomplete"));
+        else toast.ok(t("team.reseal.done", { resealed: count("resealed"), current: count("current"), skipped: count("skipped") }));
+      } catch (e) {
+        // Each outcome is saved; show where the next run resumes.
+        teamFleetCustodyStatus().then(setFleet).catch(() => {});
+        throw e;
+      } finally {
+        void loadOlder();
+        void refreshBindings();
       }
     });
   };
@@ -277,6 +324,31 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
                 ? t("team.rotation.busy")
                 : t(unfinished ? "team.rotation.resume" : "team.rotation.rotate")}
             </Button>
+          </div>
+          <div data-testid="team-reseal" className="flex flex-col gap-1.5">
+            <span className="text-label-xs text-text-strong-950">{t("team.reseal.title")}</span>
+            <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.reseal.help")}</p>
+            <div>
+              <Button
+                size="small" mode="stroke"
+                disabled={!!busy || !account.signedIn || !(ready || resealUnfinished)}
+                onClick={() => { void resealAll(); }}
+              >
+                {busy === "reseal"
+                  ? t("team.reseal.busy")
+                  : t(resealUnfinished ? "team.reseal.resume" : "team.reseal.run")}
+              </Button>
+            </div>
+            {reseal && Object.entries(reseal.profiles).map(([id, o]) => {
+              const [key, values] = resealOutcome(o);
+              // An error code reads as its message when the locale has one, else as the code.
+              const shown = values?.code ? { ...values, code: t(values.code) } : values;
+              return (
+                <p key={id} data-testid="team-reseal-profile" className="m-0 text-paragraph-xs text-text-sub-600">
+                  <span className="mono">{id.slice(0, 8)}</span> {t(key, shown)}
+                </p>
+              );
+            })}
           </div>
           {older.length > 0 && (
             <div data-testid="team-older-key" className="flex flex-col gap-1.5">
