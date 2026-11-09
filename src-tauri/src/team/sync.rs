@@ -1214,6 +1214,7 @@ async fn accept_transitions(
         async move {
             let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
                 .iter()
+                .flatten()
                 .flat_map(|p| &p.signing_public_keys)
                 .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
                 .collect();
@@ -4575,10 +4576,8 @@ async fn walked(
     // ask for the signer of every head the walk reads.
     // shortcut: each manifest is read twice; pass them to `walk` if a long
     // walk shows up in profiling.
-    // shortcut: the server takes at most 64 signers (`MAX_SIGNERS`), so a
-    // walk naming more fails closed here, and a page at most
-    // `MAX_PAGE_CONTAINERS` (1024) keys, refused fail-closed; fetch the
-    // evidence in batches of signers once a walk can span more (v2.11).
+    // ADR 0002 Q-62: the evidence is read as one listing per 64 signers, so
+    // a walk naming more than 1024 fails closed here.
     let mut signers = std::collections::BTreeSet::new();
     for v in b.version.max(1)..=head.current_version {
         signers.insert(
@@ -4587,7 +4586,7 @@ async fn walked(
                 .signer_signing_key_id(),
         );
     }
-    if signers.len() > crate::fleet_custody::MAX_SIGNERS {
+    if signers.len() > ledger::MAX_LISTED_SIGNERS {
         bail!(code("sync.walkTooManySigners"));
     }
     let signers: Vec<[u8; 32]> = signers.into_iter().collect();
@@ -4600,6 +4599,7 @@ async fn walked(
     ledger::record(db, &dev.pin.0, &seen, &chain, None, closure, now)?;
     let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
         .iter()
+        .flatten()
         .flat_map(|p| &p.signing_public_keys)
         .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
         .collect();
@@ -5617,6 +5617,7 @@ pub(crate) async fn custody_blockers(
     let chain = ledger::evaluate(&db, binding, &pin.1, &pages, now)?.map(|(_, chain)| chain);
     let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
         .iter()
+        .flatten()
         .flat_map(|p| &p.signing_public_keys)
         .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
         .collect();
@@ -6458,7 +6459,8 @@ mod tests {
         body: Bytes,
     ) -> Response {
         let mut f = fake.lock().unwrap();
-        assert!(f.log.len() < 400, "request storm");
+        // A walk over 1024 signers reads each manifest once, and 65 pushes.
+        assert!(f.log.len() < 2400, "request storm");
         let path = uri.path().to_string();
         f.log.push((format!("{method} {path}"), body.to_vec()));
         // An account login, so the client holds a password as a sync
@@ -6755,7 +6757,7 @@ mod tests {
             let pages = pages(&self.me, &self.grant, &ev);
             let fkek = crate::open_fleet_grant(
                 &self.grant,
-                &pages,
+                std::slice::from_ref(&pages),
                 &self.dev.pin,
                 &self.me.to,
                 &FLEET,
@@ -8562,7 +8564,7 @@ mod tests {
             let mut db = self.db();
             let opened = crate::open_fleet_grant(
                 &grant,
-                &pages,
+                std::slice::from_ref(&pages),
                 &self.dev.pin,
                 &self.me.to,
                 &FLEET,
@@ -9417,7 +9419,7 @@ mod tests {
         let err = w.pull(&out).unwrap_err();
         assert!(!out.exists());
         let omitted = author_pages(&w, T0 + 300 * DAY, false, false);
-        let (_, chain) = ledger::evaluate(&w.db(), &w.dev.pin.0, &w.dev.pin.1, &omitted, NOW)
+        let (_, chain) = ledger::evaluate(&w.db(), &w.dev.pin.0, &w.dev.pin.1, &[omitted], NOW)
             .unwrap()
             .unwrap();
         let kid = shardx_core::keys::signing_key_id(author().verifying_key().as_bytes());
@@ -9478,7 +9480,7 @@ mod tests {
         let mut db = w.db();
         let opened = crate::open_fleet_grant(
             &second,
-            &pages(&w.me, &w.grant, &ev),
+            &[pages(&w.me, &w.grant, &ev)],
             &w.dev.pin,
             &w.me.to,
             &FLEET,
@@ -12880,24 +12882,99 @@ mod tests {
         assert_eq!(w.count("SELECT count(*) FROM profile_bindings"), 0);
     }
 
-    /// A walk naming more signers than one evidence request takes fails
-    /// closed, before the evidence is asked for.
-    #[test]
-    fn a_walk_over_64_signers_is_skipped_with_its_error() {
-        let w = world();
-        push_next(&w);
+    /// Re-signs version `v` of the first manifest by `signers[v - 1]`, each
+    /// on the one below, for `v` from 1, and lists the last.
+    fn long_walk(w: &World, signers: &[Ed25519SigningKey]) {
         let template = w.fake().manifests[&1].clone();
         let mut below = None;
-        for v in 1..=65u64 {
+        for (sk, v) in signers.iter().zip(1u64..) {
             w.fake().manifests.insert(v, template.clone());
-            let sk = Ed25519SigningKey::from_bytes(&[0x80 + v as u8; 32]);
             let previous = below;
-            below = Some(resign(&w, v, &sk, |p| {
+            below = Some(resign(w, v, sk, |p| {
                 p.target_version = v;
                 p.base_version = v - 1;
                 p.previous_signed_head_hash = previous;
             }));
         }
+    }
+
+    /// 65 committers this device approved, whose records the server serves
+    /// only to a request naming them, over [`author_pages`]. Their keys.
+    fn named_committers(w: &World) -> Vec<Ed25519SigningKey> {
+        let mut p = author_pages(w, T0 + 300 * DAY, false, false);
+        serve(w, &p);
+        let served = p[0].containers.len();
+        (0x91..=0xd1u8)
+            .map(|seed| {
+                let k = committer(w, &mut p, seed, T0 + 300 * DAY);
+                let records = p[0].containers.split_off(served);
+                w.fake()
+                    .named
+                    .insert(key_id_of(&k), (k.verifying_key().to_bytes(), records));
+                k
+            })
+            .collect()
+    }
+
+    /// ADR 0002 Q-62: a walk naming 65 signers reads one evidence listing
+    /// per 64 of them, and every head verifies against both.
+    #[test]
+    fn a_walk_over_64_signers_verifies_through_two_listings() {
+        let w = world();
+        push_next(&w);
+        let _d = second(&w);
+        let keys = named_committers(&w);
+        long_walk(&w, &keys);
+        let walk =
+            w.rt.block_on(async {
+                let mut db = Db::open()?;
+                let b = bound(&db, LOCAL)?;
+                let head = listed(&w.client, "t", &mut db, &b).await?;
+                walked(&w.client, "t", &mut db, &w.dev, &b, &head, NOW).await
+            })
+            .unwrap();
+        assert_eq!(walk.anchor.expect("the listed head").0.version, 65);
+        let sizes: Vec<usize> = w.fake().asked.iter().map(Vec::len).collect();
+        assert_eq!(sizes, [64, 1]);
+    }
+
+    /// Q-62: the re-seal's walk over 65 signers verifies through two
+    /// listings and the head is sealed again.
+    #[test]
+    fn a_reseal_walk_over_64_signers_reseals() {
+        let w = world();
+        let keys = named_committers(&w);
+        for _ in &keys {
+            push_next(&w);
+        }
+        relink(&w, &keys.iter().map(|k| (k, GEN)).collect::<Vec<_>>());
+        let _d = unbound_custodian(&w);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "resealed:66");
+        let (p, signer) = w.manifest_at(66);
+        assert_eq!(
+            (p.key_generation, signer),
+            (GEN + 1, w.me.to.signing_key_id)
+        );
+        let sizes: Vec<usize> = w.fake().asked.iter().map(Vec::len).collect();
+        assert!(sizes.windows(2).any(|s| s == [64, 1]), "{sizes:?}");
+    }
+
+    /// A walk naming more signers than 16 evidence listings take fails
+    /// closed, before the evidence is asked for.
+    #[test]
+    fn a_walk_over_1024_signers_is_skipped_with_its_error() {
+        let w = world();
+        push_next(&w);
+        let keys: Vec<Ed25519SigningKey> = (0..1025u64)
+            .map(|v| {
+                let mut seed = [0x5a; 32];
+                seed[..8].copy_from_slice(&v.to_le_bytes());
+                Ed25519SigningKey::from_bytes(&seed)
+            })
+            .collect();
+        long_walk(&w, &keys);
         let _d = unbound_custodian(&w);
         let before = w.fake().log.len();
         let run = w.reseal(None).unwrap();

@@ -1254,7 +1254,7 @@ fn a_revoked_device_is_cut_off_but_keeps_the_key_it_already_holds_against_a_real
             .unwrap()
     });
     let now = crate::root_bootstrap::now_ms();
-    let (seen, chain) = crate::team::ledger::evaluate(&ledger, &binding, &anchor, &pages, now)
+    let (seen, chain) = crate::team::ledger::evaluate(&ledger, &binding, &anchor, &[pages], now)
         .unwrap()
         .expect("the evidence verifies to A's anchor");
     crate::team::ledger::record(&mut ledger, &binding, &seen, &chain, None, false, now).unwrap();

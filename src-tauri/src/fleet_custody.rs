@@ -2068,7 +2068,7 @@ async fn revoke_row(
                     || anyhow::anyhow!(crate::errcode::code("fleet.compromisedCustodian"));
                 let ledger = custody.as_deref_mut().ok_or_else(refused)?;
                 let pages = client.trust_evidence(access, me.tenant_id).await?;
-                let (_, chain) = ledger.evaluate(&pages, now)?;
+                let (_, chain) = ledger.evaluate(&[pages], now)?;
                 // As strict as the Team page, which reads the ledger.
                 if chain.custodians().any(|(k, ..)| *k == signing)
                     || crate::team::ledger::held_custody(ledger.db, &ledger.pin.0, &signing)?
@@ -2304,9 +2304,9 @@ pub struct Ledger<'a> {
 impl Ledger<'_> {
     fn evaluate(
         &mut self,
-        pages: &[TenantTrustEvidencePageV2],
+        pages: &[Vec<TenantTrustEvidencePageV2>],
         now: u64,
-    ) -> Result<(Vec<TenantTrustEvidencePageV2>, TrustChain)> {
+    ) -> Result<(crate::team::ledger::Listings, TrustChain)> {
         crate::team::ledger::evaluate(self.db, &self.pin.0, &self.pin.1, pages, now)?
             .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.trustEvidenceRefused")))
     }
@@ -2412,7 +2412,7 @@ pub async fn rotate_fleet(
                 })?;
             let key = previous_key(previous)?;
             let pages = client.trust_evidence(access, device.tenant_id).await?;
-            let (_, chain) = ledger.evaluate(&pages, now)?;
+            let (_, chain) = ledger.evaluate(&[pages], now)?;
             if !chain.approval_valid_at(&cx.signing_key_id, Scope::Fleet(cx.tenant), now) {
                 bail!(crate::errcode::code(
                     "fleet.rotationCustodianApprovalExpired"
@@ -3002,7 +3002,8 @@ pub async fn accept_custody<CF: std::future::Future<Output = Result<u64>>>(
         .await?;
         let (_, chain) = ledger.evaluate(&pages, now)?;
         let mut named = false;
-        let found = evidence_records(&pages)
+        let flat = pages.concat();
+        let found = evidence_records(&flat)
             .into_iter()
             .find_map(|(c, issuer, p)| {
                 let Payload::TenantRootKeyGrant(g) = p else {
@@ -6101,7 +6102,7 @@ pub(crate) mod tests {
             };
             let key = crate::open_fleet_grant(
                 &container,
-                &[page],
+                &[vec![page]],
                 &pin,
                 &me,
                 &fleet,
@@ -7191,7 +7192,7 @@ pub(crate) mod tests {
             .rt
             .block_on(rig.client.trust_evidence("access", &f.tenant))
             .unwrap();
-        let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &pages, now)
+        let (seen, chain) = crate::team::ledger::evaluate(&rig.db, &pin.0, &pin.1, &[pages], now)
             .unwrap()
             .unwrap();
         crate::team::ledger::record(&mut rig.db, &pin.0, &seen, &chain, None, false, now).unwrap();

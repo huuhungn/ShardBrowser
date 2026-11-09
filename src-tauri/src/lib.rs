@@ -4184,7 +4184,7 @@ fn bootstrap_anchor(
 #[allow(clippy::too_many_arguments)]
 fn open_fleet_grant(
     container: &[u8],
-    pages: &[shardx_core::trust_evidence::TenantTrustEvidencePageV2],
+    pages: &[Vec<shardx_core::trust_evidence::TenantTrustEvidencePageV2>],
     (binding, anchor): &(shardx_core::trust_chain::Binding, [u8; 32]),
     me: &shardx_core::trust_chain::Recipient,
     fleet_id: &[u8; 16],
@@ -4797,7 +4797,7 @@ mod custody_tests {
             let mut ledger = team::db::Db::open_at(&dir.path().join("t.db")).unwrap();
             open_fleet_grant(
                 container,
-                pages,
+                &[pages.to_vec()],
                 pin,
                 to,
                 &FLEET,
@@ -5033,7 +5033,7 @@ mod custody_tests {
         let pin = (BINDING, me.to.signing_key_id);
         open_fleet_grant(
             grant,
-            pages,
+            &[pages.to_vec()],
             &pin,
             &me.to,
             &FLEET,
@@ -5095,7 +5095,7 @@ mod custody_tests {
             let mut ledger = team::db::Db::open_at(&path).unwrap();
             open_fleet_grant(
                 &grant,
-                &pages,
+                std::slice::from_ref(&pages),
                 &pin,
                 &me.to,
                 &FLEET,
@@ -5118,7 +5118,7 @@ mod custody_tests {
             .unwrap()
             .expect("the grant is kept");
         assert!(
-            kept[0].containers.contains(&revocation),
+            kept[0][0].containers.contains(&revocation),
             "the closure listing is the kept one"
         );
         assert!(fleet_key_verifies(&db, &pin, &me.to, &FLEET, 1, &fkek, T0 + 2 * DAY).unwrap());
@@ -6210,7 +6210,7 @@ mod custody_tests {
         let pin = (BINDING, me.to.signing_key_id);
         let opened = open_fleet_grant(
             &grant,
-            &pages,
+            std::slice::from_ref(&pages),
             &pin,
             &me.to,
             &TENANT,
@@ -6388,10 +6388,16 @@ mod custody_tests {
     fn chain_at(path: &std::path::Path, pages: &[Page]) -> shardx_core::trust_chain::TrustChain {
         let db = team::db::Db::open_at(path).unwrap();
         let me = me();
-        team::ledger::evaluate(&db, &BINDING, &me.to.signing_key_id, pages, T0 + DAY)
-            .unwrap()
-            .expect("the evidence verifies")
-            .1
+        team::ledger::evaluate(
+            &db,
+            &BINDING,
+            &me.to.signing_key_id,
+            &[pages.to_vec()],
+            T0 + DAY,
+        )
+        .unwrap()
+        .expect("the evidence verifies")
+        .1
     }
 
     /// M23 refused: once this device counts D's revocation, a revocation of

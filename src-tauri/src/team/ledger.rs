@@ -43,10 +43,10 @@
 //!   the count, is kept once per key in `trust_custodian_alerts`
 //!   (`custodian.renewed_after_revocation`).
 //! - **Closure** (D12, ADR 0002 Q-58): a not-yet-counted revocation of a key
-//!   that held custody counts only in a closure listing, one evidence
-//!   listing naming every known device signer ([`closure_evidence`]), so the
-//!   approvals that custodian issued are first seen in the counting
-//!   evaluation and keep their standing ("Order").
+//!   that held custody counts only in a closure evidence naming every known
+//!   device signer, one complete listing per 64 of them, merged (ADR 0002
+//!   Q-62, [`closure_evidence`]), so the approvals that custodian issued are
+//!   first seen in the counting evaluation and keep their standing ("Order").
 //!
 //! Not here yet: the other custodian change events of D-6 (a), and the
 //! acknowledgement of any, whose wording follows the Q-17 UX review.
@@ -62,18 +62,26 @@ use shardx_core::authz_record::{
 use shardx_core::canonical::{decode, encode, Value};
 use shardx_core::trust_chain::{
     Binding, Evidence, Scope, TrustChain, CLOCK_TOLERANCE_MS, MAX_CUSTODIAN_KEY_AGE_MS,
+    MAX_EVIDENCE_LISTINGS,
 };
-use shardx_core::trust_evidence::{RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2};
+use shardx_core::trust_evidence::{
+    RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2, MAX_EVIDENCE_CONTAINERS,
+};
 
 use super::db::Db;
 use crate::fleet_client::{decode_hex16, decode_hex32, hex, FleetClient};
 
 type Keys = BTreeMap<[u8; 32], [u8; 32]>;
 
-/// The public keys `pages` list, by the ID each hashes to.
-fn keys_of(pages: &[TenantTrustEvidencePageV2]) -> Keys {
-    pages
+/// Complete trust evidence listings, each every page of one request, in
+/// order (ADR 0002 Q-62). Never concatenated: each is checked on its own.
+pub type Listings = Vec<Vec<TenantTrustEvidencePageV2>>;
+
+/// The public keys `listings` list, by the ID each hashes to.
+fn keys_of(listings: &[Vec<TenantTrustEvidencePageV2>]) -> Keys {
+    listings
         .iter()
+        .flatten()
         .flat_map(|p| &p.signing_public_keys)
         .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
         .collect()
@@ -86,10 +94,10 @@ pub struct Opened<'a> {
     pub fleet_id: &'a [u8; 16],
     pub generation: u64,
     pub fkek_key_id: [u8; 32],
-    /// The grant's exact container, and the pages it verified against as the
-    /// server sent them.
+    /// The grant's exact container, and the listings it verified against as
+    /// the server sent them.
     pub container: &'a [u8],
-    pub pages: &'a [TenantTrustEvidencePageV2],
+    pub pages: &'a [Vec<TenantTrustEvidencePageV2>],
 }
 
 fn ids(b: &Binding) -> (String, String) {
@@ -225,7 +233,7 @@ pub fn distrust_key(db: &Db, binding: &Binding, key: &[u8; 32], now: u64) -> Res
     Ok(())
 }
 
-/// `pages` at `now` as this device's history lets it see them: first the
+/// `listings` at `now` as this device's history lets it see them: first the
 /// lapses history shows ([`observe_lapses`]), then [`prepare`], and the chain
 /// they verify to from `anchor`, with every key's windows clipped from its
 /// cached `first_not_before` when that is earlier (D-6 (c)). `None` when they
@@ -234,12 +242,12 @@ pub fn evaluate(
     db: &Db,
     binding: &Binding,
     anchor: &[u8; 32],
-    pages: &[TenantTrustEvidencePageV2],
+    listings: &[Vec<TenantTrustEvidencePageV2>],
     now: u64,
-) -> Result<Option<(Vec<TenantTrustEvidencePageV2>, TrustChain)>> {
+) -> Result<Option<(Listings, TrustChain)>> {
     observe_lapses(db, binding, now)?;
-    let seen = prepare(db, binding, pages, now)?;
-    let Ok(mut evidence) = Evidence::collect(binding, &seen) else {
+    let seen = prepare(db, binding, listings, now)?;
+    let Ok(mut evidence) = Evidence::collect_listings(binding, &seen) else {
         return Ok(None);
     };
     let (instance, tenant) = ids(binding);
@@ -367,9 +375,9 @@ pub fn lapsed_at(db: &Db, binding: &Binding, key: &[u8; 32]) -> Result<Option<u6
 fn prepare(
     db: &Db,
     binding: &Binding,
-    pages: &[TenantTrustEvidencePageV2],
+    listings: &[Vec<TenantTrustEvidencePageV2>],
     now: u64,
-) -> Result<Vec<TenantTrustEvidencePageV2>> {
+) -> Result<Listings> {
     let (instance, tenant) = ids(binding);
     let mut cutoffs = BTreeMap::new();
     {
@@ -406,13 +414,13 @@ fn prepare(
             lapses.insert(r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, at));
         }
     }
-    let keys = keys_of(pages);
+    let keys = keys_of(listings);
     let mut first_seen = db.conn.prepare(
         "SELECT first_seen_evaluation FROM trust_sightings
          WHERE server_instance_id = ?1 AND tenant_id = ?2 AND signed_container_hash = ?3",
     )?;
-    let mut out = pages.to_vec();
-    for page in &mut out {
+    let mut out = listings.to_vec();
+    for page in out.iter_mut().flatten() {
         let mut kept = Vec::with_capacity(page.containers.len());
         for c in std::mem::take(&mut page.containers) {
             if let Ok(r) = AuthorizationRecord::parse(&c) {
@@ -442,7 +450,8 @@ fn prepare(
         }
         page.containers = kept;
     }
-    let Some(first) = out.first_mut() else {
+    // The merge counts a report from any listing: the first page carries them.
+    let Some(first) = out.first_mut().and_then(|l| l.first_mut()) else {
         return Ok(out);
     };
     let mut s = db.conn.prepare(
@@ -556,15 +565,44 @@ fn lapse_allows(
     }
 }
 
-/// G2-35: the exact grant kept for `generation` of `fleet_id` and the pages it
-/// was accepted from, when `anchor` is the one pinned for `binding`.
+/// `evidence_pages` as [`record_in`] keeps them: one listing as a CBOR array
+/// of page bytes (the v2.10 shape), several as an array of such arrays.
+/// `None` when the bytes are neither.
+fn stored_listings(bytes: &[u8]) -> Option<Listings> {
+    let Ok(Value::Array(items)) = decode(bytes) else {
+        return None;
+    };
+    let pages = |items: Vec<Value>| -> Option<Vec<TenantTrustEvidencePageV2>> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).ok(),
+                _ => None,
+            })
+            .collect()
+    };
+    if !matches!(items.first(), Some(Value::Array(_))) {
+        return Some(vec![pages(items)?]);
+    }
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Array(listing) => pages(listing),
+            _ => None,
+        })
+        .collect()
+}
+
+/// G2-35: the exact grant kept for `generation` of `fleet_id` and the
+/// listings it was accepted from, when `anchor` is the one pinned for
+/// `binding`.
 pub fn fleet_key_grant(
     db: &Db,
     binding: &Binding,
     anchor: &[u8; 32],
     fleet_id: &[u8; 16],
     generation: u64,
-) -> Result<Option<(Vec<u8>, Vec<TenantTrustEvidencePageV2>)>> {
+) -> Result<Option<(Vec<u8>, Listings)>> {
     let (instance, tenant) = ids(binding);
     let row: Option<(Vec<u8>, Vec<u8>)> = db
         .conn
@@ -587,17 +625,8 @@ pub fn fleet_key_grant(
     let Some((container, pages)) = row else {
         return Ok(None);
     };
-    let unreadable = || anyhow!(crate::errcode::code("team.trustLedgerUnreadable"));
-    let Ok(Value::Array(items)) = decode(&pages) else {
-        return Err(unreadable());
-    };
-    let pages = items
-        .into_iter()
-        .map(|item| match item {
-            Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).map_err(|_| unreadable()),
-            _ => Err(unreadable()),
-        })
-        .collect::<Result<_>>()?;
+    let pages = stored_listings(&pages)
+        .ok_or_else(|| anyhow!(crate::errcode::code("team.trustLedgerUnreadable")))?;
     Ok(Some((container, pages)))
 }
 
@@ -613,11 +642,11 @@ pub(crate) type Holding = ([u8; 32], Option<[u8; 16]>, u64);
 /// Whoever issues a key-carrying grant holds the key.
 pub(crate) fn holdings(
     binding: &Binding,
-    pages: &[TenantTrustEvidencePageV2],
+    pages: &[Vec<TenantTrustEvidencePageV2>],
 ) -> std::collections::BTreeSet<Holding> {
     let keys = keys_of(pages);
     let mut out = std::collections::BTreeSet::new();
-    for c in pages.iter().flat_map(|p| &p.containers) {
+    for c in pages.iter().flatten().flat_map(|p| &p.containers) {
         let Ok(r) = AuthorizationRecord::parse(c) else {
             continue;
         };
@@ -661,12 +690,12 @@ pub(crate) fn holdings(
 fn activations(
     chain: &TrustChain,
     binding: &Binding,
-    seen: &[TenantTrustEvidencePageV2],
+    seen: &[Vec<TenantTrustEvidencePageV2>],
 ) -> Vec<([u8; 16], u64, [u8; 32], u64)> {
     let keys = keys_of(seen);
     let mut recoveries = BTreeMap::new();
     let mut rotations = Vec::new();
-    for c in seen.iter().flat_map(|p| &p.containers) {
+    for c in seen.iter().flatten().flat_map(|p| &p.containers) {
         let Ok(r) = AuthorizationRecord::parse(c) else {
             continue;
         };
@@ -758,17 +787,7 @@ pub(crate) fn backfill_holdings(tx: &rusqlite::Connection) -> Result<()> {
             server_instance_id: decode_hex16(&instance, "server_instance_id")?,
             tenant_id: decode_hex16(&tenant, "tenant_id")?,
         };
-        let Ok(Value::Array(items)) = decode(&pages) else {
-            continue;
-        };
-        let Some(pages) = items
-            .into_iter()
-            .map(|item| match item {
-                Value::Bytes(b) => TenantTrustEvidencePageV2::parse(&b).ok(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
+        let Some(pages) = stored_listings(&pages) else {
             continue;
         };
         file_holdings(tx, &binding, &holdings(&binding, &pages), evaluation)?;
@@ -906,13 +925,13 @@ pub fn commit_blocked(
 fn needs_closure(
     conn: &rusqlite::Connection,
     binding: &Binding,
-    seen: &[TenantTrustEvidencePageV2],
+    seen: &[Vec<TenantTrustEvidencePageV2>],
     chain: &TrustChain,
     now: u64,
 ) -> Result<bool> {
     let (instance, tenant) = ids(binding);
     let keys = keys_of(seen);
-    for c in seen.iter().flat_map(|p| &p.containers) {
+    for c in seen.iter().flatten().flat_map(|p| &p.containers) {
         let Ok(r) = AuthorizationRecord::parse(c) else {
             continue;
         };
@@ -949,7 +968,7 @@ fn needs_closure(
     Ok(false)
 }
 
-/// D12: when `pages`, evaluated at `now` to `anchor` without being recorded,
+/// D12: when `listings`, evaluated at `now` to `anchor` without being recorded,
 /// would count a not-yet-counted revocation of a key that held custody, the
 /// signers a closure listing names: the subject of every `DeviceHpkeGrant`
 /// they hold, which the server serves for every fleet grant of the tenant.
@@ -960,18 +979,19 @@ pub fn closure_signers(
     db: &Db,
     binding: &Binding,
     anchor: &[u8; 32],
-    pages: &[TenantTrustEvidencePageV2],
+    listings: &[Vec<TenantTrustEvidencePageV2>],
     now: u64,
 ) -> Result<Option<std::collections::BTreeSet<[u8; 32]>>> {
-    let Some((seen, chain)) = evaluate(db, binding, anchor, pages, now)? else {
+    let Some((seen, chain)) = evaluate(db, binding, anchor, listings, now)? else {
         return Ok(None);
     };
     if !needs_closure(&db.conn, binding, &seen, &chain, now)? {
         return Ok(None);
     }
-    let keys = keys_of(pages);
-    let subjects = pages
+    let keys = keys_of(listings);
+    let subjects = listings
         .iter()
+        .flatten()
         .flat_map(|p| &p.containers)
         .filter_map(|c| {
             let r = AuthorizationRecord::parse(c).ok()?;
@@ -987,18 +1007,17 @@ pub fn closure_signers(
 }
 
 /// D12 (ADR 0002 Q-58): the trust evidence of `tenant` naming `named`, read
-/// over the session `access`, as one complete listing for the caller to
-/// evaluate and record, and whether it is a closure listing. When recording
-/// the listing would count a not-yet-counted revocation of a key that held
+/// over the session `access`, as complete listings ([`listings_of`]) for the
+/// caller to evaluate and record, and whether they are a closure listing.
+/// When recording them would count a not-yet-counted revocation of a key that held
 /// custody ([`closure_signers`]), it is read again, once, naming every known
 /// device signer: `named` (a walk's head signers), every fleet grant
 /// subject, the active rows a custodian session lists, and the signers of
 /// the heads this device's bindings pin. So each approval of those devices
 /// is first seen in the counting evaluation and keeps its standing. Names
 /// add evidence, never trust: the listing and the manifests are the
-/// server's word. Listings are never concatenated: more than the server's
-/// 64 signers fail closed with `fleet.trustClosureTooLarge` (a multi-listing
-/// closure is v2.11's).
+/// server's word. More than 1024 signers fail closed with
+/// `fleet.trustClosureTooLarge` (Q-62).
 pub async fn closure_evidence(
     client: &FleetClient,
     access: &str,
@@ -1007,8 +1026,8 @@ pub async fn closure_evidence(
     (binding, anchor): &(Binding, [u8; 32]),
     named: &[[u8; 32]],
     now: u64,
-) -> Result<(Vec<TenantTrustEvidencePageV2>, bool)> {
-    let pages = client.trust_evidence_of(access, tenant, named).await?;
+) -> Result<(Listings, bool)> {
+    let pages = listings_of(client, access, tenant, named.iter().copied().collect()).await?;
     let Some(mut signers) = closure_signers(db, binding, anchor, &pages, now)? else {
         return Ok((pages, false));
     };
@@ -1043,16 +1062,47 @@ pub async fn closure_evidence(
         }
     }
     let n = signers.len();
-    if n > crate::fleet_custody::MAX_SIGNERS {
+    if n > MAX_LISTED_SIGNERS {
         eprintln!("[closure] a custodian revocation to count: {n} signers, refused");
         anyhow::bail!(crate::errcode::code("fleet.trustClosureTooLarge"));
     }
     eprintln!("[closure] a custodian revocation to count: {n} signers");
+    Ok((listings_of(client, access, tenant, signers).await?, true))
+}
+
+/// The most signers the evidence of one evaluation names (ADR 0002 Q-62).
+pub(crate) const MAX_LISTED_SIGNERS: usize =
+    crate::fleet_custody::MAX_SIGNERS * MAX_EVIDENCE_LISTINGS;
+
+/// Q-62: one complete listing per 64 of `signers` (in key order), or one
+/// listing naming none; more than [`MAX_LISTED_SIGNERS`] fail closed with
+/// `fleet.trustClosureTooLarge`. Reading stops with
+/// `fleet.trustEvidenceRefused` once the listings hold more containers than
+/// [`Evidence::collect_listings`] takes, so no more are fetched in vain.
+async fn listings_of(
+    client: &FleetClient,
+    access: &str,
+    tenant: &str,
+    signers: std::collections::BTreeSet<[u8; 32]>,
+) -> Result<Listings> {
+    if signers.len() > MAX_LISTED_SIGNERS {
+        anyhow::bail!(crate::errcode::code("fleet.trustClosureTooLarge"));
+    }
     let signers: Vec<[u8; 32]> = signers.into_iter().collect();
-    Ok((
-        client.trust_evidence_of(access, tenant, &signers).await?,
-        true,
-    ))
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for chunk in signers.chunks(crate::fleet_custody::MAX_SIGNERS) {
+        let listing = client.trust_evidence_of(access, tenant, chunk).await?;
+        total += listing.iter().map(|p| p.containers.len()).sum::<usize>();
+        if total > 2 * MAX_EVIDENCE_CONTAINERS {
+            anyhow::bail!(crate::errcode::code("fleet.trustEvidenceRefused"));
+        }
+        out.push(listing);
+    }
+    if out.is_empty() {
+        out.push(client.trust_evidence_of(access, tenant, &[]).await?);
+    }
+    Ok(out)
 }
 
 /// After `chain` evaluated `seen` (from [`evaluate`]), in one transaction:
@@ -1067,7 +1117,7 @@ pub async fn closure_evidence(
 pub fn record(
     db: &mut Db,
     binding: &Binding,
-    seen: &[TenantTrustEvidencePageV2],
+    seen: &[Vec<TenantTrustEvidencePageV2>],
     chain: &TrustChain,
     opened: Option<Opened>,
     closure: bool,
@@ -1084,7 +1134,7 @@ pub fn record(
 pub fn record_in(
     tx: &rusqlite::Connection,
     binding: &Binding,
-    seen: &[TenantTrustEvidencePageV2],
+    seen: &[Vec<TenantTrustEvidencePageV2>],
     chain: &TrustChain,
     opened: Option<Opened>,
     closure: bool,
@@ -1101,7 +1151,7 @@ pub fn record_in(
     )?;
     let evaluation = tx.last_insert_rowid();
     let keys = keys_of(seen);
-    for c in seen.iter().flat_map(|p| &p.containers) {
+    for c in seen.iter().flatten().flat_map(|p| &p.containers) {
         let Ok(r) = AuthorizationRecord::parse(c) else {
             continue;
         };
@@ -1195,7 +1245,7 @@ pub fn record_in(
             ],
         )?;
     }
-    for r in seen.iter().flat_map(|p| &p.revocations) {
+    for r in seen.iter().flatten().flat_map(|p| &p.revocations) {
         // A time past i64::MAX revokes nothing before the year 292 million.
         let Ok(at) = i64::try_from(r.revoked_at_ms) else {
             continue;
@@ -1206,7 +1256,7 @@ pub fn record_in(
             params![instance, tenant, r.payload_domain, hex(&r.replay_id), at],
         )?;
     }
-    for d in seen.iter().flat_map(|p| &p.device_revocations) {
+    for d in seen.iter().flatten().flat_map(|p| &p.device_revocations) {
         let Ok(at) = i64::try_from(d.revoked_at_ms) else {
             continue;
         };
@@ -1253,9 +1303,14 @@ pub fn record_in(
         // shortcut: each generation keeps the whole evidence it verified
         // against, up to the client's evidence cap; keep only the grant's
         // ancestry once the signed-claim store (W6, probe 3) lands.
-        let pages = encode(&Value::Array(
-            o.pages.iter().map(|p| Value::Bytes(p.encode())).collect(),
-        ));
+        let listing = |l: &[TenantTrustEvidencePageV2]| {
+            Value::Array(l.iter().map(|p| Value::Bytes(p.encode())).collect())
+        };
+        // One listing keeps the v2.10 shape (`stored_listings`).
+        let pages = encode(&match o.pages {
+            [one] => listing(one),
+            several => Value::Array(several.iter().map(|l| listing(l)).collect()),
+        });
         // A renewed grant of the same key replaces the kept one; a grant of
         // another key never does (rule 5, `KEY_SUBSTITUTION_DETECTED`).
         tx.execute(
@@ -1540,13 +1595,13 @@ mod tests {
             (extending(&x, &x, 9, L - 1), true),
         ];
         let all: Vec<Vec<u8>> = cases.iter().map(|(c, _)| c.clone()).collect();
-        let kept = prepare(&db, &B, &[page(&[&d, &x], all)], 0).unwrap();
+        let kept = prepare(&db, &B, &[vec![page(&[&d, &x], all)]], 0).unwrap();
         for (c, expected) in &cases {
-            assert_eq!(kept[0].containers.contains(c), *expected, "{}", hash(c));
+            assert_eq!(kept[0][0].containers.contains(c), *expected, "{}", hash(c));
         }
         let unverifiable = signed_by(&d, 10, L - 1);
-        let kept = prepare(&db, &B, &[page(&[&x], vec![unverifiable.clone()])], 0).unwrap();
-        assert_eq!(kept[0].containers, [unverifiable]);
+        let kept = prepare(&db, &B, &[vec![page(&[&x], vec![unverifiable.clone()])]], 0).unwrap();
+        assert_eq!(kept[0][0].containers, [unverifiable]);
     }
 
     /// C-1 "exposed", the issuer clause included: whoever issues or receives
@@ -1618,7 +1673,7 @@ mod tests {
             build_record(&d, DOMAIN_TENANT_ROOT_KEY_GRANT, &other_tenant.encode()),
             extending(&x, &x, 5, L),
         ];
-        let held: Vec<Holding> = holdings(&B, &[page(&[&d, &e], containers)])
+        let held: Vec<Holding> = holdings(&B, &[vec![page(&[&d, &e], containers)]])
             .into_iter()
             .collect();
         let mut expected = vec![
@@ -2088,7 +2143,7 @@ mod tests {
         pages[0].containers.push(grant.clone());
         let opened = crate::open_fleet_grant(
             &grant,
-            &pages,
+            &[pages],
             &(B, a.to.signing_key_id),
             &a.to,
             &FLEET,
@@ -2101,6 +2156,122 @@ mod tests {
         )
         .unwrap();
         assert!(opened.is_some(), "generation {generation} verifies");
+    }
+
+    /// Q-62: A0's grant of generation 0 in a second listing, the records
+    /// that make A0 a custodian with `fleet.manage` in the first. Opened
+    /// through the launcher's verified open into `db`. The listings.
+    fn open_from_two_listings(db: &mut Db, a: &Custodian, fkek: &[u8; 32]) -> Listings {
+        let grant = device_grant(a, &a.to, 0, fkek, 40);
+        let listings = vec![
+            evidence(a, false, vec![]),
+            vec![page(&[&a.sk], vec![grant.clone()])],
+        ];
+        let opened = crate::open_fleet_grant(
+            &grant,
+            &listings,
+            &(B, a.to.signing_key_id),
+            &a.to,
+            &FLEET,
+            0,
+            &a.hpke_sk,
+            T0 + DAY,
+            db,
+            "https://fleet.test",
+            false,
+        )
+        .unwrap();
+        assert!(opened.is_some(), "the grant verifies across both listings");
+        listings
+    }
+
+    /// The `evidence_pages` kept for generation 0 of `FLEET`.
+    fn stored(db: &Db) -> Vec<u8> {
+        db.conn
+            .query_row(
+                "SELECT evidence_pages FROM trust_fleet_key_grants WHERE generation = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_key_opened_from_two_listings_reverifies_from_its_stored_listings() {
+        let a = a0();
+        let k0 = [0x30; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let listings = open_from_two_listings(&mut db, &a, &k0);
+        let pin = (B, a.to.signing_key_id);
+        let (_, kept) = fleet_key_grant(&db, &B, &pin.1, &FLEET, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept, listings, "both listings, each as served");
+        assert!(
+            matches!(decode(&stored(&db)), Ok(Value::Array(v)) if matches!(v[0], Value::Array(_)))
+        );
+        assert!(crate::fleet_key_verifies(&db, &pin, &a.to, &FLEET, 0, &k0, T0 + DAY).unwrap());
+        assert!(
+            !crate::fleet_key_verifies(&db, &pin, &a.to, &FLEET, 0, &[0x31; 32], T0 + DAY).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_single_listing_is_stored_in_the_v2_10_shape() {
+        let a = a0();
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let pages = evidence(&a, false, vec![]);
+        collect(&mut db, &a, 0, &[0x30; 32], 40, pages);
+        let (_, kept) = fleet_key_grant(&db, &B, &a.to.signing_key_id, &FLEET, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        // Exactly what 2.10 wrote: a CBOR array of the page bytes.
+        let v2_10 = encode(&Value::Array(
+            kept[0].iter().map(|p| Value::Bytes(p.encode())).collect(),
+        ));
+        assert_eq!(stored(&db), v2_10);
+    }
+
+    #[test]
+    fn a_stored_flat_page_array_still_reads() {
+        let a = a0();
+        let k0 = [0x30; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let listings = open_from_two_listings(&mut db, &a, &k0);
+        // A 2.10 ledger kept one listing as a flat array of page bytes.
+        let mut one = listings[0][0].clone();
+        one.containers.extend(listings[1][0].containers.clone());
+        let flat = encode(&Value::Array(vec![Value::Bytes(one.encode())]));
+        let set = |bytes: &[u8]| {
+            db.conn
+                .execute(
+                    "UPDATE trust_fleet_key_grants SET evidence_pages = ?1",
+                    [bytes],
+                )
+                .unwrap();
+        };
+        set(&flat);
+        let pin = (B, a.to.signing_key_id);
+        let (_, kept) = fleet_key_grant(&db, &B, &pin.1, &FLEET, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept, vec![vec![one.clone()]]);
+        assert!(crate::fleet_key_verifies(&db, &pin, &a.to, &FLEET, 0, &k0, T0 + DAY).unwrap());
+        // A shape mixing a page and a listing is no ledger this launcher wrote.
+        let mixed = encode(&Value::Array(vec![
+            Value::Array(vec![Value::Bytes(one.encode())]),
+            Value::Bytes(one.encode()),
+        ]));
+        set(&mixed);
+        let err = fleet_key_grant(&db, &B, &pin.1, &FLEET, 0).unwrap_err();
+        assert!(crate::errcode::has_code(
+            &err.to_string(),
+            "team.trustLedgerUnreadable"
+        ));
     }
 
     /// Unvalidated assumption 1 (v0.2.3 analysis), first half: the evidence
@@ -2283,7 +2454,9 @@ mod tests {
         let anchor = a.to.signing_key_id;
         assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
         let mut evaluate_at = |pages: &[TenantTrustEvidencePageV2], now| {
-            let (seen, chain) = evaluate(&db, &B, &anchor, pages, now).unwrap().unwrap();
+            let (seen, chain) = evaluate(&db, &B, &anchor, &[pages.to_vec()], now)
+                .unwrap()
+                .unwrap();
             record(&mut db, &B, &seen, &chain, None, true, now).unwrap();
             chain
         };
@@ -2569,11 +2742,7 @@ mod tests {
         }
 
         /// One evidence read naming `named`, through the closure path.
-        fn fetch(
-            &mut self,
-            named: &[[u8; 32]],
-            now: u64,
-        ) -> Result<(Vec<TenantTrustEvidencePageV2>, bool)> {
+        fn fetch(&mut self, named: &[[u8; 32]], now: u64) -> Result<(Listings, bool)> {
             let pin = (B, self.anchor);
             self.rt.block_on(closure_evidence(
                 &self.client,
@@ -2686,28 +2855,87 @@ mod tests {
         assert!(withdrawn(&d.db, &B, &d.anchor).unwrap());
     }
 
-    /// D12 fails closed past the server's 64 signers: nothing is recorded
-    /// and no listing is read beyond the first. 64 signers still close.
+    /// ADR 0002 Q-62: a closure naming 65 signers reads one listing per 64
+    /// of them and counts the revocation in one evaluation of both, so the
+    /// 65th member's approval keeps its standing.
     #[test]
-    fn more_than_64_closure_signers_fail_closed() {
+    fn a_closure_over_65_signers_reads_two_listings_and_counts_the_revocation() {
         let h = hand_over(65);
         let mut d = device(&h);
         d.serve(&h.after, &h.named);
-        let err = d.fetch(&[], AFTER).unwrap_err();
+        d.evaluate(&[], AFTER).unwrap();
+        let sizes: Vec<usize> = d.asked().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [0, 64, 1]);
+        assert_eq!(d.evaluations(), 1, "only the closure listings are recorded");
+        assert!(withdrawn(&d.db, &B, &d.anchor).unwrap());
+        let last = &h.members[64];
+        let chain = d.evaluate(&[id(last)], AFTER + DAY).unwrap();
+        assert!(trusts(&chain, last, AFTER + DAY), "the 65th member stands");
+    }
+
+    /// Q-62 fails closed past 1024 signers: nothing is recorded and no
+    /// listing is read beyond the first. 1000 fleet grant subjects (a page
+    /// holds at most 1024 containers) and 25 more named signers.
+    #[test]
+    fn more_than_1024_closure_signers_fail_closed() {
+        let h = hand_over(1000);
+        let mut d = device(&h);
+        d.serve(&h.after, &h.named);
+        let named: Vec<[u8; 32]> = (0..25u8).map(|i| [0xe0 + i; 32]).collect();
+        let err = d.fetch(&named, AFTER).unwrap_err();
         assert!(
             crate::errcode::has_code(&err.to_string(), "fleet.trustClosureTooLarge"),
             "{err:#}"
         );
-        assert_eq!(d.asked(), [Vec::<String>::new()]);
+        let sizes: Vec<usize> = d.asked().iter().map(Vec::len).collect();
+        assert_eq!(sizes, [25]);
         assert_eq!(d.evaluations(), 0);
         assert!(!withdrawn(&d.db, &B, &d.anchor).unwrap());
+        assert_eq!(MAX_LISTED_SIGNERS, 1024);
+    }
 
-        let h = hand_over(64);
-        let mut d = device(&h);
-        d.serve(&h.after, &h.named);
-        assert!(d.fetch(&[], AFTER).unwrap().1, "64 signers close");
-        let sizes: Vec<usize> = d.asked().iter().map(Vec::len).collect();
-        assert_eq!(sizes, [0, 64]);
+    /// Q-62: listings holding more containers in all than the merge takes
+    /// stop the reads at the listing that crosses the cap: three full
+    /// listings of 64 pages of 1024 containers, of the 16 asked for.
+    #[test]
+    fn listings_past_the_container_cap_stop_the_reads() {
+        let reply = |call: &str, _: &[u8]| {
+            let at = call
+                .split('&')
+                .find_map(|kv| kv.split("cursor=").nth(1))
+                .map_or(0, |c| u32::from_str_radix(c, 16).unwrap());
+            // A page's containers are distinct.
+            let distinct = (0..1024u32).map(|i| i.to_be_bytes().to_vec()).collect();
+            let mut p = page(&[], distinct);
+            p.page_index = at;
+            if at + 1 < 64 {
+                p.next_cursor = (at + 1).to_be_bytes().to_vec();
+            }
+            (200, p.encode())
+        };
+        let rt = crate::fleet_custody::tests::runtime();
+        let (client, seen) = rt.block_on(crate::fleet_custody::tests::mock(std::sync::Arc::new(
+            reply,
+        )));
+        let signers = (0..MAX_LISTED_SIGNERS as u16)
+            .map(|i| {
+                let mut s = [0x44; 32];
+                s[..2].copy_from_slice(&i.to_le_bytes());
+                s
+            })
+            .collect();
+        let err = rt
+            .block_on(listings_of(&client, "t", &hex(&B.tenant_id), signers))
+            .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.trustEvidenceRefused"),
+            "{err:#}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3 * 64,
+            "no fourth listing is read"
+        );
     }
 
     /// D12 costs nothing without a custodian revocation: a first evaluation
@@ -2733,7 +2961,9 @@ mod tests {
         assert!(pin_anchor(&db, &B, &anchor, JOIN, T0).unwrap());
         let mut pages = vec![page(&[], h.after.clone())];
         pages[0].signing_public_keys = h.keys.clone();
-        let (seen, chain) = evaluate(&db, &B, &anchor, &pages, AFTER).unwrap().unwrap();
+        let (seen, chain) = evaluate(&db, &B, &anchor, &[pages], AFTER)
+            .unwrap()
+            .unwrap();
         let err = record(&mut db, &B, &seen, &chain, None, false, AFTER).unwrap_err();
         assert!(
             crate::errcode::has_code(&err.to_string(), "fleet.trustClosureNeeded"),
