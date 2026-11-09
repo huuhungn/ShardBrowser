@@ -261,6 +261,8 @@ struct Rotating {
     vault: MemVault,
     local: Vec<(u64, Zeroizing<[u8; 32]>)>,
     path: std::path::PathBuf,
+    db: crate::team::db::Db,
+    pin: (shardx_core::trust_chain::Binding, [u8; 32]),
     _dir: tempfile::TempDir,
 }
 
@@ -331,12 +333,24 @@ fn rotating() -> Rotating {
         vault: MemVault::default(),
         local: vec![(0, Zeroizing::new(FK0)), (1, Zeroizing::new(FK1))],
         path,
+        db: crate::team::db::Db::open_at(&dir.path().join("team-ledger.db")).unwrap(),
+        pin: (
+            shardx_core::trust_chain::Binding {
+                server_instance_id: cx.instance,
+                tenant_id: cx.tenant,
+            },
+            cx.signing_key_id,
+        ),
         _dir: dir,
     }
 }
 
 impl Rotating {
     fn rotate(&mut self) -> Result<()> {
+        self.rotate_saving(&mut |_| Ok(()))
+    }
+
+    fn rotate_saving(&mut self, save: &mut impl FnMut(&BootstrapState) -> Result<()>) -> Result<()> {
         let (signer, account) = (signer(), hex(&[4; 16]));
         let me = RenewingDevice {
             account_id: &account,
@@ -348,17 +362,22 @@ impl Rotating {
             passphrase: RR_PASS,
         };
         let now = self.server.lock().unwrap().now;
+        let mut ledger = crate::fleet_custody::Ledger {
+            db: &mut self.db,
+            pin: &self.pin,
+        };
         self.rt.block_on(rotate_root(
             &self.client,
             "access",
             &me,
             &self.vault,
+            &mut ledger,
             &self.custody,
             &self.local,
             &recovery,
             now,
             &mut self.state,
-            &mut |_| Ok(()),
+            save,
         ))
     }
 
@@ -711,6 +730,88 @@ fn a_discarded_root_generation_clears_the_run_and_releases_the_new_trk() {
     assert!(f.state.root_rotation.is_none());
     assert!(f.vault.0.lock().unwrap().is_empty());
     assert!(f.state.root_grant.is_empty(), "root 0 stays current");
+}
+
+/// A crash while a discarded run is cleared: its one save fails after the
+/// new TRK was forgotten, and the next run reopens that TRK from the saved
+/// RotationGrant, finds the generation discarded and clears the run.
+#[test]
+fn a_failed_save_while_clearing_a_discarded_run_resumes_into_the_same_discard() {
+    let mut f = rotating();
+    f.server.lock().unwrap().refuse = Some(("/key-generations/0/grants", 503, "BUSY"));
+    assert!(f.rotate().is_err());
+    f.server.lock().unwrap().discarded = true;
+    let err = f
+        .rotate_saving(&mut |s| match s.root_rotation {
+            None => Err(anyhow!("disk full")),
+            Some(_) => Ok(()),
+        })
+        .unwrap_err();
+    assert!(!has(&err, "fleet.rootRotationDiscarded"), "{err}");
+    assert!(crate::root_rotation::unfinished(&f.state));
+    let err = f.rotate().unwrap_err();
+    assert!(has(&err, "fleet.rootRotationDiscarded"), "{err}");
+    assert!(f.state.root_rotation.is_none());
+    assert!(f.vault.0.lock().unwrap().is_empty());
+}
+
+/// A credential store that lost the new TRK mid-run (a wiped keyring): the
+/// run reopens it from its saved RotationGrant and finishes.
+#[test]
+fn a_new_trk_the_store_lost_mid_run_reopens_from_the_rotation_grant() {
+    let mut f = rotating();
+    f.server.lock().unwrap().refuse = Some(("/key-generations/0/grants", 503, "BUSY"));
+    assert!(f.rotate().is_err());
+    let id = f.run().root_key_id;
+    f.vault.0.lock().unwrap().clear();
+    f.rotate().unwrap();
+    assert!(f.run().done);
+    assert_eq!(f.run().root_key_id, id);
+    assert_eq!(hex(&root_key_id(&f.new_trk())), id);
+    assert!(f.vault.0.lock().unwrap().is_empty(), "released after activation");
+}
+
+/// A bundle moved away stops the run before activation; once the operator
+/// discarded the generation, the server is asked and the run is cleared.
+#[test]
+fn a_discarded_generation_whose_bundle_was_moved_still_clears_the_run() {
+    let mut f = rotating();
+    f.server.lock().unwrap().refuse = Some(("/activate", 409, "ROOT_GENERATION_MISMATCH"));
+    let err = f.rotate().unwrap_err();
+    assert!(has(&err, "fleet.rootRotationWaitsForFleetDiscard"), "{err}");
+    std::fs::remove_file(&f.path).unwrap();
+    let err = f.rotate().unwrap_err();
+    assert!(has(&err, "fleet.recoveryBundleChanged"), "{err}");
+    assert!(crate::root_rotation::unfinished(&f.state));
+    f.server.lock().unwrap().discarded = true;
+    let err = f.rotate().unwrap_err();
+    assert!(has(&err, "fleet.rootRotationDiscarded"), "{err}");
+    assert!(f.state.root_rotation.is_none());
+    assert!(f.vault.0.lock().unwrap().is_empty());
+}
+
+/// Root N's bundle is never written over by the rotation away from it.
+#[test]
+fn a_root_rotation_refuses_to_write_over_the_current_recovery_bundle() {
+    let mut f = rotating();
+    std::fs::write(&f.path, b"root 0 bundle").unwrap();
+    f.state.recovery_path = f.path.to_string_lossy().into_owned();
+    let err = f.rotate().unwrap_err();
+    assert!(has(&err, "fleet.rootRotationBundlePathInUse"), "{err}");
+    assert!(f.posts().is_empty());
+    assert!(f.state.root_rotation.is_none());
+    assert_eq!(std::fs::read(&f.path).unwrap(), b"root 0 bundle");
+}
+
+/// Q-62: the evidence is read through the multi-listing path, naming this
+/// device's signer.
+#[test]
+fn root_rotation_reads_its_evidence_through_the_ledger_listings() {
+    let mut f = rotating();
+    f.rotate().unwrap();
+    let own = signing_key_id(signer().verifying_key().as_bytes());
+    let named = format!("/trust-evidence?signer={}", hex(&own));
+    assert!(f.calls().iter().any(|(c, _)| c.contains(&named)));
 }
 
 /// v2.10 U6: a root custodian that handed its custody over never rotates.

@@ -4102,7 +4102,7 @@ async fn team_rotate_root(
     if !c.can_receive_custody() {
         return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
     }
-    bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
     handed_over()?;
     let signer = c.signing_key().map_err(|e| e.to_string())?;
     let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
@@ -4134,11 +4134,17 @@ async fn team_rotate_root(
             signer: &signer,
             hpke_seed: &seed,
         };
+        let mut db = team::db::Db::open().map_err(error)?;
+        let mut ledger = fleet_custody::Ledger {
+            db: &mut db,
+            pin: &pin,
+        };
         let rotated = root_rotation::rotate_root(
             &client,
             access,
             &me,
             &root_bootstrap::CredentialTrkStore,
+            &mut ledger,
             &custody,
             &local,
             &recovery,

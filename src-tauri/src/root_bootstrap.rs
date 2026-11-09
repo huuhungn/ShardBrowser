@@ -1122,6 +1122,11 @@ pub async fn export_again(
 ) -> Result<String> {
     crate::fleet_custody::refuse_handed_over(&crate::fleet_custody::load()?)?;
     let state = load()?;
+    // A bundle of root N now could overwrite the one N + 1 pins, and stops
+    // restoring once N + 1 activates.
+    if crate::root_rotation::unfinished(&state) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
+    }
     let (grant, container, issuer) = current_root_grant(&state, signer)?;
     let exported = root_grant_sha256(&state);
     let tenant_hex = hex(&grant.common.tenant_id);
@@ -1458,7 +1463,7 @@ fn first_not_before(state: &BootstrapState, own: &[u8; 32]) -> Option<u64> {
 }
 
 /// The pin `state` names: its binding and anchor.
-pub(crate) fn pin_of(state: &BootstrapState) -> Result<(Binding, [u8; 32])> {
+fn pin_of(state: &BootstrapState) -> Result<(Binding, [u8; 32])> {
     Ok((
         Binding {
             server_instance_id: decode_hex16(&state.server_instance_id, "server_instance_id")?,
@@ -2660,6 +2665,52 @@ pub(crate) mod tests {
             custodian.root_grant_issuer,
             Some(a0().verifying_key().to_bytes())
         );
+    }
+
+    /// v2.11 S4: while a root rotation is unfinished, export refuses before
+    /// the server is asked or a file is written.
+    #[test]
+    fn export_is_refused_while_a_root_rotation_is_unfinished() {
+        use crate::fleet_custody::tests::{mock, runtime};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let (state, _) = appointed_state(0);
+        save(&BootstrapState {
+            root_rotation: Some(crate::root_rotation::RootRotation {
+                generation: 1,
+                ..Default::default()
+            }),
+            ..state
+        })
+        .unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(std::sync::Arc::new(|_: &str, _: &[u8]| {
+            (404, Vec::new())
+        })));
+        let path = dir.path().join("again.bundle");
+        let result = rt.block_on(export_again(
+            &client,
+            "access",
+            &hex(&[1; 16]),
+            &signer(),
+            &HPKE_SEED,
+            vec![(0, Zeroizing::new([0x44; 32]))],
+            &RecoveryExport {
+                path: &path,
+                passphrase: "correct horse battery",
+            },
+        ));
+        crate::store::set_config_root(None);
+        let err = result.unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.rootRotationUnfinished"),
+            "{err}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!path.exists());
     }
 
     /// Q-52: a custodian that is not the anchor names the saved anchor `A0`,

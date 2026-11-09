@@ -43,13 +43,14 @@ use shardx_core::mutation::{
     RECORD_TYPE_ROOT_GRANT_CREATED,
 };
 use shardx_core::recovery_bundle::{RecoveryBundlePlaintextV2, RetainedFkek, RootCustodian};
-use shardx_core::trust_chain::{Evidence, TrustChain};
 
 use crate::fleet_client::{decode_hex16, hex, FleetClient};
-use crate::fleet_custody::{refused_for_good, refused_with, FleetCustodyState, RotationPhase};
+use crate::fleet_custody::{
+    refused_for_good, refused_with, FleetCustodyState, Ledger, RotationPhase,
+};
 use crate::root_bootstrap::{
-    check_bundle, commit, corrupt, current_root_grant, is_missing, mismatch, nonce_ok, pin_of,
-    random, renewal_context, saved, sealed_root_grant, stored_payload, trk_ref, unhex, unhex_vec,
+    check_bundle, commit, corrupt, current_root_grant, is_missing, mismatch, nonce_ok, random,
+    renewal_context, saved, sealed_root_grant, stored_payload, trk_ref, unhex, unhex_vec,
     verified_root_grant, write_bundle, BootstrapState, Context16, RecoveryExport, RenewingDevice,
     TrkStore, CLOCK_SKEW_MS, RENEWED_VALIDITY_MS,
 };
@@ -145,9 +146,13 @@ fn refuse_start(state: &BootstrapState, custody: &FleetCustodyState) -> Result<(
 /// Step 3: the new TRK is held before anything names it. A key under this
 /// run's reference whose id is not saved yet was named by nothing and is
 /// reused; a new one is made only when the store answers
-/// `credential.missing` and no id is saved.
+/// `credential.missing` and no id is saved. A key the store lost once the
+/// saved `RotationGrant` (sealed to this device, `own`) names it is reopened
+/// from that grant with `hpke_secret` and stored again.
 fn hold_trk(
     vault: &dyn TrkStore,
+    own: &[u8; 32],
+    hpke_secret: &[u8],
     state: &mut BootstrapState,
     save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<Zeroizing<[u8; 32]>> {
@@ -167,6 +172,12 @@ fn hold_trk(
             vault.store(&name, &key)?;
             key
         }
+        Err(e) if is_missing(&e) && !r.root_grant.is_empty() => {
+            let (grant, _) = verified_root_grant(&unhex_vec(&r.root_grant)?, own)?;
+            let key = grant.open_trk(hpke_secret).map_err(|_| corrupt())?;
+            vault.store(&name, &key)?;
+            key
+        }
         Err(e) => return Err(e),
     };
     let id = hex(&root_key_id(&key));
@@ -178,6 +189,24 @@ fn hold_trk(
     Ok(key)
 }
 
+/// Forgets the new TRK's stored copy, if the run names one; forgetting it
+/// again does no harm.
+fn forget_trk(vault: &dyn TrkStore, state: &BootstrapState) -> Result<bool> {
+    let Some(nonce) = state
+        .root_rotation
+        .as_ref()
+        .map(|r| r.trk_nonce.as_str())
+        .filter(|n| !n.is_empty())
+    else {
+        return Ok(false);
+    };
+    if !nonce_ok(nonce) {
+        return Err(corrupt());
+    }
+    vault.forget(&trk_ref(&state.tenant_id, nonce))?;
+    Ok(true)
+}
+
 /// Forgets the new TRK's stored copy, then drops its reference: once `N + 1`
 /// is active this device reopens it from its `RotationGrant`.
 fn release_trk(
@@ -185,18 +214,9 @@ fn release_trk(
     state: &mut BootstrapState,
     save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<()> {
-    let Some(nonce) = state
-        .root_rotation
-        .as_ref()
-        .map(|r| r.trk_nonce.clone())
-        .filter(|n| !n.is_empty())
-    else {
+    if !forget_trk(vault, state)? {
         return Ok(());
-    };
-    if !nonce_ok(&nonce) {
-        return Err(corrupt());
     }
-    vault.forget(&trk_ref(&state.tenant_id, &nonce))?;
     commit(state, save, |s| rotation_mut(s).trk_nonce.clear())
 }
 
@@ -219,7 +239,7 @@ struct Retained {
 async fn retained_keys(
     client: &FleetClient,
     access: &str,
-    state: &BootstrapState,
+    ledger: &mut Ledger<'_>,
     cx: &Context16,
     current: &TenantRootKeyGrantV2,
     old_trk: &[u8; 32],
@@ -227,16 +247,32 @@ async fn retained_keys(
     local_now: u64,
 ) -> Result<Retained> {
     let tenant = hex(&cx.tenant);
-    let pages = client.trust_evidence(access, &tenant).await?;
-    let server_now = pages.iter().map(|p| p.server_now_ms).min().unwrap_or(0);
+    // Q-62: complete listings, read again naming every known signer when a
+    // custodian revocation is to be counted.
+    let (listings, _) = crate::team::ledger::closure_evidence(
+        client,
+        access,
+        &tenant,
+        ledger.db,
+        ledger.pin,
+        &[cx.signing_key_id],
+        local_now,
+    )
+    .await?;
+    let server_now = listings
+        .iter()
+        .flatten()
+        .map(|p| p.server_now_ms)
+        .min()
+        .unwrap_or(0);
     if server_now == 0 {
         return Err(mismatch());
     }
     let t = local_now.min(server_now).saturating_sub(CLOCK_SKEW_MS);
-    let (binding, anchor) = pin_of(state)?;
-    let refused = || code("fleet.trustEvidenceRefused");
-    let evidence = Evidence::collect(&binding, &pages).map_err(|_| refused())?;
-    let chain = TrustChain::evaluate(evidence, Some(&anchor)).map_err(|_| refused())?;
+    let (_, chain) =
+        crate::team::ledger::evaluate(ledger.db, &ledger.pin.0, &ledger.pin.1, &listings, t)?
+            .ok_or_else(|| code("fleet.trustEvidenceRefused"))?;
+    let pages = listings.concat();
     if !chain.custodian_now(&cx.signing_key_id, t) {
         return Err(code("fleet.notCustodian"));
     }
@@ -765,7 +801,11 @@ async fn discarded(
         return Ok(refused_with(e, 409, Some("ROOT_GENERATION_MISMATCH"))
             || refused_with(e, 422, Some("MUTATION_RESPONSE_MISMATCH")));
     }
-    if !refused_for_good(e) {
+    // A moved or replaced bundle stops the run before activation, locally:
+    // the server is asked too, so a discarded run still ends.
+    if !refused_for_good(e)
+        && !crate::errcode::has_code(&e.to_string(), "fleet.recoveryBundleChanged")
+    {
         return Ok(false);
     }
     let (request, _) = saved(&r.root_grant_request)?;
@@ -796,6 +836,7 @@ pub(crate) async fn rotate_root(
     access: &str,
     me: &RenewingDevice<'_>,
     vault: &dyn TrkStore,
+    ledger: &mut Ledger<'_>,
     custody: &FleetCustodyState,
     local_keys: &[(u64, Zeroizing<[u8; 32]>)],
     recovery: &RecoveryExport<'_>,
@@ -837,10 +878,19 @@ pub(crate) async fn rotate_root(
             .as_ref()
             .is_some_and(|r| r.create_request.is_empty())
     {
+        // Root N's bundle is the only one that restores until N + 1 activates.
+        let current_bundle = std::path::Path::new(&state.recovery_path);
+        let same = |a: &std::path::Path, b: &std::path::Path| {
+            a == b
+                || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+        };
+        if !state.recovery_path.is_empty() && same(recovery.path, current_bundle) {
+            return Err(code("fleet.rootRotationBundlePathInUse"));
+        }
         let old_trk = current.open_trk(&hpke_secret).map_err(|_| corrupt())?;
         Some(
             retained_keys(
-                client, access, state, &cx, &current, &old_trk, local_keys, local_now,
+                client, access, ledger, &cx, &current, &old_trk, local_keys, local_now,
             )
             .await?,
         )
@@ -867,7 +917,8 @@ pub(crate) async fn rotate_root(
     if current.root_generation.checked_add(1) != Some(generation) {
         return Err(corrupt());
     }
-    let new_trk = hold_trk(vault, state, save)?;
+    let own = me.signer.verifying_key().to_bytes();
+    let new_trk = hold_trk(vault, &own, &hpke_secret, state, save)?;
     if let Some(retained) = retained {
         build(
             &cx, me, &current, &new_trk, retained, recovery, local_now, state, save,
@@ -878,7 +929,7 @@ pub(crate) async fn rotate_root(
         client,
         access,
         &cx,
-        &me.signer.verifying_key().to_bytes(),
+        &own,
         &hpke_secret,
         &new_trk,
         recovery,
@@ -888,7 +939,9 @@ pub(crate) async fn rotate_root(
     .await;
     if let Err(e) = sent {
         if discarded(client, access, state, &e).await? {
-            release_trk(vault, state, save)?;
+            // One save ends the run: a crash before it resumes into the
+            // same discard, its TRK reopened from the RotationGrant.
+            forget_trk(vault, state)?;
             commit(state, save, |s| s.root_rotation = None)?;
             eprintln!("[root-rotation] generation {generation} was discarded");
             return Err(code("fleet.rootRotationDiscarded"));
