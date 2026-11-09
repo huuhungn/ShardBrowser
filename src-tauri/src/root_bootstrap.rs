@@ -126,9 +126,18 @@ pub struct BootstrapState {
     #[serde(default)]
     pub activated: bool,
     /// The bootstrap anchor `A0` the server's trust evidence verified to:
-    /// this device's own signing key ID.
+    /// this device's own signing key ID, or the pinned one of the tenant
+    /// whose custody this device received (ADR 0002 Q-52).
     #[serde(default)]
     pub anchor: String,
+    /// The exact current root grant container, once a renewal or a hand-over
+    /// replaced the first self-grant (Q-52); empty while the first self-grant
+    /// is current.
+    #[serde(default)]
+    pub root_grant: String,
+    /// The Ed25519 public key that signed `root_grant`.
+    #[serde(default)]
+    pub root_grant_issuer: String,
 }
 
 impl std::fmt::Debug for BootstrapState {
@@ -286,8 +295,16 @@ pub(crate) fn own_grant(
     container: &[u8],
     signer: &Ed25519SigningKey,
 ) -> Result<(TenantRootKeyGrantV2, RootGrantRef)> {
+    verified_root_grant(container, signer.verifying_key().as_bytes())
+}
+
+/// A root grant verified under its issuer's public key `issuer`.
+pub(crate) fn verified_root_grant(
+    container: &[u8],
+    issuer: &[u8; 32],
+) -> Result<(TenantRootKeyGrantV2, RootGrantRef)> {
     let v = AuthorizationRecord::parse(container)
-        .and_then(|r| r.verify_signature(signer.verifying_key().as_bytes()))
+        .and_then(|r| r.verify_signature(issuer))
         .map_err(|_| anyhow!(crate::errcode::code("fleet.custodyStateCorrupt")))?;
     let Payload::TenantRootKeyGrant(g) = v.payload() else {
         bail!(crate::errcode::code("fleet.custodyStateCorrupt"));
@@ -303,6 +320,29 @@ pub(crate) fn own_grant(
         exact_signed_container_bytes_sha256: *v.record().exact_signed_container_bytes_sha256(),
     };
     Ok((g.clone(), grant_ref))
+}
+
+/// This device's current root grant (ADR 0002 Q-52): the first self-grant
+/// until a renewal or a hand-over saved another in `root_grant`. Returns it
+/// with its exact container and its issuer's public key, once it verifies
+/// under that key and names this device's own signing key.
+pub(crate) fn current_root_grant(
+    state: &BootstrapState,
+    signer: &Ed25519SigningKey,
+) -> Result<(TenantRootKeyGrantV2, Vec<u8>, [u8; 32])> {
+    let own = signer.verifying_key().to_bytes();
+    if state.root_grant.is_empty() {
+        let container = unhex_vec(&state.self_grant)?;
+        let (grant, _) = verified_root_grant(&container, &own)?;
+        return Ok((grant, container, own));
+    }
+    let container = unhex_vec(&state.root_grant)?;
+    let issuer = unhex(&state.root_grant_issuer)?;
+    let (grant, _) = verified_root_grant(&container, &issuer)?;
+    if grant.subject_signing_key_id != signing_key_id(&own) {
+        return Err(corrupt());
+    }
+    Ok((grant, container, issuer))
 }
 
 /// The D1 receipt must answer exactly this device's approval of itself, as
@@ -373,7 +413,6 @@ fn export_recovery_bundle(
     recovery: &RecoveryExport<'_>,
     now: u64,
 ) -> Result<[u8; 32]> {
-    let failed = || crate::errcode::code("fleet.recoveryExportFailed");
     let plaintext = RecoveryBundlePlaintextV2 {
         trk: (*trk).into(),
         bootstrap_anchor_signing_key_id: cx.signing_key_id,
@@ -383,15 +422,29 @@ fn export_recovery_bundle(
             device_id: cx.device,
             signing_key_seed: signer.to_bytes().into(),
             hpke_key_seed: (*hpke_seed).into(),
-            first_self_grant: self_grant.to_vec(),
+            root_grant: self_grant.to_vec(),
+            root_grant_issuer: None,
         }),
     };
+    write_bundle((cx.tenant, cx.instance, 0), &plaintext, recovery, now)
+}
+
+/// Seals `plaintext` under a header naming `(tenant, instance, root
+/// generation)` and writes it once its sealed bytes open, then re-reads
+/// exactly those bytes from its final path. Returns the pinned hash.
+fn write_bundle(
+    (tenant, instance, root_generation): ([u8; 16], [u8; 16], u64),
+    plaintext: &RecoveryBundlePlaintextV2,
+    recovery: &RecoveryExport<'_>,
+    now: u64,
+) -> Result<[u8; 32]> {
+    let failed = || crate::errcode::code("fleet.recoveryExportFailed");
     let (header, file) = rb::seal(
-        cx.tenant,
-        cx.instance,
-        0,
+        tenant,
+        instance,
+        root_generation,
         now,
-        &plaintext,
+        plaintext,
         recovery.passphrase,
     )
     .map_err(|e| anyhow!(e).context(failed()))?;
@@ -441,7 +494,7 @@ fn reusable_bundle(
     Ok(
         check_bundle(recovery, &unhex(&state.recovery_bundle_sha256)?, trk).is_ok_and(|pt| {
             pt.root_custodian
-                .is_some_and(|c| c.device_id == *device && c.first_self_grant == self_grant)
+                .is_some_and(|c| c.device_id == *device && c.root_grant == self_grant)
         }),
     )
 }
@@ -983,17 +1036,21 @@ pub async fn run(
     };
     // A bootstrap returns Ok only once the generation is active.
     bootstrap_root(client, device, &recovery, &mut state, &mut |s| save(s)).await?;
-    keep_records(client.base_url(), &state)?;
+    // Generation 0's records; a custodian that received custody has none.
+    if state.root_grant.is_empty() {
+        keep_records(client.base_url(), &state)?;
+    }
     Ok(BootstrapStatus::of(&state))
 }
 
 /// Exports the recovery bundle again (v0.2.2b plan, section 4.X) over this
 /// root custodian's device session `access`. `fkeks` is every verified fleet
 /// key of `fleet_hex` this device holds: the fleet's ACTIVE generation must be
-/// among them. The first self-grant must read back acknowledged under an
-/// ACTIVE root generation and open to the TRK. The bundle names the
-/// self-grant's server instance and root generation 0, which the first
-/// self-grant always names. Nothing is filed and no state file changes.
+/// among them. The current root grant (Q-52) must read back acknowledged
+/// under an ACTIVE root generation and open to the TRK. The bundle names that
+/// grant's server instance and root generation and the saved anchor; it is v3
+/// while the first self-grant is current, v4 otherwise (Q-53). Nothing is
+/// filed and no state file changes.
 #[allow(clippy::too_many_arguments)]
 pub async fn export_again(
     client: &FleetClient,
@@ -1005,8 +1062,7 @@ pub async fn export_again(
     recovery: &RecoveryExport<'_>,
 ) -> Result<()> {
     let state = load()?;
-    let container = unhex_vec(&state.self_grant)?;
-    let (grant, _) = own_grant(&container, signer)?;
+    let (grant, container, issuer) = current_root_grant(&state, signer)?;
     let tenant_hex = hex(&grant.common.tenant_id);
     let active = client
         .active_fleet_generation(access, &tenant_hex, fleet_hex)
@@ -1023,7 +1079,7 @@ pub async fn export_again(
         access,
         &tenant_hex,
         &container,
-        signer,
+        &issuer,
         &hpke_secret,
         &trk,
     )
@@ -1037,25 +1093,25 @@ pub async fn export_again(
             fkek,
         })
         .collect();
-    let cx = Context16 {
-        tenant: grant.common.tenant_id,
-        instance: grant.common.server_instance_id,
-        epoch: grant.common.restore_epoch,
-        account: grant.subject_account_id,
-        device: grant.subject_device_id,
-        signing_key_id: signing_key_id(signer.verifying_key().as_bytes()),
-        hpke_key_id: grant.recipient_hpke_key_id,
+    let plaintext = RecoveryBundlePlaintextV2 {
+        trk,
+        bootstrap_anchor_signing_key_id: unhex(&state.anchor)?,
+        retained_fkeks: retained,
+        root_custodian: Some(RootCustodian {
+            account_id: grant.subject_account_id,
+            device_id: grant.subject_device_id,
+            signing_key_seed: signer.to_bytes().into(),
+            hpke_key_seed: (*hpke_seed).into(),
+            root_grant: container,
+            root_grant_issuer: (!state.root_grant.is_empty()).then_some(issuer),
+        }),
     };
-    export_recovery_bundle(
-        &cx,
-        &trk,
-        signer,
-        hpke_seed,
-        &container,
-        retained,
-        recovery,
-        now_ms(),
-    )?;
+    let header = (
+        grant.common.tenant_id,
+        grant.common.server_instance_id,
+        grant.root_generation,
+    );
+    write_bundle(header, &plaintext, recovery, now_ms())?;
     Ok(())
 }
 
@@ -1114,19 +1170,17 @@ impl BootstrapStatus {
     }
 }
 
-/// The `root_key_id` of `state`'s first self-grant, verified under this
-/// device's signing key; empty when not activated or when either does not read.
+/// The `root_key_id` of `state`'s current root grant ([`current_root_grant`]);
+/// empty when not activated or when it or this device's key does not read.
 fn root_key_id_of(state: &BootstrapState) -> String {
     if !state.activated {
         return String::new();
     }
-    let signer = crate::team_config::load().and_then(|c| c.signing_key());
-    match (unhex_vec(&state.self_grant), signer) {
-        (Ok(grant), Ok(signer)) => own_grant(&grant, &signer)
-            .map(|(g, _)| hex(&g.root_key_id))
-            .unwrap_or_default(),
-        _ => String::new(),
-    }
+    crate::team_config::load()
+        .and_then(|c| c.signing_key())
+        .and_then(|signer| current_root_grant(state, &signer))
+        .map(|(g, _, _)| hex(&g.root_key_id))
+        .unwrap_or_default()
 }
 
 /// The saved bootstrap's progress.
@@ -1154,7 +1208,7 @@ pub fn save(state: &BootstrapState) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use shardx_core::recovery_bundle::{open, recovery_bundle_sha256};
 
@@ -1614,7 +1668,7 @@ mod tests {
         );
         assert_eq!(*custodian.signing_key_seed, signer().to_bytes());
         assert_eq!(*custodian.hpke_key_seed, HPKE_SEED);
-        assert_eq!(custodian.first_self_grant, grant);
+        assert_eq!(custodian.root_grant, grant);
         assert!(!dir.join("recovery.bundle.tmp").exists());
 
         // The pinned bundle checks out; a changed or missing one does not.
@@ -1723,6 +1777,255 @@ mod tests {
             (state.trk_ref.as_str(), saved),
             ("ab", vec!["ab".to_string()])
         );
+    }
+
+    /// An `ExistingRootGrant` of `trk` as root `generation` from `issuer`
+    /// to the device `cx` names, sealed to `hpke_public` and linked to the
+    /// approval `approval_replay_id`.
+    pub(crate) fn existing_grant(
+        issuer: &Ed25519SigningKey,
+        cx: &Context16,
+        hpke_public: &[u8],
+        trk: &[u8; 32],
+        generation: u64,
+        approval_replay_id: [u8; 16],
+        now: u64,
+    ) -> Vec<u8> {
+        let mut g = TenantRootKeyGrantV2 {
+            common: cx.common(random().unwrap(), now),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: root_key_id(trk),
+            root_generation: generation,
+            subject_account_id: cx.account,
+            subject_device_id: cx.device,
+            subject_signing_key_id: cx.signing_key_id,
+            recipient_hpke_key_id: cx.hpke_key_id,
+            subject_device_approval_replay_id: approval_replay_id,
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let sealed = seal_trk(hpke_public, &g.scope(), trk).unwrap();
+        g.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+        g.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+        build_record(issuer, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
+    }
+
+    /// The anchor `A0` that appointed this test device (test key only).
+    fn a0() -> Ed25519SigningKey {
+        Ed25519SigningKey::from_bytes(&[0xa0; 32])
+    }
+
+    /// A root state whose current grant is `A0`'s `ExistingRootGrant` of
+    /// `TRK` as root `generation` to this device, anchored at `A0`.
+    fn appointed_state(generation: u64) -> (BootstrapState, Vec<u8>) {
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let (_, pk) = derive_keypair(&HPKE_SEED);
+        let grant = existing_grant(&a0(), &cx, &pk, &[9; 32], generation, [0x34; 16], now_ms());
+        let state = BootstrapState {
+            tenant_id: hex(&cx.tenant),
+            device_id: hex(&cx.device),
+            server_instance_id: hex(&cx.instance),
+            activated: true,
+            anchor: hex(&signing_key_id(a0().verifying_key().as_bytes())),
+            root_grant: hex(&grant),
+            root_grant_issuer: hex(&a0().verifying_key().to_bytes()),
+            ..Default::default()
+        };
+        (state, grant)
+    }
+
+    /// Q-52: the first self-grant until another grant replaced it; that one
+    /// only while it verifies under its saved issuer and names this device's
+    /// own signing key.
+    #[test]
+    fn the_current_root_grant_refuses_a_grant_to_another_key() {
+        let (_, first) = custodian_cx([5; 16], &[9; 32]);
+        let initial = BootstrapState {
+            self_grant: hex(&first),
+            ..Default::default()
+        };
+        let (grant, container, issuer) = current_root_grant(&initial, &signer()).unwrap();
+        assert_eq!(
+            (grant.root_generation, container, issuer),
+            (0, first.clone(), signer().verifying_key().to_bytes())
+        );
+
+        let (mut state, appointed) = appointed_state(1);
+        state.self_grant = hex(&first);
+        let (grant, container, issuer) = current_root_grant(&state, &signer()).unwrap();
+        assert_eq!(
+            (grant.root_generation, container, issuer),
+            (1, appointed, a0().verifying_key().to_bytes())
+        );
+
+        // A grant to another device's key, or under a key that did not sign
+        // it, is refused.
+        let other = Ed25519SigningKey::from_bytes(&[0x0e; 32]);
+        assert!(current_root_grant(&state, &other).is_err());
+        let forged = BootstrapState {
+            root_grant_issuer: hex(&other.verifying_key().to_bytes()),
+            ..state.clone()
+        };
+        assert!(current_root_grant(&forged, &signer()).is_err());
+        let damaged = BootstrapState {
+            root_grant_issuer: "ab".into(),
+            ..state
+        };
+        assert!(current_root_grant(&damaged, &signer()).is_err());
+    }
+
+    /// Exports again from `state` against a server that lists generation 0
+    /// ACTIVE and reads `grant` back acknowledged from `issuer`; returns the
+    /// opened bundle.
+    fn export_again_from(
+        state: &BootstrapState,
+        grant: &[u8],
+        issuer: &Ed25519SigningKey,
+    ) -> (rb::RecoveryBundleHeaderV2, RecoveryBundlePlaintextV2) {
+        use crate::fleet_custody::tests::{mock, runtime};
+        use shardx_core::mutation::{RootGenerationState, RootGrantState};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        save(state).unwrap();
+        let record = AuthorizationRecord::parse(grant)
+            .unwrap()
+            .verify_signature(issuer.verifying_key().as_bytes())
+            .unwrap();
+        let descriptor = TenantRootGrantDescriptorV2::new(
+            record,
+            RootGrantState::Acknowledged,
+            RootGenerationState::Active,
+        )
+        .unwrap()
+        .encode();
+        let rt = runtime();
+        let (client, _) = rt.block_on(mock(std::sync::Arc::new(move |call: &str, _: &[u8]| {
+            if call.ends_with("/key-generation") {
+                (200, br#"{"generation":0}"#.to_vec())
+            } else if call.contains("/root-key-generations/") {
+                (200, descriptor.clone())
+            } else {
+                (404, Vec::new())
+            }
+        })));
+        let path = dir.path().join("again.bundle");
+        let export = RecoveryExport {
+            path: &path,
+            passphrase: "correct horse battery",
+        };
+        let result = rt.block_on(export_again(
+            &client,
+            "access",
+            &hex(&[1; 16]),
+            &signer(),
+            &HPKE_SEED,
+            vec![(0, Zeroizing::new([0x44; 32]))],
+            &export,
+        ));
+        let file = std::fs::read(&path);
+        crate::store::set_config_root(None);
+        result.unwrap();
+        open(&file.unwrap(), "correct horse battery").unwrap()
+    }
+
+    /// Q-52: the header's root generation is the current grant's, so a
+    /// custodian of root generation 1 exports.
+    #[test]
+    fn export_again_succeeds_for_a_custodian_of_root_generation_1() {
+        let (state, grant) = appointed_state(1);
+        let (header, plaintext) = export_again_from(&state, &grant, &a0());
+        assert_eq!(header.root_generation, 1);
+        let custodian = plaintext.root_custodian.unwrap();
+        assert_eq!(custodian.root_grant, grant);
+        assert_eq!(
+            custodian.root_grant_issuer,
+            Some(a0().verifying_key().to_bytes())
+        );
+    }
+
+    /// Q-52: a custodian that is not the anchor names the saved anchor `A0`,
+    /// not its own key.
+    #[test]
+    fn the_v4_bundle_names_the_saved_anchor_not_the_custodian() {
+        let (state, grant) = appointed_state(0);
+        let (_, plaintext) = export_again_from(&state, &grant, &a0());
+        let a0_id = signing_key_id(a0().verifying_key().as_bytes());
+        assert_eq!(plaintext.bootstrap_anchor_signing_key_id, a0_id);
+        assert_ne!(a0_id, cx().signing_key_id);
+        let custodian = plaintext.root_custodian.unwrap();
+        assert_eq!(*custodian.signing_key_seed, signer().to_bytes());
+        assert_eq!(custodian.device_id, [5; 16]);
+    }
+
+    /// Q-53 (D3): while the first self-grant is current, export writes v3
+    /// for 2.9.x to read.
+    #[test]
+    fn export_writes_v3_while_the_first_self_grant_is_current() {
+        let (cx, first) = custodian_cx([5; 16], &[9; 32]);
+        let state = BootstrapState {
+            self_grant: hex(&first),
+            anchor: hex(&cx.signing_key_id),
+            ..Default::default()
+        };
+        let (header, plaintext) = export_again_from(&state, &first, &signer());
+        assert_eq!(header.root_generation, 0);
+        assert_eq!(plaintext.bootstrap_anchor_signing_key_id, cx.signing_key_id);
+        let custodian = plaintext.root_custodian.unwrap();
+        assert_eq!(custodian.root_grant_issuer, None);
+        assert_eq!(custodian.root_grant, first);
+    }
+
+    /// Neither the debug print nor the status shows the current grant.
+    #[test]
+    fn a_root_state_with_a_current_grant_never_prints_it() {
+        let (state, grant) = appointed_state(1);
+        let printed = format!("{state:?}");
+        let status = serde_json::to_string(&BootstrapStatus::of(&state)).unwrap();
+        for shown in [printed, status] {
+            assert!(!shown.contains(&hex(&grant)), "{shown}");
+            assert!(!shown.contains(&state.root_grant_issuer), "{shown}");
+        }
+    }
+
+    /// An activated custodian whose current grant replaced the first
+    /// self-grant files no bootstrap records: those are generation 0's.
+    #[test]
+    fn an_activated_run_with_a_current_root_grant_keeps_no_bootstrap_records() {
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let (state, _) = appointed_state(0);
+        save(&state).unwrap();
+        let client = FleetClient::new("http://127.0.0.1:9", "t").unwrap();
+        let (tenant, device_id, account) = (
+            state.tenant_id.clone(),
+            state.device_id.clone(),
+            hex(&cx().account),
+        );
+        let signer = signer();
+        let device = BootstrapDevice {
+            login: AccountLogin {
+                tenant_id: &tenant,
+                username: "u",
+                password: "p",
+            },
+            device_id: &device_id,
+            account_id: &account,
+            signer: &signer,
+            hpke_seed: &HPKE_SEED,
+            trk_store: &CredentialTrkStore,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let status = rt.block_on(run(&client, &device, Path::new("unused"), "pass"));
+        let db = crate::team::db::Db::path().unwrap();
+        crate::store::set_config_root(None);
+        assert!(status.unwrap().activated);
+        assert!(!db.exists(), "no team database was written");
     }
 
     #[test]

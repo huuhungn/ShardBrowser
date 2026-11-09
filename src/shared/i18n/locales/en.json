@@ -369,6 +369,7 @@
   "recovery.deviceNotActive": "The team server does not list the bundle's root custodian device as active with the bundle's keys",
   "recovery.approvalExpired": "The root custodian device in this bundle no longer holds a live approval on the team server",
   "recovery.rootGrantMissing": "The team server does not hold this device's root key grant as acknowledged and active",
+  "recovery.rootGrantIssuerNotCustodian": "The trust evidence does not count this bundle's root custodian device as a custodian now, so its root key grant cannot be trusted",
   "recovery.importedCollectFailed": "The recovery bundle was imported, but collecting the fleet key failed; run Collect key custody to try again: {error}",
   "fleet.trustEvidenceRefused": "The team server's trust evidence does not verify to this device as the tenant's bootstrap anchor and custodian",
   "fleet.trustClosureTooLarge": "The team server's trust evidence revokes a root custodian, and checking every device it approved needs more than 64 devices in one request, which this version cannot do. Team sync stays paused on this device until a later version; nothing was changed.",

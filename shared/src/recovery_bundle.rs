@@ -33,9 +33,13 @@ pub const DOMAIN_PLAINTEXT: &str = "shardx.recovery.bundle-plaintext.v2";
 /// The plaintext that also carries the root custodian (ADR 0002 D-5
 /// amendment of 2026-11-06).
 pub const DOMAIN_PLAINTEXT_V3: &str = "shardx.recovery.bundle-plaintext.v3";
+/// The plaintext whose root custodian carries its current root grant and
+/// that grant's issuer (ADR 0002 Q-53, D-5 amendment of 2026-11-09).
+pub const DOMAIN_PLAINTEXT_V4: &str = "shardx.recovery.bundle-plaintext.v4";
 pub const DOMAIN_READINESS_PROBE: &str = "shardx.recovery.readiness-probe.v2";
 const VERSION: u64 = 2;
 const VERSION_V3: u64 = 3;
+const VERSION_V4: u64 = 4;
 /// Plan L862.
 pub const FIRST_SELF_GRANT_BYTES: RangeInclusive<usize> = 1..=131_072;
 pub const KDF_SALT_CONTEXT: &[u8] = b"SHARDX-RECOVERY-BUNDLE-KDF-V2\0";
@@ -233,13 +237,17 @@ pub struct RetainedFkek {
 }
 
 /// The root custodian device the bundle restores: its IDs, both key seeds and
-/// its exact first root self-grant. [`open`] checks they belong together.
+/// its exact current root grant. In v3 that grant is its first root
+/// self-grant; in v4 (ADR 0002 Q-53) it is the `ExistingRootGrant`
+/// `root_grant_issuer` signed. [`open`] checks they belong together.
 pub struct RootCustodian {
     pub account_id: [u8; 16],
     pub device_id: [u8; 16],
     pub signing_key_seed: Zeroizing<[u8; 32]>,
     pub hpke_key_seed: Zeroizing<[u8; 32]>,
-    pub first_self_grant: Vec<u8>,
+    pub root_grant: Vec<u8>,
+    /// v4: the Ed25519 public key that signed `root_grant`; `None` in v3.
+    pub root_grant_issuer: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for RootCustodian {
@@ -249,85 +257,117 @@ impl std::fmt::Debug for RootCustodian {
             .field("device_id", &self.device_id)
             .field("signing_key_seed", &"<redacted>")
             .field("hpke_key_seed", &"<redacted>")
-            .field("first_self_grant", &self.first_self_grant.len())
+            .field("root_grant", &self.root_grant.len())
+            .field("root_grant_issuer", &self.root_grant_issuer)
             .finish()
     }
 }
 
 impl RootCustodian {
-    fn entries(&self) -> Result<Value> {
-        if !FIRST_SELF_GRANT_BYTES.contains(&self.first_self_grant.len()) {
-            return Err(RecordError::BadValue("first_self_grant").into());
+    /// The plaintext field `root_grant` is kept in: v3's or v4's.
+    fn grant_field(v4: bool) -> &'static str {
+        if v4 {
+            "root_grant"
+        } else {
+            "first_self_grant"
         }
-        Ok(c::m(vec![
+    }
+
+    fn entries(&self) -> Result<Value> {
+        let field = Self::grant_field(self.root_grant_issuer.is_some());
+        if !FIRST_SELF_GRANT_BYTES.contains(&self.root_grant.len()) {
+            return Err(RecordError::BadValue(field).into());
+        }
+        let mut entries = vec![
             ("account_id", c::b(&self.account_id)),
             ("device_id", c::b(&self.device_id)),
             ("signing_key_seed", c::b(self.signing_key_seed.as_slice())),
             ("hpke_key_seed", c::b(self.hpke_key_seed.as_slice())),
-            ("first_self_grant", c::b(&self.first_self_grant)),
-        ]))
+            (field, c::b(&self.root_grant)),
+        ];
+        if let Some(issuer) = &self.root_grant_issuer {
+            entries.push(("root_grant_issuer_public_key", c::b(issuer)));
+        }
+        Ok(c::m(entries))
     }
 
-    fn read(v: Value) -> Result<Self> {
+    fn read(v: Value, v4: bool) -> Result<Self> {
         let mut f = Fields::open("RootCustodian", v)?;
         let custodian = Self {
             account_id: f.fixed("account_id")?,
             device_id: f.fixed("device_id")?,
             signing_key_seed: Zeroizing::new(f.fixed("signing_key_seed")?),
             hpke_key_seed: Zeroizing::new(f.fixed("hpke_key_seed")?),
-            first_self_grant: f.bytes(
-                "first_self_grant",
+            root_grant: f.bytes(
+                Self::grant_field(v4),
                 *FIRST_SELF_GRANT_BYTES.start(),
                 *FIRST_SELF_GRANT_BYTES.end(),
             )?,
+            root_grant_issuer: if v4 {
+                Some(f.fixed("root_grant_issuer_public_key")?)
+            } else {
+                None
+            },
         };
         f.finish()?;
         Ok(custodian)
     }
 
-    /// The signing seed is the anchor's key, and the first self-grant is
-    /// signed by it, names this tenant, root key, generation, account and
-    /// device, and opens with the HPKE seed to `trk`.
+    /// The root grant is signed by its issuer, names this tenant, root key,
+    /// generation, account, device and signing key, and opens with the HPKE
+    /// seed to `trk`. v3: it is the first self-grant, so the signing seed is
+    /// its issuer and the anchor's key. v4: it is an `ExistingRootGrant` from
+    /// `root_grant_issuer`, and the subject need not be the anchor.
     fn check(
         &self,
         header: &RecoveryBundleHeaderV2,
         anchor: &[u8; 32],
         trk: &[u8; 32],
     ) -> Result<()> {
-        let vk = Ed25519SigningKey::from_bytes(&self.signing_key_seed).verifying_key();
-        let grant = AuthorizationRecord::parse(&self.first_self_grant)
-            .and_then(|r| r.verify_signature(vk.as_bytes()));
+        let own = Ed25519SigningKey::from_bytes(&self.signing_key_seed)
+            .verifying_key()
+            .to_bytes();
+        let own_id = signing_key_id(&own);
+        let (issuer, variant) = match &self.root_grant_issuer {
+            Some(issuer) => (issuer, RootGrantVariant::ExistingRootGrant),
+            None => (&own, RootGrantVariant::FirstRootSelfGrant),
+        };
+        let grant =
+            AuthorizationRecord::parse(&self.root_grant).and_then(|r| r.verify_signature(issuer));
         let names_us = match grant.as_ref().map(|v| v.payload()) {
             Ok(authz::Payload::TenantRootKeyGrant(g)) => {
-                g.variant == RootGrantVariant::FirstRootSelfGrant
+                g.variant == variant
                     && g.common.tenant_id == header.tenant_id
                     && g.common.server_instance_id == header.server_instance_id
                     && g.root_key_id == header.root_key_id
                     && g.root_generation == header.root_generation
                     && g.subject_account_id == self.account_id
                     && g.subject_device_id == self.device_id
-                    && g.subject_signing_key_id == *anchor
+                    && g.subject_signing_key_id == own_id
                     && g.open_trk(&derive_keypair(&self.hpke_key_seed).0)
                         .is_ok_and(|opened| *opened == *trk)
             }
             _ => false,
         };
-        if signing_key_id(vk.as_bytes()) != *anchor || !names_us {
+        let anchored = self.root_grant_issuer.is_some() || own_id == *anchor;
+        if !anchored || !names_us {
             return Err(RecoveryBundleError::Mismatch("root_custodian"));
         }
         Ok(())
     }
 }
 
-/// `RecoveryBundlePlaintextV2`, or v3 when it carries the root custodian.
-/// The root key id is derived from `trk`.
+/// `RecoveryBundlePlaintextV2`, or v3 when it carries the root custodian
+/// with its first self-grant, v4 with another current root grant. The root
+/// key id is derived from `trk`.
 pub struct RecoveryBundlePlaintextV2 {
     pub trk: Zeroizing<[u8; 32]>,
     pub bootstrap_anchor_signing_key_id: [u8; 32],
     /// Sorted by `(fleet_id, generation)`, each at most once. Empty at
     /// bootstrap.
     pub retained_fkeks: Vec<RetainedFkek>,
-    /// Present in every bundle this build writes (v3); absent in a 2.7.x one.
+    /// Present in every bundle this build writes (v3 or v4); absent in a
+    /// 2.7.x one.
     pub root_custodian: Option<RootCustodian>,
 }
 
@@ -381,8 +421,12 @@ impl RecoveryBundlePlaintextV2 {
             ("retained_fkeks", Value::Array(items)),
         ];
         if let Some(custodian) = &self.root_custodian {
-            entries[0].1 = c::t(DOMAIN_PLAINTEXT_V3);
-            entries[1].1 = c::u(VERSION_V3);
+            let (domain, version) = match custodian.root_grant_issuer {
+                Some(_) => (DOMAIN_PLAINTEXT_V4, VERSION_V4),
+                None => (DOMAIN_PLAINTEXT_V3, VERSION_V3),
+            };
+            entries[0].1 = c::t(domain);
+            entries[1].1 = c::u(version);
             entries.push(("root_custodian", custodian.entries()?));
         }
         Ok(Zeroizing::new(c::encode(&c::m(entries))))
@@ -391,16 +435,16 @@ impl RecoveryBundlePlaintextV2 {
     fn parse(bytes: &[u8]) -> Result<Self> {
         let mut f = Fields::decode("RecoveryBundlePlaintextV2", bytes)?;
         // The v2 domain carries no custodian; `finish` refuses one.
-        let v3 = match f.text("domain")?.as_str() {
-            DOMAIN_PLAINTEXT => false,
-            DOMAIN_PLAINTEXT_V3 => true,
+        let (version, v4) = match f.text("domain")?.as_str() {
+            DOMAIN_PLAINTEXT => (VERSION, None),
+            DOMAIN_PLAINTEXT_V3 => (VERSION_V3, Some(false)),
+            DOMAIN_PLAINTEXT_V4 => (VERSION_V4, Some(true)),
             _ => return Err(RecordError::BadValue("domain").into()),
         };
-        supported(&mut f, "version", if v3 { VERSION_V3 } else { VERSION })?;
-        let root_custodian = if v3 {
-            Some(RootCustodian::read(f.req("root_custodian")?)?)
-        } else {
-            None
+        supported(&mut f, "version", version)?;
+        let root_custodian = match v4 {
+            Some(v4) => Some(RootCustodian::read(f.req("root_custodian")?, v4)?),
+            None => None,
         };
         let named_root = f.fixed::<32>("root_key_id")?;
         let trk = Zeroizing::new(f.fixed::<32>("trk")?);
@@ -717,7 +761,16 @@ mod tests {
     /// A first root self-grant of `trk`, signed with `SIGNING_SEED` and
     /// sealed to `HPKE_SEED`, after `edit`.
     fn self_grant(trk: &[u8; 32], edit: fn(&mut TenantRootKeyGrantV2)) -> Vec<u8> {
-        let sk = Ed25519SigningKey::from_bytes(&SIGNING_SEED);
+        grant_by(&SIGNING_SEED, trk, edit)
+    }
+
+    /// [`self_grant`], signed with `issuer_seed` instead.
+    fn grant_by(
+        issuer_seed: &[u8; 32],
+        trk: &[u8; 32],
+        edit: impl Fn(&mut TenantRootKeyGrantV2),
+    ) -> Vec<u8> {
+        let sk = Ed25519SigningKey::from_bytes(issuer_seed);
         let (_, pk) = derive_keypair(&HPKE_SEED);
         let h = header();
         let mut g = TenantRootKeyGrantV2 {
@@ -748,13 +801,45 @@ mod tests {
         build_record(&sk, DOMAIN_TENANT_ROOT_KEY_GRANT, &g.encode())
     }
 
-    fn custodian(first_self_grant: Vec<u8>) -> RootCustodian {
+    fn custodian(root_grant: Vec<u8>) -> RootCustodian {
         RootCustodian {
             account_id: ACCOUNT,
             device_id: DEVICE,
             signing_key_seed: Zeroizing::new(SIGNING_SEED),
             hpke_key_seed: Zeroizing::new(HPKE_SEED),
-            first_self_grant,
+            root_grant,
+            root_grant_issuer: None,
+        }
+    }
+
+    /// The custodian that appointed this device in the v4 tests.
+    const ISSUER_SEED: [u8; 32] = [0x25; 32];
+
+    fn issuer_pk(seed: &[u8; 32]) -> [u8; 32] {
+        Ed25519SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    /// `ISSUER_SEED`'s `ExistingRootGrant` of `TRK` to this device, after
+    /// `edit`.
+    fn appointed(edit: fn(&mut TenantRootKeyGrantV2)) -> Vec<u8> {
+        grant_by(&ISSUER_SEED, &TRK, |g| {
+            g.variant = RootGrantVariant::ExistingRootGrant;
+            edit(g);
+        })
+    }
+
+    /// A v4 plaintext: anchored at `ISSUER_SEED`'s key, this device holding
+    /// `grant` from `issuer`.
+    fn plaintext_v4(grant: Vec<u8>, issuer: [u8; 32]) -> RecoveryBundlePlaintextV2 {
+        RecoveryBundlePlaintextV2 {
+            bootstrap_anchor_signing_key_id: anchor_of(&ISSUER_SEED),
+            root_custodian: Some(RootCustodian {
+                root_grant_issuer: Some(issuer),
+                ..custodian(grant)
+            }),
+            ..plaintext(vec![fkek(1, 0)])
         }
     }
 
@@ -793,7 +878,7 @@ mod tests {
             (*c.signing_key_seed, *c.hpke_key_seed),
             (SIGNING_SEED, HPKE_SEED)
         );
-        assert_eq!(c.first_self_grant, grant);
+        assert_eq!(c.root_grant, grant);
         assert_eq!(
             verify_export(&file, PASS, &h),
             Ok(recovery_bundle_sha256(&file))
@@ -951,6 +1036,192 @@ mod tests {
             reseal(&plaintext(vec![]), DOMAIN_PLAINTEXT, VERSION_V3, false),
             RecoveryBundleError::Format(RecordError::Unsupported { .. })
         ));
+    }
+
+    /// Q-53: a renewed root custodian holds an `ExistingRootGrant` it
+    /// issued to itself; its v4 bundle opens with the grant and issuer.
+    #[test]
+    fn a_v4_self_issued_existing_grant_opens() {
+        let grant = self_grant(&TRK, |g| g.variant = RootGrantVariant::ExistingRootGrant);
+        let pt = RecoveryBundlePlaintextV2 {
+            bootstrap_anchor_signing_key_id: anchor_of(&SIGNING_SEED),
+            ..plaintext_v4(grant.clone(), issuer_pk(&SIGNING_SEED))
+        };
+        let file = seal_with(&header(), &pt, PASS).unwrap();
+        let (_, opened) = open(&file, PASS).unwrap();
+        let c = opened.root_custodian.as_ref().unwrap();
+        assert_eq!(c.root_grant, grant);
+        assert_eq!(c.root_grant_issuer, Some(issuer_pk(&SIGNING_SEED)));
+        // The issuer key is public: the debug print shows it, no seed.
+        let debug = format!("{opened:?}");
+        assert!(!debug.contains("33, 33") && !debug.contains("34, 34"));
+    }
+
+    /// Q-53: a v4 grant must verify under the bundle's issuer key, be an
+    /// `ExistingRootGrant`, name the header's tenant, instance, root key and
+    /// generation with this subject, and open to the TRK. The subject need
+    /// not be the anchor.
+    #[test]
+    fn a_v4_bundle_whose_grant_names_another_subject_is_refused() {
+        let good = || plaintext_v4(appointed(|_| {}), issuer_pk(&ISSUER_SEED));
+        assert!(open(&seal_with(&header(), &good(), PASS).unwrap(), PASS).is_ok());
+        let with = |grant: Vec<u8>| plaintext_v4(grant, issuer_pk(&ISSUER_SEED));
+        let cases: Vec<(&str, RecoveryBundlePlaintextV2)> = vec![
+            (
+                "another device",
+                with(appointed(|g| g.subject_device_id = [0x0c; 16])),
+            ),
+            (
+                "another account",
+                with(appointed(|g| g.subject_account_id = [0x0d; 16])),
+            ),
+            (
+                "another signing key",
+                with(appointed(|g| g.subject_signing_key_id = [0x0e; 32])),
+            ),
+            (
+                "another tenant",
+                with(appointed(|g| g.common.tenant_id = [0x42; 16])),
+            ),
+            (
+                "another server instance",
+                with(appointed(|g| g.common.server_instance_id = [8; 16])),
+            ),
+            (
+                "another root generation",
+                with(appointed(|g| g.root_generation = 1)),
+            ),
+            (
+                "another root key",
+                with(grant_by(&ISSUER_SEED, &[0x11; 32], |g| {
+                    g.variant = RootGrantVariant::ExistingRootGrant
+                })),
+            ),
+            (
+                "a first self-grant",
+                with(grant_by(&ISSUER_SEED, &TRK, |_| {})),
+            ),
+            (
+                "signed by another key than the named issuer",
+                plaintext_v4(appointed(|_| {}), issuer_pk(&[0x26; 32])),
+            ),
+            ("not a record", with(vec![1, 2, 3])),
+        ];
+        for (what, pt) in cases {
+            let file = seal_with(&header(), &pt, PASS).unwrap();
+            assert_eq!(
+                open(&file, PASS).unwrap_err(),
+                RecoveryBundleError::Mismatch("root_custodian"),
+                "{what}"
+            );
+        }
+        let mut other_hpke = good();
+        other_hpke.root_custodian.as_mut().unwrap().hpke_key_seed = Zeroizing::new([0x24; 32]);
+        let file = seal_with(&header(), &other_hpke, PASS).unwrap();
+        assert_eq!(
+            open(&file, PASS).unwrap_err(),
+            RecoveryBundleError::Mismatch("root_custodian")
+        );
+    }
+
+    /// v3 keeps opening as before, and each custodian domain takes only its
+    /// own version and block.
+    #[test]
+    fn a_v3_bundle_still_opens_and_a_v4_domain_takes_only_version_4() {
+        let v3 = plaintext_v3(vec![fkek(1, 0)], custodian(self_grant(&TRK, |_| {})));
+        let (_, opened) = open(&seal_with(&header(), &v3, PASS).unwrap(), PASS).unwrap();
+        let c = opened.root_custodian.unwrap();
+        assert_eq!(c.root_grant_issuer, None);
+        assert_eq!(c.root_grant, self_grant_bytes_of(&v3));
+
+        let reseal = |pt: &RecoveryBundlePlaintextV2, domain: &str, version: u64| {
+            let Value::Map(mut entries) = c::decode(&pt.encode().unwrap()).unwrap() else {
+                panic!("a map")
+            };
+            entries.iter_mut().find(|(k, _)| k == "domain").unwrap().1 = c::t(domain);
+            entries.iter_mut().find(|(k, _)| k == "version").unwrap().1 = c::u(version);
+            let file = seal_exact(&header(), &c::encode(&Value::Map(entries)), PASS).unwrap();
+            open(&file, PASS)
+        };
+        let v4 = plaintext_v4(appointed(|_| {}), issuer_pk(&ISSUER_SEED));
+        assert!(reseal(&v4, DOMAIN_PLAINTEXT_V4, VERSION_V4).is_ok());
+        for version in [VERSION, VERSION_V3] {
+            assert!(matches!(
+                reseal(&v4, DOMAIN_PLAINTEXT_V4, version).unwrap_err(),
+                RecoveryBundleError::Format(RecordError::Unsupported { .. })
+            ));
+        }
+        // A v4 block under the v3 domain, and a v3 block under the v4 one.
+        assert!(matches!(
+            reseal(&v4, DOMAIN_PLAINTEXT_V3, VERSION_V3).unwrap_err(),
+            RecoveryBundleError::Format(_)
+        ));
+        assert!(matches!(
+            reseal(&v3, DOMAIN_PLAINTEXT_V4, VERSION_V4).unwrap_err(),
+            RecoveryBundleError::Format(_)
+        ));
+        assert!(matches!(
+            reseal(&v3, DOMAIN_PLAINTEXT_V3, VERSION_V4).unwrap_err(),
+            RecoveryBundleError::Format(RecordError::Unsupported { .. })
+        ));
+    }
+
+    fn self_grant_bytes_of(pt: &RecoveryBundlePlaintextV2) -> Vec<u8> {
+        pt.root_custodian.as_ref().unwrap().root_grant.clone()
+    }
+
+    /// Sealed by the v3 encoder as it stood before v4 existed (fixed test
+    /// keys): it still opens to its first self-grant with no issuer, and
+    /// today's encoder writes exactly the same bytes for it.
+    #[test]
+    fn a_v3_golden_vector_reads_back_exactly() {
+        let golden = unhex(include_str!("../tests/fixtures/recovery_bundle_v3.hex").trim());
+        let (opened, pt) = open(&golden, PASS).unwrap();
+        assert_eq!(opened, header());
+        assert_eq!(*pt.trk, TRK);
+        assert_eq!(pt.bootstrap_anchor_signing_key_id, anchor_of(&SIGNING_SEED));
+        assert_eq!(pt.retained_fkeks.len(), 1);
+        let c = pt.root_custodian.as_ref().unwrap();
+        assert_eq!((c.account_id, c.device_id), (ACCOUNT, DEVICE));
+        assert_eq!(
+            (*c.signing_key_seed, *c.hpke_key_seed),
+            (SIGNING_SEED, HPKE_SEED)
+        );
+        assert_eq!(c.root_grant_issuer, None);
+        assert_eq!(seal_with(&header(), &pt, PASS).unwrap(), golden);
+        let Value::Map(entries) = c::decode(&pt.encode().unwrap()).unwrap() else {
+            panic!("a map")
+        };
+        let field = |k: &str| entries.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(field("domain"), Some(c::t(DOMAIN_PLAINTEXT_V3)));
+        assert_eq!(field("version"), Some(c::u(VERSION_V3)));
+    }
+
+    /// Sealed once by this build's v4 encoder (fixed test keys): it opens to
+    /// exactly the custodian it was made from, and sealing what it opened to
+    /// under its header writes exactly its bytes.
+    #[test]
+    fn a_v4_golden_vector_reads_back_exactly() {
+        let golden = unhex(include_str!("../tests/fixtures/recovery_bundle_v4.hex").trim());
+        let (opened, pt) = open(&golden, PASS).unwrap();
+        assert_eq!(opened, header());
+        assert_eq!(*pt.trk, TRK);
+        assert_eq!(pt.bootstrap_anchor_signing_key_id, anchor_of(&ISSUER_SEED));
+        assert_eq!(pt.retained_fkeks.len(), 1);
+        let c = pt.root_custodian.as_ref().unwrap();
+        assert_eq!((c.account_id, c.device_id), (ACCOUNT, DEVICE));
+        assert_eq!(
+            (*c.signing_key_seed, *c.hpke_key_seed),
+            (SIGNING_SEED, HPKE_SEED)
+        );
+        assert_eq!(c.root_grant_issuer, Some(issuer_pk(&ISSUER_SEED)));
+        assert_eq!(seal_with(&header(), &pt, PASS).unwrap(), golden);
+        let Value::Map(entries) = c::decode(&pt.encode().unwrap()).unwrap() else {
+            panic!("a map")
+        };
+        let field = |k: &str| entries.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(field("domain"), Some(c::t(DOMAIN_PLAINTEXT_V4)));
+        assert_eq!(field("version"), Some(c::u(VERSION_V4)));
     }
 
     const GOLDEN_BUNDLE: &str = "a30861716f4f7506a7941cfa19e8bf04a17d0a685ebbf4cb2105145008564d76";
