@@ -1,6 +1,46 @@
 {
   "releases": [
     {
+      "version": "2.11.1",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "sqlite-wal-guard",
+          "title": "Từ chối nhật ký SQLite không khớp",
+          "lead": "Launcher từ chối cơ sở dữ liệu profile có nhật ký ghi trước không khớp với nó, khắc phục RUSTSEC-2026-0459.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "SQLite trước 3.54.0 có thể trả về vùng nhớ chưa khởi tạo khi mở một cơ sở dữ liệu kèm tệp -wal có kích thước trang khác với cơ sở dữ liệu. Cơ sở dữ liệu của profile có thể đi kèm tệp -wal trong snapshot từ thiết bị khác, nên cookie, mật khẩu đã lưu, dữ liệu web và cơ sở dữ liệu automation giờ được kiểm tra trước khi SQLite mở, và cặp tệp không khớp sẽ bị từ chối."
+            },
+            {
+              "type": "note",
+              "text": "Chưa build được bản SQLite đã vá; lớp chặn này che đúng điều kiện kích hoạt đã công bố cho tới khi build được."
+            }
+          ]
+        },
+        {
+          "id": "team-approval-refused-code",
+          "title": "Từ chối gia hạn thành viên rõ ràng hơn",
+          "lead": "Server nhóm gắn mã cho các lần từ chối phê duyệt thiết bị, nên thành viên bị từ chối không còn bị nhầm là server cũ.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Mọi lần từ chối phê duyệt thiết bị thông thường giờ mang mã APPROVAL_REFUSED. Việc gia hạn thành viên chỉ báo server nhóm quá cũ khi lời từ chối không có mã, như server 2.10 gửi, và trang Team yêu cầu cập nhật server nhóm lên phiên bản mới nhất."
+            },
+            {
+              "type": "note",
+              "text": "Hãy cập nhật server nhóm cùng với launcher này: lời từ chối của server 2.11.0 cũng không có mã, nên sẽ bị coi là server quá cũ."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.11.0",
       "date": "2026-11-09",
       "entries": [

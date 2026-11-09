@@ -3,6 +3,46 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.11.1",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "sqlite-wal-guard",
+          "title": "Mismatched SQLite log refused",
+          "lead": "The launcher refuses a profile database whose write-ahead log does not match it, closing RUSTSEC-2026-0459.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "SQLite before 3.54.0 can return uninitialized memory when a database is opened with a -wal file whose page size differs from the database's. Profile databases can arrive with their -wal in another device's snapshot, so cookies, saved passwords, web data and automation databases are now checked before SQLite opens them, and a mismatched pair is refused."
+            },
+            {
+              "type": "note",
+              "text": "The patched SQLite cannot be built yet; this guard covers the published trigger until it can."
+            }
+          ]
+        },
+        {
+          "id": "team-approval-refused-code",
+          "title": "Clearer member renewal refusals",
+          "lead": "The team server codes its refusals of a device approval, so a refused member is no longer mistaken for an old server.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Every refusal of an ordinary device approval now carries the code APPROVAL_REFUSED. Member renewal reports a team server too old only when a refusal has no code, as a 2.10 server sends, and the Team page asks to update the team server to the latest version."
+            },
+            {
+              "type": "note",
+              "text": "Update the team server with this launcher: a 2.11.0 server's refusals carry no code either, so they read as a server too old."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.11.0",
       "date": "2026-11-09",
       "entries": [
