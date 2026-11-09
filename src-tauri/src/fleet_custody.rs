@@ -192,6 +192,10 @@ pub struct MemberRenewal {
     /// the last pass saw it (the Team page shows its end).
     #[serde(default)]
     pub approvals: BTreeMap<String, (u64, u64)>,
+    /// This server took an approval of an active member once (ADR 0002
+    /// Q-61): a later 403 on one is no sign of a 2.10 server.
+    #[serde(default)]
+    pub server_renews: bool,
 }
 
 /// One member's renewal: its approval, its capability grants and the
@@ -2290,6 +2294,14 @@ pub fn reset_revocation_holds(
             .handover
             .as_ref()
             .filter(|h| h.rotated_generation <= h.accepted_generation)
+            // A rotation past the accepted generation may already be ACTIVE
+            // on the server (activated, or an activation whose reply was
+            // lost) before `rotated_generation` is saved at its end.
+            .filter(|h| {
+                !state.rotation.as_ref().is_some_and(|r| {
+                    r.generation > h.accepted_generation && r.phase != RotationPhase::Expired
+                })
+            })
             .and_then(|h| decode_hex32(&h.root_grant_issuer, "issuer").ok())
             .map(|pk| signing_key_id(&pk))
     };
@@ -2315,9 +2327,9 @@ pub fn reset_revocation_holds(
 }
 
 /// RS's wipe of the fleet custody: forgets every setup key the saved state
-/// names (Create fleet key's and a rotation's), best effort, then deletes
-/// the state.
-pub fn forget_all() -> Result<()> {
+/// names (Create fleet key's and a rotation's), best effort. The state
+/// itself is deleted last, by the caller.
+pub fn forget_setup_keys() -> Result<()> {
     let mut state = load()?;
     for slot in [bootstrap_key as SetupKey, rotation_key] {
         if let (false, Ok(name)) = (
@@ -2327,10 +2339,7 @@ pub fn forget_all() -> Result<()> {
             let _ = crate::credential::forget(&name);
         }
     }
-    match std::fs::remove_file(crate::store::fleet_custody_path()?) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 // ---- Member renewal (v2.11 MR, ADR 0002 Q-61) ----
@@ -2691,6 +2700,8 @@ pub async fn renew_members(
         .await?;
     let mut approvals = BTreeMap::new();
     let mut built = BTreeMap::new();
+    // The members a saved run may still be sent for.
+    let mut eligible = BTreeSet::new();
     for member in &members {
         let (id, _, keys) = member;
         if chain.reported_revoked_at(&keys.0, t)
@@ -2705,6 +2716,7 @@ pub async fn renew_members(
         };
         let a = &found.approval.common;
         approvals.insert(id.clone(), (a.not_before_ms, a.not_after_ms));
+        eligible.insert(id.clone());
         if state.member_renewal.runs.contains_key(id) {
             continue;
         }
@@ -2722,25 +2734,47 @@ pub async fn renew_members(
             build_member_run(&cx, me.signer, member, &found, fkek, t)?,
         );
     }
-    if !built.is_empty() {
-        commit(state, save, |s| s.member_renewal.runs.extend(built))?;
+    // A saved run of a member no longer listed, approved or unrevoked is
+    // never sent.
+    let stale = state
+        .member_renewal
+        .runs
+        .keys()
+        .any(|id| !eligible.contains(id));
+    if !built.is_empty() || stale {
+        commit(state, save, |s| {
+            s.member_renewal.runs.retain(|id, _| eligible.contains(id));
+            s.member_renewal.runs.extend(built);
+        })?;
         eprintln!("[members] renewals built at server time {t}");
     }
+    // A 2.10 server refuses to approve any active member with a bare 403,
+    // as a 2.11 one refuses a member whose account is not active: a 403 on
+    // an approval reads as a server too old only while this server never
+    // took an approval of an active member, in this pass or before.
+    let mut approved = state.member_renewal.server_renews;
+    let mut refused_approvals = Vec::new();
     let open: Vec<String> = state.member_renewal.runs.keys().cloned().collect();
     for id in open {
         let sent = send_member_run(client, access, &cx, &vk, &id, active, state, save).await;
+        let answered = state.member_renewal.runs[&id].step > 0;
+        approved |= answered;
+        let code =
+            |e: &anyhow::Error| crate::recovery_import::error_code(&e.to_string()).to_string();
         let outcome = match sent {
             Ok(()) => "renewed".to_string(),
-            Err(e) if refused_with(&e, 403, None) && state.member_renewal.runs[&id].step == 0 => {
+            // Refused for good: the run would never finish, so it goes and
+            // is built again once the member is due on a later pass.
+            Err(e) if refused_for_good(&e) => {
                 commit(state, save, |s| {
                     s.member_renewal.runs.remove(&id);
                 })?;
-                "skipped:server-too-old".to_string()
+                if !answered && refused_with(&e, 403, None) {
+                    refused_approvals.push(id.clone());
+                }
+                format!("skipped:{}", code(&e))
             }
-            Err(e) => format!(
-                "skipped:{}",
-                crate::recovery_import::error_code(&e.to_string())
-            ),
+            Err(e) => format!("skipped:{}", code(&e)),
         };
         if outcome == "renewed" {
             // The Team page shows the new approval's end from now on.
@@ -2762,12 +2796,18 @@ pub async fn renew_members(
         }
         outcomes.insert(id, outcome);
     }
+    if !approved {
+        for id in refused_approvals {
+            outcomes.insert(id, "skipped:server-too-old".to_string());
+        }
+    }
     for (id, outcome) in &outcomes {
         eprintln!("[members] {id}: {outcome}");
     }
     let result = outcomes.clone();
     commit(state, save, |s| {
         let r = &mut s.member_renewal;
+        r.server_renews = approved;
         r.checked_ms = local_now;
         r.outcomes = outcomes;
         r.approvals = approvals;
@@ -10628,5 +10668,97 @@ pub(crate) mod tests {
         ] {
             assert!(!file.contains(&secret), "the state names a key");
         }
+    }
+
+    #[test]
+    fn a_member_run_refused_for_good_is_dropped() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(13, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        // The approval goes through; the server refuses the first grant.
+        rig.refuse("/capability-grants", 400, "BAD_REQUEST");
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert!(outcome(&o, &due.0).starts_with("skipped:"), "{o:?}");
+        assert_eq!(rig.posts(), ["approve", "capability"]);
+        assert!(load().unwrap().member_renewal.runs.is_empty());
+        // Nothing is resent within the day.
+        rig.allow();
+        rig.clear();
+        assert!(rig.renew_members_at(&f, now + 1000).unwrap().is_empty());
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn a_saved_run_of_a_member_revoked_meanwhile_is_dropped_unsent() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(14, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.refuse("/capability-grants", 503, "UNAVAILABLE");
+        rig.renew_members_at(&f, now).unwrap();
+        let id = due.0.device_id.to_ascii_lowercase();
+        let mut state = load().unwrap();
+        assert!(
+            state.member_renewal.runs.contains_key(&id),
+            "a run is saved"
+        );
+        state.revocations.insert(id, "00".into());
+        save(&state).unwrap();
+        rig.allow();
+        rig.clear();
+        let o = rig.renew_members_at(&f, now + 5 * 60_000).unwrap();
+        assert_eq!(outcome(&o, &due.0), "skipped:revoked");
+        assert!(rig.posts().is_empty(), "{:?}", rig.posts());
+        assert!(load().unwrap().member_renewal.runs.is_empty());
+    }
+
+    /// A 403 on one member's approval, from a server that approved another
+    /// member, in this pass or an earlier one, keeps its own code.
+    #[test]
+    fn a_403_from_a_server_that_renews_members_is_not_server_too_old() {
+        let f = fixture();
+        let now = now_ms();
+        let (refused, fine) = (aged(15, now, 200, 365), aged(16, now, 200, 365));
+        let mut rig = renewal_rig(&f, &[refused.clone(), fine.clone()]);
+        let refused_id = refused.0.device_id.to_ascii_lowercase();
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            (call.ends_with("/approve") && call.contains(&refused_id)).then_some((403, "FORBIDDEN"))
+        }));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fine.0), "renewed");
+        let skipped = outcome(&o, &refused.0);
+        assert!(
+            skipped.starts_with("skipped:") && skipped != "skipped:server-too-old",
+            "{skipped}"
+        );
+        assert!(!status().unwrap().members_need_server_update);
+        // On a later pass that approves nobody, a 403 still keeps its code.
+        rig.refuse("/approve", 403, "FORBIDDEN");
+        let mut state = load().unwrap();
+        state.member_renewal.checked_ms = 0;
+        save(&state).unwrap();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fine.0), skipped);
+        assert_eq!(outcome(&o, &refused.0), skipped);
+        assert!(!status().unwrap().members_need_server_update);
+    }
+
+    /// Choice (c): a member holding no grant of the ACTIVE generation gets a
+    /// new approval and capability grants, never a first device grant.
+    #[test]
+    fn a_member_without_a_grant_of_the_active_generation_gets_no_device_grant() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(17, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        // `served_member` serves its generation 0 grant last.
+        rig.rot.lock().unwrap().base.pop();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &due.0), "renewed");
+        assert_eq!(
+            rig.posts(),
+            ["approve", "capability", "capability", "capability"]
+        );
     }
 }

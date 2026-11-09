@@ -3750,11 +3750,16 @@ fn reset_root_device(
     {
         let _ = credential::forget(&root_bootstrap::trk_ref(&root.tenant_id, &r.trk_nonce));
     }
+    fleet_custody::forget_setup_keys().map_err(e)?;
     fleet_keys::forget_fleet(&sync_cmd::fleet_id(&now)).map_err(e)?;
-    fleet_custody::forget_all().map_err(e)?;
-    match std::fs::remove_file(store::custody_bootstrap_path().map_err(e)?) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.to_string()),
-        _ => {}
+    // The root state goes before the custody state: a wipe that stops in
+    // between leaves a device that is no longer root, which Reset clears as
+    // the revoked device it is; the other way round it would be refused.
+    for path in [store::custody_bootstrap_path(), store::fleet_custody_path()] {
+        match std::fs::remove_file(path.map_err(e)?) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.to_string()),
+            _ => {}
+        }
     }
     let refs = clear_identity(&mut now);
     team_config::save(&now).map_err(e)?;
@@ -8347,6 +8352,16 @@ mod custody_tests {
     fn signed_revocation(
         by: &[u8; 32],
         at: u64,
+        subject: ([u8; 16], [u8; 16], [u8; 32]),
+    ) -> Vec<u8> {
+        revocation_on(INSTANCE, by, at, subject)
+    }
+
+    /// [`signed_revocation`] naming the server `instance`.
+    fn revocation_on(
+        instance: [u8; 16],
+        by: &[u8; 32],
+        at: u64,
         (tenant, device, key): ([u8; 16], [u8; 16], [u8; 32]),
     ) -> Vec<u8> {
         use shardx_core::authz_record::{
@@ -8360,7 +8375,7 @@ mod custody_tests {
                 issued_at_ms: at,
                 not_before_ms: at,
                 not_after_ms: at + DAY,
-                server_instance_id: INSTANCE,
+                server_instance_id: instance,
                 restore_epoch: 0,
             },
             subject_account_id: [6; 16],
@@ -8620,6 +8635,15 @@ mod custody_tests {
             refused_unsigned(reply);
             untouched(&refs);
         }
+        // Another server instance.
+        let subject = (TENANT, JOINER, key);
+        let revoked = revocation_on([0x0e; 16], &B_SEED, T0 + DAY, subject);
+        let (reply, _, _j, refs) = root_reset(
+            handed_over_to_b(),
+            vec![joiner_listed(Some((&B_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
     }
 
     #[test]
@@ -8631,6 +8655,120 @@ mod custody_tests {
         );
         refused_unsigned(reply);
         untouched(&refs);
+    }
+
+    /// The appointee whose own rotation to generation 2 stands at `phase`,
+    /// with `activate_request` saved, before `rotated_generation` is.
+    fn rotating_after_accept(
+        phase: fleet_custody::RotationPhase,
+        activate_request: &str,
+    ) -> fleet_custody::FleetCustodyState {
+        fleet_custody::FleetCustodyState {
+            rotation: Some(fleet_custody::FleetRotationState {
+                generation: 2,
+                phase,
+                activate_request: activate_request.into(),
+                ..Default::default()
+            }),
+            ..accepted_from_old(false)
+        }
+    }
+
+    #[test]
+    fn reset_refuses_a_cancel_once_the_appointees_rotation_activated() {
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            rotating_after_accept(fleet_custody::RotationPhase::Activated, "00"),
+            vec![joiner_listed(Some((&OLD_SEED, revoked)))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+    }
+
+    #[test]
+    fn reset_refuses_a_cancel_once_the_appointees_activation_was_sent() {
+        // Its reply may have been lost: generation 2 may be ACTIVE.
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) = root_reset(
+            rotating_after_accept(fleet_custody::RotationPhase::Preparing, "00"),
+            vec![joiner_listed(Some((&OLD_SEED, revoked.clone())))],
+        );
+        refused_unsigned(reply);
+        untouched(&refs);
+        drop(_j);
+        // A rotation that expired never activated: the cancel still resets.
+        let (reply, _, _j, refs) = root_reset(
+            rotating_after_accept(fleet_custody::RotationPhase::Expired, "00"),
+            vec![joiner_listed(Some((&OLD_SEED, revoked)))],
+        );
+        reply.unwrap();
+        assert_cleared(refs, false);
+    }
+
+    /// The appointee revoked O itself at T0: O's revocation of it from T0 on
+    /// is refused.
+    #[test]
+    fn reset_refuses_a_revocation_signed_after_this_device_revoked_its_issuer() {
+        use shardx_core::mutation::{
+            DeviceRevokeRequestV2, IdempotentMutationRequestV2, OperationKind,
+        };
+        let container = signed_revocation(&[7; 32], T0, (TENANT, [0x0a; 16], id_of(&OLD_SEED)));
+        let payload = DeviceRevokeRequestV2 {
+            signed_container_hash: *shardx_core::authz_record::AuthorizationRecord::parse(
+                &container,
+            )
+            .unwrap()
+            .signed_container_hash(),
+            exact_signed_revocation_container_bytes: container,
+            activations: Vec::new(),
+        };
+        let request = IdempotentMutationRequestV2 {
+            operation_kind: OperationKind::DeviceRevoke,
+            idempotency_key: [0x41; 16],
+            canonical_payload_bytes: payload.encode(),
+            client_request_nonce: [0x42; 16],
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+        };
+        let mut custody = accepted_from_old(false);
+        custody
+            .revocations
+            .insert(hex(&[0x0a; 16]), hex(&request.encode()));
+        let revoked = joiner_revoked_by(&OLD_SEED, T0 + DAY);
+        let (reply, _, _j, refs) =
+            root_reset(custody, vec![joiner_listed(Some((&OLD_SEED, revoked)))]);
+        refused_unsigned(reply);
+        untouched(&refs);
+    }
+
+    /// The root state goes before the custody state: a wipe that stops at the
+    /// root state leaves a device Reset still takes as a revoked root.
+    #[cfg(windows)]
+    #[test]
+    fn a_reset_stopped_before_the_root_state_went_resets_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let rt = runtime();
+        let revoked = joiner_revoked_by(&B_SEED, T0 + DAY);
+        let (client, _) = listing_server(&rt, vec![joiner_listed(Some((&B_SEED, revoked)))]);
+        let _j = joiner(client.base_url(), root_bootstrap::now_ms());
+        root_device_here(handed_over_to_b());
+        let refs = refs();
+        // Read sharing only: the root state cannot be deleted while open.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(store::custody_bootstrap_path().unwrap())
+            .unwrap();
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap_err();
+        drop(held);
+        assert!(store::fleet_custody_path().unwrap().exists());
+        untouched(&refs);
+        rt.block_on(team_enroll_again("u".into(), "p".into()))
+            .unwrap();
+        assert_cleared(refs, false);
+        assert!(!store::custody_bootstrap_path().unwrap().exists());
+        assert!(!store::fleet_custody_path().unwrap().exists());
     }
 
     /// A stolen former custodian key (here the pinned anchor and the old root
@@ -8708,7 +8846,21 @@ mod custody_tests {
         let mut c = team_config::load().unwrap();
         c.fleet_id = hex(&TENANT);
         team_config::save(&c).unwrap();
-        root_device_here(handed_over_to_b());
+        // Create fleet key's and a rotation's setup keys.
+        let setup: Vec<String> = [0x5f, 0x6f]
+            .map(|n| format!("fleet-setup.{}.{}", hex(&TENANT), hex(&[n; 16])))
+            .into();
+        root_device_here(fleet_custody::FleetCustodyState {
+            fkek_nonce: hex(&[0x5f; 16]),
+            rotation: Some(fleet_custody::FleetRotationState {
+                fkek_nonce: hex(&[0x6f; 16]),
+                ..Default::default()
+            }),
+            ..handed_over_to_b()
+        });
+        for name in &setup {
+            credential::store(name, &[0x5f; 32]).unwrap();
+        }
         let trk = format!("tenant-root.{}.{}", hex(&TENANT), hex(&[0x5e; 16]));
         credential::store(&trk, &[0x5e; 32]).unwrap();
         let mut root = root_bootstrap::load().unwrap();
@@ -8734,6 +8886,9 @@ mod custody_tests {
             credential::load(&next_trk).is_err(),
             "the rotation TRK is forgotten"
         );
+        for name in &setup {
+            assert!(credential::load(name).is_err(), "{name}");
+        }
         assert!(!fleet_keys::load()
             .unwrap()
             .fleets
