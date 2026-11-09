@@ -12500,7 +12500,8 @@ async fn a_custodian_renews_an_active_members_approval() {
     }
     // Past the server's limit it is refused, as for any approval.
     let long = approval(&member, &dev.sk, 0x5e, 0, 731);
-    assert_eq!(server.approve(&member.id, &access, &long).await.0, 403);
+    let (status, _, body) = server.approve(&member.id, &access, &long).await;
+    assert_eq!((status, code_of(&body).as_str()), (403, "APPROVAL_REFUSED"));
 }
 
 #[tokio::test]
@@ -12514,7 +12515,8 @@ async fn a_device_without_device_approve_cannot_renew_another_device() {
 
     // The custodian without `device.approve`.
     let renewal = approval(&member, &dev.sk, 0x60, 0, 30);
-    assert_eq!(server.approve(&member.id, &access, &renewal).await.0, 403);
+    let (status, _, body) = server.approve(&member.id, &access, &renewal).await;
+    assert_eq!((status, code_of(&body).as_str()), (403, "APPROVAL_REFUSED"));
     // A member, whose session is ordinary, for another member.
     let member_access = session(&server, &member).await["access_token"]
         .as_str()
@@ -12558,7 +12560,8 @@ async fn a_revoked_device_is_never_approved_again() {
         201
     );
     let renewal = approval(&member, &dev.sk, 0x5d, 0, 30);
-    assert_eq!(server.approve(&member.id, &access, &renewal).await.0, 403);
+    let (status, _, body) = server.approve(&member.id, &access, &renewal).await;
+    assert_eq!((status, code_of(&body).as_str()), (403, "APPROVAL_REFUSED"));
     assert_eq!(
         server
             .count(&format!(

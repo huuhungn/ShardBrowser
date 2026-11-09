@@ -71,6 +71,13 @@ fn stale() -> AppError {
     )
 }
 
+/// Every 403 of an ordinary approval carries this code (ADR 0002 Q-61): a
+/// 2.10 server refuses an active member with a bare 403, so a launcher tells
+/// a server too old to renew members from a refusal of this one member.
+fn refused(msg: &str) -> AppError {
+    coded(StatusCode::FORBIDDEN, "APPROVAL_REFUSED", msg)
+}
+
 fn closed() -> AppError {
     coded(
         StatusCode::CONFLICT,
@@ -336,11 +343,13 @@ async fn replay(
         .and_then(|r| r.confirmation_id)
         .is_some();
     if !d1 {
-        let live = holds_capability(&mut tx, v, s, fleet_of(a), Capability::DeviceApprove, now)
-            .await?
-            && subject_is_active(&mut tx, s, a).await?;
-        if !live {
-            return Err(AppError::Forbidden);
+        if !holds_capability(&mut tx, v, s, fleet_of(a), Capability::DeviceApprove, now).await? {
+            return Err(refused(
+                "the session's device no longer holds device.approve",
+            ));
+        }
+        if !subject_is_active(&mut tx, s, a).await? {
+            return Err(refused("the approved device is not active under its keys"));
         }
         tx.commit().await?;
         return Ok(cbor(StatusCode::CREATED, response));
@@ -964,14 +973,14 @@ async fn ordinary_approval(
         }
     }
     if !holds_capability(&mut tx, v, s, fleet_of(a), Capability::DeviceApprove, now).await? {
-        return Err(AppError::Forbidden);
+        return Err(refused("the session's device holds no device.approve"));
     }
     let window = c.not_after_ms - c.not_before_ms;
     if int(c.not_before_ms)? > now
         || now >= int(c.not_after_ms)?
         || window > MAX_DEVICE_APPROVAL_TTL_MS
     {
-        return Err(AppError::Forbidden);
+        return Err(refused("the approval's time window does not hold now"));
     }
 
     // The subject: a pending device of an active account of this tenant, or
@@ -989,11 +998,11 @@ async fn ordinary_approval(
     .bind(a.subject_account_id.as_slice())
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or(AppError::Forbidden)?;
+    .ok_or_else(|| refused("no device of an active account of this tenant"))?;
     let status: String = device.get("status");
     let renewal = status == "active";
     if !renewal && status != "pending" {
-        return Err(AppError::Forbidden);
+        return Err(refused("the device is revoked"));
     }
     let spk: [u8; 32] = blob(&device, "signing_public_key")?;
     let hpk: [u8; 32] = blob(&device, "hpke_public_key")?;

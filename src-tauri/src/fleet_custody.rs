@@ -192,10 +192,6 @@ pub struct MemberRenewal {
     /// the last pass saw it (the Team page shows its end).
     #[serde(default)]
     pub approvals: BTreeMap<String, (u64, u64)>,
-    /// This server took an approval of an active member once (ADR 0002
-    /// Q-61): a later 403 on one is no sign of a 2.10 server.
-    #[serde(default)]
-    pub server_renews: bool,
 }
 
 /// One member's renewal: its approval, its capability grants and the
@@ -2212,6 +2208,15 @@ pub(crate) fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -
         })
 }
 
+/// Whether the custody refusal `e` carries a top-level `code` at all.
+fn refused_with_any_code(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    let open = "[[shardx:fleet.refusedCustody|";
+    text.find(open)
+        .and_then(|i| text[i + open.len()..].split("]]").next())
+        .is_some_and(|args| args.split('|').any(|f| f.starts_with("code=")))
+}
+
 /// Whether `e` is the server's refusal of the request itself: the custody
 /// marker with a 4xx status other than 401, 408 or 429, which a resend of
 /// the same bytes would not change.
@@ -2613,8 +2618,8 @@ async fn send_member_run(
 /// ([`member_records`]); a due member's new records are built at `T`
 /// ([`build_member_run`]) and saved, every due member's at once, before the
 /// first is sent. Saved runs resume with their exact bytes. Outcomes per
-/// member: `renewed`, `current` or `skipped:<code>`; a 403 on an approval
-/// (a 2.10 server never approves an active device) is
+/// member: `renewed`, `current` or `skipped:<code>`; a 403 with no code on
+/// an approval (a 2.10 server never approves an active device) is
 /// `skipped:server-too-old`, and its run is dropped to be built again once
 /// the server is updated. `fleet_key` gives the verified key of a
 /// generation.
@@ -2748,17 +2753,10 @@ pub async fn renew_members(
         })?;
         eprintln!("[members] renewals built at server time {t}");
     }
-    // A 2.10 server refuses to approve any active member with a bare 403,
-    // as a 2.11 one refuses a member whose account is not active: a 403 on
-    // an approval reads as a server too old only while this server never
-    // took an approval of an active member, in this pass or before.
-    let mut approved = state.member_renewal.server_renews;
-    let mut refused_approvals = Vec::new();
     let open: Vec<String> = state.member_renewal.runs.keys().cloned().collect();
     for id in open {
         let sent = send_member_run(client, access, &cx, &vk, &id, active, state, save).await;
         let answered = state.member_renewal.runs[&id].step > 0;
-        approved |= answered;
         let code =
             |e: &anyhow::Error| crate::recovery_import::error_code(&e.to_string()).to_string();
         let outcome = match sent {
@@ -2769,10 +2767,14 @@ pub async fn renew_members(
                 commit(state, save, |s| {
                     s.member_renewal.runs.remove(&id);
                 })?;
-                if !answered && refused_with(&e, 403, None) {
-                    refused_approvals.push(id.clone());
+                // A 2.10 server refuses to approve any active member with a
+                // bare 403; a later one codes every refusal of an approval
+                // `APPROVAL_REFUSED` (ADR 0002 Q-61).
+                if !answered && refused_with(&e, 403, None) && !refused_with_any_code(&e) {
+                    "skipped:server-too-old".to_string()
+                } else {
+                    format!("skipped:{}", code(&e))
                 }
-                format!("skipped:{}", code(&e))
             }
             Err(e) => format!("skipped:{}", code(&e)),
         };
@@ -2796,18 +2798,12 @@ pub async fn renew_members(
         }
         outcomes.insert(id, outcome);
     }
-    if !approved {
-        for id in refused_approvals {
-            outcomes.insert(id, "skipped:server-too-old".to_string());
-        }
-    }
     for (id, outcome) in &outcomes {
         eprintln!("[members] {id}: {outcome}");
     }
     let result = outcomes.clone();
     commit(state, save, |s| {
         let r = &mut s.member_renewal;
-        r.server_renews = approved;
         r.checked_ms = local_now;
         r.outcomes = outcomes;
         r.approvals = approvals;
@@ -6140,10 +6136,13 @@ pub(crate) mod tests {
     impl Rot {
         fn answer(&mut self, call: &str, body: &[u8]) -> (u16, Vec<u8>) {
             if let Some((status, code)) = self.refuse.as_ref().and_then(|f| f(call, body)) {
-                return (
-                    status,
-                    serde_json::to_vec(&serde_json::json!({ "code": code })).unwrap(),
-                );
+                // An empty code is a bare refusal, as `AppError::Forbidden`.
+                let body = if code.is_empty() {
+                    serde_json::json!({ "error": "forbidden" })
+                } else {
+                    serde_json::json!({ "code": code })
+                };
+                return (status, serde_json::to_vec(&body).unwrap());
             }
             let json = |v: serde_json::Value| (200, serde_json::to_vec(&v).unwrap());
             let post = call.starts_with("POST ");
@@ -10506,7 +10505,7 @@ pub(crate) mod tests {
         let now = now_ms();
         let due = aged(8, now, 200, 365);
         let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
-        rig.refuse("/approve", 403, "FORBIDDEN");
+        rig.refuse("/approve", 403, "");
         let o = rig.renew_members_at(&f, now).unwrap();
         assert_eq!(outcome(&o, &due.0), "skipped:server-too-old");
         assert_eq!(rig.posts(), ["approve"]);
@@ -10713,35 +10712,23 @@ pub(crate) mod tests {
         assert!(load().unwrap().member_renewal.runs.is_empty());
     }
 
-    /// A 403 on one member's approval, from a server that approved another
-    /// member, in this pass or an earlier one, keeps its own code.
+    /// A 403 coded `APPROVAL_REFUSED` keeps its own code, even from a
+    /// server that has approved no member yet.
     #[test]
-    fn a_403_from_a_server_that_renews_members_is_not_server_too_old() {
+    fn a_coded_403_is_never_server_too_old() {
         let f = fixture();
         let now = now_ms();
-        let (refused, fine) = (aged(15, now, 200, 365), aged(16, now, 200, 365));
-        let mut rig = renewal_rig(&f, &[refused.clone(), fine.clone()]);
-        let refused_id = refused.0.device_id.to_ascii_lowercase();
-        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
-            (call.ends_with("/approve") && call.contains(&refused_id)).then_some((403, "FORBIDDEN"))
-        }));
+        let due = aged(15, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.refuse("/approve", 403, "APPROVAL_REFUSED");
         let o = rig.renew_members_at(&f, now).unwrap();
-        assert_eq!(outcome(&o, &fine.0), "renewed");
-        let skipped = outcome(&o, &refused.0);
+        let skipped = outcome(&o, &due.0);
         assert!(
             skipped.starts_with("skipped:") && skipped != "skipped:server-too-old",
             "{skipped}"
         );
         assert!(!status().unwrap().members_need_server_update);
-        // On a later pass that approves nobody, a 403 still keeps its code.
-        rig.refuse("/approve", 403, "FORBIDDEN");
-        let mut state = load().unwrap();
-        state.member_renewal.checked_ms = 0;
-        save(&state).unwrap();
-        let o = rig.renew_members_at(&f, now).unwrap();
-        assert_eq!(outcome(&o, &fine.0), skipped);
-        assert_eq!(outcome(&o, &refused.0), skipped);
-        assert!(!status().unwrap().members_need_server_update);
+        assert!(load().unwrap().member_renewal.runs.is_empty());
     }
 
     /// Choice (c): a member holding no grant of the ACTIVE generation gets a
