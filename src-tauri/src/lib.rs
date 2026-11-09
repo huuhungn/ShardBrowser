@@ -2886,10 +2886,10 @@ async fn team_approve_device(
     }
     let pin = bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
     let as_custodian = as_custodian.unwrap_or(false);
-    let appointed = fleet_custody::load()
-        .map_err(|e| e.to_string())?
-        .handed_over_to
-        .eq_ignore_ascii_case(device_id.trim());
+    let appointed = fleet_custody::resumes_appointment(
+        &fleet_custody::load().map_err(|e| e.to_string())?,
+        &device_id,
+    );
     if !(as_custodian && appointed) {
         handed_over()?;
     }
@@ -3334,14 +3334,19 @@ async fn team_revoke_device(
                     .await?;
                     anyhow::Ok(pushed.version)
                 };
+                let bound = |remote: &str| {
+                    let profile = fleet_client::decode_hex16(remote, "remote_profile_id")?;
+                    Ok(team::sync::bound_local(&pin.0, &profile)?.is_some())
+                };
                 return fleet_custody::revoke_outgoing(
                     client,
                     access,
                     &device,
-                    &pin.0,
+                    pin,
                     row,
                     reason,
                     accept_reverts.as_deref().unwrap_or_default(),
+                    bound,
                     revert,
                     root_bootstrap::now_ms(),
                     &mut state,

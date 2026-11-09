@@ -410,13 +410,31 @@ fn evidence_records(pages: &[TenantTrustEvidencePageV2]) -> Vec<(&[u8], [u8; 32]
 }
 
 /// v2.10 4.H step 1: a root custodian that appointed another device runs no
-/// custody step of its own (Approve, Rotate, Re-seal, Export; renewal reads
-/// `handed_over_to` itself).
+/// custody step of its own (Approve, Rotate, Re-seal, Export, renewal). It
+/// has appointed once `handed_over_to` is saved, or once a device it has not
+/// revoked holds a saved root grant request: the grant may be filed though
+/// the save after it was lost.
 pub fn refuse_handed_over(state: &FleetCustodyState) -> Result<()> {
-    if !state.handed_over_to.is_empty() {
+    let filing = state
+        .members
+        .iter()
+        .any(|(d, m)| !m.root_grant.is_empty() && !state.revocations.contains_key(d));
+    if !state.handed_over_to.is_empty() || filing {
         bail!(crate::errcode::code("fleet.custodyHandedOver"));
     }
     Ok(())
+}
+
+/// Whether Appoint of `device_id` may resume: it is the saved appointee, or
+/// no appointee is saved yet and it holds the saved root grant request.
+pub fn resumes_appointment(state: &FleetCustodyState, device_id: &str) -> bool {
+    let id = device_id.trim().to_ascii_lowercase();
+    state.handed_over_to == id
+        || (state.handed_over_to.is_empty()
+            && state
+                .members
+                .get(&id)
+                .is_some_and(|m| !m.root_grant.is_empty()))
 }
 
 /// Two containers with their replay IDs, and a root generation.
@@ -1352,7 +1370,7 @@ pub async fn approve_member(
     let id = row.device_id.to_ascii_lowercase();
     // v2.10 4.H step 1: once an appointment is filed only it resumes, and
     // one runs at a time.
-    if state.handed_over_to != id || custodian_root.is_none() {
+    if custodian_root.is_none() || !resumes_appointment(state, &id) {
         refuse_handed_over(state)?;
     }
     if state
@@ -1372,6 +1390,16 @@ pub async fn approve_member(
     }
     let fleet = hex(&cx.tenant);
     see_devices(std::slice::from_ref(row), pin, now, state, save)?;
+    // Appoint builds its own requests: a device approved as a member is not
+    // waiting for them.
+    if custodian_root.is_some()
+        && state
+            .members
+            .get(&id)
+            .is_some_and(|m| !m.approval.is_empty() && m.root_grant.is_empty())
+    {
+        bail!(crate::errcode::code("fleet.deviceNotPending"));
+    }
     let first_seen = match state.members.get(&id) {
         Some(m) if !m.approval.is_empty() => None,
         Some(_) => window_start(state, row),
@@ -1403,7 +1431,7 @@ pub async fn approve_member(
                 .collect();
             if !finished
                 || !crate::team::sync::custody_blockers(
-                    client, access, &pin.0, cx.tenant, generation, None, &also,
+                    client, access, pin, cx.tenant, generation, None, &also, now,
                 )
                 .await?
                 .is_empty()
@@ -1851,18 +1879,23 @@ fn missing_step(h: &Handover, active: u64) -> Option<&'static str> {
 /// are checked: `retired` needs no blocker; `lost` allows only heads signed
 /// by the outgoing key at a version above the one the re-seal committed, and
 /// only when `accept_reverts` lists exactly those profiles. Otherwise
-/// `fleet.handoverNotReady`. A saved revocation is checked under the reason
-/// it was saved with. Right after the revoke, `revert` runs for each listed
-/// profile, its outcome saved per profile; a resume retries the pending ones.
+/// `fleet.handoverNotReady`. With `lost`, every listed profile must also be
+/// bound here (`bound`), or the revoke is refused with step `bind` before
+/// anything is sent. A saved revocation is checked under the reason it was
+/// saved with. Each check replaces the profiles to revert with the ones it
+/// listed (none for `retired`). Right after the revoke, `revert` runs for
+/// each of them, its outcome saved per profile; a resume retries the pending
+/// and failed ones, and the hand-over is `done` only once none is left.
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
     client: &FleetClient,
     access: &str,
     me: &FleetDevice<'_>,
-    binding: &Binding,
+    pin: &(Binding, [u8; 32]),
     row: &TenantDevice,
     reason: DeviceRevocationReason,
     accept_reverts: &[String],
+    bound: impl Fn(&str) -> Result<bool>,
     mut revert: impl FnMut(String) -> RF,
     now: u64,
     state: &mut FleetCustodyState,
@@ -1898,11 +1931,12 @@ pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
         let blockers = crate::team::sync::custody_blockers(
             client,
             access,
-            binding,
+            pin,
             cx.tenant,
             active,
             Some(outgoing),
             &also,
+            now,
         )
         .await?;
         // "After the re-seal" is a version above the one it committed.
@@ -1933,12 +1967,28 @@ pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
         if !ready {
             return Err(not_ready("heads", &listed));
         }
+        // The reverts run after the revoke, which cannot be undone: each
+        // needs this device's copy to push.
+        let to_revert = if reason == DeviceRevocationReason::Retired {
+            Vec::new()
+        } else {
+            listed
+        };
+        let mut unbound = Vec::new();
+        for p in &to_revert {
+            if !bound(p)? {
+                unbound.push(p.clone());
+            }
+        }
+        if !unbound.is_empty() {
+            return Err(not_ready("bind", &unbound));
+        }
         commit(state, save, |s| {
             if let Some(h) = s.handover.as_mut() {
-                for p in &listed {
-                    h.reverts
-                        .entry(p.clone())
-                        .or_insert_with(|| "pending".into());
+                h.reverts
+                    .retain(|p, o| o != "pending" || to_revert.contains(p));
+                for p in &to_revert {
+                    h.reverts.insert(p.clone(), "pending".into());
                 }
             }
         })?;
@@ -1948,7 +1998,7 @@ pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
         .handover
         .iter()
         .flat_map(|h| h.reverts.iter())
-        .filter(|(_, o)| *o == "pending")
+        .filter(|(_, o)| *o == "pending" || o.starts_with("error:"))
         .map(|(p, _)| p.clone())
         .collect();
     for p in pending {
@@ -1965,6 +2015,15 @@ pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
                 h.reverts.insert(p.clone(), outcome);
             }
         })?;
+    }
+    let failed = state
+        .handover
+        .iter()
+        .flat_map(|h| h.reverts.values())
+        .any(|o| o.starts_with("error:"));
+    if failed {
+        eprintln!("[handover] the outgoing custodian {id} is revoked; a revert failed");
+        return Ok(());
     }
     commit(state, save, |s| {
         if let Some(h) = s.handover.as_mut() {
@@ -5686,7 +5745,7 @@ pub(crate) mod tests {
         let (client, seen) = rt.block_on(mock(Arc::new(move |call: &str, body: &[u8]| {
             answer.lock().unwrap().answer(call, body)
         })));
-        let db = Db::open_at(&f._dir.path().join("team-ledger.db")).unwrap();
+        let db = Db::open().unwrap();
         let (binding, anchor) = f.pin();
         crate::team::ledger::pin_anchor(
             &db,
@@ -8265,6 +8324,27 @@ pub(crate) mod tests {
             r.active = Some(1);
             r.revokes = true;
         });
+        // Issued after the custodian's own grants the rig serves.
+        let now = now_ms();
+        let (signing, hpke, _) = listed_keys(&old).unwrap();
+        let subject = GrantSubject::Device {
+            account_id: decode_hex16(&old.account_id, "a").unwrap(),
+            device_id: decode_hex16(&old.device_id, "d").unwrap(),
+            signing_key_id: signing,
+            hpke_key_id: hpke,
+        };
+        let commit = [(
+            Capability::ProfileCommit,
+            CapabilityScopeKind::Fleet,
+            f.cx.tenant,
+        )];
+        let grants = capability_grants(&f.cx, &f.signer, &subject, commit, now).unwrap();
+        {
+            let mut r = rig.rot.lock().unwrap();
+            r.base.push(approval_of(f, &old, now, now + 365 * DAY_MS));
+            r.base.extend(grants.iter().map(|g| unhex_vec(g).unwrap()));
+            r.base_keys.push(peer_signer(1).verifying_key().to_bytes());
+        }
         let mut state = load().unwrap();
         state.create_request.clear();
         state.imported = true;
@@ -8308,6 +8388,22 @@ pub(crate) mod tests {
         reverts: &[String],
         reverted: &Arc<Mutex<Vec<(String, usize)>>>,
     ) -> Result<()> {
+        revoke_old_with(rig, f, row, reason, reverts, reverted, |_| true, 0)
+    }
+
+    /// [`revoke_old`] with only the profiles `bound` names bound here, and
+    /// the first `failing` reverts failing.
+    #[allow(clippy::too_many_arguments)]
+    fn revoke_old_with(
+        rig: &Rig,
+        f: &Fixture,
+        row: &TenantDevice,
+        reason: DeviceRevocationReason,
+        reverts: &[String],
+        reverted: &Arc<Mutex<Vec<(String, usize)>>>,
+        bound: impl Fn(&str) -> bool,
+        failing: usize,
+    ) -> Result<()> {
         let mut state = load().unwrap();
         let log = reverted.clone();
         let seen = rig.seen.clone();
@@ -8315,19 +8411,176 @@ pub(crate) mod tests {
             &rig.client,
             "access",
             &f.device(&CredentialFkekStore),
-            &f.pin().0,
+            &f.pin(),
             row,
             reason,
             reverts,
+            |p| Ok(bound(p)),
             move |p: String| {
                 let sent = seen.lock().unwrap().len();
-                log.lock().unwrap().push((p, sent));
-                async { Ok(7) }
+                let mut log = log.lock().unwrap();
+                log.push((p, sent));
+                let fail = log.len() <= failing;
+                async move {
+                    if fail {
+                        bail!(crate::errcode::code("sync.remoteAhead"));
+                    }
+                    Ok(7)
+                }
             },
             now_ms(),
             &mut state,
             &mut |s| save(s),
         ))
+    }
+
+    /// Review MF-1: a revert needs this device's copy, and the revoke cannot
+    /// be undone, so a profile to revert that is not bound here refuses the
+    /// revoke before it is sent.
+    #[test]
+    fn the_lost_path_refuses_a_profile_not_bound_here_before_revoking() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        listed_head(&mut rig.rot.lock().unwrap(), X, 3, 1, &peer_signer(1));
+        let log = Arc::default();
+        let err = revoke_old_with(
+            &rig,
+            &f,
+            &old,
+            DeviceRevocationReason::Lost,
+            &[hex(&X)],
+            &log,
+            |_| false,
+            0,
+        )
+        .unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert!(err.to_string().contains("step=bind"), "{err}");
+        assert!(err.to_string().contains(&hex(&X)), "{err}");
+        assert_eq!(revoke_posts(&rig), 0);
+        let state = load().unwrap();
+        assert!(state.revocations.is_empty());
+        assert!(state.handover.unwrap().reverts.is_empty());
+    }
+
+    /// Review MF-1: a revert that failed after the revoke is retried on the
+    /// next run, and the hand-over is done only once it went through.
+    #[test]
+    fn a_failed_revert_is_retried_on_resume() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        listed_head(&mut rig.rot.lock().unwrap(), X, 3, 1, &peer_signer(1));
+        let log: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
+        let lost = DeviceRevocationReason::Lost;
+        revoke_old_with(&rig, &f, &old, lost, &[hex(&X)], &log, |_| true, 1).unwrap();
+        let h = load().unwrap().handover.unwrap();
+        assert!(h.reverts[&hex(&X)].starts_with("error:"), "{h:?}");
+        assert_ne!(h.phase, "done");
+        let revoked = TenantDevice {
+            status: "revoked".into(),
+            ..old
+        };
+        revoke_old_with(&rig, &f, &revoked, lost, &[], &log, |_| true, 1).unwrap();
+        assert_eq!(log.lock().unwrap().len(), 2, "retried once");
+        let h = load().unwrap().handover.unwrap();
+        assert_eq!(h.reverts, [(hex(&X), "reverted:7".to_string())].into());
+        assert_eq!(h.phase, "done");
+        assert_eq!(revoke_posts(&rig), 2, "the saved revoke resent once");
+    }
+
+    /// Review MF-2: a profile an earlier check listed but the last one does
+    /// not (here re-sealed meanwhile) is never reverted.
+    #[test]
+    fn a_rechecked_revoke_reverts_only_the_profiles_listed_last() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            listed_head(&mut rot, X, 3, 1, &peer_signer(1));
+            listed_head(&mut rot, Y, 2, 1, &peer_signer(1));
+            rot.revokes = false;
+        }
+        let log: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
+        let lost = DeviceRevocationReason::Lost;
+        revoke_old(&rig, &f, &old, lost, &[hex(&X), hex(&Y)], &log).unwrap_err();
+        assert_eq!(load().unwrap().handover.unwrap().reverts.len(), 2);
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            listed_head(&mut rot, Y, 3, 1, &f.signer);
+            rot.revokes = true;
+        }
+        revoke_old(&rig, &f, &old, lost, &[hex(&X)], &log).unwrap();
+        let reverted: Vec<String> = log.lock().unwrap().iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(reverted, [hex(&X)]);
+        let h = load().unwrap().handover.unwrap();
+        assert_eq!(h.reverts, [(hex(&X), "reverted:7".to_string())].into());
+    }
+
+    /// Review SF-3: a head whose signer the chain does not count blocks,
+    /// whatever its manifest says, so a server cannot make it pass.
+    #[test]
+    fn a_head_the_chain_does_not_count_blocks_the_revoke() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        let stranger = Ed25519SigningKey::from_bytes(&[0x77; 32]);
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            listed_head(&mut rot, X, 3, 1, &stranger);
+            rot.base_keys.push(stranger.verifying_key().to_bytes());
+        }
+        let log = Arc::default();
+        for (reason, accept) in [
+            (DeviceRevocationReason::Retired, vec![]),
+            (DeviceRevocationReason::Lost, vec![hex(&X)]),
+        ] {
+            let err = revoke_old(&rig, &f, &old, reason, &accept, &log).unwrap_err();
+            assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+            assert!(err.to_string().contains(&hex(&X)), "{err}");
+        }
+        assert_eq!(revoke_posts(&rig), 0);
+    }
+
+    /// Review SF-4: once the appointee's root grant request is saved, the
+    /// appointer runs no custody step, though the save of the appointee
+    /// after the filing was lost; Appoint itself still resumes.
+    #[test]
+    fn a_root_grant_filed_before_its_save_still_refuses_custody_steps() {
+        let f = fixture();
+        let b = pending(9);
+        let mut rig = appoint_rig(&f, vec![b.clone()]);
+        let mut failed = false;
+        appoint_with(&rig, &f, &b, &mut |s| {
+            if !s.handed_over_to.is_empty() && !failed {
+                failed = true;
+                bail!("save failed");
+            }
+            save(s)
+        })
+        .unwrap_err();
+        let state = load().unwrap();
+        assert!(state.handed_over_to.is_empty());
+        let err = refuse_handed_over(&state).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+        assert!(resumes_appointment(&state, &b.device_id));
+        appoint_of(&rig, &f, &b).unwrap();
+        assert_eq!(load().unwrap().handed_over_to, b.device_id);
+    }
+
+    /// Review SF-5: a device already approved as a member is not appointed
+    /// by building nothing.
+    #[test]
+    fn appoint_refuses_an_already_approved_member() {
+        let f = fixture();
+        let b = pending(9);
+        let rig = appoint_rig(&f, vec![b.clone()]);
+        approve_on(&rig, &f, &b, &f.code(&b)).unwrap();
+        rig.clear();
+        let err = appoint_of(&rig, &f, &b).unwrap_err();
+        assert!(has(&err, "fleet.deviceNotPending"), "{err}");
+        assert!(posts(&rig).is_empty());
+        assert!(load().unwrap().handed_over_to.is_empty());
     }
 
     fn revoke_posts(rig: &Rig) -> usize {

@@ -5502,6 +5502,9 @@ pub(crate) enum Blocked {
     OlderGeneration,
     /// Signed by the outgoing custodian.
     Outgoing,
+    /// Its head manifest does not verify under a key the trust chain counts
+    /// as a profile committer of this fleet: whatever it says is not read.
+    Untrusted,
 }
 
 /// One blocking head: its remote profile ID, version and why.
@@ -5512,19 +5515,26 @@ pub(crate) struct HeadBlocker {
     pub why: Blocked,
 }
 
-/// v2.10 4.H (D7), read only: the heads of every profile the fleet lists,
-/// this device binds or `also` names that are not sealed under `g`, or are
-/// signed by `outgoing`. The live listing decides, never a saved re-seal
-/// outcome; a bound or named profile the listing omits blocks.
+/// v2.10 4.H (D7): the heads of every profile the fleet lists, this device
+/// binds or `also` names that are not sealed under `g`, or are signed by
+/// `outgoing`. The live listing decides, never a saved re-seal outcome; a
+/// bound or named profile the listing omits blocks. Each head manifest must
+/// verify under its signer's key, and the trust chain evaluated to `pin` at
+/// `now` must count that signer's fleet approval and profile commit grant;
+/// otherwise the head blocks as untrusted (a server cannot vouch for a head).
+/// Records nothing in the ledger.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn custody_blockers(
     client: &FleetClient,
     access: &str,
-    binding: &Binding,
+    pin: &(Binding, [u8; 32]),
     fleet: [u8; 16],
     g: u64,
     outgoing: Option<[u8; 32]>,
     also: &[String],
+    now: u64,
 ) -> Result<Vec<HeadBlocker>> {
+    let binding = &pin.0;
     let of = |profile| Bound {
         local: String::new(),
         server: String::new(),
@@ -5567,6 +5577,7 @@ pub(crate) async fn custody_blockers(
     ids.extend(bound.into_iter().map(|id| id.to_ascii_lowercase()));
     ids.extend(also.iter().map(|id| id.to_ascii_lowercase()));
     let mut out = Vec::new();
+    let mut read = Vec::new();
     for id in ids {
         let blocked = |version, why| HeadBlocker {
             profile: id.clone(),
@@ -5580,18 +5591,65 @@ pub(crate) async fn custody_blockers(
         if p.current_version == 0 {
             continue;
         }
-        // The listing's generation is the one the profile was published
-        // under; the head manifest names the one its head is sealed under.
         let m = manifest(client, access, &of(p.profile_id), p.current_version).await?;
         if Some(m.head_hash()) != p.current_signed_head_hash {
             return Err(bad("current_signed_head_hash"));
         }
-        let head = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
-            .map_err(|_| bad("manifest"))?;
-        if head.key_generation < g {
-            out.push(blocked(p.current_version, Blocked::OlderGeneration));
-        } else if outgoing == Some(head.signer_signing_key_id) {
-            out.push(blocked(p.current_version, Blocked::Outgoing));
+        read.push((id, p.profile_id, p.current_version, m));
+    }
+    let mut signers: Vec<[u8; 32]> = read.iter().map(|r| *r.3.signer_signing_key_id()).collect();
+    signers.sort();
+    signers.dedup();
+    if signers.len() > crate::fleet_custody::MAX_SIGNERS {
+        bail!(code("sync.walkTooManySigners"));
+    }
+    let mut db = Db::open()?;
+    let (pages, _) = ledger::closure_evidence(
+        client,
+        access,
+        &hex(&binding.tenant_id),
+        &mut db,
+        pin,
+        &signers,
+        now,
+    )
+    .await?;
+    let chain = ledger::evaluate(&db, binding, &pin.1, &pages, now)?.map(|(_, chain)| chain);
+    let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
+        .iter()
+        .flat_map(|p| &p.signing_public_keys)
+        .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
+        .collect();
+    for (id, profile, version, m) in read {
+        let signer = *m.signer_signing_key_id();
+        let trusted = chain.as_ref().is_some_and(|chain| {
+            let commits =
+                |scope| chain.capability_at(&signer, Capability::ProfileCommit, scope, now);
+            chain.approval_valid_at(&signer, Scope::Fleet(fleet), now)
+                && (commits(Scope::Profile(profile)) || commits(Scope::Fleet(fleet)))
+        });
+        // The listing's generation is the one the profile was published
+        // under; the verified head manifest names the one its head is under.
+        let head = keys
+            .get(&signer)
+            .filter(|_| trusted)
+            .and_then(|pk| m.verify_signature(pk).ok())
+            .map(|v| v.payload().clone())
+            .filter(|h| {
+                (h.tenant_id, h.fleet_id, h.profile_id) == (binding.tenant_id, fleet, profile)
+            });
+        let why = match head {
+            None => Some(Blocked::Untrusted),
+            Some(h) if h.key_generation < g => Some(Blocked::OlderGeneration),
+            Some(h) if outgoing == Some(h.signer_signing_key_id) => Some(Blocked::Outgoing),
+            Some(_) => None,
+        };
+        if let Some(why) = why {
+            out.push(HeadBlocker {
+                profile: id,
+                version,
+                why,
+            });
         }
     }
     Ok(out)

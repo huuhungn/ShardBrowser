@@ -1820,7 +1820,7 @@ pub(crate) async fn renew(
     state: &mut BootstrapState,
     save: &mut impl FnMut(&BootstrapState) -> Result<()>,
 ) -> Result<RenewalOutcome> {
-    if !custody.handed_over_to.is_empty() {
+    if crate::fleet_custody::refuse_handed_over(custody).is_err() {
         return Ok(RenewalOutcome::HandedOver);
     }
     let resuming = state.renewal.as_ref().is_some_and(|r| !r.done);
