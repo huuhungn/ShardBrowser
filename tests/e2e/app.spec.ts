@@ -1138,6 +1138,46 @@ test("a root custodian not yet due to renew sees its custody dates and no renew 
   await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
 });
 
+test("a root key rotation waits for a stuck fleet generation, resumes with its bundle, and asks for a fleet rotation", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(a, "a", server, false, "&teamRootRotation=waits");
+  await cardClick(a, "Create fleet key");
+  const root = card.getByTestId("team-root-rotation");
+  await expect(root).toContainText("Recovery bundles exported before stop working.");
+  await expect(root).toContainText("hand root custody over to a new device first");
+
+  await test.step("the confirm tick and both passphrases gate the button", async () => {
+    await cardSignIn(a);
+    await root.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse battery");
+    await root.getByLabel("Recovery passphrase again").fill("correct horse battery");
+    await expect(root.getByRole("button", { name: "Rotate root key" })).toBeDisabled();
+    await root.getByLabel("I understand that recovery bundles exported before stop working").check();
+  });
+
+  await test.step("the first run stops at a stuck fleet generation and stays resumable", async () => {
+    await root.getByRole("button", { name: "Rotate root key" }).click();
+    await expect(a.getByText("the team server operator must discard it first", { exact: false })).toBeVisible();
+    await expect(root.getByTestId("team-root-rotation-unfinished"))
+      .toContainText("keeps the bundle it wrote at C:\\Users\\Example\\shardx-recovery.shxrecovery");
+  });
+
+  await test.step("resuming finishes, keeps the first bundle path and asks for a fleet rotation", async () => {
+    await cardSignIn(a);
+    await root.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse battery");
+    await root.getByLabel("Recovery passphrase again").fill("correct horse battery");
+    await root.getByRole("button", { name: "Resume root key rotation" }).click();
+    await expect(a.getByText("Root key rotated. The new recovery bundle is at C:\\Users\\Example\\shardx-recovery.shxrecovery.", { exact: false })).toBeVisible();
+    await expect(root.getByTestId("team-root-rotation-unfinished")).toHaveCount(0);
+    await expect(root.getByTestId("team-root-rotation-fleet-due")).toContainText("Rotate the fleet key to finish the root key rotation");
+  });
+
+  await test.step("a fleet rotation clears the prompt", async () => {
+    await rotateOn(a);
+    await expect(root.getByTestId("team-root-rotation-fleet-due")).toHaveCount(0);
+  });
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
 // The v2.10 root custody hand-over (plan 4.H): A, the root custodian, appoints B;
 // B accepts and works through the checklist, then revokes A, which stays inert.
 const B_ID = "b1".repeat(16);

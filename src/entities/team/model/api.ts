@@ -77,6 +77,22 @@ export const teamBootstrapCustody = (
   });
 
 /**
+ * Rotate the tenant root key as the root custodian, or resume the rotation:
+ * every retained fleet key is wrapped under the new key, and a new recovery
+ * bundle is written to `bundlePath` under `passphrase` (a resumed run keeps
+ * the path it saved). The password is used for one login and never stored.
+ */
+export const teamRotateRoot = (
+  username: string,
+  password: string,
+  bundlePath: string,
+  passphrase: string,
+) =>
+  invoke<CustodyBootstrapStatus>("team_rotate_root", {
+    username, password, bundlePath, passphrase,
+  });
+
+/**
  * Export the recovery bundle again as the root custodian, with every
  * verified fleet key, to `path` under `passphrase`. Nothing is filed; the
  * password is used for one login and never stored.

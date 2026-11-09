@@ -8,7 +8,7 @@ import {
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
   teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle, teamFleetCustodyStatus,
-  teamRenewCustody, teamCustodyAccept,
+  teamRenewCustody, teamCustodyAccept, teamRotateRoot,
   type TeamStatus, type CustodyBootstrapStatus, type CustodyResult, type HandoverStatus,
 } from "../../../entities/team";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -73,6 +73,10 @@ export function TeamCard() {
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
   const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
   const [exportDue, setExportDue] = useState<"rotation" | "renewal" | null>(null);
+  // v2.11 root key rotation: its own passphrase fields and the confirmation that older bundles stop working.
+  const [rootPass, setRootPass] = useState("");
+  const [rootPass2, setRootPass2] = useState("");
+  const [rootConfirmed, setRootConfirmed] = useState(false);
   // v2.10 hand-over: the device this root custodian appointed, and the hand-over this device accepted.
   const [handedOverTo, setHandedOverTo] = useState("");
   const [handover, setHandover] = useState<HandoverStatus | null>(null);
@@ -285,6 +289,37 @@ export function TeamCard() {
     void loadBoot();
     void loadExportDue();
     toast.ok(t(outcome === "renewed" ? "team.renewal.done" : "team.renewal.notDue"));
+  });
+
+  const rotateRoot = () => run("rootRotation", async () => {
+    if (!passphrasesAgree(rootPass, rootPass2)) return;
+    // A resumed rotation keeps the bundle it already wrote; the backend ignores a new path then.
+    let path = boot?.root_rotation_path ?? "";
+    if (!path) {
+      const picked = await saveDialog({
+        defaultPath: "shardx-recovery-rotated.shxrecovery",
+        filters: [{ name: t("team.recoveryBundle"), extensions: ["shxrecovery"] }],
+      });
+      if (typeof picked !== "string") return; // cancelled
+      path = picked;
+    }
+    const typed = password;
+    setPassword("");
+    try {
+      const next = await teamRotateRoot(username.trim(), typed, path, rootPass);
+      setBoot(next);
+      setRootPass("");
+      setRootPass2("");
+      setRootConfirmed(false);
+      setRootKeyIdRecorded(false);
+      toast.ok(t("team.rootRotation.done", { path: next.recovery_path }));
+    } catch (e) {
+      // Whatever step it reached is saved: show where the next try resumes.
+      void loadBoot();
+      throw e;
+    } finally {
+      void loadExportDue();
+    }
   });
 
   const acceptCustody = () => run("accept", async () => {
@@ -682,7 +717,7 @@ export function TeamCard() {
                       account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
                       hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
                       handedOverTo={handedOverTo} handover={handover} onReset={reset}
-                      onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); void loadExportDue(); }}
+                      onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); void loadExportDue(); void loadBoot(); }}
                     />
                   ) : st.has_fleet_key ? (
                     <p data-testid="team-joined" className="m-0 text-paragraph-xs text-text-sub-600">
@@ -748,6 +783,60 @@ export function TeamCard() {
                           </Button>
                         </div>
                       )}
+                    </div>
+                  )}
+                  {st.can_sync && custodian && !handedOverTo && (
+                    <div data-testid="team-root-rotation" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
+                      <span className="text-label-xs text-text-strong-950">{t("team.rootRotation.title")}</span>
+                      {boot.fleet_rotation_due && (
+                        <p data-testid="team-root-rotation-fleet-due" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.rootRotation.fleetDue")}
+                        </p>
+                      )}
+                      {boot.root_rotation_unfinished ? (
+                        <p data-testid="team-root-rotation-unfinished" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.rootRotation.unfinished", { path: boot.root_rotation_path })}
+                        </p>
+                      ) : (
+                        <>
+                          <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.rootRotation.help")}</p>
+                          <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.rootRotation.handOverFirst")}</p>
+                          <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.rootRotation.fleetAfter")}</p>
+                          <Checkbox
+                            label={t("team.rootRotation.confirm")}
+                            checked={rootConfirmed}
+                            onChange={() => setRootConfirmed((v) => !v)}
+                          />
+                        </>
+                      )}
+                      <Input
+                        label={t("team.recoveryPassphrase")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={rootPass}
+                        onChange={(e) => setRootPass(e.target.value)}
+                      />
+                      <Input
+                        label={t("team.recoveryPassphraseAgain")}
+                        inputSize="small"
+                        type="password"
+                        autoComplete="new-password"
+                        value={rootPass2}
+                        onChange={(e) => setRootPass2(e.target.value)}
+                      />
+                      <div>
+                        <Button
+                          size="small"
+                          mode="stroke"
+                          disabled={!!busy || !username.trim() || !password || !rootPass || !rootPass2 || (!boot.root_rotation_unfinished && !rootConfirmed)}
+                          onClick={rotateRoot}
+                        >
+                          {busy === "rootRotation"
+                            ? t("team.rootRotation.busy")
+                            : t(boot.root_rotation_unfinished ? "team.rootRotation.resume" : "team.rootRotation.rotate")}
+                        </Button>
+                      </div>
                     </div>
                   )}
                   {st.can_sync && custodian && !handedOverTo && (

@@ -76,6 +76,12 @@ export type CustodyBootstrapStatus = {
   custody_ends_ms: number | null;
   /** When this device's key stops counting as a root custodian's. */
   key_age_ends_ms: number | null;
+  /** A root key rotation started and has not activated: Rotate root key resumes it. */
+  root_rotation_unfinished: boolean;
+  /** Where that rotation wrote its recovery bundle; a resumed run keeps it. Empty until written. */
+  root_rotation_path: string;
+  /** A finished root key rotation waits for a fleet key rotation. */
+  fleet_rotation_due: boolean;
 };
 
 /** What one root custody renewal step did. */
