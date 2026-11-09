@@ -1547,7 +1547,7 @@
   "team.reseal.outcome.inUse": "Bỏ qua: đang dùng, đang được giữ hoặc có thay đổi chưa đẩy lên",
   "team.reseal.outcome.quarantined": "Bỏ qua: bị cách ly",
   "team.reseal.outcome.olderKeyNotHeld": "Bỏ qua: máy này không giữ khoá đã niêm phong hồ sơ",
-  "team.reseal.outcome.error": "Bỏ qua: lỗi {code}",
+  "team.reseal.outcome.error": "Bỏ qua: {code}",
   "team.joinCode.help": "Thiết bị mới tham gia khi người giữ khoá gốc duyệt nó. Trong vòng mười phút sau khi ghi danh, hãy hiện mã của thiết bị này và so với mã trong danh sách thiết bị của người giữ khoá.",
   "team.joinCode.show": "Hiện mã tham gia",
   "team.joinCode.codesMatch": "Mã khớp",

@@ -1547,7 +1547,7 @@
   "team.reseal.outcome.inUse": "Skipped: in use, checked out or with unpushed changes",
   "team.reseal.outcome.quarantined": "Skipped: quarantined",
   "team.reseal.outcome.olderKeyNotHeld": "Skipped: this computer does not hold the key it is sealed under",
-  "team.reseal.outcome.error": "Skipped: error {code}",
+  "team.reseal.outcome.error": "Skipped: {code}",
   "team.joinCode.help": "A new device joins once the root custodian approves it. Within ten minutes of enrolling, show this device's code and compare it with the one on the custodian's device list.",
   "team.joinCode.show": "Show join code",
   "team.joinCode.codesMatch": "Codes match",

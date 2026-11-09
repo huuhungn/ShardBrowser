@@ -341,9 +341,11 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
             </div>
             {reseal && Object.entries(reseal.profiles).map(([id, o]) => {
               const [key, values] = resealOutcome(o);
+              // An error code reads as its message when the locale has one, else as the code.
+              const shown = values?.code ? { ...values, code: t(values.code) } : values;
               return (
                 <p key={id} data-testid="team-reseal-profile" className="m-0 text-paragraph-xs text-text-sub-600">
-                  <span className="mono">{id.slice(0, 8)}</span> {t(key, values)}
+                  <span className="mono">{id.slice(0, 8)}</span> {t(key, shown)}
                 </p>
               );
             })}

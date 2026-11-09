@@ -631,6 +631,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
         if (h.version === 0 || (sealed.get(id) ?? 0) >= generation) profiles[id] = "current";
         else if (h.holder && h.holder !== device) profiles[id] = "skipped:in-use";
         else if (h.revoked) profiles[id] = "skipped:quarantined";
+        else if (h.label === "Untrusted") profiles[id] = "skipped:error:sync.signerUntrusted";
         else {
           h.version += 1;
           sealed.set(id, generation);
@@ -1047,6 +1048,7 @@ test("re-seal all profiles moves each free head under the newest key and lists t
     }
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@1"]);
     server.heads.set("e1".repeat(16), { version: 1, label: "Leased", holder: "b", revoked: false });
+    server.heads.set("e2".repeat(16), { version: 1, label: "Untrusted", holder: null, revoked: false });
   });
 
   await test.step("after a rotation the confirm warns members to pull first, and the run lists each outcome", async () => {
@@ -1056,10 +1058,14 @@ test("re-seal all profiles moves each free head under the newest key and lists t
     await expect(dialog).toContainText("Members with unpushed changes must Pull first, which replaces their local changes.");
     await expect(dialog).toContainText("Profiles in use, in error or quarantined are skipped and listed.");
     await dialog.getByRole("button", { name: "Re-seal all profiles" }).click();
-    await expect(a.getByText("Re-seal finished: 1 re-sealed, 0 already current, 1 skipped.")).toBeVisible();
-    await expect(results).toHaveCount(2);
+    await expect(a.getByText("Re-seal finished: 1 re-sealed, 0 already current, 2 skipped.")).toBeVisible();
+    await expect(results).toHaveCount(3);
     await expect(results.filter({ hasText: "Re-sealed (version 2)" })).toHaveCount(1);
     await expect(results.filter({ hasText: "Skipped: in use, checked out or with unpushed changes" })).toHaveCount(1);
+    // An error shows its message, never the raw code.
+    await expect(results.filter({ hasText: "Skipped: The snapshot's signer is not trusted to commit this profile" }))
+      .toHaveCount(1);
+    await expect(results.filter({ hasText: "sync.signerUntrusted" })).toHaveCount(0);
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@2"]);
     await expect(a.getByTestId("team-older-key")).toHaveCount(0);
   });
@@ -1067,8 +1073,8 @@ test("re-seal all profiles moves each free head under the newest key and lists t
   await test.step("a second run commits nothing new", async () => {
     await cardClick(a, "Re-seal all profiles");
     await a.getByRole("dialog").getByRole("button", { name: "Re-seal all profiles" }).click();
-    await expect(a.getByText("Re-seal finished: 0 re-sealed, 1 already current, 1 skipped.")).toBeVisible();
-    expect([...server.heads.values()].map((h) => h.version)).toEqual([2, 1]);
+    await expect(a.getByText("Re-seal finished: 0 re-sealed, 1 already current, 2 skipped.")).toBeVisible();
+    expect([...server.heads.values()].map((h) => h.version)).toEqual([2, 1, 1]);
   });
   await expect(a.getByText("[[shardx:")).toHaveCount(0);
 });
