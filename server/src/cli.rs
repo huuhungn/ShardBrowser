@@ -48,7 +48,8 @@ pub const USAGE: &str = "usage:
   shardx-team-server fleet discard-preparing --tenant <slug> --generation <n> [--fleet <hex>] [--force]
       archive and delete a stuck PREPARING fleet key generation (the ACTIVE
       one + 1) and its grants, so the number can be used again; back up the
-      database first. --force skips the wait for the rotation's grant window
+      database first. --force skips the wait for the rotation's grant window,
+      or for a rotation that filed no rotation grant yet
   shardx-team-server root discard-preparing --tenant <slug> --generation <n>
       the same for a stuck PREPARING root key generation";
 

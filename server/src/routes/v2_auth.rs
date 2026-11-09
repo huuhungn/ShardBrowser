@@ -1602,7 +1602,7 @@ async fn revocation_of(
     tenant: &[u8; 16],
     device: &[u8],
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    let (replay, exact, issuer): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+    let found = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>)>(
         "SELECT r.replay_id, r.exact_signed_container_bytes, d.signing_public_key
            FROM v2_device_revocations r
            JOIN v2_devices d ON d.tenant_id = r.tenant_id
@@ -1614,8 +1614,14 @@ async fn revocation_of(
     .bind(tenant.as_slice())
     .bind(device)
     .fetch_optional(&mut *conn)
-    .await
-    .ok()??;
+    .await;
+    let (replay, exact, issuer) = match found {
+        Ok(found) => found?,
+        Err(e) => {
+            tracing::warn!("a revoked device's revocation could not be read for the listing: {e}");
+            return None;
+        }
+    };
     let replay = <[u8; 16]>::try_from(replay).ok()?;
     match super::v2_device_revoke::load_revocation(conn, &v.server_instance_id, tenant, &replay)
         .await

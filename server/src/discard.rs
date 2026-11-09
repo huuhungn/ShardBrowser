@@ -183,10 +183,17 @@ pub async fn discard_preparing(
             .bind(n)
             .fetch_one(&mut *tx)
             .await?;
-            if let Some(until) = open_until.filter(|u| *u > now_ms()) {
+            // With no rotation grant filed yet, the launcher may still be
+            // preparing its run: its window has not even started.
+            let open = match open_until {
+                None => Some("no rotation grant is filed yet".to_string()),
+                Some(until) if until > now_ms() => Some(format!("until {until} (ms)")),
+                Some(_) => None,
+            };
+            if let Some(why) = open {
                 ensure!(
                     force,
-                    "refusing: the rotation's grant window is open until {until} (ms); \
+                    "refusing: the rotation's grant window is open ({why}); \
                      wait for it to end or pass --force"
                 );
             }

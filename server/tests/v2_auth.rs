@@ -11999,6 +11999,20 @@ async fn discard_preparing_archives_a_stuck_root_rotation_and_frees_its_number()
     let (a, access, _) = fleet_at_0(&mut server, 0x6a).await;
     let trk1 = [0x7d; 32];
     root_rotation_to_1(&server, &a, &access, trk1, 0xd8, 0xe1, 0xf1).await;
+    // Marks the startup pass filed for the root grant of 1 and for the
+    // rewrap under it go with them.
+    for (kind, replay) in [("root_grant", 0xe1), ("fleet_recovery_grant", 0xf1)] {
+        server
+            .sql(
+                &format!(
+                    "INSERT INTO v2_grant_quarantine
+                         (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+                     VALUES ('{kind}', ?, ?, ?, 'container_mismatch', 't')"
+                ),
+                &[&INSTANCE, &TENANT, &[replay; 16]],
+            )
+            .await;
+    }
 
     let out = server
         .offline(
@@ -12046,8 +12060,15 @@ async fn discard_preparing_archives_a_stuck_root_rotation_and_frees_its_number()
         ),
         (
             "SELECT count(*) FROM v2_discarded_records WHERE kind = 'root' AND generation = 1",
-            3,
+            5,
         ),
+        (
+            "SELECT count(*) FROM v2_discarded_records
+              WHERE source_table = 'v2_grant_quarantine'
+                AND json_extract(row_json, '$.kind') IN ('root_grant', 'fleet_recovery_grant')",
+            2,
+        ),
+        ("SELECT count(*) FROM v2_grant_quarantine", 0),
         ("SELECT count(*) FROM v2_offline_discard", 0),
         (
             "SELECT count(*) FROM v2_audit_events
@@ -12081,6 +12102,45 @@ async fn discard_preparing_archives_a_stuck_root_rotation_and_frees_its_number()
                   WHERE generation = 1 AND state = 'ACTIVE' AND root_key_id = x'{}'",
                 hex(&shared::keys::root_key_id(&trk1b))
             ))
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn discard_preparing_waits_for_a_rotation_that_filed_no_rotation_grant_yet() {
+    let mut server = start("v211-discard-no-grant", 28255).await;
+    let (a, access, _) = fleet_at_0(&mut server, 0x6a).await;
+    // Generation 1 is created, but its launcher has filed nothing yet.
+    let stuck = rotation_to_1(&a, [0xe1; 32], 0xd5);
+    let create = shared::fleet_lifecycle::FleetKeyGenerationCreateV2 {
+        terms: stuck.terms,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc0, create.encode());
+    assert_eq!(
+        server
+            .call(&fleet_generation_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let before = discard_rows(&server).await;
+    let out = server.offline(&FLEET_DISCARD, "").await;
+    let (_, err) = out_text(&out);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("grant window is open (no rotation grant is filed yet)"),
+        "{err}"
+    );
+    assert_eq!(discard_rows(&server).await, before);
+    let out = server
+        .offline(&[&FLEET_DISCARD[..], &["--force"]].concat(), "")
+        .await;
+    assert!(out.status.success(), "{:?}", out_text(&out));
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_discarded_records WHERE kind = 'fleet'")
             .await,
         1
     );
