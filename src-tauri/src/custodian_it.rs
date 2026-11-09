@@ -2634,7 +2634,7 @@ fn keep_state(dir: &std::path::Path, device: &str) {
 }
 
 /// The journey the leak scan watches: the S3 journey, A's revoke of B, A's
-/// rotation of the fleet key, A's export of its recovery bundle again, B's refused collect and a fresh
+/// rotation of the fleet key, A's re-seal and renewal, A's export of its recovery bundle again, B's refused collect and a fresh
 /// device's import of that bundle. Each reply and each device's state files go to the
 /// scan directory; the secrets to look for go to the side file.
 #[test]
@@ -2660,6 +2660,17 @@ fn the_journey_leak_scan_worker() {
     assert!(resealed
         .reseal
         .is_some_and(|r| r.profiles.values().all(|o| o == "skipped:quarantined")));
+    // v2.10 U5: a renewal, forced due (the journey's records are all new).
+    crate::root_bootstrap::tests::RENEWAL_DUE.with(|d| d.set(true));
+    let renewed = call(
+        &rt,
+        crate::team_renew_custody(OWNER.into(), PASSWORD.into()),
+    );
+    crate::root_bootstrap::tests::RENEWAL_DUE.with(|d| d.set(false));
+    assert_eq!(
+        renewed.unwrap(),
+        crate::root_bootstrap::RenewalOutcome::Renewed
+    );
 
     let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
     let rotated = crate::credential::load(&format!("fleet-key.{}.1", h.tenant)).unwrap();
@@ -3443,4 +3454,189 @@ fn reseal_all_moves_every_head_and_a_new_device_reads_them_against_a_real_server
     );
     std::fs::write(udd.join("Preferences"), b"{\"from\":\"b, after\"}").unwrap();
     assert_eq!(push(&y_local, 2).unwrap().version, 3);
+}
+
+/// v2.10 U5 (4.R), port slot 3: root custodian A bootstraps and creates the
+/// fleet key with its launcher clock 200 days behind the server's, so its
+/// year-long records are past half their life by the server's clock. Back on
+/// the real clock, A's next published sync renews them in that session: the
+/// server keeps A's new tenant approval, an acknowledged `ExistingRootGrant`
+/// to A, six capability grants and A's own grant of the ACTIVE generation;
+/// the next renewal step finds nothing due. A then approves member B,
+/// rotates and exports v4, and a fresh device imports it and keeps custody.
+#[test]
+fn the_root_custodian_renews_itself_and_keeps_custody_against_a_real_server() {
+    use crate::root_bootstrap::RenewalOutcome;
+    const DAY: u64 = 86_400_000;
+    let rt = runtime();
+    let back = |ms: u64| crate::root_bootstrap::tests::CLOCK_BACK_MS.with(|c| c.set(ms));
+    back(200 * DAY);
+    let h = custodian_at(V210_PORT_BASE, 3, "v210-renewal", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    back(0);
+    let a = crate::team_config::load().unwrap();
+    let a_id = a.device_id.clone();
+    let now = crate::root_bootstrap::now_ms();
+    let first = note(crate::team_custody_bootstrap_status()).unwrap();
+    assert!(first.renewal_due_ms.unwrap() < now, "{first:?}");
+    assert!(first.custody_ends_ms.unwrap() < now + 170 * DAY);
+
+    let actions = [
+        "device.approve",
+        "root.grant_create",
+        "root.grant_ack",
+        "capability.grant",
+        "fleet.key_grant.create",
+        "fleet.key_grant.ack",
+    ];
+    let counts = || {
+        actions.map(|action| {
+            h.server.count(&format!(
+                "SELECT count(*) FROM v2_audit_events WHERE action = '{action}'"
+            ))
+        })
+    };
+    let before = counts();
+
+    // 1. A publishes a profile; that session renews A's records.
+    let (user, pass) = account();
+    let profile = local_profile("Renewed", 5);
+    call(
+        &rt,
+        crate::sync_cmd::profile_sync_publish(profile, Some("Renewed".into()), user, pass),
+    )
+    .unwrap();
+    let renewed = counts();
+    let delta: Vec<i64> = renewed.iter().zip(before).map(|(a, b)| a - b).collect();
+    assert_eq!(delta, [1, 1, 1, 6, 1, 1], "{actions:?}");
+    let root = crate::root_bootstrap::load().unwrap();
+    let run = root.renewal.clone().expect("a renewal");
+    assert!(run.done);
+    assert_eq!(root.root_grant, run.root_grant);
+    assert_eq!(
+        root.root_grant_issuer,
+        hex(a.signing_key().unwrap().verifying_key().as_bytes())
+    );
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_device_approvals
+              WHERE lower(hex(subject_device_id)) = '{a_id}' AND approval_scope_kind = 'tenant'"
+        )),
+        2,
+        "D1 and the renewal"
+    );
+    let listed = with_session(&rt, &h, async |client, access| {
+        client
+            .root_key_grants(access, &h.tenant, &a_id)
+            .await
+            .unwrap()
+    });
+    let variants: Vec<&str> = listed.iter().map(|g| g.grant_variant.as_str()).collect();
+    assert_eq!(listed.len(), 2, "{variants:?}");
+    assert!(variants.contains(&"ExistingRootGrant"), "{variants:?}");
+    let status = note(crate::team_custody_bootstrap_status()).unwrap();
+    assert!(
+        status.renewal_due_ms.unwrap() > now + 150 * DAY,
+        "{status:?}"
+    );
+    assert!(
+        status.custody_ends_ms.unwrap() > now + 360 * DAY,
+        "{status:?}"
+    );
+    assert_eq!(status.key_age_ends_ms, first.key_age_ends_ms);
+    assert!(crate::fleet_custody::load().unwrap().export_due);
+
+    // 2. Nothing is due any more.
+    let outcome = call(
+        &rt,
+        crate::team_renew_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(outcome, RenewalOutcome::NotDue);
+    assert_eq!(counts(), renewed);
+
+    // 3. B enrolls; A approves it under the renewed records; B joins and
+    // collects generation 0.
+    let b = Member {
+        config: tempfile::tempdir().unwrap(),
+        data: tempfile::tempdir().unwrap(),
+    };
+    b.act_as_b();
+    note(crate::team_set_connection(
+        h.server.url(),
+        String::new(),
+        h.tenant.clone(),
+    ))
+    .unwrap();
+    let b_id = call(
+        &rt,
+        crate::team_enroll_device("member".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+    b.act_as_b();
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert!(crate::team_config::status().unwrap().has_fleet_key);
+
+    // 4. A rotates: B gets generation 1. A exports v4 with the renewed grant.
+    h.act_as_a();
+    call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap();
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants
+              WHERE lower(hex(subject_device_id)) = '{b_id}' AND generation = 1"
+        )),
+        1
+    );
+    let bundle = config_path("renewed.shardx-recovery");
+    export(&rt, &bundle).unwrap();
+    assert!(!crate::fleet_custody::load().unwrap().export_due);
+    let (header, plaintext) =
+        shardx_core::recovery_bundle::open(&std::fs::read(&bundle).unwrap(), PASSPHRASE).unwrap();
+    assert_eq!(header.root_generation, 0);
+    let custodian = plaintext.root_custodian.expect("v4 carries the custodian");
+    assert_eq!(hex(&custodian.root_grant), run.root_grant);
+    assert_eq!(
+        custodian.root_grant_issuer,
+        Some(a.signing_key().unwrap().verifying_key().to_bytes())
+    );
+
+    // 5. A fresh device imports it, holds generation 1, and lists the
+    // tenant's devices as its root custodian.
+    let _c = fresh_device("c", h.server.url(), h.tenant.clone());
+    let report = import(&rt, &bundle).unwrap();
+    assert_eq!(report["fleet_opened"], 1, "{report}");
+    let rows = call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    assert!(rows.iter().any(|r| r.device_id == b_id));
+    assert_eq!(counts()[1], renewed[1], "no second renewal");
 }

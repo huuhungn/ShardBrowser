@@ -1534,7 +1534,7 @@ fn outside_window(e: &anyhow::Error) -> bool {
 /// Whether `e` is the custody refusal with `status` and, when given, the
 /// top-level `code`, read from the marker's own fields as [`outside_window`]
 /// reads them.
-fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -> bool {
+pub(crate) fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -> bool {
     let text = e.to_string();
     let open = "[[shardx:fleet.refusedCustody|";
     text.find(open)
@@ -4421,7 +4421,11 @@ pub(crate) mod tests {
         approves: bool,
     }
 
-    fn stored(body: &[u8], record_type: &str, payload: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
+    pub(crate) fn stored(
+        body: &[u8],
+        record_type: &str,
+        payload: impl FnOnce(&[u8]) -> Vec<u8>,
+    ) -> Vec<u8> {
         let req = IdempotentMutationRequestV2::parse(body).unwrap();
         IdempotentStoredResponseV2 {
             operation_kind: req.operation_kind,
