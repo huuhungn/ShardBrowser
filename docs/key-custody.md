@@ -506,7 +506,9 @@ is needed.
       (`fleet.handoverNotReady`). `retired` needs no blocker. `lost` may go
       ahead when the only blockers are heads A pushed after the re-seal, which
       are listed and reverted right after the revoke once the user confirms
-      that exact list. Before confirming, every member must run 2.10 and have
+      that exact list; each listed profile must be joined on B first (step
+      `bind`), and a revert that fails is retried by the next Revoke. Before
+      confirming, every member must run 2.10 and have
       synced once since the hand-over began: a member still on 2.9.x distrusts
       peers it has not seen and must enroll again.
 5. A stays registered but inert: it cannot push, and every custody command
@@ -533,6 +535,10 @@ What the hand-over does not do:
   heads, later pushes and B's own key of N stay readable; older snapshots
   below the heads do not.
 - **Run two at once.** One hand-over at a time.
+- **Survive a restore from before the rotation.** A new custodian restored
+  from its first v4 bundle (written before its rotation) has lost its
+  hand-over state, so its Revoke of the old root takes the plain path,
+  without the checklist or the live check of step 4.4.
 
 ## Threat model, stated plainly
 
