@@ -64,7 +64,9 @@ use shardx_core::trust_chain::{
     Binding, Evidence, Scope, TrustChain, CLOCK_TOLERANCE_MS, MAX_CUSTODIAN_KEY_AGE_MS,
     MAX_EVIDENCE_LISTINGS,
 };
-use shardx_core::trust_evidence::{RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2};
+use shardx_core::trust_evidence::{
+    RevokedDevice, RevokedRecord, TenantTrustEvidencePageV2, MAX_EVIDENCE_CONTAINERS,
+};
 
 use super::db::Db;
 use crate::fleet_client::{decode_hex16, decode_hex32, hex, FleetClient};
@@ -1074,7 +1076,9 @@ pub(crate) const MAX_LISTED_SIGNERS: usize =
 
 /// Q-62: one complete listing per 64 of `signers` (in key order), or one
 /// listing naming none; more than [`MAX_LISTED_SIGNERS`] fail closed with
-/// `fleet.trustClosureTooLarge`.
+/// `fleet.trustClosureTooLarge`. Reading stops with
+/// `fleet.trustEvidenceRefused` once the listings hold more containers than
+/// [`Evidence::collect_listings`] takes, so no more are fetched in vain.
 async fn listings_of(
     client: &FleetClient,
     access: &str,
@@ -1086,8 +1090,14 @@ async fn listings_of(
     }
     let signers: Vec<[u8; 32]> = signers.into_iter().collect();
     let mut out = Vec::new();
+    let mut total = 0usize;
     for chunk in signers.chunks(crate::fleet_custody::MAX_SIGNERS) {
-        out.push(client.trust_evidence_of(access, tenant, chunk).await?);
+        let listing = client.trust_evidence_of(access, tenant, chunk).await?;
+        total += listing.iter().map(|p| p.containers.len()).sum::<usize>();
+        if total > 2 * MAX_EVIDENCE_CONTAINERS {
+            anyhow::bail!(crate::errcode::code("fleet.trustEvidenceRefused"));
+        }
+        out.push(listing);
     }
     if out.is_empty() {
         out.push(client.trust_evidence_of(access, tenant, &[]).await?);
@@ -2882,6 +2892,50 @@ mod tests {
         assert_eq!(d.evaluations(), 0);
         assert!(!withdrawn(&d.db, &B, &d.anchor).unwrap());
         assert_eq!(MAX_LISTED_SIGNERS, 1024);
+    }
+
+    /// Q-62: listings holding more containers in all than the merge takes
+    /// stop the reads at the listing that crosses the cap: three full
+    /// listings of 64 pages of 1024 containers, of the 16 asked for.
+    #[test]
+    fn listings_past_the_container_cap_stop_the_reads() {
+        let reply = |call: &str, _: &[u8]| {
+            let at = call
+                .split('&')
+                .find_map(|kv| kv.split("cursor=").nth(1))
+                .map_or(0, |c| u32::from_str_radix(c, 16).unwrap());
+            // A page's containers are distinct.
+            let distinct = (0..1024u32).map(|i| i.to_be_bytes().to_vec()).collect();
+            let mut p = page(&[], distinct);
+            p.page_index = at;
+            if at + 1 < 64 {
+                p.next_cursor = (at + 1).to_be_bytes().to_vec();
+            }
+            (200, p.encode())
+        };
+        let rt = crate::fleet_custody::tests::runtime();
+        let (client, seen) = rt.block_on(crate::fleet_custody::tests::mock(std::sync::Arc::new(
+            reply,
+        )));
+        let signers = (0..MAX_LISTED_SIGNERS as u16)
+            .map(|i| {
+                let mut s = [0x44; 32];
+                s[..2].copy_from_slice(&i.to_le_bytes());
+                s
+            })
+            .collect();
+        let err = rt
+            .block_on(listings_of(&client, "t", &hex(&B.tenant_id), signers))
+            .unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.trustEvidenceRefused"),
+            "{err:#}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            3 * 64,
+            "no fourth listing is read"
+        );
     }
 
     /// D12 costs nothing without a custodian revocation: a first evaluation
