@@ -831,17 +831,18 @@ test("compromised is offered for a member row only, and its revoke asks for an u
   ]);
   const card = await teamDevicePage(a, "a", server);
   await cardClick(a, "Create fleet key");
-  const reasons = async (label: string) => {
+  // A web-first assertion: the option list renders after the click.
+  const offers = async (label: string, reasons: string[]) => {
     const row = await listDevices(a, label);
     await row.getByRole("combobox", { name: "Reason" }).click();
-    const offered = await a.getByRole("option").allInnerTexts();
+    await expect(a.getByRole("option")).toHaveText(reasons);
     await a.keyboard.press("Escape");
-    return offered;
+    await expect(a.getByRole("option")).toHaveCount(0);
   };
 
   await test.step("a custodian row is not offered compromised; a member row is", async () => {
-    expect(await reasons("Machine X")).toEqual(["Retired", "Lost"]);
-    expect(await reasons("Machine C")).toEqual(["Retired", "Lost", "Compromised"]);
+    await offers("Machine X", ["Retired", "Lost"]);
+    await offers("Machine C", ["Retired", "Lost", "Compromised"]);
   });
 
   await test.step("the compromised revoke warns that pushes stop until the rotation, then raises the urgent banner", async () => {
@@ -1385,15 +1386,23 @@ test("the custodian cannot approve a row it first saw more than ten minutes ago"
   await b.context().close();
 });
 
-test("the reason list offers only Retired and Lost", async ({ page: a }) => {
-  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: false }]);
+test("the reason list offers Retired and Lost, and Compromised for a member row only", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: false },
+    { device_id: "c5".repeat(16), label: "Machine X", status: "active", granted: false, custodian: true },
+  ]);
   await teamDevicePage(a, "a", server);
-  const row = await listDevices(a, "Machine C");
+  const custodian = await listDevices(a, "Machine X");
+  const row = a.getByTestId("team-device").filter({ hasText: "Machine C" });
   await expect(a.getByTestId("team-device").filter({ hasText: "Machine A" }).getByRole("combobox")).toHaveCount(0);
+  await custodian.getByRole("combobox", { name: "Reason" }).click();
+  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost"]);
+  await a.keyboard.press("Escape");
+  await expect(a.getByRole("option")).toHaveCount(0);
   const reason = row.getByRole("combobox", { name: "Reason" });
   await expect(reason).toContainText("Retired");
   await reason.click();
-  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost"]);
+  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost", "Compromised"]);
   await a.getByRole("option", { name: "Lost" }).click();
   await expect(reason).toContainText("Lost");
 });
