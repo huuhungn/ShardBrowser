@@ -49,10 +49,12 @@ jobs:
       # new advisory, or one of these reaching a new path, fails the build.
       - name: Launcher, server and shared RustSec audit
         run: |
-          cargo +stable audit --deny unsound --deny yanked --file shared/Cargo.lock
+          cargo +stable audit --deny unsound --deny yanked --file shared/Cargo.lock \
+            --ignore RUSTSEC-2026-0459
           cargo +stable audit --deny unsound --deny yanked --file server/Cargo.lock \
-            --ignore RUSTSEC-2023-0071
+            --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
           cargo +stable audit --deny unsound --deny yanked --file src-tauri/Cargo.lock \
+            --ignore RUSTSEC-2026-0459 \
             --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 \
             --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 --ignore RUSTSEC-2026-0369 \
             --ignore RUSTSEC-2026-0429 \

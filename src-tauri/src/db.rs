@@ -51,6 +51,8 @@ fn open(name: &str) -> Result<Connection> {
         })?;
     }
 
+    // A project's database may arrive with its `-wal` (RUSTSEC-2026-0459).
+    shardx_core::sqlite_wal::check_wal(&path)?;
     let conn = Connection::open(&path).with_context(|| {
         crate::errcode::code_with(
             "db.databaseCouldNotBeOpened",

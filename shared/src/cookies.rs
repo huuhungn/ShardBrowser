@@ -64,6 +64,7 @@ pub fn read(db_path: &Path, crypt: &LocalCrypt) -> Result<Vec<PortableCookie>> {
     if !db_path.exists() {
         return Ok(Vec::new());
     }
+    crate::sqlite_wal::check_wal(db_path)?;
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", db_path.display()))?;
     let mut stmt = conn.prepare(
@@ -123,6 +124,7 @@ pub fn write(db_path: &Path, crypt: &LocalCrypt, cookies: &[PortableCookie]) -> 
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    crate::sqlite_wal::check_wal(db_path)?;
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     ensure_schema(&conn)?;
 
