@@ -8,8 +8,8 @@ import {
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
   teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle, teamFleetCustodyStatus,
-  teamRenewCustody,
-  type TeamStatus, type CustodyBootstrapStatus, type CustodyResult,
+  teamRenewCustody, teamCustodyAccept,
+  type TeamStatus, type CustodyBootstrapStatus, type CustodyResult, type HandoverStatus,
 } from "../../../entities/team";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { TeamDevices, type TeamAccount } from "./TeamDevices";
@@ -73,6 +73,9 @@ export function TeamCard() {
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
   const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
   const [exportDue, setExportDue] = useState<"rotation" | "renewal" | null>(null);
+  // v2.10 hand-over: the device this root custodian appointed, and the hand-over this device accepted.
+  const [handedOverTo, setHandedOverTo] = useState("");
+  const [handover, setHandover] = useState<HandoverStatus | null>(null);
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -82,7 +85,11 @@ export function TeamCard() {
       .catch(() => { setBoot(null); setBootUnreadable(true); });
   // A finished fleet key rotation asks for the recovery bundle again.
   const loadExportDue = () =>
-    teamFleetCustodyStatus().then((f) => setExportDue(f.export_due ? f.export_reason : null)).catch(() => {});
+    teamFleetCustodyStatus().then((f) => {
+      setExportDue(f.export_due ? f.export_reason : null);
+      setHandedOverTo(f.handed_over_to);
+      setHandover(f.handover);
+    }).catch(() => {});
 
   const refresh = () => {
     teamStatus().then((s) => {
@@ -280,6 +287,19 @@ export function TeamCard() {
     toast.ok(t(outcome === "renewed" ? "team.renewal.done" : "team.renewal.notDue"));
   });
 
+  const acceptCustody = () => run("accept", async () => {
+    const typed = password;
+    setPassword("");
+    try {
+      await teamCustodyAccept(username.trim(), typed);
+      toast.ok(t("team.handover.accepted"));
+    } finally {
+      // Whatever step it reached is saved: once the root state is written this device is the root custodian.
+      refresh();
+      void shareStatus();
+    }
+  });
+
   const collect = () => run("collect", async () => {
     const typed = password;
     setPassword("");
@@ -293,6 +313,9 @@ export function TeamCard() {
   // Only this device's root state makes it the root custodian. Another device's, kept by a connection change,
   // offers no setup: the backend refuses to start or resume over it.
   const setupOpen = !!boot && (boot.this_device ? !boot.activated : !boot.started);
+  const custodian = !!boot?.this_device && boot.activated;
+  // Accept is offered to a member, and resumed until it collected its own grant (4.H step 2).
+  const acceptUnfinished = !!handover && handover.phase !== "granted" && handover.phase !== "done";
   // Root custody renewal (v2.10 4.R): renewing is due from half the records' life,
   // and the warning shows from 75%, halfway from the renewal point to the end.
   const now = Date.now();
@@ -658,6 +681,7 @@ export function TeamCard() {
                     <TeamDevices
                       account={account} busy={busy} run={run} anchor={boot.anchor} selfId={st.device_id}
                       hasFleetKey={st.has_fleet_key} fleetKeyBlocked={st.fleet_key_blocked}
+                      handedOverTo={handedOverTo} handover={handover}
                       onFleetKey={() => { teamStatus().then(setSt).catch(() => {}); void loadExportDue(); }}
                     />
                   ) : st.has_fleet_key ? (
@@ -676,7 +700,24 @@ export function TeamCard() {
                       onEnrolledAgain={(next) => { setSt(next); void shareStatus(); }}
                     />
                   ))}
-                  {st.can_sync && boot?.this_device && boot.activated && renewalDue !== null && custodyEnds !== null && (
+                  {st.can_sync && boot && (!custodian || acceptUnfinished) && (
+                    <div data-testid="team-handover-accept" className="flex flex-col gap-1.5 border-t border-stroke-soft-200 pt-2">
+                      <span className="text-label-xs text-text-strong-950">{t("team.handover.acceptTitle")}</span>
+                      <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.handover.acceptHelp")}</p>
+                      <div>
+                        <Button
+                          size="small" mode="stroke"
+                          disabled={!!busy || !username.trim() || !password}
+                          onClick={acceptCustody}
+                        >
+                          {busy === "accept"
+                            ? t("team.handover.accepting")
+                            : t(handover ? "team.handover.acceptResume" : "team.handover.accept")}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  {st.can_sync && custodian && !handedOverTo && renewalDue !== null && custodyEnds !== null && (
                     <div data-testid="team-renewal" className="flex flex-col gap-1.5 border-t border-stroke-soft-200 pt-2">
                       <span className="text-label-xs text-text-strong-950">{t("team.renewal.title")}</span>
                       {renewalWarning ? (
@@ -709,7 +750,7 @@ export function TeamCard() {
                       )}
                     </div>
                   )}
-                  {st.can_sync && boot?.this_device && boot.activated && (
+                  {st.can_sync && custodian && !handedOverTo && (
                     <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
                       {exportDue && (
                         <p data-testid="team-export-due" className="m-0 text-paragraph-xs text-state-error-base">

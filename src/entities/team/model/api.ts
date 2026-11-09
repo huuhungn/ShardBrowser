@@ -126,17 +126,37 @@ export const teamProfilesUnderOlderKey = () =>
 export const teamDevices = (username: string, password: string) =>
   invoke<TeamDevice[]>("team_devices", { username, password });
 
-/** Approve the pending device once the user confirmed it shows `sas`. */
-export const teamApproveDevice = (username: string, password: string, deviceId: string, sas: string) =>
-  invoke<void>("team_approve_device", { username, password, deviceId, sas });
+/**
+ * Approve the pending device once the user confirmed it shows `sas`; with
+ * `asCustodian`, as the new root custodian this device hands its custody to.
+ */
+export const teamApproveDevice = (
+  username: string,
+  password: string,
+  deviceId: string,
+  sas: string,
+  asCustodian = false,
+) => invoke<void>("team_approve_device", { username, password, deviceId, sas, asCustodian });
 
-/** Revoke the tenant's device as retired, lost or (a member only) compromised. */
+/**
+ * Revoke the tenant's device as retired, lost or (a member only) compromised.
+ * Revoking the old root custodian as lost needs `acceptReverts`: exactly the
+ * profiles it pushed after the re-seal, reverted right after the revoke.
+ */
 export const teamRevokeDevice = (
   username: string,
   password: string,
   deviceId: string,
   reason: TeamRevokeReason,
-) => invoke<void>("team_revoke_device", { username, password, deviceId, reason });
+  acceptReverts?: string[],
+) => invoke<void>("team_revoke_device", { username, password, deviceId, reason, acceptReverts: acceptReverts ?? null });
+
+/**
+ * Accept the root custody the root custodian appointed this device to, or
+ * resume Accept. The password is used for one login and never stored.
+ */
+export const teamCustodyAccept = (username: string, password: string) =>
+  invoke<FleetCustodyStatus>("team_custody_accept", { username, password });
 
 /** This device's join code, while its join window is open. */
 export const teamJoinCode = (username: string, password: string) =>

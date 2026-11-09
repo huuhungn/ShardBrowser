@@ -485,7 +485,11 @@ test("a refused action shows the localized error and keeps the row", async ({ pa
   await expect(beta.getByRole("button")).toHaveText(["Publish"]);
 });
 
-type TeamHead = { version: number; label: string | null; holder: string | null; revoked: boolean };
+type TeamHead = {
+  version: number; label: string | null; holder: string | null; revoked: boolean;
+  /** The old root custodian pushed it after the hand-over's re-seal. */
+  oldRootPush?: boolean;
+};
 type TeamDeviceRow = {
   device_id: string; label: string; status: "pending" | "active" | "revoked"; granted: boolean;
   /** The fleet generation its grant is for. */
@@ -509,8 +513,11 @@ type TeamDeviceRow = {
  * key once A created it, and revoking one refuses its sessions from then on.
  * A rotation grants the next generation to every active device but A's
  * refused ones; a push sealed under an older generation is refused.
+ *
+ * The v2.10 hand-over: A appoints a pending device only while every head is
+ * under the newest generation, and only the device `appointed` names accepts.
  */
-function fakeTeamServer(more: TeamDeviceRow[] = []) {
+function fakeTeamServer(more: TeamDeviceRow[] = [], appointed: string | null = null) {
   const heads = new Map<string, TeamHead>();
   const devices: TeamDeviceRow[] = [
     { device_id: "aa".repeat(16), label: "Machine A", status: "active", granted: false, custodian: true }, ...more,
@@ -546,7 +553,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   };
   type Args = {
     label?: string | null; remote_profile_id?: string; pin?: number | null; device_id?: string; target?: string;
-    generation?: number; skip?: string | null;
+    generation?: number; skip?: string | null; custodian?: boolean;
   };
   const ops: Record<string, (device: string, args: Args) => unknown> = {
     enroll: (_device, { label }) => {
@@ -567,12 +574,33 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       fleetKey = true;
       return null;
     },
-    approve: (_device, { device_id, target }) => {
+    approve: (_device, { device_id, target, custodian }) => {
       live(device_id);
       const d = row(target);
       if (d?.status !== "pending") throw new Error("[[shardx:fleet.deviceNotPending]]");
-      Object.assign(d, { status: "active", granted: fleetKey, generation });
+      if (custodian && [...heads.entries()].some(([id, h]) => h.version > 0 && (sealed.get(id) ?? 0) < generation)) {
+        throw new Error("[[shardx:fleet.handoverNeedsReseal]]");
+      }
+      Object.assign(d, { status: "active", granted: fleetKey, generation, custodian: !!custodian || d.custodian });
+      if (custodian) appointed = String(target);
       return null;
+    },
+    // The root grant A filed for the device it appointed, from A's key.
+    accept: (_device, { device_id }) => {
+      live(device_id);
+      if (appointed !== device_id) throw new Error("[[shardx:fleet.handoverNoGrant]]");
+      return { outgoing: "aa".repeat(32), generation };
+    },
+    generation: () => generation,
+    // The heads that block revoking the old root: one under an older generation, or one it pushed after the re-seal.
+    blockers: () => [...heads.entries()]
+      .filter(([id, h]) => h.version > 0 && ((sealed.get(id) ?? 0) < generation || h.oldRootPush))
+      .map(([id, h]) => ({ profile: id, after_reseal: (sealed.get(id) ?? 0) >= generation && !!h.oldRootPush })),
+    // The new custodian's revert of a head the old root pushed after the re-seal.
+    undo: (_device, { remote_profile_id }) => {
+      const h = head(String(remote_profile_id));
+      Object.assign(h, { version: h.version + 1, oldRootPush: false });
+      return h.version;
     },
     revoke: (_device, { device_id, target }) => {
       live(device_id);
@@ -586,7 +614,9 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       failing = null;
       let [filed, refused, skipped] = [0, 0, 0];
       for (const d of devices) {
-        if (d.status === "revoked" || (d.status === "active" && d.device_id === skip)) {
+        // The new root custodian's rotation skips the outgoing one, A.
+        const outgoing = device_id === appointed && d.device_id === "aa".repeat(16);
+        if (d.status === "revoked" || (d.status === "active" && (d.device_id === skip || outgoing))) {
           skipped += 1;
           continue;
         }
@@ -651,6 +681,8 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   return {
     heads,
     devices,
+    /** A appoints `id`, as its Approve as root custodian files. */
+    appoint: (id: string) => { appointed = id; },
     call: (op: string, device: string, args: Args) => ops[op](device, args),
     /** A device whose key is later proven revoked checks in a new head. */
     revokedCheckIn: (id: string) => Object.assign(head(id), { version: head(id).version + 1, revoked: true }),
@@ -750,7 +782,7 @@ async function admitB(a: Page, b: Page) {
   });
 
   await test.step("Approve stays disabled until the codes are confirmed to match", async () => {
-    const approve = row.getByRole("button", { name: "Approve" });
+    const approve = row.getByRole("button", { name: "Approve", exact: true });
     await cardSignIn(a);
     await expect(approve).toBeDisabled();
     await row.getByLabel("The code on the other device matches").check();
@@ -910,7 +942,7 @@ test("an unfinished rotation shows Resume and its deadline, and refuses Approve 
   const row = await listDevices(a, "Machine C");
   await cardSignIn(a);
   await row.getByLabel("The code on the other device matches").check();
-  await row.getByRole("button", { name: "Approve" }).click();
+  await row.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(a.getByText("A fleet key rotation is unfinished. Finish it before approving a device.")).toBeVisible();
   expect(server.devices.find((d) => d.label === "Machine C")?.status).toBe("pending");
 
@@ -918,7 +950,7 @@ test("an unfinished rotation shows Resume and its deadline, and refuses Approve 
   await expect(card.getByTestId("team-rotation-status")).toContainText("Fleet key rotated to generation 1.");
   await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeVisible();
   await cardSignIn(a);
-  await row.getByRole("button", { name: "Approve" }).click();
+  await row.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(row).toContainText("Active");
 });
 
@@ -932,7 +964,7 @@ test("an expired rotation shows the stuck notice, keeps Rotate on to try again, 
   const row = await listDevices(a, "Machine C");
   await cardSignIn(a);
   await row.getByLabel("The code on the other device matches").check();
-  await row.getByRole("button", { name: "Approve" }).click();
+  await row.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(row).toContainText("Active");
 });
 
@@ -1104,6 +1136,265 @@ test("a root custodian not yet due to renew sees its custody dates and no renew 
   await expect(renewal.getByTestId("team-renewal-warning")).toHaveCount(0);
   await expect(renewal.getByTestId("team-renewal-key-age")).toContainText("counts as the root custodian's until");
   await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
+});
+
+// The v2.10 root custody hand-over (plan 4.H): A, the root custodian, appoints B;
+// B accepts and works through the checklist, then revokes A, which stays inert.
+const B_ID = "b1".repeat(16);
+const pendingB: TeamDeviceRow = { device_id: B_ID, label: "Machine B", status: "pending", granted: false };
+const activeB: TeamDeviceRow = { device_id: B_ID, label: "Machine B", status: "active", granted: true, generation: 0 };
+
+/** The hand-over checklist's step states on `page`, in order. */
+const handoverSteps = (page: Page) =>
+  page.getByTestId("team-handover-step").evaluateAll((els) => els.map((e) => e.getAttribute("data-state")));
+
+/** Appoints the pending "Machine B" on A through the code tick and the confirm dialog. */
+async function appointB(a: Page) {
+  const row = await listDevices(a, "Machine B");
+  await cardSignIn(a);
+  await row.getByLabel("The code on the other device matches").check();
+  await row.getByRole("button", { name: "Approve as root custodian" }).click();
+  await a.getByRole("dialog").getByRole("button", { name: "Approve as root custodian" }).click();
+  return row;
+}
+
+/** Opens B, the device A appointed, and accepts root custody on it. */
+async function acceptOnB(b: Page, server: ReturnType<typeof fakeTeamServer>) {
+  const card = await teamDevicePage(b, "b", server, false, "&teamHandover=appointed");
+  await cardClick(b, "Accept root custody");
+  await expect(b.getByText("Root custody accepted. Work through the hand-over checklist.")).toBeVisible();
+  await expect.poll(() => handoverSteps(b)).toEqual(["next", "waiting", "waiting", "waiting", "waiting"]);
+  return card;
+}
+
+/** Exports the recovery bundle on the page's own root custodian. */
+async function exportBundle(page: Page) {
+  const out = page.getByTestId("team-export");
+  await cardSignIn(page);
+  await out.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse");
+  await out.getByLabel("Recovery passphrase again").fill("correct horse");
+  await out.getByLabel("I recorded this root key fingerprint").check();
+  await out.getByRole("button", { name: "Export recovery bundle" }).click();
+}
+
+/** B's checklist steps 0-3: export, rotate, re-seal, export again, each enabled once the one before is done. */
+async function finishChecklist(b: Page) {
+  const card = b.getByTestId("team-card");
+  await cardSignIn(b);
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeDisabled();
+  await expect(card.getByRole("button", { name: "Re-seal all profiles" })).toBeDisabled();
+  await exportBundle(b);
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "next", "waiting", "waiting", "waiting"]);
+  await rotateOn(b);
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "done", "next", "waiting", "waiting"]);
+  await cardClick(b, "Re-seal all profiles");
+  await b.getByRole("dialog").getByRole("button", { name: "Re-seal all profiles" }).click();
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "done", "done", "next", "waiting"]);
+  await exportBundle(b);
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "done", "done", "done", "next"]);
+}
+
+/** Starts revoking the old root "Machine A" on B as `reason`, through the confirm that states the member rule. */
+async function revokeOldRoot(b: Page, reason: "Retired" | "Lost") {
+  const row = await listDevices(b, "Machine A");
+  await expect(row).toContainText("Old root");
+  await cardSignIn(b);
+  await row.getByRole("combobox", { name: "Reason" }).click();
+  await expect(b.getByRole("option", { name: "Compromised" })).toHaveCount(0);
+  await b.getByRole("option", { name: reason }).click();
+  await row.getByRole("button", { name: "Revoke" }).click();
+  const dialog = b.getByRole("dialog");
+  await expect(dialog).toContainText(
+    "Every member must run 2.10 and have synced once since the hand-over began: a member still on 2.9.x distrusts peers it has not seen and must enroll again.",
+  );
+  await dialog.getByRole("button", { name: "Revoke" }).click();
+  return row;
+}
+
+test("team-handover-appoint: the root custodian approves a pending device as root custodian and hands over", async ({ page: a }) => {
+  const server = fakeTeamServer([pendingB]);
+  const card = await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  const row = await listDevices(a, "Machine B");
+  await cardSignIn(a);
+  await expect(row.getByRole("button", { name: "Approve as root custodian" })).toBeDisabled();
+  await row.getByLabel("The code on the other device matches").check();
+  await row.getByRole("button", { name: "Approve as root custodian" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("Machine B becomes the root custodian and this computer hands its root custody over.");
+  await expect(dialog).toContainText("can be cancelled only by revoking Machine B before it rotates the fleet key");
+  await dialog.getByRole("button", { name: "Approve as root custodian" }).click();
+  await expect(a.getByText("Machine B was approved as root custodian.")).toBeVisible();
+  await expect(row).toContainText("Active");
+  await expect(card.getByTestId("team-handed-over")).toContainText("Root custody was handed to device b1b1b1b1.");
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toHaveCount(0);
+  await expect(card.getByTestId("team-export")).toHaveCount(0);
+  await expect(card.getByTestId("team-renewal")).toHaveCount(0);
+  expect(server.devices.find((d) => d.device_id === B_ID)?.custodian).toBe(true);
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-needs-reseal: appointing is refused until every head is under the current fleet key", async ({ page: a }) => {
+  const server = fakeTeamServer([pendingB]);
+  const card = await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  server.heads.set("e1".repeat(16), { version: 1, label: "Shop", holder: null, revoked: false });
+  await rotateOn(a);
+  const row = await appointB(a);
+  await expect(a.getByText(
+    "Re-seal all profiles first: every profile head must be under the current fleet key before another device can take over root custody.",
+  )).toBeVisible();
+  await expect(row).toContainText("Pending");
+  await expect(card.getByTestId("team-handed-over")).toHaveCount(0);
+
+  await cardClick(a, "Re-seal all profiles");
+  await a.getByRole("dialog").getByRole("button", { name: "Re-seal all profiles" }).click();
+  await expect(a.getByText("Re-seal finished: 1 re-sealed, 0 already current, 0 skipped.")).toBeVisible();
+  await cardSignIn(a);
+  await row.getByRole("button", { name: "Approve as root custodian" }).click();
+  await a.getByRole("dialog").getByRole("button", { name: "Approve as root custodian" }).click();
+  await expect(card.getByTestId("team-handed-over")).toBeVisible();
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-accept: the appointed device accepts root custody and is shown the checklist", async ({ page: b }) => {
+  const server = fakeTeamServer([activeB]);
+  const card = await teamDevicePage(b, "b", server, false, "&teamHandover=appointed");
+  const accept = card.getByTestId("team-handover-accept");
+  await expect(accept).toContainText("Only when the root custodian approved this device as the new root custodian");
+  await expect(card.getByTestId("team-handover-checklist")).toHaveCount(0);
+  await cardClick(b, "Accept root custody");
+  await expect(b.getByText("No root custodian has appointed this device yet.")).toBeVisible();
+  await expect(card.getByTestId("team-handover-checklist")).toHaveCount(0);
+
+  server.appoint(B_ID);
+  await cardClick(b, "Accept root custody");
+  await expect(b.getByText("Root custody accepted. Work through the hand-over checklist.")).toBeVisible();
+  await expect(accept).toHaveCount(0);
+  await expect(card.getByTestId("team-handover-checklist")).toContainText("Root custody hand-over");
+  await expect.poll(() => handoverSteps(b)).toEqual(["next", "waiting", "waiting", "waiting", "waiting"]);
+  await expect(card.getByTestId("team-devices").getByText("Fleet key ready", { exact: true })).toBeVisible();
+  await expect(b.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-checklist: the new custodian's steps enable in order and its rotation skips the old root", async ({ page: b }) => {
+  const server = fakeTeamServer([activeB], B_ID);
+  await acceptOnB(b, server);
+  const old = await listDevices(b, "Machine A");
+  await cardSignIn(b);
+  await expect(old.getByRole("button", { name: "Revoke" })).toBeDisabled();
+  await finishChecklist(b);
+  expect(server.devices.find((d) => d.label === "Machine A")?.generation).not.toBe(1);
+  await cardSignIn(b);
+  await expect(old.getByRole("button", { name: "Revoke" })).toBeEnabled();
+  await expect(b.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-blocked: a head the old root pushed after the re-seal blocks a retired revoke", async ({ page: b }) => {
+  const server = fakeTeamServer([activeB], B_ID);
+  server.heads.set("e1".repeat(16), { version: 1, label: "Shop", holder: null, revoked: false });
+  const card = await acceptOnB(b, server);
+  await finishChecklist(b);
+  Object.assign(server.heads.get("e1".repeat(16)) ?? {}, { version: 3, oldRootPush: true });
+  const row = await revokeOldRoot(b, "Retired");
+  await expect(b.getByText(/The old root custodian cannot be revoked yet: finish the hand-over step "heads" first/)).toBeVisible();
+  await expect(card.getByTestId("team-handover-blockers")).toContainText("e1e1e1e1");
+  await expect(row).toContainText("Active");
+  expect(server.devices.find((d) => d.label === "Machine A")?.status).toBe("active");
+  await expect(b.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-lost-reverts: a lost old root is revoked once the will-be-reverted list is confirmed", async ({ page: b }) => {
+  const server = fakeTeamServer([activeB], B_ID);
+  server.heads.set("e1".repeat(16), { version: 1, label: "Shop", holder: null, revoked: false });
+  const card = await acceptOnB(b, server);
+  await finishChecklist(b);
+  Object.assign(server.heads.get("e1".repeat(16)) ?? {}, { version: 3, oldRootPush: true });
+  const row = await revokeOldRoot(b, "Lost");
+  const reverts = b.getByRole("dialog").filter({ hasText: "Revoke the old root and revert these profiles?" });
+  await expect(reverts).toContainText("They will be reverted right after the revoke: e1e1e1e1");
+  await reverts.getByRole("button", { name: "Revoke and revert" }).click();
+  await expect(row).toContainText("Revoked");
+  await expect(card.getByTestId("team-handover-revert")).toContainText("e1e1e1e1 Reverted (version 4)");
+  await expect(card.getByTestId("team-handover-done")).toBeVisible();
+  expect(server.heads.get("e1".repeat(16))?.version).toBe(4);
+  expect(server.devices.find((d) => d.label === "Machine A")?.status).toBe("revoked");
+  await expect(b.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-handover-cancel-too-late: the old root cannot cancel once the new custodian rotated", async ({
+  page: a, browser, baseURL, viewport,
+}) => {
+  const server = fakeTeamServer([{ ...activeB, custodian: true }], B_ID);
+  const b = await (await browser.newContext({ baseURL, viewport })).newPage();
+  await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
+  await acceptOnB(b, server);
+  await exportBundle(b);
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "next", "waiting", "waiting", "waiting"]);
+  await rotateOn(b);
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "done", "next", "waiting", "waiting"]);
+
+  const row = await listDevices(a, "Machine B");
+  await cardSignIn(a);
+  await row.getByRole("button", { name: "Revoke" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("Revoking the appointed device cancels the hand-over");
+  await dialog.getByRole("button", { name: "Revoke" }).click();
+  await expect(a.getByText("The new root custodian already rotated the fleet key, so the hand-over can no longer be cancelled.")).toBeVisible();
+  await expect(row).toContainText("Active");
+  await expect(a.getByTestId("team-handed-over")).toBeVisible();
+  expect(server.devices.find((d) => d.device_id === B_ID)?.status).toBe("active");
+  await b.context().close();
+});
+
+test("team-handover-done: the new custodian revokes the old root as retired and the hand-over ends", async ({ page: b }) => {
+  const server = fakeTeamServer([activeB], B_ID);
+  server.heads.set("e1".repeat(16), { version: 1, label: "Shop", holder: null, revoked: false });
+  const card = await acceptOnB(b, server);
+  await finishChecklist(b);
+  const row = await revokeOldRoot(b, "Retired");
+  await expect(row).toContainText("Revoked");
+  await expect(card.getByTestId("team-handover-done")).toContainText(
+    "Root custody hand-over finished: the old root device is revoked.",
+  );
+  await expect.poll(() => handoverSteps(b)).toEqual(["done", "done", "done", "done", "done"]);
+  await expect(card.getByTestId("team-handover-revert")).toHaveCount(0);
+  expect(server.devices.find((d) => d.label === "Machine A")?.status).toBe("revoked");
+  await expect(b.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("team-old-root-inert: a root custodian that handed over runs no custody action and can only cancel", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { ...activeB, custodian: true },
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 },
+    { device_id: "d1".repeat(16), label: "Machine D", status: "pending", granted: false },
+  ], B_ID);
+  const card = await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
+  const notice = card.getByTestId("team-handed-over");
+  await expect(notice).toContainText("Root custody was handed to device b1b1b1b1. This computer runs no custody actions any more.");
+  await expect(notice).toContainText("this computer can be switched off");
+  await expect(notice).toContainText("Reset of this computer comes in v2.11");
+  for (const name of ["Rotate fleet key", "Re-seal all profiles", "Create fleet key", "Export recovery bundle", "Renew custody"]) {
+    await expect(card.getByRole("button", { name })).toHaveCount(0);
+  }
+  await expect(card.getByTestId("team-handover-accept")).toHaveCount(0);
+
+  const pending = await listDevices(a, "Machine D");
+  await cardSignIn(a);
+  await pending.getByLabel("The code on the other device matches").check();
+  await expect(pending.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  await expect(pending.getByRole("button", { name: "Approve as root custodian" })).toHaveCount(0);
+  await expect(a.getByTestId("team-device").filter({ hasText: "Machine C" }).getByRole("button", { name: "Revoke" }))
+    .toHaveCount(0);
+
+  // Before the new custodian rotates, revoking it cancels the hand-over and custody comes back.
+  const appointee = a.getByTestId("team-device").filter({ hasText: "Machine B" });
+  await appointee.getByRole("button", { name: "Revoke" }).click();
+  await a.getByRole("dialog").getByRole("button", { name: "Revoke" }).click();
+  await expect(appointee).toContainText("Revoked");
+  await expect(notice).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeVisible();
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
 });
 
 // The two-machine gate (Plan:2388), each step a test.step below:
@@ -1295,7 +1586,7 @@ test("an approved device whose join code expired can enroll again", async ({ pag
   const old = await listDevices(a, "Machine B");
   await old.getByLabel("The code on the other device matches").check();
   await cardSignIn(a);
-  await old.getByRole("button", { name: "Approve" }).click();
+  await old.getByRole("button", { name: "Approve", exact: true }).click();
   await expect(old).toContainText("Active");
 
   await b.clock.fastForward("10:01");
@@ -1457,7 +1748,7 @@ test("the custodian cannot approve a row it first saw more than ten minutes ago"
   await teamEnroll(b, "Machine B");
 
   const row = await listDevices(a, "Machine B");
-  const approve = row.getByRole("button", { name: "Approve" });
+  const approve = row.getByRole("button", { name: "Approve", exact: true });
   await row.getByLabel("The code on the other device matches").check();
   await cardSignIn(a);
   await expect(approve).toBeEnabled();
