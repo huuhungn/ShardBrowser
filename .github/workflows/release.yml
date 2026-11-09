@@ -106,7 +106,11 @@ jobs:
               exit 1
             fi
           done
+          # RUSTSEC-2026-0459 (SQLite WAL page size): no build can take the
+          # fix while sqlx caps libsqlite3-sys below 0.38; see
+          # docs/dependency-review.md for the guard that covers it.
           cargo +stable audit --file src-tauri/Cargo.lock \
+            --ignore RUSTSEC-2026-0459 \
             --ignore RUSTSEC-2026-0194 \
             --ignore RUSTSEC-2026-0195 \
             --ignore RUSTSEC-2026-0367 \
@@ -115,13 +119,13 @@ jobs:
             --ignore RUSTSEC-2026-0429
           # shared builds into the launcher as shardx-core, and server is
           # published as a release asset, so both ship and both are audited.
-          cargo +stable audit --file shared/Cargo.lock
+          cargo +stable audit --file shared/Cargo.lock --ignore RUSTSEC-2026-0459
           # RUSTSEC-2023-0071 has no fixed release. rsa reaches the lockfile
           # only through sqlx's unused mysql feature: server enables just
           # sqlite, and a release build produces no rsa artifact. Drop this
           # ignore if the server ever enables a MySQL backend.
           cargo +stable audit --file server/Cargo.lock \
-            --ignore RUSTSEC-2023-0071
+            --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 
       - name: Verify Rust SDK MSRV gates
         env:

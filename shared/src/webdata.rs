@@ -68,6 +68,7 @@ pub fn read(db_path: &Path, crypt: &LocalCrypt) -> Result<Vec<PortableSecret>> {
     if !db_path.exists() {
         return Ok(Vec::new());
     }
+    crate::sqlite_wal::check_wal(db_path)?;
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", db_path.display()))?;
     let mut out = Vec::new();
@@ -114,6 +115,7 @@ pub fn reencrypt_in_place(
     if secrets.is_empty() || !db_path.exists() {
         return Ok(0);
     }
+    crate::sqlite_wal::check_wal(db_path)?;
     let conn = Connection::open(db_path).with_context(|| format!("open {}", db_path.display()))?;
     let tx = conn.unchecked_transaction()?;
     let mut updated = 0usize;

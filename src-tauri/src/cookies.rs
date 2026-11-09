@@ -297,6 +297,7 @@ pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
     }
     let crypt = Crypt::open(&udd)?;
     // Read-only to avoid WAL write-lock fights with a running browser.
+    shardx_core::sqlite_wal::check_wal(&path)?;
     let conn =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open {}", path.display()))?;
@@ -346,6 +347,7 @@ pub fn import(profile_id: &str, cookies: &[Cookie]) -> Result<usize> {
         std::fs::create_dir_all(parent).ok();
     }
     let crypt = Crypt::open(&udd)?;
+    shardx_core::sqlite_wal::check_wal(&path)?;
     let conn =
         rusqlite::Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
     ensure_schema(&conn)?;

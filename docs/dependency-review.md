@@ -31,6 +31,7 @@ The server, shared and launcher suites pass on the updated lockfiles.
 | RUSTSEC-2023-0071 | `rsa` 0.9.10 | server | Not built. It is an optional dependency of `sqlx-mysql`, which the server does not enable; `cargo tree -i rsa` is empty. No upstream fix exists. |
 | RUSTSEC-2026-0367, -0368, -0369, -0429 | `zip` 4.6.1 | launcher | Reached only through `tauri-plugin-updater` 2.11.0. Version 2.14.1 moves to `zip` 9 but needs Tauri 2.12 in both the crate and the npm packages, so that upgrade is a separate change. With `createUpdaterArtifacts: true` the updater installs a signed `.exe`/`.msi` on Windows, a `.tar.gz` on macOS and an AppImage on Linux, so it never extracts a zip; every artifact is minisign-verified before it is opened. The advisories are about Unix permission bits and symlinks during extraction, and (-0429) an abort in `ZipArchive::extract` on a symlink entry with a large declared size. The launcher's own archive code uses `zip` 9, which is not affected. |
 | RUSTSEC-2026-0194, -0195 | `quick-xml` 0.39.4 | launcher | Build time only, on Linux: `wayland-scanner` is a proc-macro that parses the Wayland protocol XML shipped with the crate. No runtime input reaches it. |
+| RUSTSEC-2026-0459 | `libsqlite3-sys` 0.30.1 (bundled SQLite 3.46) | shared, server, launcher | No build can take the fix yet: `libsqlite3-sys` 0.39 (SQLite 3.54) is the first patched release, and `sqlx` up to 0.9.0 requires `libsqlite3-sys` below 0.38; one binary links one SQLite, and the launcher's test-only `sqlx` shares the lockfile. The flaw needs a database opened with a `-wal` whose page size differs from the database's. The server opens only its own database. The launcher opens profile databases that can arrive in another device's snapshot (the `-wal` travels), and automation databases from an imported project, so `shardx_core::sqlite_wal::check_wal` refuses such a pair before SQLite opens it, at every profile database reader and writer and at `db::open`. Retire this when `sqlx` allows `libsqlite3-sys` 0.39, or by moving the launcher tests off `sqlx` and the launcher and shared to `rusqlite` 0.41. |
 | RUSTSEC-2024-0429 | `glib` 0.18.5 | launcher | Unsound `VariantStrIter`, in the GTK stack Tauri uses on Linux. The launcher never calls it; the fix needs gtk-rs 0.20, which needs a Tauri release that moves off GTK 0.18. |
 
 ### Reachability and feature graph of each accepted advisory
@@ -43,6 +44,7 @@ Re-checked on 2026-10-29 with `cargo tree --locked --target all -i <crate>`
 | RUSTSEC-2023-0071 | `rsa` 0.9.10 | none: `cargo tree -i rsa` and `-i sqlx-mysql` print nothing; both `sqlx` entries in `server/Cargo.toml` set `default-features = false` with only `runtime-tokio`, `sqlite` (+ `macros`, `migrate`) | No. The crate is in the lockfile only as an optional dependency and is never compiled. |
 | RUSTSEC-2026-0367, -0368, -0369, -0429 | `zip` 4.6.1, no features | `zip` <- `tauri-plugin-updater` 2.11.0 <- `shardx-launcher` | No. The launcher's update artifacts are `.exe`/`.msi`, `.tar.gz` and AppImage, so the updater never extracts a zip, and each artifact is minisign-verified before it is opened. |
 | RUSTSEC-2026-0194, -0195 | `quick-xml` 0.39.4 `[default]` | `quick-xml` <- `wayland-scanner` (proc-macro) <- `wayland-client` <- ... <- `wl-clipboard-rs` <- `arboard` <- `tauri-plugin-clipboard-manager` | No. It runs inside a proc-macro at build time, on Linux only, over XML shipped with the crate. |
+| RUSTSEC-2026-0459 | `libsqlite3-sys` 0.30.1 `[bundled]` | `libsqlite3-sys` <- `rusqlite` 0.32 <- `shardx-core`, `shardx-launcher`; <- `sqlx-sqlite` 0.8 <- `sqlx` <- `shardx-team-server` (and the launcher's dev-dependencies) | Only through a database paired with a `-wal` of another page size, which `check_wal` refuses (added 2026-11-09, tests in `shared/src/sqlite_wal.rs`). |
 | RUSTSEC-2024-0429 | `glib` 0.18.5 `[default, gio, gio_ffi, v2_58 .. v2_70]` | `glib` <- `atk` <- `gtk` <- `libappindicator` <- `tray-icon` <- `tauri` (and the autostart, clipboard and dialog plugins) | Linked on Linux only. The unsound `VariantStrIter` is never called by launcher code. |
 
 ### Feature graph of the custody crates
@@ -111,7 +113,7 @@ raises it fails the `custody-msrv` job until the manifest follows.
 ## Re-running
 
 ```bash
-cargo audit --deny unsound --deny yanked --file server/Cargo.lock --ignore RUSTSEC-2023-0071
+cargo audit --deny unsound --deny yanked --file server/Cargo.lock --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0459
 cargo tree -i <crate> --locked --target all   # who pulls a flagged crate in
 ```
 
