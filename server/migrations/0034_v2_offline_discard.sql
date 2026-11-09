@@ -15,7 +15,7 @@ CREATE TABLE v2_offline_discard (
 
 -- What a discard removed, each row as JSON (blobs as hex), kept forever.
 CREATE TABLE v2_discarded_records (
-    id           INTEGER PRIMARY KEY,
+    id           INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 9223372036854775807),
     tenant_id    BLOB    NOT NULL CHECK (length(tenant_id) = 16),
     kind         TEXT    NOT NULL CHECK (kind IN ('fleet', 'root')),
     generation   INTEGER NOT NULL CHECK (generation BETWEEN 0 AND 9223372036854775807),
@@ -23,6 +23,37 @@ CREATE TABLE v2_discarded_records (
     row_json     TEXT    NOT NULL,
     discarded_at TEXT    NOT NULL
 );
+
+-- 0030's rule for every v2 integer column: it holds only integers.
+CREATE TRIGGER v2_offline_discard_integers_on_insert
+BEFORE INSERT ON v2_offline_discard
+WHEN typeof(NEW.generation) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
+
+CREATE TRIGGER v2_offline_discard_integers_on_update
+BEFORE UPDATE OF generation ON v2_offline_discard
+WHEN typeof(NEW.generation) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
+
+CREATE TRIGGER v2_discarded_records_integers_on_insert
+BEFORE INSERT ON v2_discarded_records
+WHEN typeof(NEW.id) NOT IN ('integer', 'null')
+   OR typeof(NEW.generation) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
+
+CREATE TRIGGER v2_discarded_records_integers_on_update
+BEFORE UPDATE OF id, generation ON v2_discarded_records
+WHEN typeof(NEW.id) NOT IN ('integer', 'null')
+   OR typeof(NEW.generation) NOT IN ('integer', 'null')
+BEGIN
+    SELECT RAISE(ABORT, 'an integer column holds only integers');
+END;
 
 CREATE TRIGGER v2_discarded_records_no_delete
 BEFORE DELETE ON v2_discarded_records

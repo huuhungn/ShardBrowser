@@ -578,8 +578,9 @@ async fn every_integer_column_of_every_v2_table_refuses_a_value_that_is_no_integ
         }
     }
     assert!(unguarded.is_empty(), "{unguarded:?}");
-    // 0031 adds `v2_idempotency.superseded_by_restore_epoch`.
-    assert_eq!(guarded, 181);
+    // 0031 adds `v2_idempotency.superseded_by_restore_epoch`; 0034 adds
+    // `v2_offline_discard.generation`, `v2_discarded_records.{id, generation}`.
+    assert_eq!(guarded, 184);
 }
 
 #[test]
