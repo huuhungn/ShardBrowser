@@ -35,6 +35,9 @@ pub const CLOCK_TOLERANCE_MS: u64 = 300_000;
 /// A client stops at this many pages: enough for the container cap at the
 /// smallest pages the byte limit forces, and a bound on empty pages.
 pub const MAX_EVIDENCE_PAGES: usize = 4096;
+/// ADR 0002 Q-62: a client merges at most this many listings (64 named
+/// signers each, so 1024 signers).
+pub const MAX_EVIDENCE_LISTINGS: usize = 16;
 
 type KeyId = [u8; 32];
 
@@ -124,57 +127,80 @@ impl Evidence {
         binding: &Binding,
         pages: &[TenantTrustEvidencePageV2],
     ) -> Result<Self, TrustError> {
-        if pages.len() > MAX_EVIDENCE_PAGES {
+        Self::collect_listings(binding, &[pages])
+    }
+
+    /// ADR 0002 Q-62: [`Self::collect`] over several listings, each checked
+    /// on its own as one complete, ordered listing, merged: a container
+    /// counts once by its hash, and a revocation in any listing counts from
+    /// its earliest time. At most [`MAX_EVIDENCE_LISTINGS`], and twice
+    /// `MAX_EVIDENCE_CONTAINERS` across them.
+    pub fn collect_listings<L: AsRef<[TenantTrustEvidencePageV2]>>(
+        binding: &Binding,
+        listings: &[L],
+    ) -> Result<Self, TrustError> {
+        if listings.len() > MAX_EVIDENCE_LISTINGS {
             return Err(TrustError::TooMuchEvidence);
         }
-        let Some(last) = pages.last() else {
+        if listings.is_empty() {
             return Err(TrustError::BadPages("no page"));
-        };
-        if !last.next_cursor.is_empty() {
-            return Err(TrustError::BadPages("the last page names a next one"));
         }
         let mut keys = BTreeMap::new();
         let mut revoked = BTreeMap::new();
         let mut out = Evidence::default();
-        let mut total = 0usize;
-        for (i, page) in pages.iter().enumerate() {
-            if usize::try_from(page.page_index).ok() != Some(i) {
-                return Err(TrustError::BadPages("pages out of order"));
-            }
-            if i + 1 < pages.len() && page.next_cursor.is_empty() {
-                return Err(TrustError::BadPages(
-                    "a page before the last ends the listing",
-                ));
-            }
-            if page.tenant_id != binding.tenant_id
-                || page.server_instance_id != binding.server_instance_id
-            {
-                return Err(TrustError::BadPages(
-                    "a page names another tenant or server",
-                ));
-            }
-            total += page.containers.len();
-            if total > MAX_EVIDENCE_CONTAINERS {
+        let mut all = 0usize;
+        for pages in listings.iter().map(AsRef::as_ref) {
+            if pages.len() > MAX_EVIDENCE_PAGES {
                 return Err(TrustError::TooMuchEvidence);
             }
-            // A key is used only for the ID it hashes to.
-            for pk in &page.signing_public_keys {
-                keys.insert(signing_key_id(pk), *pk);
+            let Some(last) = pages.last() else {
+                return Err(TrustError::BadPages("no page"));
+            };
+            if !last.next_cursor.is_empty() {
+                return Err(TrustError::BadPages("the last page names a next one"));
             }
-            for r in &page.revocations {
-                let at = revoked
-                    .entry((r.payload_domain.clone(), r.replay_id))
-                    .or_insert(u64::MAX);
-                *at = (*at).min(r.revoked_at_ms);
-            }
-            for d in &page.device_revocations {
-                let at = out.revoked_devices.entry(d.device_id).or_insert(u64::MAX);
-                *at = (*at).min(d.revoked_at_ms);
+            let mut total = 0usize;
+            for (i, page) in pages.iter().enumerate() {
+                if usize::try_from(page.page_index).ok() != Some(i) {
+                    return Err(TrustError::BadPages("pages out of order"));
+                }
+                if i + 1 < pages.len() && page.next_cursor.is_empty() {
+                    return Err(TrustError::BadPages(
+                        "a page before the last ends the listing",
+                    ));
+                }
+                if page.tenant_id != binding.tenant_id
+                    || page.server_instance_id != binding.server_instance_id
+                {
+                    return Err(TrustError::BadPages(
+                        "a page names another tenant or server",
+                    ));
+                }
+                total += page.containers.len();
+                all += page.containers.len();
+                if total > MAX_EVIDENCE_CONTAINERS || all > 2 * MAX_EVIDENCE_CONTAINERS {
+                    return Err(TrustError::TooMuchEvidence);
+                }
+                // A key is used only for the ID it hashes to.
+                for pk in &page.signing_public_keys {
+                    keys.insert(signing_key_id(pk), *pk);
+                }
+                for r in &page.revocations {
+                    let at = revoked
+                        .entry((r.payload_domain.clone(), r.replay_id))
+                        .or_insert(u64::MAX);
+                    *at = (*at).min(r.revoked_at_ms);
+                }
+                for d in &page.device_revocations {
+                    let at = out.revoked_devices.entry(d.device_id).or_insert(u64::MAX);
+                    *at = (*at).min(d.revoked_at_ms);
+                }
             }
         }
 
         let mut seen = BTreeSet::new();
-        for container in pages.iter().flat_map(|p| &p.containers) {
+        let pages = listings.iter().flat_map(AsRef::as_ref);
+        for container in pages.flat_map(|p| &p.containers) {
             let Ok(record) = AuthorizationRecord::parse(container) else {
                 continue;
             };
@@ -1685,6 +1711,137 @@ mod tests {
         assert!(
             Evidence::collect(&BINDING, &[twice, last]).is_err(),
             "an index repeats"
+        );
+    }
+
+    /// ADR 0002 Q-62: the tenant split over two listings: A0's records in
+    /// the first, B's root grant in the second.
+    fn split(a0: &Device, b: &Device) -> [TenantTrustEvidencePageV2; 2] {
+        let mut first = tenant(a0, b);
+        let second = first.split_off(4);
+        [page(&[a0, b], first), page(&[a0, b], second)]
+    }
+
+    #[test]
+    fn two_complete_listings_merge_into_one_evidence() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let [first, second] = split(&a0, &b);
+        let listings = [vec![first.clone()], vec![second.clone()]];
+        let ev = Evidence::collect_listings(&BINDING, &listings).unwrap();
+        let c = TrustChain::evaluate(ev, Some(&a0.key())).unwrap();
+        assert!(c.custodian_at(&b.key(), T0 + 50 * DAY));
+        let alone = Evidence::collect(&BINDING, &[first]).unwrap();
+        let c = TrustChain::evaluate(alone, None).unwrap();
+        assert!(
+            !c.custodian_at(&b.key(), T0 + 50 * DAY),
+            "B's grant is in the second"
+        );
+        let alone = Evidence::collect(&BINDING, &[second]).unwrap();
+        assert_eq!(
+            TrustChain::evaluate(alone, None).unwrap_err(),
+            TrustError::NoAnchor
+        );
+    }
+
+    #[test]
+    fn a_listing_whose_last_page_names_a_next_one_is_refused_among_several() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let [first, mut second] = split(&a0, &b);
+        second.next_cursor = vec![1];
+        let listings = [vec![first], vec![second]];
+        assert_eq!(
+            Evidence::collect_listings(&BINDING, &listings).unwrap_err(),
+            TrustError::BadPages("the last page names a next one")
+        );
+        let none: [Vec<TenantTrustEvidencePageV2>; 2] = [listings[0].clone(), Vec::new()];
+        assert!(
+            Evidence::collect_listings(&BINDING, &none).is_err(),
+            "an empty listing"
+        );
+        let nothing: [Vec<TenantTrustEvidencePageV2>; 0] = [];
+        assert!(Evidence::collect_listings(&BINDING, &nothing).is_err());
+    }
+
+    #[test]
+    fn a_listing_of_another_tenant_is_refused_among_several() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let [first, mut second] = split(&a0, &b);
+        second.tenant_id = [8; 16];
+        assert_eq!(
+            Evidence::collect_listings(&BINDING, &[vec![first], vec![second]]).unwrap_err(),
+            TrustError::BadPages("a page names another tenant or server")
+        );
+    }
+
+    #[test]
+    fn merged_listings_deduplicate_shared_containers() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let p = page(&[&a0, &b], tenant(&a0, &b));
+        let one = Evidence::collect(&BINDING, std::slice::from_ref(&p)).unwrap();
+        let two = Evidence::collect_listings(&BINDING, &[vec![p.clone()], vec![p]]).unwrap();
+        assert_eq!(
+            (two.roots.len(), two.approvals.len(), two.grants.len()),
+            (one.roots.len(), one.approvals.len(), one.grants.len())
+        );
+        assert_eq!((one.roots.len(), one.approvals.len()), (2, 2));
+    }
+
+    #[test]
+    fn a_revocation_in_any_listing_counts_from_its_earliest_time() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let [mut first, mut second] = split(&a0, &b);
+        first.device_revocations.push(RevokedDevice {
+            device_id: b.id,
+            revoked_at_ms: T0 + 20 * DAY,
+        });
+        second.device_revocations.push(RevokedDevice {
+            device_id: b.id,
+            revoked_at_ms: T0 + 10 * DAY,
+        });
+        let ev = Evidence::collect_listings(&BINDING, &[vec![first.clone()], vec![second]]);
+        let c = TrustChain::evaluate(ev.unwrap(), None).unwrap();
+        assert!(c.custodian_at(&b.key(), T0 + 10 * DAY - 1));
+        assert!(
+            !c.custodian_at(&b.key(), T0 + 10 * DAY),
+            "the earliest report"
+        );
+
+        // A record revocation only one listing reports counts too.
+        let [_, plain] = split(&a0, &b);
+        first.device_revocations.clear();
+        first.revocations.push(RevokedRecord {
+            payload_domain: DOMAIN_TENANT_ROOT_KEY_GRANT.into(),
+            replay_id: [21; 16],
+            revoked_at_ms: T0 + 5 * DAY,
+        });
+        let ev = Evidence::collect_listings(&BINDING, &[vec![plain], vec![first]]);
+        let c = TrustChain::evaluate(ev.unwrap(), None).unwrap();
+        assert!(!c.custodian_at(&b.key(), T0 + 5 * DAY));
+    }
+
+    #[test]
+    fn more_than_16_listings_are_too_much_evidence() {
+        let (a0, b) = (Device::new(1), Device::new(2));
+        let p = page(&[&a0, &b], tenant(&a0, &b));
+        let listings = vec![vec![p.clone()]; MAX_EVIDENCE_LISTINGS];
+        assert!(Evidence::collect_listings(&BINDING, &listings).is_ok());
+        let listings = vec![vec![p]; MAX_EVIDENCE_LISTINGS + 1];
+        assert_eq!(
+            Evidence::collect_listings(&BINDING, &listings).unwrap_err(),
+            TrustError::TooMuchEvidence
+        );
+        // Critic round 1: twice the one-listing container cap across them.
+        let full = page(&[], vec![vec![0]; MAX_EVIDENCE_CONTAINERS]);
+        let listings = [vec![full.clone()], vec![full.clone()]];
+        assert!(Evidence::collect_listings(&BINDING, &listings).is_ok());
+        let listings = [
+            vec![full.clone()],
+            vec![full],
+            vec![page(&[], vec![vec![0]])],
+        ];
+        assert_eq!(
+            Evidence::collect_listings(&BINDING, &listings).unwrap_err(),
+            TrustError::TooMuchEvidence
         );
     }
 
