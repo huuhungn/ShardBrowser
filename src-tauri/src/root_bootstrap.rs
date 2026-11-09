@@ -168,6 +168,11 @@ pub struct Renewal {
     pub device_ack_request: String,
     #[serde(default)]
     pub generation: u64,
+    /// The next step to send, saved once the one before it is answered: the
+    /// capability grants one by one, then the approval, the root grant, its
+    /// ack, the device grant, its ack and the collect.
+    #[serde(default)]
+    pub step: u8,
     /// Every step was answered and the new records are the current ones.
     #[serde(default)]
     pub done: bool,
@@ -1561,16 +1566,48 @@ fn saved(saved: &str) -> Result<(IdempotentMutationRequestV2, Vec<u8>)> {
     Ok((request, bytes))
 }
 
-/// Sends `run`'s saved records in order, each checked against the reply that
-/// answers it, then `collect`s this device's new grant of `run.generation`.
-/// A rotation since `run` was built granted this device the newer ACTIVE
-/// generation, so the device grant of the retired one is left out.
+/// `run`'s own records are past half their life at `t`: the next renewal is
+/// due, and a grant not yet sent has ended or soon will.
+fn run_stale(run: &Renewal, own: &[u8; 32], t: u64) -> bool {
+    let windows: Vec<_> = run
+        .capability_grants
+        .iter()
+        .chain([&run.approval, &run.root_grant])
+        .filter_map(|h| decode_hex(h))
+        .filter_map(|c| window_of(&c, own))
+        .collect();
+    due(&windows, t)
+}
+
+/// Saves that the saved run's `step` is the next one to send.
+fn answered(
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+    step: usize,
+) -> Result<()> {
+    let step = u8::try_from(step).map_err(|_| corrupt())?;
+    commit(state, save, |s| {
+        if let Some(r) = s.renewal.as_mut() {
+            r.step = step;
+        }
+    })
+}
+
+/// Sends the saved run's records in order from its saved `step`, each
+/// checked against the reply that answers it and saved as answered before
+/// the next is sent, then `collect`s this device's new grant of
+/// `run.generation`. A rotation since the run was built granted this device
+/// the newer ACTIVE generation, so the device grant of the retired one is
+/// left out; so is one of a `stale` run, whose root grant was acked.
+#[allow(clippy::too_many_arguments)]
 async fn send_renewal(
     client: &FleetClient,
     access: &str,
     cx: &Context16,
     own: &[u8; 32],
-    run: &Renewal,
+    stale: bool,
+    state: &mut BootstrapState,
+    save: &mut impl FnMut(&BootstrapState) -> Result<()>,
     collect: impl AsyncFnOnce(u64) -> Result<()>,
 ) -> Result<()> {
     use shardx_core::fleet_lifecycle::{
@@ -1580,35 +1617,41 @@ async fn send_renewal(
     use shardx_core::mutation::{
         TenantRootGrantCreateV2, TenantRootGrantCreatedV2, RECORD_TYPE_ROOT_GRANT_CREATED,
     };
-    for grant in &run.capability_grants {
+    let run = state.renewal.clone().ok_or_else(corrupt)?;
+    let (n, from) = (run.capability_grants.len(), usize::from(run.step));
+    for (i, grant) in run.capability_grants.iter().enumerate().skip(from) {
         let grant = unhex_vec(grant)?;
         if client.file_capability_grant(access, &grant).await? != grant {
             return Err(mismatch());
         }
+        answered(state, save, i + 1)?;
     }
 
-    let approval = unhex_vec(&run.approval)?;
-    let replay = saved_replay(&approval, own)?;
-    let receipt = client
-        .approve_device(access, &hex(&cx.device), &approval)
-        .await?;
-    let r = DeviceApprovalReceiptV2::parse(&receipt).map_err(|_| mismatch())?;
-    let hash = device_approve_request_hash(
-        &cx.instance,
-        cx.epoch,
-        &cx.tenant,
-        &cx.account,
-        &cx.device,
-        &cx.device,
-        &approval,
-    );
-    if r.request_hash != hash
-        || (r.server_instance_id, r.restore_epoch, r.tenant_id)
-            != (cx.instance, cx.epoch, cx.tenant)
-        || (r.actor_account_id, r.actor_device_id) != (cx.account, cx.device)
-        || (r.subject_device_id, r.approval_replay_id) != (cx.device, replay)
-    {
-        return Err(mismatch());
+    if from <= n {
+        let approval = unhex_vec(&run.approval)?;
+        let replay = saved_replay(&approval, own)?;
+        let receipt = client
+            .approve_device(access, &hex(&cx.device), &approval)
+            .await?;
+        let r = DeviceApprovalReceiptV2::parse(&receipt).map_err(|_| mismatch())?;
+        let hash = device_approve_request_hash(
+            &cx.instance,
+            cx.epoch,
+            &cx.tenant,
+            &cx.account,
+            &cx.device,
+            &cx.device,
+            &approval,
+        );
+        if r.request_hash != hash
+            || (r.server_instance_id, r.restore_epoch, r.tenant_id)
+                != (cx.instance, cx.epoch, cx.tenant)
+            || (r.actor_account_id, r.actor_device_id) != (cx.account, cx.device)
+            || (r.subject_device_id, r.approval_replay_id) != (cx.device, replay)
+        {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 1)?;
     }
 
     let tenant = hex(&cx.tenant);
@@ -1616,34 +1659,41 @@ async fn send_renewal(
     let filing =
         TenantRootGrantCreateV2::parse(&request.canonical_payload_bytes).map_err(|_| corrupt())?;
     let generation = filing.grant.root_generation;
-    let stored = client
-        .file_root_grant(access, &tenant, generation, &bytes)
-        .await?;
-    let created = TenantRootGrantCreatedV2::parse(&stored_payload(
-        &stored,
-        &request,
-        RECORD_TYPE_ROOT_GRANT_CREATED,
-    )?)
-    .map_err(|_| mismatch())?;
-    if created.grant != filing.grant {
-        return Err(mismatch());
+    if from <= n + 1 {
+        let stored = client
+            .file_root_grant(access, &tenant, generation, &bytes)
+            .await?;
+        let created = TenantRootGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_ROOT_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if created.grant != filing.grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 2)?;
     }
-    let (request, bytes) = saved(&run.ack_request)?;
-    let replay = hex(&filing.grant.replay_id);
-    let stored = client
-        .ack_root_grant(access, &tenant, generation, &replay, &bytes)
-        .await?;
-    let acked = TenantRootGrantAckedV2::parse(&stored_payload(
-        &stored,
-        &request,
-        RECORD_TYPE_ROOT_GRANT_ACKED,
-    )?)
-    .map_err(|_| mismatch())?;
-    if acked.grant != filing.grant {
-        return Err(mismatch());
+    if from <= n + 2 {
+        let (request, bytes) = saved(&run.ack_request)?;
+        let replay = hex(&filing.grant.replay_id);
+        let stored = client
+            .ack_root_grant(access, &tenant, generation, &replay, &bytes)
+            .await?;
+        let acked = TenantRootGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_ROOT_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if acked.grant != filing.grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 3)?;
     }
 
-    if run.device_grant_request.is_empty()
+    if stale
+        || run.device_grant_request.is_empty()
         || client
             .active_fleet_generation(access, &tenant, &tenant)
             .await?
@@ -1655,30 +1705,36 @@ async fn send_renewal(
     let grant = FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
         .map_err(|_| corrupt())?
         .grant;
-    let stored = client
-        .file_fleet_grant(access, &tenant, run.generation, &bytes)
-        .await?;
-    let created = FleetKeyGrantCreatedV2::parse(&stored_payload(
-        &stored,
-        &request,
-        RECORD_TYPE_FLEET_GRANT_CREATED,
-    )?)
-    .map_err(|_| mismatch())?;
-    if created.grant != grant {
-        return Err(mismatch());
+    if from <= n + 3 {
+        let stored = client
+            .file_fleet_grant(access, &tenant, run.generation, &bytes)
+            .await?;
+        let created = FleetKeyGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if created.grant != grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 4)?;
     }
-    let (request, bytes) = saved(&run.device_ack_request)?;
-    let stored = client
-        .ack_fleet_grant(access, &tenant, run.generation, &bytes)
-        .await?;
-    let acked = FleetKeyGrantAckedV2::parse(&stored_payload(
-        &stored,
-        &request,
-        RECORD_TYPE_FLEET_GRANT_ACKED,
-    )?)
-    .map_err(|_| mismatch())?;
-    if acked.grant != grant {
-        return Err(mismatch());
+    if from <= n + 4 {
+        let (request, bytes) = saved(&run.device_ack_request)?;
+        let stored = client
+            .ack_fleet_grant(access, &tenant, run.generation, &bytes)
+            .await?;
+        let acked = FleetKeyGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &request,
+            RECORD_TYPE_FLEET_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if acked.grant != grant {
+            return Err(mismatch());
+        }
+        answered(state, save, n + 5)?;
     }
     collect(run.generation).await
 }
@@ -1703,7 +1759,9 @@ fn lapsed(
 
 /// Root self-renewal (4.R) over this custodian's session `access`, under the
 /// custody lock the caller holds. A run in progress is resumed with its
-/// saved bytes. Otherwise nothing is asked of the server unless one of this
+/// saved bytes at its saved step; once past half its own life it is built
+/// again if its root grant was never sent, else finished without its device
+/// grant. Otherwise nothing is asked of the server unless one of this
 /// custodian's own records ([`own_windows`]) reaches half its life at the
 /// local clock less the skew; then the server's time `T = min(local,
 /// server_now_ms) - CLOCK_SKEW_MS`, from fresh trust evidence, decides, and
@@ -1744,8 +1802,16 @@ pub(crate) async fn renew(
     let cx = renewal_context(state, me)?;
     let pages = client.trust_evidence(access, &hex(&cx.tenant)).await?;
     let server_now = pages.iter().map(|p| p.server_now_ms).max().unwrap_or(0);
+    // Without the server's time nothing is due, sent or lapsed.
+    if server_now == 0 {
+        return Err(mismatch());
+    }
     let t = local_now.min(server_now).saturating_sub(CLOCK_SKEW_MS);
-    if !resuming {
+    let open = state.renewal.as_ref().filter(|r| !r.done);
+    let stale = open.is_some_and(|r| run_stale(r, &own, t));
+    // A stale run whose root grant was never sent is built again.
+    let rebuild = stale && open.is_some_and(|r| usize::from(r.step) <= r.capability_grants.len());
+    if !resuming || rebuild {
         if !due(t) {
             return Ok(RenewalOutcome::NotDue);
         }
@@ -1753,8 +1819,18 @@ pub(crate) async fn renew(
         commit(state, save, |s| s.renewal = Some(run))?;
         eprintln!("[renewal] built at server time {t}");
     }
-    let run = state.renewal.clone().ok_or_else(corrupt)?;
-    if let Err(e) = send_renewal(client, access, &cx, &own, &run, collect).await {
+    let skip_device_grant = stale && !rebuild;
+    let sent = send_renewal(
+        client,
+        access,
+        &cx,
+        &own,
+        skip_device_grant,
+        state,
+        save,
+        collect,
+    );
+    if let Err(e) = sent.await {
         if crate::fleet_custody::refused_with(&e, 403, None)
             && lapsed(state, &pages, &cx.signing_key_id, server_now)
         {
@@ -1763,6 +1839,7 @@ pub(crate) async fn renew(
         }
         return Err(e);
     }
+    let run = state.renewal.clone().ok_or_else(corrupt)?;
     let issuer = hex(me.signer.verifying_key().as_bytes());
     commit(state, save, |s| {
         s.root_grant = run.root_grant.clone();
@@ -3319,6 +3396,9 @@ pub(crate) mod tests {
             }
             let (cx, _) = custodian_cx([5; 16], &[9; 32]);
             let post = call.starts_with("POST ");
+            // The server refuses a capability or fleet grant that has ended.
+            let ended = |container: &[u8]| window(container).1 <= s.now;
+            let refused = || (403, br#"{"code":"EXPIRED"}"#.to_vec());
             match call {
                 c if c.contains("/trust-evidence") => {
                     let page = shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
@@ -3338,6 +3418,7 @@ pub(crate) mod tests {
                     Some(g) => (200, format!(r#"{{"generation":{g}}}"#).into_bytes()),
                     None => (200, b"null".to_vec()),
                 },
+                "POST /v2/capability-grants" if ended(body) => refused(),
                 "POST /v2/capability-grants" => (201, body.to_vec()),
                 c if post && c.ends_with("/approve") => {
                     let a = approval_of(body);
@@ -3390,6 +3471,12 @@ pub(crate) mod tests {
                     (201, reply)
                 }
                 c if post && c.starts_with("POST /v2/fleets/") && c.ends_with("/grants") => {
+                    let request = IdempotentMutationRequestV2::parse(body).unwrap();
+                    let filing =
+                        FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes).unwrap();
+                    if ended(&filing.exact_signed_grant_container_bytes) {
+                        return refused();
+                    }
                     let reply = stored(body, RECORD_TYPE_FLEET_GRANT_CREATED, |p| {
                         FleetKeyGrantCreatedV2 {
                             grant: FleetKeyGrantCreateV2::parse(p).unwrap().grant,
@@ -3770,7 +3857,8 @@ pub(crate) mod tests {
     }
 
     /// Each request is built once and saved before the first is sent: a run
-    /// that stopped resumes, even before it is due, resending the same bytes.
+    /// that stopped resumes, even before it is due, at the step that was not
+    /// answered, resending the same bytes.
     #[test]
     fn renewal_resumes_each_step_with_byte_identical_requests() {
         let rt = crate::fleet_custody::tests::runtime();
@@ -3790,11 +3878,13 @@ pub(crate) mod tests {
             RenewalOutcome::Renewed
         );
         let second = f.posts();
-        assert_eq!(second.len(), 11);
-        assert_eq!(first[..], second[..first.len()], "byte-identical resend");
+        let order: Vec<String> = second.iter().map(|(c, _)| short(c)).collect();
+        assert_eq!(order, ["root ack", "device grant", "device ack"]);
+        assert_eq!(first.last(), second.first(), "byte-identical resend");
         assert_eq!(
             Renewal {
                 done: true,
+                step: 11,
                 ..saved
             },
             f.run(),
@@ -3802,8 +3892,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// One root grant per renewal: a resume refiles the saved one, and a
-    /// finished renewal is not due again.
+    /// One root grant per renewal: a resume goes on after the answered one,
+    /// and a finished renewal is not due again.
     #[test]
     fn a_renewal_never_files_two_root_grants() {
         let rt = crate::fleet_custody::tests::runtime();
@@ -3824,9 +3914,88 @@ pub(crate) mod tests {
             .filter(|(c, _)| short(c) == "root grant")
             .map(|(_, body)| body)
             .collect();
-        assert_eq!(sent.len(), 2, "filed, then resent");
-        let filed: std::collections::BTreeSet<Vec<u8>> = sent.into_iter().collect();
-        assert_eq!(filed.len(), 1);
+        assert_eq!(sent.len(), 1, "filed once, never resent");
+    }
+
+    /// A run that stopped before its root grant was sent and then sat past
+    /// half its own life is dropped and built again at the server's time,
+    /// never resent with records that have ended.
+    #[test]
+    fn a_stale_unsent_renewal_is_rebuilt() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        let stale = f.run();
+        f.seen.lock().unwrap().clear();
+
+        let later = now + 400 * DAY;
+        f.server.lock().unwrap().now = later;
+        assert_eq!(
+            rt.block_on(f.renew_at(later)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        let run = f.run();
+        assert_ne!(run.capability_grants, stale.capability_grants, "rebuilt");
+        assert_eq!(
+            window(&unhex_vec(&run.root_grant).unwrap()).0,
+            later - CLOCK_SKEW_MS
+        );
+        let roots: Vec<_> = f
+            .posts()
+            .into_iter()
+            .filter(|(c, _)| short(c) == "root grant")
+            .map(|(_, body)| body)
+            .collect();
+        assert_eq!(roots.len(), 1, "one root grant");
+        assert_eq!(roots[0], saved(&run.root_grant_request).unwrap().1);
+    }
+
+    /// A run whose root grant was acked and then sat past half its own life
+    /// finishes without its device grant, which has ended or soon will: the
+    /// next renewal is due at once and grants the device again.
+    #[test]
+    fn a_renewal_past_its_root_ack_completes_without_its_expired_device_grant() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/key-generations/0/grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        let saved = f.run();
+        f.seen.lock().unwrap().clear();
+
+        let later = now + 400 * DAY;
+        f.server.lock().unwrap().now = later;
+        assert_eq!(
+            rt.block_on(f.renew_at(later)).unwrap(),
+            RenewalOutcome::Renewed
+        );
+        assert!(f.posts().is_empty(), "{:?}", f.posts());
+        assert!(f.collected.lock().unwrap().is_empty());
+        let run = f.run();
+        assert!(run.done);
+        assert_eq!(run.root_grant, saved.root_grant, "nothing rebuilt");
+        assert_eq!(f.state.root_grant, saved.root_grant);
+    }
+
+    /// A trust-evidence reply without the server's time proves nothing: no
+    /// request is sent and a refusal is never read as a lapse.
+    #[test]
+    fn a_reply_without_the_servers_time_is_never_a_lapse() {
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 503));
+        assert!(rt.block_on(f.renew_at(now)).is_err());
+        f.seen.lock().unwrap().clear();
+
+        f.server.lock().unwrap().now = 0;
+        f.server.lock().unwrap().refuse = Some(("/capability-grants", 403));
+        let err = rt.block_on(f.renew_at(now)).unwrap_err().to_string();
+        assert!(!err.contains("fleet.custodyLapsed"), "{err}");
+        assert!(err.contains("fleet.custodyReplyMismatch"), "{err}");
+        assert!(f.posts().is_empty(), "{:?}", f.posts());
     }
 
     /// 4.H: a custodian that handed its custody over never renews.
