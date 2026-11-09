@@ -297,8 +297,8 @@ fn tenant_server_at(base: u16, slot: u16, slug: &str) -> (Server, String) {
          cargo build --manifest-path server/Cargo.toml",
         bin.display()
     );
-    // Its own range, below the Linux ephemeral ports, one slot per test: the
-    // highest slot, 21, ends at most at 20500 + 299 + 21 * 400 = 29199, below
+    // Its own range, below the Linux ephemeral ports, one slot per test: with
+    // PORT_BASE the highest slot, 21, ends at most at 20500 + 299 + 21 * 400 = 29199, below
     // 32768 and clear of OmniRoute's 20128-20132. The range overlaps the
     // `fleet_enrollment_it` (21500) and `fleet_sync_it` (24900) bases, which
     // is safe only because cargo runs test binaries one at a time.
@@ -2654,6 +2654,12 @@ fn the_journey_leak_scan_worker() {
         crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
     )
     .unwrap();
+    // v2.10 U3: a re-seal run; the shared head, signed by the revoked B, is
+    // listed as quarantined.
+    let resealed = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    assert!(resealed
+        .reseal
+        .is_some_and(|r| r.profiles.values().all(|o| o == "skipped:quarantined")));
 
     let fkek = crate::credential::load(&format!("fleet-key.{}.0", h.tenant)).unwrap();
     let rotated = crate::credential::load(&format!("fleet-key.{}.1", h.tenant)).unwrap();
@@ -3222,4 +3228,219 @@ fn members_stay_trusted_by_a_device_that_joins_after_a_custodian_revocation_agai
     .unwrap();
     assert_eq!(files(&d_profile), m_files, "D reads M's head");
     assert_eq!(pinned_version(&d_profile), 2);
+}
+
+/// v2.10 U3 (4.S): X's head is A's, Y's is B's and A binds nothing of Y, Z
+/// is checked out by B. A rotates and re-seals; the run stops right after
+/// Y's commit and resumes with no second version. X and Y move under
+/// generation 1, Z is skipped as in use, and C, approved afterwards and so
+/// holding only generation 1, reads X and Y. B, behind on Y, is refused its
+/// push until it pulls, then pushes.
+#[test]
+fn reseal_all_moves_every_head_and_a_new_device_reads_them_against_a_real_server() {
+    let rt = runtime();
+    let Journey {
+        b,
+        h,
+        a_profile,
+        profile_id: x_id,
+        ..
+    } = shared_profile_at(V210_PORT_BASE, 2, "u3-reseal", &rt);
+    let (user, pass) = account();
+    let push = |local: &str, base: i64| {
+        call(
+            &rt,
+            crate::sync_cmd::profile_sync_push(
+                local.into(),
+                String::new(),
+                base,
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+    };
+    let publish = |name: &str, seed: u32| {
+        let local = local_profile(name, seed);
+        let published = call(
+            &rt,
+            crate::sync_cmd::profile_sync_publish(
+                local.clone(),
+                Some(name.into()),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(push(&local, 0).unwrap().version, 1);
+        (local, published.profile_id)
+    };
+    let head_of = |id: &str| {
+        h.server.count(&format!(
+            "SELECT current_version FROM v2_profiles WHERE lower(hex(id)) = '{id}'"
+        ))
+    };
+
+    // 1. X: A pushes version 3 over B's 2. Y and Z: B publishes and pushes
+    // each, then holds a lease on Z.
+    let udd = crate::profile::user_data_dir(&a_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"a\"}").unwrap();
+    assert_eq!(push(&a_profile, 2).unwrap().version, 3);
+    let x_files = files(&a_profile);
+    b.act_as_b();
+    let (y_local, y_id) = publish("Y", 3);
+    let y_files = files(&y_local);
+    let (z_local, z_id) = publish("Z", 4);
+    with_session(&rt, &h, async |client, access| {
+        crate::team::sync::check_out(client, access, &z_local)
+            .await
+            .unwrap()
+    });
+
+    // 2. A rotates, then re-seals; the run stops right after Y's commit.
+    h.act_as_a();
+    call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap();
+    let audit = || -> Vec<i64> {
+        [
+            "profile.checkout",
+            "profile.create_upload",
+            "profile.finalize_upload",
+            "profile.commit",
+        ]
+        .into_iter()
+        .map(|a| {
+            h.server.count(&format!(
+                "SELECT count(*) FROM v2_audit_events WHERE action = '{a}'"
+            ))
+        })
+        .collect()
+    };
+    let before = audit();
+    let c = crate::team_config::load().unwrap();
+    let dev = crate::team::sync::Device {
+        signer: c.signing_key().unwrap(),
+        me: crate::recipient(&c).unwrap(),
+        pin: crate::bootstrap_anchor(&c).unwrap(),
+    };
+    let fleet = crate::fleet_client::decode_hex16(&crate::sync_cmd::fleet_id(&c), "fleet").unwrap();
+    let free = |_: &str| Some(Box::new(()) as Box<dyn Send>);
+    let err = with_session(&rt, &h, async |client, access| {
+        let mut crash = |s: &crate::fleet_custody::FleetCustodyState| {
+            let y = s.reseal.as_ref().and_then(|r| r.profiles.get(&y_id));
+            if y.is_some_and(|o| o.starts_with("resealed")) {
+                anyhow::bail!("crash");
+            }
+            crate::fleet_custody::save(s)
+        };
+        let now = crate::root_bootstrap::now_ms();
+        crate::team::sync::reseal_all(client, access, &dev, fleet, None, &free, now, &mut crash)
+            .await
+            .unwrap_err()
+    });
+    assert_eq!(err.to_string(), "crash");
+    assert_eq!(head_of(&y_id), 2, "Y's commit landed");
+
+    // 3. The command resumes: Y is re-sealed with no extra version, X too,
+    // and Z is skipped.
+    let status = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    let run = status.reseal.expect("the run");
+    assert_eq!(run.generation, 1);
+    assert_eq!(run.profiles[&x_id], "resealed:4");
+    assert_eq!(run.profiles[&y_id], "resealed:2");
+    assert_eq!(run.profiles[&z_id], "skipped:in-use");
+    assert_eq!((head_of(&x_id), head_of(&y_id), head_of(&z_id)), (4, 2, 1));
+    let after: Vec<i64> = audit().iter().zip(&before).map(|(a, b)| a - b).collect();
+    assert_eq!(
+        after,
+        [2, 2, 2, 2],
+        "one checkout, upload and commit per re-sealed profile"
+    );
+    assert_eq!(pinned_version(&a_profile), 4, "A's binding moved with X");
+    let rows = crate::team::sync::statuses(crate::root_bootstrap::now_ms()).unwrap();
+    assert_eq!(rows.profiles.len(), 1, "no re-seal row is left");
+    let again = call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    let again = again.reseal.unwrap();
+    assert_eq!(
+        (
+            again.profiles[&x_id].as_str(),
+            again.profiles[&y_id].as_str()
+        ),
+        ("current", "current")
+    );
+    let twice: Vec<i64> = audit().iter().zip(&before).map(|(a, b)| a - b).collect();
+    assert_eq!(twice, after, "a second run commits nothing");
+
+    // 4. C, approved after the rotation, holds only generation 1 and reads X
+    // and Y.
+    let c_dev = fresh_device("c", h.server.url(), h.tenant.clone());
+    let c_id = call(
+        &rt,
+        crate::team_enroll_device("third".into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(&rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(OWNER.into(), PASSWORD.into(), c_id, code.sas.clone()),
+    )
+    .unwrap();
+    act_as(c_dev.config.path(), c_dev.data.path(), "c");
+    call(
+        &rt,
+        crate::team_join_confirm(OWNER.into(), PASSWORD.into(), code.anchor, code.sas),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let keys = crate::fleet_keys::load().unwrap();
+    assert_eq!(keys.active_key(&h.tenant).map(|(_, g)| g), Some(1));
+    for (remote, want, seed) in [(&x_id, &x_files, 5), (&y_id, &y_files, 6)] {
+        let local = local_profile("C", seed);
+        std::fs::remove_dir_all(crate::profile::user_data_dir(&local).unwrap()).unwrap();
+        call(
+            &rt,
+            crate::sync_cmd::team_join_profile(
+                remote.clone(),
+                local.clone(),
+                user.clone(),
+                pass.clone(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(&files(&local), want, "C reads {remote}");
+    }
+
+    // 5. B, behind on Y, is refused its push until it pulls, then pushes.
+    b.act_as_b();
+    let udd = crate::profile::user_data_dir(&y_local).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"b, behind\"}").unwrap();
+    let refused = push(&y_local, 1).unwrap_err();
+    assert!(refused.contains("sync.remoteAhead"), "{refused}");
+    assert_eq!(head_of(&y_id), 2);
+    call(
+        &rt,
+        crate::sync_cmd::profile_sync_pull(
+            y_local.clone(),
+            String::new(),
+            user.clone(),
+            pass.clone(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        files(&y_local),
+        y_files,
+        "the pull replaced B's local change"
+    );
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"b, after\"}").unwrap();
+    assert_eq!(push(&y_local, 2).unwrap().version, 3);
 }
