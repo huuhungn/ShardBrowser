@@ -88,6 +88,8 @@ const SCOPE: &[(&str, Source)] = &[
     ("v2_fleet_device_hpke_grants", Source::Live),
     ("v2_fleet_recovery_grants", Source::Live),
     ("v2_fleet_rotation_grants", Source::Live),
+    ("v2_offline_discard", Source::Live),
+    ("v2_discarded_records", Source::Live),
     ("v2_restore_epoch_transitions", Source::Live),
     ("v2_restore_epoch_transition_proofs", Source::Live),
     ("v2_audit_events", Source::Live),
@@ -594,6 +596,14 @@ pub async fn status(cfg: &Config) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses unless `restore status` is clean: K3 with nothing of an earlier
+/// restore left. Another offline command runs only then.
+pub async fn require_clean(cfg: &Config) -> anyhow::Result<()> {
+    let (site, o) = observe(cfg).await?;
+    let site = site.context("SHARDX_IDENTITY_DIR must be set")?;
+    require_clean_k3(&site, &o).map(|_| ())
 }
 
 fn refuse_release_build() -> anyhow::Result<()> {

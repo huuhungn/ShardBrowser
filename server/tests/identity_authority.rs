@@ -1231,3 +1231,151 @@ async fn confirm_refuses_a_device_that_is_not_a_clean_pending_first_device() {
     );
     assert_eq!(first_device_rows(&d).await.1, vec![]);
 }
+
+// ------------------------------------------------- v2.11 offline discard ---
+
+#[test]
+fn discard_preparing_arguments_parse_and_need_a_generation() {
+    let cases: [(&[&str], &str); 7] = [
+        (
+            &["fleet", "discard-preparing", "--tenant", "acme"],
+            "--generation is required",
+        ),
+        (
+            &["root", "discard-preparing", "--generation", "1"],
+            "--tenant is required",
+        ),
+        (
+            &[
+                "fleet",
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "x",
+            ],
+            "--generation must be a number",
+        ),
+        (
+            &[
+                "fleet",
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "1",
+                "--fleet",
+                "00",
+            ],
+            "--fleet must be 32 hex digits",
+        ),
+        // Only a fleet discard names a fleet or waits for a grant window.
+        (
+            &[
+                "root",
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "1",
+                "--force",
+            ],
+            "unrecognized argument",
+        ),
+        (
+            &[
+                "fleet",
+                "discard-preparing",
+                "--tenant",
+                "a",
+                "--tenant",
+                "b",
+                "--generation",
+                "1",
+            ],
+            "unrecognized argument",
+        ),
+        (&["fleet", "discard"], "unrecognized command"),
+    ];
+    for (args, why) in cases {
+        let out = bin().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&out).contains(why), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("discard-preparing --tenant <slug>"));
+    }
+}
+
+#[tokio::test]
+async fn discard_preparing_refuses_while_the_server_holds_the_lock() {
+    let d = initialised("discard-lock");
+    let _server = spawn(&d, 28156, true);
+    ready(&http(), 28156).await;
+    for kind in ["fleet", "root"] {
+        let out = cli(
+            &d,
+            &[
+                kind,
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "1",
+            ],
+        );
+        assert!(!out.status.success(), "{kind}");
+        assert!(
+            stderr(&out).contains("another instance holds the data directory lock"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[tokio::test]
+async fn discard_preparing_refuses_while_a_restore_is_prepared() {
+    let d = initialised("discard-restore");
+    let args = [
+        "fleet",
+        "discard-preparing",
+        "--tenant",
+        "acme",
+        "--generation",
+        "1",
+    ];
+    // Clean: it gets as far as the tenant.
+    let out = cli(&d, &args);
+    assert!(
+        stderr(&out).contains("no tenant with slug acme"),
+        "{}",
+        stderr(&out)
+    );
+    // A restore's manifest is there: nothing else runs until it ends.
+    let manifest = d
+        .identity
+        .join(shardx_team_server::restore_manifest::MANIFEST_FILE);
+    std::fs::write(&manifest, b"a prepared restore").unwrap();
+    for kind in ["fleet", "root"] {
+        let out = cli(
+            &d,
+            &[
+                kind,
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "1",
+            ],
+        );
+        assert!(!out.status.success(), "{kind}");
+        assert!(stderr(&out).contains("not K3"), "{}", stderr(&out));
+    }
+    std::fs::remove_file(&manifest).unwrap();
+    // So does a candidate left of an earlier one.
+    std::fs::write(d.data.join("restore-candidate-00.db"), b"").unwrap();
+    let out = cli(&d, &args);
+    assert!(
+        stderr(&out).contains("leftovers of an earlier restore"),
+        "{}",
+        stderr(&out)
+    );
+}
