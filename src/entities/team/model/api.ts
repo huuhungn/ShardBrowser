@@ -103,6 +103,14 @@ export const teamFleetKeySetup = (username: string, password: string) =>
 export const teamFleetKeyRotate = (username: string, password: string, skipMember?: string) =>
   invoke<FleetCustodyStatus>("team_fleet_key_rotate", { username, password, skipMember: skipMember ?? null });
 
+/**
+ * Re-seal every fleet profile head under an older fleet key as the root
+ * custodian, or resume the run. The password is used for one login and never
+ * stored.
+ */
+export const teamResealAll = (username: string, password: string) =>
+  invoke<FleetCustodyStatus>("team_reseal_all", { username, password });
+
 /** Bound profiles still under an older fleet key; no server is asked. */
 export const teamProfilesUnderOlderKey = () =>
   invoke<OlderKeyProfile[]>("team_profiles_under_older_key");
