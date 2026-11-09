@@ -540,6 +540,46 @@ What the hand-over does not do:
   hand-over state, so its Revoke of the old root takes the plain path,
   without the checklist or the live check of step 4.4.
 
+## Root key rotation
+
+In development for v2.11 (ADR 0002 Q-59, sequence RR). The root custodian
+replaces the tenant root key (TRK) N with a fresh N+1 from the Team page
+("Rotate root key"). It needs the 2.11 team server only when a stuck
+generation has to be discarded (Q-60).
+
+1. It is refused before anything is sent when this device is not the root
+   custodian, handed custody over, or has another custody action unfinished
+   (fleet rotation, re-seal, renewal, hand-over), a compromised-revocation
+   block, or a fleet rotation still PREPARING on the server.
+2. Every fleet key the team ever used is opened from its recovery grant under
+   root N, verified against the pinned anchor, with TRK N. A key that does not
+   open stops the rotation (`fleet.rootRotationMissingFleetKey`).
+3. TRK N+1 is created in the credential store. A new recovery bundle (v4,
+   holding TRK N+1, every fleet key and the rotation grant) is written to the
+   path you choose, and its hash is pinned on the server, before root N+1 is
+   created. Keep that file: older bundles stop working once N+1 is active.
+4. The launcher files N+1, its rotation grant, a recovery grant of every fleet
+   key under N+1, and activates N+1. Every step is saved before it is sent, so
+   a crash or a lost reply resumes with the same bytes.
+5. Then rotate the fleet key: the Team page asks for it until a fleet
+   generation activates under N+1. Members are not interrupted by the root
+   rotation itself.
+
+If the activation waits for a stuck fleet rotation
+(`fleet.rootRotationWaitsForFleetDiscard`) or the create finds a stuck root
+rotation (`fleet.rootRotationStuck`), the server operator discards it with the
+server stopped (see `docs/team-server.md`), and the rotation resumes.
+
+What root rotation does not do:
+
+- **Cut off an old TRK backwards.** Recovery grants under N stay on the
+  server, so whoever holds TRK N (an old bundle, a handed-over root) still
+  opens every fleet key up to that point. Only fleet keys activated after the
+  following fleet rotation are out of its reach.
+- **Cut off the current custodian.** Its own leaked bundle or stolen machine
+  receives TRK N+1 like the rest of its keys. Hand custody over to a new
+  device first (see "Root custody hand-over"), then rotate.
+
 ## Threat model, stated plainly
 
 The team server is trusted for RBAC and coordination (who belongs to a
@@ -613,6 +653,10 @@ What does not hold:
 - From v2.10, a cryptographic cut-off of an old root after a hand-over. Its
   cut-off is server-enforced until v2.11 rotates the root key; see "Root
   custody hand-over".
+- From v2.11, a cut-off of the current custodian's own leaked bundle by a
+  root rotation: root rotation cuts off a handed-over root's TRK going
+  forward; it does not cut off the current custodian's own leaked bundle:
+  hand over first. See "Root key rotation".
 - From v2.10, trust in a member the server leaves out of the evidence when a
   custodian is revoked: that member is distrusted and enrolls again. A server
   can deny service this way, not forge trust.
