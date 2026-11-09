@@ -2130,7 +2130,18 @@ fn an_interrupted_import_resumes() {
     assert_eq!(report["fleet_opened"], 1, "{report}");
     assert_eq!(crate::team_config::load().unwrap().device_id, a.device_id);
     assert_eq!(saved(crate::store::custody_bootstrap_path()), root);
-    assert_eq!(saved(crate::store::fleet_custody_path()), custody);
+    // The collect after the import runs the member renewal pass, which
+    // only stamps when it last looked; the custody state is otherwise the
+    // first run's.
+    let unstamped = |bytes: Vec<u8>| {
+        let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["member_renewal"]["checked_ms"] = serde_json::json!(0);
+        v
+    };
+    assert_eq!(
+        unstamped(saved(crate::store::fleet_custody_path())),
+        unstamped(custody)
+    );
     let replaced = std::fs::read_dir(c.config.path())
         .unwrap()
         .filter(|e| {
