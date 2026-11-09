@@ -1716,6 +1716,49 @@ mod tests {
         assert_eq!(root.anchor, hex(&h.anchor));
     }
 
+    /// v2.10 4.H step 3: the appointee B is lost after Accept; its first v4
+    /// bundle restores it on a fresh machine as the custodian A0 appointed,
+    /// with no hand-over of its own in progress there.
+    #[test]
+    fn a_lost_appointee_is_restored_from_its_post_accept_v4_bundle() {
+        let f = fixture();
+        let h = hand_over([0xa0; 32], [0xa0; 32], false);
+        let (result, _, _) = import_v4(&f, &h);
+        result.unwrap();
+        let root = crate::root_bootstrap::load().unwrap();
+        assert!(root.activated);
+        assert_eq!(
+            (root.root_grant_issuer, root.anchor),
+            (hex(&h.issuer), hex(&h.anchor))
+        );
+        let custody = crate::fleet_custody::load().unwrap();
+        assert!(custody.handover.is_none() && custody.handed_over_to.is_empty());
+        assert!(custody.device_id.eq_ignore_ascii_case(&hex(&DEVICE)));
+    }
+
+    /// v2.10 4.H step 5 (A-minor 5): B is lost after its rotation and A0's
+    /// revocation; its last v4 bundle still imports through the closure
+    /// path. Collecting B's own N+1 grant with B's keys runs against a real
+    /// server in `custodian_it`.
+    #[test]
+    fn a_lost_new_custodian_after_rotation_is_recovered_from_its_v4_bundle() {
+        let f = fixture();
+        let h = hand_over([0xa0; 32], [0xa0; 32], true);
+        let (result, calls, _) = import_v4(&f, &h);
+        result.unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.contains("/trust-evidence"))
+                .count(),
+            2
+        );
+        let root = crate::root_bootstrap::load().unwrap();
+        assert_eq!(root.root_grant, hex(&h.grant));
+        let custody = crate::fleet_custody::load().unwrap();
+        assert!(custody.handover.is_none() && custody.handed_over_to.is_empty());
+    }
+
     /// A wrong passphrase, or a file that is not there, says only that the
     /// bundle does not open, and nothing is written.
     #[test]

@@ -5493,6 +5493,130 @@ async fn reseal_one(
     }
 }
 
+/// Why a head keeps a root custody hand-over from going on (v2.10 4.H D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Blocked {
+    /// Bound here or named by a re-seal run, but the fleet does not list it.
+    Unlisted,
+    /// Sealed under a generation below the ACTIVE one.
+    OlderGeneration,
+    /// Signed by the outgoing custodian.
+    Outgoing,
+}
+
+/// One blocking head: its remote profile ID, version and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadBlocker {
+    pub profile: String,
+    pub version: u64,
+    pub why: Blocked,
+}
+
+/// v2.10 4.H (D7), read only: the heads of every profile the fleet lists,
+/// this device binds or `also` names that are not sealed under `g`, or are
+/// signed by `outgoing`. The live listing decides, never a saved re-seal
+/// outcome; a bound or named profile the listing omits blocks.
+pub(crate) async fn custody_blockers(
+    client: &FleetClient,
+    access: &str,
+    binding: &Binding,
+    fleet: [u8; 16],
+    g: u64,
+    outgoing: Option<[u8; 32]>,
+    also: &[String],
+) -> Result<Vec<HeadBlocker>> {
+    let of = |profile| Bound {
+        local: String::new(),
+        server: String::new(),
+        instance: binding.server_instance_id,
+        tenant: binding.tenant_id,
+        fleet,
+        profile,
+        version: 0,
+        head: None,
+        epoch: 0,
+        lease: None,
+        state: "LOCAL".into(),
+        error: None,
+    };
+    let mut heads = std::collections::BTreeMap::new();
+    fleet_pages(client, access, &of([0; 16]), |p| {
+        heads.insert(hex(&p.profile_id), p.clone());
+        true
+    })
+    .await?;
+    let mut ids: std::collections::BTreeSet<String> = heads.keys().cloned().collect();
+    let db = Db::open()?;
+    let bound: Vec<String> = db
+        .conn
+        .prepare(
+            "SELECT remote_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND fleet_id = ?3
+               AND local_profile_id NOT GLOB 'reseal:*'",
+        )?
+        .query_map(
+            params![
+                hex(&binding.server_instance_id),
+                hex(&binding.tenant_id),
+                hex(&fleet)
+            ],
+            |r| r.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(db);
+    ids.extend(bound.into_iter().map(|id| id.to_ascii_lowercase()));
+    ids.extend(also.iter().map(|id| id.to_ascii_lowercase()));
+    let mut out = Vec::new();
+    for id in ids {
+        let blocked = |version, why| HeadBlocker {
+            profile: id.clone(),
+            version,
+            why,
+        };
+        let Some(p) = heads.get(&id) else {
+            out.push(blocked(0, Blocked::Unlisted));
+            continue;
+        };
+        if p.current_version == 0 {
+            continue;
+        }
+        // The listing's generation is the one the profile was published
+        // under; the head manifest names the one its head is sealed under.
+        let m = manifest(client, access, &of(p.profile_id), p.current_version).await?;
+        if Some(m.head_hash()) != p.current_signed_head_hash {
+            return Err(bad("current_signed_head_hash"));
+        }
+        let head = SnapshotManifestV2::parse(m.canonical_manifest_payload_bytes())
+            .map_err(|_| bad("manifest"))?;
+        if head.key_generation < g {
+            out.push(blocked(p.current_version, Blocked::OlderGeneration));
+        } else if outgoing == Some(head.signer_signing_key_id) {
+            out.push(blocked(p.current_version, Blocked::Outgoing));
+        }
+    }
+    Ok(out)
+}
+
+/// The local profile bound to `profile` under `binding`, if any, other than
+/// a re-seal row: what the hand-over's `lost` path reverts.
+pub(crate) fn bound_local(binding: &Binding, profile: &[u8; 16]) -> Result<Option<String>> {
+    let db = Db::open()?;
+    Ok(db
+        .conn
+        .query_row(
+            "SELECT local_profile_id FROM profile_bindings
+             WHERE server_instance_id = ?1 AND tenant_id = ?2 AND remote_profile_id = ?3
+               AND local_profile_id NOT GLOB 'reseal:*'",
+            params![
+                hex(&binding.server_instance_id),
+                hex(&binding.tenant_id),
+                hex(profile)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Checks out the published `local` as a push does and keeps the lease: a
 /// lease another device holds, for the real-server tests.
 #[cfg(test)]

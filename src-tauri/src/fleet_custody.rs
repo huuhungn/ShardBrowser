@@ -27,9 +27,10 @@ use shardx_core::approval_receipt::{
 use shardx_core::authz_record::{
     build_record, ApprovalScopeKind, AuthorizationRecord, Capability, CapabilityScopeKind,
     DeviceApprovalV2, DeviceHpkeGrantV2, DeviceRevocationReason, DeviceRevocationV2, GrantSubject,
-    Payload, RecoveryGrantV2, RotationGrantV2, TenantCapabilityGrantV2, DOMAIN_DEVICE_APPROVAL,
-    DOMAIN_DEVICE_REVOCATION, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_FLEET_KEY_GRANT_RECOVERY,
-    DOMAIN_FLEET_KEY_GRANT_ROTATION, DOMAIN_TENANT_CAPABILITY_GRANT,
+    Payload, RecoveryGrantV2, RootGrantVariant, RotationGrantV2, TenantCapabilityGrantV2,
+    TenantRootKeyGrantV2, DOMAIN_DEVICE_APPROVAL, DOMAIN_DEVICE_REVOCATION,
+    DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    DOMAIN_FLEET_KEY_GRANT_ROTATION, DOMAIN_TENANT_CAPABILITY_GRANT, DOMAIN_TENANT_ROOT_KEY_GRANT,
 };
 use shardx_core::fleet_grants::{fkek_key_id, generate_fkek};
 use shardx_core::fleet_lifecycle::{
@@ -39,11 +40,13 @@ use shardx_core::fleet_lifecycle::{
     FleetRotation, RECORD_TYPE_FLEET_GENERATION_ACTIVATED, RECORD_TYPE_FLEET_GENERATION_CREATED,
     RECORD_TYPE_FLEET_GRANT_ACKED, RECORD_TYPE_FLEET_GRANT_CREATED,
 };
-use shardx_core::grants::{derive_keypair, seal_device_fkek};
+use shardx_core::grants::{derive_keypair, seal_device_fkek, seal_trk};
 use shardx_core::keys::{hpke_key_id, signing_key_id};
 use shardx_core::mutation::{
     fleet_device_grant_set_hash, DeviceRevokeRequestV2, DeviceRevokedV2,
-    IdempotentMutationRequestV2, OperationKind, RECORD_TYPE_DEVICE_REVOKED,
+    IdempotentMutationRequestV2, OperationKind, TenantRootGrantAckV2, TenantRootGrantAckedV2,
+    TenantRootGrantCreateV2, TenantRootGrantCreatedV2, RECORD_TYPE_DEVICE_REVOKED,
+    RECORD_TYPE_ROOT_GRANT_ACKED, RECORD_TYPE_ROOT_GRANT_CREATED,
 };
 use shardx_core::signing::Ed25519SigningKey;
 use shardx_core::trust_chain::{
@@ -54,7 +57,7 @@ use shardx_core::trust_evidence::TenantTrustEvidencePageV2;
 use crate::fleet_client::{decode_hex, decode_hex16, decode_hex32, hex, FleetClient, TenantDevice};
 use crate::root_bootstrap::{
     commit, corrupt, current_root_grant, is_missing, mismatch, nonce_ok, now_ms, random,
-    stored_payload, unhex_vec, BootstrapState, Context16,
+    stored_payload, unhex_vec, verified_root_grant, BootstrapState, Context16,
 };
 
 /// Where the fleet key lives from its creation until the generation is
@@ -158,6 +161,61 @@ pub struct FleetCustodyState {
     /// ([`crate::root_bootstrap::root_grant_sha256`]); empty before one.
     #[serde(default)]
     pub exported_root_grant_sha256: String,
+    /// The ACTIVE fleet generation when `handed_over_to` was saved: the
+    /// cancel (Revoke of the appointee) is refused once the server is past it.
+    #[serde(default)]
+    pub handed_over_generation: u64,
+    /// The hand-over this device accepted as the new root custodian (v2.10
+    /// 4.H steps 2-7, U6).
+    #[serde(default)]
+    pub handover: Option<Handover>,
+}
+
+/// What the new root custodian keeps of its hand-over (v2.10 4.H). Records
+/// and requests only, hex-encoded; no key is among it.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Handover {
+    /// The outgoing custodian's signing key ID, hex.
+    pub outgoing: String,
+    /// The ACTIVE fleet generation when the hand-over was accepted.
+    pub accepted_generation: u64,
+    /// `accepting` (requests saved), `accepted` (root state written),
+    /// `granted` (own grant of the accepted generation collected), `done`
+    /// (the outgoing custodian revoked).
+    pub phase: String,
+    /// Step 2's records and requests, built once and saved before the first
+    /// send: the root grant and its issuer's public key, the root grant ack,
+    /// the six own capability grants, the own `DeviceHpkeGrant` filing of the
+    /// accepted generation and its ack.
+    pub root_grant: String,
+    pub root_grant_issuer: String,
+    pub ack_request: String,
+    #[serde(default)]
+    pub capability_grants: Vec<String>,
+    #[serde(default)]
+    pub own_grant_request: String,
+    #[serde(default)]
+    pub own_ack_request: String,
+    /// Step 3: the first v4 bundle written after Accept.
+    #[serde(default)]
+    pub first_export_sha256: String,
+    /// Step 4: the generation this device's finished rotation activated.
+    #[serde(default)]
+    pub rotated_generation: u64,
+    /// Step 5: the generation a re-seal run with this outgoing custodian
+    /// finished for, with no profile pending.
+    #[serde(default)]
+    pub resealed_generation: u64,
+    /// Step 6: the v4 bundle written after that re-seal, and the newest
+    /// generation it holds.
+    #[serde(default)]
+    pub exported_sha256: String,
+    #[serde(default)]
+    pub exported_generation: u64,
+    /// Step 7's `lost` path, per remote profile ID: `pending`, `reverted:<v>`
+    /// or `error:<code>`.
+    #[serde(default)]
+    pub reverts: BTreeMap<String, String>,
 }
 
 /// One run of Re-seal all profiles (v2.10 4.S). No key is among it.
@@ -331,6 +389,34 @@ fn container_hash(container: &[u8]) -> Result<[u8; 32]> {
     AuthorizationRecord::parse(container)
         .map(|r| *r.signed_container_hash())
         .map_err(|_| corrupt())
+}
+
+/// Every container of `pages` that verifies under the page key its issuer
+/// ID names, with that key and its payload.
+fn evidence_records(pages: &[TenantTrustEvidencePageV2]) -> Vec<(&[u8], [u8; 32], Payload)> {
+    pages
+        .iter()
+        .flat_map(|p| p.containers.iter().map(move |c| (p, c)))
+        .filter_map(|(p, c)| {
+            let record = AuthorizationRecord::parse(c).ok()?;
+            let issuer = *p
+                .signing_public_keys
+                .iter()
+                .find(|k| signing_key_id(k) == *record.issuer_signing_key_id())?;
+            let payload = record.verify_signature(&issuer).ok()?.payload().clone();
+            Some((c.as_slice(), issuer, payload))
+        })
+        .collect()
+}
+
+/// v2.10 4.H step 1: a root custodian that appointed another device runs no
+/// custody step of its own (Approve, Rotate, Re-seal, Export; renewal reads
+/// `handed_over_to` itself).
+pub fn refuse_handed_over(state: &FleetCustodyState) -> Result<()> {
+    if !state.handed_over_to.is_empty() {
+        bail!(crate::errcode::code("fleet.custodyHandedOver"));
+    }
+    Ok(())
 }
 
 /// Two containers with their replay IDs, and a root generation.
@@ -804,8 +890,29 @@ pub async fn ack_device_grant(
     )
     .grant;
     let fleet = hex(&g.fleet_id);
-    let key = format!("{fleet}.{}", g.generation);
     let mut state = load()?;
+    // A device may hold two grants of one generation (a hand-over's issuer's
+    // and its own, D11): an ack is kept per grant, under `{fleet}.{generation}`
+    // for the first and with the grant's container hash once that is taken.
+    let names_grant = |saved: &String| {
+        saved_request(saved)
+            .ok()
+            .and_then(|r| FleetKeyGrantAckV2::parse(&r.canonical_payload_bytes).ok())
+            .is_some_and(|a| a.grant == grant)
+    };
+    let key = state
+        .device_acks
+        .iter()
+        .find(|(_, saved)| names_grant(saved))
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| {
+            let first = format!("{fleet}.{}", g.generation);
+            if state.device_acks.contains_key(&first) {
+                format!("{first}.{}", hex(record.signed_container_hash()))
+            } else {
+                first
+            }
+        });
     if !state.device_acks.contains_key(&key) {
         let cx = Context16 {
             tenant: g.common.tenant_id,
@@ -858,6 +965,10 @@ pub struct MemberApproval {
     pub capability_grants: Vec<String>,
     #[serde(default)]
     pub grant_request: String,
+    /// Appoint (v2.10 4.H step 1): the request filing the `ExistingRootGrant`
+    /// to the device; empty for a member.
+    #[serde(default)]
+    pub root_grant: String,
 }
 
 /// A device of the tenant as the Approve screen shows it.
@@ -1056,6 +1167,7 @@ fn build_member(
             &approval.encode(),
         )),
         capability_grants: grants,
+        root_grant: String::new(),
         grant_request: member_grant(
             cx,
             signer,
@@ -1115,6 +1227,87 @@ pub(crate) fn member_grant(
     )?))
 }
 
+/// 4.H step 1: Appoint's requests for `row`: a tenant-scoped approval and an
+/// `ExistingRootGrant` of this custodian's ACTIVE root, sealed to the listed
+/// HPKE key and linked to that approval, both running the server's 730-day
+/// cap, and the device's grant of `generation`. No capability grants: the
+/// appointee issues its own.
+#[allow(clippy::too_many_arguments)]
+fn build_custodian(
+    cx: &Context16,
+    me: &FleetDevice<'_>,
+    root: &BootstrapState,
+    row: &TenantDevice,
+    (signing, hpke, hpke_pk): ([u8; 32], [u8; 32], [u8; 32]),
+    fkek: &[u8; 32],
+    generation: u64,
+    now: u64,
+    first_seen_ms: u64,
+) -> Result<MemberApproval> {
+    let account = decode_hex16(&row.account_id, "account_id")?;
+    let device = decode_hex16(&row.device_id, "device_id")?;
+    let window = || -> Result<_> {
+        let mut common = cx.common(random()?, now);
+        common.not_after_ms = common.not_before_ms + crate::root_bootstrap::RENEWED_VALIDITY_MS;
+        Ok(common)
+    };
+    let approval = DeviceApprovalV2 {
+        common: window()?,
+        subject_account_id: account,
+        subject_device_id: device,
+        subject_signing_key_id: signing,
+        subject_hpke_key_id: hpke,
+        approval_scope_kind: ApprovalScopeKind::Tenant,
+        approval_scope_id: cx.tenant,
+    };
+    let (own, _, _) = current_root_grant(root, me.signer)?;
+    let (hpke_secret, _) = derive_keypair(me.hpke_seed);
+    let trk = own.open_trk(&hpke_secret).map_err(|_| corrupt())?;
+    let mut grant = TenantRootKeyGrantV2 {
+        common: window()?,
+        variant: RootGrantVariant::ExistingRootGrant,
+        root_key_id: own.root_key_id,
+        root_generation: own.root_generation,
+        subject_account_id: account,
+        subject_device_id: device,
+        subject_signing_key_id: signing,
+        recipient_hpke_key_id: hpke,
+        subject_device_approval_replay_id: approval.common.replay_id,
+        hpke_encapped_key_bytes: [0; 32],
+        hpke_wrapped_trk_bytes: [0; 48],
+    };
+    let sealed = seal_trk(&hpke_pk, &grant.scope(), &trk).map_err(|_| corrupt())?;
+    grant.hpke_encapped_key_bytes = sealed
+        .encapped_key_bytes
+        .try_into()
+        .map_err(|_| corrupt())?;
+    grant.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().map_err(|_| corrupt())?;
+    let container = build_record(me.signer, DOMAIN_TENANT_ROOT_KEY_GRANT, &grant.encode());
+    let filing = TenantRootGrantCreateV2 {
+        grant: verified_root_grant(&container, &me.signer.verifying_key().to_bytes())?.1,
+        exact_signed_grant_container_bytes: container,
+    };
+    Ok(MemberApproval {
+        first_seen_ms,
+        approval: hex(&build_record(
+            me.signer,
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        )),
+        capability_grants: Vec::new(),
+        grant_request: member_grant(
+            cx,
+            me.signer,
+            (account, device),
+            (signing, hpke, hpke_pk),
+            fkek,
+            generation,
+            now,
+        )?,
+        root_grant: hex(&cx.request(OperationKind::RootGrantCreate, filing.encode())?),
+    })
+}
+
 /// The facts this custodian's records name, once `state` holds its own
 /// Create fleet key or a recovery import of it.
 fn custodian(me: &FleetDevice<'_>, state: &FleetCustodyState) -> Result<Context16> {
@@ -1150,11 +1343,25 @@ pub async fn approve_member(
     sas: &str,
     fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
     withdrawn: impl Fn(&[u8; 32]) -> Result<bool>,
+    custodian_root: Option<&BootstrapState>,
     now: u64,
     state: &mut FleetCustodyState,
     save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
 ) -> Result<()> {
     let cx = custodian(me, state)?;
+    let id = row.device_id.to_ascii_lowercase();
+    // v2.10 4.H step 1: once an appointment is filed only it resumes, and
+    // one runs at a time.
+    if state.handed_over_to != id || custodian_root.is_none() {
+        refuse_handed_over(state)?;
+    }
+    if state
+        .members
+        .iter()
+        .any(|(d, m)| *d != id && !m.root_grant.is_empty() && !state.revocations.contains_key(d))
+    {
+        bail!(crate::errcode::code("fleet.custodyHandedOver"));
+    }
     // ADR 0002 Q-48: a device approved now would get no N+1 grant.
     if state
         .rotation
@@ -1165,7 +1372,6 @@ pub async fn approve_member(
     }
     let fleet = hex(&cx.tenant);
     see_devices(std::slice::from_ref(row), pin, now, state, save)?;
-    let id = row.device_id.to_ascii_lowercase();
     let first_seen = match state.members.get(&id) {
         Some(m) if !m.approval.is_empty() => None,
         Some(_) => window_start(state, row),
@@ -1178,14 +1384,46 @@ pub async fn approve_member(
             .active_fleet_generation(access, me.tenant_id, &fleet)
             .await?
             .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))?;
+        // 4.H step 1: the appointee cannot hold a generation below the ACTIVE
+        // one, so every head must be under it first, from a finished re-seal
+        // and the live listing.
+        if custodian_root.is_some() {
+            let finished = state.reseal.as_ref().is_some_and(|r| {
+                r.generation == generation
+                    && r.ended_ms.is_some()
+                    && !r
+                        .profiles
+                        .values()
+                        .any(|o| crate::team::sync::reseal_pending(o))
+            });
+            let also: Vec<String> = state
+                .reseal
+                .iter()
+                .flat_map(|r| r.profiles.keys().cloned())
+                .collect();
+            if !finished
+                || !crate::team::sync::custody_blockers(
+                    client, access, &pin.0, cx.tenant, generation, None, &also,
+                )
+                .await?
+                .is_empty()
+            {
+                bail!(crate::errcode::code("fleet.handoverNeedsReseal"));
+            }
+        }
         let fkek = fleet_key(generation)?;
         // The read may outlast the window: check it again at signing time,
         // and sign at that time.
         let now = now + started.elapsed().as_millis() as u64;
         let keys = check_member(row, pin, first_seen, now, sas)?;
-        let built = build_member(
-            &cx, me.signer, row, keys, &fkek, generation, now, first_seen,
-        )?;
+        let built = match custodian_root {
+            Some(root) => {
+                build_custodian(&cx, me, root, row, keys, &fkek, generation, now, first_seen)?
+            }
+            None => build_member(
+                &cx, me.signer, row, keys, &fkek, generation, now, first_seen,
+            )?,
+        };
         commit(state, save, |s| {
             s.members.insert(id.clone(), built);
         })?;
@@ -1242,6 +1480,44 @@ pub async fn approve_member(
         let grant = unhex_vec(grant)?;
         if client.file_capability_grant(access, &grant).await? != grant {
             return Err(mismatch());
+        }
+    }
+    // 4.H step 1: the appointee's root grant; once it is filed this device
+    // has handed its custody over.
+    if !m.root_grant.is_empty() {
+        let filing = saved_request(&m.root_grant)?;
+        let sent = TenantRootGrantCreateV2::parse(&filing.canonical_payload_bytes)
+            .map_err(|_| corrupt())?;
+        let stored = client
+            .file_root_grant(
+                access,
+                me.tenant_id,
+                sent.grant.root_generation,
+                &filing.encode(),
+            )
+            .await?;
+        let created = TenantRootGrantCreatedV2::parse(&stored_payload(
+            &stored,
+            &filing,
+            RECORD_TYPE_ROOT_GRANT_CREATED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if created.grant != sent.grant {
+            return Err(mismatch());
+        }
+        if state.handed_over_to != id {
+            let generation = FleetKeyGrantCreateV2::parse(
+                &saved_request(&m.grant_request)?.canonical_payload_bytes,
+            )
+            .map_err(|_| corrupt())?
+            .grant
+            .generation
+            .generation;
+            commit(state, save, |s| {
+                s.handed_over_to = id.clone();
+                s.handed_over_generation = generation;
+            })?;
+            eprintln!("[handover] appointed {id} at generation {generation}");
         }
     }
     let mut filing = saved_request(&m.grant_request)?;
@@ -1454,14 +1730,260 @@ pub fn revoke_reason(reason: &str) -> Result<DeviceRevocationReason> {
     }
 }
 
+/// Whether `row` is the outgoing custodian of this device's hand-over.
+fn is_outgoing(state: &FleetCustodyState, row: &TenantDevice) -> bool {
+    state.handover.as_ref().is_some_and(|h| {
+        !h.outgoing.is_empty() && h.outgoing.eq_ignore_ascii_case(&row.signing_key_id)
+    })
+}
+
+/// `fleet.handoverNotReady` for the missing checklist `step`, naming the
+/// blocking `profiles`.
+fn not_ready(step: &str, profiles: &[String]) -> anyhow::Error {
+    anyhow::anyhow!(crate::errcode::code_with(
+        "fleet.handoverNotReady",
+        &[("step", step), ("profiles", &profiles.join(", "))],
+    ))
+}
+
+/// D13: whether the server is past the appointment's generation: ACTIVE
+/// above it, or a fleet grant of a later generation filed (a PREPARING
+/// generation shows only through the grants filed for it).
+async fn past_rotation(
+    client: &FleetClient,
+    access: &str,
+    tenant: &str,
+    fleet: &str,
+    generation: u64,
+) -> Result<bool> {
+    let active = client
+        .active_fleet_generation(access, tenant, fleet)
+        .await?;
+    if active.is_some_and(|g| g > generation) {
+        return Ok(true);
+    }
+    let pages = client.trust_evidence(access, tenant).await?;
+    Ok(evidence_records(&pages).iter().any(|(_, _, p)| match p {
+        Payload::DeviceHpkeGrant(g) => g.generation > generation,
+        Payload::RecoveryGrant(g) => g.generation > generation,
+        Payload::RotationGrant(g) => g.generation > generation,
+        _ => false,
+    }))
+}
+
 /// Runs, or resumes, Revoke of `row` as `reason` (section 4.R) under the
-/// device session `access`. A saved revocation is resent as saved, whatever
-/// `reason` now says, unless the server refuses it as one it cannot file now.
-/// This device never revokes itself. `compromised` is built only once fresh
-/// trust evidence, evaluated in `custody` to the pin, does not count the
-/// row's key as a custodian (D10, Q-57); without `custody` it is refused.
+/// device session `access`; see [`revoke_row`]. After an appointment (v2.10
+/// 4.H step 1) only the appointee may be revoked, which cancels the
+/// hand-over, and only until the server is past the appointment's generation
+/// (`fleet.handoverPastRotation`, D13). The outgoing custodian of this
+/// device's hand-over is revoked only by [`revoke_outgoing`].
 #[allow(clippy::too_many_arguments)]
 pub async fn revoke_member(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    row: &TenantDevice,
+    reason: DeviceRevocationReason,
+    custody: Option<&mut Ledger<'_>>,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    if is_outgoing(state, row) {
+        if reason == DeviceRevocationReason::Compromised {
+            bail!(crate::errcode::code("fleet.revokeOutgoingReason"));
+        }
+        return Err(not_ready("checklist", &[]));
+    }
+    if state.handed_over_to.is_empty() {
+        return revoke_row(client, access, me, row, reason, custody, now, state, save).await;
+    }
+    let id = row.device_id.to_ascii_lowercase();
+    if state.handed_over_to != id {
+        bail!(crate::errcode::code("fleet.custodyHandedOver"));
+    }
+    let cx = custodian(me, state)?;
+    let fleet = hex(&cx.tenant);
+    if past_rotation(
+        client,
+        access,
+        me.tenant_id,
+        &fleet,
+        state.handed_over_generation,
+    )
+    .await?
+    {
+        bail!(crate::errcode::code("fleet.handoverPastRotation"));
+    }
+    revoke_row(client, access, me, row, reason, custody, now, state, save).await?;
+    commit(state, save, |s| {
+        s.handed_over_to.clear();
+        s.handed_over_generation = 0;
+    })?;
+    eprintln!("[handover] cancelled: {id} revoked");
+    Ok(())
+}
+
+/// 4.H step 7's checklist for the ACTIVE generation `active`: the first
+/// step not done, if any.
+fn missing_step(h: &Handover, active: u64) -> Option<&'static str> {
+    if h.phase != "granted" && h.phase != "done" {
+        Some("accept")
+    } else if h.first_export_sha256.is_empty() {
+        Some("export")
+    } else if h.rotated_generation != active || active <= h.accepted_generation {
+        Some("rotate")
+    } else if h.resealed_generation != active {
+        Some("reseal")
+    } else if h.exported_generation != active || h.exported_sha256.is_empty() {
+        Some("export-again")
+    } else {
+        None
+    }
+}
+
+/// 4.H step 7 (D7, D10): this new root custodian revokes the outgoing one,
+/// `retired` or `lost`, never `compromised` (`fleet.revokeOutgoingReason`).
+/// Before the first send and before any resend, unless the listing already
+/// reads the row revoked (a lost reply: the saved request is resent for the
+/// server's stored reply), the saved checklist for the current ACTIVE
+/// generation and the live heads ([`crate::team::sync::custody_blockers`])
+/// are checked: `retired` needs no blocker; `lost` allows only heads signed
+/// by the outgoing key at a version above the one the re-seal committed, and
+/// only when `accept_reverts` lists exactly those profiles. Otherwise
+/// `fleet.handoverNotReady`. A saved revocation is checked under the reason
+/// it was saved with. Right after the revoke, `revert` runs for each listed
+/// profile, its outcome saved per profile; a resume retries the pending ones.
+#[allow(clippy::too_many_arguments)]
+pub async fn revoke_outgoing<RF: std::future::Future<Output = Result<u64>>>(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    binding: &Binding,
+    row: &TenantDevice,
+    reason: DeviceRevocationReason,
+    accept_reverts: &[String],
+    mut revert: impl FnMut(String) -> RF,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    if !is_outgoing(state, row) {
+        bail!(crate::errcode::code("fleet.deviceNotListed"));
+    }
+    let id = row.device_id.to_ascii_lowercase();
+    let cx = custodian(me, state)?;
+    let vk = me.signer.verifying_key().to_bytes();
+    let reason = match state.revocations.get(&id) {
+        Some(saved) => saved_revocation(saved, &vk)?.reason_code,
+        None => reason,
+    };
+    if reason == DeviceRevocationReason::Compromised {
+        bail!(crate::errcode::code("fleet.revokeOutgoingReason"));
+    }
+    let lost_reply = row.status == "revoked" && state.revocations.contains_key(&id);
+    if !lost_reply {
+        let h = state.handover.clone().ok_or_else(corrupt)?;
+        let fleet = hex(&cx.tenant);
+        let active = client
+            .active_fleet_generation(access, me.tenant_id, &fleet)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))?;
+        if let Some(step) = missing_step(&h, active) {
+            return Err(not_ready(step, &[]));
+        }
+        let outgoing = decode_hex32(&h.outgoing, "outgoing")?;
+        let run = state.reseal.clone().unwrap_or_default();
+        let also: Vec<String> = run.profiles.keys().cloned().collect();
+        let blockers = crate::team::sync::custody_blockers(
+            client,
+            access,
+            binding,
+            cx.tenant,
+            active,
+            Some(outgoing),
+            &also,
+        )
+        .await?;
+        // "After the re-seal" is a version above the one it committed.
+        let after_reseal = |b: &crate::team::sync::HeadBlocker| {
+            b.why == crate::team::sync::Blocked::Outgoing
+                && match run.profiles.get(&b.profile).map(String::as_str) {
+                    Some(o) if o.starts_with("resealed:") => o["resealed:".len()..]
+                        .parse::<u64>()
+                        .is_ok_and(|v| b.version > v),
+                    Some("current") | None => true,
+                    _ => false,
+                }
+        };
+        let listed: Vec<String> = blockers.iter().map(|b| b.profile.clone()).collect();
+        let mut accepted: Vec<String> = accept_reverts
+            .iter()
+            .map(|p| p.trim().to_ascii_lowercase())
+            .collect();
+        accepted.sort();
+        let ready = match reason {
+            DeviceRevocationReason::Retired => blockers.is_empty(),
+            _ => blockers.iter().all(after_reseal) && accepted == listed,
+        };
+        eprintln!(
+            "[handover] revoke check: generation {active}, {} blockers",
+            blockers.len()
+        );
+        if !ready {
+            return Err(not_ready("heads", &listed));
+        }
+        commit(state, save, |s| {
+            if let Some(h) = s.handover.as_mut() {
+                for p in &listed {
+                    h.reverts
+                        .entry(p.clone())
+                        .or_insert_with(|| "pending".into());
+                }
+            }
+        })?;
+    }
+    revoke_row(client, access, me, row, reason, None, now, state, save).await?;
+    let pending: Vec<String> = state
+        .handover
+        .iter()
+        .flat_map(|h| h.reverts.iter())
+        .filter(|(_, o)| *o == "pending")
+        .map(|(p, _)| p.clone())
+        .collect();
+    for p in pending {
+        let outcome = match revert(p.clone()).await {
+            Ok(v) => format!("reverted:{v}"),
+            Err(e) => format!(
+                "error:{}",
+                crate::recovery_import::error_code(&e.to_string())
+            ),
+        };
+        eprintln!("[handover] revert {p}: {outcome}");
+        commit(state, save, |s| {
+            if let Some(h) = s.handover.as_mut() {
+                h.reverts.insert(p.clone(), outcome);
+            }
+        })?;
+    }
+    commit(state, save, |s| {
+        if let Some(h) = s.handover.as_mut() {
+            h.phase = "done".into();
+        }
+    })?;
+    eprintln!("[handover] done: the outgoing custodian {id} is revoked");
+    Ok(())
+}
+
+/// Files, or resends, the revocation of `row` as `reason` (section 4.R)
+/// under the device session `access`. A saved revocation is resent as saved,
+/// whatever `reason` now says, unless the server refuses it as one it cannot
+/// file now. This device never revokes itself. `compromised` is built only
+/// once fresh trust evidence, evaluated in `custody` to the pin, does not
+/// count the row's key as a custodian (D10, Q-57); without `custody` it is
+/// refused.
+#[allow(clippy::too_many_arguments)]
+async fn revoke_row(
     client: &FleetClient,
     access: &str,
     me: &FleetDevice<'_>,
@@ -1763,6 +2285,17 @@ pub async fn rotate_fleet(
         bail!(crate::errcode::code("fleet.notCustodian"));
     }
     let cx = custodian(device, state)?;
+    refuse_handed_over(state)?;
+    // 4.H steps 2-3: a new root custodian rotates once Accept is done and a
+    // v4 bundle was written after it.
+    if let Some(h) = &state.handover {
+        if h.phase != "granted" && h.phase != "done" {
+            return Err(not_ready("accept", &[]));
+        }
+        if h.first_export_sha256.is_empty() {
+            return Err(not_ready("export", &[]));
+        }
+    }
     // The deadline is checked at each send's time, not this call's: a wait
     // for the server may cross it.
     let past = |s: &FleetCustodyState| {
@@ -2204,28 +2737,35 @@ pub async fn grant_members(
         let (seen, chain) = ledger.evaluate(&pages, now)?;
         crate::team::ledger::record(ledger.db, &ledger.pin.0, &seen, &chain, None, closure, now)?;
         for (id, ids, keys) in batch {
-            let skip =
-                if state.revocations.contains_key(id) || chain.reported_revoked_at(&keys.0, now) {
-                    Some("revoked")
-                } else if crate::team::ledger::withdrawn(ledger.db, &ledger.pin.0, &keys.0)? {
-                    Some("withdrawn")
-                } else if state
-                    .members
-                    .get(id)
-                    .is_some_and(|m| approval_names(&m.approval, &vk, *ids, keys, cx.tenant, now))
-                    || chain.approves_keys(
-                        &keys.0,
-                        &keys.1,
-                        &ids.1,
-                        &ids.0,
-                        Scope::Fleet(cx.tenant),
-                        now,
-                    )
-                {
-                    None
-                } else {
-                    Some("no-approval")
-                };
+            let outgoing = state
+                .handover
+                .as_ref()
+                .is_some_and(|h| h.outgoing.eq_ignore_ascii_case(&hex(&keys.0)));
+            let skip = if outgoing {
+                // D8: the machine being cut off gets no N+1 grant.
+                Some("outgoing-custodian")
+            } else if state.revocations.contains_key(id) || chain.reported_revoked_at(&keys.0, now)
+            {
+                Some("revoked")
+            } else if crate::team::ledger::withdrawn(ledger.db, &ledger.pin.0, &keys.0)? {
+                Some("withdrawn")
+            } else if state
+                .members
+                .get(id)
+                .is_some_and(|m| approval_names(&m.approval, &vk, *ids, keys, cx.tenant, now))
+                || chain.approves_keys(
+                    &keys.0,
+                    &keys.1,
+                    &ids.1,
+                    &ids.0,
+                    Scope::Fleet(cx.tenant),
+                    now,
+                )
+            {
+                None
+            } else {
+                Some("no-approval")
+            };
             match skip {
                 Some(why) => {
                     results.insert(id.clone(), format!("skipped:{why}"));
@@ -2285,8 +2825,16 @@ pub async fn grant_members(
     for (id, result) in &results {
         eprintln!("[rotation] member {id}: {result}");
     }
+    let generation = r.generation;
     commit(state, save, |s| {
         s.export_due = true;
+        if let Some(h) = s
+            .handover
+            .as_mut()
+            .filter(|h| generation > h.accepted_generation)
+        {
+            h.rotated_generation = generation;
+        }
         let r = rotation_mut(s);
         r.member_results = results;
         r.failing_member.clear();
@@ -2319,6 +2867,315 @@ pub fn skip_member(
     commit(state, save, |s| {
         rotation_mut(s).skipped_members.insert(id.clone());
     })
+}
+
+/// 4.H step 2: this device accepts the root custody another root custodian
+/// appointed it to, under the device session `access`, or resumes Accept.
+/// Its root grant is taken from fresh trust evidence (the closure path,
+/// Q-58) evaluated in `ledger` to the pin: one naming this device's keys,
+/// signed by a key that was a custodian when it was issued, counted for this
+/// device now and opening with its HPKE key (`fleet.handoverIssuerNotCustodian`;
+/// none naming this device: `fleet.handoverNoGrant`). Its ack and the six own
+/// capability grants are built and saved before the first send; after the
+/// ack the server reads the grant back acknowledged and the root state is
+/// written through `root_save`. Then the capability grants, the verified
+/// `collect` of the accepted generation N, and only then this device's own
+/// grant of N (D11), built once, saved, filed, acknowledged and collected.
+/// `fleet_key` gives the verified key of a generation.
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_custody<CF: std::future::Future<Output = Result<u64>>>(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    ledger: &mut Ledger<'_>,
+    fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+    mut collect: impl FnMut() -> CF,
+    now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+    root_save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+) -> Result<()> {
+    let (hpke_secret, hpke_public) = derive_keypair(me.hpke_seed);
+    let hpke_pk: [u8; 32] = hpke_public.as_slice().try_into().map_err(|_| corrupt())?;
+    let tenant = decode_hex16(me.tenant_id, "tenant_id")?;
+    let account = decode_hex16(me.account_id, "account_id")?;
+    let device = decode_hex16(me.device_id, "device_id")?;
+    let my_key = signing_key_id(me.signer.verifying_key().as_bytes());
+    let my_hpke = hpke_key_id(&hpke_public);
+    let fleet = hex(&tenant);
+    let (binding, anchor) = *ledger.pin;
+    let context = |s: &FleetCustodyState| -> Result<Context16> {
+        Ok(Context16 {
+            tenant,
+            instance: decode_hex16(&s.server_instance_id, "server_instance_id")?,
+            epoch: s.restore_epoch,
+            account,
+            device,
+            signing_key_id: my_key,
+            hpke_key_id: my_hpke,
+        })
+    };
+    if state.handover.is_none() {
+        let root = crate::root_bootstrap::load()?;
+        if root.activated || !state.create_request.is_empty() || state.imported {
+            bail!(crate::errcode::code("fleet.custodyOtherDevice"));
+        }
+        let id = client.server_identity(access).await?;
+        let instance =
+            decode_hex16(&id.server_instance_id, "server_instance_id").map_err(|_| mismatch())?;
+        let epoch = u64::try_from(id.restore_epoch).map_err(|_| mismatch())?;
+        if instance != binding.server_instance_id {
+            bail!(crate::errcode::code("fleet.custodyServerChanged"));
+        }
+        let generation = client
+            .active_fleet_generation(access, me.tenant_id, &fleet)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!(crate::errcode::code("fleet.createFleetKeyFirst")))?;
+        let (pages, _) = crate::team::ledger::closure_evidence(
+            client,
+            access,
+            me.tenant_id,
+            ledger.db,
+            ledger.pin,
+            &[my_key],
+            now,
+        )
+        .await?;
+        let (_, chain) = ledger.evaluate(&pages, now)?;
+        let mut named = false;
+        let found = evidence_records(&pages)
+            .into_iter()
+            .find_map(|(c, issuer, p)| {
+                let Payload::TenantRootKeyGrant(g) = p else {
+                    return None;
+                };
+                if g.subject_device_id != device {
+                    return None;
+                }
+                named = true;
+                let counted = g.variant == RootGrantVariant::ExistingRootGrant
+                    && (
+                        g.subject_account_id,
+                        g.subject_signing_key_id,
+                        g.recipient_hpke_key_id,
+                    ) == (account, my_key, my_hpke)
+                    && chain.custodian_at(&signing_key_id(&issuer), g.common.issued_at_ms)
+                    && g.open_trk(&hpke_secret).is_ok();
+                counted.then(|| (c.to_vec(), issuer))
+            });
+        let Some((container, issuer)) = found else {
+            bail!(crate::errcode::code(if named {
+                "fleet.handoverIssuerNotCustodian"
+            } else {
+                "fleet.handoverNoGrant"
+            }));
+        };
+        if !chain.custodian_now(&my_key, now) {
+            bail!(crate::errcode::code("fleet.handoverIssuerNotCustodian"));
+        }
+        let cx = Context16 {
+            tenant,
+            instance,
+            epoch,
+            account,
+            device,
+            signing_key_id: my_key,
+            hpke_key_id: my_hpke,
+        };
+        let grant = verified_root_grant(&container, &issuer)?.1;
+        let ack_request = hex(&cx.request(
+            OperationKind::RootGrantAck,
+            TenantRootGrantAckV2 { grant }.encode(),
+        )?);
+        let subject = GrantSubject::Device {
+            account_id: account,
+            device_id: device,
+            signing_key_id: my_key,
+            hpke_key_id: my_hpke,
+        };
+        let grants = capability_grants(&cx, me.signer, &subject, own_grants(&cx, tenant), now)?;
+        commit(state, save, |s| {
+            s.tenant_id = me.tenant_id.to_string();
+            s.device_id = me.device_id.to_string();
+            s.server_instance_id = hex(&instance);
+            s.restore_epoch = epoch;
+            s.handover = Some(Handover {
+                outgoing: hex(&signing_key_id(&issuer)),
+                accepted_generation: generation,
+                phase: "accepting".into(),
+                root_grant: hex(&container),
+                root_grant_issuer: hex(&issuer),
+                ack_request,
+                capability_grants: grants,
+                ..Default::default()
+            });
+        })?;
+        eprintln!("[handover] accept: requests saved, generation {generation}");
+    }
+    let h = state.handover.clone().ok_or_else(corrupt)?;
+    let cx = context(state)?;
+    if h.phase == "accepting" {
+        let ack = saved_request(&h.ack_request)?;
+        let sent =
+            TenantRootGrantAckV2::parse(&ack.canonical_payload_bytes).map_err(|_| corrupt())?;
+        let stored = client
+            .ack_root_grant(
+                access,
+                me.tenant_id,
+                sent.grant.root_generation,
+                &hex(&sent.grant.replay_id),
+                &ack.encode(),
+            )
+            .await?;
+        let acked = TenantRootGrantAckedV2::parse(&stored_payload(
+            &stored,
+            &ack,
+            RECORD_TYPE_ROOT_GRANT_ACKED,
+        )?)
+        .map_err(|_| mismatch())?;
+        if acked.grant != sent.grant {
+            return Err(mismatch());
+        }
+        let container = unhex_vec(&h.root_grant)?;
+        let issuer =
+            decode_hex32(&h.root_grant_issuer, "root_grant_issuer").map_err(|_| corrupt())?;
+        let (grant, _) = verified_root_grant(&container, &issuer)?;
+        let trk = grant.open_trk(&hpke_secret).map_err(|_| corrupt())?;
+        crate::recovery_import::check_root_grant(
+            client,
+            access,
+            me.tenant_id,
+            &container,
+            &issuer,
+            &hpke_secret,
+            &trk,
+        )
+        .await?;
+        root_save(&BootstrapState {
+            tenant_id: me.tenant_id.to_string(),
+            device_id: me.device_id.to_string(),
+            server_instance_id: state.server_instance_id.clone(),
+            restore_epoch: state.restore_epoch,
+            anchor: hex(&anchor),
+            root_grant: h.root_grant.clone(),
+            root_grant_issuer: h.root_grant_issuer.clone(),
+            activated: true,
+            ..Default::default()
+        })?;
+        commit(state, save, |s| {
+            s.imported = true;
+            if let Some(h) = s.handover.as_mut() {
+                h.phase = "accepted".into();
+            }
+        })?;
+        eprintln!("[handover] accept: root grant acknowledged, root state written");
+    }
+    if state
+        .handover
+        .as_ref()
+        .is_some_and(|h| h.phase == "accepted")
+    {
+        for grant in &h.capability_grants {
+            let grant = unhex_vec(grant)?;
+            if client.file_capability_grant(access, &grant).await? != grant {
+                return Err(mismatch());
+            }
+        }
+        let n = h.accepted_generation;
+        if collect().await? != n {
+            return Err(mismatch());
+        }
+        if h.own_grant_request.is_empty() {
+            let fkek = fleet_key(n)?;
+            let built = member_grant(
+                &cx,
+                me.signer,
+                (account, device),
+                (my_key, my_hpke, hpke_pk),
+                &fkek,
+                n,
+                now,
+            )?;
+            let grant =
+                FleetKeyGrantCreateV2::parse(&saved_request(&built)?.canonical_payload_bytes)
+                    .map_err(|_| corrupt())?
+                    .grant;
+            let ack = hex(&cx.request(
+                OperationKind::FleetGrantAck,
+                FleetKeyGrantAckV2 { grant }.encode(),
+            )?);
+            commit(state, save, |s| {
+                if let Some(h) = s.handover.as_mut() {
+                    h.own_grant_request = built.clone();
+                    h.own_ack_request = ack.clone();
+                }
+            })?;
+        }
+        let h = state.handover.clone().ok_or_else(corrupt)?;
+        send_grant(client, access, &fleet, n, &h.own_grant_request, false).await?;
+        send_grant(client, access, &fleet, n, &h.own_ack_request, true).await?;
+        if collect().await? != n {
+            return Err(mismatch());
+        }
+        commit(state, save, |s| {
+            if let Some(h) = s.handover.as_mut() {
+                h.phase = "granted".into();
+            }
+        })?;
+        eprintln!("[handover] accept: own grant of generation {n} collected");
+    }
+    Ok(())
+}
+
+/// 4.H steps 3 and 6: a recovery bundle holding `newest` was written with
+/// hash `sha256`. The first one after Accept is step 3; one written once
+/// this device rotated and re-sealed under that generation is step 6. Skipped
+/// while another custody run holds the state: export again to record it.
+pub fn handover_exported(newest: u64, sha256: &str) -> Result<()> {
+    let Ok(_running) = begin() else {
+        eprintln!("[handover] export not recorded: custody busy");
+        return Ok(());
+    };
+    let mut state = load()?;
+    let Some(h) = state.handover.as_mut() else {
+        return Ok(());
+    };
+    if h.phase != "granted" && h.phase != "done" {
+        return Ok(());
+    }
+    if h.first_export_sha256.is_empty() {
+        h.first_export_sha256 = sha256.to_string();
+    } else if h.rotated_generation > h.accepted_generation
+        && h.resealed_generation == h.rotated_generation
+        && newest >= h.rotated_generation
+    {
+        h.exported_sha256 = sha256.to_string();
+        h.exported_generation = newest;
+    } else {
+        return Ok(());
+    }
+    eprintln!("[handover] export recorded, generation {newest}");
+    save(&state)
+}
+
+/// 4.H step 5, under the custody lock the caller holds: `run` finished with
+/// no profile pending, with this hand-over's outgoing custodian.
+pub fn handover_resealed(run: &ResealRun) -> Result<()> {
+    let mut state = load()?;
+    let Some(h) = state.handover.as_mut() else {
+        return Ok(());
+    };
+    let finished = run.ended_ms.is_some()
+        && !run
+            .profiles
+            .values()
+            .any(|o| crate::team::sync::reseal_pending(o))
+        && run.outgoing.eq_ignore_ascii_case(&h.outgoing);
+    if !finished || h.resealed_generation == run.generation {
+        return Ok(());
+    }
+    h.resealed_generation = run.generation;
+    save(&state)
 }
 
 /// Set while Create fleet key runs in this process; the single-instance
@@ -2376,6 +3233,23 @@ pub struct FleetCustodyStatus {
     pub rotation_required: Option<RotationRequired>,
     /// The latest Re-seal all profiles run, if any.
     pub reseal: Option<ResealRun>,
+    /// The device this root custodian appointed (4.H step 1); empty if none.
+    pub handed_over_to: String,
+    /// The hand-over this device accepted, if any.
+    pub handover: Option<HandoverStatus>,
+}
+
+/// How far an accepted hand-over got: its checklist, no record of it.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct HandoverStatus {
+    pub outgoing: String,
+    pub accepted_generation: u64,
+    pub phase: String,
+    pub first_exported: bool,
+    pub rotated_generation: u64,
+    pub resealed_generation: u64,
+    pub exported_generation: u64,
+    pub reverts: BTreeMap<String, String>,
 }
 
 /// How far the latest rotation got: no secret of it.
@@ -2437,6 +3311,17 @@ pub fn status() -> Result<FleetCustodyStatus> {
         export_due: s.export_due,
         rotation_required: None,
         reseal: s.reseal,
+        handed_over_to: s.handed_over_to,
+        handover: s.handover.map(|h| HandoverStatus {
+            first_exported: !h.first_export_sha256.is_empty(),
+            outgoing: h.outgoing,
+            accepted_generation: h.accepted_generation,
+            phase: h.phase,
+            rotated_generation: h.rotated_generation,
+            resealed_generation: h.resealed_generation,
+            exported_generation: h.exported_generation,
+            reverts: h.reverts,
+        }),
     })
 }
 
@@ -3352,6 +4237,7 @@ pub(crate) mod tests {
             sas,
             |_| Ok(Zeroizing::new(FKEK)),
             |_| Ok(false),
+            None,
             now,
             &mut state,
             &mut |s| save(s),
@@ -3869,6 +4755,7 @@ pub(crate) mod tests {
                 "p".into(),
                 hex(&[0x0d; 16]),
                 "rekeyed".into(),
+                None,
             ))
             .unwrap_err();
         assert!(err.contains("fleet.revokeReasonUnsupported"), "{err}");
@@ -4365,6 +5252,7 @@ pub(crate) mod tests {
 
     use crate::team::db::Db;
     use shardx_core::fleet_lifecycle::FleetGrantTarget;
+    use shardx_core::fleet_profiles::FleetProfileHeadV2;
 
     /// This custodian's verified key of N = 0, and the N+1 key it holds
     /// after step 10, in the member tests.
@@ -4468,6 +5356,28 @@ pub(crate) mod tests {
         refuse: Option<Refuse>,
         /// Approvals get a receipt; otherwise they are refused.
         approves: bool,
+        /// Revocations get their stored reply; otherwise a 500.
+        revokes: bool,
+        /// The fleet's listed heads and their signed manifests (v2.10 4.H).
+        heads: Vec<FleetProfileHeadV2>,
+        manifests: BTreeMap<([u8; 16], u64), Vec<u8>>,
+        /// Root grants the server holds, by replay ID, read back acknowledged
+        /// under an ACTIVE root: (container, issuer public key).
+        root_grants: BTreeMap<[u8; 16], (Vec<u8>, [u8; 32])>,
+    }
+
+    /// The payload of `container`, signed by one of `keys`.
+    fn payload_of(keys: &[[u8; 32]], container: &[u8]) -> Payload {
+        keys.iter()
+            .find_map(|k| {
+                AuthorizationRecord::parse(container)
+                    .ok()?
+                    .verify_signature(k)
+                    .ok()
+            })
+            .expect("signed by a known key")
+            .payload()
+            .clone()
     }
 
     pub(crate) fn stored(
@@ -4500,11 +5410,112 @@ pub(crate) mod tests {
             }
             let json = |v: serde_json::Value| (200, serde_json::to_vec(&v).unwrap());
             let post = call.starts_with("POST ");
+            let mut keys = vec![self.custodian_pk];
+            keys.extend(&self.base_keys);
             match call {
                 "GET /v2/server-identity" => json(serde_json::json!({
                     "server_instance_id": hex(&self.instance),
                     "restore_epoch": self.epoch,
                 })),
+                c if post && c.contains("/root-key-generations/") && c.ends_with("/ack") => {
+                    let reply = stored(body, RECORD_TYPE_ROOT_GRANT_ACKED, |p| {
+                        TenantRootGrantAckedV2 {
+                            grant: TenantRootGrantAckV2::parse(p).unwrap().grant,
+                            acked_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (201, reply)
+                }
+                c if post && c.contains("/root-key-generations/") => {
+                    let mut filed = None;
+                    let reply = stored(body, RECORD_TYPE_ROOT_GRANT_CREATED, |p| {
+                        let f = TenantRootGrantCreateV2::parse(p).unwrap();
+                        let Payload::TenantRootKeyGrant(g) =
+                            payload_of(&keys, &f.exact_signed_grant_container_bytes)
+                        else {
+                            panic!("not a root grant");
+                        };
+                        filed = Some((f.grant.replay_id, f.exact_signed_grant_container_bytes));
+                        TenantRootGrantCreatedV2 {
+                            grant: f.grant,
+                            grant_variant: "ExistingRootGrant",
+                            subject_device_id: g.subject_device_id,
+                            recipient_hpke_key_id: g.recipient_hpke_key_id,
+                            created_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    if let Some((replay, container)) = filed {
+                        self.root_grants
+                            .insert(replay, (container, self.custodian_pk));
+                    }
+                    (201, reply)
+                }
+                c if c.contains("/root-key-generations/") => {
+                    let replay = c.rsplit('/').next().unwrap();
+                    match self
+                        .root_grants
+                        .get(&decode_hex16(replay, "replay").unwrap())
+                    {
+                        Some((container, issuer)) => {
+                            let record = AuthorizationRecord::parse(container)
+                                .unwrap()
+                                .verify_signature(issuer)
+                                .unwrap();
+                            let d = shardx_core::mutation::TenantRootGrantDescriptorV2::new(
+                                record,
+                                shardx_core::mutation::RootGrantState::Acknowledged,
+                                shardx_core::mutation::RootGenerationState::Active,
+                            )
+                            .unwrap();
+                            (200, d.encode())
+                        }
+                        None => (404, Vec::new()),
+                    }
+                }
+                c if post && self.revokes && c.ends_with("/revoke") => {
+                    let reply = stored(body, RECORD_TYPE_DEVICE_REVOKED, |p| {
+                        let sent = DeviceRevokeRequestV2::parse(p).unwrap();
+                        let Payload::DeviceRevocation(v) =
+                            payload_of(&keys, &sent.exact_signed_revocation_container_bytes)
+                        else {
+                            panic!("not a revocation");
+                        };
+                        DeviceRevokedV2 {
+                            tenant_id: v.common.tenant_id,
+                            subject_device_id: v.subject_device_id,
+                            replay_id: v.common.replay_id,
+                            signed_container_hash: sent.signed_container_hash,
+                            reason_code: v.reason_code,
+                            sessions_invalidated_count: 0,
+                            revoked_at_ms: 1,
+                        }
+                        .encode()
+                    });
+                    (200, reply)
+                }
+                c if c.contains("/profiles") && c.starts_with("GET /v2/fleets/") => (
+                    200,
+                    shardx_core::fleet_profiles::FleetProfilePageV2 {
+                        server_instance_id: self.instance,
+                        restore_epoch: self.epoch,
+                        tenant_id: self.tenant,
+                        fleet_id: self.tenant,
+                        profiles: self.heads.clone(),
+                        next_after: None,
+                    }
+                    .encode(),
+                ),
+                c if c.ends_with("/manifest") => {
+                    let parts: Vec<&str> = c.split('/').collect();
+                    let profile = decode_hex16(parts[3], "profile").unwrap();
+                    let version: u64 = parts[5].parse().unwrap();
+                    match self.manifests.get(&(profile, version)) {
+                        Some(m) => (200, m.clone()),
+                        None => (404, Vec::new()),
+                    }
+                }
                 c if c.ends_with("/key-generation") => match self.active {
                     Some(g) => json(serde_json::json!({ "generation": g })),
                     None => (200, b"null".to_vec()),
@@ -6508,6 +7519,7 @@ pub(crate) mod tests {
                 _ => bail!("no verified key of generation {generation}"),
             },
             |key| crate::team::ledger::withdrawn(&rig.db, &f.pin().0, key),
+            None,
             now_ms(),
             &mut state,
             &mut |s| save(s),
@@ -6730,5 +7742,1451 @@ pub(crate) mod tests {
         ] {
             assert!(!debug.contains(saved.as_str()));
         }
+    }
+
+    // ---- Root custody hand-over (v2.10 4.H, U6) ----
+
+    /// The HPKE secret of [`peer`] `i`.
+    fn peer_hpke_secret(i: u16) -> Zeroizing<Vec<u8>> {
+        let mut seed = [0x5c; 32];
+        seed[..2].copy_from_slice(&i.to_le_bytes());
+        seed[2] = 0x5d;
+        derive_keypair(&seed).0
+    }
+
+    /// The signing key of [`peer`] `i`.
+    fn peer_signer(i: u16) -> Ed25519SigningKey {
+        let mut seed = [0x5c; 32];
+        seed[..2].copy_from_slice(&i.to_le_bytes());
+        Ed25519SigningKey::from_bytes(&seed)
+    }
+
+    /// [`peer`] `i`, still pending.
+    fn pending(i: u16) -> TenantDevice {
+        TenantDevice {
+            status: "pending".into(),
+            ..peer(i)
+        }
+    }
+
+    /// A rig for Appoint: approvals and revocations answered, `rows` listed,
+    /// and a finished re-seal run for generation 0 saved.
+    fn appoint_rig(f: &Fixture, rows: Vec<TenantDevice>) -> Rig {
+        let rig = rig(f, |r| {
+            r.approves = true;
+            r.revokes = true;
+            r.devices = rows;
+        });
+        resealed(0);
+        rig
+    }
+
+    /// A finished re-seal run of `generation`, with nothing pending.
+    fn resealed(generation: u64) {
+        let mut state = load().unwrap();
+        state.reseal = Some(ResealRun {
+            generation,
+            started_ms: 1,
+            ended_ms: Some(2),
+            ..Default::default()
+        });
+        save(&state).unwrap();
+    }
+
+    fn appoint_with(
+        rig: &Rig,
+        f: &Fixture,
+        row: &TenantDevice,
+        save_with: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+    ) -> Result<()> {
+        let mut state = load().unwrap();
+        rig.rt.block_on(approve_member(
+            &rig.client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            &f.pin(),
+            row,
+            &f.code(row),
+            |_| Ok(Zeroizing::new(OLD_FKEK)),
+            |_| Ok(false),
+            Some(&f.root),
+            now_ms(),
+            &mut state,
+            save_with,
+        ))
+    }
+
+    fn appoint_of(rig: &Rig, f: &Fixture, row: &TenantDevice) -> Result<()> {
+        appoint_with(rig, f, row, &mut |s| save(s))
+    }
+
+    /// The POST calls the rig saw.
+    fn posts(rig: &Rig) -> Vec<String> {
+        rig.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("POST "))
+            .collect()
+    }
+
+    fn payload_in<T>(saved: &str, pk: &[u8; 32], take: impl FnOnce(Payload) -> Option<T>) -> T {
+        let bytes = unhex_vec(saved).unwrap();
+        let v = AuthorizationRecord::parse(&bytes)
+            .unwrap()
+            .verify_signature(pk)
+            .unwrap();
+        take(v.payload().clone()).unwrap()
+    }
+
+    /// The root grant container of the saved request `saved`.
+    fn filed_root_grant(saved: &str) -> Vec<u8> {
+        payload(saved, TenantRootGrantCreateV2::parse).exact_signed_grant_container_bytes
+    }
+
+    #[test]
+    fn appoint_files_a_tenant_approval_an_existing_root_grant_and_the_fleet_grant() {
+        let f = fixture();
+        let b = pending(9);
+        let rig = appoint_rig(&f, vec![b.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        let routes: Vec<String> = posts(&rig)
+            .into_iter()
+            .map(|c| c.rsplit('/').next().unwrap().to_string())
+            .collect();
+        assert_eq!(routes, ["approve", "grants", "grants"], "{:?}", rig.calls());
+        let calls = posts(&rig);
+        assert!(calls[1].contains("/root-key-generations/0/grants"));
+        assert!(calls[2].contains("/key-generations/0/grants"));
+
+        let state = load().unwrap();
+        assert_eq!(state.handed_over_to, b.device_id);
+        assert_eq!(state.handed_over_generation, 0);
+        let m = &state.members[&b.device_id];
+        assert!(
+            m.capability_grants.is_empty(),
+            "the appointee files its own"
+        );
+        let pk = f.signer.verifying_key().to_bytes();
+        let approval = payload_in(&m.approval, &pk, |p| match p {
+            Payload::DeviceApproval(a) => Some(a),
+            _ => None,
+        });
+        assert!(matches!(
+            approval.approval_scope_kind,
+            ApprovalScopeKind::Tenant
+        ));
+        let (signing, hpke, _) = listed_keys(&b).unwrap();
+        let container = filed_root_grant(&m.root_grant);
+        let (g, _) = verified_root_grant(&container, &pk).unwrap();
+        assert_eq!(g.variant, RootGrantVariant::ExistingRootGrant);
+        assert_eq!(
+            (g.subject_signing_key_id, g.recipient_hpke_key_id),
+            (signing, hpke)
+        );
+        assert_eq!(
+            g.subject_device_approval_replay_id,
+            approval.common.replay_id
+        );
+        assert_eq!(*g.open_trk(&peer_hpke_secret(9)).unwrap(), TRK);
+        let grant = payload(&m.grant_request, FleetKeyGrantCreateV2::parse);
+        assert_eq!(grant.grant.generation.generation, 0);
+    }
+
+    #[test]
+    fn appoint_records_run_730_days() {
+        let f = fixture();
+        let b = pending(9);
+        let rig = appoint_rig(&f, vec![b.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        let state = load().unwrap();
+        let m = &state.members[&b.device_id];
+        let pk = f.signer.verifying_key().to_bytes();
+        let approval = payload_in(&m.approval, &pk, |p| match p {
+            Payload::DeviceApproval(a) => Some(a.common),
+            _ => None,
+        });
+        let (g, _) = verified_root_grant(&filed_root_grant(&m.root_grant), &pk).unwrap();
+        for common in [approval, g.common] {
+            assert_eq!(common.not_after_ms - common.not_before_ms, 63_072_000_000);
+            assert_eq!(
+                common.not_after_ms - common.not_before_ms,
+                shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS
+            );
+        }
+    }
+
+    #[test]
+    fn appoint_refuses_while_a_head_is_under_a_retired_generation() {
+        let f = fixture();
+        let b = pending(9);
+        let rig = appoint_rig(&f, vec![b.clone()]);
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            rot.active = Some(1);
+            listed_head(&mut rot, [0xe1; 16], 1, 0, &f.signer);
+        }
+        // Without a finished re-seal of generation 1, then with one: the
+        // head under 0 refuses both.
+        for run in [false, true] {
+            if run {
+                resealed(1);
+            }
+            let err = appoint_of(&rig, &f, &b).unwrap_err();
+            assert!(has(&err, "fleet.handoverNeedsReseal"), "{err}");
+            assert!(posts(&rig).is_empty(), "nothing sent");
+            assert!(load().unwrap().members[&b.device_id].approval.is_empty());
+        }
+    }
+
+    #[test]
+    fn appoint_resumes_with_byte_identical_requests() {
+        let f = fixture();
+        let b = pending(9);
+        let rig = appoint_rig(&f, vec![b.clone()]);
+        let mut failed = false;
+        let err = appoint_with(&rig, &f, &b, &mut |s| {
+            if !s.handed_over_to.is_empty() && !failed {
+                failed = true;
+                bail!("save failed");
+            }
+            save(s)
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "save failed");
+        assert!(load().unwrap().handed_over_to.is_empty());
+        appoint_of(&rig, &f, &b).unwrap();
+        assert_eq!(load().unwrap().handed_over_to, b.device_id);
+        let approvals = rig.bodies("/approve");
+        let grants = rig.bodies("/grants");
+        assert_eq!(approvals.len(), 2);
+        assert_eq!(approvals[0], approvals[1]);
+        // The root grant twice, byte-identical, then the fleet grant once.
+        assert_eq!(grants.len(), 3);
+        assert_eq!(grants[0], grants[1]);
+    }
+
+    #[test]
+    fn appoint_refuses_a_listed_key_that_differs_from_the_joined_one() {
+        let f = fixture();
+        let b = pending(9);
+        let swapped = rekeyed(&b, 0x77);
+        let rig = appoint_rig(&f, vec![swapped.clone()]);
+        let mut state = load().unwrap();
+        let err = rig
+            .rt
+            .block_on(approve_member(
+                &rig.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &f.pin(),
+                &swapped,
+                &f.code(&b),
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                |_| Ok(false),
+                Some(&f.root),
+                now_ms(),
+                &mut state,
+                &mut |s| save(s),
+            ))
+            .unwrap_err();
+        assert!(has(&err, "fleet.joinCodeMismatch"), "{err}");
+        assert!(posts(&rig).is_empty());
+        assert!(load().unwrap().handed_over_to.is_empty());
+    }
+
+    #[test]
+    fn a_second_appointment_while_one_is_in_progress_is_refused() {
+        let f = fixture();
+        let (b, c) = (pending(9), pending(10));
+        let rig = appoint_rig(&f, vec![b.clone(), c.clone()]);
+        // B's requests are saved but not yet filed: C waits, as a member.
+        let mut failed = false;
+        let _ = appoint_with(&rig, &f, &b, &mut |s| {
+            if s.members
+                .get(&b.device_id)
+                .is_some_and(|m| !m.root_grant.is_empty())
+                && !failed
+            {
+                failed = true;
+                save(s)?;
+                bail!("stopped");
+            }
+            save(s)
+        });
+        assert!(load().unwrap().handed_over_to.is_empty());
+        rig.clear();
+        let err = appoint_of(&rig, &f, &c).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+        let err = approve_on(&rig, &f, &c, &f.code(&c)).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+        assert!(posts(&rig).is_empty());
+        // Once B's appointment is filed, C is refused too.
+        appoint_of(&rig, &f, &b).unwrap();
+        let err = appoint_of(&rig, &f, &c).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+    }
+
+    #[test]
+    fn a_custodian_that_appointed_refuses_approve_rotate_reseal_export_and_renewal() {
+        let f = fixture();
+        let (b, c) = (pending(9), pending(10));
+        let mut rig = appoint_rig(&f, vec![b.clone(), c.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        crate::root_bootstrap::save(&f.root).unwrap();
+        rig.clear();
+        let refused = |e: anyhow::Error| assert!(has(&e, "fleet.custodyHandedOver"), "{e}");
+        // Approve.
+        refused(approve_on(&rig, &f, &c, &f.code(&c)).unwrap_err());
+        // Rotate.
+        refused(rig.rotate(&f, rig.now).unwrap_err());
+        // Re-seal.
+        let (_, pk) = derive_keypair(&f.seed);
+        let dev = crate::team::sync::Device {
+            signer: Ed25519SigningKey::from_bytes(&f.signer.to_bytes()),
+            me: shardx_core::trust_chain::Recipient {
+                account_id: f.cx.account,
+                device_id: f.cx.device,
+                signing_key_id: f.cx.signing_key_id,
+                hpke_key_id: hpke_key_id(&pk),
+            },
+            pin: f.pin(),
+        };
+        let free = |_: &str| Some(Box::new(()) as Box<dyn Send>);
+        refused(
+            rig.rt
+                .block_on(crate::team::sync::reseal_all(
+                    &rig.client,
+                    "access",
+                    &dev,
+                    f.cx.tenant,
+                    None,
+                    &free,
+                    rig.now,
+                    &mut |s: &FleetCustodyState| save(s),
+                ))
+                .unwrap_err(),
+        );
+        // Export.
+        let path = f._dir.path().join("again.shardx-recovery");
+        let recovery = crate::root_bootstrap::RecoveryExport {
+            path: &path,
+            passphrase: "passphrase",
+        };
+        refused(
+            rig.rt
+                .block_on(crate::root_bootstrap::export_again(
+                    &rig.client,
+                    "access",
+                    &f.tenant,
+                    &f.signer,
+                    &f.seed,
+                    vec![(0, Zeroizing::new(OLD_FKEK))],
+                    &recovery,
+                ))
+                .unwrap_err(),
+        );
+        assert!(!path.exists());
+        // Renewal (U5) never renews a handed-over root.
+        let mut root = crate::root_bootstrap::load().unwrap();
+        let me = crate::root_bootstrap::RenewingDevice {
+            account_id: &f.account,
+            signer: &f.signer,
+            hpke_seed: &f.seed,
+        };
+        let outcome = rig
+            .rt
+            .block_on(crate::root_bootstrap::renew(
+                &rig.client,
+                "access",
+                &me,
+                &load().unwrap(),
+                None,
+                rig.now,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                async |_| Ok(()),
+                &mut root,
+                &mut |s| crate::root_bootstrap::save(s),
+            ))
+            .unwrap();
+        assert_eq!(outcome, crate::root_bootstrap::RenewalOutcome::HandedOver);
+        assert!(posts(&rig).is_empty(), "nothing filed: {:?}", rig.calls());
+    }
+
+    fn revoke_on(rig: &mut Rig, f: &Fixture, row: &TenantDevice) -> Result<()> {
+        let mut state = load().unwrap();
+        rig.rt.block_on(revoke_member(
+            &rig.client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            row,
+            DeviceRevocationReason::Retired,
+            None,
+            now_ms(),
+            &mut state,
+            &mut |s| save(s),
+        ))
+    }
+
+    #[test]
+    fn revoking_the_appointee_cancels_the_hand_over() {
+        let f = fixture();
+        let (b, c, m) = (pending(9), pending(10), peer(11));
+        let mut rig = appoint_rig(&f, vec![b.clone(), c.clone(), m.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        // Only the appointee may be revoked meanwhile.
+        let err = revoke_on(&mut rig, &f, &m).unwrap_err();
+        assert!(has(&err, "fleet.custodyHandedOver"), "{err}");
+        revoke_on(&mut rig, &f, &b).unwrap();
+        let state = load().unwrap();
+        assert!(state.handed_over_to.is_empty());
+        assert!(state.revocations.contains_key(&b.device_id));
+        // Custody is this device's again: another appointment goes through.
+        appoint_of(&rig, &f, &c).unwrap();
+        assert_eq!(load().unwrap().handed_over_to, c.device_id);
+    }
+
+    #[test]
+    fn revoking_the_appointee_after_its_rotation_is_refused() {
+        let f = fixture();
+        let b = pending(9);
+        let mut rig = appoint_rig(&f, vec![b.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        rig.rot.lock().unwrap().active = Some(1);
+        rig.clear();
+        let err = revoke_on(&mut rig, &f, &b).unwrap_err();
+        assert!(has(&err, "fleet.handoverPastRotation"), "{err}");
+        assert!(posts(&rig).is_empty());
+        let state = load().unwrap();
+        assert_eq!(state.handed_over_to, b.device_id);
+        assert!(state.revocations.is_empty());
+    }
+
+    #[test]
+    fn cancel_is_refused_while_a_preparing_generation_created_after_the_appointment_exists() {
+        let f = fixture();
+        let b = pending(9);
+        let mut rig = appoint_rig(&f, vec![b.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        // B created generation 1 (still PREPARING) and filed its own grant.
+        let signer = peer_signer(9);
+        let (signing, hpke, hpke_pk) = listed_keys(&b).unwrap();
+        let ids = (
+            decode_hex16(&b.account_id, "a").unwrap(),
+            decode_hex16(&b.device_id, "d").unwrap(),
+        );
+        let cx_b = Context16 {
+            account: ids.0,
+            device: ids.1,
+            signing_key_id: signing,
+            hpke_key_id: hpke,
+            ..f.cx
+        };
+        let own = member_grant(
+            &cx_b,
+            &signer,
+            ids,
+            (signing, hpke, hpke_pk),
+            &NEW_FKEK,
+            1,
+            now_ms(),
+        );
+        let own = payload(&own.unwrap(), FleetKeyGrantCreateV2::parse);
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            rot.base.push(own.exact_signed_grant_container_bytes);
+            rot.base_keys.push(signer.verifying_key().to_bytes());
+        }
+        rig.clear();
+        let err = revoke_on(&mut rig, &f, &b).unwrap_err();
+        assert!(has(&err, "fleet.handoverPastRotation"), "{err}");
+        assert!(posts(&rig).is_empty());
+        assert_eq!(rig.rot.lock().unwrap().active, Some(0));
+    }
+
+    // ---- The new custodian's side ----
+
+    /// A signed manifest of `profile` at `version` under `generation` by
+    /// `by`, listed as the fleet's head.
+    fn listed_head(
+        rot: &mut Rot,
+        profile: [u8; 16],
+        version: u64,
+        generation: u64,
+        by: &Ed25519SigningKey,
+    ) {
+        use shardx_core::snapshot_v2::{SignedSnapshotManifestV2, SnapshotManifestV2};
+        let manifest = SnapshotManifestV2 {
+            snapshot_id: [1; 16],
+            tenant_id: rot.tenant,
+            fleet_id: rot.tenant,
+            profile_id: profile,
+            lease_id: [2; 16],
+            target_version: version,
+            base_version: version - 1,
+            fencing_token: 1,
+            key_generation: generation,
+            fkek_key_id: [3; 32],
+            preamble_sha256: [4; 32],
+            intent_hash: [5; 32],
+            dek_slot_sha256: [6; 32],
+            ciphertext_sha256: [7; 32],
+            ciphertext_size: 1,
+            previous_signed_head_hash: (version > 1).then_some([8; 32]),
+            signer_signing_key_id: signing_key_id(by.verifying_key().as_bytes()),
+            server_instance_id: rot.instance,
+            restore_epoch: rot.epoch,
+            manifest_replay_id: [9; 16],
+            created_at_ms: 1,
+        };
+        let m = SignedSnapshotManifestV2::sign(by, &manifest).unwrap();
+        rot.heads.retain(|h| h.profile_id != profile);
+        rot.heads.insert(
+            rot.heads.partition_point(|h| h.profile_id < profile),
+            FleetProfileHeadV2 {
+                profile_id: profile,
+                current_version: version,
+                current_signed_head_hash: Some(m.head_hash()),
+                key_generation: generation,
+                label_ciphertext: vec![0; 16],
+            },
+        );
+        rot.manifests
+            .insert((profile, version), m.exact_bytes().to_vec());
+    }
+
+    const X: [u8; 16] = [0xe1; 16];
+    const Y: [u8; 16] = [0xe2; 16];
+
+    /// This device as a new root custodian whose hand-over from [`peer`] 1
+    /// went through every step for generation 1, against a rig whose fleet
+    /// lists X under 1 signed here and Y re-sealed here too.
+    fn handed_over_rig(f: &Fixture) -> (Rig, TenantDevice) {
+        let old = peer(1);
+        let rig = rig(f, |r| {
+            r.active = Some(1);
+            r.revokes = true;
+        });
+        let mut state = load().unwrap();
+        state.create_request.clear();
+        state.imported = true;
+        state.handover = Some(Handover {
+            outgoing: old.signing_key_id.clone(),
+            accepted_generation: 0,
+            phase: "granted".into(),
+            first_export_sha256: "aa".into(),
+            rotated_generation: 1,
+            resealed_generation: 1,
+            exported_sha256: "bb".into(),
+            exported_generation: 1,
+            ..Default::default()
+        });
+        state.reseal = Some(ResealRun {
+            generation: 1,
+            outgoing: old.signing_key_id.clone(),
+            started_ms: 1,
+            ended_ms: Some(2),
+            profiles: [
+                (hex(&X), "resealed:2".to_string()),
+                (hex(&Y), "current".to_string()),
+            ]
+            .into(),
+        });
+        save(&state).unwrap();
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            listed_head(&mut rot, X, 2, 1, &f.signer);
+            listed_head(&mut rot, Y, 1, 1, &f.signer);
+        }
+        (rig, old)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn revoke_old(
+        rig: &Rig,
+        f: &Fixture,
+        row: &TenantDevice,
+        reason: DeviceRevocationReason,
+        reverts: &[String],
+        reverted: &Arc<Mutex<Vec<(String, usize)>>>,
+    ) -> Result<()> {
+        let mut state = load().unwrap();
+        let log = reverted.clone();
+        let seen = rig.seen.clone();
+        rig.rt.block_on(revoke_outgoing(
+            &rig.client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            &f.pin().0,
+            row,
+            reason,
+            reverts,
+            move |p: String| {
+                let sent = seen.lock().unwrap().len();
+                log.lock().unwrap().push((p, sent));
+                async { Ok(7) }
+            },
+            now_ms(),
+            &mut state,
+            &mut |s| save(s),
+        ))
+    }
+
+    fn revoke_posts(rig: &Rig) -> usize {
+        posts(rig).iter().filter(|c| c.ends_with("/revoke")).count()
+    }
+
+    #[test]
+    fn the_old_root_revoke_is_refused_until_every_head_is_resealed() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        // Y's head is sealed under 0. The listing names the generation each
+        // profile was published under, as the server keeps it: X's head is
+        // re-sealed under 1 though X was published under 0.
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            listed_head(&mut rot, Y, 1, 0, &f.signer);
+            rot.heads[0].key_generation = 0;
+        }
+        let log = Arc::default();
+        for reason in [
+            DeviceRevocationReason::Retired,
+            DeviceRevocationReason::Lost,
+        ] {
+            let err = revoke_old(&rig, &f, &old, reason, &[hex(&Y)], &log).unwrap_err();
+            assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+            assert!(err.to_string().contains(&hex(&Y)), "{err}");
+            assert!(!err.to_string().contains(&hex(&X)), "{err}");
+        }
+        assert_eq!(revoke_posts(&rig), 0);
+        assert!(load().unwrap().revocations.is_empty());
+    }
+
+    #[test]
+    fn the_old_root_revoke_is_refused_before_the_rotation_or_the_exports() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        let log = Arc::default();
+        let base = load().unwrap();
+        type Edit = fn(&mut Handover);
+        let steps: [(&str, Edit); 5] = [
+            ("accept", |h| h.phase = "accepted".into()),
+            ("export", |h| h.first_export_sha256.clear()),
+            ("rotate", |h| h.rotated_generation = 0),
+            ("reseal", |h| h.resealed_generation = 0),
+            ("export-again", |h| h.exported_generation = 0),
+        ];
+        for (step, edit) in steps {
+            let mut state = base.clone();
+            edit(state.handover.as_mut().unwrap());
+            save(&state).unwrap();
+            let err =
+                revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+            assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+            assert!(err.to_string().contains(&format!("step={step}")), "{err}");
+        }
+        assert_eq!(revoke_posts(&rig), 0);
+        // The direct Revoke never files it either.
+        let mut state = base;
+        let err = rig
+            .rt
+            .block_on(revoke_member(
+                &rig.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &old,
+                DeviceRevocationReason::Retired,
+                None,
+                now_ms(),
+                &mut state,
+                &mut |s| save(s),
+            ))
+            .unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert_eq!(revoke_posts(&rig), 0);
+    }
+
+    #[test]
+    fn a_profile_pushed_by_the_old_root_after_the_reseal_blocks_a_retired_revoke() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        listed_head(&mut rig.rot.lock().unwrap(), X, 3, 1, &peer_signer(1));
+        let log = Arc::default();
+        let err =
+            revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert!(err.to_string().contains(&hex(&X)), "{err}");
+        assert_eq!(revoke_posts(&rig), 0);
+    }
+
+    #[test]
+    fn a_lost_old_root_that_keeps_pushing_after_the_reseal_can_be_revoked() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        listed_head(&mut rig.rot.lock().unwrap(), X, 3, 1, &peer_signer(1));
+        let log = Arc::default();
+        for wrong in [vec![], vec![hex(&X), hex(&Y)]] {
+            let err =
+                revoke_old(&rig, &f, &old, DeviceRevocationReason::Lost, &wrong, &log).unwrap_err();
+            assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        }
+        assert_eq!(revoke_posts(&rig), 0);
+        revoke_old(
+            &rig,
+            &f,
+            &old,
+            DeviceRevocationReason::Lost,
+            &[hex(&X)],
+            &log,
+        )
+        .unwrap();
+        assert_eq!(revoke_posts(&rig), 1);
+        let state = load().unwrap();
+        let vk = f.signer.verifying_key().to_bytes();
+        let saved = saved_revocation(&state.revocations[&old.device_id], &vk).unwrap();
+        assert_eq!(saved.reason_code, DeviceRevocationReason::Lost);
+        assert_eq!(state.handover.unwrap().phase, "done");
+    }
+
+    #[test]
+    fn the_lost_path_reverts_the_listed_profiles_right_after_the_revoke() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        listed_head(&mut rig.rot.lock().unwrap(), X, 3, 1, &peer_signer(1));
+        let log: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
+        // The revoke's reply is lost: nothing is reverted yet.
+        rig.rot.lock().unwrap().revokes = false;
+        revoke_old(
+            &rig,
+            &f,
+            &old,
+            DeviceRevocationReason::Lost,
+            &[hex(&X)],
+            &log,
+        )
+        .unwrap_err();
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(
+            load().unwrap().handover.unwrap().reverts,
+            [(hex(&X), "pending".to_string())].into()
+        );
+        // Resumed with the row revoked: the stored reply, then the revert.
+        rig.rot.lock().unwrap().revokes = true;
+        let revoked = TenantDevice {
+            status: "revoked".into(),
+            ..old.clone()
+        };
+        revoke_old(&rig, &f, &revoked, DeviceRevocationReason::Lost, &[], &log).unwrap();
+        let reverted = log.lock().unwrap().clone();
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].0, hex(&X));
+        let calls = rig.calls();
+        let last_revoke = calls.iter().rposition(|c| c.ends_with("/revoke")).unwrap();
+        assert!(reverted[0].1 > last_revoke, "reverted after the revoke");
+        let h = load().unwrap().handover.unwrap();
+        assert_eq!(h.reverts, [(hex(&X), "reverted:7".to_string())].into());
+        assert_eq!(h.phase, "done");
+    }
+
+    #[test]
+    fn a_saved_old_root_revocation_rechecks_readiness_on_resend() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        let log = Arc::default();
+        rig.rot.lock().unwrap().revokes = false;
+        revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+        assert_eq!(revoke_posts(&rig), 1);
+        assert!(load().unwrap().revocations.contains_key(&old.device_id));
+        // The old root pushes before the resend.
+        rig.rot.lock().unwrap().revokes = true;
+        listed_head(&mut rig.rot.lock().unwrap(), Y, 2, 1, &peer_signer(1));
+        let err =
+            revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert_eq!(revoke_posts(&rig), 1, "not resent");
+    }
+
+    #[test]
+    fn the_guarded_revoke_resumes_after_a_lost_reply_without_rechecking_readiness() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        let log = Arc::default();
+        rig.rot.lock().unwrap().revokes = false;
+        revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+        let first = rig.bodies("/revoke");
+        // The row reads revoked: a blocker now would not stop the resend.
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            rot.revokes = true;
+            listed_head(&mut rot, Y, 2, 1, &peer_signer(1));
+        }
+        rig.clear();
+        let revoked = TenantDevice {
+            status: "revoked".into(),
+            ..old
+        };
+        revoke_old(
+            &rig,
+            &f,
+            &revoked,
+            DeviceRevocationReason::Retired,
+            &[],
+            &log,
+        )
+        .unwrap();
+        assert_eq!(rig.bodies("/revoke"), first, "the saved bytes");
+        assert!(
+            !rig.calls().iter().any(|c| c.contains("/profiles")),
+            "no readiness check: {:?}",
+            rig.calls()
+        );
+        assert_eq!(load().unwrap().handover.unwrap().phase, "done");
+    }
+
+    #[test]
+    fn the_old_root_revoke_refuses_compromised() {
+        let f = fixture();
+        let (mut rig, old) = handed_over_rig(&f);
+        let log = Arc::default();
+        let err = revoke_old(
+            &rig,
+            &f,
+            &old,
+            DeviceRevocationReason::Compromised,
+            &[],
+            &log,
+        )
+        .unwrap_err();
+        assert!(has(&err, "fleet.revokeOutgoingReason"), "{err}");
+        let pin = f.pin();
+        let mut state = load().unwrap();
+        let mut ledger = Ledger {
+            db: &mut rig.db,
+            pin: &pin,
+        };
+        let err = rig
+            .rt
+            .block_on(revoke_member(
+                &rig.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &old,
+                DeviceRevocationReason::Compromised,
+                Some(&mut ledger),
+                now_ms(),
+                &mut state,
+                &mut |s| save(s),
+            ))
+            .unwrap_err();
+        assert!(has(&err, "fleet.revokeOutgoingReason"), "{err}");
+        assert!(posts(&rig).is_empty());
+        assert!(load().unwrap().revocations.is_empty());
+    }
+
+    #[test]
+    fn the_readiness_check_includes_profiles_bound_here_that_the_listing_omits() {
+        let f = fixture();
+        let (rig, old) = handed_over_rig(&f);
+        let hidden = [0xe9; 16];
+        let db = crate::team::db::Db::open().unwrap();
+        db.conn
+            .execute_batch(&format!(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO profile_bindings(local_profile_id, server_id, server_instance_id,
+                   tenant_id, account_id, device_id, fleet_id, remote_profile_id, remote_version,
+                   base_version, accepted_restore_epoch, fkek_key_id, key_generation, sync_state,
+                   dirty, last_observed_head_hash)
+                 VALUES ('local-hidden', 's', '{i}', '{t}', '{a}', '{d}', '{t}', '{p}', 1, 1, 0,
+                   '{k}', 1, 'AVAILABLE', 0, X'{k}');",
+                i = hex(&f.cx.instance),
+                t = hex(&f.cx.tenant),
+                a = hex(&f.cx.account),
+                d = hex(&f.cx.device),
+                p = hex(&hidden),
+                k = "cd".repeat(32),
+            ))
+            .unwrap();
+        drop(db);
+        let log = Arc::default();
+        let err =
+            revoke_old(&rig, &f, &old, DeviceRevocationReason::Retired, &[], &log).unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert!(err.to_string().contains(&hex(&hidden)), "{err}");
+        assert_eq!(revoke_posts(&rig), 0);
+    }
+
+    #[test]
+    fn the_new_custodians_rotation_skips_the_outgoing_custodian() {
+        let f = fixture();
+        let (old, m) = (peer(1), peer(2));
+        let mut rig = at_members(&f, vec![old.clone(), m.clone()]);
+        let now = rig.now;
+        save_approval(&f, &old, now, now + 365 * DAY_MS);
+        save_approval(&f, &m, now, now + 365 * DAY_MS);
+        let mut state = load().unwrap();
+        state.handover = Some(Handover {
+            outgoing: old.signing_key_id.clone(),
+            accepted_generation: 0,
+            phase: "granted".into(),
+            ..Default::default()
+        });
+        save(&state).unwrap();
+        rig.members(&f, now).unwrap();
+        assert_eq!(
+            results(),
+            [
+                (
+                    old.device_id.clone(),
+                    "skipped:outgoing-custodian".to_string()
+                ),
+                (m.device_id.clone(), "filed".to_string()),
+            ]
+        );
+        assert_eq!(rig.bodies("/grants").len(), 1);
+        assert_eq!(load().unwrap().handover.unwrap().rotated_generation, 1);
+    }
+
+    /// The old root A (signing seed 0x41) that appointed this device: its
+    /// own evidence, its tenant approval of this device and the root grant
+    /// `issuer` signed to `to` (this device's keys unless given), all served
+    /// by a rig pinned to A, whose root grant reads back acknowledged.
+    struct Old {
+        a: Ed25519SigningKey,
+        pin: (Binding, [u8; 32]),
+        rig: Rig,
+    }
+
+    fn old_root(f: &Fixture, issuer: Option<&Ed25519SigningKey>, to: Option<[u8; 32]>) -> Old {
+        let a = Ed25519SigningKey::from_bytes(&[0x41; 32]);
+        let a_seed = [0x42; 32];
+        let (_, a_pk) = derive_keypair(&a_seed);
+        let cx_a = Context16 {
+            device: [0x41; 16],
+            signing_key_id: signing_key_id(a.verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&a_pk),
+            ..f.cx
+        };
+        let now = now_ms();
+        let mut common = cx_a.common([8; 16], now);
+        common.not_after_ms = now + 365 * DAY_MS;
+        let own_approval = DeviceApprovalV2 {
+            common,
+            subject_account_id: cx_a.account,
+            subject_device_id: cx_a.device,
+            subject_signing_key_id: cx_a.signing_key_id,
+            subject_hpke_key_id: cx_a.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: f.cx.tenant,
+        };
+        let a_subject = GrantSubject::Device {
+            account_id: cx_a.account,
+            device_id: cx_a.device,
+            signing_key_id: cx_a.signing_key_id,
+            hpke_key_id: cx_a.hpke_key_id,
+        };
+        let mut base = vec![
+            build_record(&a, DOMAIN_DEVICE_APPROVAL, &own_approval.encode()),
+            crate::root_bootstrap::self_grant(&cx_a, &a, &a_pk, &TRK, [8; 16], now).unwrap(),
+        ];
+        let grants = capability_grants(&cx_a, &a, &a_subject, own_grants(&cx_a, f.cx.tenant), now);
+        base.extend(grants.unwrap().iter().map(|g| unhex_vec(g).unwrap()));
+        // A's tenant approval of this device and the root grant.
+        let (_, my_pk) = derive_keypair(&f.seed);
+        let approval = DeviceApprovalV2 {
+            common: cx_a.common([0x31; 16], now),
+            subject_account_id: f.cx.account,
+            subject_device_id: f.cx.device,
+            subject_signing_key_id: f.cx.signing_key_id,
+            subject_hpke_key_id: f.cx.hpke_key_id,
+            approval_scope_kind: ApprovalScopeKind::Tenant,
+            approval_scope_id: f.cx.tenant,
+        };
+        let by = issuer.unwrap_or(&a);
+        let mut grant = TenantRootKeyGrantV2 {
+            common: cx_a.common([0x32; 16], now),
+            variant: RootGrantVariant::ExistingRootGrant,
+            root_key_id: shardx_core::keys::root_key_id(&TRK),
+            root_generation: 0,
+            subject_account_id: f.cx.account,
+            subject_device_id: f.cx.device,
+            subject_signing_key_id: to.unwrap_or(f.cx.signing_key_id),
+            recipient_hpke_key_id: f.cx.hpke_key_id,
+            subject_device_approval_replay_id: [0x31; 16],
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let sealed = seal_trk(&my_pk, &grant.scope(), &TRK).unwrap();
+        grant.hpke_encapped_key_bytes = sealed.encapped_key_bytes.try_into().unwrap();
+        grant.hpke_wrapped_trk_bytes = sealed.ciphertext_bytes.try_into().unwrap();
+        let container = build_record(by, DOMAIN_TENANT_ROOT_KEY_GRANT, &grant.encode());
+        base.push(build_record(&a, DOMAIN_DEVICE_APPROVAL, &approval.encode()));
+        base.push(container.clone());
+        let pin = (
+            Binding {
+                server_instance_id: f.cx.instance,
+                tenant_id: f.cx.tenant,
+            },
+            cx_a.signing_key_id,
+        );
+        let mut rot = Rot {
+            tenant: f.cx.tenant,
+            instance: f.cx.instance,
+            active: Some(0),
+            custodian_pk: a.verifying_key().to_bytes(),
+            base,
+            base_keys: [f.signer.verifying_key(), by.verifying_key()]
+                .iter()
+                .map(|k| k.to_bytes())
+                .filter(|k| *k != a.verifying_key().to_bytes())
+                .collect(),
+            ..Default::default()
+        };
+        rot.root_grants
+            .insert([0x32; 16], (container, by.verifying_key().to_bytes()));
+        let rot = Arc::new(Mutex::new(rot));
+        let answer = rot.clone();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(Arc::new(move |call: &str, body: &[u8]| {
+            answer.lock().unwrap().answer(call, body)
+        })));
+        let db = Db::open_at(&f._dir.path().join("team-ledger.db")).unwrap();
+        crate::team::ledger::pin_anchor(&db, &pin.0, &pin.1, crate::team::ledger::BOOTSTRAP, now)
+            .unwrap();
+        Old {
+            a,
+            pin,
+            rig: Rig {
+                rt,
+                client,
+                seen,
+                rot,
+                db,
+                now,
+            },
+        }
+    }
+
+    type Collected = Arc<Mutex<Vec<(bool, usize)>>>;
+
+    /// Accept on `old`'s rig, the root state written through `root_save`;
+    /// each collect notes whether the own grant was still unbuilt and how
+    /// many grant filings were sent by then.
+    fn accept_on(
+        f: &Fixture,
+        old: &mut Old,
+        collected: &Collected,
+        save_with: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+        root_save: &mut impl FnMut(&BootstrapState) -> Result<()>,
+    ) -> Result<()> {
+        let mut state = load().unwrap();
+        let (log, seen) = (collected.clone(), old.rig.seen.clone());
+        let pin = old.pin;
+        let mut ledger = Ledger {
+            db: &mut old.rig.db,
+            pin: &pin,
+        };
+        old.rig.rt.block_on(accept_custody(
+            &old.rig.client,
+            "access",
+            &f.device(&CredentialFkekStore),
+            &mut ledger,
+            |_| Ok(Zeroizing::new(OLD_FKEK)),
+            move || {
+                let unbuilt = load()
+                    .unwrap()
+                    .handover
+                    .is_none_or(|h| h.own_grant_request.is_empty());
+                let filings = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(c, _)| {
+                        c.starts_with("POST ") && c.ends_with("/key-generations/0/grants")
+                    })
+                    .count();
+                log.lock().unwrap().push((unbuilt, filings));
+                async { Ok(0) }
+            },
+            now_ms(),
+            &mut state,
+            save_with,
+            root_save,
+        ))
+    }
+
+    fn accept_plain(f: &Fixture, old: &mut Old) -> Result<()> {
+        accept_on(f, old, &Collected::default(), &mut |s| save(s), &mut |s| {
+            crate::root_bootstrap::save(s)
+        })
+    }
+
+    #[test]
+    fn accept_refuses_a_root_grant_the_chain_does_not_count() {
+        let f = fixture();
+        let x = Ed25519SigningKey::from_bytes(&[0x58; 32]);
+        let mut old = old_root(&f, Some(&x), None);
+        save(&FleetCustodyState::default()).unwrap();
+        let err = accept_plain(&f, &mut old).unwrap_err();
+        assert!(has(&err, "fleet.handoverIssuerNotCustodian"), "{err}");
+        assert!(posts(&old.rig).is_empty());
+        assert!(load().unwrap().handover.is_none());
+        assert!(!crate::root_bootstrap::load().unwrap().activated);
+    }
+
+    #[test]
+    fn accept_refuses_a_grant_to_another_key() {
+        let f = fixture();
+        let mut old = old_root(&f, None, Some([0x66; 32]));
+        save(&FleetCustodyState::default()).unwrap();
+        let err = accept_plain(&f, &mut old).unwrap_err();
+        assert!(has(&err, "fleet.handoverIssuerNotCustodian"), "{err}");
+        assert!(posts(&old.rig).is_empty());
+        // With no root grant naming this device at all: none was offered.
+        old.rig.rot.lock().unwrap().base.pop();
+        let err = accept_plain(&f, &mut old).unwrap_err();
+        assert!(has(&err, "fleet.handoverNoGrant"), "{err}");
+        assert!(load().unwrap().handover.is_none());
+    }
+
+    #[test]
+    fn accept_saves_its_requests_before_the_first_send() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        let seen = old.rig.seen.clone();
+        let mut at_save: Option<usize> = None;
+        accept_on(
+            &f,
+            &mut old,
+            &Collected::default(),
+            &mut |s| {
+                if s.handover.is_some() && at_save.is_none() {
+                    let sent = seen
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(c, _)| c.starts_with("POST "))
+                        .count();
+                    at_save = Some(sent);
+                }
+                save(s)
+            },
+            &mut |s| crate::root_bootstrap::save(s),
+        )
+        .unwrap();
+        assert_eq!(at_save, Some(0), "saved before anything was sent");
+        let h = load().unwrap().handover.unwrap();
+        assert_eq!(h.capability_grants.len(), 6);
+        let acks: Vec<Vec<u8>> = old
+            .rig
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c.contains("/root-key-generations/") && c.ends_with("/ack"))
+            .map(|(_, b)| b.clone())
+            .collect();
+        assert_eq!(acks, [unhex_vec(&h.ack_request).unwrap()]);
+        assert_eq!(
+            h.outgoing,
+            hex(&signing_key_id(old.a.verifying_key().as_bytes()))
+        );
+        assert_eq!(h.phase, "granted");
+    }
+
+    #[test]
+    fn accept_resumes_after_a_crash_between_ack_and_state_write() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        let err = accept_on(
+            &f,
+            &mut old,
+            &Collected::default(),
+            &mut |s| save(s),
+            &mut |_| bail!("crash"),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "crash");
+        assert!(!crate::root_bootstrap::load().unwrap().activated);
+        assert_eq!(load().unwrap().handover.unwrap().phase, "accepting");
+        accept_plain(&f, &mut old).unwrap();
+        let acks = old.rig.bodies("/ack");
+        let root_acks: Vec<&Vec<u8>> = old
+            .rig
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| c.contains("/root-key-generations/") && c.ends_with("/ack"))
+            .map(|(_, b)| b)
+            .cloned()
+            .collect::<Vec<_>>()
+            .leak()
+            .iter()
+            .collect();
+        assert_eq!(root_acks.len(), 2);
+        assert_eq!(root_acks[0], root_acks[1], "the same ack resent");
+        assert!(acks.len() >= 3, "the root ack twice and the own grant's");
+        let root = crate::root_bootstrap::load().unwrap();
+        assert!(root.activated);
+        assert_eq!(root.device_id, f.device);
+        assert_eq!(root.anchor, hex(&old.pin.1));
+        assert_eq!(
+            root.root_grant_issuer,
+            hex(&old.a.verifying_key().to_bytes())
+        );
+        let (g, _, issuer) = current_root_grant(&root, &f.signer).unwrap();
+        assert_eq!(issuer, old.a.verifying_key().to_bytes());
+        assert_eq!(*g.open_trk(&derive_keypair(&f.seed).0).unwrap(), TRK);
+        let state = load().unwrap();
+        assert!(state.imported);
+        assert_eq!(state.handover.unwrap().phase, "granted");
+    }
+
+    #[test]
+    fn accept_builds_its_own_grant_of_n_only_after_collecting_n() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        let collected = Collected::default();
+        accept_on(&f, &mut old, &collected, &mut |s| save(s), &mut |s| {
+            crate::root_bootstrap::save(s)
+        })
+        .unwrap();
+        // First the collect of A's grant, with no own grant built or filed;
+        // then its own grant is filed and collected.
+        assert_eq!(*collected.lock().unwrap(), [(true, 0), (false, 1)]);
+        let h = load().unwrap().handover.unwrap();
+        let own = payload(&h.own_grant_request, FleetKeyGrantCreateV2::parse);
+        let issuer = *AuthorizationRecord::parse(&own.exact_signed_grant_container_bytes)
+            .unwrap()
+            .issuer_signing_key_id();
+        assert_eq!(issuer, f.cx.signing_key_id, "its own grant");
+        assert_eq!(own.grant.generation.generation, 0);
+    }
+
+    #[test]
+    fn rotate_is_refused_before_the_first_v4_export() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        accept_plain(&f, &mut old).unwrap();
+        old.rig.clear();
+        let root = crate::root_bootstrap::load().unwrap();
+        let rotate = |old: &mut Old| {
+            let mut state = load().unwrap();
+            let pin = old.pin;
+            let mut ledger = Ledger {
+                db: &mut old.rig.db,
+                pin: &pin,
+            };
+            old.rig.rt.block_on(rotate_fleet(
+                &old.rig.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &root,
+                &mut ledger,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now_ms,
+                &mut state,
+                &mut |s| save(s),
+            ))
+        };
+        let err = rotate(&mut old).unwrap_err();
+        assert!(has(&err, "fleet.handoverNotReady"), "{err}");
+        assert!(err.to_string().contains("step=export"), "{err}");
+        assert!(posts(&old.rig).is_empty());
+        let mut state = load().unwrap();
+        state.handover.as_mut().unwrap().first_export_sha256 = "aa".into();
+        save(&state).unwrap();
+        let _ = rotate(&mut old);
+        assert!(!posts(&old.rig).is_empty(), "the rotation started");
+    }
+
+    #[test]
+    fn the_old_root_stays_inert_after_the_hand_over() {
+        let f = fixture();
+        let (b, c) = (pending(9), pending(10));
+        let mut rig = appoint_rig(&f, vec![b.clone(), c.clone()]);
+        appoint_of(&rig, &f, &b).unwrap();
+        // The appointee rotated, then revoked this device: nothing it can
+        // run here does anything.
+        rig.rot.lock().unwrap().active = Some(1);
+        rig.clear();
+        for err in [
+            appoint_of(&rig, &f, &c).unwrap_err(),
+            approve_on(&rig, &f, &c, &f.code(&c)).unwrap_err(),
+            rig.rotate(&f, rig.now).unwrap_err(),
+            revoke_on(&mut rig, &f, &c).unwrap_err(),
+            refuse_handed_over(&load().unwrap()).unwrap_err(),
+        ] {
+            assert!(
+                has(&err, "fleet.custodyHandedOver") || has(&err, "fleet.handoverPastRotation"),
+                "{err}"
+            );
+        }
+        let err = revoke_on(&mut rig, &f, &b).unwrap_err();
+        assert!(has(&err, "fleet.handoverPastRotation"), "{err}");
+        assert!(posts(&rig).is_empty());
+        assert_eq!(status().unwrap().handed_over_to, b.device_id);
+    }
+
+    #[test]
+    fn the_hand_over_state_holds_no_key_bytes() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        accept_plain(&f, &mut old).unwrap();
+        let state = load().unwrap();
+        let text = std::fs::read_to_string(crate::store::fleet_custody_path().unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        let root = std::fs::read_to_string(crate::store::custody_bootstrap_path().unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        let debug = format!("{state:?} {:?}", status().unwrap()).to_ascii_lowercase();
+        let (hpke_sk, _) = derive_keypair(&f.seed);
+        for secret in [
+            hex(&TRK),
+            hex(&OLD_FKEK),
+            hex(&f.seed),
+            hex(&f.signer.to_bytes()),
+            hex(&hpke_sk),
+        ] {
+            for (name, body) in [("state", &text), ("root", &root), ("debug", &debug)] {
+                assert!(!body.contains(&secret), "{name} holds a secret");
+            }
+        }
+    }
+
+    /// U1 review: a device holding two grants of one generation (its
+    /// appointer's and its own, D11) keeps an ack per grant, so a lost ack
+    /// reply of the second resends that grant's ack, not the first one's.
+    #[test]
+    fn a_second_grant_of_one_generation_is_acked_under_its_own_key() {
+        let f = fixture();
+        save(&FleetCustodyState::default()).unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(Arc::new(|call: &str, body: &[u8]| {
+            if call.ends_with("/ack") {
+                (201, acked(body))
+            } else {
+                (500, Vec::new())
+            }
+        })));
+        let (_, pk) = derive_keypair(&f.seed);
+        let keys = (
+            f.cx.signing_key_id,
+            f.cx.hpke_key_id,
+            pk.as_slice().try_into().unwrap(),
+        );
+        let ids = (f.cx.account, f.cx.device);
+        let grant = |signer: &Ed25519SigningKey| {
+            let r = member_grant(&f.cx, signer, ids, keys, &OLD_FKEK, 0, now_ms()).unwrap();
+            payload(&r, FleetKeyGrantCreateV2::parse).exact_signed_grant_container_bytes
+        };
+        let (first, second) = (grant(&peer_signer(1)), grant(&f.signer));
+        for c in [&first, &second, &second] {
+            rt.block_on(ack_device_grant(&client, "access", c, false))
+                .unwrap();
+        }
+        let state = load().unwrap();
+        assert_eq!(state.device_acks.len(), 2);
+        let bodies: Vec<Vec<u8>> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect();
+        assert_ne!(bodies[0], bodies[1]);
+        assert_eq!(bodies[1], bodies[2], "the second grant's own ack resent");
+    }
+
+    /// 4.H step 7 (D11, Q-26): this device recorded its own grant of the
+    /// accepted generation N; once it counts the outgoing custodian's
+    /// revocation, through the closure listing, its key of N still verifies.
+    #[test]
+    fn after_the_old_roots_revoke_the_new_custodian_still_reads_generation_n() {
+        let f = fixture();
+        let mut old = old_root(&f, None, None);
+        save(&FleetCustodyState::default()).unwrap();
+        accept_plain(&f, &mut old).unwrap();
+        let h = load().unwrap().handover.unwrap();
+        let own = payload(&h.own_grant_request, FleetKeyGrantCreateV2::parse);
+        let container = own.exact_signed_grant_container_bytes;
+        let (hpke_sk, hpke_pk) = derive_keypair(&f.seed);
+        let me = shardx_core::trust_chain::Recipient {
+            account_id: f.cx.account,
+            device_id: f.cx.device,
+            signing_key_id: f.cx.signing_key_id,
+            hpke_key_id: hpke_key_id(&hpke_pk),
+        };
+        let now = now_ms();
+        let pin = old.pin;
+        let pages = |old: &mut Old| {
+            old.rig
+                .rt
+                .block_on(crate::team::ledger::closure_evidence(
+                    &old.rig.client,
+                    "access",
+                    &f.tenant,
+                    &mut old.rig.db,
+                    &pin,
+                    &[],
+                    now,
+                ))
+                .unwrap()
+        };
+        // The collect that keeps this device's own grant behind N.
+        {
+            let mut rot = old.rig.rot.lock().unwrap();
+            rot.base.push(container.clone());
+            let caps = h.capability_grants.iter().map(|g| unhex_vec(g).unwrap());
+            rot.base.extend(caps);
+        }
+        let (p, closure) = pages(&mut old);
+        let fkek = crate::open_fleet_grant(
+            &container,
+            &p,
+            &pin,
+            &me,
+            &f.cx.tenant,
+            0,
+            &hpke_sk,
+            now,
+            &mut old.rig.db,
+            "https://fleet.test",
+            closure,
+        )
+        .unwrap()
+        .expect("its own grant of N opens");
+        assert_eq!(*fkek, OLD_FKEK);
+        // This device revokes the old root: the closure listing counts it.
+        let a = &old.a;
+        let revocation = DeviceRevocationV2 {
+            common: f.cx.common([0x77; 16], now),
+            subject_account_id: f.cx.account,
+            subject_device_id: [0x41; 16],
+            subject_signing_key_id: signing_key_id(a.verifying_key().as_bytes()),
+            subject_hpke_key_id: hpke_key_id(&derive_keypair(&[0x42; 32]).1),
+            reason_code: DeviceRevocationReason::Retired,
+        };
+        old.rig.rot.lock().unwrap().base.push(build_record(
+            &f.signer,
+            DOMAIN_DEVICE_REVOCATION,
+            &revocation.encode(),
+        ));
+        let (p, closure) = pages(&mut old);
+        assert!(closure, "a custodian's revocation is counted in a closure");
+        let (seen, chain) = crate::team::ledger::evaluate(&old.rig.db, &pin.0, &pin.1, &p, now)
+            .unwrap()
+            .unwrap();
+        crate::team::ledger::record(&mut old.rig.db, &pin.0, &seen, &chain, None, closure, now)
+            .unwrap();
+        assert!(crate::team::ledger::withdrawn(&old.rig.db, &pin.0, &pin.1).unwrap());
+        assert!(
+            crate::fleet_key_verifies(&old.rig.db, &pin, &me, &f.cx.tenant, 0, &OLD_FKEK, now)
+                .unwrap(),
+            "the key of N still verifies"
+        );
     }
 }
