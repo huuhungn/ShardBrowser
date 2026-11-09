@@ -125,6 +125,8 @@ export type FleetCustodyStatus = {
   rotation_required: "urgent" | "routine" | null;
   /** A finished rotation asks for the recovery bundle to be exported again. */
   export_due: boolean;
+  /** Why: a finished renewal replaced the exported root grant, else a rotation. */
+  export_reason: "rotation" | "renewal";
   /** The latest Re-seal all profiles run, if any. */
   reseal: ResealRun | null;
 };

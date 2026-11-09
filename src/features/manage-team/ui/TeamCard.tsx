@@ -72,7 +72,7 @@ export function TeamCard() {
   const [keyPass2, setKeyPass2] = useState("");
   const [oldDeviceLost, setOldDeviceLost] = useState(false);
   const [rootKeyIdRecorded, setRootKeyIdRecorded] = useState(false);
-  const [exportDue, setExportDue] = useState(false);
+  const [exportDue, setExportDue] = useState<"rotation" | "renewal" | null>(null);
 
   const shareStatus = useTeam((s) => s.refresh);
 
@@ -82,7 +82,7 @@ export function TeamCard() {
       .catch(() => { setBoot(null); setBootUnreadable(true); });
   // A finished fleet key rotation asks for the recovery bundle again.
   const loadExportDue = () =>
-    teamFleetCustodyStatus().then((f) => setExportDue(f.export_due)).catch(() => {});
+    teamFleetCustodyStatus().then((f) => setExportDue(f.export_due ? f.export_reason : null)).catch(() => {});
 
   const refresh = () => {
     teamStatus().then((s) => {
@@ -713,7 +713,7 @@ export function TeamCard() {
                     <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
                       {exportDue && (
                         <p data-testid="team-export-due" className="m-0 text-paragraph-xs text-state-error-base">
-                          {t("team.rotation.exportDue")}
+                          {t(exportDue === "renewal" ? "team.renewal.exportDue" : "team.rotation.exportDue")}
                         </p>
                       )}
                       <p className="m-0 text-paragraph-xs text-text-soft-400">{t("team.devices.recoveryNotice")}</p>

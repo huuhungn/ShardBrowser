@@ -1546,6 +1546,7 @@
   "team.renewal.busy": "Đang gia hạn…",
   "team.renewal.done": "Đã gia hạn quyền giữ khoá gốc. Hãy xuất lại gói khôi phục.",
   "team.renewal.notDue": "Chưa đến lúc gia hạn quyền giữ khoá gốc.",
+  "team.renewal.exportDue": "Quyền giữ khoá gốc đã được gia hạn, nên gói khôi phục đã xuất trước đây vẫn chứa bản cấp khoá gốc cũ. Hãy xuất lại gói khôi phục.",
   "team.reseal.run": "Niêm phong lại mọi hồ sơ",
   "team.reseal.resume": "Tiếp tục niêm phong lại",
   "team.reseal.busy": "Đang niêm phong lại hồ sơ…",

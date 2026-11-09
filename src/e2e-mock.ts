@@ -398,11 +398,11 @@ type FleetRotation = {
 };
 let fleetCustody: {
   started: boolean; created: boolean; setup_key_held: boolean; fkek_key_id: string; rotation: FleetRotation | null;
-  rotation_required: "urgent" | "routine" | null; export_due: boolean;
+  rotation_required: "urgent" | "routine" | null; export_due: boolean; export_reason: "rotation" | "renewal";
   reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
-  export_due: false, reseal: null,
+  export_due: false, export_reason: "rotation", reseal: null,
 };
 // The highest fleet key generation this device kept.
 let teamGeneration = 0;
@@ -587,6 +587,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         rotation: { ...rotation, phase: "done", failing_member: null },
         rotation_required: null,
         export_due: true,
+        export_reason: "rotation",
       };
       return fleetCustody;
     }
@@ -674,7 +675,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       await teamServer("live", me);
       if ((custodyBootstrap.renewal_due_ms ?? Infinity) > Date.now()) return "not_due";
       custodyBootstrap = { ...custodyBootstrap, ...renewalTimes(Date.now()) };
-      fleetCustody = { ...fleetCustody, export_due: true };
+      fleetCustody = { ...fleetCustody, export_due: true, export_reason: "renewal" };
       return "renewed";
     }
     case "team_export_recovery_bundle":
@@ -682,7 +683,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       await teamServer("live", me);
       if (!teamMe.collected) teamRefuse("fleet.recoveryExportNeedsFleetKey");
       document.documentElement.dataset.e2eExportPath = String(args.path ?? "");
-      fleetCustody = { ...fleetCustody, export_due: false };
+      fleetCustody = { ...fleetCustody, export_due: false, export_reason: "rotation" };
       return null;
     case "team_collect_custody": {
       const { granted, generation, missed, kept } = await teamCollect();

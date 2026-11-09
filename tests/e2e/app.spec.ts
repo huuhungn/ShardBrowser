@@ -1090,7 +1090,9 @@ test("a root custodian past 75% of its custody records is warned, renews, and is
   await expect(renewal.getByTestId("team-renewal-warning")).toHaveCount(0);
   await expect(renewal).toContainText("Renewed automatically on the next custody action or team sync");
   await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
-  await expect(card.getByTestId("team-export-due")).toBeVisible();
+  await expect(card.getByTestId("team-export-due")).toContainText(
+    "Root custody was renewed, so a recovery bundle exported before holds the replaced root grant.",
+  );
   await expect(a.getByText("[[shardx:")).toHaveCount(0);
 });
 

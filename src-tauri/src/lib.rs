@@ -2645,11 +2645,11 @@ async fn team_export_recovery_bundle(
     .map_err(|e| e.to_string());
     client.end_session(access).await;
     match &result {
-        Ok(()) => {
+        Ok(grant) => {
             eprintln!("[recovery] export: ok");
-            // The bundle opens every generation it carries: a rotation's
-            // re-export prompt ends.
-            if let Err(e) = newest.map_or(Ok(()), fleet_custody::exported) {
+            // The bundle opens every generation it carries and holds the
+            // current root grant: a rotation's or renewal's prompt ends.
+            if let Err(e) = newest.map_or(Ok(()), |n| fleet_custody::exported(n, grant)) {
                 eprintln!("[recovery] export prompt: not cleared ({e:#})");
             }
         }
@@ -2658,7 +2658,7 @@ async fn team_export_recovery_bundle(
             recovery_import::error_code(e)
         ),
     }
-    result
+    result.map(drop)
 }
 
 /// How far this device's Create fleet key got, and whether a revocation
@@ -3605,6 +3605,7 @@ pub(crate) async fn renew_custody(
     let Some(pin) = bootstrap_anchor(c) else {
         return Ok(root_bootstrap::RenewalOutcome::NotCustodian);
     };
+    fleet_custody::prompt_unexported_renewal()?;
     let mut state = root_bootstrap::load()?;
     let custody = fleet_custody::load()?;
     let signer = c.signing_key()?;
@@ -3645,12 +3646,7 @@ pub(crate) async fn renew_custody(
         &mut |s| root_bootstrap::save(s),
     )
     .await?;
-    if outcome == root_bootstrap::RenewalOutcome::Renewed {
-        let mut custody = fleet_custody::load()?;
-        root_bootstrap::commit(&mut custody, &mut |s| fleet_custody::save(s), |s| {
-            s.export_due = true
-        })?;
-    }
+    fleet_custody::prompt_unexported_renewal()?;
     Ok(outcome)
 }
 
@@ -3678,7 +3674,11 @@ async fn renew_first(
     c: &team_config::TeamConfig,
     access: &str,
 ) -> Result<(), String> {
-    let outcome = renew_custody(client, c, access).await;
+    renewal_gate(renew_custody(client, c, access).await)
+}
+
+/// [`renew_first`]'s rule: only a lapse stops the command.
+fn renewal_gate(outcome: anyhow::Result<root_bootstrap::RenewalOutcome>) -> Result<(), String> {
     if let Err(e) = &outcome {
         if crate::errcode::has_code(&e.to_string(), "fleet.custodyLapsed") {
             return Err(e.to_string());
@@ -4328,6 +4328,25 @@ mod custody_tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// D9: a custodian command stops on a lapse only; any other renewal
+    /// error is logged and the command goes on.
+    #[test]
+    fn renew_first_stops_only_on_a_lapse() {
+        use root_bootstrap::RenewalOutcome;
+        let failed = anyhow::anyhow!(crate::errcode::code_with(
+            "fleet.refusedCustody",
+            &[("status", "500")]
+        ));
+        assert_eq!(renewal_gate(Err(failed)), Ok(()));
+        assert_eq!(renewal_gate(Ok(RenewalOutcome::Renewed)), Ok(()));
+        let lapsed = anyhow::anyhow!(crate::errcode::code("fleet.custodyLapsed"));
+        let err = renewal_gate(Err(lapsed)).unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err, "fleet.custodyLapsed"),
+            "{err}"
+        );
     }
 
     /// A collect that fails after an import says the import is done, and

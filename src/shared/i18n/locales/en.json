@@ -1546,6 +1546,7 @@
   "team.renewal.busy": "Renewing…",
   "team.renewal.done": "Root custody renewed. Export the recovery bundle again.",
   "team.renewal.notDue": "Root custody is not due for renewal yet.",
+  "team.renewal.exportDue": "Root custody was renewed, so a recovery bundle exported before holds the replaced root grant. Export the recovery bundle again.",
   "team.reseal.run": "Re-seal all profiles",
   "team.reseal.resume": "Resume re-seal",
   "team.reseal.busy": "Re-sealing profiles…",

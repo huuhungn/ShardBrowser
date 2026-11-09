@@ -154,6 +154,10 @@ pub struct FleetCustodyState {
     /// Re-seal all profiles refuses with `fleet.custodyHandedOver`.
     #[serde(default)]
     pub handed_over_to: String,
+    /// SHA-256 of the root grant in the recovery bundle last exported
+    /// ([`crate::root_bootstrap::root_grant_sha256`]); empty before one.
+    #[serde(default)]
+    pub exported_root_grant_sha256: String,
 }
 
 /// One run of Re-seal all profiles (v2.10 4.S). No key is among it.
@@ -1385,32 +1389,58 @@ pub fn rotation_required(
 /// another custody run held the state; 0 when none. That run applies it as
 /// it ends ([`Running`]'s drop).
 static EXPORTED_WHILE_BUSY: AtomicU64 = AtomicU64::new(0);
+/// The root grant hash of that bundle.
+static EXPORTED_ROOT_GRANT_WHILE_BUSY: std::sync::Mutex<String> =
+    std::sync::Mutex::new(String::new());
 
-/// Ends the re-export prompt of a finished rotation once a recovery bundle
-/// holding `newest`, the newest generation it carries, was written. While
+/// Ends the re-export prompt of a finished rotation or renewal once a
+/// recovery bundle holding `newest`, the newest generation it carries, and
+/// the root grant whose SHA-256 is `root_grant_sha256` was written. While
 /// another custody run holds the state, it is applied when that run ends,
 /// so the run's own saves never bring the prompt back.
-pub fn exported(newest: u64) -> Result<()> {
+pub fn exported(newest: u64, root_grant_sha256: &str) -> Result<()> {
     let Ok(_running) = begin() else {
         EXPORTED_WHILE_BUSY.fetch_max(newest.saturating_add(1), Ordering::SeqCst);
+        *EXPORTED_ROOT_GRANT_WHILE_BUSY
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = root_grant_sha256.to_owned();
         return Ok(());
     };
-    clear_export_due(newest)
+    clear_export_due(newest, root_grant_sha256)
 }
 
-/// [`exported`] under the custody lock: a rotation past `newest` keeps the
-/// prompt.
-fn clear_export_due(newest: u64) -> Result<()> {
+/// [`exported`] under the custody lock: a rotation past `newest`, or a
+/// renewal that replaced the exported root grant, keeps the prompt.
+fn clear_export_due(newest: u64, root_grant_sha256: &str) -> Result<()> {
     let mut state = load()?;
     let covered = state
         .rotation
         .as_ref()
         .is_none_or(|r| r.generation <= newest);
-    if state.export_due && covered {
-        state.export_due = false;
+    let current = crate::root_bootstrap::root_grant_sha256(&crate::root_bootstrap::load()?);
+    let renewed = current.is_empty() || current == root_grant_sha256;
+    let clear = state.export_due && covered && renewed;
+    if clear || state.exported_root_grant_sha256 != root_grant_sha256 {
+        state.export_due &= !clear;
+        state.exported_root_grant_sha256 = root_grant_sha256.to_owned();
         save(&state)?;
     }
     Ok(())
+}
+
+/// Asks for the recovery bundle again when a finished renewal replaced the
+/// root grant the last one carried, which a crash between the renewal and
+/// its prompt would otherwise lose.
+pub fn prompt_unexported_renewal() -> Result<()> {
+    let root = crate::root_bootstrap::load()?;
+    let mut state = load()?;
+    if state.export_due
+        || !crate::root_bootstrap::renewal_unexported(&root, &state.exported_root_grant_sha256)
+    {
+        return Ok(());
+    }
+    state.export_due = true;
+    save(&state)
 }
 
 /// The reasons Revoke offers (section 4.R): `retired`, `lost` and, for a
@@ -2304,8 +2334,13 @@ impl Drop for Running {
         // Still under the lock: an export that finished meanwhile ends the
         // prompt now ([`exported`]).
         let pending = EXPORTED_WHILE_BUSY.swap(0, Ordering::SeqCst);
+        let grant = std::mem::take(
+            &mut *EXPORTED_ROOT_GRANT_WHILE_BUSY
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
         if let Some(newest) = pending.checked_sub(1) {
-            if let Err(e) = clear_export_due(newest) {
+            if let Err(e) = clear_export_due(newest, &grant) {
                 eprintln!("[recovery] export prompt: not cleared ({e:#})");
             }
         }
@@ -2334,6 +2369,9 @@ pub struct FleetCustodyStatus {
     pub rotation: Option<RotationStatus>,
     /// A finished rotation asks for the recovery bundle to be exported again.
     pub export_due: bool,
+    /// Why: `renewal` while a finished renewal replaced the exported root
+    /// grant, else `rotation`.
+    pub export_reason: &'static str,
     /// Set by the command from [`rotation_required`]; `status` leaves it out.
     pub rotation_required: Option<RotationRequired>,
     /// The latest Re-seal all profiles run, if any.
@@ -2385,6 +2423,17 @@ pub fn status() -> Result<FleetCustodyStatus> {
                 failing_member: r.skippable().map(str::to_owned),
             }
         }),
+        export_reason: match crate::root_bootstrap::load() {
+            Ok(root)
+                if crate::root_bootstrap::renewal_unexported(
+                    &root,
+                    &s.exported_root_grant_sha256,
+                ) =>
+            {
+                "renewal"
+            }
+            _ => "rotation",
+        },
         export_due: s.export_due,
         rotation_required: None,
         reseal: s.reseal,
@@ -5996,9 +6045,9 @@ pub(crate) mod tests {
         rig.members(&f, now).unwrap();
         assert!(status().unwrap().export_due);
         // A bundle holding only generation 0 does not open generation 1.
-        exported(0).unwrap();
+        exported(0, &bundle_grant()).unwrap();
         assert!(status().unwrap().export_due);
-        exported(1).unwrap();
+        exported(1, &bundle_grant()).unwrap();
         assert!(!status().unwrap().export_due);
     }
 
@@ -6263,7 +6312,7 @@ pub(crate) mod tests {
         });
         save(&state).unwrap();
         let running = begin().unwrap();
-        exported(1).unwrap();
+        exported(1, &bundle_grant()).unwrap();
         assert!(
             status().unwrap().export_due,
             "the running action owns the state"
@@ -6274,9 +6323,73 @@ pub(crate) mod tests {
         // A bundle written before a rotation the other action finished.
         save(&state).unwrap();
         let running = begin().unwrap();
-        exported(0).unwrap();
+        exported(0, &bundle_grant()).unwrap();
         drop(running);
         assert!(status().unwrap().export_due);
+    }
+
+    /// The root grant hash of a bundle exported now.
+    fn bundle_grant() -> String {
+        crate::root_bootstrap::root_grant_sha256(&crate::root_bootstrap::load().unwrap())
+    }
+
+    /// Saves a root state whose finished renewal replaced the self-grant with
+    /// `renewed`, and returns the hashes of the old and the renewed grant.
+    fn renewed_root(f: &Fixture, renewed: &[u8]) -> (String, String) {
+        let old = crate::root_bootstrap::root_grant_sha256(&f.root);
+        crate::root_bootstrap::save(&BootstrapState {
+            root_grant: hex(renewed),
+            renewal: Some(crate::root_bootstrap::Renewal {
+                done: true,
+                ..Default::default()
+            }),
+            ..f.root.clone()
+        })
+        .unwrap();
+        (old, bundle_grant())
+    }
+
+    /// v2.10 4.R: a bundle written with the root grant a renewal replaced
+    /// while the export ran keeps the prompt, held lock or not; one with the
+    /// renewed grant ends it.
+    #[test]
+    fn an_export_that_raced_a_renewal_keeps_the_prompt() {
+        let f = fixture();
+        let mut state = f.prepared();
+        state.export_due = true;
+        save(&state).unwrap();
+        let (old, renewed) = renewed_root(&f, b"renewed grant");
+        assert_eq!(status().unwrap().export_reason, "renewal");
+        exported(0, &old).unwrap();
+        assert!(status().unwrap().export_due);
+        let running = begin().unwrap();
+        exported(0, &old).unwrap();
+        drop(running);
+        assert!(status().unwrap().export_due);
+        assert_eq!(status().unwrap().export_reason, "renewal");
+        exported(0, &renewed).unwrap();
+        assert!(!status().unwrap().export_due);
+        assert_eq!(status().unwrap().export_reason, "rotation");
+    }
+
+    /// v2.10 4.R: a renewal saved as done whose prompt was never saved (a
+    /// crash between the two) still asks for the bundle again, until one
+    /// with the renewed grant is exported.
+    #[test]
+    fn a_crash_between_renewal_done_and_export_due_still_prompts() {
+        let f = fixture();
+        let mut state = f.prepared();
+        state.exported_root_grant_sha256 = crate::root_bootstrap::root_grant_sha256(&f.root);
+        save(&state).unwrap();
+        crate::root_bootstrap::save(&f.root).unwrap();
+        prompt_unexported_renewal().unwrap();
+        assert!(!status().unwrap().export_due, "no renewal, no prompt");
+        let (_, renewed) = renewed_root(&f, b"renewed grant");
+        prompt_unexported_renewal().unwrap();
+        assert!(status().unwrap().export_due);
+        exported(0, &renewed).unwrap();
+        prompt_unexported_renewal().unwrap();
+        assert!(!status().unwrap().export_due);
     }
 
     #[test]

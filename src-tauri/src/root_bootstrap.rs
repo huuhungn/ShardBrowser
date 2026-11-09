@@ -1111,9 +1111,10 @@ pub async fn export_again(
     hpke_seed: &[u8; 32],
     fkeks: Vec<(u64, Zeroizing<[u8; 32]>)>,
     recovery: &RecoveryExport<'_>,
-) -> Result<()> {
+) -> Result<String> {
     let state = load()?;
     let (grant, container, issuer) = current_root_grant(&state, signer)?;
+    let exported = root_grant_sha256(&state);
     let tenant_hex = hex(&grant.common.tenant_id);
     let active = client
         .active_fleet_generation(access, &tenant_hex, fleet_hex)
@@ -1163,7 +1164,7 @@ pub async fn export_again(
         grant.root_generation,
     );
     write_bundle(header, &plaintext, recovery, now_ms())?;
-    Ok(())
+    Ok(exported)
 }
 
 /// Files the activated generation 0, its self-grant and this device's
@@ -1382,20 +1383,53 @@ pub(crate) fn renewal_due_ms(windows: &[(u64, u64)]) -> Option<u64> {
         .min()
 }
 
+/// SHA-256 of `state`'s current root grant as saved, lower-case hex; empty
+/// when none is saved.
+pub(crate) fn root_grant_sha256(state: &BootstrapState) -> String {
+    use sha2::{Digest, Sha256};
+    let root = if state.root_grant.is_empty() {
+        &state.self_grant
+    } else {
+        &state.root_grant
+    };
+    decode_hex(root)
+        .map(|c| hex(&Sha256::digest(c)))
+        .unwrap_or_default()
+}
+
+/// A finished renewal replaced the root grant of the recovery bundle last
+/// exported, whose [`root_grant_sha256`] is `exported`.
+pub(crate) fn renewal_unexported(state: &BootstrapState, exported: &str) -> bool {
+    state.renewal.as_ref().is_some_and(|r| r.done) && root_grant_sha256(state) != exported
+}
+
 fn due(windows: &[(u64, u64)], t: u64) -> bool {
     renewal_due_ms(windows).is_some_and(|d| t >= d)
 }
 
-/// The earliest `not_before_ms` of the root grants saved here.
-// shortcut: a custodian imported from a bundle exported after a renewal
-// shows its key age from that renewal; read the trust ledger's cached
-// `first_not_before` once the status needs it exact.
+/// The earliest `not_before_ms` of this custodian's root grants: those saved
+/// here, and the trust ledger's cached first one, which is all a custodian
+/// imported from a bundle exported after a renewal knows of the earlier ones.
+/// A ledger that does not exist is not created.
 fn first_not_before(state: &BootstrapState, own: &[u8; 32]) -> Option<u64> {
     let first = decode_hex(&state.self_grant).and_then(|c| window_of(&c, own));
     let current = decode_hex(&state.root_grant)
         .zip(unhex(&state.root_grant_issuer).ok())
         .and_then(|(c, issuer)| window_of(&c, &issuer));
-    first.into_iter().chain(current).map(|w| w.0).min()
+    let ledger = || -> Option<u64> {
+        let (binding, _) = pin_of(state).ok()?;
+        if !crate::team::db::Db::path().ok()?.try_exists().ok()? {
+            return None;
+        }
+        let db = crate::team::db::Db::open().ok()?;
+        crate::team::ledger::first_not_before(&db, &binding, &signing_key_id(own)).ok()?
+    };
+    first
+        .into_iter()
+        .chain(current)
+        .map(|w| w.0)
+        .chain(ledger())
+        .min()
 }
 
 /// The pin `state` names: its binding and anchor.
@@ -2573,7 +2607,11 @@ pub(crate) mod tests {
         ));
         let file = std::fs::read(&path);
         crate::store::set_config_root(None);
-        result.unwrap();
+        assert_eq!(
+            result.unwrap(),
+            root_grant_sha256(state),
+            "the exported grant"
+        );
         open(&file.unwrap(), "correct horse battery").unwrap()
     }
 
@@ -4086,11 +4124,12 @@ pub(crate) mod tests {
         assert!(member(START + 250 * DAY), "back before the old end");
     }
 
-    /// After a renewal the recovery bundle is v4 with the renewed,
-    /// self-issued grant, which opens offline; the chain an import checks
-    /// counts this device past the old end.
+    /// After a renewal Export again writes a v4 bundle with the renewed,
+    /// self-issued grant, after the import's own root grant check (step 5)
+    /// passed on it, and the bundle opens. The chain an import evaluates is
+    /// `a_renewal_crosses_the_old_expiry_with_no_gap`'s.
     #[test]
-    fn export_and_import_still_work_after_a_renewal() {
+    fn a_renewal_exports_a_v4_bundle_whose_grant_passes_the_import_root_grant_check() {
         let rt = crate::fleet_custody::tests::runtime();
         let now = START + 200 * DAY;
         let mut f = renewal_fixture(&rt, now);
@@ -4108,6 +4147,61 @@ pub(crate) mod tests {
             plaintext.bootstrap_anchor_signing_key_id,
             custodian_cx([5; 16], &[9; 32]).0.signing_key_id
         );
+    }
+
+    /// A custodian imported from a bundle exported after a renewal keeps only
+    /// the renewed grant; its key age still counts from the first root grant,
+    /// which the trust ledger remembers.
+    #[test]
+    fn an_imported_custodian_counts_its_key_age_from_the_ledgers_first_grant() {
+        use crate::team::{db::Db, ledger};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let rt = crate::fleet_custody::tests::runtime();
+        let now = START + 200 * DAY;
+        let mut f = renewal_fixture(&rt, now);
+        rt.block_on(f.renew_at(now)).unwrap();
+        let imported = BootstrapState {
+            self_grant: String::new(),
+            renewal: None,
+            ..f.state.clone()
+        };
+        let own = signer().verifying_key().to_bytes();
+        let renewed = first_not_before(&imported, &own);
+
+        let mut evidence = f.server.lock().unwrap().evidence.clone();
+        evidence.extend(f.renewed_records());
+        let (cx, _) = custodian_cx([5; 16], &[9; 32]);
+        let (binding, anchor) = pin_of(&imported).unwrap();
+        let page = shardx_core::trust_evidence::TenantTrustEvidencePageV2 {
+            server_instance_id: cx.instance,
+            tenant_id: cx.tenant,
+            server_now_ms: now,
+            page_index: 0,
+            next_cursor: Vec::new(),
+            signing_public_keys: vec![own],
+            containers: evidence,
+            revocations: Vec::new(),
+            device_revocations: Vec::new(),
+        };
+        let mut db = Db::open().unwrap();
+        ledger::pin_anchor(&db, &binding, &anchor, ledger::BOOTSTRAP, now).unwrap();
+        let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &[page], now)
+            .unwrap()
+            .expect("verifies");
+        ledger::record(&mut db, &binding, &seen, &chain, None, false, now).unwrap();
+        drop(db);
+        let counted = first_not_before(&imported, &own);
+        crate::store::set_config_root(None);
+        assert_eq!(
+            renewed,
+            Some(now - CLOCK_SKEW_MS),
+            "the renewed grant alone"
+        );
+        assert_eq!(counted, Some(START), "the ledger's first grant");
     }
 
     /// No key is among the renewal state: not the seeds, the TRK or the
