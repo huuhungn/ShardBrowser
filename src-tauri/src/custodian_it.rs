@@ -1821,12 +1821,25 @@ fn a_fresh_device_imports_the_recovery_bundle_and_keeps_the_team_against_a_real_
     assert_eq!(state_files(), b_files);
 
     // A exports again: v3 with generation 0's fleet key, under the
-    // self-grant's server instance and root generation 0. No state file
-    // changes and nothing is filed.
+    // self-grant's server instance and root generation 0. Only the exported
+    // root grant's hash is recorded, and nothing is filed.
     h.act_as_a();
     let (a_files, rows) = (state_files(), audit_rows(&h));
     export(&rt, &bundle).unwrap();
-    assert_eq!(state_files(), a_files);
+    let without_export_hash = |mut files: Vec<Option<Vec<u8>>>| {
+        let mut custody: serde_json::Value =
+            serde_json::from_slice(files[1].as_deref().unwrap()).unwrap();
+        custody
+            .as_object_mut()
+            .unwrap()
+            .remove("exported_root_grant_sha256");
+        files[1] = Some(custody.to_string().into_bytes());
+        files
+    };
+    assert_eq!(
+        without_export_hash(state_files()),
+        without_export_hash(a_files)
+    );
     assert_eq!(audit_rows(&h), rows);
     let (header, plaintext) =
         shardx_core::recovery_bundle::open(&std::fs::read(&bundle).unwrap(), PASSPHRASE).unwrap();
