@@ -64,7 +64,7 @@ const revertOutcome = (o: string): [string, Record<string, string>?] =>
  * any other active one.
  */
 export function TeamDevices({
-  account, busy, run, anchor, selfId, hasFleetKey, fleetKeyBlocked, onFleetKey, handedOverTo, handover,
+  account, busy, run, anchor, selfId, hasFleetKey, fleetKeyBlocked, onFleetKey, handedOverTo, handover, onReset,
 }: TeamActionProps & {
   /** This custodian's bootstrap anchor A0. */
   anchor: string;
@@ -80,6 +80,8 @@ export function TeamDevices({
   handedOverTo: string;
   /** The hand-over this device accepted; TeamCard reloads both on `onFleetKey` and after an export. */
   handover: HandoverStatus | null;
+  /** Reset of this device (v2.11): the old root once the new custodian revoked it. */
+  onReset: () => void;
 }) {
   const t = useT();
   const [fleet, setFleet] = useState<FleetCustodyStatus | null>(null);
@@ -355,6 +357,17 @@ export function TeamDevices({
           </p>
           <p className="m-0 text-paragraph-xs text-text-sub-600">{t("team.handover.cancelHint")}</p>
           <p className="m-0 text-paragraph-xs text-text-sub-600">{t("team.handover.inert")}</p>
+          <div>
+            <Button
+              data-testid="team-reset-old-root"
+              size="small"
+              variant="error"
+              disabled={!!busy || !account.signedIn}
+              onClick={onReset}
+            >
+              {busy === "reset" ? t("busy.resetting") : t("team.handover.resetOldRoot")}
+            </Button>
+          </div>
         </div>
       ) : done && fleetKeyBlocked ? (
         <p className="m-0 text-paragraph-xs text-state-error-base">{t("team.joinCode.blocked")}</p>
@@ -374,6 +387,16 @@ export function TeamDevices({
           </div>
         </>
       )}
+
+      {fleet?.members_need_server_update ? (
+        <p data-testid="team-members-server-update" className="m-0 text-paragraph-xs text-state-error-base">
+          {t("fleet.memberRenewalNeedsServerUpdate")}
+        </p>
+      ) : fleet?.member_renewal_failed ? (
+        <p data-testid="team-members-renewal-failed" className="m-0 text-paragraph-xs text-state-error-base">
+          {t("fleet.memberRenewalFailed", { code: t(fleet.member_renewal_failed) })}
+        </p>
+      ) : null}
 
       {handover && (
         <div data-testid="team-handover-checklist" className="flex flex-col gap-1.5">
@@ -554,6 +577,19 @@ export function TeamDevices({
               {isNewest && <Badge color="information" variant="filled" size="small">{t("team.devices.newest")}</Badge>}
               {isOldRoot(r) && <Badge color="warning" variant="lighter" size="small">{t("team.handover.oldRoot")}</Badge>}
             </div>
+            {r.status === "active" && !self && r.approval_window_ms && (() => {
+              // v2.11 member renewal: the warning shows from 75% of the approval's life.
+              const [from, until] = r.approval_window_ms;
+              const late = now >= from + (until - from) * 0.75;
+              return (
+                <p
+                  data-testid="team-device-approval"
+                  className={`m-0 text-paragraph-xs ${late ? "text-state-error-base" : "text-text-soft-400"}`}
+                >
+                  {t(late ? "team.renewal.memberWarning" : "team.renewal.memberEnds", { date: new Date(until).toLocaleDateString() })}
+                </p>
+              );
+            })()}
             {isNewest && (
               <p className="m-0 text-paragraph-xs text-text-soft-400">
                 {t(r.status === "active" ? "team.devices.newestHintActive" : "team.devices.newestHint")}

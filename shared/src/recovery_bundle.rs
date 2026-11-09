@@ -317,7 +317,9 @@ impl RootCustodian {
     /// generation, account, device and signing key, and opens with the HPKE
     /// seed to `trk`. v3: it is the first self-grant, so the signing seed is
     /// its issuer and the anchor's key. v4: it is an `ExistingRootGrant` from
-    /// `root_grant_issuer`, and the subject need not be the anchor.
+    /// `root_grant_issuer`, and the subject need not be the anchor; or, during
+    /// a root rotation (ADR 0002 Q-59), this device's own `RotationGrant` from
+    /// the header's generation less one.
     fn check(
         &self,
         header: &RecoveryBundleHeaderV2,
@@ -328,15 +330,26 @@ impl RootCustodian {
             .verifying_key()
             .to_bytes();
         let own_id = signing_key_id(&own);
-        let (issuer, variant) = match &self.root_grant_issuer {
-            Some(issuer) => (issuer, RootGrantVariant::ExistingRootGrant),
-            None => (&own, RootGrantVariant::FirstRootSelfGrant),
+        let issuer = self.root_grant_issuer.as_ref().unwrap_or(&own);
+        let variant_ok = |v: &RootGrantVariant| match (&self.root_grant_issuer, v) {
+            (None, RootGrantVariant::FirstRootSelfGrant) => true,
+            (Some(_), RootGrantVariant::ExistingRootGrant) => true,
+            (
+                Some(i),
+                RootGrantVariant::RotationGrant {
+                    previous_root_generation,
+                    ..
+                },
+            ) => {
+                *i == own && previous_root_generation.checked_add(1) == Some(header.root_generation)
+            }
+            _ => false,
         };
         let grant =
             AuthorizationRecord::parse(&self.root_grant).and_then(|r| r.verify_signature(issuer));
         let names_us = match grant.as_ref().map(|v| v.payload()) {
             Ok(authz::Payload::TenantRootKeyGrant(g)) => {
-                g.variant == variant
+                variant_ok(&g.variant)
                     && g.common.tenant_id == header.tenant_id
                     && g.common.server_instance_id == header.server_instance_id
                     && g.root_key_id == header.root_key_id
@@ -1120,6 +1133,75 @@ mod tests {
         let file = seal_with(&header(), &other_hpke, PASS).unwrap();
         assert_eq!(
             open(&file, PASS).unwrap_err(),
+            RecoveryBundleError::Mismatch("root_custodian")
+        );
+    }
+
+    /// A v4 header of root generation 1 with this device's own
+    /// `RotationGrant` of `TRK`, from generation `previous`, signed with
+    /// `issuer_seed`.
+    fn rotated(issuer_seed: &[u8; 32], previous: u64) -> (RecoveryBundleHeaderV2, Vec<u8>) {
+        let h = RecoveryBundleHeaderV2 {
+            root_generation: 1,
+            ..header()
+        };
+        let grant = grant_by(issuer_seed, &TRK, |g| {
+            g.variant = RootGrantVariant::RotationGrant {
+                previous_root_key_id: [0x13; 32],
+                previous_root_generation: previous,
+            };
+            g.root_generation = 1;
+        });
+        (h, grant)
+    }
+
+    /// ADR 0002 Q-59 (D6): during a root rotation the only grant of N+1 is
+    /// the custodian's own `RotationGrant`; the bundle pinned before the
+    /// create carries it.
+    #[test]
+    fn a_v4_bundle_with_a_self_issued_rotation_grant_opens() {
+        let (h, grant) = rotated(&SIGNING_SEED, 0);
+        let pt = RecoveryBundlePlaintextV2 {
+            bootstrap_anchor_signing_key_id: anchor_of(&SIGNING_SEED),
+            ..plaintext_v4(grant.clone(), issuer_pk(&SIGNING_SEED))
+        };
+        let (_, opened) = open(&seal_with(&h, &pt, PASS).unwrap(), PASS).unwrap();
+        let c = opened.root_custodian.unwrap();
+        assert_eq!(c.root_grant, grant);
+        assert_eq!(c.root_grant_issuer, Some(issuer_pk(&SIGNING_SEED)));
+    }
+
+    #[test]
+    fn a_v4_rotation_grant_whose_previous_generation_is_not_header_minus_one_is_refused() {
+        for previous in [1, 2, u64::MAX] {
+            let (h, grant) = rotated(&SIGNING_SEED, previous);
+            let pt = plaintext_v4(grant, issuer_pk(&SIGNING_SEED));
+            assert_eq!(
+                open(&seal_with(&h, &pt, PASS).unwrap(), PASS).unwrap_err(),
+                RecoveryBundleError::Mismatch("root_custodian"),
+                "previous {previous}"
+            );
+        }
+        // Generation 0 follows nothing.
+        let grant = grant_by(&SIGNING_SEED, &TRK, |g| {
+            g.variant = RootGrantVariant::RotationGrant {
+                previous_root_key_id: [0x13; 32],
+                previous_root_generation: 0,
+            };
+        });
+        let pt = plaintext_v4(grant, issuer_pk(&SIGNING_SEED));
+        assert_eq!(
+            open(&seal_with(&header(), &pt, PASS).unwrap(), PASS).unwrap_err(),
+            RecoveryBundleError::Mismatch("root_custodian")
+        );
+    }
+
+    #[test]
+    fn a_v4_rotation_grant_issued_by_another_key_is_refused() {
+        let (h, grant) = rotated(&ISSUER_SEED, 0);
+        let pt = plaintext_v4(grant, issuer_pk(&ISSUER_SEED));
+        assert_eq!(
+            open(&seal_with(&h, &pt, PASS).unwrap(), PASS).unwrap_err(),
             RecoveryBundleError::Mismatch("root_custodian")
         );
     }

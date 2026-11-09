@@ -76,6 +76,12 @@ export type CustodyBootstrapStatus = {
   custody_ends_ms: number | null;
   /** When this device's key stops counting as a root custodian's. */
   key_age_ends_ms: number | null;
+  /** A root key rotation started and has not activated: Rotate root key resumes it. */
+  root_rotation_unfinished: boolean;
+  /** Where that rotation wrote its recovery bundle; a resumed run keeps it. Empty until written. */
+  root_rotation_path: string;
+  /** A finished root key rotation waits for a fleet key rotation. */
+  fleet_rotation_due: boolean;
 };
 
 /** What one root custody renewal step did. */
@@ -133,6 +139,10 @@ export type FleetCustodyStatus = {
   handed_over_to: string;
   /** The hand-over this device accepted as the new root custodian, if any. */
   handover: HandoverStatus | null;
+  /** Member renewal's last pass: a 2.10 server refused to approve an active member. */
+  members_need_server_update: boolean;
+  /** The error code a member's renewal last failed with; empty if none. */
+  member_renewal_failed: string;
 };
 
 /** How far an accepted root custody hand-over got; no record of it. */
@@ -201,6 +211,8 @@ export type TeamDevice = {
   approve_until_ms: number | null;
   /** This custodian's trust ledger counts the row's key as a root custodian: no `compromised`. */
   custodian: boolean;
+  /** The window of the member's latest approval as member renewal last saw it (v2.11). */
+  approval_window_ms: [number, number] | null;
 };
 
 /** What `team_join_code` shows on a joining device while its window is open. */

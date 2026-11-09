@@ -1138,6 +1138,46 @@ test("a root custodian not yet due to renew sees its custody dates and no renew 
   await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
 });
 
+test("a root key rotation waits for a stuck fleet generation, resumes with its bundle, and asks for a fleet rotation", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(a, "a", server, false, "&teamRootRotation=waits");
+  await cardClick(a, "Create fleet key");
+  const root = card.getByTestId("team-root-rotation");
+  await expect(root).toContainText("Recovery bundles exported before stop working.");
+  await expect(root).toContainText("hand root custody over to a new device first");
+
+  await test.step("the confirm tick and both passphrases gate the button", async () => {
+    await cardSignIn(a);
+    await root.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse battery");
+    await root.getByLabel("Recovery passphrase again").fill("correct horse battery");
+    await expect(root.getByRole("button", { name: "Rotate root key" })).toBeDisabled();
+    await root.getByLabel("I understand that recovery bundles exported before stop working").check();
+  });
+
+  await test.step("the first run stops at a stuck fleet generation and stays resumable", async () => {
+    await root.getByRole("button", { name: "Rotate root key" }).click();
+    await expect(a.getByText("the team server operator must discard it first", { exact: false })).toBeVisible();
+    await expect(root.getByTestId("team-root-rotation-unfinished"))
+      .toContainText("keeps the bundle it wrote at C:\\Users\\Example\\shardx-recovery.shxrecovery");
+  });
+
+  await test.step("resuming finishes, keeps the first bundle path and asks for a fleet rotation", async () => {
+    await cardSignIn(a);
+    await root.getByLabel("Recovery passphrase", { exact: true }).fill("correct horse battery");
+    await root.getByLabel("Recovery passphrase again").fill("correct horse battery");
+    await root.getByRole("button", { name: "Resume root key rotation" }).click();
+    await expect(a.getByText("Root key rotated. The new recovery bundle is at C:\\Users\\Example\\shardx-recovery.shxrecovery.", { exact: false })).toBeVisible();
+    await expect(root.getByTestId("team-root-rotation-unfinished")).toHaveCount(0);
+    await expect(root.getByTestId("team-root-rotation-fleet-due")).toContainText("Rotate the fleet key to finish the root key rotation");
+  });
+
+  await test.step("a fleet rotation clears the prompt", async () => {
+    await rotateOn(a);
+    await expect(root.getByTestId("team-root-rotation-fleet-due")).toHaveCount(0);
+  });
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
 // The v2.10 root custody hand-over (plan 4.H): A, the root custodian, appoints B;
 // B accepts and works through the checklist, then revokes A, which stays inert.
 const B_ID = "b1".repeat(16);
@@ -1372,8 +1412,8 @@ test("team-old-root-inert: a root custodian that handed over runs no custody act
   const card = await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
   const notice = card.getByTestId("team-handed-over");
   await expect(notice).toContainText("Root custody was handed to device b1b1b1b1. This computer runs no custody actions any more.");
-  await expect(notice).toContainText("this computer can be switched off");
-  await expect(notice).toContainText("Reset of this computer comes in v2.11");
+  await expect(notice).toContainText("revoked this computer, reset it below");
+  await expect(notice.getByRole("button", { name: "Reset this device" })).toBeVisible();
   for (const name of ["Rotate fleet key", "Re-seal all profiles", "Create fleet key", "Export recovery bundle", "Renew custody"]) {
     await expect(card.getByRole("button", { name })).toHaveCount(0);
   }
@@ -1395,6 +1435,51 @@ test("team-old-root-inert: a root custodian that handed over runs no custody act
   await expect(notice).toHaveCount(0);
   await expect(card.getByRole("button", { name: "Rotate fleet key" })).toBeVisible();
   await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("reset the old root: a handed-over root resets only once the server lists it revoked", async ({ page: a }) => {
+  const server = fakeTeamServer([{ ...activeB, custodian: true }], B_ID);
+  const card = await teamDevicePage(a, "a", server, false, "&teamHandover=appointed");
+  const reset = card.getByTestId("team-handed-over").getByRole("button", { name: "Reset this device" });
+  await expect(reset).toBeDisabled();
+  await cardSignIn(a);
+  await reset.click();
+  await expect(a.getByText("This root device can be reset only once the team server lists it revoked")).toBeVisible();
+  await expect(card.getByTestId("team-handed-over")).toBeVisible();
+
+  // The new custodian revoked it: the signed revocation lets it reset.
+  server.devices.find((d) => d.label === "Machine A")!.status = "revoked";
+  await cardSignIn(a);
+  await reset.click();
+  await expect(a.getByText("This device's identity was cleared. Enroll it again for a new join code.")).toBeVisible();
+  await expect(card.getByTestId("team-handed-over")).toHaveCount(0);
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("member renewal: each member shows its approval end, warns from 75%, and a 2.10 server is named", async ({ page: a }) => {
+  const machineC: TeamDeviceRow = { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 };
+  const server = fakeTeamServer([machineC]);
+  const card = await teamDevicePage(a, "a", server, false, "&teamMemberApproval=late&teamMembers=server-too-old");
+  const row = await listDevices(a, "Machine C");
+  await expect(row.getByTestId("team-device-approval")).toContainText("Approval ends");
+  await expect(row.getByTestId("team-device-approval")).toContainText("renew custody now");
+  await expect(card.getByTestId("team-members-server-update")).toContainText(
+    "The team server is too old to renew member devices' approvals.",
+  );
+  // This computer's own row shows no member approval.
+  await expect(a.getByTestId("team-device").filter({ hasText: "Machine A" }).getByTestId("team-device-approval"))
+    .toHaveCount(0);
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("member renewal: a member early in its approval shows its end without a warning", async ({ page: a }) => {
+  const machineC: TeamDeviceRow = { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 };
+  const server = fakeTeamServer([machineC]);
+  const card = await teamDevicePage(a, "a", server);
+  const row = await listDevices(a, "Machine C");
+  await expect(row.getByTestId("team-device-approval")).toContainText("Approval ends");
+  await expect(row.getByTestId("team-device-approval")).not.toContainText("renew custody now");
+  await expect(card.getByTestId("team-members-server-update")).toHaveCount(0);
 });
 
 // The two-machine gate (Plan:2388), each step a test.step below:

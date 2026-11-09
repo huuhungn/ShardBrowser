@@ -1,5 +1,112 @@
 # Changelog
 
+## v2.11.0
+
+A Team release: the root custodian can rotate the tenant root key, renews
+members' approvals and fleet key grants before they end, and a revoked old root
+device can be reset. Teams with more than 64 devices no longer stop at "too
+many signers". The team server gains offline discard commands for a stuck key
+rotation. The browser engine is unchanged.
+
+### Upgrade notes
+
+- Back up the team server database, then replace the binary. Migration 0034 is
+  forward-only: a 2.10 server will not start on a database it has migrated, so
+  a downgrade means restoring the backup.
+- 2.10 launchers keep working against a 2.11 server. Member renewal and Reset
+  need the 2.11 server.
+- After a root rotation, export is refused until the rotation is finished, and
+  every older recovery bundle stops working. Keep the new bundle and delete the
+  old ones by hand.
+- Do not downgrade a launcher after a root rotation: 2.10 cannot open a v4
+  bundle that holds a rotation grant, and reads trust evidence stored from
+  several listings as unreadable (Collect again after upgrading back).
+
+### Team
+
+- **Rotate root key.** On the root custodian, Rotate root key replaces the
+  tenant root key (TRK) N with a fresh N+1. It opens every fleet key the team
+  ever used from its recovery grant, writes a new v4 recovery bundle holding
+  the new key, every fleet key and a self-issued rotation grant, and pins that
+  bundle's hash on the server before it creates N+1. Every step is saved
+  before it is sent, so a crash or a lost reply resumes with the same bytes.
+  The new bundle path must differ from the current bundle.
+- **Finish with a fleet rotation.** The Team page then asks for Rotate fleet
+  key until a fleet generation activates under N+1. Members are not
+  interrupted by the root rotation itself.
+- **Refused while unfinished.** Rotate root key is refused when the device is
+  not the root custodian, has handed custody over, or has a fleet rotation,
+  re-seal, renewal or hand-over unfinished. Export recovery bundle is refused
+  while a root rotation is unfinished.
+- **Member renewal.** The root custodian renews each member's approval,
+  capability grants and fleet key grant at half-life, on the team server's
+  clock, as part of its own custody renewal. It renews only the
+  capability and scope pairs a member already holds, and a device grant only
+  if the member already holds one of the active fleet generation: a member
+  left out of a rotation does not get the key back this way. Recovery grants
+  and member grants of retired generations are not renewed.
+- **Reset of a revoked old root.** A revoked old root device, or a cancelled
+  new custodian, can now be reset when it holds a signed revocation from a key
+  it already trusts. Reset wipes its keys and root state and the device can
+  join again. A live root custodian never resets.
+- **Larger teams.** Trust evidence is read as several complete listings of at
+  most 64 signers each and merged, so a custodian revocation or a long history
+  no longer stops at "too many signers" for teams up to 1024 signers.
+
+### Team server
+
+- **Discard a stuck rotation.** `shardx-team-server fleet discard-preparing`
+  and `shardx-team-server root discard-preparing` archive and delete a stuck
+  PREPARING generation, so the same generation number can be used again. Stop
+  the server and back up the database first.
+- **Renewal of an active device.** The approve route accepts the renewal of an
+  active device by any holder of `device.approve` for the scope. A revoked
+  device is never approved again.
+- **Signed revocation in the ticket listing.** The ticket listing carries a
+  revoked device's signed revocation and its issuer's public key, which is what
+  Reset checks.
+- **Migration 0034.** It ties the no-delete triggers on key generations and
+  grants to the offline discard marker. It is forward-only.
+
+### Known limitations
+
+- **Root rotation cuts off an old TRK going forward only.** A TRK is cut off
+  only after the following fleet rotation. Recovery grants under N stay on the
+  server and in trust evidence, so whoever holds TRK N reads every fleet key up
+  to that point; copied keys cannot be recalled.
+- **The current custodian is not cut off.** Its own leaked bundle or stolen
+  machine receives TRK N+1 like the rest of its keys. Hand custody over first
+  (v2.10), then rotate.
+- **One custodian.** The required set of a root rotation is one rotation
+  grant. A device lost mid-rotation needs the old bundle (generation N is still
+  active) plus `root discard-preparing` on the server.
+- **Discard needs downtime.** Discarding needs the server stopped and the
+  operator. Archived rows are kept forever. A replayed create of a discarded
+  generation returns its stored reply, and launchers recover.
+- **Member renewal runs only when the custodian uses the launcher** (custody
+  commands, syncs) and needs a 2.11 server. A member that holds no grant of the
+  active fleet generation gets its approval and capability grants renewed but
+  no first device grant; the next fleet rotation grants it, or it is revoked and
+  enrolls again.
+- **Reset trusts only a saved issuer.** Reset needs a 2.11 server. It trusts
+  only the saved appointment signer (the old root) or the saved hand-over
+  issuer before the appointee's own rotation (a cancelled appointee). It checks
+  the issuer's revocations in the ticket listing and those this device filed.
+  Otherwise the machine stays inert and is wiped by hand.
+- **Reset leaves some files.** The TRK of a run abandoned before its reference
+  was saved, and recovery bundle files on disk, are not wiped. Delete old
+  bundles by hand.
+- **Evidence limit.** Evidence beyond 1024 signers fails closed. Listings
+  fetched moments apart are merged as a union, so a revocation in any of them
+  counts.
+- **Downgrade.** 2.10 cannot open a v4 bundle holding a rotation grant, and
+  reads an evidence store of several listings as unreadable.
+- **Still open from earlier releases.** `compromised` for custodian rows,
+  cleanup of retained fleet generations, the members' banner, the revocations
+  of an imported custodian, a change of the server URL alone, revocations a
+  hostile server hides, and members that missed two rotations and must enroll
+  again.
+
 ## v2.10.0
 
 A Team release: root custody can move to a new device in an enforced order,

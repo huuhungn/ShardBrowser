@@ -1,6 +1,88 @@
 {
   "releases": [
     {
+      "version": "2.11.0",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "team-root-rotation",
+          "title": "Xoay khoá gốc",
+          "lead": "Root custodian có thể thay khoá gốc của nhóm ngay trên trang Team, và một gói khôi phục mới được ghi trong lúc xoay.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Xoay khoá gốc mở mọi khoá đội máy mà nhóm từng dùng, ghi một gói khôi phục mới chứa khoá gốc mới, rồi ghim hash của gói đó lên server trước khi tạo khoá mới. Mọi bước đều được lưu trước khi gửi, nên khi bị sập máy hoặc mất phản hồi, lần chạy lại gửi đúng các byte cũ. Đường dẫn gói mới phải khác gói hiện tại, và Xuất gói khôi phục bị từ chối khi việc xoay chưa xong."
+            },
+            {
+              "type": "p",
+              "text": "Sau đó trang Team yêu cầu Xoay khoá đội máy; bước này hoàn tất việc xoay và cắt khoá gốc cũ từ đó về sau. Các gói khôi phục cũ ngừng hoạt động, nên hãy giữ gói mới và tự xoá các gói cũ."
+            },
+            {
+              "type": "note",
+              "text": "Thiết bị bị mất giữa lúc xoay khoá gốc cần gói cũ cùng lệnh root discard-preparing trên server. Không hạ cấp launcher sau khi xoay khoá gốc: bản 2.10 không mở được gói mới."
+            }
+          ]
+        },
+        {
+          "id": "team-member-renewal",
+          "title": "Thành viên được root custodian gia hạn",
+          "lead": "Root custodian gia hạn phê duyệt và grant khoá đội máy của thành viên trước khi hết hạn.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Việc gia hạn chạy khi đi được nửa thời hạn, tính theo đồng hồ của server nhóm, nằm trong lần gia hạn của chính custodian khi nó dùng lệnh giữ khoá hoặc đồng bộ. Nó chỉ gia hạn các cặp quyền và phạm vi mà thành viên đã có, và grant thiết bị chỉ khi thành viên đã có một grant của thế hệ khoá đội máy đang dùng: thành viên bị bỏ sót trong một lần xoay không lấy lại được khoá bằng cách này."
+            },
+            {
+              "type": "note",
+              "text": "Gia hạn thành viên cần server nhóm bản 2.11; server bản 2.10 bỏ qua mọi thành viên. Recovery grant và grant của các thế hệ khoá đội máy đã nghỉ không được gia hạn."
+            }
+          ]
+        },
+        {
+          "id": "team-reset-old-root",
+          "title": "Reset máy gốc cũ đã bị thu hồi",
+          "lead": "Máy gốc cũ đã bị thu hồi, hoặc custodian mới đã bị huỷ, có thể được Reset và tham gia lại nhóm.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Reset cần bản thu hồi có chữ ký dành cho chính thiết bị đó, từ một khoá mà nó đã tin: người ký việc chỉ định đã lưu với máy gốc cũ, hoặc bên chuyển giao đã lưu với thiết bị được chỉ định bị huỷ mà chưa xoay khoá. Nó kiểm tra các lần thu hồi của bên ký trong danh sách ticket và những lần thiết bị này đã gửi. Reset xoá khoá và trạng thái root của thiết bị; root custodian đang hoạt động thì không bao giờ Reset."
+            },
+            {
+              "type": "note",
+              "text": "Reset cần server nhóm bản 2.11. Nó không xoá khoá của lần chạy bị bỏ trước khi lưu tham chiếu, cũng không xoá các tệp gói khôi phục trên đĩa; hãy tự xoá các gói cũ."
+            }
+          ]
+        },
+        {
+          "id": "team-server-discard",
+          "title": "Nhóm lớn hơn và sửa lần xoay bị kẹt",
+          "lead": "Nhóm trên 64 thiết bị không còn dừng ở lỗi quá nhiều bên ký, và server nhóm có thể dọn một lần xoay khoá bị kẹt.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Bằng chứng tin cậy được đọc thành nhiều danh sách đầy đủ, mỗi danh sách tối đa 64 bên ký, rồi gộp lại, nên việc thu hồi custodian hoặc kiểm tra lịch sử dài chạy được với nhóm đến 1024 bên ký."
+            },
+            {
+              "type": "p",
+              "text": "Server nhóm: shardx-team-server fleet discard-preparing và root discard-preparing dọn một lần xoay khoá bị kẹt khi server đang dừng (hãy sao lưu cơ sở dữ liệu trước), để dùng lại được đúng thế hệ đó. Route duyệt chấp nhận gia hạn cho thiết bị đang hoạt động, và danh sách ticket kèm bản thu hồi có chữ ký của thiết bị bị thu hồi."
+            },
+            {
+              "type": "note",
+              "text": "Hãy sao lưu cơ sở dữ liệu server nhóm rồi mới thay binary: migration 0034 chỉ đi một chiều, nên server bản 2.10 không khởi động được trên nó và hạ cấp nghĩa là khôi phục bản sao lưu. Launcher bản 2.10 vẫn chạy với server bản 2.11."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.10.0",
       "date": "2026-11-09",
       "entries": [

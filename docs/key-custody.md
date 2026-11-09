@@ -408,6 +408,11 @@ renewal of members' approvals and grants (which run one year), discarding a
 stuck PREPARING generation, `compromised` for custodian rows, closures over
 more than 64 signers, and Reset of a handed-over old root.
 
+Known limit of member renewal (Q-61): a member that holds no grant of the
+ACTIVE fleet generation (it missed a rotation) gets its new approval and
+capability grants but never a first device grant; it is granted the key by
+the next fleet rotation, or revoked and enrolled again.
+
 ### Fleet key rotation
 
 From 2.9.0 the root custodian rotates the fleet key with "Rotate fleet key" on

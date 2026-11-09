@@ -55,7 +55,7 @@ const DAY_MS: u64 = 86_400_000;
 /// custodian ledger (W6).
 const VALIDITY_MS: u64 = 365 * DAY_MS;
 /// Backdated so a server clock slightly behind this one accepts it.
-const CLOCK_SKEW_MS: u64 = 60_000;
+pub(crate) const CLOCK_SKEW_MS: u64 = 60_000;
 const _: () = assert!(VALIDITY_MS <= shardx_core::approval_receipt::MAX_DEVICE_APPROVAL_TTL_MS);
 
 /// Where the TRK lives while the bootstrap runs, under the reference
@@ -142,6 +142,14 @@ pub struct BootstrapState {
     /// the last one finished.
     #[serde(default)]
     pub renewal: Option<Renewal>,
+    /// Root key rotation (v2.11 RR, ADR 0002 Q-59): the run in progress, or
+    /// the last one finished.
+    #[serde(default)]
+    pub root_rotation: Option<crate::root_rotation::RootRotation>,
+    /// The root generation a finished root rotation activated, until a fleet
+    /// rotation activates with its recovery grant under it (D8).
+    #[serde(default)]
+    pub fleet_rotation_due_after_root: Option<u64>,
 }
 
 /// One root self-renewal: every record and request, hex, built once and
@@ -215,7 +223,7 @@ pub(crate) fn corrupt() -> anyhow::Error {
 }
 
 /// A saved state field: anything that does not decode is a damaged file.
-fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
+pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     unhex_vec(s)?.try_into().map_err(|_| corrupt())
 }
 
@@ -318,7 +326,7 @@ pub(crate) fn self_grant(
 }
 
 /// `g` with `trk` sealed to `hpke_public_key`, signed by `signer`.
-fn sealed_root_grant(
+pub(crate) fn sealed_root_grant(
     signer: &Ed25519SigningKey,
     hpke_public_key: &[u8],
     trk: &[u8; 32],
@@ -483,7 +491,7 @@ fn export_recovery_bundle(
 /// Seals `plaintext` under a header naming `(tenant, instance, root
 /// generation)` and writes it once its sealed bytes open, then re-reads
 /// exactly those bytes from its final path. Returns the pinned hash.
-fn write_bundle(
+pub(crate) fn write_bundle(
     (tenant, instance, root_generation): ([u8; 16], [u8; 16], u64),
     plaintext: &RecoveryBundlePlaintextV2,
     recovery: &RecoveryExport<'_>,
@@ -512,7 +520,7 @@ fn write_bundle(
 
 /// The bundle at `recovery.path` is the pinned one and still opens to `trk`.
 /// A 2.7.x (v2) bundle passes: activation accepts the one it pinned.
-fn check_bundle(
+pub(crate) fn check_bundle(
     recovery: &RecoveryExport<'_>,
     pinned: &[u8; 32],
     trk: &[u8; 32],
@@ -573,7 +581,7 @@ pub(crate) fn nonce_ok(nonce: &str) -> bool {
 }
 
 /// The reference the TRK of one run of `tenant_hex` is stored under.
-fn trk_ref(tenant_hex: &str, nonce: &str) -> String {
+pub(crate) fn trk_ref(tenant_hex: &str, nonce: &str) -> String {
     format!("tenant-root.{}.{nonce}", tenant_hex.to_ascii_lowercase())
 }
 
@@ -1114,6 +1122,11 @@ pub async fn export_again(
 ) -> Result<String> {
     crate::fleet_custody::refuse_handed_over(&crate::fleet_custody::load()?)?;
     let state = load()?;
+    // A bundle of root N now could overwrite the one N + 1 pins, and stops
+    // restoring once N + 1 activates.
+    if crate::root_rotation::unfinished(&state) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
+    }
     let (grant, container, issuer) = current_root_grant(&state, signer)?;
     let exported = root_grant_sha256(&state);
     let tenant_hex = hex(&grant.common.tenant_id);
@@ -1212,6 +1225,14 @@ pub struct BootstrapStatus {
     /// When this device's signing key stops counting as a custodian's
     /// (`MAX_CUSTODIAN_KEY_AGE_MS`); only a hand-over moves custody past it.
     pub key_age_ends_ms: Option<u64>,
+    /// A root key rotation (RR) started and has not activated: Rotate root
+    /// key resumes it.
+    pub root_rotation_unfinished: bool,
+    /// Where that rotation wrote its recovery bundle, once it did; a resumed
+    /// run keeps it.
+    pub root_rotation_path: String,
+    /// A finished root rotation waits for a fleet key rotation (D8).
+    pub fleet_rotation_due: bool,
 }
 
 impl BootstrapStatus {
@@ -1231,6 +1252,14 @@ impl BootstrapStatus {
             renewal_due_ms,
             custody_ends_ms,
             key_age_ends_ms,
+            root_rotation_unfinished: crate::root_rotation::unfinished(state),
+            root_rotation_path: state
+                .root_rotation
+                .as_ref()
+                .filter(|r| !r.done)
+                .map(|r| r.recovery_path.clone())
+                .unwrap_or_default(),
+            fleet_rotation_due: state.fleet_rotation_due_after_root.is_some(),
         }
     }
 }
@@ -1459,7 +1488,10 @@ pub(crate) fn own_device_grant(state: &BootstrapState) -> Option<Vec<u8>> {
 }
 
 /// The facts this custodian's renewed records name.
-fn renewal_context(state: &BootstrapState, me: &RenewingDevice<'_>) -> Result<Context16> {
+pub(crate) fn renewal_context(
+    state: &BootstrapState,
+    me: &RenewingDevice<'_>,
+) -> Result<Context16> {
     let (_, hpke_public) = derive_keypair(me.hpke_seed);
     Ok(Context16 {
         tenant: decode_hex16(&state.tenant_id, "tenant_id")?,
@@ -1595,7 +1627,7 @@ fn saved_replay(container: &[u8], issuer: &[u8; 32]) -> Result<[u8; 16]> {
 }
 
 /// The saved request `saved` and its exact bytes.
-fn saved(saved: &str) -> Result<(IdempotentMutationRequestV2, Vec<u8>)> {
+pub(crate) fn saved(saved: &str) -> Result<(IdempotentMutationRequestV2, Vec<u8>)> {
     let bytes = unhex_vec(saved)?;
     let request = IdempotentMutationRequestV2::parse(&bytes).map_err(|_| corrupt())?;
     Ok((request, bytes))
@@ -1822,6 +1854,10 @@ pub(crate) async fn renew(
 ) -> Result<RenewalOutcome> {
     if crate::fleet_custody::refuse_handed_over(custody).is_err() {
         return Ok(RenewalOutcome::HandedOver);
+    }
+    // The rotation's own records replace the root grant once it activates.
+    if crate::root_rotation::unfinished(state) {
+        return Ok(RenewalOutcome::Busy);
     }
     let resuming = state.renewal.as_ref().is_some_and(|r| !r.done);
     let own = me.signer.verifying_key().to_bytes();
@@ -2629,6 +2665,52 @@ pub(crate) mod tests {
             custodian.root_grant_issuer,
             Some(a0().verifying_key().to_bytes())
         );
+    }
+
+    /// v2.11 S4: while a root rotation is unfinished, export refuses before
+    /// the server is asked or a file is written.
+    #[test]
+    fn export_is_refused_while_a_root_rotation_is_unfinished() {
+        use crate::fleet_custody::tests::{mock, runtime};
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let (state, _) = appointed_state(0);
+        save(&BootstrapState {
+            root_rotation: Some(crate::root_rotation::RootRotation {
+                generation: 1,
+                ..Default::default()
+            }),
+            ..state
+        })
+        .unwrap();
+        let rt = runtime();
+        let (client, seen) = rt.block_on(mock(std::sync::Arc::new(|_: &str, _: &[u8]| {
+            (404, Vec::new())
+        })));
+        let path = dir.path().join("again.bundle");
+        let result = rt.block_on(export_again(
+            &client,
+            "access",
+            &hex(&[1; 16]),
+            &signer(),
+            &HPKE_SEED,
+            vec![(0, Zeroizing::new([0x44; 32]))],
+            &RecoveryExport {
+                path: &path,
+                passphrase: "correct horse battery",
+            },
+        ));
+        crate::store::set_config_root(None);
+        let err = result.unwrap_err();
+        assert!(
+            crate::errcode::has_code(&err.to_string(), "fleet.rootRotationUnfinished"),
+            "{err}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!path.exists());
     }
 
     /// Q-52: a custodian that is not the anchor names the saved anchor `A0`,
@@ -4224,4 +4306,6 @@ pub(crate) mod tests {
             assert!(text.contains("\"renewal\""));
         }
     }
+
+    include!("root_rotation_tests.rs");
 }

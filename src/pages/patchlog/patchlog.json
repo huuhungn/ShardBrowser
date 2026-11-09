@@ -3,6 +3,88 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.11.0",
+      "date": "2026-11-09",
+      "entries": [
+        {
+          "id": "team-root-rotation",
+          "title": "Rotate root key",
+          "lead": "The root custodian can replace the tenant root key from the Team page, and a new recovery bundle is written during the rotation.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Rotate root key opens every fleet key the team ever used, writes a new recovery bundle holding the new root key, and pins that bundle's hash on the server before the new key is created. Every step is saved before it is sent, so a crash or a lost reply resumes with the same bytes. The new bundle path must differ from the current bundle, and Export recovery bundle is refused while a rotation is unfinished."
+            },
+            {
+              "type": "p",
+              "text": "Afterwards the Team page asks for Rotate fleet key; that finishes the rotation and cuts the old root key off going forward. Older recovery bundles stop working, so keep the new one and delete the old ones by hand."
+            },
+            {
+              "type": "note",
+              "text": "A device lost during a root rotation needs the old bundle plus root discard-preparing on the server. Do not downgrade a launcher after a root rotation: 2.10 cannot open the new bundle."
+            }
+          ]
+        },
+        {
+          "id": "team-member-renewal",
+          "title": "Members renew from the root custodian",
+          "lead": "The root custodian renews members' approvals and fleet key grants before they end.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Renewal runs at half-life on the team server's clock, as part of the custodian's own renewal, when it uses custody commands or syncs. It renews only the capability and scope pairs a member already holds, and a device grant only if the member already holds one of the active fleet generation: a member left out of a rotation does not get the key back this way."
+            },
+            {
+              "type": "note",
+              "text": "Member renewal needs the 2.11 team server; a 2.10 server skips every member. Recovery grants and grants of retired fleet generations are not renewed."
+            }
+          ]
+        },
+        {
+          "id": "team-reset-old-root",
+          "title": "Reset a revoked old root",
+          "lead": "A revoked old root device, or a cancelled new custodian, can be reset and join the team again.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Reset needs the device's own signed revocation from a key it already trusts: the saved appointment signer for an old root, or the saved hand-over issuer for a cancelled appointee that has not rotated yet. It checks the issuer's revocations in the ticket listing and those this device filed. Reset wipes the device's keys and root state; a live root custodian never resets."
+            },
+            {
+              "type": "note",
+              "text": "Reset needs the 2.11 team server. It does not wipe the key of a run abandoned before its reference was saved, or recovery bundle files on disk; delete old bundles by hand."
+            }
+          ]
+        },
+        {
+          "id": "team-server-discard",
+          "title": "Larger teams and a stuck-rotation fix",
+          "lead": "Teams with more than 64 devices no longer stop at too many signers, and the team server can clear a stuck key rotation.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trust evidence is read as several complete listings of at most 64 signers each and merged, so a custodian revocation or a long history works for teams of up to 1024 signers."
+            },
+            {
+              "type": "p",
+              "text": "Team server: shardx-team-server fleet discard-preparing and root discard-preparing clear a stuck key rotation while the server is stopped (back up the database first), so the same generation can be used again. The approve route accepts the renewal of an active device, and the ticket listing carries a revoked device's signed revocation."
+            },
+            {
+              "type": "note",
+              "text": "Back up the team server database, then replace the binary: migration 0034 is forward-only, so a 2.10 server will not start on it and a downgrade means restoring the backup. 2.10 launchers keep working against a 2.11 server."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.10.0",
       "date": "2026-11-09",
       "entries": [

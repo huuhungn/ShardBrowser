@@ -374,10 +374,13 @@ const renewalTimes = (renewed: number) => ({
   renewal_due_ms: renewed + 182 * DAY_MS, custody_ends_ms: renewed + 365 * DAY_MS,
   key_age_ends_ms: Date.now() + 900 * DAY_MS,
 });
-const noRenewal = { renewal_due_ms: null, custody_ends_ms: null, key_age_ends_ms: null };
+// No root key rotation started or awaiting its fleet rotation.
+const noRootRotation = { root_rotation_unfinished: false, root_rotation_path: "", fleet_rotation_due: false };
+const noRenewal = { renewal_due_ms: null, custody_ends_ms: null, key_age_ends_ms: null, ...noRootRotation };
 let custodyBootstrap: {
   started: boolean; this_device: boolean; activated: boolean; recovery_path: string; anchor: string; root_key_id: string;
   renewal_due_ms: number | null; custody_ends_ms: number | null; key_age_ends_ms: number | null;
+  root_rotation_unfinished: boolean; root_rotation_path: string; fleet_rotation_due: boolean;
 } = foreignRoot
   ? {
     started: true, this_device: false, activated: foreignRoot === "foreign",
@@ -394,6 +397,7 @@ let custodyBootstrap: {
       started: true, this_device: true, activated: true, recovery_path: "C:\\Users\\Example\\a.shxrecovery",
       anchor: TEAM_ANCHOR, root_key_id: TEAM_ROOT_KEY_ID,
       // With `teamRenewal=due` its records are past 75% of their life.
+      ...noRootRotation,
       ...renewalTimes(Date.now() - (params.get("teamRenewal") === "due" ? 300 : 10) * DAY_MS),
     }
     : { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "", ...noRenewal };
@@ -406,9 +410,18 @@ let fleetCustody: {
   rotation_required: "urgent" | "routine" | null; export_due: boolean; export_reason: "rotation" | "renewal";
   reseal: { generation: number; started_ms: number; ended_ms: number | null; profiles: Record<string, string> } | null;
   handed_over_to: string; handover: HandoverStatus | null;
+  members_need_server_update: boolean; member_renewal_failed: string;
 } = {
   started: false, created: false, setup_key_held: false, fkek_key_id: "", rotation: null, rotation_required: null,
   export_due: false, export_reason: "rotation", reseal: null, handed_over_to: "", handover: null,
+  // `teamMembers=server-too-old`: the last member renewal met a 2.10 server.
+  members_need_server_update: params.get("teamMembers") === "server-too-old", member_renewal_failed: "",
+};
+// v2.11 member renewal: each active member's approval window as the last pass saw it;
+// with `teamMemberApproval=late` it is past 75% of its life.
+const teamMemberWindow = (): [number, number] => {
+  const from = Date.now() - (params.get("teamMemberApproval") === "late" ? 300 : 10) * DAY_MS;
+  return [from, from + 365 * DAY_MS];
 };
 // The fleet generation A was at when it appointed B: its cancel is refused once the server is past it.
 let teamHandedOverGeneration = 0;
@@ -503,7 +516,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
   const args = (payload ?? {}) as {
     profileId?: string; remoteProfileId?: string; localProfileId?: string; deviceId?: string; sas?: string;
     reason?: string; anchor?: string; label?: string; path?: string; oldDeviceLost?: boolean;
-    skipMember?: string | null; asCustodian?: boolean; acceptReverts?: string[] | null;
+    skipMember?: string | null; asCustodian?: boolean; acceptReverts?: string[] | null; bundlePath?: string;
   };
   const id = String(args.profileId ?? args.localProfileId ?? "");
   const head = () => ({
@@ -539,6 +552,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         return {
           ...r, account_id: "ac".repeat(16), ...teamKeyIds(r.device_id), sas: teamSas(r.device_id),
           approve_until_ms: first === undefined ? null : first + TEAM_WINDOW_MS,
+          approval_window_ms: r.status === "active" && r.device_id !== teamMe.device_id ? teamMemberWindow() : null,
         };
       });
     }
@@ -570,7 +584,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       const { outgoing, generation } = await teamServer<{ outgoing: string; generation: number }>("accept", me);
       custodyBootstrap = {
         started: true, this_device: true, activated: true, recovery_path: "", anchor: TEAM_ANCHOR,
-        root_key_id: TEAM_ROOT_KEY_ID, ...renewalTimes(Date.now()),
+        root_key_id: TEAM_ROOT_KEY_ID, ...noRootRotation, ...renewalTimes(Date.now()),
       };
       fleetCustody = {
         ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32),
@@ -666,6 +680,8 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
         teamRefuse("fleet.refusedCustody|status=503|detail=unavailable");
       }
       teamFailing = null;
+      // D8: a fleet key under the rotated root ends the root rotation's prompt.
+      custodyBootstrap = { ...custodyBootstrap, fleet_rotation_due: false };
       fleetCustody = {
         ...fleetCustody,
         rotation: { ...rotation, phase: "done", failing_member: null },
@@ -729,8 +745,13 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
     case "team_enroll_again": {
       const status = await teamServer<string | null>("status", me);
       const allowed = status === "pending" || status === "revoked" || (status === "active" && !teamMe.pinned);
-      // As the launcher: this device's root state refuses it, activated or not.
-      if (custodyBootstrap.this_device || !allowed) teamRefuse("fleet.enrollAgainRefused");
+      // As the launcher: this device's root state refuses it, activated or not, unless
+      // it handed custody over and the server serves its signed revocation (v2.11).
+      if (custodyBootstrap.this_device && fleetCustody.handed_over_to) {
+        if (status !== "revoked") teamRefuse("fleet.resetNeedsSignedRevocation");
+        custodyBootstrap = { started: false, this_device: false, activated: false, recovery_path: "", anchor: "", root_key_id: "", ...noRenewal };
+        fleetCustody = { ...fleetCustody, started: false, created: false, fkek_key_id: "", handed_over_to: "" };
+      } else if (custodyBootstrap.this_device || !allowed) teamRefuse("fleet.enrollAgainRefused");
       teamMe = { ...teamMe, device_id: "", enrolled_at_ms: 0, collected: false };
       teamSeeds = null;
       return teamStatusFixture();
@@ -748,7 +769,7 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       teamSeeds = null;
       custodyBootstrap = {
         started: true, this_device: true, activated: true, recovery_path: String(args.path ?? ""), anchor: TEAM_ANCHOR,
-        root_key_id: TEAM_ROOT_KEY_ID, ...renewalTimes(Date.now()),
+        root_key_id: TEAM_ROOT_KEY_ID, ...noRootRotation, ...renewalTimes(Date.now()),
       };
       fleetCustody = { ...fleetCustody, started: true, created: true, setup_key_held: false, fkek_key_id: "fk".repeat(32) };
       return {
@@ -766,6 +787,24 @@ async function teamDeviceCommand(cmd: string, payload?: InvokeArgs) {
       custodyBootstrap = { ...custodyBootstrap, ...renewalTimes(Date.now()) };
       fleetCustody = { ...fleetCustody, export_due: true, export_reason: "renewal" };
       return "renewed";
+    }
+    case "team_rotate_root": {
+      // As the launcher (v2.11 RR): with `teamRootRotation=waits` the first run stops at the activation,
+      // which waits for a stuck fleet generation's discard, and stays resumable with its saved bundle path.
+      teamCustodian();
+      teamNotHandedOver();
+      await teamServer("live", me);
+      const path = custodyBootstrap.root_rotation_path || String(args.bundlePath ?? "");
+      document.documentElement.dataset.e2eRootRotationPath = path;
+      if (params.get("teamRootRotation") === "waits" && !custodyBootstrap.root_rotation_unfinished) {
+        custodyBootstrap = { ...custodyBootstrap, root_rotation_unfinished: true, root_rotation_path: path };
+        teamRefuse("fleet.rootRotationWaitsForFleetDiscard");
+      }
+      custodyBootstrap = {
+        ...custodyBootstrap, recovery_path: path, root_key_id: "6e".repeat(32),
+        root_rotation_unfinished: false, root_rotation_path: "", fleet_rotation_due: true,
+      };
+      return custodyBootstrap;
     }
     case "team_export_recovery_bundle": {
       teamCustodian();
@@ -1318,6 +1357,7 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
         recovery_path: custodyBootstrap.recovery_path || String(args?.recoveryPath ?? ""),
         anchor: "a0".repeat(32),
         root_key_id: TEAM_ROOT_KEY_ID,
+        ...noRootRotation,
         ...renewalTimes(Date.now()),
       };
       return custodyBootstrap;

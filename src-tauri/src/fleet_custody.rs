@@ -169,6 +169,49 @@ pub struct FleetCustodyState {
     /// 4.H steps 2-7, U6).
     #[serde(default)]
     pub handover: Option<Handover>,
+    /// Member renewal (v2.11 MR): the runs in progress and the last pass.
+    #[serde(default)]
+    pub member_renewal: MemberRenewal,
+}
+
+/// What member renewal (v2.11 MR, ADR 0002 Q-61) keeps. Records and
+/// requests only, hex-encoded; no key is among it.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemberRenewal {
+    /// When the last pass ended, by the local clock; 0 asks for one now.
+    #[serde(default)]
+    pub checked_ms: u64,
+    /// Per lower-case device id, a member's records built at once and saved
+    /// before the first is sent; dropped once all are answered.
+    #[serde(default)]
+    pub runs: BTreeMap<String, MemberRun>,
+    /// The last pass, per member: `renewed`, `current` or `skipped:<code>`.
+    #[serde(default)]
+    pub outcomes: BTreeMap<String, String>,
+    /// Per member, the window of its latest approval the chain counted, as
+    /// the last pass saw it (the Team page shows its end).
+    #[serde(default)]
+    pub approvals: BTreeMap<String, (u64, u64)>,
+    /// This server took an approval of an active member once (ADR 0002
+    /// Q-61): a later 403 on one is no sign of a 2.10 server.
+    #[serde(default)]
+    pub server_renews: bool,
+}
+
+/// One member's renewal: its approval, its capability grants and the
+/// request filing its `DeviceHpkeGrant` (empty when it held none of the
+/// ACTIVE generation), sent in that order from `step`.
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemberRun {
+    pub approval: String,
+    #[serde(default)]
+    pub capability_grants: Vec<String>,
+    #[serde(default)]
+    pub grant_request: String,
+    /// The next record to send: 0 the approval, then each capability grant,
+    /// then the device grant.
+    #[serde(default)]
+    pub step: usize,
 }
 
 /// What the new root custodian keeps of its hand-over (v2.10 4.H). Records
@@ -1006,6 +1049,9 @@ pub struct ListedDevice {
     /// The trust ledger here counts the row's key as a root custodian: the
     /// Team page offers it no `compromised` (Q-57). Set by the command.
     pub custodian: bool,
+    /// The window of the member's latest approval as member renewal last
+    /// saw it (v2.11 MR); `None` before a pass named it.
+    pub approval_window_ms: Option<(u64, u64)>,
 }
 
 fn code_of(
@@ -1076,6 +1122,11 @@ pub fn see_devices(
                 sas: code_of(pin, &signing, &hpke),
                 approve_until_ms: first.map(|m| m + JOIN_WINDOW_MS),
                 custodian: false,
+                approval_window_ms: state
+                    .member_renewal
+                    .approvals
+                    .get(&r.device_id.to_ascii_lowercase())
+                    .copied(),
             })
         })
         .collect()
@@ -1372,6 +1423,10 @@ pub async fn approve_member(
     // one runs at a time.
     if custodian_root.is_none() || !resumes_appointment(state, &id) {
         refuse_handed_over(state)?;
+    }
+    // RR: an appointee's grant of the root a rotation retires would be lost.
+    if custodian_root.is_some_and(crate::root_rotation::unfinished) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
     }
     if state
         .members
@@ -2160,10 +2215,604 @@ pub(crate) fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -
 /// Whether `e` is the server's refusal of the request itself: the custody
 /// marker with a 4xx status other than 401, 408 or 429, which a resend of
 /// the same bytes would not change.
-fn refused_for_good(e: &anyhow::Error) -> bool {
+pub(crate) fn refused_for_good(e: &anyhow::Error) -> bool {
     (400..500)
         .filter(|s| ![401, 408, 429].contains(s))
         .any(|s| refused_with(e, s, None))
+}
+
+// ---- Reset of a revoked root device (v2.11 RS, ADR 0002 Q-63) ----
+
+/// Whether this root device may ask to be reset at all: it handed its
+/// custody over, or it accepted a hand-over. A live custodian never resets.
+pub fn may_reset_root(state: &FleetCustodyState) -> bool {
+    !state.handed_over_to.is_empty() || state.handover.is_some()
+}
+
+/// RS: whether `revocation`, the exact container a 2.11 server listed for
+/// this root device, hex, signed by `issuer_public_key`, hex, lets it reset.
+/// It must verify under that key, name `root`'s tenant, server and device and
+/// `own_key_id`, and come from the only issuer this device trusts for it: as
+/// the old root, the appointee named in its saved appointment approval; as an
+/// appointee before its own rotation, the saved hand-over issuer. The pinned
+/// anchor and every other custodian key are refused. It must also be issued
+/// before any revocation of that issuer this device knows of: those it filed
+/// itself, and `listed` (exact container, issuer public key, both hex), the
+/// fresh ticket listing's. Otherwise `fleet.resetNeedsSignedRevocation`.
+pub fn reset_revocation_holds(
+    state: &FleetCustodyState,
+    root: &BootstrapState,
+    own: &[u8; 32],
+    (revocation, issuer_public_key): (&str, &str),
+    listed: &[(&str, &str)],
+) -> Result<()> {
+    let refused = || anyhow::anyhow!(crate::errcode::code("fleet.resetNeedsSignedRevocation"));
+    let verified = |exact: &str, issuer: &str| -> Option<([u8; 32], DeviceRevocationV2)> {
+        let issuer = decode_hex32(issuer, "issuer").ok()?;
+        match AuthorizationRecord::parse(&decode_hex(exact)?)
+            .and_then(|r| r.verify_signature(&issuer))
+            .ok()?
+            .payload()
+        {
+            Payload::DeviceRevocation(r) => Some((signing_key_id(&issuer), r.clone())),
+            _ => None,
+        }
+    };
+    let (issuer, r) = verified(revocation, issuer_public_key).ok_or_else(refused)?;
+    let named = (
+        r.common.tenant_id,
+        r.common.server_instance_id,
+        r.subject_device_id,
+        r.subject_signing_key_id,
+    );
+    let ours = (
+        decode_hex16(&root.tenant_id, "tenant_id")?,
+        decode_hex16(&root.server_instance_id, "server_instance_id")?,
+        decode_hex16(&root.device_id, "device_id")?,
+        signing_key_id(own),
+    );
+    if named != ours {
+        return Err(refused());
+    }
+    let trusted = if !state.handed_over_to.is_empty() {
+        let approval = state
+            .members
+            .get(&state.handed_over_to)
+            .and_then(|m| decode_hex(&m.approval))
+            .and_then(|a| {
+                AuthorizationRecord::parse(&a)
+                    .ok()?
+                    .verify_signature(own)
+                    .ok()
+            });
+        match approval.as_ref().map(|v| v.payload()) {
+            Some(Payload::DeviceApproval(a)) => Some(a.subject_signing_key_id),
+            _ => None,
+        }
+    } else {
+        state
+            .handover
+            .as_ref()
+            .filter(|h| h.rotated_generation <= h.accepted_generation)
+            // A rotation past the accepted generation may already be ACTIVE
+            // on the server (activated, or an activation whose reply was
+            // lost) before `rotated_generation` is saved at its end.
+            .filter(|h| {
+                !state.rotation.as_ref().is_some_and(|r| {
+                    r.generation > h.accepted_generation && r.phase != RotationPhase::Expired
+                })
+            })
+            .and_then(|h| decode_hex32(&h.root_grant_issuer, "issuer").ok())
+            .map(|pk| signing_key_id(&pk))
+    };
+    if trusted != Some(issuer) {
+        return Err(refused());
+    }
+    let own_revocations = state
+        .revocations
+        .values()
+        .filter_map(|saved| saved_revocation(saved, own).ok());
+    let listed_revocations = listed
+        .iter()
+        .filter_map(|(exact, issuer)| verified(exact, issuer).map(|(_, r)| r));
+    let issuer_revoked = own_revocations
+        .chain(listed_revocations)
+        .filter(|v| v.subject_signing_key_id == issuer)
+        .map(|v| v.common.issued_at_ms)
+        .min();
+    if issuer_revoked.is_some_and(|at| r.common.issued_at_ms >= at) {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// RS's wipe of the fleet custody: forgets every setup key the saved state
+/// names (Create fleet key's and a rotation's), best effort. The state
+/// itself is deleted last, by the caller.
+pub fn forget_setup_keys() -> Result<()> {
+    let mut state = load()?;
+    for slot in [bootstrap_key as SetupKey, rotation_key] {
+        if let (false, Ok(name)) = (
+            slot(&mut state).0.is_empty(),
+            own_setup_ref(&mut state, slot),
+        ) {
+            let _ = crate::credential::forget(&name);
+        }
+    }
+    Ok(())
+}
+
+// ---- Member renewal (v2.11 MR, ADR 0002 Q-61) ----
+
+/// How long, by the local clock, a pass with nothing left to send lets the
+/// next sync skip member renewal; the Team page's Renew custody asks now.
+pub(crate) const MEMBER_CHECK_MS: u64 = 86_400_000;
+
+/// A listed member: its lower-case device id, account and device IDs, and
+/// listed keys.
+type Member = (String, ([u8; 16], [u8; 16]), ([u8; 32], [u8; 32], [u8; 32]));
+
+/// What member renewal found of one member at `t`: whether it is due, its
+/// latest counted approval, its capability grants to renew, and whether it
+/// holds a grant of the ACTIVE generation.
+struct MemberRecords {
+    due: bool,
+    approval: DeviceApprovalV2,
+    grants: Vec<CapabilityScope>,
+    device_grant: bool,
+}
+
+/// A capability and the scope it is granted on.
+type CapabilityScope = (Capability, CapabilityScopeKind, [u8; 16]);
+
+/// MR's reading of `records` (verified evidence) for `member` at `t`. Only
+/// an approval of exactly the listed keys that `chain` counted is taken (a
+/// lapsed one too); `None` when there is none. Its capability grants and its
+/// grant of `generation` are those issued by a key the chain counts as a
+/// custodian when they were issued, the latest of each. Due once `t`
+/// reaches half the life of the earliest-ending of them.
+fn member_records(
+    records: &[(&[u8], [u8; 32], Payload)],
+    chain: &TrustChain,
+    (_, (account, device), (signing, hpke, _)): &Member,
+    fleet: [u8; 16],
+    generation: Option<u64>,
+    t: u64,
+) -> Option<MemberRecords> {
+    let custodian = |issuer: &[u8; 32], at: u64| chain.custodian_at(&signing_key_id(issuer), at);
+    let counted = |a: &DeviceApprovalV2| {
+        let scope = match a.approval_scope_kind {
+            ApprovalScopeKind::Fleet => Scope::Fleet(a.approval_scope_id),
+            _ => Scope::Tenant,
+        };
+        (
+            a.subject_account_id,
+            a.subject_device_id,
+            a.subject_signing_key_id,
+            a.subject_hpke_key_id,
+        ) == (*account, *device, *signing, *hpke)
+            && chain.approves_keys(
+                signing,
+                hpke,
+                device,
+                account,
+                scope,
+                a.common.not_before_ms,
+            )
+    };
+    let approval = records
+        .iter()
+        .filter_map(|(_, _, p)| match p {
+            Payload::DeviceApproval(a) if counted(a) => Some(a.clone()),
+            _ => None,
+        })
+        .max_by_key(|a| a.common.not_after_ms)?;
+    let mut latest: Vec<(CapabilityScope, (u64, u64))> = Vec::new();
+    let mut device_grant: Option<(u64, u64)> = None;
+    for (_, issuer, payload) in records {
+        match payload {
+            Payload::TenantCapabilityGrant(g)
+                if matches!(g.subject, GrantSubject::Device { signing_key_id, device_id, .. }
+                    if signing_key_id == *signing && device_id == *device)
+                    && custodian(issuer, g.common.issued_at_ms) =>
+            {
+                let key = (g.capability, g.scope_kind, g.scope_id);
+                let window = (g.common.not_before_ms, g.common.not_after_ms);
+                match latest.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, w)) if w.1 < window.1 => *w = window,
+                    Some(_) => {}
+                    None => latest.push((key, window)),
+                }
+            }
+            Payload::DeviceHpkeGrant(g)
+                if Some(g.generation) == generation
+                    && g.fleet_id == fleet
+                    && (g.subject_signing_key_id, g.recipient_hpke_key_id) == (*signing, *hpke)
+                    && custodian(issuer, g.common.issued_at_ms) =>
+            {
+                let window = (g.common.not_before_ms, g.common.not_after_ms);
+                if device_grant.is_none_or(|w| w.1 < window.1) {
+                    device_grant = Some(window);
+                }
+            }
+            _ => {}
+        }
+    }
+    let windows: Vec<(u64, u64)> =
+        std::iter::once((approval.common.not_before_ms, approval.common.not_after_ms))
+            .chain(latest.iter().map(|(_, w)| *w))
+            .chain(device_grant)
+            .collect();
+    Some(MemberRecords {
+        due: crate::root_bootstrap::renewal_due_ms(&windows).is_some_and(|d| t >= d),
+        approval,
+        grants: latest.into_iter().map(|(k, _)| k).collect(),
+        device_grant: device_grant.is_some(),
+    })
+}
+
+/// MR: one member's new records at server time `t`, each starting at `t`: an
+/// approval of the same scope as its latest, exactly 730 days; its capability
+/// grants and its `DeviceHpkeGrant` of `generation` (when it held one),
+/// sealed to the listed HPKE key, a year.
+#[allow(clippy::too_many_arguments)]
+fn build_member_run(
+    cx: &Context16,
+    signer: &Ed25519SigningKey,
+    (_, ids, keys): &Member,
+    found: &MemberRecords,
+    fkek: Option<(&[u8; 32], u64)>,
+    t: u64,
+) -> Result<MemberRun> {
+    // `common` backdates by the skew: built at `start`, records begin at `t`.
+    let start = t + crate::root_bootstrap::CLOCK_SKEW_MS;
+    let mut common = cx.common(random()?, start);
+    common.not_after_ms = common.not_before_ms + crate::root_bootstrap::RENEWED_VALIDITY_MS;
+    let approval = DeviceApprovalV2 {
+        common,
+        subject_account_id: ids.0,
+        subject_device_id: ids.1,
+        subject_signing_key_id: keys.0,
+        subject_hpke_key_id: keys.1,
+        approval_scope_kind: found.approval.approval_scope_kind,
+        approval_scope_id: found.approval.approval_scope_id,
+    };
+    let subject = GrantSubject::Device {
+        account_id: ids.0,
+        device_id: ids.1,
+        signing_key_id: keys.0,
+        hpke_key_id: keys.1,
+    };
+    let grant_request = match fkek.filter(|_| found.device_grant) {
+        Some((fkek, generation)) => member_grant(cx, signer, *ids, *keys, fkek, generation, start)?,
+        None => String::new(),
+    };
+    Ok(MemberRun {
+        approval: hex(&build_record(
+            signer,
+            DOMAIN_DEVICE_APPROVAL,
+            &approval.encode(),
+        )),
+        capability_grants: capability_grants(cx, signer, &subject, found.grants.clone(), start)?,
+        grant_request,
+        step: 0,
+    })
+}
+
+/// MR: sends `id`'s saved run from its saved step, each record checked
+/// against its reply and saved as answered before the next is sent. A
+/// device grant of a generation no longer ACTIVE is left out.
+#[allow(clippy::too_many_arguments)]
+async fn send_member_run(
+    client: &FleetClient,
+    access: &str,
+    cx: &Context16,
+    vk: &[u8; 32],
+    id: &str,
+    active: Option<u64>,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<()> {
+    let run = state
+        .member_renewal
+        .runs
+        .get(id)
+        .cloned()
+        .ok_or_else(corrupt)?;
+    let mut answered = |state: &mut FleetCustodyState, step: usize| {
+        commit(state, save, |s| {
+            if let Some(r) = s.member_renewal.runs.get_mut(id) {
+                r.step = step;
+            }
+        })
+    };
+    if run.step == 0 {
+        let approval = unhex_vec(&run.approval)?;
+        let replay = match AuthorizationRecord::parse(&approval)
+            .and_then(|r| r.verify_signature(vk))
+            .map(|v| v.payload().clone())
+        {
+            Ok(Payload::DeviceApproval(a)) => a.common.replay_id,
+            _ => return Err(corrupt()),
+        };
+        let subject = decode_hex16(id, "device_id")?;
+        let receipt =
+            DeviceApprovalReceiptV2::parse(&client.approve_device(access, id, &approval).await?)
+                .map_err(|_| mismatch())?;
+        let hash = device_approve_request_hash(
+            &cx.instance,
+            cx.epoch,
+            &cx.tenant,
+            &cx.account,
+            &cx.device,
+            &subject,
+            &approval,
+        );
+        if receipt.request_hash != hash
+            || (
+                receipt.server_instance_id,
+                receipt.restore_epoch,
+                receipt.tenant_id,
+            ) != (cx.instance, cx.epoch, cx.tenant)
+            || (receipt.actor_account_id, receipt.actor_device_id) != (cx.account, cx.device)
+            || (receipt.subject_device_id, receipt.approval_replay_id) != (subject, replay)
+        {
+            return Err(mismatch());
+        }
+        answered(state, 1)?;
+    }
+    let n = run.capability_grants.len();
+    for (i, grant) in run.capability_grants.iter().enumerate() {
+        if run.step > i + 1 {
+            continue;
+        }
+        let grant = unhex_vec(grant)?;
+        if client.file_capability_grant(access, &grant).await? != grant {
+            return Err(mismatch());
+        }
+        answered(state, i + 2)?;
+    }
+    if !run.grant_request.is_empty() && run.step <= n + 1 {
+        let generation = FleetKeyGrantCreateV2::parse(
+            &saved_request(&run.grant_request)?.canonical_payload_bytes,
+        )
+        .map_err(|_| corrupt())?
+        .grant
+        .generation
+        .generation;
+        if active == Some(generation) {
+            let fleet = hex(&cx.tenant);
+            send_grant(
+                client,
+                access,
+                &fleet,
+                generation,
+                &run.grant_request,
+                false,
+            )
+            .await?;
+        }
+        answered(state, n + 2)?;
+    }
+    Ok(())
+}
+
+/// MR (v2.11, ADR 0002 Q-61): this root custodian renews its members'
+/// approvals, capability grants and grants of the ACTIVE generation under
+/// its session `access`, after its own records, best effort: the caller
+/// logs what fails and never lets it change its own result. Nothing is asked
+/// of the server while no run is open and the last pass ended less than
+/// [`MEMBER_CHECK_MS`] ago by the local clock (Renew custody clears it).
+///
+/// Members are the listed active devices but this one, the outgoing
+/// custodian of an accepted hand-over and keys revoked here, reported revoked
+/// or withdrawn, named through the multi-listing helper
+/// ([`crate::team::ledger::closure_evidence`]). Their records are read from
+/// that evidence, evaluated in `ledger` at the server's time `T = min(local,
+/// server_now_ms of every page of every listing) - CLOCK_SKEW_MS`
+/// ([`member_records`]); a due member's new records are built at `T`
+/// ([`build_member_run`]) and saved, every due member's at once, before the
+/// first is sent. Saved runs resume with their exact bytes. Outcomes per
+/// member: `renewed`, `current` or `skipped:<code>`; a 403 on an approval
+/// (a 2.10 server never approves an active device) is
+/// `skipped:server-too-old`, and its run is dropped to be built again once
+/// the server is updated. `fleet_key` gives the verified key of a
+/// generation.
+#[allow(clippy::too_many_arguments)]
+pub async fn renew_members(
+    client: &FleetClient,
+    access: &str,
+    me: &FleetDevice<'_>,
+    ledger: &mut Ledger<'_>,
+    fleet_key: impl Fn(u64) -> Result<Zeroizing<[u8; 32]>>,
+    local_now: u64,
+    state: &mut FleetCustodyState,
+    save: &mut impl FnMut(&FleetCustodyState) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    let renewal = &state.member_renewal;
+    if refuse_handed_over(state).is_err()
+        || (renewal.runs.is_empty()
+            && local_now < renewal.checked_ms.saturating_add(MEMBER_CHECK_MS))
+    {
+        return Ok(BTreeMap::new());
+    }
+    let cx = custodian(me, state)?;
+    let fleet = hex(&cx.tenant);
+    let vk = me.signer.verifying_key().to_bytes();
+    let outgoing = state
+        .handover
+        .as_ref()
+        .map(|h| h.outgoing.to_ascii_lowercase());
+    let rows = client.list_tenant_devices(access, me.tenant_id).await?;
+    let mut outcomes = BTreeMap::new();
+    let mut members: Vec<Member> = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|r| r.status == "active" && !r.device_id.eq_ignore_ascii_case(me.device_id))
+    {
+        let id = row.device_id.to_ascii_lowercase();
+        if outgoing.as_deref() == Some(row.signing_key_id.to_ascii_lowercase().as_str()) {
+            outcomes.insert(id, "skipped:outgoing-custodian".to_string());
+            continue;
+        }
+        if state.revocations.contains_key(&id) {
+            outcomes.insert(id, "skipped:revoked".to_string());
+            continue;
+        }
+        let ids = decode_hex16(&row.account_id, "account_id")
+            .and_then(|a| Ok((a, decode_hex16(&id, "device_id")?)));
+        match (ids, listed_keys(row)) {
+            (Ok(ids), Ok(keys)) => members.push((id, ids, keys)),
+            _ => {
+                outcomes.insert(id, "skipped:keys".to_string());
+            }
+        }
+    }
+    let signers: Vec<[u8; 32]> = members.iter().map(|(_, _, k)| k.0).collect();
+    let (listings, _) = crate::team::ledger::closure_evidence(
+        client,
+        access,
+        me.tenant_id,
+        ledger.db,
+        ledger.pin,
+        &signers,
+        local_now,
+    )
+    .await?;
+    // T: the earliest server time of every page of every listing.
+    let server_now = listings
+        .iter()
+        .flatten()
+        .map(|p| p.server_now_ms)
+        .min()
+        .unwrap_or(0);
+    if server_now == 0 {
+        return Err(mismatch());
+    }
+    let t = local_now
+        .min(server_now)
+        .saturating_sub(crate::root_bootstrap::CLOCK_SKEW_MS);
+    let (_, chain) = ledger.evaluate(&listings, t)?;
+    let pages: Vec<TenantTrustEvidencePageV2> = listings.iter().flatten().cloned().collect();
+    let records = evidence_records(&pages);
+    let active = client
+        .active_fleet_generation(access, me.tenant_id, &fleet)
+        .await?;
+    let mut approvals = BTreeMap::new();
+    let mut built = BTreeMap::new();
+    // The members a saved run may still be sent for.
+    let mut eligible = BTreeSet::new();
+    for member in &members {
+        let (id, _, keys) = member;
+        if chain.reported_revoked_at(&keys.0, t)
+            || crate::team::ledger::withdrawn(ledger.db, &ledger.pin.0, &keys.0)?
+        {
+            outcomes.insert(id.clone(), "skipped:revoked".to_string());
+            continue;
+        }
+        let Some(found) = member_records(&records, &chain, member, cx.tenant, active, t) else {
+            outcomes.insert(id.clone(), "skipped:no-approval".to_string());
+            continue;
+        };
+        let a = &found.approval.common;
+        approvals.insert(id.clone(), (a.not_before_ms, a.not_after_ms));
+        eligible.insert(id.clone());
+        if state.member_renewal.runs.contains_key(id) {
+            continue;
+        }
+        if !found.due {
+            outcomes.insert(id.clone(), "current".to_string());
+            continue;
+        }
+        let fkek = match (active, found.device_grant) {
+            (Some(g), true) => Some((fleet_key(g)?, g)),
+            _ => None,
+        };
+        let fkek = fkek.as_ref().map(|(k, g)| (&**k, *g));
+        built.insert(
+            id.clone(),
+            build_member_run(&cx, me.signer, member, &found, fkek, t)?,
+        );
+    }
+    // A saved run of a member no longer listed, approved or unrevoked is
+    // never sent.
+    let stale = state
+        .member_renewal
+        .runs
+        .keys()
+        .any(|id| !eligible.contains(id));
+    if !built.is_empty() || stale {
+        commit(state, save, |s| {
+            s.member_renewal.runs.retain(|id, _| eligible.contains(id));
+            s.member_renewal.runs.extend(built);
+        })?;
+        eprintln!("[members] renewals built at server time {t}");
+    }
+    // A 2.10 server refuses to approve any active member with a bare 403,
+    // as a 2.11 one refuses a member whose account is not active: a 403 on
+    // an approval reads as a server too old only while this server never
+    // took an approval of an active member, in this pass or before.
+    let mut approved = state.member_renewal.server_renews;
+    let mut refused_approvals = Vec::new();
+    let open: Vec<String> = state.member_renewal.runs.keys().cloned().collect();
+    for id in open {
+        let sent = send_member_run(client, access, &cx, &vk, &id, active, state, save).await;
+        let answered = state.member_renewal.runs[&id].step > 0;
+        approved |= answered;
+        let code =
+            |e: &anyhow::Error| crate::recovery_import::error_code(&e.to_string()).to_string();
+        let outcome = match sent {
+            Ok(()) => "renewed".to_string(),
+            // Refused for good: the run would never finish, so it goes and
+            // is built again once the member is due on a later pass.
+            Err(e) if refused_for_good(&e) => {
+                commit(state, save, |s| {
+                    s.member_renewal.runs.remove(&id);
+                })?;
+                if !answered && refused_with(&e, 403, None) {
+                    refused_approvals.push(id.clone());
+                }
+                format!("skipped:{}", code(&e))
+            }
+            Err(e) => format!("skipped:{}", code(&e)),
+        };
+        if outcome == "renewed" {
+            // The Team page shows the new approval's end from now on.
+            let renewed = state.member_renewal.runs[&id].approval.clone();
+            if let Some(Payload::DeviceApproval(a)) = decode_hex(&renewed)
+                .and_then(|a| {
+                    AuthorizationRecord::parse(&a)
+                        .ok()?
+                        .verify_signature(&vk)
+                        .ok()
+                })
+                .map(|v| v.payload().clone())
+            {
+                approvals.insert(id.clone(), (a.common.not_before_ms, a.common.not_after_ms));
+            }
+            commit(state, save, |s| {
+                s.member_renewal.runs.remove(&id);
+            })?;
+        }
+        outcomes.insert(id, outcome);
+    }
+    if !approved {
+        for id in refused_approvals {
+            outcomes.insert(id, "skipped:server-too-old".to_string());
+        }
+    }
+    for (id, outcome) in &outcomes {
+        eprintln!("[members] {id}: {outcome}");
+    }
+    let result = outcomes.clone();
+    commit(state, save, |s| {
+        let r = &mut s.member_renewal;
+        r.server_renews = approved;
+        r.checked_ms = local_now;
+        r.outcomes = outcomes;
+        r.approvals = approvals;
+    })?;
+    Ok(result)
 }
 
 // ---- Rotate fleet key (sequence K, ADR 0002 D-9) ----
@@ -2345,6 +2994,10 @@ pub async fn rotate_fleet(
     }
     let cx = custodian(device, state)?;
     refuse_handed_over(state)?;
+    // RR: the fleet key is wrapped under the root a root rotation activates.
+    if crate::root_rotation::unfinished(root) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
+    }
     // 4.H steps 2-3: a new root custodian rotates once Accept is done and a
     // v4 bundle was written after it.
     if let Some(h) = &state.handover {
@@ -3297,6 +3950,12 @@ pub struct FleetCustodyStatus {
     pub handed_over_to: String,
     /// The hand-over this device accepted, if any.
     pub handover: Option<HandoverStatus>,
+    /// Member renewal's last pass (v2.11 MR): a 2.10 server refused to
+    /// approve an active member (`fleet.memberRenewalNeedsServerUpdate`).
+    pub members_need_server_update: bool,
+    /// The code a member's renewal last failed with
+    /// (`fleet.memberRenewalFailed`); empty if none.
+    pub member_renewal_failed: String,
 }
 
 /// How far an accepted hand-over got: its checklist, no record of it.
@@ -3382,6 +4041,24 @@ pub fn status() -> Result<FleetCustodyStatus> {
             exported_generation: h.exported_generation,
             reverts: h.reverts,
         }),
+        members_need_server_update: s
+            .member_renewal
+            .outcomes
+            .values()
+            .any(|o| o == "skipped:server-too-old"),
+        member_renewal_failed: s
+            .member_renewal
+            .outcomes
+            .values()
+            .filter_map(|o| o.strip_prefix("skipped:"))
+            .find(|c| {
+                !matches!(
+                    *c,
+                    "server-too-old" | "no-approval" | "revoked" | "outgoing-custodian" | "keys"
+                )
+            })
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -6311,6 +6988,102 @@ pub(crate) mod tests {
         assert!(has(&err, "fleet.custodyServerChanged"), "{err}");
         assert_eq!(rig.calls(), ["GET /v2/server-identity"]);
         assert!(load().unwrap().rotation.is_none());
+    }
+
+    /// `f`'s root state after a root rotation (RR step 6): its own
+    /// `RotationGrant` of `trk` as root 1 is the current root grant.
+    fn root_rotated(f: &Fixture, trk: &[u8; 32]) -> BootstrapState {
+        use shardx_core::keys::root_key_id;
+        let (_, pk) = derive_keypair(&f.seed);
+        let g = TenantRootKeyGrantV2 {
+            common: f.cx.common(random().unwrap(), now_ms()),
+            variant: RootGrantVariant::RotationGrant {
+                previous_root_key_id: root_key_id(&TRK),
+                previous_root_generation: 0,
+            },
+            root_key_id: root_key_id(trk),
+            root_generation: 1,
+            subject_account_id: f.cx.account,
+            subject_device_id: f.cx.device,
+            subject_signing_key_id: f.cx.signing_key_id,
+            recipient_hpke_key_id: f.cx.hpke_key_id,
+            subject_device_approval_replay_id: [8; 16],
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let grant = crate::root_bootstrap::sealed_root_grant(&f.signer, &pk, trk, g).unwrap();
+        BootstrapState {
+            root_grant: hex(&grant),
+            root_grant_issuer: hex(&f.signer.verifying_key().to_bytes()),
+            fleet_rotation_due_after_root: Some(1),
+            ..f.root.clone()
+        }
+    }
+
+    /// The rotation's saved recovery grant, signed by `f`'s key.
+    fn rotation_recovery_grant(f: &Fixture) -> RecoveryGrantV2 {
+        let container = unhex_vec(&rotation().recovery_grant).unwrap();
+        match AuthorizationRecord::parse(&container)
+            .unwrap()
+            .verify_signature(f.signer.verifying_key().as_bytes())
+            .unwrap()
+            .payload()
+        {
+            Payload::RecoveryGrant(g) => g.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const ROTATED_TRK: [u8; 32] = [0x4e; 32];
+
+    /// D8: the fleet rotation after a root rotation wraps the new fleet key
+    /// under the root generation the rotation activated.
+    #[test]
+    fn a_fleet_rotation_after_a_root_rotation_wraps_under_the_new_root() {
+        let mut f = fixture();
+        f.root = root_rotated(&f, &ROTATED_TRK);
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        let g = rotation_recovery_grant(&f);
+        assert_eq!(g.recipient_root_generation, 1);
+        assert_eq!(
+            g.recipient_root_key_id,
+            shardx_core::keys::root_key_id(&ROTATED_TRK)
+        );
+        let create = payload(
+            &rotation().create_request,
+            FleetKeyGenerationCreateV2::parse,
+        );
+        assert_eq!(create.root_generation, 1);
+    }
+
+    /// RR: no fleet rotation starts while a root rotation is unfinished.
+    #[test]
+    fn a_fleet_rotation_is_refused_while_a_root_rotation_is_unfinished() {
+        let mut f = fixture();
+        f.root.root_rotation = Some(crate::root_rotation::RootRotation {
+            generation: 1,
+            ..Default::default()
+        });
+        let mut rig = rig(&f, |_| {});
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.rootRotationUnfinished"), "{err}");
+        assert!(rig.calls().is_empty());
+        assert!(load().unwrap().rotation.is_none());
+    }
+
+    /// Known limitation, going forward: a fleet key activated after the root
+    /// rotation is out of reach of the old TRK.
+    #[test]
+    fn the_old_trk_cannot_open_a_fleet_key_activated_after_the_root_rotation() {
+        let mut f = fixture();
+        f.root = root_rotated(&f, &ROTATED_TRK);
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        let g = rotation_recovery_grant(&f);
+        let key = rotation_key_held().expect("held until step 10");
+        assert!(g.open_fkek(&TRK).is_err());
+        assert_eq!(*g.open_fkek(&ROTATED_TRK).unwrap(), *key);
     }
 
     #[test]
@@ -9441,6 +10214,551 @@ pub(crate) mod tests {
             crate::fleet_key_verifies(&old.rig.db, &pin, &me, &f.cx.tenant, 0, &OLD_FKEK, now)
                 .unwrap(),
             "the key of N still verifies"
+        );
+    }
+
+    // ---- Member renewal (v2.11 MR, ADR 0002 Q-61) ----
+
+    const SKEW: u64 = crate::root_bootstrap::CLOCK_SKEW_MS;
+
+    /// Serves member `m`: this custodian's approval of its listed keys from
+    /// `from` until `until` and its three profile capability grants from
+    /// `from` for a year, for its signer; its grant of generation 0 from
+    /// `from` for a year, to everyone.
+    fn served_member(f: &Fixture, rot: &mut Rot, m: &TenantDevice, from: u64, until: u64) {
+        let (signing, hpke, hpke_pk) = listed_keys(m).unwrap();
+        let ids = (
+            decode_hex16(&m.account_id, "a").unwrap(),
+            decode_hex16(&m.device_id, "d").unwrap(),
+        );
+        let subject = GrantSubject::Device {
+            account_id: ids.0,
+            device_id: ids.1,
+            signing_key_id: signing,
+            hpke_key_id: hpke,
+        };
+        use CapabilityScopeKind::Fleet;
+        let profile = [
+            (Capability::ProfilePublish, Fleet, f.cx.tenant),
+            (Capability::ProfileCheckout, Fleet, f.cx.tenant),
+            (Capability::ProfileCommit, Fleet, f.cx.tenant),
+        ];
+        let mut served = vec![approval_of(f, m, from + SKEW, until)];
+        let grants = capability_grants(&f.cx, &f.signer, &subject, profile, from + SKEW).unwrap();
+        served.extend(grants.iter().map(|g| unhex_vec(g).unwrap()));
+        let pk = decode_hex32(&m.signing_public_key, "pk").unwrap();
+        rot.by_signer.insert(signing, (pk, served));
+        let keys = (signing, hpke, hpke_pk);
+        let grant = member_grant(&f.cx, &f.signer, ids, keys, &OLD_FKEK, 0, from + SKEW);
+        let grant = saved_request(&grant.unwrap()).unwrap();
+        rot.base.push(
+            FleetKeyGrantCreateV2::parse(&grant.canonical_payload_bytes)
+                .unwrap()
+                .exact_signed_grant_container_bytes,
+        );
+    }
+
+    /// A member listed active and, when given, the window of its served
+    /// approval.
+    type Listed = (TenantDevice, Option<(u64, u64)>);
+
+    /// A custodian whose own records run from 310 days ago, listing
+    /// `members`, each served as [`served_member`] serves it, generation 0
+    /// ACTIVE; approvals get receipts.
+    fn renewal_rig(f: &Fixture, members: &[Listed]) -> Rig {
+        let now = now_ms();
+        rig(f, |rot| {
+            rot.base = own_evidence(f, now - 310 * DAY_MS, now + 365 * DAY_MS);
+            rot.approves = true;
+            rot.devices = members.iter().map(|(m, _)| m.clone()).collect();
+            for (m, window) in members {
+                if let Some((from, until)) = window {
+                    served_member(f, rot, m, *from, *until);
+                }
+            }
+        })
+    }
+
+    impl Rig {
+        fn renew_members_at(&mut self, f: &Fixture, now: u64) -> Result<BTreeMap<String, String>> {
+            let mut state = load()?;
+            let pin = f.pin();
+            let mut ledger = Ledger {
+                db: &mut self.db,
+                pin: &pin,
+            };
+            self.rt.block_on(renew_members(
+                &self.client,
+                "access",
+                &f.device(&CredentialFkekStore),
+                &mut ledger,
+                |_| Ok(Zeroizing::new(OLD_FKEK)),
+                now,
+                &mut state,
+                &mut |s| save(s),
+            ))
+        }
+
+        /// Every POST so far, by the kind of its route.
+        fn posts(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("POST "))
+                .map(|c| {
+                    if c.ends_with("/approve") {
+                        "approve".into()
+                    } else if c.ends_with("/capability-grants") {
+                        "capability".into()
+                    } else if c.ends_with("/grants") {
+                        "grant".into()
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// Member `i`, whose approval began `from_days` ago and runs `days`
+    /// days (its grants a year).
+    fn aged(i: u16, now: u64, from_days: u64, days: u64) -> Listed {
+        let from = now - from_days * DAY_MS;
+        (peer(i), Some((from, from + days * DAY_MS)))
+    }
+
+    fn outcome(o: &BTreeMap<String, String>, m: &TenantDevice) -> String {
+        o[&m.device_id.to_ascii_lowercase()].clone()
+    }
+
+    /// The payload of a record this custodian signed.
+    fn own_payload(f: &Fixture, container: &[u8]) -> Payload {
+        payload_of(&[f.signer.verifying_key().to_bytes()], container)
+    }
+
+    /// The signed container a saved or sent grant filing carries.
+    fn filed_container(filing: &[u8]) -> Vec<u8> {
+        let request = IdempotentMutationRequestV2::parse(filing).unwrap();
+        FleetKeyGrantCreateV2::parse(&request.canonical_payload_bytes)
+            .unwrap()
+            .exact_signed_grant_container_bytes
+    }
+
+    #[test]
+    fn a_due_member_gets_a_new_approval_capability_grants_and_device_grant_in_order() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(1, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &due.0), "renewed");
+        assert_eq!(
+            rig.posts(),
+            ["approve", "capability", "capability", "capability", "grant"]
+        );
+        // The device grant goes to the listed HPKE key, of the ACTIVE generation.
+        let filing = rig.bodies("/grants").pop().unwrap();
+        let Payload::DeviceHpkeGrant(g) = own_payload(&f, &filed_container(&filing)) else {
+            panic!("a device grant")
+        };
+        let (signing, hpke, _) = listed_keys(&due.0).unwrap();
+        assert_eq!(
+            (
+                g.generation,
+                g.subject_signing_key_id,
+                g.recipient_hpke_key_id
+            ),
+            (0, signing, hpke)
+        );
+        let state = load().unwrap();
+        assert!(state.member_renewal.runs.is_empty());
+        assert_eq!(state.member_renewal.outcomes, o);
+    }
+
+    #[test]
+    fn a_member_not_due_is_left_current() {
+        let f = fixture();
+        let now = now_ms();
+        let fresh = aged(2, now, 10, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&fresh));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fresh.0), "current");
+        assert!(rig.posts().is_empty(), "{:?}", rig.posts());
+        // The Team page shows its approval's window.
+        let id = fresh.0.device_id.to_ascii_lowercase();
+        assert_eq!(
+            load().unwrap().member_renewal.approvals[&id],
+            fresh.1.unwrap()
+        );
+        // Within a day nothing is asked again; Renew custody asks now.
+        rig.clear();
+        assert!(rig.renew_members_at(&f, now + 1000).unwrap().is_empty());
+        assert!(rig.calls().is_empty());
+        let mut state = load().unwrap();
+        state.member_renewal.checked_ms = 0;
+        save(&state).unwrap();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fresh.0), "current");
+    }
+
+    #[test]
+    fn a_lapsed_member_with_a_counted_earlier_approval_is_renewed() {
+        let f = fixture();
+        let now = now_ms();
+        // Its approval ended yesterday; the custodian issued it in custody.
+        let lapsed = aged(3, now, 300, 299);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&lapsed));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &lapsed.0), "renewed");
+        assert_eq!(rig.posts().first().map(String::as_str), Some("approve"));
+    }
+
+    #[test]
+    fn a_listed_device_the_chain_never_approved_is_not_renewed() {
+        let f = fixture();
+        let now = now_ms();
+        let stranger: Listed = (peer(4), None);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&stranger));
+        // An approval signed by a key that is no custodian names it.
+        let other = Ed25519SigningKey::from_bytes(&[0x77; 32]);
+        let (signing, hpke, _) = listed_keys(&stranger.0).unwrap();
+        let mut common = f.cx.common([0x78; 16], now - 200 * DAY_MS);
+        common.not_after_ms = now + 165 * DAY_MS;
+        let forged = DeviceApprovalV2 {
+            common,
+            subject_account_id: decode_hex16(&stranger.0.account_id, "a").unwrap(),
+            subject_device_id: decode_hex16(&stranger.0.device_id, "d").unwrap(),
+            subject_signing_key_id: signing,
+            subject_hpke_key_id: hpke,
+            approval_scope_kind: ApprovalScopeKind::Fleet,
+            approval_scope_id: f.cx.tenant,
+        };
+        {
+            let mut rot = rig.rot.lock().unwrap();
+            let pk = decode_hex32(&stranger.0.signing_public_key, "pk").unwrap();
+            let forged = build_record(&other, DOMAIN_DEVICE_APPROVAL, &forged.encode());
+            rot.by_signer.insert(signing, (pk, vec![forged]));
+            rot.base_keys.push(other.verifying_key().to_bytes());
+        }
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &stranger.0), "skipped:no-approval");
+        assert!(rig.posts().is_empty(), "{:?}", rig.posts());
+    }
+
+    #[test]
+    fn member_renewal_resumes_with_byte_identical_requests() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(5, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        // The second capability grant is lost on the way.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            (call.ends_with("/capability-grants") && count.fetch_add(1, Ordering::SeqCst) == 1)
+                .then_some((503, "UNAVAILABLE"))
+        }));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert!(outcome(&o, &due.0).starts_with("skipped:"), "{o:?}");
+        let id = due.0.device_id.to_ascii_lowercase();
+        let saved = load().unwrap().member_renewal.runs[&id].clone();
+        assert_eq!(
+            saved.step, 2,
+            "the approval and the first grant were answered"
+        );
+        let first = rig.bodies("/capability-grants");
+        rig.allow();
+        rig.clear();
+        let o = rig.renew_members_at(&f, now + 5 * 60_000).unwrap();
+        assert_eq!(outcome(&o, &due.0), "renewed");
+        assert_eq!(rig.posts(), ["capability", "capability", "grant"]);
+        let again = rig.bodies("/capability-grants");
+        assert_eq!(again[0], first[1], "the lost grant is resent byte for byte");
+        assert_eq!(hex(&again[1]), saved.capability_grants[2]);
+        let grant = unhex_vec(&saved.grant_request).unwrap();
+        assert_eq!(rig.bodies("/grants"), [grant]);
+    }
+
+    #[test]
+    fn member_renewal_skips_the_outgoing_custodian_and_revoked_keys() {
+        let f = fixture();
+        let now = now_ms();
+        let (outgoing, revoked) = (aged(6, now, 200, 365), aged(7, now, 200, 365));
+        let mut rig = renewal_rig(&f, &[outgoing.clone(), revoked.clone()]);
+        let mut state = load().unwrap();
+        state.handover = Some(Handover {
+            outgoing: outgoing.0.signing_key_id.clone(),
+            phase: "granted".into(),
+            ..Default::default()
+        });
+        state
+            .revocations
+            .insert(revoked.0.device_id.to_ascii_lowercase(), "00".into());
+        save(&state).unwrap();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &outgoing.0), "skipped:outgoing-custodian");
+        assert_eq!(outcome(&o, &revoked.0), "skipped:revoked");
+        assert!(rig.posts().is_empty(), "{:?}", rig.posts());
+    }
+
+    #[test]
+    fn a_2_10_server_refusal_skips_the_member_with_server_too_old() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(8, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.refuse("/approve", 403, "FORBIDDEN");
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &due.0), "skipped:server-too-old");
+        assert_eq!(rig.posts(), ["approve"]);
+        assert!(load().unwrap().member_renewal.runs.is_empty());
+        let status = status().unwrap();
+        assert!(status.members_need_server_update);
+        assert_eq!(status.member_renewal_failed, "");
+    }
+
+    #[test]
+    fn a_failed_member_renewal_never_fails_the_sync() {
+        let f = fixture();
+        let now = now_ms();
+        let (failing, fine) = (aged(9, now, 200, 365), aged(10, now, 200, 365));
+        let mut rig = renewal_rig(&f, &[failing.clone(), fine.clone()]);
+        let failing_id = failing.0.device_id.to_ascii_lowercase();
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            call.contains(&failing_id).then_some((500, "BROKEN"))
+        }));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert!(outcome(&o, &failing.0).starts_with("skipped:"), "{o:?}");
+        assert_eq!(outcome(&o, &fine.0), "renewed");
+        assert!(!status().unwrap().member_renewal_failed.is_empty());
+        // Evidence that does not read fails the pass, which its caller logs.
+        rig.rot.lock().unwrap().evidence_down = true;
+        let mut state = load().unwrap();
+        state.member_renewal.checked_ms = 0;
+        save(&state).unwrap();
+        assert!(rig.renew_members_at(&f, now).is_err());
+    }
+
+    #[test]
+    fn member_approvals_run_730_days_and_grants_365() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(11, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.renew_members_at(&f, now).unwrap();
+        let window = |c: &[u8]| {
+            let c = match own_payload(&f, c) {
+                Payload::DeviceApproval(a) => a.common,
+                Payload::TenantCapabilityGrant(g) => g.common,
+                Payload::DeviceHpkeGrant(g) => g.common,
+                _ => panic!("unexpected record"),
+            };
+            (c.not_before_ms, c.not_after_ms - c.not_before_ms)
+        };
+        let approval = rig.bodies("/approve").pop().unwrap();
+        let (start, life) = window(&approval);
+        assert_eq!(life, 730 * DAY_MS);
+        // T = min(local, server) - skew; the server's pages read its own now.
+        assert!(
+            start <= now - SKEW && start + 10_000 > now - SKEW,
+            "{start} {now}"
+        );
+        for grant in rig.bodies("/capability-grants") {
+            assert_eq!(window(&grant), (start, 365 * DAY_MS));
+        }
+        let filing = rig.bodies("/grants").pop().unwrap();
+        assert_eq!(window(&filed_container(&filing)), (start, 365 * DAY_MS));
+    }
+
+    /// 65 members: more than one listing names them.
+    fn many_members(now: u64, from_days: u64) -> Vec<Listed> {
+        (0..65)
+            .map(|i| aged(200 + i, now, from_days, 365))
+            .collect()
+    }
+
+    /// How many signers each trust evidence request seen named.
+    fn evidence_queries(rig: &Rig) -> Vec<usize> {
+        rig.calls()
+            .iter()
+            .filter(|c| c.contains("/trust-evidence"))
+            .map(|c| c.matches("signer=").count())
+            .collect()
+    }
+
+    #[test]
+    fn member_renewal_names_more_than_64_members_through_listings() {
+        let f = fixture();
+        let now = now_ms();
+        let members = many_members(now, 200);
+        let mut rig = renewal_rig(&f, &members);
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(o.len(), 65);
+        assert!(o.values().all(|v| v == "renewed"), "{o:?}");
+        let queries = evidence_queries(&rig);
+        assert!(queries.windows(2).any(|w| w == [64, 1]), "{queries:?}");
+    }
+
+    /// Carried S3 criterion: T is the earliest `server_now_ms` of every page
+    /// of every listing, never the first page's. Members due 7.5 days ago by
+    /// the local clock are not due 30 days earlier, which is what the second
+    /// listing's page reads.
+    #[test]
+    fn member_renewal_takes_t_from_the_earliest_page_of_every_listing() {
+        let f = fixture();
+        let now = now_ms();
+        let members = many_members(now, 190);
+        let base = renewal_rig(&f, &members);
+        let last = members
+            .iter()
+            .map(|(m, _)| m.signing_key_id.to_ascii_lowercase())
+            .max()
+            .unwrap();
+        let rot = base.rot.clone();
+        let (client, seen) = base
+            .rt
+            .block_on(mock(Arc::new(move |call: &str, body: &[u8]| {
+                let (status, reply) = rot.lock().unwrap().answer(call, body);
+                match TenantTrustEvidencePageV2::parse(&reply) {
+                    Ok(mut page) if call.contains("/trust-evidence") => {
+                        page.server_now_ms = if call.contains(&last) {
+                            now - 30 * DAY_MS
+                        } else {
+                            now
+                        };
+                        (status, page.encode())
+                    }
+                    _ => (status, reply),
+                }
+            })));
+        let mut rig = Rig {
+            client,
+            seen,
+            ..base
+        };
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(o.len(), 65);
+        assert!(o.values().all(|v| v == "current"), "{o:?}");
+        assert!(rig.posts().is_empty());
+        assert!(
+            evidence_queries(&rig).contains(&1),
+            "two listings were read"
+        );
+    }
+
+    #[test]
+    fn the_member_renewal_state_holds_no_key_bytes() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(12, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.refuse("/grants", 503, "UNAVAILABLE");
+        rig.renew_members_at(&f, now).unwrap();
+        assert!(
+            !load().unwrap().member_renewal.runs.is_empty(),
+            "a run is saved"
+        );
+        let file = std::fs::read_to_string(crate::store::fleet_custody_path().unwrap()).unwrap();
+        let (sk, _) = derive_keypair(&f.seed);
+        for secret in [
+            hex(&OLD_FKEK),
+            hex(&TRK),
+            hex(&[3; 32]),
+            hex(&f.seed),
+            hex(&sk),
+        ] {
+            assert!(!file.contains(&secret), "the state names a key");
+        }
+    }
+
+    #[test]
+    fn a_member_run_refused_for_good_is_dropped() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(13, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        // The approval goes through; the server refuses the first grant.
+        rig.refuse("/capability-grants", 400, "BAD_REQUEST");
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert!(outcome(&o, &due.0).starts_with("skipped:"), "{o:?}");
+        assert_eq!(rig.posts(), ["approve", "capability"]);
+        assert!(load().unwrap().member_renewal.runs.is_empty());
+        // Nothing is resent within the day.
+        rig.allow();
+        rig.clear();
+        assert!(rig.renew_members_at(&f, now + 1000).unwrap().is_empty());
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+    }
+
+    #[test]
+    fn a_saved_run_of_a_member_revoked_meanwhile_is_dropped_unsent() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(14, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        rig.refuse("/capability-grants", 503, "UNAVAILABLE");
+        rig.renew_members_at(&f, now).unwrap();
+        let id = due.0.device_id.to_ascii_lowercase();
+        let mut state = load().unwrap();
+        assert!(
+            state.member_renewal.runs.contains_key(&id),
+            "a run is saved"
+        );
+        state.revocations.insert(id, "00".into());
+        save(&state).unwrap();
+        rig.allow();
+        rig.clear();
+        let o = rig.renew_members_at(&f, now + 5 * 60_000).unwrap();
+        assert_eq!(outcome(&o, &due.0), "skipped:revoked");
+        assert!(rig.posts().is_empty(), "{:?}", rig.posts());
+        assert!(load().unwrap().member_renewal.runs.is_empty());
+    }
+
+    /// A 403 on one member's approval, from a server that approved another
+    /// member, in this pass or an earlier one, keeps its own code.
+    #[test]
+    fn a_403_from_a_server_that_renews_members_is_not_server_too_old() {
+        let f = fixture();
+        let now = now_ms();
+        let (refused, fine) = (aged(15, now, 200, 365), aged(16, now, 200, 365));
+        let mut rig = renewal_rig(&f, &[refused.clone(), fine.clone()]);
+        let refused_id = refused.0.device_id.to_ascii_lowercase();
+        rig.rot.lock().unwrap().refuse = Some(Box::new(move |call: &str, _: &[u8]| {
+            (call.ends_with("/approve") && call.contains(&refused_id)).then_some((403, "FORBIDDEN"))
+        }));
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fine.0), "renewed");
+        let skipped = outcome(&o, &refused.0);
+        assert!(
+            skipped.starts_with("skipped:") && skipped != "skipped:server-too-old",
+            "{skipped}"
+        );
+        assert!(!status().unwrap().members_need_server_update);
+        // On a later pass that approves nobody, a 403 still keeps its code.
+        rig.refuse("/approve", 403, "FORBIDDEN");
+        let mut state = load().unwrap();
+        state.member_renewal.checked_ms = 0;
+        save(&state).unwrap();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &fine.0), skipped);
+        assert_eq!(outcome(&o, &refused.0), skipped);
+        assert!(!status().unwrap().members_need_server_update);
+    }
+
+    /// Choice (c): a member holding no grant of the ACTIVE generation gets a
+    /// new approval and capability grants, never a first device grant.
+    #[test]
+    fn a_member_without_a_grant_of_the_active_generation_gets_no_device_grant() {
+        let f = fixture();
+        let now = now_ms();
+        let due = aged(17, now, 200, 365);
+        let mut rig = renewal_rig(&f, std::slice::from_ref(&due));
+        // `served_member` serves its generation 0 grant last.
+        rig.rot.lock().unwrap().base.pop();
+        let o = rig.renew_members_at(&f, now).unwrap();
+        assert_eq!(outcome(&o, &due.0), "renewed");
+        assert_eq!(
+            rig.posts(),
+            ["approve", "capability", "capability", "capability"]
         );
     }
 }
