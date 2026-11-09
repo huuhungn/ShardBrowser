@@ -2818,14 +2818,26 @@ async fn team_devices(
     client.end_session(&session.access_token).await;
     let rows = rows.map_err(|e| e.to_string())?;
     let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
-    fleet_custody::see_devices(
+    let mut listed = fleet_custody::see_devices(
         &rows,
         &pin,
         root_bootstrap::now_ms(),
         &mut state,
         &mut |s| fleet_custody::save(s),
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // Advisory (Q-57): Revoke checks fresh evidence itself. A ledger that
+    // does not read offers no `compromised`.
+    let ledger = team::db::Db::open().ok();
+    for d in &mut listed {
+        let key = fleet_client::decode_hex32(&d.signing_key_id, "signing_key_id")
+            .map_err(|e| e.to_string())?;
+        d.custodian = d.device_id.eq_ignore_ascii_case(&c.device_id)
+            || ledger
+                .as_ref()
+                .is_none_or(|db| team::ledger::held_custody(db, &pin.0, &key).unwrap_or(true));
+    }
+    Ok(listed)
 }
 
 /// Approves the pending device `device_id` once the user confirmed that it
@@ -2923,11 +2935,14 @@ fn verified_fleet_key(
 /// rotation (sequence K, ADR 0002 D-9): N+1 is created with this device as
 /// its required set and activated (N retires), the setup key is released,
 /// N+1 is collected verified, then granted to every member a signed approval
-/// names (Q-45). The password is used for one login and never stored.
+/// names (Q-45). `skip_member`, the member whose grant keeps failing, is
+/// left out first ([`fleet_custody::skip_member`]). The password is used for
+/// one login and never stored.
 #[tauri::command]
 async fn team_fleet_key_rotate(
     username: String,
     password: String,
+    skip_member: Option<String>,
 ) -> Result<fleet_custody::FleetCustodyStatus, String> {
     let c = team_config::load().map_err(|e| e.to_string())?;
     if !c.can_sync() {
@@ -2959,6 +2974,9 @@ async fn team_fleet_key_rotate(
         let started = std::time::Instant::now();
         let save = &mut |s: &fleet_custody::FleetCustodyState| fleet_custody::save(s);
         let mut state = fleet_custody::load().map_err(error)?;
+        if let Some(id) = &skip_member {
+            fleet_custody::skip_member(&mut state, id, save).map_err(error)?;
+        }
         // Start needs N verified here, and N as the ledger's highest.
         let previous_key = |generation: u64| {
             let fleet = fleet_client::decode_hex16(&fleet_hex, "fleet_id")?;
@@ -3030,9 +3048,11 @@ async fn team_fleet_key_rotate(
     team_fleet_custody_status()
 }
 
-/// Revokes the tenant's device `device_id` as `reason`, `retired` or `lost`
-/// (section 4.R). A saved revocation is resent as saved. The device is cut
-/// off from the server, but keeps the fleet key it already holds (section 7).
+/// Revokes the tenant's device `device_id` as `reason`, `retired`, `lost` or,
+/// for a member device, `compromised` (section 4.R, Q-57: checked against
+/// fresh evidence evaluated to this device's pin). A saved revocation is
+/// resent as saved. The device is cut off from the server, but keeps the
+/// fleet key it already holds (section 7).
 #[tauri::command]
 async fn team_revoke_device(
     username: String,
@@ -3068,12 +3088,24 @@ async fn team_revoke_device(
             .find(|r| r.device_id.eq_ignore_ascii_case(device_id.trim()))
             .ok_or_else(|| crate::errcode::code("fleet.deviceNotListed"))?;
         let mut state = fleet_custody::load().map_err(|e| e.to_string())?;
+        let pin = pinned_anchor(&c);
+        let mut db = match pin {
+            Some(_) if reason == shardx_core::authz_record::DeviceRevocationReason::Compromised => {
+                Some(team::db::Db::open().map_err(|e| e.to_string())?)
+            }
+            _ => None,
+        };
+        let mut ledger = pin
+            .as_ref()
+            .zip(db.as_mut())
+            .map(|(pin, db)| fleet_custody::Ledger { db, pin });
         fleet_custody::revoke_member(
             &client,
             access,
             &device,
             row,
             reason,
+            ledger.as_mut(),
             root_bootstrap::now_ms(),
             &mut state,
             &mut |s| fleet_custody::save(s),
@@ -3498,10 +3530,24 @@ async fn team_collect_custody(
     result
 }
 
+/// Collect key custody's fleet step for a published sync the server refused
+/// under a rotated key (`sync_cmd`), over that sync's session `access`, under
+/// the custody lock a collect takes.
+pub(crate) async fn collect_after_refusal(
+    client: &fleet_client::FleetClient,
+    c: &team_config::TeamConfig,
+    access: &str,
+) -> Result<FleetGrant, String> {
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let (device_sk, _) = shardx_core::grants::derive_keypair(&seed);
+    collect_fleet_grant(client, c, access, &device_sk, true).await
+}
+
 /// What became of this device's D-9 `DeviceHpkeGrant` of the fleet's ACTIVE
 /// generation: the readback holds at most one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FleetGrant {
+pub(crate) enum FleetGrant {
     /// No ACTIVE generation, no grant filed, or a revoked one.
     None,
     /// Filed, but this device pins no anchor to verify it against.

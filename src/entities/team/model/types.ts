@@ -128,6 +128,8 @@ export type FleetRotationStatus = {
   members_filed: number;
   members_refused: number;
   members_skipped: number;
+  /** An activated rotation's member whose grant keeps failing, which Skip member leaves out. */
+  failing_member: string | null;
 };
 
 /** A bound profile whose head here is still sealed under an older fleet key. */
@@ -149,6 +151,8 @@ export type TeamDevice = {
   sas: string;
   /** For a pending device: until when it may be approved, by this computer's clock. */
   approve_until_ms: number | null;
+  /** This custodian's trust ledger counts the row's key as a root custodian: no `compromised`. */
+  custodian: boolean;
 };
 
 /** What `team_join_code` shows on a joining device while its window is open. */
@@ -163,7 +167,7 @@ export type TeamJoinCode = {
 };
 
 /** The reasons Revoke offers. */
-export type TeamRevokeReason = "retired" | "lost";
+export type TeamRevokeReason = "retired" | "lost" | "compromised";
 
 /** A `profile_bindings` sync state. */
 export type TeamSyncState =

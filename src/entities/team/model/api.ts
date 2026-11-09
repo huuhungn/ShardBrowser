@@ -96,11 +96,12 @@ export const teamFleetKeySetup = (username: string, password: string) =>
   invoke<FleetCustodyStatus>("team_fleet_key_setup", { username, password });
 
 /**
- * Rotate the fleet key as the root custodian, or resume the rotation. The
+ * Rotate the fleet key as the root custodian, or resume the rotation, first
+ * leaving out `skipMember`, the member whose grant keeps failing. The
  * password is used for one login and never stored.
  */
-export const teamFleetKeyRotate = (username: string, password: string) =>
-  invoke<FleetCustodyStatus>("team_fleet_key_rotate", { username, password });
+export const teamFleetKeyRotate = (username: string, password: string, skipMember?: string) =>
+  invoke<FleetCustodyStatus>("team_fleet_key_rotate", { username, password, skipMember: skipMember ?? null });
 
 /** Bound profiles still under an older fleet key; no server is asked. */
 export const teamProfilesUnderOlderKey = () =>
@@ -114,7 +115,7 @@ export const teamDevices = (username: string, password: string) =>
 export const teamApproveDevice = (username: string, password: string, deviceId: string, sas: string) =>
   invoke<void>("team_approve_device", { username, password, deviceId, sas });
 
-/** Revoke the tenant's device as retired or lost. */
+/** Revoke the tenant's device as retired, lost or (a member only) compromised. */
 export const teamRevokeDevice = (
   username: string,
   password: string,
@@ -184,9 +185,11 @@ export const teamCancelPublish = (profileId: string) =>
 
 // A published profile ignores the passphrase and base version: it seals under
 // the fleet key and takes its base from the binding (sync_cmd.rs).
-/** Check in (push) a published profile. */
+/** Check in (push) a published profile; `collected_generation` names a fleet key collected on the way. */
 export const teamCheckIn = (profileId: string, username: string, password: string) =>
-  invoke<unknown>("profile_sync_push", { profileId, passphrase: "", baseVersion: 0, username, password });
+  invoke<{ collected_generation?: number } | null>("profile_sync_push", {
+    profileId, passphrase: "", baseVersion: 0, username, password,
+  });
 
 /** Pull a published profile's current snapshot over the local one. */
 export const teamPull = (profileId: string, username: string, password: string) =>
@@ -194,7 +197,7 @@ export const teamPull = (profileId: string, username: string, password: string) 
 
 /** Commit the last valid snapshot over a run of heads whose signers are proven revoked. */
 export const teamRevert = (profileId: string, username: string, password: string) =>
-  invoke<unknown>("profile_sync_revert", { profileId, username, password });
+  invoke<{ collected_generation?: number } | null>("profile_sync_revert", { profileId, username, password });
 
 /** Unbind the stopped profile from its fleet profile; it stays a local profile. */
 export const teamUnbindProfile = (profileId: string) =>

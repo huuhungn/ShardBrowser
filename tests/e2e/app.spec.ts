@@ -492,6 +492,10 @@ type TeamDeviceRow = {
   generation?: number;
   /** The server refuses it a grant for a rotated key. */
   refuses?: boolean;
+  /** The server fails its grant for a rotated key with an error a resend may cure. */
+  fails?: boolean;
+  /** It holds root custody; A always does. */
+  custodian?: boolean;
 };
 
 /**
@@ -508,9 +512,13 @@ type TeamDeviceRow = {
  */
 function fakeTeamServer(more: TeamDeviceRow[] = []) {
   const heads = new Map<string, TeamHead>();
-  const devices: TeamDeviceRow[] = [{ device_id: "aa".repeat(16), label: "Machine A", status: "active", granted: false }, ...more];
+  const devices: TeamDeviceRow[] = [
+    { device_id: "aa".repeat(16), label: "Machine A", status: "active", granted: false, custodian: true }, ...more,
+  ];
   let fleetKey = false;
   let generation = 0;
+  // A rotation left activated by a member whose grant failed resumes at its generation.
+  let failing: string | null = null;
   // The generation each head was sealed under.
   const sealed = new Map<string, number>();
   let enrolled = 0;
@@ -538,7 +546,7 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
   };
   type Args = {
     label?: string | null; remote_profile_id?: string; pin?: number | null; device_id?: string; target?: string;
-    generation?: number;
+    generation?: number; skip?: string | null;
   };
   const ops: Record<string, (device: string, args: Args) => unknown> = {
     enroll: (_device, { label }) => {
@@ -550,7 +558,9 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
     status: (_device, { device_id }) => row(device_id)?.status ?? null,
     devices: (_device, { device_id }) => {
       live(device_id);
-      return devices.map(({ device_id: id, label, status }) => ({ device_id: id, label, status }));
+      return devices.map(({ device_id: id, label, status, custodian }) => ({
+        device_id: id, label, status, custodian: !!custodian,
+      }));
     },
     fleetKey: (_device, { device_id }) => {
       Object.assign(live(device_id), { granted: true, generation });
@@ -570,20 +580,25 @@ function fakeTeamServer(more: TeamDeviceRow[] = []) {
       Object.assign(row(target) ?? {}, { status: "revoked", granted: false });
       return { held };
     },
-    rotate: (_device, { device_id }) => {
+    rotate: (_device, { device_id, skip }) => {
       live(device_id);
-      generation += 1;
+      if (!failing) generation += 1;
+      failing = null;
       let [filed, refused, skipped] = [0, 0, 0];
       for (const d of devices) {
-        if (d.status === "revoked") skipped += 1;
+        if (d.status === "revoked" || (d.status === "active" && d.device_id === skip)) {
+          skipped += 1;
+          continue;
+        }
         if (d.status !== "active") continue;
         if (d.device_id !== device_id && d.refuses) refused += 1;
+        else if (d.device_id !== device_id && d.fails) failing = d.device_id;
         else {
           Object.assign(d, { granted: true, generation });
           if (d.device_id !== device_id) filed += 1;
         }
       }
-      return { generation, filed, refused, skipped };
+      return { generation, filed, refused, skipped, failing };
     },
     collect: (_device, { device_id }) => {
       const d = live(device_id);
@@ -809,6 +824,67 @@ test("a revoke raises the rotation banner by reason, and a rotation clears it an
   });
 });
 
+test("compromised is offered for a member row only, and its revoke asks for an urgent rotation", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 },
+    { device_id: "c5".repeat(16), label: "Machine X", status: "active", granted: true, generation: 0, custodian: true },
+  ]);
+  const card = await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  // A web-first assertion: the option list renders after the click.
+  const offers = async (label: string, reasons: string[]) => {
+    const row = await listDevices(a, label);
+    await row.getByRole("combobox", { name: "Reason" }).click();
+    await expect(a.getByRole("option")).toHaveText(reasons);
+    await a.keyboard.press("Escape");
+    await expect(a.getByRole("option")).toHaveCount(0);
+  };
+
+  await test.step("a custodian row is not offered compromised; a member row is", async () => {
+    await offers("Machine X", ["Retired", "Lost"]);
+    await offers("Machine C", ["Retired", "Lost", "Compromised"]);
+  });
+
+  await test.step("the compromised revoke warns that pushes stop until the rotation, then raises the urgent banner", async () => {
+    const row = await listDevices(a, "Machine C");
+    await cardSignIn(a);
+    await row.getByRole("combobox", { name: "Reason" }).click();
+    await a.getByRole("option", { name: "Compromised" }).click();
+    await row.getByRole("button", { name: "Revoke" }).click();
+    const dialog = a.getByRole("dialog");
+    await expect(dialog).toContainText("no device can push or publish under the current key");
+    await dialog.getByRole("button", { name: "Revoke" }).click();
+    await expect(row).toContainText("Revoked");
+    await expect(card.getByTestId("team-rotation-banner")).toContainText("lost or compromised");
+  });
+});
+
+test("a rotation held up by a member's failing grant finishes once the custodian uses skip member", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: true, generation: 0 },
+    { device_id: "c6".repeat(16), label: "Machine G", status: "active", granted: true, generation: 0, fails: true },
+  ]);
+  const card = await teamDevicePage(a, "a", server);
+  await cardClick(a, "Create fleet key");
+  await rotateOn(a);
+  const failing = card.getByTestId("team-rotation-failing");
+  await expect(card.getByTestId("team-rotation-status")).toContainText("is unfinished");
+  // One failure may be a timeout: Skip is offered only once a resume fails too.
+  await expect(failing).toHaveCount(0);
+  await rotateOn(a, "Resume fleet key rotation");
+  await expect(failing).toContainText(`keeps failing the new fleet key grant of device ${"c6".repeat(4)}`);
+
+  await cardSignIn(a);
+  await failing.getByRole("button", { name: "Skip member" }).click();
+  const dialog = a.getByRole("dialog");
+  await expect(dialog).toContainText("revoke it and have it enroll again");
+  await dialog.getByRole("button", { name: "Skip member" }).click();
+  await expect(card.getByTestId("team-rotation-status"))
+    .toContainText("New key granted to 1 device(s); refused by the server for 0; skipped for 1.");
+  await expect(failing).toHaveCount(0);
+  expect(server.devices.find((d) => d.label === "Machine G")?.generation).toBe(0);
+});
+
 test("an unfinished rotation shows Resume and its deadline, and refuses Approve until it is done", async ({ page: a }) => {
   const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "pending", granted: false }]);
   const card = await teamDevicePage(a, "a", server, false, "&teamRotation=unfinished");
@@ -851,7 +927,7 @@ test("a pull refused as under a retired key shows why", async ({ page }) => {
   await expect(page.getByText("[[shardx:")).toHaveCount(0);
 });
 
-test("after a rotation the custodian pushes profiles under an older key, and a member follows the new key", async ({
+test("after a rotation the custodian pushes profiles under an older key, and a member's check-in collects the new key", async ({
   page: a, browser, baseURL, viewport,
 }) => {
   test.slow();
@@ -907,13 +983,11 @@ test("after a rotation the custodian pushes profiles under an older key, and a m
     await expect.poll(() => teamPins(a)).toEqual(["AVAILABLE@3"]);
   });
 
-  await test.step("B's check-in under the old key is refused; B collects generation 1 and checks in", async () => {
+  await test.step("B's check-in refused under the old key collects generation 1 and runs once more", async () => {
     await click(b, rowB, "Pull");
     await click(b, rowB, "Check in");
-    await expect(b.getByText("The team's fleet key was rotated", { exact: false })).toBeVisible();
-    await cardClick(b, "Collect key custody");
     await expect(b.getByText("Fleet key collected (generation 1).")).toBeVisible();
-    await click(b, rowB, "Check in");
+    await expect(b.getByText("The team's fleet key was rotated", { exact: false })).toHaveCount(0);
     await expect.poll(() => teamPins(b)).toEqual(["AVAILABLE@4"]);
   });
 
@@ -1312,15 +1386,23 @@ test("the custodian cannot approve a row it first saw more than ten minutes ago"
   await b.context().close();
 });
 
-test("the reason list offers only Retired and Lost", async ({ page: a }) => {
-  const server = fakeTeamServer([{ device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: false }]);
+test("the reason list offers Retired and Lost, and Compromised for a member row only", async ({ page: a }) => {
+  const server = fakeTeamServer([
+    { device_id: "c1".repeat(16), label: "Machine C", status: "active", granted: false },
+    { device_id: "c5".repeat(16), label: "Machine X", status: "active", granted: false, custodian: true },
+  ]);
   await teamDevicePage(a, "a", server);
-  const row = await listDevices(a, "Machine C");
+  const custodian = await listDevices(a, "Machine X");
+  const row = a.getByTestId("team-device").filter({ hasText: "Machine C" });
   await expect(a.getByTestId("team-device").filter({ hasText: "Machine A" }).getByRole("combobox")).toHaveCount(0);
+  await custodian.getByRole("combobox", { name: "Reason" }).click();
+  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost"]);
+  await a.keyboard.press("Escape");
+  await expect(a.getByRole("option")).toHaveCount(0);
   const reason = row.getByRole("combobox", { name: "Reason" });
   await expect(reason).toContainText("Retired");
   await reason.click();
-  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost"]);
+  await expect(a.getByRole("option")).toHaveText(["Retired", "Lost", "Compromised"]);
   await a.getByRole("option", { name: "Lost" }).click();
   await expect(reason).toContainText("Lost");
 });

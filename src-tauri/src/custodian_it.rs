@@ -1522,7 +1522,7 @@ fn the_fleet_key_rotates_and_members_follow_against_a_real_server() {
     );
     let status = call(
         &rt,
-        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into()),
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
     )
     .unwrap();
     let rotation = status.rotation.expect("the rotation");
@@ -2651,7 +2651,7 @@ fn the_journey_leak_scan_worker() {
     .unwrap();
     call(
         &rt,
-        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into()),
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
     )
     .unwrap();
 
@@ -3125,6 +3125,7 @@ fn members_stay_trusted_by_a_device_that_joins_after_a_custodian_revocation_agai
             &device,
             row,
             shardx_core::authz_record::DeviceRevocationReason::Retired,
+            None,
             crate::root_bootstrap::now_ms(),
             &mut state,
             &mut |_| Ok(()),

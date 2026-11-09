@@ -108,8 +108,16 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
   const rotation = fleet?.rotation ?? null;
   const unfinished = rotation?.phase === "preparing" || rotation?.phase === "activated";
   const stuck = rotation?.phase === "expired";
-  const rotate = async () => {
-    const ok = await confirmModal({
+  const rotate = async (skipMember?: string) => {
+    // Skipping is its own decision: the member must be revoked and enroll again.
+    const ok = await confirmModal(skipMember ? {
+      title: t("team.rotation.skipMember"),
+      message: t("team.rotation.skipConfirm", { id: skipMember.slice(0, 8) }),
+      buttons: [
+        { label: t("common.cancel"), value: false },
+        { label: t("team.rotation.skipMember"), value: true, danger: true },
+      ],
+    } : {
       title: t("team.rotation.confirmTitle"),
       message: `${t("team.rotation.confirm")} ${t("team.rotation.retroactive")}`,
       buttons: [
@@ -121,7 +129,7 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
     await run("rotate", async () => {
       const [u, p] = login();
       try {
-        const next = await teamFleetKeyRotate(u, p);
+        const next = await teamFleetKeyRotate(u, p, skipMember);
         setFleet(next);
         toast.ok(t("team.rotation.done", { n: next.rotation?.generation ?? 0 }));
         const refused = next.rotation?.members_refused ?? 0;
@@ -170,7 +178,9 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
     const reason = reasons[r.device_id] ?? "retired";
     const ok = await confirmModal({
       title: t("team.devices.revokeTitle", { label: r.label }),
-      message: t("team.devices.revokeConfirm"),
+      message: reason === "compromised"
+        ? `${t("team.devices.revokeConfirm")} ${t("team.devices.compromisedWarning")}`
+        : t("team.devices.revokeConfirm"),
       buttons: [
         { label: t("common.cancel"), value: false },
         { label: t("team.devices.revoke"), value: true, danger: true },
@@ -234,6 +244,20 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
               {unfinished && rotation.deadline_ms != null
                 && ` ${t("team.rotation.deadline", { date: new Date(rotation.deadline_ms).toLocaleString() })}`}
             </p>
+          )}
+          {rotation?.failing_member && (
+            <div data-testid="team-rotation-failing" className="flex flex-wrap items-center gap-2">
+              <p className="m-0 text-paragraph-xs text-state-error-base">
+                {t("team.rotation.failingMember", { id: rotation.failing_member.slice(0, 8) })}
+              </p>
+              <Button
+                size="xsmall" variant="error" mode="stroke"
+                disabled={!!busy || !account.signedIn}
+                onClick={() => { void rotate(rotation.failing_member ?? undefined); }}
+              >
+                {t("team.rotation.skipMember")}
+              </Button>
+            </div>
           )}
           {rotation?.phase === "done" && (
             <p data-testid="team-rotation-status" className="m-0 text-paragraph-xs text-text-sub-600">
@@ -375,6 +399,8 @@ export function TeamDevices({ account, busy, run, anchor, selfId, hasFleetKey, f
                     options={[
                       { value: "retired", label: t("team.devices.reasonRetired") },
                       { value: "lost", label: t("team.devices.reasonLost") },
+                      // Q-57: a custodian row is never offered `compromised`.
+                      ...(r.custodian ? [] : [{ value: "compromised", label: t("team.devices.reasonCompromised") }]),
                     ]}
                   />
                 </div>
