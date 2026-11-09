@@ -139,9 +139,8 @@ the right model to keep.
 | Recovery bundle | A v3 bundle (2.8.0) holds the root custodian's device identity, the root key and, when exported again after the fleet key exists, the team's verified fleet keys; a bundle from 2.7.x holds only the root key and cannot restore the team |
 | Approvals and grants | Run one year, with no renewal |
 
-The table describes 2.9.0. v2.10 (in development, ADR 0002 Q-52 to Q-58;
-each point is checked against the code as its story merges) changes it, with
-no server change:
+The table describes 2.9.0. v2.10 (ADR 0002 Q-52 to Q-58) changes it, with no
+server change:
 
 - **Revocation** also offers `compromised` for member rows; custodian rows
   keep `retired` and `lost` (Q-57).
@@ -228,11 +227,13 @@ From v2.10 (ADR 0002 Q-57, Q-58):
   that would first count it is a *closure evaluation*: one evidence request
   that names every known device signer, at most 64, so that every member
   approval is first seen together with the revocation and keeps its standing.
-  A device that would need more than 64 fails closed
-  (`fleet.trustClosureTooLarge`) until v2.11. A member the server leaves out
-  is distrusted and enrolls again. Whether this ships in v2.10 is decided by
-  gate G6; without it the old root is not revoked in v2.10 (see "Root custody
-  hand-over").
+  Every device ever named as the subject of a fleet key grant
+  (`DeviceHpkeGrant`) counts toward the 64, revoked and retired ones included,
+  not only today's members. A device that would need more than 64 fails
+  closed (`fleet.trustClosureTooLarge`) and stays blocked until v2.11 brings a
+  helper that evaluates several listings. A member the server leaves out is
+  distrusted and enrolls again. A member still on 2.9.x when the old root is
+  revoked distrusts peers it has not seen and must enroll again.
 
 ### A failure worth remembering
 
@@ -397,17 +398,15 @@ Roughly the sequence the constraints force:
 
 7. **Fleet key rotation.** Done in 2.9.0 (see below).
 
-In development for v2.10, with no server change (ADR 0002 Q-52 to Q-58):
-moving root custody to a new device row, the root custodian renewing its own
-approval and grants, and re-sealing every profile under the newest fleet key
-at once. Once the old row is revoked (v2.10 if gate G6 passes, otherwise
-v2.11), a lost machine or an old bundle stops being a root custodian.
+v2.10, with no server change (ADR 0002 Q-52 to Q-58): moving root custody to
+a new device row, the root custodian renewing its own approval and grants,
+and re-sealing every profile under the newest fleet key at once. Once the old
+row is revoked, a lost machine or an old bundle stops being a root custodian.
 
 Still to come in v2.11, with one batched server update: root key rotation,
 renewal of members' approvals and grants (which run one year), discarding a
-stuck PREPARING generation, `compromised` for custodian rows, Reset of a
-handed-over old root, and, if gate G6 fails in v2.10, revoking the old root
-after a hand-over.
+stuck PREPARING generation, `compromised` for custodian rows, closures over
+more than 64 signers, and Reset of a handed-over old root.
 
 ### Fleet key rotation
 
@@ -479,11 +478,11 @@ member but not to the outgoing custodian (`skipped:outgoing-custodian`).
 
 ## Root custody hand-over
 
-In development for v2.10 (ADR 0002 Q-56, Q-58, D-5 sequence H). It moves root
-custody from the current root machine A to a new device B, which is how a
-custodian re-keys before its key age (1095 days). Once the old row is revoked
-(v2.10 if gate G6 passes, otherwise v2.11), a lost machine or an old bundle
-stops being a root custodian. No server change is needed.
+Since v2.10 (ADR 0002 Q-56, Q-58, D-5 sequence H), on the Team page. It moves
+root custody from the current root machine A to a new device B, which is how a
+custodian re-keys before its key age (1095 days). Once the old row is revoked,
+a lost machine or an old bundle stops being a root custodian. No server change
+is needed.
 
 1. B enrolls and joins like any member, comparing the join code.
 2. On A, **Approve as root custodian**. It is refused
@@ -511,15 +510,16 @@ stops being a root custodian. No server change is needed.
       synced once since the hand-over began: a member still on 2.9.x distrusts
       peers it has not seen and must enroll again.
 5. A stays registered but inert: it cannot push, and every custody command
-   refuses. Switch it off. Reset of the old machine, and wiping its seeds,
-   come in v2.11.
+   refuses. Its Team page says it handed over and can be switched off. Switch
+   it off. A revoked device cannot open a session to read its own signed
+   revocation, so A stays inert, still holding its seeds and root state, until
+   v2.11 brings Reset and the wipe of its seeds. A cancelled appointee stays
+   inert the same way.
 
-**Step 4.4 ships only if gate G6 passes** (the closure evaluation in
-"Revocation" keeps every member trusted after a custodian is revoked). If G6
-cannot be met without a server change, the checklist ends after step 4.3 with
-a notice (`team.handover.revokeInV211`): A stays a registered root custodian
-until v2.11, and its machine and every bundle it exported must be kept
-offline. Reset of A is v2.11 either way.
+Step 4.4 relies on the closure evaluation in "Revocation", which keeps every
+member trusted after a custodian is revoked, within its limits: at most 64
+signers, fleet key grant subjects of the past included; a member the server
+omits enrolls again; a member still on 2.9.x enrolls again.
 
 What the hand-over does not do:
 
@@ -605,8 +605,8 @@ What does not hold:
   server, but it keeps the fleet key it already holds; see "Revocation: what
   it does and does not protect".
 - From v2.10, a cryptographic cut-off of an old root after a hand-over. Its
-  cut-off is server-enforced until v2.11 rotates the root key (in branch B,
-  none until the v2.11 revoke); see "Root custody hand-over".
+  cut-off is server-enforced until v2.11 rotates the root key; see "Root
+  custody hand-over".
 - From v2.10, trust in a member the server leaves out of the evidence when a
   custodian is revoked: that member is distrusted and enrolls again. A server
   can deny service this way, not forge trust.
