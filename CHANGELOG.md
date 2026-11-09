@@ -1,5 +1,44 @@
 # Changelog
 
+## v2.11.1
+
+A security and Team fix release: the launcher refuses a profile database whose
+write-ahead log does not match it (RUSTSEC-2026-0459), and the team server
+codes its refusals of a device approval, so a launcher tells a refused member
+from a server too old to renew members. The browser engine is unchanged.
+
+### Upgrade notes
+
+- Replace the team server binary. There is no new migration (0034 is still the
+  latest); back up the database first as usual.
+- Update the team server together with the root custodian's launcher: a 2.11.1
+  launcher reads a 2.11.0 server's refusal of a member's renewal as a server
+  too old, and the Team page asks for the update.
+
+### Security
+
+- **SQLite write-ahead log guard (RUSTSEC-2026-0459, CVE-2026-119375).** SQLite
+  before 3.54.0 can return uninitialized memory when a database is opened with
+  a `-wal` whose page size differs from the database's. Profile databases can
+  arrive with their `-wal` in another device's snapshot, so the launcher now
+  refuses such a pair before SQLite opens it, for cookies, saved passwords, web
+  data and automation databases. The patched SQLite cannot be built yet
+  (`sqlx` caps `libsqlite3-sys` below 0.38), so the advisory is accepted with
+  this guard; see `docs/dependency-review.md`.
+
+### Team
+
+- **Coded approval refusals.** The team server answers every 403 of an
+  ordinary device approval with the code `APPROVAL_REFUSED`. Member renewal
+  reports a team server too old only for a 403 without a code, as a 2.10
+  server sends, instead of guessing from whether the server ever renewed a
+  member. The Team page asks to update the team server to the latest version.
+
+### Known limitations
+
+- The bundled SQLite stays at 3.46 until `sqlx` allows `libsqlite3-sys` 0.39;
+  the guard covers the published trigger only.
+
 ## v2.11.0
 
 A Team release: the root custodian can rotate the tenant root key, renews
