@@ -5240,6 +5240,10 @@ pub(crate) async fn reseal_all(
         }
     };
     run.ended_ms = None;
+    // A resumed run keeps the outgoing custodian it started with.
+    let outgoing = (!run.outgoing.is_empty())
+        .then(|| crate::fleet_client::decode_hex32(&run.outgoing, "outgoing"))
+        .transpose()?;
     let ids: Vec<String> = run
         .profiles
         .iter()
@@ -5455,6 +5459,18 @@ async fn reseal_one(
                 [&local],
             )?;
             b = bound(&db, &local)?;
+        }
+        // A restore transition accepted above moves the pin and not
+        // `base_version`: the copy is then behind the head, and a commit on
+        // it would clear the mark that makes the next push ask for a Pull.
+        let behind: bool = db.conn.query_row(
+            "SELECT base_version < remote_version FROM profile_bindings
+             WHERE local_profile_id = ?1",
+            [&local],
+            |r| r.get(0),
+        )?;
+        if behind && !local.starts_with("reseal:") {
+            return Ok(IN_USE.into());
         }
         mark(&format!("sealing:{}:{}", at.version, hex(&at.hash)))?;
         opened(client, access, &b, &p, fkek).await?
@@ -12997,6 +13013,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A restore transition the re-seal accepts moves a bound pin to a head
+    /// another device committed, past the data this copy holds
+    /// (`base_version < remote_version`): the profile is skipped as in use
+    /// before it is marked for sealing or opened, nothing is sent, and the
+    /// copy stays behind so its next push asks for a Pull.
+    #[test]
+    fn a_bound_profile_whose_restore_transition_moves_the_pin_past_its_data_is_skipped() {
+        let w = world();
+        w.push().unwrap();
+        w.push().unwrap();
+        let (h1, h2) = (w.head_of(1), w.head_of(2));
+        // A joined copy whose first pull never landed: no pin and no data.
+        w.db()
+            .conn
+            .execute(
+                "UPDATE profile_bindings SET remote_version = 0, base_version = 0,
+                   last_observed_head_hash = NULL",
+                [],
+            )
+            .unwrap();
+        w.fake().restore(1);
+        let leaves = [leaf(PROFILE, h2, h1)];
+        let t = transition(&w.me, 0, &leaves);
+        w.file(&w.me.sk, &t, &leaves, &[PROFILE], 0);
+        rotate(&w);
+        make_custodian(&w);
+        let (checkouts, commits) = (w.posts("/checkout"), w.posts("/commit"));
+        let reads = w.sent("GET", "/snapshots/1").len();
+        let mut sealing = false;
+        let run = w
+            .reseal_with(None, &free, &mut |s| {
+                let p = s.reseal.as_ref().map(|r| r.profiles.get(&hex(&PROFILE)));
+                sealing |= p.flatten().is_some_and(|o| o.starts_with("sealing:"));
+                crate::fleet_custody::save(s)
+            })
+            .unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "skipped:in-use");
+        assert!(!sealing, "never marked for sealing");
+        assert_eq!(w.sent("GET", "/snapshots/1").len(), reads, "never opened");
+        assert_eq!(
+            (w.posts("/checkout"), w.posts("/commit")),
+            (checkouts, commits)
+        );
+        let (_, _, epoch, version, _) = w.state(LOCAL);
+        assert_eq!((epoch, version), (1, 1), "the transition moved the pin");
+        assert_eq!(
+            w.count("SELECT base_version < remote_version FROM profile_bindings"),
+            1,
+            "still behind"
+        );
+    }
+
+    /// 4.S step 4 names this device's own commit only: a head on the saved
+    /// base under `G` that another device signed is current, not re-sealed.
+    #[test]
+    fn a_next_head_another_device_signed_on_the_saved_base_is_current() {
+        let w = world();
+        push_next(&w);
+        rotate(&w);
+        push_next(&w);
+        let heads = relink(&w, &[(&w.me.sk, GEN), (&author(), GEN + 1)]);
+        let _d = unbound_custodian(&w);
+        serve(&w, &author_pages(&w, T0 + 300 * DAY, false, false));
+        let pending = format!("sealing:1:{}", hex(&heads[0]));
+        crate::fleet_custody::save(&FleetCustodyState {
+            reseal: Some(ResealRun {
+                generation: GEN + 1,
+                profiles: [(hex(&PROFILE), pending)].into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        let commits = w.posts("/commit");
+        let run = w.reseal(None).unwrap();
+        assert_eq!(run.profiles[&hex(&PROFILE)], "current");
+        assert_eq!(w.posts("/commit"), commits);
     }
 
     /// The generation floor: a valid head under `GEN` advancing over a pin
