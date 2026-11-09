@@ -5617,6 +5617,7 @@ pub(crate) async fn custody_blockers(
     let chain = ledger::evaluate(&db, binding, &pin.1, &pages, now)?.map(|(_, chain)| chain);
     let keys: std::collections::BTreeMap<[u8; 32], [u8; 32]> = pages
         .iter()
+        .flatten()
         .flat_map(|p| &p.signing_public_keys)
         .map(|pk| (shardx_core::keys::signing_key_id(pk), *pk))
         .collect();

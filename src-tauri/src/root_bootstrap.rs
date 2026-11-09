@@ -4109,13 +4109,13 @@ pub(crate) mod tests {
             let mut db = Db::open_at(&dir.path().join("m.db")).unwrap();
             ledger::pin_anchor(&db, &binding, &anchor, ledger::JOIN, START).unwrap();
             for (containers, now) in [(old.clone(), START + DAY), (both.clone(), back)] {
-                let pages = [page(containers, now)];
+                let pages = [vec![page(containers, now)]];
                 let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &pages, now)
                     .unwrap()
                     .expect("verifies");
                 ledger::record(&mut db, &binding, &seen, &chain, None, false, now).unwrap();
             }
-            let pages = [page(both.clone(), START + 400 * DAY)];
+            let pages = [vec![page(both.clone(), START + 400 * DAY)]];
             let (_, chain) = ledger::evaluate(&db, &binding, &anchor, &pages, START + 400 * DAY)
                 .unwrap()
                 .unwrap();
@@ -4190,7 +4190,7 @@ pub(crate) mod tests {
         };
         let mut db = Db::open().unwrap();
         ledger::pin_anchor(&db, &binding, &anchor, ledger::BOOTSTRAP, now).unwrap();
-        let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &[page], now)
+        let (seen, chain) = ledger::evaluate(&db, &binding, &anchor, &[vec![page]], now)
             .unwrap()
             .expect("verifies");
         ledger::record(&mut db, &binding, &seen, &chain, None, false, now).unwrap();

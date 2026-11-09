@@ -3002,7 +3002,8 @@ pub async fn accept_custody<CF: std::future::Future<Output = Result<u64>>>(
         .await?;
         let (_, chain) = ledger.evaluate(&pages, now)?;
         let mut named = false;
-        let found = evidence_records(&pages)
+        let flat = pages.concat();
+        let found = evidence_records(&flat)
             .into_iter()
             .find_map(|(c, issuer, p)| {
                 let Payload::TenantRootKeyGrant(g) = p else {
