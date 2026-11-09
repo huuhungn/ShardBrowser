@@ -1079,6 +1079,31 @@ test("re-seal all profiles moves each free head under the newest key and lists t
   await expect(a.getByText("[[shardx:")).toHaveCount(0);
 });
 
+test("a root custodian past 75% of its custody records is warned, renews, and is asked to export again", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(a, "a", server, false, "&teamRenewal=due");
+  const renewal = card.getByTestId("team-renewal");
+  await expect(renewal.getByTestId("team-renewal-warning")).toContainText("Root custody records end");
+  await expect(card.getByTestId("team-export-due")).toHaveCount(0);
+  await cardClick(a, "Renew custody");
+  await expect(a.getByText("Root custody renewed. Export the recovery bundle again.")).toBeVisible();
+  await expect(renewal.getByTestId("team-renewal-warning")).toHaveCount(0);
+  await expect(renewal).toContainText("Renewed automatically on the next custody action or team sync");
+  await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
+  await expect(card.getByTestId("team-export-due")).toBeVisible();
+  await expect(a.getByText("[[shardx:")).toHaveCount(0);
+});
+
+test("a root custodian not yet due to renew sees its custody dates and no renew action", async ({ page: a }) => {
+  const server = fakeTeamServer();
+  const card = await teamDevicePage(a, "a", server);
+  const renewal = card.getByTestId("team-renewal");
+  await expect(renewal).toContainText("Root custody records");
+  await expect(renewal.getByTestId("team-renewal-warning")).toHaveCount(0);
+  await expect(renewal.getByTestId("team-renewal-key-age")).toContainText("counts as the root custodian's until");
+  await expect(renewal.getByRole("button", { name: "Renew custody" })).toHaveCount(0);
+});
+
 // The two-machine gate (Plan:2388), each step a test.step below:
 //   publish               = S5 publish on A
 //   checkout/restore on B = S3b join + pull on B

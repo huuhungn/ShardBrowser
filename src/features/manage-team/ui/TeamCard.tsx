@@ -8,6 +8,7 @@ import {
   teamCustodyBootstrapStatus, teamBootstrapCustody,
   teamKeysCreateFile, teamKeysUnlock,
   teamEnrollAgain, teamExportRecoveryBundle, teamImportRecoveryBundle, teamFleetCustodyStatus,
+  teamRenewCustody,
   type TeamStatus, type CustodyBootstrapStatus, type CustodyResult,
 } from "../../../entities/team";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -16,6 +17,8 @@ import { TeamJoin } from "./TeamJoin";
 
 /** The recovery bundle's passphrase floor, as the backend seals it. */
 const MIN_RECOVERY_PASSPHRASE = 8;
+/** How long a root custodian's signing key counts as one (`MAX_CUSTODIAN_KEY_AGE_MS`). */
+const KEY_AGE_MS = 1095 * 86_400_000;
 import { t, useT } from "../../../shared/i18n";
 import { safeUiError } from "../../../shared/lib/utils";
 
@@ -268,6 +271,15 @@ export function TeamCard() {
     if (r.fleet_opened > 0) teamStatus().then(setSt).catch(() => {});
   };
 
+  const renew = () => run("renew", async () => {
+    const typed = password;
+    setPassword("");
+    const outcome = await teamRenewCustody(username.trim(), typed);
+    void loadBoot();
+    void loadExportDue();
+    toast.ok(t(outcome === "renewed" ? "team.renewal.done" : "team.renewal.notDue"));
+  });
+
   const collect = () => run("collect", async () => {
     const typed = password;
     setPassword("");
@@ -281,6 +293,17 @@ export function TeamCard() {
   // Only this device's root state makes it the root custodian. Another device's, kept by a connection change,
   // offers no setup: the backend refuses to start or resume over it.
   const setupOpen = !!boot && (boot.this_device ? !boot.activated : !boot.started);
+  // Root custody renewal (v2.10 4.R): renewing is due from half the records' life,
+  // and the warning shows from 75%, halfway from the renewal point to the end.
+  const now = Date.now();
+  const day = (ms: number) => new Date(ms).toLocaleDateString();
+  const renewalDue = boot?.renewal_due_ms ?? null;
+  const custodyEnds = boot?.custody_ends_ms ?? null;
+  const keyAgeEnds = boot?.key_age_ends_ms ?? null;
+  const renewalWarning = renewalDue !== null && custodyEnds !== null
+    && now >= renewalDue + (custodyEnds - renewalDue) / 2;
+  const keyAgeWarning = keyAgeEnds !== null && now >= keyAgeEnds - KEY_AGE_MS / 4;
+
   const account: TeamAccount = {
     username,
     signedIn: !!username.trim() && !!password,
@@ -653,6 +676,39 @@ export function TeamCard() {
                       onEnrolledAgain={(next) => { setSt(next); void shareStatus(); }}
                     />
                   ))}
+                  {st.can_sync && boot?.this_device && boot.activated && renewalDue !== null && custodyEnds !== null && (
+                    <div data-testid="team-renewal" className="flex flex-col gap-1.5 border-t border-stroke-soft-200 pt-2">
+                      <span className="text-label-xs text-text-strong-950">{t("team.renewal.title")}</span>
+                      {renewalWarning ? (
+                        <p data-testid="team-renewal-warning" className="m-0 text-paragraph-xs text-state-error-base">
+                          {t("team.renewal.warning", { date: day(custodyEnds) })}
+                        </p>
+                      ) : (
+                        <p className="m-0 text-paragraph-xs text-text-soft-400">
+                          {t("team.renewal.dates", { due: day(renewalDue), ends: day(custodyEnds) })}
+                        </p>
+                      )}
+                      {keyAgeEnds !== null && (
+                        <p
+                          data-testid="team-renewal-key-age"
+                          className={`m-0 text-paragraph-xs ${keyAgeWarning ? "text-state-error-base" : "text-text-soft-400"}`}
+                        >
+                          {t(keyAgeWarning ? "team.renewal.keyAgeWarning" : "team.renewal.keyAge", { date: day(keyAgeEnds) })}
+                        </p>
+                      )}
+                      {now >= renewalDue && (
+                        <div>
+                          <Button
+                            size="small" mode="stroke"
+                            disabled={!!busy || !username.trim() || !password}
+                            onClick={renew}
+                          >
+                            {busy === "renew" ? t("team.renewal.busy") : t("team.renewal.renew")}
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                   {st.can_sync && boot?.this_device && boot.activated && (
                     <div data-testid="team-export" className="flex flex-col gap-2 border-t border-stroke-soft-200 pt-2">
                       {exportDue && (
