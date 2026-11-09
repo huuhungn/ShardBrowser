@@ -9,7 +9,7 @@ use anyhow::Context;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
-use crate::{audit, auth, bootstrap, db, identity, restore, util};
+use crate::{audit, auth, bootstrap, db, discard, identity, restore, util};
 
 pub const USAGE: &str = "usage:
   shardx-team-server
@@ -44,7 +44,14 @@ pub const USAGE: &str = "usage:
       close a confirmed first device that will not be approved; this tenant
       cannot bootstrap again
   shardx-team-server tenant first-device-status --tenant <slug>
-      read the first-device confirmation back without changing anything";
+      read the first-device confirmation back without changing anything
+  shardx-team-server fleet discard-preparing --tenant <slug> --generation <n> [--fleet <hex>] [--force]
+      archive and delete a stuck PREPARING fleet key generation (the ACTIVE
+      one + 1) and its grants, so the number can be used again; back up the
+      database first. --force skips the wait for the rotation's grant window,
+      or for a rotation that filed no rotation grant yet
+  shardx-team-server root discard-preparing --tenant <slug> --generation <n>
+      the same for a stuck PREPARING root key generation";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -87,6 +94,13 @@ pub enum Command {
     },
     FirstDeviceStatus {
         slug: String,
+    },
+    DiscardPreparing {
+        kind: discard::Kind,
+        slug: String,
+        generation: u64,
+        fleet: Option<[u8; 16]>,
+        force: bool,
     },
 }
 
@@ -148,8 +162,45 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         ["tenant", "first-device-status", "--tenant", slug] => Ok(Command::FirstDeviceStatus {
             slug: slug.to_string(),
         }),
+        ["fleet", "discard-preparing", rest @ ..] => parse_discard(discard::Kind::Fleet, rest),
+        ["root", "discard-preparing", rest @ ..] => parse_discard(discard::Kind::Root, rest),
         _ => Err("unrecognized command".into()),
     }
+}
+
+fn parse_discard(kind: discard::Kind, rest: &[&str]) -> Result<Command, String> {
+    let (mut slug, mut generation, mut fleet, mut force) = (None, None, None, false);
+    let mut it = rest.iter().enumerate();
+    while let Some((i, arg)) = it.next() {
+        let mut value = || match it.next() {
+            Some((_, v)) if !v.starts_with("--") => Ok(*v),
+            _ => Err(format!("argument {} needs a value", i + 3)),
+        };
+        match (*arg, kind) {
+            ("--tenant", _) if slug.is_none() => slug = Some(value()?.to_string()),
+            ("--generation", _) if generation.is_none() => {
+                generation = Some(
+                    value()?
+                        .parse::<u64>()
+                        .map_err(|_| "--generation must be a number")?,
+                )
+            }
+            ("--fleet", discard::Kind::Fleet) if fleet.is_none() => {
+                fleet = Some(
+                    bootstrap::parse_device_id(value()?).ok_or("--fleet must be 32 hex digits")?,
+                )
+            }
+            ("--force", discard::Kind::Fleet) if !force => force = true,
+            _ => return Err(format!("unrecognized argument {}", i + 3)),
+        }
+    }
+    Ok(Command::DiscardPreparing {
+        kind,
+        slug: slug.ok_or("--tenant is required")?,
+        generation: generation.ok_or("--generation is required")?,
+        fleet,
+        force,
+    })
 }
 
 fn parse_tenant_create(rest: &[&str]) -> Result<Command, String> {
@@ -237,6 +288,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         }
         Command::CancelFirstDevice { slug } => bootstrap::cancel(&cfg, &slug).await,
         Command::FirstDeviceStatus { slug } => bootstrap::status(&cfg, &slug).await,
+        Command::DiscardPreparing {
+            kind,
+            slug,
+            generation,
+            fleet,
+            force,
+        } => discard::discard_preparing(&cfg, kind, &slug, generation, fleet, force).await,
     }
 }
 
@@ -606,7 +664,33 @@ mod tests {
                 slug: "acme".into()
             })
         );
+        assert_eq!(
+            parse(&args(
+                "fleet discard-preparing --generation 2 --tenant acme --force \
+                 --fleet 000102030405060708090a0b0c0d0e0f"
+            )),
+            Ok(Command::DiscardPreparing {
+                kind: discard::Kind::Fleet,
+                slug: "acme".into(),
+                generation: 2,
+                fleet: Some([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+                force: true,
+            })
+        );
+        assert_eq!(
+            parse(&args("root discard-preparing --tenant acme --generation 1")),
+            Ok(Command::DiscardPreparing {
+                kind: discard::Kind::Root,
+                slug: "acme".into(),
+                generation: 1,
+                fleet: None,
+                force: false,
+            })
+        );
         for bad in [
+            "fleet discard-preparing --tenant acme",
+            "fleet discard-preparing --tenant acme --generation -1",
+            "root discard-preparing --tenant acme --generation 1 --fleet 000102030405060708090a0b0c0d0e0f",
             "tenant confirm-first-device --tenant acme",
             "tenant confirm-first-device --tenant acme --device 0001",
             "tenant cancel-first-device acme",

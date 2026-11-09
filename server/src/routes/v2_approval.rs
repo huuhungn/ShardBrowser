@@ -12,7 +12,8 @@
 //!
 //! After D1, an approval is ordinary (ADR 0002 D-2): a root custodian holding
 //! a device-scoped `device.approve` over the approval's scope approves a
-//! pending device of its tenant, or renews its own live approval. Its receipt
+//! pending device of its tenant, or renews the approval of an active one, its
+//! own or a member's (ADR 0002 Q-61). Its receipt
 //! names no confirmation, and its retry rechecks that authority live.
 
 use axum::body::Bytes;
@@ -974,8 +975,8 @@ async fn ordinary_approval(
     }
 
     // The subject: a pending device of an active account of this tenant, or
-    // the session's own device renewing its approval, under its own keys.
-    let renewal = *path_device == s.device_id;
+    // an active one (the session's own or a member's, ADR 0002 Q-61) whose
+    // approval is renewed, under its own keys. A revoked device never is.
     let device = sqlx::query(
         "SELECT d.status, d.signing_suite, d.signing_public_key, d.signing_key_id,
                 d.hpke_suite, d.hpke_public_key, d.hpke_key_id
@@ -990,7 +991,8 @@ async fn ordinary_approval(
     .await?
     .ok_or(AppError::Forbidden)?;
     let status: String = device.get("status");
-    if status != if renewal { "active" } else { "pending" } {
+    let renewal = status == "active";
+    if !renewal && status != "pending" {
         return Err(AppError::Forbidden);
     }
     let spk: [u8; 32] = blob(&device, "signing_public_key")?;

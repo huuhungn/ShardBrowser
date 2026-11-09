@@ -2520,6 +2520,45 @@ mod tests {
         assert!(!verifies(&k1b), "the new key under that number never does");
     }
 
+    /// Assumption A1 (v2.11, ADR 0002 Q-60): a device collects only the
+    /// fleet's ACTIVE generation (`collect_fleet_grant` asks the server which
+    /// one that is), so a generation left PREPARING is never recorded, even by
+    /// an evaluation of evidence that serves all of its grants, this device's
+    /// own included. Once the operator discards it, a new key under the same
+    /// number verifies.
+    #[test]
+    fn a_collect_never_records_a_preparing_generation() {
+        let a = a0();
+        let (k0, k1, k1b) = ([0x30; 32], [0x31; 32], [0x41; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_at(&dir.path().join("t.db")).unwrap();
+        let mut stuck = rotation(&a, 1, &k1, &k0);
+        stuck.push(device_grant(&a, &a.to, 1, &k1, 50));
+        collect(&mut db, &a, 0, &k0, 40, evidence(&a, true, stuck));
+
+        let kept: Vec<(i64, String)> = db
+            .conn
+            .prepare("SELECT generation, fkek_key_id FROM trust_fleet_key_grants")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let k0_id = hex(&shardx_core::fleet_grants::fkek_key_id(&k0));
+        assert_eq!(kept, [(0, k0_id)], "only the ACTIVE generation");
+        assert_eq!(highest_generation(&db, &B, &FLEET).unwrap(), Some(0));
+
+        // Discarded, then rotated again under `k1b`.
+        let more = rotation(&a, 1, &k1b, &k0);
+        collect(&mut db, &a, 1, &k1b, 42, evidence(&a, true, more));
+        let pin = (B, a.to.signing_key_id);
+        let verifies = |k: &[u8; 32]| {
+            crate::fleet_key_verifies(&db, &pin, &a.to, &FLEET, 1, k, T0 + DAY).unwrap()
+        };
+        assert!(verifies(&k1b), "the new key under that number verifies");
+        assert!(!verifies(&k1), "the discarded key never did");
+    }
+
     // ---- v2.10 hand-over: member trust after a custodian revocation (U1b, G6) ----
 
     /// A0 approved `members` member devices for the fleet, let each commit to

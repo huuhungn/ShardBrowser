@@ -1534,24 +1534,36 @@ pub async fn me(State(app): State<AppState>, who: Principal) -> Result<Json<Valu
     });
     let mut out = match who {
         Principal::Ticket(t) => {
-            let devices: Vec<Value> = sqlx::query(
+            let mut conn = app.db.acquire().await?;
+            let rows = sqlx::query(
                 "SELECT id, status, signing_key_id, hpke_key_id FROM v2_devices
                   WHERE tenant_id = ? AND account_id = ? ORDER BY created_at, id",
             )
             .bind(t.tenant_id.as_slice())
             .bind(t.account_id.as_slice())
-            .fetch_all(&app.db)
-            .await?
-            .iter()
-            .map(|r| {
-                json!({
-                    "device_id": hex(&r.get::<Vec<u8>, _>("id")),
-                    "status": r.get::<String, _>("status"),
+            .fetch_all(&mut *conn)
+            .await?;
+            let mut devices = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let id: Vec<u8> = r.get("id");
+                let status: String = r.get("status");
+                let mut device = json!({
+                    "device_id": hex(&id),
+                    "status": status,
                     "signing_key_id": hex(&r.get::<Vec<u8>, _>("signing_key_id")),
                     "hpke_key_id": hex(&r.get::<Vec<u8>, _>("hpke_key_id")),
-                })
-            })
-            .collect();
+                });
+                if status == "revoked" {
+                    if let (Some(o), Some((exact, issuer))) = (
+                        device.as_object_mut(),
+                        revocation_of(&mut conn, v, &t.tenant_id, &id).await,
+                    ) {
+                        o.insert("revocation".into(), json!(hex(&exact)));
+                        o.insert("revocation_issuer_public_key".into(), json!(hex(&issuer)));
+                    }
+                }
+                devices.push(device);
+            }
             json!({
                 "kind": "pre_device",
                 "ticket_id": hex(&t.id),
@@ -1578,6 +1590,49 @@ pub async fn me(State(app): State<AppState>, who: Principal) -> Result<Json<Valu
         o.extend(c.clone());
     }
     Ok(Json(out))
+}
+
+/// A revoked device's earliest filed revocation (ADR 0002 Q-63): its exact
+/// signed container and the issuer's signing public key, so the device can
+/// check it itself. `None` when there is none, or when it does not verify
+/// against its row right now (quarantined): the listing stays readable.
+async fn revocation_of(
+    conn: &mut SqliteConnection,
+    v: &Verified,
+    tenant: &[u8; 16],
+    device: &[u8],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let found = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, Vec<u8>)>(
+        "SELECT r.replay_id, r.exact_signed_container_bytes, d.signing_public_key
+           FROM v2_device_revocations r
+           JOIN v2_devices d ON d.tenant_id = r.tenant_id
+                            AND d.signing_key_id = r.issuer_signing_key_id
+          WHERE r.server_instance_id = ? AND r.tenant_id = ? AND r.subject_device_id = ?
+          ORDER BY r.issued_at_ms, r.replay_id LIMIT 1",
+    )
+    .bind(v.server_instance_id.as_slice())
+    .bind(tenant.as_slice())
+    .bind(device)
+    .fetch_optional(&mut *conn)
+    .await;
+    let (replay, exact, issuer) = match found {
+        Ok(found) => found?,
+        Err(e) => {
+            tracing::warn!("a revoked device's revocation could not be read for the listing: {e}");
+            return None;
+        }
+    };
+    let replay = <[u8; 16]>::try_from(replay).ok()?;
+    match super::v2_device_revoke::load_revocation(conn, &v.server_instance_id, tenant, &replay)
+        .await
+    {
+        Ok(Some(_)) => Some((exact, issuer)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!("a revoked device's revocation is left out of the listing: {e:?}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

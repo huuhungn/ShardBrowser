@@ -4630,13 +4630,26 @@ async fn file_approval_in(
     scope: (ApprovalScopeKind, [u8; 16]),
 ) {
     let start = now_ms() - 60_000;
+    file_approval_window(server, from, to, replay, scope, start, start + 30 * DAY_MS).await;
+}
+
+/// [`file_approval_in`] valid from `start` to `end`.
+async fn file_approval_window(
+    server: &Server,
+    from: &Device,
+    to: &Device,
+    replay: u8,
+    scope: (ApprovalScopeKind, [u8; 16]),
+    start: u64,
+    end: u64,
+) {
     let approval = DeviceApprovalV2 {
         common: CommonFields {
             replay_id: [replay; 16],
             tenant_id: TENANT,
             issued_at_ms: start,
             not_before_ms: start,
-            not_after_ms: start + 30 * DAY_MS,
+            not_after_ms: end,
             server_instance_id: INSTANCE,
             restore_epoch: 0,
         },
@@ -6617,8 +6630,9 @@ async fn a_custodian_approves_a_second_device_into_an_ordinary_session() {
     assert_eq!(ordinary["class"], "ordinary");
     let ordinary_access = ordinary["access_token"].as_str().unwrap().to_string();
     assert_eq!(server.me(&ordinary_access).await.0, 200);
+    // Approving the active joiner again renews its approval (Q-61).
     let twice = approval(&joiner, &dev.sk, 0x5f, 0, 30);
-    assert_eq!(server.approve(&joiner.id, &access, &twice).await.0, 403);
+    assert_eq!(server.approve(&joiner.id, &access, &twice).await.0, 201);
     // The joiner is no custodian, so it cannot renew its own approval.
     let renewal = approval(&joiner, &joiner.sk, 0x60, 0, 30);
     assert_eq!(
@@ -6649,7 +6663,7 @@ async fn a_custodian_approves_a_second_device_into_an_ordinary_session() {
         server
             .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'")
             .await,
-        2
+        3
     );
 }
 
@@ -11467,4 +11481,1221 @@ async fn server_identity_answers_a_ticket_and_a_session_without_a_v1_token() {
     // A v2 token that names nothing live is still refused.
     let dead = format!("v2a.{}", hex(&[0; 32]));
     assert_eq!(server.call("/v2/server-identity", &dead, None).await.0, 401);
+}
+
+// ---------------------------------------- v2.11: offline discard (Q-60) ---
+
+/// `a`'s grants of `FLEET` generation 1 under `fkek`, rotated from generation
+/// 0 under `[0xe0; 32]`, with replay IDs `replay`, `replay + 1` and
+/// `replay + 2`, and the terms naming them.
+struct Rotation {
+    fkek: [u8; 32],
+    device: Vec<u8>,
+    recovery: Vec<u8>,
+    rotation: Vec<u8>,
+    replay: u8,
+    terms: shared::fleet_lifecycle::FleetGenerationTerms,
+}
+
+fn rotation_to_1(a: &Device, fkek: [u8; 32], replay: u8) -> Rotation {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, RotationGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY, DOMAIN_FLEET_KEY_GRANT_ROTATION,
+    };
+    use shared::fleet_lifecycle::{FleetGenerationRef, FleetGenerationTerms, FleetRotation};
+    use shared::mutation::fleet_device_grant_set_hash;
+    let fkek0 = [0xe0; 32];
+    let device = DeviceHpkeGrantV2 {
+        common: fleet_common(replay, 365),
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 1,
+        subject_account_id: OWNER,
+        subject_device_id: a.id,
+        subject_signing_key_id: a.signing_key_id,
+        recipient_hpke_key_id: a.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let device = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &device.encode());
+    let recovery = RecoveryGrantV2 {
+        common: fleet_common(replay + 1, 3650),
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 1,
+        recipient_root_key_id: shared::keys::root_key_id(&TRK),
+        recipient_root_generation: 0,
+        root_wrap_nonce_bytes: [5; 12],
+        wrapped_fleet_key_bytes: [6; 48],
+    };
+    let recovery = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &recovery.encode());
+    let set = fleet_device_grant_set_hash(&[container_hash(&device)]).unwrap();
+    let common = fleet_common(replay + 2, 30);
+    let rotation = RotationGrantV2 {
+        activation_not_before_ms: common.not_before_ms,
+        common,
+        fleet_id: FLEET,
+        fkek_key_id: fkek,
+        generation: 1,
+        previous_fkek_key_id: fkek0,
+        previous_generation: 0,
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: set,
+        recovery_grant_signed_container_hash: container_hash(&recovery),
+    };
+    let rotation = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_ROTATION, &rotation.encode());
+    let terms = FleetGenerationTerms {
+        generation: FleetGenerationRef {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            fleet_id: FLEET,
+            generation: 1,
+            fkek_key_id: fkek,
+        },
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: set,
+        recovery_grant_signed_container_hash: container_hash(&recovery),
+        rotation: Some(FleetRotation {
+            previous_generation: 0,
+            previous_fkek_key_id: fkek0,
+            rotation_grant_signed_container_hash: container_hash(&rotation),
+        }),
+    };
+    Rotation {
+        fkek,
+        device,
+        recovery,
+        rotation,
+        replay,
+        terms,
+    }
+}
+
+impl Rotation {
+    fn grants(&self) -> [(shared::fleet_lifecycle::FleetGrantVariant, u8, &[u8]); 3] {
+        use shared::fleet_lifecycle::FleetGrantVariant as V;
+        [
+            (V::DeviceHpke, self.replay, &self.device),
+            (V::Recovery, self.replay + 1, &self.recovery),
+            (V::Rotation, self.replay + 2, &self.rotation),
+        ]
+    }
+
+    /// Creates generation 1 and files its three grants, under idempotency
+    /// keys `key` to `key + 3`.
+    async fn create_and_file(&self, server: &Server, access: &str, key: u8) {
+        use shared::fleet_lifecycle::FleetKeyGenerationCreateV2;
+        let create = FleetKeyGenerationCreateV2 {
+            terms: self.terms,
+            root_generation: 0,
+        };
+        let request = lifecycle_request(OperationKind::FleetGenerationCreate, key, create.encode());
+        let (status, body) = server
+            .call(&fleet_generation_path(), access, Some(&request))
+            .await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        for (i, (variant, replay, c)) in self.grants().into_iter().enumerate() {
+            let request = fleet_grant_request(key + 1 + i as u8, 1, self.fkek, variant, replay, c);
+            let (status, body) = server
+                .call(&fleet_grants_path(1), access, Some(&request))
+                .await;
+            assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        }
+    }
+
+    /// Acknowledges the three grants and activates generation 1, under
+    /// idempotency keys `key` to `key + 3`.
+    async fn ack_and_activate(&self, server: &Server, access: &str, key: u8) {
+        use shared::fleet_lifecycle::{FleetKeyGenerationActivateV2, FleetKeyGrantAckV2};
+        let path = fleet_generation_path();
+        for (i, (variant, replay, c)) in self.grants().into_iter().enumerate() {
+            let grant = fleet_grant_ref(1, self.fkek, variant, replay, c);
+            let request = lifecycle_request(
+                OperationKind::FleetGrantAck,
+                key + i as u8,
+                FleetKeyGrantAckV2 { grant }.encode(),
+            );
+            let (status, body) = server
+                .call(&format!("{path}/1/ack"), access, Some(&request))
+                .await;
+            assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+        }
+        let request = lifecycle_request(
+            OperationKind::FleetGenerationActivate,
+            key + 3,
+            FleetKeyGenerationActivateV2 { terms: self.terms }.encode(),
+        );
+        let (status, body) = server
+            .call(&format!("{path}/1/activate"), access, Some(&request))
+            .await;
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    }
+}
+
+/// A root custodian `a` whose fleet `FLEET` has generation 0 ACTIVE (key
+/// `[0xe0; 32]`, wrapped under root 0); returns `a`, its access token and
+/// generation 0's device grant.
+async fn fleet_at_0(server: &mut Server, seed: u8) -> (Device, String, Vec<u8>) {
+    use shared::authz_record::{
+        DeviceHpkeGrantV2, RecoveryGrantV2, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE,
+        DOMAIN_FLEET_KEY_GRANT_RECOVERY,
+    };
+    use shared::fleet_lifecycle::{
+        FleetGenerationRef, FleetGenerationTerms, FleetGrantVariant as V,
+        FleetKeyGenerationActivateV2, FleetKeyGenerationCreateV2, FleetKeyGrantAckV2,
+    };
+    use shared::mutation::fleet_device_grant_set_hash;
+
+    let (a, access, _) = custodian(server, seed).await;
+    server
+        .sql(
+            "INSERT INTO v2_fleets (id, tenant_id, name, status, created_at)
+             VALUES (?, ?, 'f', 'active', 'now')",
+            &[&FLEET, &TENANT],
+        )
+        .await;
+    for (replay, capability) in [
+        (0xa7, Capability::FleetManage),
+        (0xa8, Capability::KeyRotate),
+    ] {
+        let grant = capability_grant(&a, &a.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let fkek0 = [0xe0; 32];
+    let device0 = DeviceHpkeGrantV2 {
+        common: fleet_common(0xd0, 365),
+        fleet_id: FLEET,
+        fkek_key_id: fkek0,
+        generation: 0,
+        subject_account_id: OWNER,
+        subject_device_id: a.id,
+        subject_signing_key_id: a.signing_key_id,
+        recipient_hpke_key_id: a.hpke_key_id,
+        hpke_encapped_key_bytes: vec![3; 32],
+        hpke_wrapped_fleet_key_bytes: vec![4; 48],
+    };
+    let device0 = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_DEVICE_HPKE, &device0.encode());
+    let recovery0 = RecoveryGrantV2 {
+        common: fleet_common(0xd1, 3650),
+        fleet_id: FLEET,
+        fkek_key_id: fkek0,
+        generation: 0,
+        recipient_root_key_id: shared::keys::root_key_id(&TRK),
+        recipient_root_generation: 0,
+        root_wrap_nonce_bytes: [5; 12],
+        wrapped_fleet_key_bytes: [6; 48],
+    };
+    let recovery0 = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &recovery0.encode());
+    let terms0 = FleetGenerationTerms {
+        generation: FleetGenerationRef {
+            tenant_id: TENANT,
+            server_instance_id: INSTANCE,
+            restore_epoch: 0,
+            fleet_id: FLEET,
+            generation: 0,
+            fkek_key_id: fkek0,
+        },
+        required_device_grant_count: 1,
+        required_device_grant_set_hash: fleet_device_grant_set_hash(&[container_hash(&device0)])
+            .unwrap(),
+        recovery_grant_signed_container_hash: container_hash(&recovery0),
+        rotation: None,
+    };
+    let path = fleet_generation_path();
+    let create = FleetKeyGenerationCreateV2 {
+        terms: terms0,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xb0, create.encode());
+    assert_eq!(server.call(&path, &access, Some(&request)).await.0, 201);
+    for (key, variant, replay, c) in [
+        (0xb1, V::DeviceHpke, 0xd0, &device0),
+        (0xb2, V::Recovery, 0xd1, &recovery0),
+    ] {
+        let request = fleet_grant_request(key, 0, fkek0, variant, replay, c);
+        assert_eq!(
+            server
+                .call(&fleet_grants_path(0), &access, Some(&request))
+                .await
+                .0,
+            201
+        );
+    }
+    for (key, variant, replay, c) in [
+        (0xb4, V::DeviceHpke, 0xd0, &device0),
+        (0xb5, V::Recovery, 0xd1, &recovery0),
+    ] {
+        let grant = fleet_grant_ref(0, fkek0, variant, replay, c);
+        let request = lifecycle_request(
+            OperationKind::FleetGrantAck,
+            key,
+            FleetKeyGrantAckV2 { grant }.encode(),
+        );
+        assert_eq!(
+            server
+                .call(&format!("{path}/0/ack"), &access, Some(&request))
+                .await
+                .0,
+            201
+        );
+    }
+    let request = lifecycle_request(
+        OperationKind::FleetGenerationActivate,
+        0xb3,
+        FleetKeyGenerationActivateV2 { terms: terms0 }.encode(),
+    );
+    assert_eq!(
+        server
+            .call(&format!("{path}/0/activate"), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    (a, access, device0)
+}
+
+/// [`fleet_at_0`] with a rotation to generation 1 (key `[0xe1; 32]`) left
+/// PREPARING after its three grants were filed.
+async fn stuck_fleet(server: &mut Server, seed: u8) -> (Device, String, Rotation, Vec<u8>) {
+    let (a, access, device0) = fleet_at_0(server, seed).await;
+    let stuck = rotation_to_1(&a, [0xe1; 32], 0xd5);
+    stuck.create_and_file(server, &access, 0xc0).await;
+    (a, access, stuck, device0)
+}
+
+const FLEET_DISCARD: [&str; 6] = [
+    "fleet",
+    "discard-preparing",
+    "--tenant",
+    "acme",
+    "--generation",
+    "1",
+];
+
+fn out_text(out: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Runs `statement` against the server's database; the error text if refused.
+async fn try_sql(server: &Server, statement: &str) -> Result<(), String> {
+    let pool = db(&server.data).await;
+    let done = sqlx::query(statement)
+        .execute(&pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    pool.close().await;
+    done
+}
+
+/// The row counts a discard changes.
+async fn discard_rows(server: &Server) -> Vec<i64> {
+    let mut counts = Vec::new();
+    for table in [
+        "v2_root_key_generations",
+        "v2_tenant_root_key_grants",
+        "v2_fleet_key_generations",
+        "v2_fleet_device_hpke_grants",
+        "v2_fleet_recovery_grants",
+        "v2_fleet_rotation_grants",
+        "v2_grant_quarantine",
+        "v2_discarded_records",
+        "v2_offline_discard",
+        "v2_audit_events",
+    ] {
+        counts.push(server.count(&format!("SELECT count(*) FROM {table}")).await);
+    }
+    counts
+}
+
+#[tokio::test]
+async fn discard_preparing_archives_a_stuck_fleet_generation_and_frees_its_number() {
+    let mut server = start("v211-discard-fleet", 28247).await;
+    let (a, access, stuck, _) = stuck_fleet(&mut server, 0x6a).await;
+    // A mark the startup pass filed for one of its grants goes with it.
+    server
+        .sql(
+            "INSERT INTO v2_grant_quarantine
+                 (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+             VALUES ('fleet_recovery_grant', ?, ?, ?, 'container_mismatch', 't')",
+            &[&INSTANCE, &TENANT, &[0xd6; 16]],
+        )
+        .await;
+    // Stuck: no second generation 1 can be created.
+    let again = rotation_to_1(&a, [0xe2; 32], 0x35);
+    let create = shared::fleet_lifecycle::FleetKeyGenerationCreateV2 {
+        terms: again.terms,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0x3f, create.encode());
+    let (status, body) = server
+        .call(&fleet_generation_path(), &access, Some(&request))
+        .await;
+    assert_eq!(
+        (status, code_of(&body).as_str()),
+        (409, "FLEET_GENERATION_EXISTS")
+    );
+
+    // Inside the rotation grant's window a launcher may still finish it.
+    let before = discard_rows(&server).await;
+    let out = server.offline(&FLEET_DISCARD, "").await;
+    let (_, err) = out_text(&out);
+    assert!(!out.status.success());
+    assert!(err.contains("grant window is open"), "{err}");
+    assert_eq!(discard_rows(&server).await, before);
+
+    let out = server
+        .offline(&[&FLEET_DISCARD[..], &["--force"]].concat(), "")
+        .await;
+    let (text, err) = out_text(&out);
+    assert!(out.status.success(), "{text} {err}");
+    assert!(text.contains("discarded=fleet generation=1"), "{text}");
+    assert!(
+        text.contains(&format!("key_id_prefix={}", &hex(&stuck.fkek)[..16])),
+        "{text}"
+    );
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_fleet_key_generations WHERE generation = 1",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE generation = 1",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_recovery_grants WHERE generation = 1",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_rotation_grants WHERE generation = 1",
+            0,
+        ),
+        ("SELECT count(*) FROM v2_grant_quarantine", 0),
+        // Generation 0 and its grants are untouched.
+        (
+            "SELECT count(*) FROM v2_fleet_key_generations
+              WHERE generation = 0 AND state = 'ACTIVE'",
+            1,
+        ),
+        (
+            "SELECT (SELECT count(*) FROM v2_fleet_device_hpke_grants WHERE generation = 0)
+                  + (SELECT count(*) FROM v2_fleet_recovery_grants WHERE generation = 0)",
+            2,
+        ),
+        // Every removed row is archived, and the marker is gone.
+        (
+            "SELECT count(*) FROM v2_discarded_records WHERE kind = 'fleet' AND generation = 1",
+            5,
+        ),
+        (
+            "SELECT count(DISTINCT source_table) FROM v2_discarded_records",
+            5,
+        ),
+        ("SELECT count(*) FROM v2_offline_discard", 0),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+
+    // The number is free: generation 1 again, under a new key, activates.
+    again.create_and_file(&server, &access, 0x40).await;
+    again.ack_and_activate(&server, &access, 0x50).await;
+    for (query, want) in [
+        (
+            format!(
+                "SELECT count(*) FROM v2_fleet_key_generations
+                  WHERE generation = 1 AND state = 'ACTIVE' AND fkek_key_id = x'{}'",
+                hex(&again.fkek)
+            ),
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_key_generations
+              WHERE generation = 0 AND state = 'RETIRED'"
+                .into(),
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(&query).await, want, "{query}");
+    }
+}
+
+/// Files root generation 1 of `trk` as a rotation of root 0 with `a`'s own
+/// `RotationGrant` (replay `grant`) as the required set, acknowledges it,
+/// and rewraps fleet generation 0's key under it (replay `wrap`); keys from
+/// `key` to `key + 4`. Returns the terms.
+async fn root_rotation_to_1(
+    server: &Server,
+    a: &Device,
+    access: &str,
+    trk: [u8; 32],
+    key: u8,
+    grant: u8,
+    wrap: u8,
+) -> RootGenerationTarget {
+    use shared::authz_record::{RecoveryGrantV2, DOMAIN_FLEET_KEY_GRANT_RECOVERY};
+    use shared::fleet_lifecycle::{FleetGrantVariant as V, FleetKeyGrantAckV2};
+    let k0 = shared::keys::root_key_id(&TRK);
+    let after0 = RootGrantVariant::RotationGrant {
+        previous_root_key_id: k0,
+        previous_root_generation: 0,
+    };
+    let gen0 = PreviousRoot {
+        root_key_id: k0,
+        root_generation: 0,
+    };
+    let rotation = root_grant_of(a, a, APPROVAL_REPLAY, grant, &trk, 1, after0);
+    let target = rotation_target(&trk, 1, &[rotation.as_slice()]);
+    let (status, body) = server
+        .root(&TENANT, access, &rotation_create(key, target.clone(), gen0))
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    let grants1 = format!("/v2/tenants/{}/root-key-generations/1/grants", hex(&TENANT));
+    let request = root_grant_create_request(key + 1, a, &rotation);
+    assert_eq!(server.call(&grants1, access, Some(&request)).await.0, 201);
+    let request = ack_request(key + 2, grant_ref(a, &rotation));
+    let ack_path = format!("{}/ack", grant_path("1", &[grant; 16]));
+    assert_eq!(server.call(&ack_path, access, Some(&request)).await.0, 201);
+    let rewrap = RecoveryGrantV2 {
+        common: fleet_common(wrap, 3650),
+        fleet_id: FLEET,
+        fkek_key_id: [0xe0; 32],
+        generation: 0,
+        recipient_root_key_id: shared::keys::root_key_id(&trk),
+        recipient_root_generation: 1,
+        root_wrap_nonce_bytes: [5; 12],
+        wrapped_fleet_key_bytes: [6; 48],
+    };
+    let rewrap = build_record(&a.sk, DOMAIN_FLEET_KEY_GRANT_RECOVERY, &rewrap.encode());
+    let request = fleet_grant_request(key + 3, 0, [0xe0; 32], V::Recovery, wrap, &rewrap);
+    assert_eq!(
+        server
+            .call(&fleet_grants_path(0), access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let grant = fleet_grant_ref(0, [0xe0; 32], V::Recovery, wrap, &rewrap);
+    let request = lifecycle_request(
+        OperationKind::FleetGrantAck,
+        key + 4,
+        FleetKeyGrantAckV2 { grant }.encode(),
+    );
+    let ack0 = format!("{}/0/ack", fleet_generation_path());
+    assert_eq!(server.call(&ack0, access, Some(&request)).await.0, 201);
+    target
+}
+
+#[tokio::test]
+async fn discard_preparing_archives_a_stuck_root_rotation_and_frees_its_number() {
+    let mut server = start("v211-discard-root", 28248).await;
+    let (a, access, _) = fleet_at_0(&mut server, 0x6a).await;
+    let trk1 = [0x7d; 32];
+    root_rotation_to_1(&server, &a, &access, trk1, 0xd8, 0xe1, 0xf1).await;
+    // Marks the startup pass filed for the root grant of 1 and for the
+    // rewrap under it go with them.
+    for (kind, replay) in [("root_grant", 0xe1), ("fleet_recovery_grant", 0xf1)] {
+        server
+            .sql(
+                &format!(
+                    "INSERT INTO v2_grant_quarantine
+                         (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+                     VALUES ('{kind}', ?, ?, ?, 'container_mismatch', 't')"
+                ),
+                &[&INSTANCE, &TENANT, &[replay; 16]],
+            )
+            .await;
+    }
+
+    let out = server
+        .offline(
+            &[
+                "root",
+                "discard-preparing",
+                "--tenant",
+                "acme",
+                "--generation",
+                "1",
+            ],
+            "",
+        )
+        .await;
+    let (text, err) = out_text(&out);
+    assert!(out.status.success(), "{text} {err}");
+    assert!(text.contains("discarded=root generation=1"), "{text}");
+    let k1 = shared::keys::root_key_id(&trk1);
+    assert!(
+        text.contains(&format!("key_id_prefix={}", &hex(&k1)[..16])),
+        "{text}"
+    );
+    for (query, want) in [
+        (
+            "SELECT count(*) FROM v2_root_key_generations WHERE generation = 1",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_tenant_root_key_grants WHERE root_generation = 1",
+            0,
+        ),
+        // The rewrap under root 1 goes; generation 0's own under root 0 stays.
+        (
+            "SELECT count(*) FROM v2_fleet_recovery_grants WHERE recipient_root_generation = 1",
+            0,
+        ),
+        (
+            "SELECT count(*) FROM v2_fleet_recovery_grants WHERE recipient_root_generation = 0",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_root_key_generations
+              WHERE generation = 0 AND state = 'ACTIVE'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM v2_discarded_records WHERE kind = 'root' AND generation = 1",
+            5,
+        ),
+        (
+            "SELECT count(*) FROM v2_discarded_records
+              WHERE source_table = 'v2_grant_quarantine'
+                AND json_extract(row_json, '$.kind') IN ('root_grant', 'fleet_recovery_grant')",
+            2,
+        ),
+        ("SELECT count(*) FROM v2_grant_quarantine", 0),
+        ("SELECT count(*) FROM v2_offline_discard", 0),
+        (
+            "SELECT count(*) FROM v2_audit_events
+              WHERE action = 'root.generation_discarded'
+                AND reason_code = 'offline_operator_cli'",
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(query).await, want, "{query}");
+    }
+
+    // The number is free: root 1 again, under a new key, activates.
+    let trk1b = [0x7e; 32];
+    let target = root_rotation_to_1(&server, &a, &access, trk1b, 0x20, 0xe5, 0xf5).await;
+    let gen0 = PreviousRoot {
+        root_key_id: shared::keys::root_key_id(&TRK),
+        root_generation: 0,
+    };
+    let (status, body) = server
+        .call(
+            &activate_path("1"),
+            &access,
+            Some(&rotation_activate(0x26, target, gen0)),
+        )
+        .await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_root_key_generations
+                  WHERE generation = 1 AND state = 'ACTIVE' AND root_key_id = x'{}'",
+                hex(&shared::keys::root_key_id(&trk1b))
+            ))
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn discard_preparing_waits_for_a_rotation_that_filed_no_rotation_grant_yet() {
+    let mut server = start("v211-discard-no-grant", 28255).await;
+    let (a, access, _) = fleet_at_0(&mut server, 0x6a).await;
+    // Generation 1 is created, but its launcher has filed nothing yet.
+    let stuck = rotation_to_1(&a, [0xe1; 32], 0xd5);
+    let create = shared::fleet_lifecycle::FleetKeyGenerationCreateV2 {
+        terms: stuck.terms,
+        root_generation: 0,
+    };
+    let request = lifecycle_request(OperationKind::FleetGenerationCreate, 0xc0, create.encode());
+    assert_eq!(
+        server
+            .call(&fleet_generation_path(), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let before = discard_rows(&server).await;
+    let out = server.offline(&FLEET_DISCARD, "").await;
+    let (_, err) = out_text(&out);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("grant window is open (no rotation grant is filed yet)"),
+        "{err}"
+    );
+    assert_eq!(discard_rows(&server).await, before);
+    let out = server
+        .offline(&[&FLEET_DISCARD[..], &["--force"]].concat(), "")
+        .await;
+    assert!(out.status.success(), "{:?}", out_text(&out));
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_discarded_records WHERE kind = 'fleet'")
+            .await,
+        1
+    );
+}
+
+fn discard_args<'a>(kind: &'a str, generation: &'a str, force: bool) -> Vec<&'a str> {
+    let mut args = vec![
+        kind,
+        "discard-preparing",
+        "--tenant",
+        "acme",
+        "--generation",
+        generation,
+    ];
+    if force {
+        args.push("--force");
+    }
+    args
+}
+
+#[tokio::test]
+async fn discard_preparing_refuses_an_active_or_retired_generation() {
+    let mut server = start("v211-discard-active", 28249).await;
+    let (_, access, stuck, _) = stuck_fleet(&mut server, 0x6a).await;
+    let before = discard_rows(&server).await;
+    for (args, why) in [
+        (discard_args("fleet", "0", true), "is ACTIVE, not PREPARING"),
+        (discard_args("root", "0", false), "is ACTIVE, not PREPARING"),
+    ] {
+        let out = server.offline(&args, "").await;
+        let (_, err) = out_text(&out);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+    assert_eq!(discard_rows(&server).await, before);
+    stuck.ack_and_activate(&server, &access, 0xc4).await;
+    let before = discard_rows(&server).await;
+    for (args, why) in [
+        (
+            discard_args("fleet", "0", true),
+            "is RETIRED, not PREPARING",
+        ),
+        (discard_args("fleet", "1", true), "is ACTIVE, not PREPARING"),
+    ] {
+        let out = server.offline(&args, "").await;
+        let (_, err) = out_text(&out);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+    assert_eq!(discard_rows(&server).await, before);
+}
+
+#[tokio::test]
+async fn discard_preparing_refuses_a_generation_that_is_not_active_plus_one() {
+    let mut server = start("v211-discard-gap", 28250).await;
+    stuck_fleet(&mut server, 0x6a).await;
+    // PREPARING rows above the next number, as no route makes them.
+    server
+        .sql(
+            "INSERT INTO v2_fleet_key_generations (
+                 server_instance_id, tenant_id, fleet_id, generation, fkek_key_id,
+                 root_generation, state, created_at, required_device_grant_count,
+                 required_grant_set_hash, recovery_grant_hash, previous_fkek_key_id,
+                 rotation_grant_hash)
+             VALUES (?, ?, ?, 3, ?, 0, 'PREPARING', 't', 1, zeroblob(32), zeroblob(32),
+                     ?, zeroblob(32))",
+            &[&INSTANCE, &TENANT, &FLEET, &[0xe3; 32], &[0xe2; 32]],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_root_key_generations (
+                 server_instance_id, tenant_id, generation, root_key_id, state, created_at,
+                 required_custodian_grant_count, required_custodian_grant_set_hash,
+                 recovery_bundle_sha256)
+             VALUES (?, ?, 2, ?, 'PREPARING', 't', 1, zeroblob(32), zeroblob(32))",
+            &[&INSTANCE, &TENANT, &[0x3d; 32]],
+        )
+        .await;
+    let before = discard_rows(&server).await;
+    for (args, why) in [
+        (
+            discard_args("fleet", "2", true),
+            "no fleet key generation 2",
+        ),
+        (
+            discard_args("fleet", "3", true),
+            "not the ACTIVE generation + 1",
+        ),
+        (discard_args("root", "1", false), "no root key generation 1"),
+        (
+            discard_args("root", "2", false),
+            "not the ACTIVE generation + 1",
+        ),
+    ] {
+        let out = server.offline(&args, "").await;
+        let (_, err) = out_text(&out);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+    assert_eq!(discard_rows(&server).await, before);
+}
+
+#[tokio::test]
+async fn discard_writes_an_audit_row_and_prints_no_wrapped_key() {
+    let mut server = start("v211-discard-audit", 28251).await;
+    let (_, _, stuck, _) = stuck_fleet(&mut server, 0x6a).await;
+    let out = server
+        .offline(&[&FLEET_DISCARD[..], &["--force"]].concat(), "")
+        .await;
+    let (text, err) = out_text(&out);
+    assert!(out.status.success(), "{text} {err}");
+    let printed = format!("{text}{err}").to_ascii_lowercase();
+    for secret in [
+        hex(&[4; 48]),
+        hex(&[6; 48]),
+        hex(&[3; 32]),
+        hex(&stuck.device),
+        hex(&stuck.recovery),
+        hex(&stuck.rotation),
+    ] {
+        assert!(!printed.contains(&secret), "printed {secret}");
+    }
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_audit_events
+                  WHERE action = 'fleet.generation_discarded'
+                    AND target_type = 'fleet_key_generation' AND target_id = x'{}'
+                    AND outcome = 'success' AND reason_code = 'offline_operator_cli'
+                    AND actor_account_id IS NULL AND actor_device_id IS NULL",
+                hex(&stuck.fkek)
+            ))
+            .await,
+        1
+    );
+    // The archive keeps the rows whole, wrapped key included.
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_discarded_records
+                  WHERE source_table = 'v2_fleet_device_hpke_grants'
+                    AND lower(json_extract(row_json, '$.hpke_wrapped_fleet_key_bytes')) = '{}'",
+                hex(&[4; 48])
+            ))
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn trust_evidence_no_longer_serves_a_discarded_generations_grants() {
+    let mut server = start("v211-discard-evidence", 28252).await;
+    let (_, access, stuck, device0) = stuck_fleet(&mut server, 0x6a).await;
+    let served = containers(&evidence(&server, &access, &[]).await);
+    for c in [&stuck.device, &stuck.recovery, &stuck.rotation, &device0] {
+        assert!(served.contains(c));
+    }
+    let out = server
+        .offline(&[&FLEET_DISCARD[..], &["--force"]].concat(), "")
+        .await;
+    assert!(out.status.success(), "{:?}", out_text(&out));
+    let served = containers(&evidence(&server, &access, &[]).await);
+    for c in [&stuck.device, &stuck.recovery, &stuck.rotation] {
+        assert!(!served.contains(c));
+    }
+    assert!(served.contains(&device0));
+}
+
+#[tokio::test]
+async fn the_live_server_still_never_deletes_a_generation_or_grant() {
+    let mut server = start("v211-no-delete", 28253).await;
+    stuck_fleet(&mut server, 0x6a).await;
+    server
+        .sql(
+            "INSERT INTO v2_grant_quarantine
+                 (kind, server_instance_id, tenant_id, replay_id, reason, created_at)
+             VALUES ('fleet_rotation_grant', ?, ?, ?, 'container_mismatch', 't')",
+            &[&INSTANCE, &TENANT, &[0xd7; 16]],
+        )
+        .await;
+    server
+        .sql(
+            "INSERT INTO v2_discarded_records
+                 (tenant_id, kind, generation, source_table, row_json, discarded_at)
+             VALUES (?, 'fleet', 9, 't', '{}', 't')",
+            &[&TENANT],
+        )
+        .await;
+    let statements = [
+        (
+            "DELETE FROM v2_fleet_key_generations WHERE generation = 1",
+            "a fleet key generation is never deleted",
+        ),
+        (
+            "DELETE FROM v2_fleet_device_hpke_grants WHERE generation = 1",
+            "a fleet device grant is never deleted",
+        ),
+        (
+            "DELETE FROM v2_fleet_recovery_grants WHERE generation = 1",
+            "a fleet recovery grant is never deleted",
+        ),
+        (
+            "DELETE FROM v2_fleet_rotation_grants WHERE generation = 1",
+            "a fleet rotation grant is never deleted",
+        ),
+        (
+            "DELETE FROM v2_tenant_root_key_grants",
+            "a root key grant is never deleted",
+        ),
+        ("DELETE FROM v2_root_key_generations", "root key generation"),
+        (
+            "DELETE FROM v2_grant_quarantine",
+            "a grant quarantine is never removed",
+        ),
+        (
+            "DELETE FROM v2_discarded_records",
+            "a discarded record is never removed",
+        ),
+        (
+            "UPDATE v2_discarded_records SET row_json = '[]'",
+            "a discarded record never changes",
+        ),
+    ];
+    for (statement, why) in statements {
+        let e = try_sql(&server, statement).await.unwrap_err();
+        assert!(e.contains(why), "{statement}: {e}");
+    }
+    // A marker opens only its own tenant, kind and generation.
+    for (tenant, kind, generation) in [
+        (TENANT2, "fleet", 1),
+        (TENANT, "fleet", 5),
+        (TENANT, "root", 1),
+    ] {
+        server
+            .sql(
+                &format!(
+                    "INSERT INTO v2_offline_discard (tenant_id, kind, generation)
+                     VALUES (?, '{kind}', {generation})"
+                ),
+                &[&tenant],
+            )
+            .await;
+    }
+    for (statement, why) in statements {
+        let e = try_sql(&server, statement).await.unwrap_err();
+        assert!(e.contains(why), "{statement}: {e}");
+    }
+}
+
+#[tokio::test]
+async fn a_non_preparing_generation_row_is_never_deleted_even_under_the_marker() {
+    let mut server = start("v211-marker-active", 28254).await;
+    stuck_fleet(&mut server, 0x6a).await;
+    server
+        .sql(
+            "INSERT INTO v2_offline_discard (tenant_id, kind, generation)
+             VALUES (?, 'fleet', 0), (?, 'root', 0), (?, 'fleet', 1)",
+            &[&TENANT, &TENANT, &TENANT],
+        )
+        .await;
+    for (statement, why) in [
+        (
+            "DELETE FROM v2_fleet_key_generations WHERE generation = 0",
+            "only a PREPARING fleet key generation is discarded",
+        ),
+        (
+            "DELETE FROM v2_root_key_generations WHERE generation = 0",
+            "only a PREPARING root key generation is discarded",
+        ),
+    ] {
+        let e = try_sql(&server, statement).await.unwrap_err();
+        assert!(e.contains(why), "{statement}: {e}");
+    }
+    // Under its own marker the PREPARING generation goes, grants first.
+    for table in [
+        "v2_fleet_device_hpke_grants",
+        "v2_fleet_recovery_grants",
+        "v2_fleet_rotation_grants",
+        "v2_fleet_key_generations",
+    ] {
+        try_sql(
+            &server,
+            &format!("DELETE FROM {table} WHERE generation = 1"),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_fleet_key_generations")
+            .await,
+        1
+    );
+}
+
+#[test]
+fn no_route_names_the_offline_discard_marker() {
+    let routes = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("routes");
+    for entry in std::fs::read_dir(routes).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("v2_offline_discard"),
+            "{} names the marker",
+            path.display()
+        );
+    }
+}
+
+// ------------------------- v2.11: renewal of an active device (Q-61, D3) ---
+
+#[tokio::test]
+async fn a_custodian_renews_an_active_members_approval() {
+    let mut server = start("v211-renew-member", 28240).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xc2; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let member = device(&server, OWNER, 0x5b, "active").await;
+    file_approval(&server, &dev, &member, 0x5c).await;
+
+    let renewal = approval(&member, &dev.sk, 0x5d, 0, 730);
+    let (status, _, receipt) = server.approve(&member.id, &access, &renewal).await;
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&receipt));
+    let parsed = DeviceApprovalReceiptV2::parse(&receipt).unwrap();
+    assert_eq!(
+        (
+            parsed.subject_device_id,
+            parsed.actor_device_id,
+            parsed.approval_replay_id
+        ),
+        (member.id, dev.id, [0x5d; 16])
+    );
+    // A retry gets the stored receipt; the device stays active, with both
+    // approvals kept.
+    let (status, _, again) = server.approve(&member.id, &access, &renewal).await;
+    assert_eq!((status, again), (201, receipt));
+    for (query, want) in [
+        (
+            format!(
+                "SELECT count(*) FROM v2_device_approvals WHERE subject_device_id = x'{}'",
+                hex(&member.id)
+            ),
+            2,
+        ),
+        (
+            format!(
+                "SELECT count(*) FROM v2_devices WHERE id = x'{}' AND status = 'active'",
+                hex(&member.id)
+            ),
+            1,
+        ),
+    ] {
+        assert_eq!(server.count(&query).await, want, "{query}");
+    }
+    // Past the server's limit it is refused, as for any approval.
+    let long = approval(&member, &dev.sk, 0x5e, 0, 731);
+    assert_eq!(server.approve(&member.id, &access, &long).await.0, 403);
+}
+
+#[tokio::test]
+async fn a_device_without_device_approve_cannot_renew_another_device() {
+    let mut server = start("v211-renew-no-duty", 28241).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    let member = device(&server, OWNER, 0x5b, "active").await;
+    file_approval(&server, &dev, &member, 0x5c).await;
+    let other = device(&server, OWNER, 0x5d, "active").await;
+    file_approval(&server, &dev, &other, 0x5e).await;
+
+    // The custodian without `device.approve`.
+    let renewal = approval(&member, &dev.sk, 0x60, 0, 30);
+    assert_eq!(server.approve(&member.id, &access, &renewal).await.0, 403);
+    // A member, whose session is ordinary, for another member.
+    let member_access = session(&server, &member).await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let renewal = approval(&other, &member.sk, 0x61, 0, 30);
+    assert_eq!(
+        server.approve(&other.id, &member_access, &renewal).await.0,
+        403
+    );
+    assert_eq!(
+        server
+            .count("SELECT count(*) FROM v2_audit_events WHERE action = 'device.approve'")
+            .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_device_is_never_approved_again() {
+    let mut server = start("v211-renew-revoked", 28242).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    for (replay, capability) in [
+        (0xc2, Capability::DeviceApprove),
+        (0xa8, Capability::DeviceRevoke),
+    ] {
+        let grant = capability_grant(&dev, &dev.sk, |g| {
+            g.common.replay_id = [replay; 16];
+            g.capability = capability;
+        });
+        assert_eq!(server.call(GRANTS, &access, Some(&grant)).await.0, 201);
+    }
+    let member = device(&server, OWNER, 0x5b, "active").await;
+    file_approval(&server, &dev, &member, 0x5c).await;
+    let request = revoke_request(0xa6, &revocation(&dev.sk, &member, 0x90, 29));
+    assert_eq!(
+        server
+            .call(&device_revoke_path(&member.id), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    let renewal = approval(&member, &dev.sk, 0x5d, 0, 30);
+    assert_eq!(server.approve(&member.id, &access, &renewal).await.0, 403);
+    assert_eq!(
+        server
+            .count(&format!(
+                "SELECT count(*) FROM v2_device_approvals WHERE replay_id = x'{}'",
+                hex(&[0x5d; 16])
+            ))
+            .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_lapsed_members_renewed_approval_opens_a_session_again() {
+    let mut server = start("v211-renew-lapsed", 28243).await;
+    let (dev, access, _) = custodian(&mut server, 0x6d).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| g.common.replay_id = [0xc2; 16]);
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let member = device(&server, OWNER, 0x5b, "active").await;
+    let now = now_ms();
+    file_approval_window(
+        &server,
+        &dev,
+        &member,
+        0x5c,
+        (ApprovalScopeKind::Tenant, TENANT),
+        now - 40 * DAY_MS,
+        now - 10 * DAY_MS,
+    )
+    .await;
+    let ticket = server.login("owner").await;
+    let (status, body) = challenge(&server, &ticket, &member).await;
+    assert_ne!(status, 201, "a lapsed approval opens no session: {body}");
+
+    let renewal = approval(&member, &dev.sk, 0x5d, 0, 730);
+    assert_eq!(server.approve(&member.id, &access, &renewal).await.0, 201);
+    let s = session(&server, &member).await;
+    assert_eq!(s["class"], "ordinary");
+}
+
+// ------------------ v2.11: a revoked device sees its revocation (Q-63, D4) ---
+
+/// The ticket listing's entry for `device`.
+async fn listed(server: &Server, device: &[u8; 16]) -> Value {
+    let ticket = server.login("owner").await;
+    let (status, me) = server.me(ticket["ticket"].as_str().unwrap()).await;
+    assert_eq!(status, 200, "{me}");
+    me["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["device_id"] == json!(hex(device)))
+        .cloned()
+        .expect("the device is listed")
+}
+
+/// A custodian holding `device.revoke` that revoked a pending device;
+/// returns the custodian, the device and the revocation.
+async fn revoked(server: &mut Server) -> (Device, Device, Vec<u8>) {
+    let (dev, access, _) = custodian(server, 0x6c).await;
+    let duty = capability_grant(&dev, &dev.sk, |g| {
+        g.common.replay_id = [0xa8; 16];
+        g.capability = Capability::DeviceRevoke;
+    });
+    assert_eq!(server.call(GRANTS, &access, Some(&duty)).await.0, 201);
+    let subject = device(server, OWNER, 0x7b, "pending").await;
+    let container = revocation(&dev.sk, &subject, 0x90, 29);
+    let request = revoke_request(0xa6, &container);
+    assert_eq!(
+        server
+            .call(&device_revoke_path(&subject.id), &access, Some(&request))
+            .await
+            .0,
+        201
+    );
+    (dev, subject, container)
+}
+
+#[tokio::test]
+async fn the_ticket_listing_carries_a_revoked_devices_signed_revocation() {
+    let mut server = start("v211-me-revocation", 28244).await;
+    let (dev, subject, container) = revoked(&mut server).await;
+    let entry = listed(&server, &subject.id).await;
+    assert_eq!(entry["status"], "revoked");
+    assert_eq!(entry["revocation"], json!(hex(&container)), "{entry}");
+    let issuer = dev.sk.verifying_key().to_bytes();
+    assert_eq!(entry["revocation_issuer_public_key"], json!(hex(&issuer)));
+    // The device checks it itself, under the key it was given.
+    let exact = unhex(entry["revocation"].as_str().unwrap());
+    let verified = AuthorizationRecord::parse(&exact)
+        .unwrap()
+        .verify_signature(&issuer)
+        .unwrap();
+    let Payload::DeviceRevocation(r) = verified.payload() else {
+        panic!("a device revocation")
+    };
+    assert_eq!(
+        (r.subject_device_id, r.subject_signing_key_id),
+        (subject.id, subject.signing_key_id)
+    );
+}
+
+#[tokio::test]
+async fn an_active_or_pending_device_has_no_revocation_field() {
+    let mut server = start("v211-me-no-revocation", 28245).await;
+    let (dev, _, _) = custodian(&mut server, 0x6c).await;
+    let pending = device(&server, OWNER, 0x7b, "pending").await;
+    for (id, status) in [(dev.id, "active"), (pending.id, "pending")] {
+        let entry = listed(&server, &id).await;
+        assert_eq!(entry["status"], status);
+        let fields = entry.as_object().unwrap();
+        assert!(
+            !fields.contains_key("revocation")
+                && !fields.contains_key("revocation_issuer_public_key"),
+            "{entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_quarantined_revocation_leaves_the_ticket_listing_readable() {
+    let mut server = start("v211-me-quarantined", 28246).await;
+    let (_, subject, container) = revoked(&mut server).await;
+    let pool = matrix_pool(&server, "v2_device_revocations").await;
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'lost'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let entry = listed(&server, &subject.id).await;
+    assert_eq!(entry["status"], "revoked");
+    assert!(entry.get("revocation").is_none(), "{entry}");
+    assert!(entry.get("revocation_issuer_public_key").is_none());
+    // Put back, it is served again.
+    sqlx::query("UPDATE v2_device_revocations SET reason_code = 'compromised'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let entry = listed(&server, &subject.id).await;
+    assert_eq!(entry["revocation"], json!(hex(&container)));
 }

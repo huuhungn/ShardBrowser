@@ -44,7 +44,7 @@ pub fn parse_device_id(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-async fn verified_identity(cfg: &Config) -> Result<Verified> {
+pub(crate) async fn verified_identity(cfg: &Config) -> Result<Verified> {
     let mirror = identity::read_mirror_read_only(cfg).await?;
     identity::authority(cfg, mirror.as_ref()).map_err(|r| {
         anyhow::anyhow!(
@@ -55,7 +55,7 @@ async fn verified_identity(cfg: &Config) -> Result<Verified> {
     })
 }
 
-async fn tenant_id(conn: &mut SqliteConnection, slug: &str) -> Result<Vec<u8>> {
+pub(crate) async fn tenant_id(conn: &mut SqliteConnection, slug: &str) -> Result<Vec<u8>> {
     sqlx::query_scalar("SELECT id FROM v2_tenants WHERE slug = ?")
         .bind(slug)
         .fetch_optional(&mut *conn)

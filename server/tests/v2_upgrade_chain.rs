@@ -337,6 +337,13 @@ fn guard(version: i64) -> (String, String, &'static str) {
             "UPDATE v2_grant_quarantine SET created_at = 'u'".into(),
             "a grant quarantine never changes",
         ),
+        // An upgraded ACTIVE root generation stays even under a discard's
+        // marker: only a PREPARING one is ever discarded.
+        34 => (
+            format!("INSERT INTO v2_offline_discard VALUES ({T}, 'root', 0)"),
+            "DELETE FROM v2_root_key_generations".into(),
+            "only a PREPARING root key generation is discarded",
+        ),
         _ => unreachable!("no guard for {version}"),
     }
 }
@@ -1500,4 +1507,24 @@ async fn m0033_the_quarantine_gains_a_container_hash_and_stays_append_only() {
         .await
         .unwrap_err();
     assert!(e.contains("a grant quarantine is never removed"), "{e}");
+}
+
+#[tokio::test]
+async fn m0034_upgraded_generations_and_grants_are_deleted_only_by_an_offline_discard() {
+    let pool = upgrade(34).await;
+    // Without a marker nothing of the upgraded tenant goes.
+    exec(&pool, "DELETE FROM v2_offline_discard").await.unwrap();
+    for (statement, why) in [
+        (
+            "DELETE FROM v2_fleet_key_generations",
+            "fleet key generation",
+        ),
+        (
+            "DELETE FROM v2_tenant_root_key_grants",
+            "a root key grant is never deleted",
+        ),
+    ] {
+        let e = exec(&pool, statement).await.unwrap_err();
+        assert!(e.contains(why), "{statement}: {e}");
+    }
 }

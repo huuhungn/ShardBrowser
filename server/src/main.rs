@@ -6,6 +6,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod db;
+mod discard;
 mod error;
 mod extract;
 mod fleet;
