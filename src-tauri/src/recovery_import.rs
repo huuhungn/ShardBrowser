@@ -1017,6 +1017,79 @@ mod tests {
         }
     }
 
+    /// RR: once root 1 is ACTIVE, a bundle exported before the rotation
+    /// holds a grant of the RETIRED root 0 and reads as missing; the bundle
+    /// written during the rotation, with this device's `RotationGrant` of
+    /// root 1, passes once that grant is acknowledged under the ACTIVE root.
+    #[test]
+    fn an_old_root_generations_bundle_is_refused_after_the_rotation() {
+        use shardx_core::authz_record::{RootGrantVariant, TenantRootKeyGrantV2};
+        use shardx_core::keys::root_key_id;
+        let f = fixture();
+        let rt = runtime();
+        let (hpke_secret, pk) = derive_keypair(&HPKE_SEED);
+        let new_trk = [0x9f; 32];
+        let cx = Context16 {
+            tenant: TENANT,
+            instance: INSTANCE,
+            epoch: 0,
+            account: ACCOUNT,
+            device: DEVICE,
+            signing_key_id: signing_key_id(signer().verifying_key().as_bytes()),
+            hpke_key_id: hpke_key_id(&pk),
+        };
+        let rotation = TenantRootKeyGrantV2 {
+            common: cx.common([0x61; 16], now_ms()),
+            variant: RootGrantVariant::RotationGrant {
+                previous_root_key_id: root_key_id(&TRK),
+                previous_root_generation: 0,
+            },
+            root_key_id: root_key_id(&new_trk),
+            root_generation: 1,
+            subject_account_id: ACCOUNT,
+            subject_device_id: DEVICE,
+            subject_signing_key_id: cx.signing_key_id,
+            recipient_hpke_key_id: cx.hpke_key_id,
+            subject_device_approval_replay_id: [8; 16],
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let rotation =
+            crate::root_bootstrap::sealed_root_grant(&signer(), &pk, &new_trk, rotation).unwrap();
+        // The server after the rotation: root 0 RETIRED, root 1 ACTIVE.
+        let check = |container: &[u8], trk: &[u8; 32], generation: RootGenerationState| {
+            let record = AuthorizationRecord::parse(container)
+                .unwrap()
+                .verify_signature(signer().verifying_key().as_bytes())
+                .unwrap();
+            let descriptor =
+                TenantRootGrantDescriptorV2::new(record, RootGrantState::Acknowledged, generation)
+                    .unwrap()
+                    .encode();
+            let reply: Arc<Reply> = Arc::new(move |_, _| (200, descriptor.clone()));
+            let (client, _) = rt.block_on(mock(reply));
+            rt.block_on(check_root_grant(
+                &client,
+                "v2a.access",
+                &hex(&TENANT),
+                container,
+                &signer().verifying_key().to_bytes(),
+                &hpke_secret,
+                trk,
+            ))
+        };
+        let err = check(&f.self_grant, &TRK, RootGenerationState::Retired)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            crate::errcode::has_code(&err, "recovery.rootGrantMissing"),
+            "{err}"
+        );
+        assert!(check(&rotation, &new_trk, RootGenerationState::Active).is_ok());
+        // The old TRK does not open the new root's grant.
+        assert!(check(&rotation, &TRK, RootGenerationState::Active).is_err());
+    }
+
     #[test]
     fn an_unticked_confirmation_is_refused_before_the_bundle_is_read() {
         let f = fixture();

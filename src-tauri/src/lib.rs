@@ -30,6 +30,7 @@ mod launch;
 mod profile_icon;
 mod recovery_import;
 pub mod root_bootstrap;
+mod root_rotation;
 pub mod runner;
 pub mod traffic;
 
@@ -3156,6 +3157,19 @@ async fn team_fleet_key_rotate(
             }
             fleet_custody::rotation_collected(now, &mut state, save).map_err(error)?;
         }
+        // D8: a fleet key activated under the rotated root ends that prompt.
+        if let Some(grant) = state
+            .rotation
+            .as_ref()
+            .and_then(|r| fleet_client::decode_hex(&r.recovery_grant))
+        {
+            let issuer = signer.verifying_key().to_bytes();
+            let mut root = root_bootstrap::load().map_err(error)?;
+            root_rotation::fleet_rotated(&grant, &issuer, &mut root, &mut |s| {
+                root_bootstrap::save(s)
+            })
+            .map_err(error)?;
+        }
         // 11 and 12.
         let fkek = verified_fleet_key(&fleet_hex, &pin, &me, generation, now)
             .map_err(error)?
@@ -4059,6 +4073,92 @@ async fn team_renew_custody(
             )
         }
     })
+}
+
+/// Rotate root key (v2.11 sequence RR, ADR 0002 Q-59) as the tenant's root
+/// custodian, or resume the run: a new TRK, every retained fleet key wrapped
+/// under it, the recovery bundle written to `bundle_path` under `passphrase`
+/// and pinned before the create (a resumed run keeps the path it saved),
+/// then the activation. The fleet key rotation that follows is the next
+/// step. The password is used for one login and never stored.
+#[tauri::command]
+async fn team_rotate_root(
+    username: String,
+    password: String,
+    bundle_path: String,
+    passphrase: String,
+) -> Result<root_bootstrap::BootstrapStatus, String> {
+    let c = team_config::load().map_err(|e| e.to_string())?;
+    if !c.can_sync() {
+        return Err(crate::errcode::code("fleet.deviceNotEnrolled"));
+    }
+    if !c.can_receive_custody() {
+        return Err(crate::errcode::code("teamConfig.hpkeKeyUnusable"));
+    }
+    bootstrap_anchor(&c).ok_or_else(|| crate::errcode::code("fleet.notCustodian"))?;
+    handed_over()?;
+    let signer = c.signing_key().map_err(|e| e.to_string())?;
+    let seed = zeroize::Zeroizing::new(c.hpke_seed().map_err(|e| e.to_string())?);
+    let fleet_hex = sync_cmd::fleet_id(&c);
+    let local = fleet_keys::verified_keys(&fleet_hex).map_err(|e| e.to_string())?;
+    let newest = local.iter().map(|(g, _)| *g).max();
+    let _running = fleet_custody::begin().map_err(|e| e.to_string())?;
+    let (client, session) = open_session(&c, &username, &password).await?;
+    let access = session.access_token.as_str();
+    let result = async {
+        // RR step 1: the RotationGrant links a live own tenant approval.
+        renew_first(&client, &c, access).await?;
+        let error = |e: anyhow::Error| e.to_string();
+        let mut state = root_bootstrap::load().map_err(error)?;
+        let custody = fleet_custody::load().map_err(error)?;
+        let saved = state
+            .root_rotation
+            .as_ref()
+            .filter(|r| !r.done && !r.recovery_path.is_empty())
+            .map(|r| std::path::PathBuf::from(&r.recovery_path));
+        let recovery = root_bootstrap::RecoveryExport {
+            path: saved
+                .as_deref()
+                .unwrap_or(std::path::Path::new(&bundle_path)),
+            passphrase: &passphrase,
+        };
+        let me = root_bootstrap::RenewingDevice {
+            account_id: &c.account_id,
+            signer: &signer,
+            hpke_seed: &seed,
+        };
+        let rotated = root_rotation::rotate_root(
+            &client,
+            access,
+            &me,
+            &root_bootstrap::CredentialTrkStore,
+            &custody,
+            &local,
+            &recovery,
+            root_bootstrap::now_ms(),
+            &mut state,
+            &mut |s| root_bootstrap::save(s),
+        )
+        .await;
+        match &rotated {
+            Ok(()) => eprintln!("[root-rotation] done"),
+            Err(e) => eprintln!(
+                "[root-rotation] stopped {}",
+                recovery_import::error_code(&e.to_string())
+            ),
+        }
+        rotated.map_err(error)?;
+        // The new bundle holds every retained key and the current grant.
+        let grant = root_bootstrap::root_grant_sha256(&state);
+        if let Err(e) = newest.map_or(Ok(()), |n| fleet_custody::exported(n, &grant)) {
+            eprintln!("[recovery] export prompt: not cleared ({e:#})");
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    client.end_session(access).await;
+    result?;
+    root_bootstrap::status().map_err(|e| e.to_string())
 }
 
 /// Collect key custody's fleet step for a published sync the server refused
@@ -9131,6 +9231,7 @@ pub fn run() {
             team_fleet_key_rotate,
             team_reseal_all,
             team_renew_custody,
+            team_rotate_root,
             team_devices,
             team_approve_device,
             team_custody_accept,

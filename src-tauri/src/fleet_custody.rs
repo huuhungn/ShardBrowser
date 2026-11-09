@@ -1420,6 +1420,10 @@ pub async fn approve_member(
     if custodian_root.is_none() || !resumes_appointment(state, &id) {
         refuse_handed_over(state)?;
     }
+    // RR: an appointee's grant of the root a rotation retires would be lost.
+    if custodian_root.is_some_and(crate::root_rotation::unfinished) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
+    }
     if state
         .members
         .iter()
@@ -2207,7 +2211,7 @@ pub(crate) fn refused_with(e: &anyhow::Error, status: u16, code: Option<&str>) -
 /// Whether `e` is the server's refusal of the request itself: the custody
 /// marker with a 4xx status other than 401, 408 or 429, which a resend of
 /// the same bytes would not change.
-fn refused_for_good(e: &anyhow::Error) -> bool {
+pub(crate) fn refused_for_good(e: &anyhow::Error) -> bool {
     (400..500)
         .filter(|s| ![401, 408, 429].contains(s))
         .any(|s| refused_with(e, s, None))
@@ -2950,6 +2954,10 @@ pub async fn rotate_fleet(
     }
     let cx = custodian(device, state)?;
     refuse_handed_over(state)?;
+    // RR: the fleet key is wrapped under the root a root rotation activates.
+    if crate::root_rotation::unfinished(root) {
+        bail!(crate::errcode::code("fleet.rootRotationUnfinished"));
+    }
     // 4.H steps 2-3: a new root custodian rotates once Accept is done and a
     // v4 bundle was written after it.
     if let Some(h) = &state.handover {
@@ -6940,6 +6948,102 @@ pub(crate) mod tests {
         assert!(has(&err, "fleet.custodyServerChanged"), "{err}");
         assert_eq!(rig.calls(), ["GET /v2/server-identity"]);
         assert!(load().unwrap().rotation.is_none());
+    }
+
+    /// `f`'s root state after a root rotation (RR step 6): its own
+    /// `RotationGrant` of `trk` as root 1 is the current root grant.
+    fn root_rotated(f: &Fixture, trk: &[u8; 32]) -> BootstrapState {
+        use shardx_core::keys::root_key_id;
+        let (_, pk) = derive_keypair(&f.seed);
+        let g = TenantRootKeyGrantV2 {
+            common: f.cx.common(random().unwrap(), now_ms()),
+            variant: RootGrantVariant::RotationGrant {
+                previous_root_key_id: root_key_id(&TRK),
+                previous_root_generation: 0,
+            },
+            root_key_id: root_key_id(trk),
+            root_generation: 1,
+            subject_account_id: f.cx.account,
+            subject_device_id: f.cx.device,
+            subject_signing_key_id: f.cx.signing_key_id,
+            recipient_hpke_key_id: f.cx.hpke_key_id,
+            subject_device_approval_replay_id: [8; 16],
+            hpke_encapped_key_bytes: [0; 32],
+            hpke_wrapped_trk_bytes: [0; 48],
+        };
+        let grant = crate::root_bootstrap::sealed_root_grant(&f.signer, &pk, trk, g).unwrap();
+        BootstrapState {
+            root_grant: hex(&grant),
+            root_grant_issuer: hex(&f.signer.verifying_key().to_bytes()),
+            fleet_rotation_due_after_root: Some(1),
+            ..f.root.clone()
+        }
+    }
+
+    /// The rotation's saved recovery grant, signed by `f`'s key.
+    fn rotation_recovery_grant(f: &Fixture) -> RecoveryGrantV2 {
+        let container = unhex_vec(&rotation().recovery_grant).unwrap();
+        match AuthorizationRecord::parse(&container)
+            .unwrap()
+            .verify_signature(f.signer.verifying_key().as_bytes())
+            .unwrap()
+            .payload()
+        {
+            Payload::RecoveryGrant(g) => g.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const ROTATED_TRK: [u8; 32] = [0x4e; 32];
+
+    /// D8: the fleet rotation after a root rotation wraps the new fleet key
+    /// under the root generation the rotation activated.
+    #[test]
+    fn a_fleet_rotation_after_a_root_rotation_wraps_under_the_new_root() {
+        let mut f = fixture();
+        f.root = root_rotated(&f, &ROTATED_TRK);
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        let g = rotation_recovery_grant(&f);
+        assert_eq!(g.recipient_root_generation, 1);
+        assert_eq!(
+            g.recipient_root_key_id,
+            shardx_core::keys::root_key_id(&ROTATED_TRK)
+        );
+        let create = payload(
+            &rotation().create_request,
+            FleetKeyGenerationCreateV2::parse,
+        );
+        assert_eq!(create.root_generation, 1);
+    }
+
+    /// RR: no fleet rotation starts while a root rotation is unfinished.
+    #[test]
+    fn a_fleet_rotation_is_refused_while_a_root_rotation_is_unfinished() {
+        let mut f = fixture();
+        f.root.root_rotation = Some(crate::root_rotation::RootRotation {
+            generation: 1,
+            ..Default::default()
+        });
+        let mut rig = rig(&f, |_| {});
+        let err = rig.rotate(&f, rig.now).unwrap_err();
+        assert!(has(&err, "fleet.rootRotationUnfinished"), "{err}");
+        assert!(rig.calls().is_empty());
+        assert!(load().unwrap().rotation.is_none());
+    }
+
+    /// Known limitation, going forward: a fleet key activated after the root
+    /// rotation is out of reach of the old TRK.
+    #[test]
+    fn the_old_trk_cannot_open_a_fleet_key_activated_after_the_root_rotation() {
+        let mut f = fixture();
+        f.root = root_rotated(&f, &ROTATED_TRK);
+        let mut rig = rig(&f, |_| {});
+        rig.rotate(&f, rig.now).unwrap();
+        let g = rotation_recovery_grant(&f);
+        let key = rotation_key_held().expect("held until step 10");
+        assert!(g.open_fkek(&TRK).is_err());
+        assert_eq!(*g.open_fkek(&ROTATED_TRK).unwrap(), *key);
     }
 
     #[test]
