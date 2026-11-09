@@ -332,7 +332,7 @@
   "fleet.handoverNeedsReseal": "Re-seal all profiles first: every profile head must be under the current fleet key before another device can take over root custody.",
   "fleet.handoverPastRotation": "The new root custodian already rotated the fleet key, so the hand-over can no longer be cancelled.",
   "fleet.memberRenewalFailed": "Renewing the member devices' records failed ({code}). The next custody action or team sync tries again.",
-  "fleet.memberRenewalNeedsServerUpdate": "The team server is too old to renew member devices' approvals. Update the team server to 2.11, or members lose access when their approvals end.",
+  "fleet.memberRenewalNeedsServerUpdate": "The team server is too old to renew member devices' approvals. Update the team server to the latest version, or members lose access when their approvals end.",
   "fleet.resetNeedsSignedRevocation": "This root device can be reset only once the team server lists it revoked with a revocation signed by the device it trusts for that (the new root custodian, or the custodian that appointed it before this device rotated the fleet key). Update the team server to 2.11, or wait until the new custodian revokes this device.",
   "fleet.handoverIssuerNotCustodian": "The root grant the team server offers this device was not issued by a root custodian it can verify, or does not name this device's keys. Nothing was accepted.",
   "fleet.handoverNoGrant": "No root custodian has appointed this device yet. Ask the root custodian to approve it as root custodian, then try again.",

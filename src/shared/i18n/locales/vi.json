@@ -332,7 +332,7 @@
   "fleet.handoverNeedsReseal": "Hãy niêm phong lại mọi hồ sơ trước: phiên bản mới nhất của mọi hồ sơ phải dùng khoá nhóm hiện tại thì thiết bị khác mới nhận được quyền giữ khoá gốc.",
   "fleet.handoverPastRotation": "Thiết bị giữ khoá gốc mới đã xoay khoá nhóm, nên không thể huỷ việc chuyển giao nữa.",
   "fleet.memberRenewalFailed": "Gia hạn hồ sơ của các thiết bị thành viên không thành công ({code}). Lần thao tác giữ khoá hoặc đồng bộ nhóm tiếp theo sẽ thử lại.",
-  "fleet.memberRenewalNeedsServerUpdate": "Máy chủ nhóm quá cũ để gia hạn phê duyệt của các thiết bị thành viên. Hãy cập nhật máy chủ nhóm lên 2.11, nếu không thành viên sẽ mất quyền truy cập khi phê duyệt hết hạn.",
+  "fleet.memberRenewalNeedsServerUpdate": "Máy chủ nhóm quá cũ để gia hạn phê duyệt của các thiết bị thành viên. Hãy cập nhật máy chủ nhóm lên phiên bản mới nhất, nếu không thành viên sẽ mất quyền truy cập khi phê duyệt hết hạn.",
   "fleet.resetNeedsSignedRevocation": "Chỉ đặt lại được thiết bị gốc này khi máy chủ nhóm liệt kê nó đã bị thu hồi, kèm bản thu hồi được ký bởi thiết bị mà nó tin cho việc đó (thiết bị giữ khoá gốc mới, hoặc thiết bị đã chỉ định nó trước khi máy này xoay khoá nhóm). Hãy cập nhật máy chủ nhóm lên 2.11, hoặc chờ thiết bị giữ khoá mới thu hồi máy này.",
   "fleet.handoverIssuerNotCustodian": "Bản cấp khoá gốc mà máy chủ nhóm đưa cho thiết bị này không do một thiết bị giữ khoá gốc mà nó xác minh được cấp, hoặc không ghi đúng khoá của thiết bị này. Chưa nhận gì cả.",
   "fleet.handoverNoGrant": "Chưa có thiết bị giữ khoá gốc nào chỉ định thiết bị này. Hãy nhờ thiết bị giữ khoá gốc duyệt nó làm thiết bị giữ khoá gốc rồi thử lại.",
