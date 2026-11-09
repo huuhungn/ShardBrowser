@@ -4127,12 +4127,11 @@ fn root_custody_moves_to_a_new_device_and_the_team_keeps_every_profile_against_a
     revoke(&a_id).unwrap();
     let handover = crate::fleet_custody::load().unwrap().handover.unwrap();
     assert_eq!(handover.phase, "done");
+    // (v2.11: A may now reset on its signed revocation, which
+    // `the_revoked_old_root_resets_and_joins_again_against_a_real_server`
+    // covers; it stays as it is here.)
     h.act_as_a();
     call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap_err();
-    refused(
-        call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into())),
-        "fleet.enrollAgainRefused",
-    );
     refused(rotate(), "fleet.custodyHandedOver");
 
     // 9. M, offline since step 1, collects N + 1, pulls X, Y and W, and
@@ -4409,5 +4408,295 @@ fn the_operator_discards_a_stuck_fleet_rotation_and_the_custodian_rotates_again_
             pushed.version
         )),
         1
+    );
+}
+
+/// Enrolls the acting device as `label` and reads its join code.
+fn enroll_with_code(rt: &tokio::runtime::Runtime, label: &str) -> (String, crate::JoinCode) {
+    let id = call(
+        rt,
+        crate::team_enroll_device(label.into(), OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap()
+    .device_id;
+    let code = call(rt, crate::team_join_code(OWNER.into(), PASSWORD.into())).unwrap();
+    (id, code)
+}
+
+/// The acting custodian approves `id` showing `code`; then the device in
+/// `member` pins the anchor and collects.
+fn admit(rt: &tokio::runtime::Runtime, id: &str, code: &crate::JoinCode, member: impl Fn()) {
+    call(rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            id.into(),
+            code.sas.clone(),
+            None,
+        ),
+    )
+    .unwrap();
+    member();
+    call(
+        rt,
+        crate::team_join_confirm(
+            OWNER.into(),
+            PASSWORD.into(),
+            code.anchor.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+    call(
+        rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+}
+
+/// v2.11 S3 MR (ADR 0002 Q-61), port slot 1: member B is approved, and A
+/// set up, on a launcher clock 200 days behind, so B's approval, capability
+/// grants and grant of generation 0 are past half their life on the real
+/// clock; C is approved on the real clock, A renewing itself on the way
+/// while its member pass waits for its daily turn. A's Renew custody then
+/// renews B only: the server keeps B's second approval, three more
+/// capability grants and a second grant of generation 0; C gets nothing. B
+/// then collects and pushes.
+#[test]
+fn members_are_renewed_by_the_custodian_against_a_real_server() {
+    const DAY: u64 = 86_400_000;
+    let rt = runtime();
+    let back = |ms: u64| crate::root_bootstrap::tests::CLOCK_BACK_MS.with(|c| c.set(ms));
+    back(200 * DAY);
+    let Journey {
+        b,
+        h,
+        b_id,
+        b_profile,
+        profile_id,
+        ..
+    } = shared_profile_at(V211_PORT_BASE, 1, "v211-members", &rt);
+    back(0);
+    let (user, pass) = account();
+    // The member pass waits for its daily turn until Renew custody.
+    let mut custody = crate::fleet_custody::load().unwrap();
+    custody.member_renewal.checked_ms = crate::root_bootstrap::now_ms();
+    crate::fleet_custody::save(&custody).unwrap();
+
+    // C enrolls and is approved on the real clock.
+    let c = fresh_device("c", h.server.url(), h.tenant.clone());
+    let (c_id, code) = enroll_with_code(&rt, "fresh");
+    h.act_as_a();
+    admit(&rt, &c_id, &code, || {
+        act_as(c.config.path(), c.data.path(), "c")
+    });
+
+    let of = |table: &str, id: &str, extra: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM {table} WHERE lower(hex(subject_device_id)) = '{id}' {extra}"
+        ))
+    };
+    let grants = |id: &str| of("v2_fleet_device_hpke_grants", id, "AND generation = 0");
+    let before = [
+        of("v2_device_approvals", &b_id, ""),
+        of("v2_capability_grants", &b_id, ""),
+        grants(&b_id),
+        of("v2_device_approvals", &c_id, ""),
+        of("v2_capability_grants", &c_id, ""),
+        grants(&c_id),
+    ];
+    assert_eq!(before, [1, 3, 1, 1, 3, 1]);
+
+    // A renewed itself while approving C; Renew custody renews the due
+    // member B only.
+    h.act_as_a();
+    let outcome = call(
+        &rt,
+        crate::team_renew_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(outcome, crate::root_bootstrap::RenewalOutcome::NotDue);
+    assert!(crate::root_bootstrap::load().unwrap().renewal.unwrap().done);
+    let renewal = crate::fleet_custody::load().unwrap().member_renewal;
+    assert_eq!(renewal.outcomes[&b_id], "renewed", "{renewal:?}");
+    assert_eq!(renewal.outcomes[&c_id], "current", "{renewal:?}");
+    assert!(renewal.runs.is_empty());
+    let after = [
+        of("v2_device_approvals", &b_id, ""),
+        of("v2_capability_grants", &b_id, ""),
+        grants(&b_id),
+        of("v2_device_approvals", &c_id, ""),
+        of("v2_capability_grants", &c_id, ""),
+        grants(&c_id),
+    ];
+    assert_eq!(after, [2, 6, 2, 1, 3, 1]);
+    let now = crate::root_bootstrap::now_ms() as i64;
+    let newest = h.server.count(&format!(
+        "SELECT max(not_after_ms) FROM v2_device_approvals WHERE lower(hex(subject_device_id)) = '{b_id}'"
+    ));
+    assert!(newest > now + 700 * DAY as i64, "730 days from now");
+    // The Team page lists B's new approval end.
+    let rows = call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    let b_row = rows.iter().find(|r| r.device_id == b_id).unwrap();
+    assert!(b_row.approval_window_ms.unwrap().1 > now as u64 + 700 * DAY);
+
+    // B collects and pushes.
+    b.act_as_b();
+    call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let base = pinned_version(&b_profile);
+    let udd = crate::profile::user_data_dir(&b_profile).unwrap();
+    std::fs::write(udd.join("Preferences"), b"{\"from\":\"b, renewed\"}").unwrap();
+    let pushed = call(
+        &rt,
+        crate::sync_cmd::profile_sync_push(b_profile.clone(), String::new(), base, user, pass),
+    )
+    .unwrap();
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT current_version FROM v2_profiles WHERE lower(hex(id)) = '{profile_id}'"
+        )),
+        pushed.version
+    );
+}
+
+/// v2.11 S3 RS (ADR 0002 Q-63), port slot 0 (after S2's test, serial): A
+/// appoints B; B accepts, exports, rotates, re-seals, exports again and
+/// revokes A. Before that A's Reset is refused; after it, A's Reset reads
+/// the signed revocation from the ticket listing and wipes its root state,
+/// custody, TRK, fleet keys and credentials, keeping the pin. A then joins
+/// as a new device, B approves it and it collects the current generation.
+#[test]
+fn the_revoked_old_root_resets_and_joins_again_against_a_real_server() {
+    let rt = runtime();
+    let h = custodian_at(V211_PORT_BASE, 0, "v211-reset", &rt);
+    call(
+        &rt,
+        crate::team_fleet_key_setup(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    let a = crate::team_config::load().unwrap();
+    let a_id = a.device_id.clone();
+    let a_refs = [
+        a.signing_credential_ref.clone(),
+        a.hpke_credential_ref.clone(),
+    ];
+    let tenant16 = crate::fleet_client::decode_hex16(&h.tenant, "tenant").unwrap();
+    let pin = || {
+        crate::team::ledger::tenant_pin(&crate::team::db::Db::open().unwrap(), &tenant16).unwrap()
+    };
+    let a_pin = pin();
+    assert!(a_pin.is_some());
+    let a_fleet = format!("fleet-key.{}.0", h.tenant);
+    assert!(crate::credential::load(&a_fleet).is_ok());
+
+    // 1. A re-seals (no profile) and appoints B.
+    let b = fresh_device("n", h.server.url(), h.tenant.clone());
+    let (b_id, code) = enroll_with_code(&rt, "next");
+    h.act_as_a();
+    call(&rt, crate::team_devices(OWNER.into(), PASSWORD.into())).unwrap();
+    call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    call(
+        &rt,
+        crate::team_approve_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            b_id.clone(),
+            code.sas.clone(),
+            Some(true),
+        ),
+    )
+    .unwrap();
+    let as_b = || act_as(b.config.path(), b.data.path(), "n");
+    as_b();
+    call(
+        &rt,
+        crate::team_join_confirm(
+            OWNER.into(),
+            PASSWORD.into(),
+            code.anchor.clone(),
+            code.sas.clone(),
+        ),
+    )
+    .unwrap();
+    call(
+        &rt,
+        crate::team_custody_accept(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+
+    // 2. Before B revokes it, A's Reset is refused and wipes nothing.
+    h.act_as_a();
+    let refused = call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into())).unwrap_err();
+    assert!(
+        crate::errcode::has_code(&refused, "fleet.resetNeedsSignedRevocation"),
+        "{refused}"
+    );
+    assert!(crate::root_bootstrap::load().unwrap().activated);
+
+    // 3. B works through the checklist and revokes A.
+    as_b();
+    export(&rt, &config_path("v211-b1.shardx-recovery")).unwrap();
+    call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap();
+    call(&rt, crate::team_reseal_all(OWNER.into(), PASSWORD.into())).unwrap();
+    export(&rt, &config_path("v211-b2.shardx-recovery")).unwrap();
+    call(
+        &rt,
+        crate::team_revoke_device(
+            OWNER.into(),
+            PASSWORD.into(),
+            a_id.clone(),
+            "retired".into(),
+            None,
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::fleet_custody::load()
+            .unwrap()
+            .handover
+            .unwrap()
+            .phase,
+        "done"
+    );
+
+    // 4. A resets on the signed revocation the ticket listing serves.
+    h.act_as_a();
+    let status = call(&rt, crate::team_enroll_again(OWNER.into(), PASSWORD.into())).unwrap();
+    assert!(!status.is_enrolled, "{status:?}");
+    assert!(!crate::store::custody_bootstrap_path().unwrap().exists());
+    assert!(!crate::store::fleet_custody_path().unwrap().exists());
+    assert!(
+        crate::credential::load(&a_fleet).is_err(),
+        "fleet key forgotten"
+    );
+    for r in &a_refs {
+        assert!(crate::credential::load(r).is_err(), "{r} forgotten");
+    }
+    let c = crate::team_config::load().unwrap();
+    assert!(c.device_id.is_empty() && c.signing_key_seed.is_empty());
+    assert_eq!(pin(), a_pin, "the pin stays");
+
+    // 5. A joins again as a new device; B approves it; it collects
+    // generation 1.
+    let (again, code) = enroll_with_code(&rt, "again");
+    assert_ne!(again, a_id);
+    as_b();
+    admit(&rt, &again, &code, || h.act_as_a());
+    assert_eq!(
+        crate::fleet_keys::load()
+            .unwrap()
+            .active_key(&h.tenant)
+            .map(|(_, g)| g),
+        Some(1)
     );
 }
