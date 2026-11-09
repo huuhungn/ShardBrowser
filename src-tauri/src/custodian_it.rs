@@ -216,6 +216,10 @@ const PORT_BASE: u16 = 20500;
 /// OmniRoute (20128-20132), Hermes (8642), OpenViking (1933), Ollama
 /// (11434) and the ShardX API (40325).
 const V210_PORT_BASE: u16 = 29600;
+/// v2.11's real-server tests, slots 0-2 (S2 and S3's Reset test, S3, S4):
+/// ports 31600-32699, above [`V210_PORT_BASE`]'s 31499 and below the Linux
+/// ephemeral 32768, clear of the same ranges.
+const V211_PORT_BASE: u16 = 31600;
 
 /// A server with one CLI-created tenant, on port slot `slot`, and device A
 /// enrolled, confirmed by the operator and bootstrapped as root custodian.
@@ -4205,5 +4209,205 @@ fn root_custody_moves_to_a_new_device_and_the_team_keeps_every_profile_against_a
     eprintln!(
         "[u6] the hand-over journey took {} s",
         started.elapsed().as_secs()
+    );
+}
+
+/// v2.11 S2 (ADR 0002 Q-60): A's rotation to generation 1 never activates
+/// and ends `expired`; its next Start meets the stuck PREPARING generation
+/// (`fleet.rotationStuck`). With the server stopped the operator discards it
+/// (refused inside the rotation grant's window without `--force`), and A
+/// rotates to generation 1 again under a new key, which member B collects
+/// and pushes under.
+#[test]
+fn the_operator_discards_a_stuck_fleet_rotation_and_the_custodian_rotates_again_against_a_real_server(
+) {
+    let rt = runtime();
+    let Journey {
+        b,
+        mut h,
+        b_profile,
+        profile_id,
+        ..
+    } = shared_profile_at(V211_PORT_BASE, 0, "v211-discard", &rt);
+    let (user, pass) = account();
+
+    // 1. A rotates; the server never sees the activation before the
+    // rotation's deadline: this device's clock jumps past it once all three
+    // grants are acknowledged.
+    let c = crate::team_config::load().unwrap();
+    let (signer, seed) = (c.signing_key().unwrap(), c.hpke_seed().unwrap());
+    let device = crate::fleet_custody::FleetDevice {
+        tenant_id: &c.tenant_id,
+        device_id: &c.device_id,
+        account_id: &c.account_id,
+        signer: &signer,
+        hpke_seed: &seed,
+        vault: &crate::fleet_custody::CredentialFkekStore,
+    };
+    let root = crate::root_bootstrap::load().unwrap();
+    let pin = crate::bootstrap_anchor(&c).unwrap();
+    let me = crate::recipient(&c).unwrap();
+    let server_db = h.server.data.path().join("shardx.db");
+    let acked = move || -> i64 {
+        let db = rusqlite::Connection::open_with_flags(
+            &server_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row(
+            "SELECT (SELECT count(*) FROM v2_fleet_device_hpke_grants
+                      WHERE generation = 1 AND acked_at IS NOT NULL)
+                  + (SELECT count(*) FROM v2_fleet_recovery_grants
+                      WHERE generation = 1 AND acked_at IS NOT NULL)
+                  + (SELECT count(*) FROM v2_fleet_rotation_grants
+                      WHERE generation = 1 AND acked_at IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let err = with_session(&rt, &h, async |client, access| {
+        let now = crate::root_bootstrap::now_ms();
+        let mut db = crate::team::db::Db::open().unwrap();
+        let mut ledger = crate::fleet_custody::Ledger {
+            db: &mut db,
+            pin: &pin,
+        };
+        let mut state = crate::fleet_custody::load().unwrap();
+        crate::fleet_custody::rotate_fleet(
+            client,
+            access,
+            &device,
+            &root,
+            &mut ledger,
+            |g| Ok(crate::verified_fleet_key(&h.tenant, &pin, &me, g, now)?.unwrap()),
+            || {
+                if acked() == 3 {
+                    now + 3650 * 86_400_000
+                } else {
+                    now
+                }
+            },
+            &mut state,
+            &mut |s| crate::fleet_custody::save(s),
+        )
+        .await
+        .unwrap_err()
+    });
+    assert!(
+        crate::errcode::has_code(&err.to_string(), "fleet.rotationExpired"),
+        "{err}"
+    );
+    let generation_1 = |h: &Harness, state: &str| {
+        h.server.count(&format!(
+            "SELECT count(*) FROM v2_fleet_key_generations
+              WHERE generation = 1 AND state = '{state}'"
+        ))
+    };
+    assert_eq!(generation_1(&h, "PREPARING"), 1);
+
+    // 2. Start again: generation 1 is still PREPARING on the server.
+    let refused = call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap_err();
+    assert!(
+        crate::errcode::has_code(&refused, "fleet.rotationStuck"),
+        "{refused}"
+    );
+    assert_eq!(
+        crate::fleet_custody::load()
+            .unwrap()
+            .rotation
+            .unwrap()
+            .phase,
+        crate::fleet_custody::RotationPhase::Expired
+    );
+
+    // 3. The operator stops the server and discards generation 1: refused
+    // while the first rotation's grant window is open, then forced.
+    let args = [
+        "fleet",
+        "discard-preparing",
+        "--tenant",
+        "v211-discard",
+        "--generation",
+        "1",
+    ];
+    let _ = h.server.child.kill();
+    let _ = h.server.child.wait();
+    let out = Server::command(h.server.data.path(), h.server.identity.path())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("grant window is open"),
+        "{err}"
+    );
+    let discarded = h.server.operator(&[&args[..], &["--force"]].concat(), "");
+    assert!(
+        discarded.contains("discarded=fleet generation=1"),
+        "{discarded}"
+    );
+    assert_eq!(generation_1(&h, "PREPARING"), 0);
+
+    // 4. A rotates to generation 1 again, under a new key, and grants B.
+    let status = call(
+        &rt,
+        crate::team_fleet_key_rotate(OWNER.into(), PASSWORD.into(), None),
+    )
+    .unwrap();
+    let rotation = status.rotation.expect("the rotation");
+    assert_eq!(
+        (rotation.generation, rotation.phase, rotation.members_filed),
+        (1, crate::fleet_custody::RotationPhase::Done, 1)
+    );
+    assert_eq!(generation_1(&h, "ACTIVE"), 1);
+    let now = crate::root_bootstrap::now_ms();
+    assert!(
+        crate::verified_fleet_key(&h.tenant, &pin, &me, 1, now)
+            .unwrap()
+            .is_some(),
+        "A holds the new generation 1 verified"
+    );
+    let archived = h
+        .server
+        .count("SELECT count(*) FROM v2_discarded_records WHERE kind = 'fleet' AND generation = 1");
+    assert_eq!(archived, 4, "the stuck generation and its three grants");
+
+    // 5. B collects generation 1 and pushes under it.
+    b.act_as_b();
+    let report = call(
+        &rt,
+        crate::team_collect_custody(OWNER.into(), PASSWORD.into()),
+    )
+    .unwrap();
+    assert_eq!(
+        (&report["fleet_opened"], &report["newest_fleet_generation"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{report}"
+    );
+    let base = pinned_version(&b_profile);
+    let udd = crate::profile::user_data_dir(&b_profile).unwrap();
+    std::fs::write(
+        udd.join("Preferences"),
+        b"{\"from\":\"b, under the new 1\"}",
+    )
+    .unwrap();
+    let pushed = call(
+        &rt,
+        crate::sync_cmd::profile_sync_push(b_profile.clone(), String::new(), base, user, pass),
+    )
+    .unwrap();
+    assert_eq!(
+        h.server.count(&format!(
+            "SELECT key_generation FROM v2_snapshots
+              WHERE lower(hex(profile_id)) = '{profile_id}' AND version = {}",
+            pushed.version
+        )),
+        1
     );
 }
