@@ -361,8 +361,10 @@ async fn fetch_manifest_from(url: &str) -> RemoteManifest {
 /// `client_hints` — `brand_version` / `brand_full_version` / `chrome_build` /
 /// `chrome_patch` (derived from the version), plus `grease_brand` /
 /// `grease_version` / `grease_full_version` (from the manifest, since GREASE
-/// can't be derived from the version number). Leaves platform_version,
-/// architecture, webgl, etc. intact. Returns the number of files changed.
+/// can't be derived from the version number), and the fixes `migrate_value`
+/// lists. An imported fingerprint keeps its config under `payload`; that is
+/// what gets migrated, with the `chrome` label it shows in the library.
+/// Returns the number of files changed.
 fn migrate_dir_to(
     dir: &Path,
     chromium_version: &str,
@@ -380,18 +382,30 @@ fn migrate_dir_to(
         let Ok(text) = fs::read_to_string(&p) else {
             continue;
         };
-        let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(mut file) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        let wrapped =
+            file.get("payload").is_some_and(|v| v.is_object()) && file.get("chrome").is_some();
+        let cfg = if wrapped {
+            &mut file["payload"]
+        } else {
+            &mut file
+        };
         if migrate_value(
-            &mut cfg,
+            cfg,
             chromium_version,
             grease_brand,
             grease_version,
             tls,
             android_version,
         ) {
-            fs::write(&p, serde_json::to_string_pretty(&cfg)?)?;
+            if wrapped {
+                if let Some(v) = file.pointer("/payload/client_hints/brand_version").cloned() {
+                    file["chrome"] = v;
+                }
+            }
+            crate::profile::atomic_write(&p, serde_json::to_string_pretty(&file)?.as_bytes())?;
             n += 1;
         }
     }
@@ -697,14 +711,16 @@ pub async fn ensure_profiles_migrated() {
     let Some(target) = m.chromium_version.clone() else {
         return;
     };
-    // This launcher refuses to install that engine, so its profiles must keep
-    // describing the one they run on.
-    if engine_needs_newer_launcher(&m) {
-        return;
-    }
     let sig = migration_signature(&target, &m);
     let mut local = load_manifest();
     if local.applied_signature.as_deref() == Some(sig.as_str()) {
+        return;
+    }
+    // An engine still on another version (an update not in yet, one that failed,
+    // or one this launcher refuses): its profiles keep its version; the install
+    // migrates after the swap.
+    let on_disk = binary_path().is_ok_and(|p| p.exists());
+    if on_disk && effective_installed_version(&local).is_some_and(|v| v != target) {
         return;
     }
     // A migration that did not finish is not recorded as applied: the next
@@ -1308,16 +1324,17 @@ fn place_widevine(base: &Path) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
-    let dst = base
+    let versions = base
         .join("ShardX-Mac-arm64")
         .join("ShardX.app")
         .join("Contents")
         .join("Frameworks")
         .join("ShardX Framework.framework")
-        .join("Versions")
-        .join(CHROMIUM_VERSION)
-        .join("Libraries")
-        .join("WidevineCdm");
+        .join("Versions");
+    // The engine's own version folder: the constant lags whenever the manifest
+    // moves to a build this launcher was not compiled with.
+    let version = framework_version(&versions).unwrap_or_else(|| CHROMIUM_VERSION.to_string());
+    let dst = versions.join(version).join("Libraries").join("WidevineCdm");
     if dst.exists() {
         let _ = fs::remove_dir_all(&dst);
     }
@@ -1328,6 +1345,20 @@ fn place_widevine(base: &Path) -> Result<()> {
     fs::rename(&src, &dst)?;
     let _ = fs::remove_dir(base.join("ShardX-Widevine-Mac-arm64"));
     Ok(())
+}
+
+/// The one `<major>.<minor>.<build>.<patch>` folder under a framework's
+/// `Versions/` (beside the `Current` link), when there is exactly one.
+#[cfg(any(target_os = "macos", test))]
+fn framework_version(versions: &Path) -> Option<String> {
+    let mut found = fs::read_dir(versions).ok()?.flatten().filter_map(|e| {
+        let name = e.file_name().into_string().ok()?;
+        let dotted =
+            name.split('.').count() == 4 && name.split('.').all(|p| p.parse::<u32>().is_ok());
+        (dotted && e.path().is_dir()).then_some(name)
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 /// Windows flat layout: WidevineCdm/ sits beside chrome.exe.
@@ -1536,6 +1567,55 @@ mod tests {
             !migrate_value(&mut p, "157.0.8103.50", None, None, None, None),
             "once"
         );
+    }
+
+    #[test]
+    fn an_imported_fingerprint_is_migrated_under_its_wrapper_once() {
+        let dir =
+            std::env::temp_dir().join(format!("shardx-migrate-wrapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("imported.json");
+        let entry = json!({ "id": "imported", "label": "Imported", "platform": "Windows",
+            "chrome": "156", "gpu": "", "tag_color": "", "payload": {
+                "navigator": { "platform": "Windows", "platform_version": "19.0.0",
+                    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/156.0.0.0 Safari/537.36" },
+                "client_hints": { "brand_version": "156", "platform_version": "19.0.0" } } });
+        std::fs::write(&file, entry.to_string()).unwrap();
+
+        assert_eq!(
+            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None).unwrap(),
+            1
+        );
+        let got: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(got["chrome"], "157");
+        assert_eq!(
+            got["payload"]["client_hints"]["brand_full_version"],
+            "157.0.8103.50"
+        );
+        assert!(
+            got.get("navigator").is_none(),
+            "nothing written beside the payload"
+        );
+        assert_eq!(
+            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn widevine_goes_to_the_framework_version_on_disk() {
+        let dir = std::env::temp_dir().join(format!("shardx-fw-versions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("157.0.8103.50")).unwrap();
+        std::fs::create_dir_all(dir.join("Current")).unwrap();
+        assert_eq!(framework_version(&dir).as_deref(), Some("157.0.8103.50"));
+        std::fs::create_dir_all(dir.join("156.0.8078.48")).unwrap();
+        assert_eq!(framework_version(&dir), None, "two versions: not a guess");
+        assert_eq!(framework_version(&dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -48,6 +48,8 @@ test("Undo brings every deleted bookmark back", async ({ page }) => {
   await expect(page.getByText("Docs", { exact: true })).toBeVisible();
   await expect(page.getByText("Shop one")).toBeVisible();
   expect(await stat(page, "bookmark-saves")).toBe("4");
+  // The restored rows come back unselected, so a second Delete cannot take them again.
+  await expect(bar(page)).toHaveCount(0);
 });
 
 test("a row box picks one bookmark and Clear drops the picks", async ({ page }) => {

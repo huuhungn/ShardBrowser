@@ -26,8 +26,18 @@ v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
   shipped with). Saved profiles with a version Chrome never reports are
   corrected once by migration, and again at every start before the engine
   sees them.
-- A launcher that refuses to install the published engine (its
-  `min_launcher_version`) no longer migrates its profiles to it.
+- Profiles are migrated only once the engine on disk is the published one
+  (upstream v2.1.1): while an engine update is pending, has failed, or is
+  refused, profiles keep describing the engine they run on; the install
+  migrates them after the swap.
+- Fingerprints imported into the library (stored with their config under
+  `payload`) are migrated too; before, only bare configs were.
+- Migration writes each profile atomically, so an interrupted start cannot
+  leave a truncated profile file.
+- **Widevine on macOS** goes into the engine's own `Versions/<build>` folder on
+  disk instead of one named after the launcher's compiled-in version, so a
+  manifest that moves ahead of the launcher no longer breaks protected video.
+  macOS users on 2.11.1 who take the 157 engine should update the launcher.
 
 ### Fixes
 
@@ -35,6 +45,11 @@ v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
   browser inherited the local proxy relay's sockets and could keep a stopped
   relay's port open. Updated to mio 1.2.4, with a regression test (harvested
   from the shiranzby/ShardBrowser-ProxyChain fork).
+
+### Security
+
+- rustix 1.1.4 → 1.1.6 in the launcher, team server and shared lockfiles
+  (RUSTSEC-2026-0486, unsound xattr reads; denied by the CI audit).
 
 ### Launcher
 

@@ -606,7 +606,7 @@ pub fn load_raw(id: &str) -> Result<StoredProfile> {
     Ok(stored)
 }
 
-fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &std::path::Path, body: &[u8]) -> Result<()> {
     let parent = path.parent().with_context(|| {
         crate::errcode::code_with(
             "profile.pathNoParent",

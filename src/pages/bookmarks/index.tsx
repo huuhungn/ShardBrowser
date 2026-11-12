@@ -152,7 +152,7 @@ export function BookmarksPage() {
           <Button
             variant="error" mode="stroke" size="2xsmall"
             leftIcon={<DeleteIcon className="size-3.5" />}
-            onClick={() => void removeMany(picked)}
+            onClick={() => void removeMany(picked).then((n) => { if (n > 0) setSelected(new Set()); })}
           >
             {t("common.delete")}
           </Button>
