@@ -202,7 +202,7 @@ jobs:
 
       # The publish job reads its notes from CHANGELOG.md and refuses a tag
       # with no matching section. Checking it here costs seconds; leaving it
-      # to publish wastes three platform builds first.
+      # to publish wastes both platform builds first.
       - name: Verify the changelog documents this release
         env:
           TAG: ${{ steps.version.outputs.tag }}

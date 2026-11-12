@@ -122,7 +122,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       # The SDK's Windows-gated branches (host paths, runtime process control)
-      # were otherwise compiled only on Linux and macOS.
+      # are otherwise compiled only on Linux.
       - name: Rust SDK tests
         run: cargo test --manifest-path sdks/rust/Cargo.toml --all-features
 

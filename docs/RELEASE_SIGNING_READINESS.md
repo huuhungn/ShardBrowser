@@ -18,9 +18,9 @@ Before native builds start, the workflow signs a disposable fixture with the
 updater private-key secret and verifies it using the exact public key shipped
 in `src-tauri/tauri.conf.json`. A rotated or mismatched key stops the release.
 Native builds emit updater bundles and `.sig` files, and the deterministic
-`latest.json` maps those signatures to the Windows NSIS bundle, Apple Silicon
-app archive, and Linux x86_64 AppImage. Duplicate or missing updater bundles
-fail publication.
+`latest.json` maps those signatures to the Windows NSIS bundle and the Linux
+x86_64 AppImage (macOS builds stopped after v2.11.1). Duplicate or missing
+updater bundles fail publication.
 
 Checksums and GitHub build-provenance attestations cover the release assets.
 The updater verifier rejects modified artifacts or signatures that do not match

@@ -11,9 +11,13 @@ forks and similar open-source launchers (ledger: `docs/V2.12_PORT_LEDGER.md`).
 - The engine moves to Chromium 157. Install the engine update when the
   launcher offers it, with no profile running; profiles are migrated after
   the swap.
-- macOS: protected video needs this launcher with the 157 engine.
-- This release ships Windows and Linux builds only. macOS builds stop at
-  v2.11.1, and the in-app updater offers macOS installs no newer version.
+- This release ships Windows and Linux builds only; v2.11.1 is the last
+  macOS build. `latest.json` no longer carries a macOS entry, so from now on
+  the in-app updater on a macOS install reports that it found no update for
+  its platform.
+- macOS installs stay on 2.11.1, where protected video breaks with the 157
+  engine (see Widevine below). Skip the 157 engine update there if you need
+  protected video.
 
 ### Engine
 
@@ -47,7 +51,7 @@ forks and similar open-source launchers (ledger: `docs/V2.12_PORT_LEDGER.md`).
 - **Widevine on macOS** goes into the engine's own `Versions/<build>` folder on
   disk instead of one named after the launcher's compiled-in version, so a
   manifest that moves ahead of the launcher no longer breaks protected video.
-  macOS users on 2.11.1 who take the 157 engine should update the launcher.
+  This fix ships in no macOS build, since macOS releases stop at 2.11.1.
 
 ### Fixes
 

@@ -233,8 +233,9 @@ iframes, web workers, developer tools and headless mode.
   launching while it runs.
 * **Extra launch arguments:** switches are appended to every profile launch
   and applied last, so they can override the launcher's defaults.
-* **Cross-platform:** macOS arm64, Windows x64 and Linux x64. The app uses
-  native traffic lights on macOS and a custom title bar elsewhere.
+* **Cross-platform:** releases ship Windows x64 and Linux x64; v2.11.1 is the
+  last macOS arm64 build, and CI no longer compiles the macOS code. The app
+  uses native traffic lights on macOS and a custom title bar elsewhere.
 
 ---
 
