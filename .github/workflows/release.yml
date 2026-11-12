@@ -202,7 +202,7 @@ jobs:
 
       # The publish job reads its notes from CHANGELOG.md and refuses a tag
       # with no matching section. Checking it here costs seconds; leaving it
-      # to publish wastes three platform builds first.
+      # to publish wastes both platform builds first.
       - name: Verify the changelog documents this release
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -222,10 +222,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Windows and Linux only: macOS builds stopped after v2.11.1 (the hosted
+        # arm64 pool left the job unacquired for hours, and the fork targets
+        # Windows).
         include:
-          - os: macos-15
-            target: aarch64-apple-darwin
-            label: mac-arm64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             label: linux-x64
@@ -326,8 +326,7 @@ jobs:
           mkdir -p staging
           find src-tauri/target/${{ matrix.target }}/release/bundle \
             -type f \
-            \( -name '*.dmg' -o -name '*.app.tar.gz' \
-               -o -name '*.msi' -o -name '*.exe' \
+            \( -name '*.msi' -o -name '*.exe' \
                -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
                -o -name '*.sig' \) \
             -exec cp -v {} staging/ \;
@@ -476,7 +475,7 @@ jobs:
           # quietly lost these would ship a Launcher that cannot reach them,
           # which is exactly what v0.2.3 did.
           missing=0
-          for label in mac-arm64 linux-x64 win-x64; do
+          for label in linux-x64 win-x64; do
             ext=""
             if [ "$label" = win-x64 ]; then ext=".exe"; fi
             if [ ! -f "dist/shardx-team-server-$label$ext" ]; then
@@ -528,7 +527,6 @@ jobs:
           ## Install
 
           * **Windows** — the installer and portable executable are not Authenticode-signed, so Windows can show SmartScreen / **Unknown Publisher** during a manual install. The in-app updater separately verifies downloaded update bytes with the shipped Tauri updater public key.
-          * **macOS** — Apple Silicon .dmg; this build is not notarized because the fork does not currently have an Apple Developer ID.
           * **Linux** — .AppImage or .deb.
           * **MCP** — ShardX-MCP.tar.gz contains the matching MCP source and host helpers. Launcher Settings downloads this asset from this exact fork release.
           * **Team server** — shardx-team-server-<platform> is the self-hosted server. It serves the v2 fleet, enrollment, root key generation, and grant endpoints that the Launcher's Team features talk to.
