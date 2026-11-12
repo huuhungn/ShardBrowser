@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
-import Badge from "../../../shared/ui/Badge";
+import Badge, { type BadgeColor } from "../../../shared/ui/Badge";
 import { UDP_DOCS_URL } from "../../../shared/lib/utils";
-import type { ProxyEntry, ProxyTestSnapshot } from "../model/types";
+import type { ProxyEntry, ProxyTestSnapshot, ProxyTestStatus } from "../model/types";
 import { useT } from "../../../shared/i18n";
 
 export function ProxyTestResult({ snap, kind, busy }: {
@@ -13,17 +13,28 @@ export function ProxyTestResult({ snap, kind, busy }: {
   if (busy) return <span className="text-paragraph-xs text-text-soft-400">{t("proxy.test.testing")}</span>;
   if (!snap) return <span className="text-paragraph-xs text-text-soft-400">{t("proxy.notTested")}</span>;
 
+  const status = snap.status ?? (snap.tcp_ms != null ? "working" : "failed");
+  const statusBadge: Record<ProxyTestStatus, { color: BadgeColor; label: string }> = {
+    working: { color: "success", label: t("proxyTable.active") },
+    unstable: { color: "warning", label: t("proxyTable.unstable") },
+    failed: { color: "error", label: t("proxyTable.failed") },
+  };
+  const tcpTitle = snap.tcp_ms == null
+    ? t("proxyTable.tcpFailed")
+    : status === "unstable"
+      ? t("proxyTable.unstableHint", { ms: snap.tcp_ms, n: snap.attempts ?? 0 })
+      : `TCP ${snap.tcp_ms} ms`;
+
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      <Badge
-        color={snap.tcp_ms != null ? "success" : "error"}
-        variant='filled'
-        size="small"
-        dot
-        title={snap.tcp_ms != null ? `TCP ${snap.tcp_ms} ms` : t("proxyTable.tcpFailed")}
-      >
-        {snap.tcp_ms != null ? t("proxyTable.active") : t("proxyTable.failed")}
+      <Badge color={statusBadge[status].color} variant='filled' size="small" dot title={tcpTitle}>
+        {statusBadge[status].label}
       </Badge>
+      {snap.failure_reason && (
+        <Badge color="error" variant="lighter" size="small">
+          {t(`proxyTable.reason.${snap.failure_reason}`)}
+        </Badge>
+      )}
       {/* UDP pill: clickable to docs explaining what the presence/absence of
           UDP means for QUIC + WebRTC. HTTP proxies never have UDP, but the
           badge still tells the user why QUIC will be force-disabled at launch. */}
