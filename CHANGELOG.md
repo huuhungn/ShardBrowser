@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+Ports the browser engine and the launcher-side fixes of upstream ProxyShard
+v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
+
+### Engine
+
+- **Chromium 157.0.8103.50 (upstream v2.1.5).** Carries Chrome's November 9
+  security fix for an XML flaw exploited in the wild, and upstream's engine
+  fixes since 156: WebRTC behind proxies without UDP, canvas/WebGL/WebGPU
+  reads, audio written by a page, Widevine license requests, fonts and
+  processor results of another system, headless screens, touch on profiles
+  without a touch screen. The shared engine bucket already served this build
+  while `runtime.json` still named 156, so a fresh install got a 157 engine
+  under profiles describing 156; the manifest now names the build it serves.
+- **Profiles follow the new engine.** Migration brings saved profiles and the
+  fingerprint library to 157 (user agent, client hints, GREASE `Not-A.Brand`
+  99). Phone profiles report the Chrome for Android build and the
+  `Google Chrome` brand; Apple M-series profiles gain the WebGPU features
+  Chrome 156/157 report on their chip.
+- **Operating system versions Chrome can report.** New Windows and macOS
+  profiles get a version that exists (Windows 10.0.0 / 15.0.0 / 19.0.0, macOS
+  releases current as of 2026-11, never older than the claimed Apple chip
+  shipped with). Saved profiles with a version Chrome never reports are
+  corrected once by migration, and again at every start before the engine
+  sees them.
+- A launcher that refuses to install the published engine (its
+  `min_launcher_version`) no longer migrates its profiles to it.
+
+### Fixes
+
+- **Relay sockets on Windows.** Mio 1.2.0 created inheritable sockets, so the
+  browser inherited the local proxy relay's sockets and could keep a stopped
+  relay's port open. Updated to mio 1.2.4, with a regression test (harvested
+  from the shiranzby/ShardBrowser-ProxyChain fork).
+
+### Launcher
+
+- **Delete many bookmarks.** The Bookmarks page has row checkboxes and a
+  select-all box that follows the search and folder tab; delete the selection
+  in one go, and Undo in the toast brings them all back.
+
+### SDKs
+
+- `CHROMIUM_VERSION` in the Node, Python and Rust SDKs is 157.0.8103.50 (the
+  macOS framework path and the fallback when the manifest is unreachable).
+
 ## v2.11.1
 
 A security and Team fix release: the launcher refuses a profile database whose
