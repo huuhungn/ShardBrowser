@@ -1192,10 +1192,10 @@ server.tool(
 
 server.tool(
   "import_cookies",
-  "Import cookies into a STOPPED profile.",
-  { id: z.string(), cookies: z.array(z.any()) },
-  async ({ id, cookies }) =>
-    text(await api(`/profiles/${id}/cookies`, { method: "POST", body: { cookies } })),
+  "Import cookies into a STOPPED profile. Pass `cookies` (a JSON array: Cookie-Editor, EditThisCookie, Playwright/Puppeteer or ShardX shape) or `text` (raw cookies.txt in Netscape format, or any of those JSON exports as text). Returns the detected format and a `skipped` list (line/entry number and reason) for entries that could not be imported.",
+  { id: z.string(), cookies: z.array(z.any()).optional(), text: z.string().optional() },
+  async ({ id, cookies, text: raw }) =>
+    text(await api(`/profiles/${id}/cookies`, { method: "POST", body: { cookies, text: raw } })),
 );
 
 // ================= CDP browser tools (patchright) =================

@@ -69,7 +69,13 @@ export const helperClose = () => invoke<void>("helper_close");
 export const helperDismiss = (profile: string) => invoke<void>("helper_dismiss", { profile });
 export const folderDelete = (folder: string, deleteProfiles: boolean) => invoke<number>("folder_delete", { folder, deleteProfiles });
 export const cookiesExportToFile = (profileId: string, path: string) => invoke<number>("cookies_export_to_file", { profileId, path });
-export const cookiesImport = (profileId: string, cookies: any[]) => invoke<number>("cookies_import", { profileId, cookies });
+export type CookieImportReport = {
+  imported: number;
+  format: string;
+  /** `position` is a 1-based line (cookies.txt) or array index (JSON). */
+  skipped: { position: number; reason: string }[];
+};
+export const cookiesImport = (profileId: string, text: string) => invoke<CookieImportReport>("cookies_import", { profileId, text });
 export const enrichPicksForPreset = (presetId: string) => invoke<{ hardware_concurrency?: number; device_memory?: number; platform_version?: string }>("enrich_picks_for_preset", { presetId });
 export const hostPlatform = () => invoke<string>("host_platform");
 

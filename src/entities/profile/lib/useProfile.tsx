@@ -588,15 +588,18 @@ export const useProfile = create<ProfileStore>((set, get) => ({
     if (get().running[p.id]) { toast.err(t("profile.stopTheProfileBeforeImportingCookies")); return; }
     try {
       const path = await open({
-        multiple: false, directory: false, title: t("profile.selectCookiesJson"),
-        filters: [{ name: "JSON", extensions: ["json"] }],
+        multiple: false, directory: false, title: t("profile.selectCookiesFile"),
+        filters: [{ name: t("profile.cookiesFileFilter"), extensions: ["txt", "json"] }],
       });
       if (typeof path !== "string") return;
-      const text = await readTextFile(path);
-      const cookies = JSON.parse(text);
-      if (!Array.isArray(cookies)) { toast.err(t("profile.expectedAJSONArrayOfCookies")); return; }
-      const n = await cookiesImport(p.id, cookies);
-      toast.ok(t(n === 1 ? "profile.importedCookieOne" : "profile.importedCookieMany", { n }));
+      // The backend detects the format and lists what it could not import.
+      const { imported: n, skipped } = await cookiesImport(p.id, await readTextFile(path));
+      if (n > 0) toast.ok(t(n === 1 ? "profile.importedCookieOne" : "profile.importedCookieMany", { n }));
+      if (skipped.length) {
+        const shown = skipped.slice(0, 10).map((s) => s.position).join(", ");
+        const positions = skipped.length > 10 ? `${shown}, …` : shown;
+        (n > 0 ? toast.info : toast.err)(t("profile.skippedCookieEntries", { n: skipped.length, positions }));
+      }
     } catch (e) { toast.err(safeUiError(e)); }
   },
 

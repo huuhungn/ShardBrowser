@@ -6,6 +6,7 @@ mod backup_cmd;
 mod bookmarks;
 pub mod cdp;
 mod codex_mcp;
+mod cookie_import;
 mod cookies;
 #[cfg(test)]
 mod crash_harness;
@@ -1827,14 +1828,18 @@ fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, Str
     Ok(cookies.len())
 }
 
+/// Import cookies from the raw text of a cookies.txt or JSON export; the
+/// format is detected and malformed entries come back in the report.
 #[tauri::command]
-fn cookies_import(profile_id: String, cookies: Vec<cookies::Cookie>) -> Result<usize, String> {
+fn cookies_import(profile_id: String, text: String) -> Result<cookie_import::ImportReport, String> {
     let _claim = profile::begin_user_mutation(
         [&profile_id],
         &crate::errcode::code("profile.actionImportCookies"),
     )
     .map_err(|error| error.to_string())?;
-    cookies::import(&profile_id, &cookies).map_err(|e| e.to_string())
+    let parsed = cookie_import::parse(&text).map_err(|e| e.to_string())?;
+    let imported = cookies::import(&profile_id, &parsed.cookies).map_err(|e| e.to_string())?;
+    Ok(parsed.into_report(imported))
 }
 
 // ---- Settings ----
@@ -9268,7 +9273,7 @@ mod profile_mutation_boundary_tests {
             profile_id.to_string(),
             vec!["tag".to_string()],
         ));
-        assert_running_blocked(cookies_import(profile_id.to_string(), Vec::new()));
+        assert_running_blocked(cookies_import(profile_id.to_string(), "[]".to_string()));
 
         // Sync reads and writes the profile directory exactly as backup and
         // restore do, so it must refuse a running profile for the same reason:
