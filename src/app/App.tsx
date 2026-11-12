@@ -10,6 +10,7 @@ import { ConfirmHost } from "../widgets/ConfirmHost/ConfirmHost";
 import { PassphraseHost } from "../widgets/PassphraseHost/PassphraseHost";
 import { StarModal } from "../widgets/StarModal/StarModal";
 import { HelperWatcher } from "../widgets/HelperWatcher";
+import { OpenLinkWatcher } from "../widgets/OpenLinkWatcher";
 import { WhatsNewGate } from "../widgets/WhatsNewGate";
 import { BrowsersPage } from "../pages/browsers";
 import { ProxiesPage } from "../pages/proxies";
@@ -55,6 +56,7 @@ export function App() {
       <HelperWatcher />
       <WhatsNewGate />
       <FirstRunGate>
+        <OpenLinkWatcher />
         <div
           className="grid overflow-hidden bg-bg-weak-50 [grid-template-columns:240px_1fr] [@media(min-width:1700px)]:[grid-template-columns:280px_1fr]"
           style={{ height: "100vh", paddingTop: "var(--titlebar-h)" }}

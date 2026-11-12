@@ -33,6 +33,8 @@ export const devtoolsActivate = (profileId: string) =>
   invoke<DevtoolsTarget>("devtools_activate", { profileId });
 export const processKill = (profileId: string) => invoke<boolean>("process_kill", { profileId });
 export const launch = (profileId: string) => invoke<number>("launch", { profileId });
+/** shardbrowser://open links the backend queued: a profile id or name each, null if malformed. */
+export const openLinkTake = () => invoke<(string | null)[]>("open_link_take");
 /** Stop a launch that has not started its browser yet. */
 export const launchCancel = (profileId: string) => invoke("launch_cancel", { profileId });
 

@@ -55,6 +55,7 @@ pub fn cdp_launch_args_for_tests() -> &'static [&'static str] {
 
 mod mcp_setup;
 mod migrate;
+mod open_link;
 mod process;
 mod profile;
 mod proxy;
@@ -9316,6 +9317,8 @@ pub fn run() {
                 show_main_window(app);
             }
         }))
+        // After single-instance: a link a second launch carries reaches this one.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![startup::AUTOSTART_ARG]),
@@ -9500,9 +9503,25 @@ pub fn run() {
             updater::launcher_update_download,
             updater::launcher_update_install,
             updater::launcher_update_restart,
+            open_link::open_link_take,
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                // Installers register the scheme; an AppImage and a dev run have none.
+                #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("[launcher] shardbrowser:// links not registered: {e}");
+                }
+                app.deep_link().on_open_url(|event| {
+                    open_link::handle(event.urls().iter().map(|u| u.as_str()))
+                });
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    open_link::handle(urls.iter().map(|u| u.as_str()));
+                }
+            }
 
             // Point the heavy directories wherever the operator moved them,
             // before anything reads a profile.

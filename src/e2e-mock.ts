@@ -167,7 +167,8 @@ let proxyListCalls = 0;
 let proxyListsInFlight = 0;
 let maxProxyListsInFlight = 0;
 
-type E2EWindow = Window & { __resolveUpdateCheck?: () => void };
+// __e2eOpenLinks: what the backend queued for open_link_take, set by a test.
+type E2EWindow = Window & { __resolveUpdateCheck?: () => void; __e2eOpenLinks?: (string | null)[] };
 
 function updateInfo() {
   const available = params.get("update") !== "none";
@@ -1198,7 +1199,10 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
     case "launcher_update_restart":
       count("RestartRequests");
       return null;
+    case "open_link_take":
+      return (window as E2EWindow).__e2eOpenLinks?.splice(0) ?? [];
     case "launch":
+      count("Launches");
       if (scenario === "slow-launch") {
         await new Promise<void>((resolve) => { cancelPendingLaunch = resolve; });
         throw new Error("launch.cancelled");
