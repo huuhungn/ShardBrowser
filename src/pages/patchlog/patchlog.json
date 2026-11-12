@@ -3,6 +3,142 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.12.0",
+      "date": "2026-11-12",
+      "entries": [
+        {
+          "id": "chromium-157",
+          "title": "Chromium 157",
+          "lead": "Profiles now run on Chromium 157 and present themselves as Chrome 157.",
+          "tag": "new",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The engine carries Chrome's November 9 security fix for an XML flaw attackers were already using, and the engine fixes since 156: WebRTC behind proxies, canvas, WebGL and WebGPU reads, audio, protected video and fonts. Install the engine update when the launcher offers it, with no profile running. Profiles are brought to 157 after the update."
+            }
+          ]
+        },
+        {
+          "id": "os-version",
+          "title": "Operating system versions",
+          "lead": "Profiles report Windows and macOS versions that really exist.",
+          "tag": "fix",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A version Chrome could never report is corrected once, and again before every start. A Mac profile reports a macOS its Apple chip can run."
+            }
+          ]
+        },
+        {
+          "id": "maximized-window",
+          "title": "Maximized window",
+          "lead": "A profile's window can open maximized.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Turn on \"Report the window as maximized\" in the profile editor. The window opens the size of the profile's screen and sites see it maximized. Resize it, and sites see its real size. Phone profiles do not have this setting."
+            }
+          ]
+        },
+        {
+          "id": "hide-profile-name",
+          "title": "Profile name in the browser",
+          "lead": "The profile's name next to the address bar can be hidden.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Turn off \"Show the profile name in the browser\" in Settings, for example before recording or sharing your screen. Sites never see the name either way."
+            }
+          ]
+        },
+        {
+          "id": "open-link",
+          "title": "Open a profile from a link",
+          "lead": "shardbrowser://open/<profile> opens a profile after you confirm.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Use a profile's id or its exact name. The launcher comes forward and asks before it starts the profile. A link can only open a profile: it cannot create or delete one, or pass addresses, proxies or settings."
+            }
+          ]
+        },
+        {
+          "id": "cookie-formats",
+          "title": "More cookie formats",
+          "lead": "Cookie import reads cookies.txt, Cookie-Editor and Playwright exports.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Pick a .txt or .json file from the profile menu. Entries that cannot be imported are listed by line or position with the reason; their values are never shown."
+            }
+          ]
+        },
+        {
+          "id": "proxy-test",
+          "title": "Proxy test details",
+          "lead": "A proxy test now says why a proxy failed.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Each test tries up to three times in the same time as before and reports working, unstable or failed, with the reason: sign-in refused, timeout, address not found, unreachable or a protocol error."
+            }
+          ]
+        },
+        {
+          "id": "bookmarks-bulk",
+          "title": "Delete many bookmarks",
+          "lead": "Select bookmarks and delete them in one go.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Select rows, or all of them with the box in the header; the selection follows the search and the folder tab. Undo brings them all back."
+            }
+          ]
+        },
+        {
+          "id": "cache-cleanup",
+          "title": "Cache of deleted profiles",
+          "lead": "Deleting a profile for good also removes its browser cache.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "On macOS and Linux the cache stayed on disk after a profile was deleted. It now goes with the profile, and cache left by profiles deleted earlier is cleared once. Moving a profile to the trash keeps it, so a restore finds it."
+            }
+          ]
+        },
+        {
+          "id": "relay-sockets",
+          "title": "Proxy relay on Windows",
+          "lead": "The browser no longer holds on to the proxy relay's connections.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "On Windows the browser could inherit the local proxy relay's sockets and keep a stopped relay's port open."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.11.1",
       "date": "2026-11-09",
       "entries": [

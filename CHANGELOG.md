@@ -1,9 +1,17 @@
 # Changelog
 
-## Unreleased
+## v2.12.0
 
 Ports the browser engine and the launcher-side fixes of upstream ProxyShard
-v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
+v2.1.1–v2.1.5 that this fork can use, plus ideas harvested from third-party
+forks and similar open-source launchers (ledger: `docs/V2.12_PORT_LEDGER.md`).
+
+### Upgrade notes
+
+- The engine moves to Chromium 157. Install the engine update when the
+  launcher offers it, with no profile running; profiles are migrated after
+  the swap.
+- macOS: protected video needs this launcher with the 157 engine.
 
 ### Engine
 
@@ -45,6 +53,12 @@ v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
   browser inherited the local proxy relay's sockets and could keep a stopped
   relay's port open. Updated to mio 1.2.4, with a regression test (harvested
   from the shiranzby/ShardBrowser-ProxyChain fork).
+- **Browser cache of deleted profiles (upstream v2.1.3).** Deleting a profile
+  for good (purge from the trash, a temporary profile closing) now removes its
+  browser cache on macOS and Linux, where Chromium keeps it under the OS cache
+  folder; moving to the trash keeps it so a restore finds it. Caches left by
+  profiles deleted earlier are swept once at the first start. On Windows the
+  cache sits inside the profile folder and was already removed.
 
 ### Security
 
@@ -60,11 +74,37 @@ v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
   browser: turned off, the engine shows no name next to the address bar or in
   the window title (useful on a recorded or shared screen). Needs the 157
   engine; an older engine ignores the switch.
+- **Maximized window (upstream v2.1.4).** Profile editor › "Report the window
+  as maximized": the window opens the size of the profile's screen and sites
+  see it maximized; resized, they see its real size. Not offered on phone
+  profiles.
+- **Open a profile from a link.** `shardbrowser://open/<profile id or exact
+  name>` brings the launcher forward and asks before starting that profile.
+  Links can only open: no create, delete, URLs, proxies or launch arguments,
+  and a malformed link is refused with a notice (idea from the
+  mathisspr/ShardBrowser fork, re-implemented with a confirmation).
+- **Cookie import formats.** Import cookies from a Netscape `cookies.txt`,
+  a Cookie-Editor / EditThisCookie export, or a Playwright/Puppeteer cookie
+  list or `storageState`, as well as the launcher's own format, from the
+  profile menu, the API (`text` or `cookies`) or MCP. Skipped entries are
+  reported by line or position with a reason, never with their values
+  (format handling adapted from polyackiy/camoufox-profile-manager, MIT).
+- **Proxy test details.** A proxy test tries up to three times within the
+  same time budget and reports working, unstable or failed, with the reason
+  for a failure: authentication, timeout, DNS, unreachable or protocol error.
 
 ### SDKs
 
 - `CHROMIUM_VERSION` in the Node, Python and Rust SDKs is 157.0.8103.50 (the
   macOS framework path and the fallback when the manifest is unreachable).
+- **Install the engine ahead of time (upstream v2.1.3):** `npx shardx install`
+  and `shardx install` / `python -m shardx install`, with `--force` and
+  `--cache-dir`; in Rust, `Runtime::install`. Suits Docker images.
+- **Graceful close:** stopping a session asks the browser to quit over CDP
+  and waits up to 5 seconds before killing it, so recent saves and logins
+  survive (upstream v2.1.3).
+- Phone profiles report the Chrome for Android build and the `Google Chrome`
+  brand; Apple M-series profiles gain the Chrome 156/157 WebGPU features.
 
 ## v2.11.1
 
