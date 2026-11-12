@@ -342,8 +342,9 @@ sessions even when the initial public checks passed:
 ### Option A: download a release
 
 Download the build for your OS from [GitHub Releases](../../releases),
-then run it. Use `.dmg` for macOS, `.msi` or the portable `.exe` for
-Windows, and `.AppImage` or `.deb` for Linux.
+then run it. Use `.msi` or the portable `.exe` for Windows, and
+`.AppImage` or `.deb` for Linux. Releases from v2.12.0 on ship no macOS
+build; v2.11.1 is the last one with a `.dmg`.
 
 Vietnamese walkthrough: [Hướng dẫn cài đặt](docs/CAI-DAT-TIENG-VIET.md).
 

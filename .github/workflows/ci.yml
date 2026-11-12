@@ -131,41 +131,6 @@ jobs:
         shell: pwsh
         run: Remove-SmbShare -Name shardx-g2-smb -Force -ErrorAction SilentlyContinue
 
-  macos-check:
-    # The hosted arm64 pool repeatedly leaves this job unacquired ("capacity
-    # constraints"); the Intel image compiles the same cfg(target_os = "macos")
-    # code. The release build keeps arm64.
-    runs-on: macos-15-intel
-    name: Rust compiles on macOS
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Rust stable
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            shared/target
-            sdks/rust/target
-          key: macos-check-${{ hashFiles('shared/Cargo.lock', 'sdks/rust/Cargo.lock') }}
-
-      # The macOS-only branches (os_crypt key derivation, cookie decryption,
-      # runtime and host paths) compile nowhere else: a Linux runner cannot
-      # cross-check them because both crates build C code (rusqlite, ring).
-      # Without this job a macOS compile error only surfaces at release time.
-      - name: Shared core compiles
-        run: cargo check --manifest-path shared/Cargo.toml --all-targets
-
-      - name: Rust SDK compiles
-        run: cargo check --manifest-path sdks/rust/Cargo.toml --all-targets --all-features
-
   checks:
     runs-on: ubuntu-22.04
     name: frontend, Rust, and MCP checks

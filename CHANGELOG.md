@@ -12,6 +12,8 @@ forks and similar open-source launchers (ledger: `docs/V2.12_PORT_LEDGER.md`).
   launcher offers it, with no profile running; profiles are migrated after
   the swap.
 - macOS: protected video needs this launcher with the 157 engine.
+- This release ships Windows and Linux builds only. macOS builds stop at
+  v2.11.1, and the in-app updater offers macOS installs no newer version.
 
 ### Engine
 

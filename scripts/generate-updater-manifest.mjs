@@ -31,10 +31,6 @@ const targets = {
     description: "one NSIS setup executable",
     matches: (name) => /setup\.exe$/i.test(name),
   },
-  "darwin-aarch64": {
-    description: "one Apple Silicon app archive",
-    matches: (name) => /\.app\.tar\.gz$/i.test(name),
-  },
   "linux-x86_64": {
     description: "one x86_64 AppImage",
     matches: (name) => /\.AppImage$/.test(name),

@@ -11,7 +11,7 @@ Vào trang [GitHub Releases](https://github.com/huuhungn/ShardBrowser/releases/l
 | --- | --- | --- |
 | Windows | `ShardX.Launcher_2.2.0_x64-setup.exe` | Bản cài đặt thông thường, có tự động cập nhật |
 | Windows (không cài đặt) | `ShardX-Launcher-portable-win-x64.exe` | Chạy thẳng, không ghi vào máy |
-| macOS (Apple Silicon) | `.dmg` bản `aarch64` | |
+| macOS (Apple Silicon) | `.dmg` bản `aarch64` | Chỉ có đến bản 2.11.1; từ 2.12.0 không phát hành bản macOS |
 | Linux | `.AppImage` hoặc `.deb` | |
 
 ### Kiểm tra tệp tải về (khuyến nghị)
