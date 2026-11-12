@@ -27,6 +27,9 @@ pub struct Settings {
     /// the host's real camera contradicts the fingerprint and links profiles.
     #[serde(default = "default_true")]
     pub camera_enabled: bool,
+    /// The profile's name next to the address bar and in the window title.
+    #[serde(default = "default_true")]
+    pub show_profile_name: bool,
     /// Field kinds the helper reacts to, as the engine names them. Empty = all.
     #[serde(default)]
     pub helper_triggers: Vec<String>,
@@ -111,6 +114,7 @@ pub fn defaults() -> Settings {
         screen_resolution_mode: Some("fingerprint".into()),
         helper_enabled: default_true(),
         camera_enabled: default_true(),
+        show_profile_name: default_true(),
         helper_triggers: Vec::new(),
         minimize_to_tray: default_minimize_to_tray(),
         launch_at_login: false,

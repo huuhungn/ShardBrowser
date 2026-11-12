@@ -204,6 +204,8 @@ pub async fn launch_profile_synced(
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
     resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    // A version Chrome could not report never reaches the engine, wherever the profile came from.
+    crate::settle_platform_version(&mut raw);
     fill_window_from_screen(&mut raw);
     // The claimed screen still has to fit this monitor: the profile may have
     // moved to a smaller machine since it was created, and a window cannot be
@@ -253,12 +255,13 @@ pub async fn launch_profile_synced(
             eprintln!("[launcher] profile icon unavailable: {e:#}");
         }
     }
-    // Same accent behind the profile-name pill in the omnibox, so the icon and
+    // Turned off in Settings, no name in the omnibox or the window title.
+    // Otherwise the same accent behind the profile-name pill, so the icon and
     // the window never disagree about a profile's colour. Left off for "auto":
-    // the pill then keeps the toolbar colour, which is the browser's own
-    // default and follows the theme.
-    if let Some(c) = color.as_deref() {
-        cmd.arg(format!("--shardx-profile-pill-color={c}"));
+    // the pill then keeps the toolbar colour, which follows the theme.
+    let show_name = settings::load().map_or(true, |s| s.show_profile_name);
+    for arg in profile_name_args(show_name, color.as_deref()) {
+        cmd.arg(arg);
     }
     cmd.arg("--no-first-run");
 
@@ -713,6 +716,16 @@ impl Drop for CancelScope {
     }
 }
 
+/// The engine switches for the profile-name pill: hidden, or tinted with the
+/// profile's colour when it has one.
+fn profile_name_args(show: bool, color: Option<&str>) -> Vec<String> {
+    match (show, color) {
+        (false, _) => vec!["--shardx-hide-profile-name".into()],
+        (true, Some(c)) => vec![format!("--shardx-profile-pill-color={c}")],
+        (true, None) => Vec::new(),
+    }
+}
+
 /// Whether the operator's extra arguments choose a proxy themselves.
 fn names_a_proxy(extra_args: &str) -> bool {
     settings::parse_extra_args(extra_args).iter().any(|a| {
@@ -1096,6 +1109,20 @@ mod direct_profile_tests {
             "--mute-audio --proxy-server=http://10.0.0.1:3128"
         ));
         assert!(names_a_proxy("--proxy-pac-url=http://corp/proxy.pac"));
+    }
+
+    #[test]
+    fn a_hidden_profile_name_drops_the_pill_colour_too() {
+        use super::profile_name_args;
+        assert_eq!(
+            profile_name_args(false, Some("#3366ff")),
+            ["--shardx-hide-profile-name"]
+        );
+        assert_eq!(
+            profile_name_args(true, Some("#3366ff")),
+            ["--shardx-profile-pill-color=#3366ff"]
+        );
+        assert!(profile_name_args(true, None).is_empty());
     }
 }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Button, DialogModal, cn } from "@proxyshard/shardx-ui-kit";
+import { Button, Checkbox, DialogModal, cn } from "@proxyshard/shardx-ui-kit";
 import { Topbar } from "../../shared/ui/Topbar";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { useStoreChanged } from "../../shared/hooks/useStoreChanged";
@@ -67,6 +67,7 @@ export function BookmarksPage() {
   const editing = useBookmarks((s) => s.editing);
   const setEditing = useBookmarks((s) => s.setEditing);
   const remove = useBookmarks((s) => s.remove);
+  const removeMany = useBookmarks((s) => s.removeMany);
   const search = useBookmarks((s) => s.search);
   const setSearch = useBookmarks((s) => s.setSearch);
   const folder = useBookmarks((s) => s.folder);
@@ -89,6 +90,13 @@ export function BookmarksPage() {
         (!q || b.title.toLowerCase().includes(q) || b.url.toLowerCase().includes(q)),
     );
   }, [items, search, folder]);
+
+  // Picks follow the filter: the header box and the bar act on the rows shown.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const picked = useMemo(() => shown.filter((b) => selected.has(b.id)), [shown, selected]);
+  const allShownPicked = shown.length > 0 && picked.length === shown.length;
+  const toggle = (ids: string[], on: boolean) =>
+    setSelected((s) => { const next = new Set(s); for (const id of ids) on ? next.add(id) : next.delete(id); return next; });
 
   const countIn = (f: string) =>
     f === "" ? profiles.length : profiles.filter((p) => p.folder === f).length;
@@ -138,12 +146,47 @@ export function BookmarksPage() {
         </Button>
       </div>
 
+      {picked.length > 0 && (
+        <div className="mb-3 flex flex-wrap items-center gap-2 rounded-8 bg-primary-alpha-10 py-1 pl-3 pr-1 text-label-xs text-primary-base ring-1 ring-inset ring-primary-alpha-24">
+          <span>{t("bookmarks.selectedCount", { n: picked.length })}</span>
+          <Button
+            variant="error" mode="stroke" size="2xsmall"
+            leftIcon={<DeleteIcon className="size-3.5" />}
+            onClick={() => void removeMany(picked).then((n) => { if (n > 0) setSelected(new Set()); })}
+          >
+            {t("common.delete")}
+          </Button>
+          <Button variant="neutral" mode="ghost" size="2xsmall" onClick={() => setSelected(new Set())}>
+            {t("bookmarks.clear")}
+          </Button>
+        </div>
+      )}
+
       <div className="overflow-hidden rounded-12 bg-bg-white-0 shadow-[var(--shadow-xs)] ring-1 ring-inset ring-stroke-soft-200">
+        {shown.length > 0 && (
+          <div className="grid grid-cols-[28px_1fr_1fr_200px_100px] items-center gap-3 bg-bg-weak-50 px-4 py-2 text-subheading-2xs text-text-soft-400">
+            <Checkbox
+              aria-label={t("bookmarks.selectAll")}
+              checked={allShownPicked}
+              indeterminate={picked.length > 0 && !allShownPicked}
+              onChange={(e) => toggle(shown.map((b) => b.id), e.target.checked)}
+            />
+            <div>{t("bookmarks.titleField")}</div>
+            <div>{t("bookmarks.url")}</div>
+            <div>{t("bookmarks.folder")}</div>
+            <div />
+          </div>
+        )}
         {shown.map((b) => (
           <div
             key={b.id}
-            className="grid grid-cols-[1fr_1fr_200px_100px] items-center gap-3 border-t border-stroke-soft-200 px-4 py-2.5 first:border-t-0 transition-colors hover:bg-bg-weak-50"
+            className="grid grid-cols-[28px_1fr_1fr_200px_100px] items-center gap-3 border-t border-stroke-soft-200 px-4 py-2.5 first:border-t-0 transition-colors hover:bg-bg-weak-50"
           >
+            <Checkbox
+              aria-label={t("bookmarks.select", { name: b.title || b.url })}
+              checked={selected.has(b.id)}
+              onChange={(e) => toggle([b.id], e.target.checked)}
+            />
             <div
               className="min-w-0 cursor-pointer truncate text-label-xs text-text-strong-950 transition-colors hover:text-primary-base"
               onClick={() => setEditing(b)}

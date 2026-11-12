@@ -29,6 +29,8 @@ export type BookmarkStore = {
   setFolder: (f: string) => void;
   save: (b: Bookmark) => Promise<void>;
   remove: (b: Bookmark) => Promise<void>;
+  /** Asks once, deletes them all, then offers Undo (the same ids are saved back). Resolves to how many went. */
+  removeMany: (list: Bookmark[]) => Promise<number>;
 };
 
 export const useBookmarks = create<BookmarkStore>((set, get) => ({
@@ -76,5 +78,36 @@ export const useBookmarks = create<BookmarkStore>((set, get) => ({
       await bookmarkDelete(b.id);
       await get().reload();
     } catch (e) { toast.err(safeUiError(e)); }
+  },
+
+  removeMany: async (list) => {
+    const n = list.length;
+    if (n === 0) return 0;
+    const ok = await confirmModal({
+      title: t("bookmarks.deleteManyTitle"),
+      message: t(n === 1 ? "bookmarks.deleteManyAskOne" : "bookmarks.deleteManyAskMany", { n }),
+      danger: true,
+    });
+    if (ok !== true) return 0;
+    const gone: Bookmark[] = [];
+    for (const b of list) {
+      try { await bookmarkDelete(b.id); gone.push(b); }
+      catch (e) { toast.err(safeUiError(e)); }
+    }
+    // An editor left open on a deleted bookmark would save it back.
+    if (gone.some((b) => b.id === get().editing?.id)) set({ editing: null });
+    await get().reload();
+    if (gone.length === 0) return 0;
+    toast.ok(t(gone.length === 1 ? "bookmarks.deletedOne" : "bookmarks.deletedMany", { n: gone.length }), {
+      label: t("bookmarks.undo"),
+      onClick: async () => {
+        for (const b of gone) {
+          try { await bookmarkSave(b); }
+          catch (e) { toast.err(safeUiError(e)); }
+        }
+        await get().reload();
+      },
+    });
+    return gone.length;
   },
 }));

@@ -27,6 +27,7 @@ mod hermes_mcp;
 pub mod http_session;
 mod key_file;
 mod launch;
+mod platform_version;
 mod profile_icon;
 mod recovery_import;
 pub mod root_bootstrap;
@@ -477,52 +478,7 @@ fn infer_gpu_preset_id(config: &serde_json::Map<String, Value>) -> Option<String
     renderer_match
 }
 
-// ---- Realistic Sec-CH-UA-Platform-Version pools (spread per profile) ----
-
-// macOS Sonoma 14.x, Sequoia 15.x, Tahoe 26.x.
-const MACOS_PLATFORM_VERSIONS: &[&str] = &[
-    "14.6.1", "14.7", "14.7.1", "14.7.2", "15.4", "15.4.1", "15.5", "15.6", "15.6.1", "15.7",
-    "26.0", "26.0.1", "26.1",
-];
-
-// Win 10 21H1+ ("10.0.0"), Win 11 21H2..25H2 ("13"–"17"); weighted to 22H2/23H2/24H2.
-const WINDOWS_PLATFORM_VERSIONS: &[&str] = &[
-    "10.0.0", "13.0.0", "14.0.0", "14.0.0", "14.0.0", "15.0.0", "15.0.0", "15.0.0", "15.0.0",
-    "16.0.0", "16.0.0", "16.0.0", "17.0.0",
-];
-
-// LTS kernels + current mainline.
-const LINUX_PLATFORM_VERSIONS: &[&str] = &[
-    "5.15.0", "6.1.0", "6.5.0", "6.6.0", "6.8.0", "6.10.0", "6.11.0", "6.12.0", "6.14.0", "6.15.0",
-    "6.16.0",
-];
-
-/// Write a random platform_version into navigator + client_hints; unknown platforms left alone.
-pub(crate) fn randomize_platform_version(payload: &mut serde_json::Map<String, Value>) {
-    let platform = payload
-        .get("navigator")
-        .and_then(|n| n.get("platform"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let pool: &[&str] = match platform {
-        "macOS" => MACOS_PLATFORM_VERSIONS,
-        "Windows" => WINDOWS_PLATFORM_VERSIONS,
-        "Linux" => LINUX_PLATFORM_VERSIONS,
-        _ => return,
-    };
-    let pick_idx = (uuid::Uuid::new_v4().as_bytes()[0] as usize) % pool.len();
-    let version = pool[pick_idx].to_string();
-
-    if let Some(nav) = payload.get_mut("navigator").and_then(|v| v.as_object_mut()) {
-        nav.insert("platform_version".into(), Value::String(version.clone()));
-    }
-    if let Some(ch) = payload
-        .get_mut("client_hints")
-        .and_then(|v| v.as_object_mut())
-    {
-        ch.insert("platform_version".into(), Value::String(version));
-    }
-}
+pub(crate) use platform_version::{randomize_platform_version, settle_platform_version};
 
 /// Realistic (hardware_concurrency, deviceMemory) combos per Mac model id.
 fn mac_hw_configs(model: &str) -> Option<&'static [(u32, u32)]> {
@@ -1270,6 +1226,10 @@ fn enrich_picks_for_preset(preset_id: String) -> Result<PresetEnrichPicks, Strin
         "navigator".into(),
         serde_json::json!({ "platform": platform }),
     );
+    // The claimed Apple chip bounds the macOS it can report.
+    if let Some(webgl) = entry.payload.get("webgl") {
+        payload.insert("webgl".into(), webgl.clone());
+    }
     // Mirror enrich_new_config order: platform_version first, then hardware.
     randomize_platform_version(&mut payload);
     randomize_hardware(&mut payload);
