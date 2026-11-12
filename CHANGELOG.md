@@ -41,6 +41,10 @@ v2.1.1–v2.1.5 that this fork can use (ledger: `docs/V2.12_PORT_LEDGER.md`).
 - **Delete many bookmarks.** The Bookmarks page has row checkboxes and a
   select-all box that follows the search and folder tab; delete the selection
   in one go, and Undo in the toast brings them all back.
+- **Hide the profile name in the browser.** Settings › Profile name in the
+  browser: turned off, the engine shows no name next to the address bar or in
+  the window title (useful on a recorded or shared screen). Needs the 157
+  engine; an older engine ignores the switch.
 
 ### SDKs
 

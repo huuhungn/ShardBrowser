@@ -304,6 +304,17 @@ export function SettingsPage() {
         />
       </SettingsCard>
 
+      <SettingsCard title={t("settings.profileName.title")}>
+        <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
+          {t("settings.profileName.help")}
+        </p>
+        <Switch
+          label={t("settings.profileName.show")}
+          checked={s.show_profile_name ?? true}
+          onChange={(checked) => setS({ ...s, show_profile_name: checked })}
+        />
+      </SettingsCard>
+
       <SettingsCard title={t("settings.dataRoot.title")}>
         <DataRootCard />
       </SettingsCard>

@@ -21,6 +21,7 @@ export type Settings = {
   helper_triggers?: string[];
   /** Profile's camera is ShardX's rather than the machine's. */
   camera_enabled?: boolean;
+  show_profile_name?: boolean;
   /** Hide to the tray on close instead of quitting. */
   minimize_to_tray?: boolean;
   /** Appended to every launch, one per line. Applied last, so a repeat wins. */
