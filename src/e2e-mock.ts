@@ -168,7 +168,12 @@ let proxyListsInFlight = 0;
 let maxProxyListsInFlight = 0;
 
 // __e2eOpenLinks: what the backend queued for open_link_take, set by a test.
-type E2EWindow = Window & { __resolveUpdateCheck?: () => void; __e2eOpenLinks?: (string | null)[] };
+// __e2eStartedElsewhere: profiles a test starts behind the UI's back.
+type E2EWindow = Window & {
+  __resolveUpdateCheck?: () => void;
+  __e2eOpenLinks?: (string | null)[];
+  __e2eStartedElsewhere?: string[];
+};
 
 function updateInfo() {
   const available = params.get("update") !== "none";
@@ -946,18 +951,19 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       }
     }
     case "process_list":
-      return profiles.some((profile) => profile.id === "profile-beta")
-        ? [{
-            profile_id: "profile-beta",
-            pid: 4242,
-            cdp: {
-              port: 9222,
-              http_url: "http://127.0.0.1:9222",
-              web_socket_debugger_url: "ws://127.0.0.1:9222/devtools/browser/fixture",
-            },
-            uptime_ms: 5_000,
-          }]
-        : [];
+      return [
+        ...(profiles.some((profile) => profile.id === "profile-beta") ? ["profile-beta"] : []),
+        ...((window as E2EWindow).__e2eStartedElsewhere ?? []),
+      ].map((profile_id) => ({
+        profile_id,
+        pid: 4242,
+        cdp: {
+          port: 9222,
+          http_url: "http://127.0.0.1:9222",
+          web_socket_debugger_url: "ws://127.0.0.1:9222/devtools/browser/fixture",
+        },
+        uptime_ms: 5_000,
+      }));
     case "fingerprint_list":
       return fingerprints;
     case "gpu_caps":

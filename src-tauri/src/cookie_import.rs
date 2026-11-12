@@ -48,12 +48,13 @@ impl Parsed {
     }
 }
 
-/// Unix seconds below 1e11 (year 5138); milliseconds below 1e14; microseconds
-/// below 1e17. The ranges do not overlap for any date from 1973 to 5138, so
-/// the magnitude alone identifies the unit. shortcut: Chromium's 1601-epoch
-/// microseconds (about 1.3e16 today) would read as Unix microseconds, so they
-/// are not supported.
-const SECS_LIMIT: f64 = 1e11;
+/// Unix seconds below 1e12 (year 33658, so a "never" of year 9999 stays
+/// seconds); milliseconds below 1e14; microseconds below 1e17. The ranges do
+/// not overlap for any date from 2001 to 5138, so the magnitude alone
+/// identifies the unit; a millisecond expiry before 2001 is long past anyway.
+/// shortcut: Chromium's 1601-epoch microseconds (about 1.3e16 today) would read
+/// as Unix microseconds, so they are not supported.
+const SECS_LIMIT: f64 = 1e12;
 const MILLIS_LIMIT: f64 = 1e14;
 const MICROS_LIMIT: f64 = 1e17;
 
@@ -501,14 +502,18 @@ mod tests {
 
     #[test]
     fn expiry_unit_boundaries() {
-        // seconds: below 1e11
+        // seconds: below 1e12, including a year-9999 "never"
         assert_eq!(normalise_expiry(1_900_000_000.0), Ok(Some(1_900_000_000.0)));
         assert_eq!(
-            normalise_expiry(99_999_999_999.0),
-            Ok(Some(99_999_999_999.0))
+            normalise_expiry(253_402_300_799.0),
+            Ok(Some(253_402_300_799.0))
         );
-        // milliseconds: [1e11, 1e14)
-        assert_eq!(normalise_expiry(1e11), Ok(Some(1e8)));
+        assert_eq!(
+            normalise_expiry(999_999_999_999.0),
+            Ok(Some(999_999_999_999.0))
+        );
+        // milliseconds: [1e12, 1e14)
+        assert_eq!(normalise_expiry(1e12), Ok(Some(1e9)));
         assert_eq!(
             normalise_expiry(1_900_000_000_000.0),
             Ok(Some(1_900_000_000.0))

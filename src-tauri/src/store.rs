@@ -117,13 +117,23 @@ fn cache_mapping() -> Option<(PathBuf, PathBuf)> {
 pub fn browser_cache_twin(udd: &Path) -> Option<PathBuf> {
     let (config, cache) = cache_mapping()?;
     let rel = udd.strip_prefix(config).ok()?;
-    (!rel.as_os_str().is_empty()).then(|| cache.join(rel))
+    // Never a `..` that climbs out of the cache root.
+    let normal = rel
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    (normal && !rel.as_os_str().is_empty()).then(|| cache.join(rel))
 }
 
 /// Removes that cache with the profile: it is not inside the folder the profile is deleted with.
 /// A symlink in its place is unlinked, never followed.
 pub fn remove_browser_cache(udd: &Path) {
-    if let Some(twin) = browser_cache_twin(udd) {
+    let Some(twin) = browser_cache_twin(udd) else {
+        return;
+    };
+    // One profile's folder directly under the twin of `user-data/`, never that root itself
+    // (`user-data/.` normalises to it) nor anything beside it.
+    let root_twin = user_data_root().ok().and_then(|r| browser_cache_twin(&r));
+    if root_twin.is_some_and(|root| twin.parent() == Some(root.as_path())) {
         let _ = std::fs::remove_dir_all(twin);
     }
 }
@@ -454,6 +464,43 @@ mod cache_sweep_tests {
         std::fs::create_dir_all(twin.join(&later)).unwrap();
         assert_eq!(sweep_orphan_caches(), 0, "it ran once");
         assert!(twin.join(&later).exists());
+        set_cache_mapping(None);
+    }
+
+    #[test]
+    fn removing_a_cache_never_reaches_beyond_one_profile_folder() {
+        let _lock = config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (config, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        set_config_root(Some(config.path().to_path_buf()));
+        set_cache_mapping(Some((
+            config.path().to_path_buf(),
+            cache.path().to_path_buf(),
+        )));
+        let twin = cache.path().join("user-data");
+        let (gone, kept) = (uuid(), uuid());
+        for id in [&gone, &kept] {
+            std::fs::create_dir_all(twin.join(id).join("Cache_Data")).unwrap();
+        }
+        let root = user_data_root().unwrap();
+        for bad in [
+            root.join("."),
+            root.join(".."),
+            root.clone(),
+            config.path().join("x"),
+        ] {
+            remove_browser_cache(&bad);
+            assert!(
+                twin.join(&kept).exists(),
+                "{} removed too much",
+                bad.display()
+            );
+        }
+        assert!(cache.path().exists());
+        remove_browser_cache(&root.join(&gone));
+        assert!(!twin.join(&gone).exists());
+        assert!(twin.join(&kept).exists());
         set_cache_mapping(None);
     }
 

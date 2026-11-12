@@ -1,6 +1,142 @@
 {
   "releases": [
     {
+      "version": "2.12.0",
+      "date": "2026-11-12",
+      "entries": [
+        {
+          "id": "chromium-157",
+          "title": "Chromium 157",
+          "lead": "Profile giờ chạy trên Chromium 157 và tự nhận là Chrome 157.",
+          "tag": "new",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Engine có bản vá bảo mật Chrome phát hành ngày 9 tháng 11 cho lỗ hổng xử lý XML đang bị khai thác, cùng các bản sửa engine từ 156: WebRTC sau proxy, đọc canvas, WebGL và WebGPU, âm thanh, video có bảo vệ và phông chữ. Hãy cài bản cập nhật engine khi launcher đề nghị, lúc không có profile nào đang chạy. Profile được đưa lên 157 sau khi cập nhật."
+            }
+          ]
+        },
+        {
+          "id": "os-version",
+          "title": "Phiên bản hệ điều hành",
+          "lead": "Profile báo phiên bản Windows và macOS có thật.",
+          "tag": "fix",
+          "scope": "browser",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Phiên bản mà Chrome không bao giờ báo được sửa một lần, và sửa lại trước mỗi lần khởi động. Profile Mac báo bản macOS mà chip Apple của nó chạy được."
+            }
+          ]
+        },
+        {
+          "id": "maximized-window",
+          "title": "Cửa sổ phóng to",
+          "lead": "Cửa sổ của profile có thể mở ở trạng thái phóng to.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Bật \"Báo cửa sổ ở trạng thái phóng to\" trong trình sửa profile. Cửa sổ mở bằng kích thước màn hình của profile và trang web thấy nó đang phóng to. Khi bạn đổi kích thước, trang web thấy kích thước thật. Profile điện thoại không có tùy chọn này."
+            }
+          ]
+        },
+        {
+          "id": "hide-profile-name",
+          "title": "Tên hồ sơ trong trình duyệt",
+          "lead": "Có thể ẩn tên profile cạnh thanh địa chỉ.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Tắt \"Hiện tên hồ sơ trong trình duyệt\" trong Cài đặt, ví dụ trước khi quay hay chia sẻ màn hình. Dù bật hay tắt, trang web đều không thấy tên này."
+            }
+          ]
+        },
+        {
+          "id": "open-link",
+          "title": "Mở profile từ liên kết",
+          "lead": "shardbrowser://open/<profile> mở profile sau khi bạn xác nhận.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Dùng id của profile hoặc đúng tên của nó. Launcher hiện lên và hỏi trước khi khởi động profile. Liên kết chỉ mở được profile: không tạo, không xóa, không truyền địa chỉ, proxy hay cài đặt nào."
+            }
+          ]
+        },
+        {
+          "id": "cookie-formats",
+          "title": "Thêm định dạng cookie",
+          "lead": "Nhập cookie đọc được cookies.txt, bản xuất của Cookie-Editor và Playwright.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Chọn tệp .txt hoặc .json từ menu của profile. Mục nào không nhập được sẽ được liệt kê theo dòng hoặc vị trí kèm lý do; giá trị cookie không bao giờ hiện ra."
+            }
+          ]
+        },
+        {
+          "id": "proxy-test",
+          "title": "Chi tiết kiểm tra proxy",
+          "lead": "Kiểm tra proxy giờ cho biết vì sao proxy lỗi.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Mỗi lần kiểm tra thử tối đa ba lần trong cùng khoảng thời gian như trước, rồi báo hoạt động, chập chờn hay lỗi, kèm lý do: bị từ chối đăng nhập, hết thời gian, không tìm thấy địa chỉ, không kết nối được hoặc lỗi giao thức."
+            }
+          ]
+        },
+        {
+          "id": "bookmarks-bulk",
+          "title": "Xóa nhiều dấu trang",
+          "lead": "Chọn dấu trang và xóa một lần.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Chọn từng dòng, hoặc chọn tất cả bằng ô ở tiêu đề; lựa chọn đi theo ô tìm kiếm và thẻ thư mục. Hoàn tác sẽ đưa tất cả trở lại."
+            }
+          ]
+        },
+        {
+          "id": "cache-cleanup",
+          "title": "Bộ nhớ đệm của profile đã xóa",
+          "lead": "Xóa hẳn một profile giờ xóa luôn bộ nhớ đệm trình duyệt của nó.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trên macOS và Linux, bộ nhớ đệm còn nằm lại trên đĩa sau khi xóa profile. Giờ nó bị xóa cùng profile, và bộ nhớ đệm do các profile đã xóa trước đây để lại được dọn một lần. Chuyển profile vào thùng rác thì vẫn giữ, để khi khôi phục vẫn còn."
+            }
+          ]
+        },
+        {
+          "id": "relay-sockets",
+          "title": "Bộ chuyển tiếp proxy trên Windows",
+          "lead": "Trình duyệt không còn giữ kết nối của bộ chuyển tiếp proxy.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trên Windows, trình duyệt có thể thừa kế socket của bộ chuyển tiếp proxy cục bộ và giữ cổng của một bộ chuyển tiếp đã dừng."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.11.1",
       "date": "2026-11-09",
       "entries": [

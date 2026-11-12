@@ -49,3 +49,16 @@ test("a running profile is not asked about, an unknown or malformed link gets a 
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await launches(page)).toBeNull();
 });
+
+test("a profile started while the dialog is open is not stopped by Start", async ({ page }) => {
+  await open(page);
+  await link(page, "profile-alpha");
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("Start profile");
+  await page.evaluate(() => {
+    (window as unknown as { __e2eStartedElsewhere?: string[] }).__e2eStartedElsewhere = ["profile-alpha"];
+  });
+  await dialog.getByRole("button", { name: "Start", exact: true }).click();
+  await expect(page.getByText("is already running.").first()).toBeVisible();
+  expect(await launches(page)).toBeNull();
+});

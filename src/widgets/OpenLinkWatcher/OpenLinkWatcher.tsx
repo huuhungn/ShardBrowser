@@ -8,6 +8,11 @@ import { t } from "../../shared/i18n";
 /// A shardbrowser://open/<profile> link names a profile and nothing else, and any
 /// web page can fire one. So it never starts anything by itself: the operator
 /// sees the profile's name and confirms first.
+async function isRunning(id: string) {
+  const s = useProfile.getState();
+  return !!s.running[id] || s.startBusy.has(id) || (await processList()).some((p) => p.profile_id === id);
+}
+
 async function openNamed(ref: string) {
   const profiles = await profileList();
   const byId = profiles.find((p) => p.id === ref);
@@ -15,9 +20,8 @@ async function openNamed(ref: string) {
   if (!byId && named.length > 1) return toast.err(t("openLink.ambiguous", { name: ref }));
   const profile = byId ?? named[0];
   if (!profile) return toast.err(t("openLink.notFound"));
-  if ((await processList()).some((p) => p.profile_id === profile.id)) {
-    return toast.info(t("openLink.alreadyRunning", { name: profile.name }));
-  }
+  const already = () => toast.info(t("openLink.alreadyRunning", { name: profile.name }));
+  if (await isRunning(profile.id)) return already();
   const ok = await confirmModal({
     title: t("openLink.confirmTitle"),
     message: t("openLink.confirm", { name: profile.name }),
@@ -26,7 +30,10 @@ async function openNamed(ref: string) {
       { label: t("openLink.start"), value: true, primary: true },
     ],
   });
-  if (ok === true) await useProfile.getState().startStop(profile);
+  if (ok !== true) return;
+  // startStop toggles: a profile started while the dialog was open must not be stopped.
+  if (await isRunning(profile.id)) return already();
+  await useProfile.getState().startStop(profile);
 }
 
 /// Takes the links the backend queued (a cold start brings one before this
