@@ -204,6 +204,8 @@ pub async fn launch_profile_synced(
     // closed-source engine until the coherence gate in the design note passes.
     remove_unavailable_custom_fonts(&mut raw);
     resolve_auto_fields(&mut raw, bound_proxy.as_ref()).await;
+    // A version Chrome could not report never reaches the engine, wherever the profile came from.
+    crate::settle_platform_version(&mut raw);
     fill_window_from_screen(&mut raw);
     // The claimed screen still has to fit this monitor: the profile may have
     // moved to a smaller machine since it was created, and a window cannot be

@@ -655,7 +655,11 @@ mod tests {
         ] {
             let mut flags = 0;
             assert_ne!(unsafe { GetHandleInformation(socket as _, &mut flags) }, 0);
-            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{kind} socket is inheritable");
+            assert_eq!(
+                flags & HANDLE_FLAG_INHERIT,
+                0,
+                "{kind} socket is inheritable"
+            );
         }
     }
 

@@ -18,7 +18,7 @@ const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
-pub const CHROMIUM_VERSION: &str = "156.0.8078.48";
+pub const CHROMIUM_VERSION: &str = "157.0.8103.50";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ArchiveSpec {
@@ -297,6 +297,10 @@ struct RemoteManifest {
     /// Lowest launcher version this engine build can be driven by; absent means
     /// any. An older launcher gets a browser it cannot configure.
     min_launcher_version: Option<String>,
+    /// The Chrome for Android build of the same major, which phone profiles
+    /// report: Android ships its own build numbers, and a phone with a desktop
+    /// one is a build no phone has.
+    android_chromium_version: Option<String>,
 }
 
 /// Fetch the version manifest (GitHub raw) — one request yielding every
@@ -346,6 +350,7 @@ async fn fetch_manifest_from(url: &str) -> RemoteManifest {
                 _ => None,
             }),
             min_launcher_version: str_field("min_launcher_version"),
+            android_chromium_version: str_field("android_chromium_version"),
         })
     }
     inner(url).await.unwrap_or_default()
@@ -364,15 +369,8 @@ fn migrate_dir_to(
     grease_brand: Option<&str>,
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
+    android_version: Option<&str>,
 ) -> Result<usize> {
-    let parts: Vec<&str> = chromium_version.split('.').collect();
-    if parts.len() != 4 {
-        return Ok(0);
-    }
-    let major = parts[0];
-    let build: i64 = parts[2].parse().unwrap_or(0);
-    let patch: i64 = parts[3].parse().unwrap_or(0);
-
     let mut n = 0usize;
     for ent in fs::read_dir(dir)?.flatten() {
         let p = ent.path();
@@ -385,6 +383,44 @@ fn migrate_dir_to(
         let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        if migrate_value(
+            &mut cfg,
+            chromium_version,
+            grease_brand,
+            grease_version,
+            tls,
+            android_version,
+        ) {
+            fs::write(&p, serde_json::to_string_pretty(&cfg)?)?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// One profile's config brought to the engine descriptor; whether it changed.
+fn migrate_value(
+    cfg: &mut serde_json::Value,
+    chromium_version: &str,
+    grease_brand: Option<&str>,
+    grease_version: Option<&str>,
+    tls: Option<&serde_json::Value>,
+    android_version: Option<&str>,
+) -> bool {
+    let parts: Vec<&str> = chromium_version.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let major = parts[0];
+    // A phone reports the Android build of this major, when the manifest names one.
+    let chromium_version = android_version
+        .filter(|v| v.split('.').count() == 4 && v.split('.').next() == Some(major))
+        .filter(|_| cfg.as_object().is_some_and(claims_mobile))
+        .unwrap_or(chromium_version);
+    let parts: Vec<&str> = chromium_version.split('.').collect();
+    let build: i64 = parts[2].parse().unwrap_or(0);
+    let patch: i64 = parts[3].parse().unwrap_or(0);
+    {
         let mut changed = false;
 
         // navigator.user_agent: replace the Chrome/<ver> token with major.0.0.0.
@@ -448,12 +484,111 @@ fn migrate_dir_to(
             }
         }
 
-        if changed {
-            fs::write(&p, serde_json::to_string_pretty(&cfg)?)?;
-            n += 1;
+        if add_apple_webgpu_features(cfg) {
+            changed = true;
         }
+        if add_chrome_brand(cfg) {
+            changed = true;
+        }
+        if cfg
+            .as_object_mut()
+            .is_some_and(crate::settle_platform_version)
+        {
+            changed = true;
+        }
+        changed
     }
-    Ok(n)
+}
+
+/// Mirrors the engine's fingerprint::ProfileClaimsMobile(): the same three
+/// signals, so launcher and engine agree on what a phone is. navigator.platform
+/// is not one of them: Chrome for Android says "Linux armv8l" there.
+fn claims_mobile(config: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let ch = config.get("client_hints");
+    let lower = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    ch.and_then(|c| c.get("mobile"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || lower(ch.and_then(|c| c.get("platform"))).starts_with("android")
+        || lower(config.get("navigator").and_then(|n| n.get("user_agent"))).contains("android")
+}
+
+/// The brand Chrome lists in `userAgentData.brands` and `Sec-CH-UA`, Android included.
+const CHROME_BRAND: &str = "Google Chrome";
+
+/// Names the brand on a phone profile that names none: Android templates lacked it, and the
+/// brand list then held only "Chromium" and GREASE. A brand the profile names stays.
+fn add_chrome_brand(cfg: &mut serde_json::Value) -> bool {
+    if !cfg.as_object().is_some_and(claims_mobile) {
+        return false;
+    }
+    let Some(ch) = cfg.get_mut("client_hints").and_then(|v| v.as_object_mut()) else {
+        return false;
+    };
+    if ch
+        .get("brand")
+        .and_then(|v| v.as_str())
+        .is_some_and(|b| !b.is_empty())
+    {
+        return false;
+    }
+    ch.insert("brand".into(), CHROME_BRAND.into());
+    true
+}
+
+/// WebGPU features Chrome 156 reports on Apple M-series that older templates lack.
+const APPLE_WEBGPU_ADDED: &[&str] = &["texture-compression-unaligned"];
+/// Chrome 157 adds these from M2 on (Dawn: Apple8 with Mac2, or Apple9); M1 has none.
+const APPLE_M2_WEBGPU_ADDED: &[&str] = &["atomic-vec2u-min-max"];
+
+/// Adds `APPLE_WEBGPU_ADDED` (and from M2 on `APPLE_M2_WEBGPU_ADDED`) to an Apple M-series
+/// `webgpu.features`; touches nothing else. An absent or empty list means "the host's own".
+fn add_apple_webgpu_features(cfg: &mut serde_json::Value) -> bool {
+    let generation: Option<u32> = cfg
+        .pointer("/webgl/renderer")
+        .and_then(|v| v.as_str())
+        .and_then(|r| r.find("Apple M").map(|i| &r[i + 7..]))
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        });
+    let apple_adapter = cfg.pointer("/webgpu/vendor").and_then(|v| v.as_str()) == Some("apple");
+    let Some(generation) = generation.filter(|_| apple_adapter) else {
+        return false;
+    };
+    let Some(list) = cfg
+        .pointer_mut("/webgpu/features")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+    if list.is_empty() {
+        return false;
+    }
+    let m2: &[&str] = if generation >= 2 {
+        APPLE_M2_WEBGPU_ADDED
+    } else {
+        &[]
+    };
+    let mut changed = false;
+    for &feat in APPLE_WEBGPU_ADDED.iter().chain(m2) {
+        if list.iter().any(|v| v.as_str() == Some(feat)) {
+            continue;
+        }
+        let at = list
+            .iter()
+            .position(|v| v.as_str().is_some_and(|s| s > feat))
+            .unwrap_or(list.len());
+        list.insert(at, serde_json::Value::String(feat.to_string()));
+        changed = true;
+    }
+    changed
 }
 
 /// Migrate both the saved profiles AND the fingerprint library (bundled +
@@ -465,16 +600,33 @@ fn migrate_all_to(
     grease_brand: Option<&str>,
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
+    android_version: Option<&str>,
 ) -> usize {
     // Profile files are rewritten here without a claim; a downgrade in flight
     // is moving them, so the two take turns.
     let _flow = crate::team::downgrade::exclusive();
     let mut n = 0;
     if let Ok(d) = crate::store::profiles_dir() {
-        n += migrate_dir_to(&d, chromium_version, grease_brand, grease_version, tls).unwrap_or(0);
+        n += migrate_dir_to(
+            &d,
+            chromium_version,
+            grease_brand,
+            grease_version,
+            tls,
+            android_version,
+        )
+        .unwrap_or(0);
     }
     if let Ok(d) = crate::store::fingerprints_dir() {
-        n += migrate_dir_to(&d, chromium_version, grease_brand, grease_version, tls).unwrap_or(0);
+        n += migrate_dir_to(
+            &d,
+            chromium_version,
+            grease_brand,
+            grease_version,
+            tls,
+            android_version,
+        )
+        .unwrap_or(0);
     }
     n
 }
@@ -488,6 +640,7 @@ async fn migrate_all_blocking(
     grease_brand: Option<String>,
     grease_version: Option<String>,
     tls: Option<serde_json::Value>,
+    android_version: Option<String>,
 ) -> Option<usize> {
     blocking(move || {
         migrate_all_to(
@@ -495,6 +648,7 @@ async fn migrate_all_blocking(
             grease_brand.as_deref(),
             grease_version.as_deref(),
             tls.as_ref(),
+            android_version.as_deref(),
         )
     })
     .await
@@ -514,27 +668,36 @@ fn applied_after<T>(migrated: bool, new: T, previous: Option<T>) -> Option<T> {
     }
 }
 
+/// Raised when `migrate_value` learns a new fix, so a launcher update reruns the
+/// migration once even on a manifest it has already applied.
+const MIGRATION_REV: u32 = 1;
+
+/// What a migration was applied for; the install path and the start share it.
+/// TLS is part of it: without it a manifest that changes only the ClientHello
+/// shape would be a no-op for anyone already on this version, and their
+/// profiles would keep the previous release's JA4.
+fn migration_signature(target: &str, m: &RemoteManifest) -> String {
+    format!(
+        "{target}|{}|{}|{}|{}|m{MIGRATION_REV}",
+        m.grease_brand.as_deref().unwrap_or(""),
+        m.grease_version.as_deref().unwrap_or(""),
+        m.tls.as_ref().map(|t| t.to_string()).unwrap_or_default(),
+        m.android_chromium_version.as_deref().unwrap_or(""),
+    )
+}
+
 /// Startup hook: migrate saved profiles + the fingerprint library (bundled +
 /// user-added) to the manifest's engine descriptor when not already done. One
-/// GitHub-manifest GET (never S3). Guarded by a signature of
-/// `<version>|<grease_brand>|<grease_version>`, so a change to the grease (or any
-/// future manifest field) re-triggers migration even for users already on the
-/// current version — no version bump or constant needed. Also covers users
-/// whose engine auto-updated via the etag path without an explicit install.
+/// GitHub-manifest GET (never S3). Guarded by `migration_signature`, so a change
+/// to any manifest field it covers, or to `MIGRATION_REV`, re-triggers migration
+/// even for users already on the current version. Also covers users whose
+/// engine auto-updated via the etag path without an explicit install.
 pub async fn ensure_profiles_migrated() {
     let m = fetch_manifest().await;
     let Some(target) = m.chromium_version.clone() else {
         return;
     };
-    // TLS is part of the signature: without it a manifest that changes only
-    // the ClientHello shape would be a no-op for anyone already on this
-    // version, and their profiles would keep the previous release's JA4.
-    let sig = format!(
-        "{target}|{}|{}|{}",
-        m.grease_brand.as_deref().unwrap_or(""),
-        m.grease_version.as_deref().unwrap_or(""),
-        m.tls.as_ref().map(|t| t.to_string()).unwrap_or_default(),
-    );
+    let sig = migration_signature(&target, &m);
     let mut local = load_manifest();
     if local.applied_signature.as_deref() == Some(sig.as_str()) {
         return;
@@ -546,6 +709,7 @@ pub async fn ensure_profiles_migrated() {
         m.grease_brand.clone(),
         m.grease_version.clone(),
         m.tls.clone(),
+        m.android_chromium_version.clone(),
     )
     .await
     else {
@@ -786,16 +950,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         .chromium_version
         .clone()
         .unwrap_or_else(|| CHROMIUM_VERSION.to_string());
-    let sig = format!(
-        "{target_ver}|{}|{}|{}",
-        manifest.grease_brand.as_deref().unwrap_or(""),
-        manifest.grease_version.as_deref().unwrap_or(""),
-        manifest
-            .tls
-            .as_ref()
-            .map(|t| t.to_string())
-            .unwrap_or_default(),
-    );
+    let sig = migration_signature(&target_ver, &manifest);
     let mut migrated = true;
     if local.applied_signature.as_deref() != Some(sig.as_str()) {
         match migrate_all_blocking(
@@ -803,6 +958,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
             manifest.grease_brand.clone(),
             manifest.grease_version.clone(),
             manifest.tls.clone(),
+            manifest.android_chromium_version.clone(),
         )
         .await
         {
@@ -1204,6 +1360,195 @@ fn place_widevine(base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    const M1: &str = "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)";
+
+    fn mac(renderer: &str, vendor: &str, features: serde_json::Value) -> serde_json::Value {
+        json!({
+            "navigator": { "platform": "macOS", "platform_version": "15.6.1" },
+            "webgl": { "renderer": renderer },
+            "webgpu": { "vendor": vendor, "features": features },
+        })
+    }
+
+    #[test]
+    fn apple_m_lists_gain_the_chrome_157_features_in_order_and_once() {
+        let mut m1 = mac(
+            M1,
+            "apple",
+            json!(["shader-f16", "texture-compression-etc2", "timestamp-query"]),
+        );
+        assert!(add_apple_webgpu_features(&mut m1));
+        assert_eq!(
+            m1["webgpu"]["features"],
+            json!([
+                "shader-f16",
+                "texture-compression-etc2",
+                "texture-compression-unaligned",
+                "timestamp-query"
+            ]),
+            "M1 has no atomic-vec2u-min-max"
+        );
+        assert!(!add_apple_webgpu_features(&mut m1), "once");
+
+        let m3 = "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Max, Unspecified Version)";
+        let mut m3 = mac(
+            m3,
+            "apple",
+            json!(["shader-f16", "texture-compression-unaligned"]),
+        );
+        assert!(add_apple_webgpu_features(&mut m3));
+        assert_eq!(
+            m3["webgpu"]["features"],
+            json!([
+                "atomic-vec2u-min-max",
+                "shader-f16",
+                "texture-compression-unaligned"
+            ])
+        );
+    }
+
+    #[test]
+    fn other_gpus_and_host_webgpu_lists_are_left_alone() {
+        let feats = json!(["shader-f16"]);
+        let intel =
+            "ANGLE (Intel, ANGLE Metal Renderer: Intel(R) UHD Graphics 630, Unspecified Version)";
+        let apple_gpu = "ANGLE (Apple, ANGLE Metal Renderer: Apple GPU, Unspecified Version)";
+        for mut cfg in [
+            mac(intel, "intel", feats.clone()),
+            mac(M1, "intel", feats.clone()),
+            mac(apple_gpu, "apple", feats.clone()),
+            mac(M1, "apple", json!([])),
+            json!({ "webgl": { "renderer": M1 }, "webgpu": { "vendor": "apple" } }),
+        ] {
+            let before = cfg.clone();
+            assert!(!add_apple_webgpu_features(&mut cfg));
+            assert_eq!(cfg, before);
+        }
+    }
+
+    #[test]
+    fn claims_mobile_matches_the_engines_three_signals() {
+        let m = |v: serde_json::Value| claims_mobile(v.as_object().unwrap());
+        assert!(m(json!({"client_hints": {"mobile": true}})));
+        assert!(m(json!({"client_hints": {"platform": "Android"}})));
+        assert!(m(
+            json!({"navigator": {"user_agent": "Mozilla/5.0 (Linux; Android 15) Chrome"}})
+        ));
+        assert!(!m(
+            json!({"navigator": {"user_agent": "Mozilla/5.0 (Macintosh) Chrome"}})
+        ));
+        assert!(!m(json!({"navigator": {"platform": "Linux armv8l"}})));
+    }
+
+    fn phone() -> serde_json::Value {
+        json!({ "navigator": { "platform": "Android",
+                "user_agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36" },
+            "client_hints": { "mobile": true, "brand_version": "156", "brand_full_version": "156.0.8078.48" } })
+    }
+
+    #[test]
+    fn a_phone_reports_the_android_build_and_chromes_brand() {
+        let mut p = phone();
+        assert!(migrate_value(
+            &mut p,
+            "157.0.8103.50",
+            None,
+            None,
+            None,
+            Some("157.0.8103.38")
+        ));
+        let ch = &p["client_hints"];
+        assert_eq!(ch["brand_full_version"], "157.0.8103.38");
+        assert_eq!(
+            (ch["chrome_build"].as_i64(), ch["chrome_patch"].as_i64()),
+            (Some(8103), Some(38))
+        );
+        assert_eq!(ch["brand"], "Google Chrome");
+        assert!(p["navigator"]["user_agent"]
+            .as_str()
+            .unwrap()
+            .contains("Chrome/157.0.0.0 Mobile"));
+        assert!(
+            !migrate_value(
+                &mut p,
+                "157.0.8103.50",
+                None,
+                None,
+                None,
+                Some("157.0.8103.38")
+            ),
+            "once"
+        );
+
+        // An Android build of another major is not trusted; the engine's own is used.
+        let mut q = phone();
+        assert!(migrate_value(
+            &mut q,
+            "157.0.8103.50",
+            None,
+            None,
+            None,
+            Some("156.0.1.1")
+        ));
+        assert_eq!(q["client_hints"]["brand_full_version"], "157.0.8103.50");
+    }
+
+    #[test]
+    fn a_desktop_profile_keeps_the_engine_build_and_its_brand() {
+        let mut d = json!({ "navigator": { "platform": "Windows", "platform_version": "15.0.0",
+                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/156.0.0.0 Safari/537.36" },
+            "client_hints": { "mobile": false, "brand": "Microsoft Edge", "platform_version": "15.0.0" } });
+        assert!(migrate_value(
+            &mut d,
+            "157.0.8103.50",
+            None,
+            None,
+            None,
+            Some("157.0.8103.38")
+        ));
+        assert_eq!(d["client_hints"]["brand_full_version"], "157.0.8103.50");
+        assert_eq!(d["client_hints"]["brand"], "Microsoft Edge");
+    }
+
+    #[test]
+    fn a_saved_profile_loses_a_windows_version_chrome_never_reports() {
+        let mut p = json!({ "navigator": { "platform": "Windows", "platform_version": "17.0.0" },
+            "client_hints": { "brand_full_version": "157.0.8103.50", "brand_version": "157",
+                "chrome_build": 8103, "chrome_patch": 50, "platform_version": "17.0.0" } });
+        assert!(migrate_value(
+            &mut p,
+            "157.0.8103.50",
+            None,
+            None,
+            None,
+            None
+        ));
+        assert_eq!(p["navigator"]["platform_version"], "19.0.0");
+        assert_eq!(p["client_hints"]["platform_version"], "19.0.0");
+        assert!(
+            !migrate_value(&mut p, "157.0.8103.50", None, None, None, None),
+            "once"
+        );
+    }
+
+    #[test]
+    fn the_migration_signature_moves_with_the_android_build_and_the_revision() {
+        let m = RemoteManifest {
+            android_chromium_version: Some("157.0.8103.50".into()),
+            ..Default::default()
+        };
+        let sig = migration_signature("157.0.8103.50", &m);
+        assert!(
+            sig.ends_with(&format!("|157.0.8103.50|m{MIGRATION_REV}")),
+            "{sig}"
+        );
+        assert_ne!(
+            sig,
+            migration_signature("157.0.8103.50", &RemoteManifest::default())
+        );
+    }
 
     /// NEW-F: a migration that panics is not "applied": the caller gets `None`
     /// and records nothing new, so the next start runs it again.
@@ -1235,7 +1580,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let worker = tokio::spawn(migrate_all_blocking("1.0.0".into(), None, None, None));
+            let worker = tokio::spawn(migrate_all_blocking("1.0.0".into(), None, None, None, None));
             // The only async thread is free to run other work meanwhile.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert!(!worker.is_finished());
@@ -1258,7 +1603,7 @@ mod tests {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = finished.clone();
         let worker = std::thread::spawn(move || {
-            migrate_all_to("1.0.0", None, None, None);
+            migrate_all_to("1.0.0", None, None, None, None);
             seen.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
