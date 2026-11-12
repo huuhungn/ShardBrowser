@@ -798,6 +798,8 @@
   "profile.longitude": "Longitude",
   "profile.lostTrack": "Lost track of running browsers: {err}",
   "profile.manualCoords": "Manual coords",
+  "profile.maximizedHelp": "The window opens the size of the profile’s screen, and sites see it maximized, the way most people browse. Resize it, and sites see its real size.",
+  "profile.maximizedLabel": "Report the window as maximized",
   "profile.mediaDevices": "Media devices",
   "profile.memoryGb": "Memory (GB)",
   "profile.micIn": "Mic in",

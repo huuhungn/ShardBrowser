@@ -798,6 +798,8 @@
   "profile.longitude": "Kinh độ",
   "profile.lostTrack": "Mất dấu các trình duyệt đang chạy: {err}",
   "profile.manualCoords": "Toạ độ thủ công",
+  "profile.maximizedHelp": "Cửa sổ mở đúng cỡ màn hình của hồ sơ và các trang web thấy nó ở trạng thái phóng to, như cách đa số mọi người duyệt web. Khi bạn đổi cỡ cửa sổ, các trang web sẽ thấy cỡ thực của nó.",
+  "profile.maximizedLabel": "Báo cửa sổ ở trạng thái phóng to",
   "profile.mediaDevices": "Thiết bị đa phương tiện",
   "profile.memoryGb": "Bộ nhớ (GB)",
   "profile.micIn": "Micro vào",

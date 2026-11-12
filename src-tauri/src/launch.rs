@@ -76,7 +76,9 @@ pub(crate) const CDP_ARGS: [&str; 3] = [
 /// no --window-size and Chromium uses the REAL monitor's work area, so a
 /// profile claiming 1920x1080 opened in a window sized for the host and sitting
 /// outside its own claimed screen. A profile that names a usable window keeps
-/// it. Derived per launch, never written back, so the stored profile (and team
+/// it. A window block that names no size (`maximized` alone, say) keeps its
+/// other keys and gains the derived size, which is what a maximized window
+/// fills. Derived per launch, never written back, so the stored profile (and team
 /// sync) is untouched. Ported from upstream 081770c.
 fn fill_window_from_screen(raw: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(scr) = raw.get("screen").and_then(|v| v.as_object()) else {
@@ -112,15 +114,16 @@ fn fill_window_from_screen(raw: &mut serde_json::Map<String, serde_json::Value>)
         return;
     }
     let outer_h = (avail_h - 1).max(1);
-    raw.insert(
-        "window".into(),
-        serde_json::json!({
-            "outer_width": avail_w,
-            "outer_height": outer_h,
-            "inner_width": avail_w,
-            "inner_height": (outer_h - 87).max(1),
-        }),
-    );
+    let mut win = raw
+        .get("window")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    win.insert("outer_width".into(), avail_w.into());
+    win.insert("outer_height".into(), outer_h.into());
+    win.insert("inner_width".into(), avail_w.into());
+    win.insert("inner_height".into(), (outer_h - 87).max(1).into());
+    raw.insert("window".into(), win.into());
     eprintln!(
         "[launcher] display: profile named no window — derived {avail_w}x{outer_h} \
          from its claimed {w}x{h} screen"
@@ -1177,6 +1180,19 @@ mod window_from_screen_tests {
         let mut raw = obj(json!({ "name": "no screen here" }));
         fill_window_from_screen(&mut raw);
         assert!(raw.get("window").is_none());
+    }
+
+    #[test]
+    fn a_window_block_without_a_size_keeps_its_other_keys() {
+        let mut raw = obj(json!({
+            "screen": { "width": 1600, "height": 900,
+                        "avail_width": 1600, "avail_height": 860 },
+            "window": { "maximized": true }
+        }));
+        fill_window_from_screen(&mut raw);
+        assert_eq!(raw["window"]["maximized"], true);
+        assert_eq!(raw["window"]["outer_width"], 1600);
+        assert_eq!(raw["window"]["outer_height"], 859);
     }
 
     #[test]

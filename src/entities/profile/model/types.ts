@@ -52,6 +52,10 @@ export type ProfileForm = {
   /// Automation profiles accumulate tabs nobody closes; restoring them all
   /// makes every reopen slower for no gain.
   restore_session: boolean;
+  /// Present the window as maximized within the profile's screen: it opens the
+  /// size of that screen and sites see it maximized. Stored as
+  /// `window.maximized`; off by default. Not offered on a phone profile.
+  maximized: boolean;
 
   noise_canvas: NoiseMode;
   noise_webgl: NoiseMode;
