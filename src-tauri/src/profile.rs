@@ -764,7 +764,10 @@ pub fn save_raw(stored: &mut StoredProfile) -> Result<()> {
 /// unbound local profile, which a retry deletes.
 pub fn delete(id: &str) -> Result<()> {
     crate::team::sync::unbind_removed(id)?;
-    remove(id)
+    remove(id)?;
+    // Not in the trash's `remove`: a trashed profile's cache comes back with it.
+    store::remove_browser_cache(&store::user_data_root()?.join(id));
+    Ok(())
 }
 
 /// The record and data of `id`, once the trash has archived them, or for
@@ -1711,6 +1714,45 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    /// A profile with a browser cache in `cache`, the stand-in for the OS cache folder.
+    fn profile_with_cache(cache: &std::path::Path) -> (String, std::path::PathBuf) {
+        let id = new_profile("Cached", &[]);
+        let udd = store::user_data_root().unwrap().join(&id);
+        fs::create_dir_all(&udd).unwrap();
+        let twin = store::browser_cache_twin(&udd).unwrap();
+        assert!(twin.starts_with(cache), "{twin:?}");
+        fs::create_dir_all(twin.join("Cache_Data")).unwrap();
+        fs::write(twin.join("Cache_Data/f_000001"), b"cache").unwrap();
+        (id, twin)
+    }
+
+    #[test]
+    fn a_browser_cache_goes_with_a_profile_deleted_for_good_not_with_one_in_the_trash() {
+        let (dir, _config, _lifecycle) = scratch_profiles();
+        let cache = tempfile::tempdir().unwrap();
+        store::set_cache_mapping(Some((dir.path().to_path_buf(), cache.path().to_path_buf())));
+
+        let (trashed, trashed_cache) = profile_with_cache(cache.path());
+        crate::trash::move_to_trash(&trashed).unwrap();
+        assert!(
+            trashed_cache.exists(),
+            "the trash keeps the cache for a restore"
+        );
+        crate::trash::restore(&trashed).unwrap();
+        assert!(trashed_cache.exists(), "a restore finds its cache");
+        crate::trash::move_to_trash(&trashed).unwrap();
+        crate::trash::purge(&trashed).unwrap();
+        assert!(!trashed_cache.exists(), "a purge removes it");
+
+        let (deleted, deleted_cache) = profile_with_cache(cache.path());
+        let (other, other_cache) = profile_with_cache(cache.path());
+        delete(&deleted).unwrap();
+        assert!(!deleted_cache.exists(), "a delete for good removes it");
+        assert!(other_cache.exists(), "another profile's cache stays");
+        assert!(load_raw(&other).is_ok());
+        store::set_cache_mapping(None);
     }
 
     #[test]

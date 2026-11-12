@@ -9648,6 +9648,11 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[launcher] temporary purge failed: {e}"),
             }
+            // Browser caches deleted profiles left in the OS cache folder, once.
+            tauri::async_runtime::spawn_blocking(|| match store::sweep_orphan_caches() {
+                0 => {}
+                n => eprintln!("[launcher] removed {n} cache folder(s) of deleted profiles"),
+            });
 
             // API task on the shared tokio runtime.
             match settings::ensure_secret() {
