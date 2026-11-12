@@ -48,15 +48,15 @@ impl Parsed {
     }
 }
 
-/// Unix seconds below 1e12 (year 33658, so a "never" of year 9999 stays
-/// seconds); milliseconds below 1e14; microseconds below 1e17. The ranges do
-/// not overlap for any date from 2001 to 5138, so the magnitude alone
-/// identifies the unit; a millisecond expiry before 2001 is long past anyway.
-/// shortcut: Chromium's 1601-epoch microseconds (about 1.3e16 today) would read
-/// as Unix microseconds, so they are not supported.
+/// Unix seconds below 1e12, milliseconds below 1e15, microseconds below 1e18:
+/// each unit then covers 2001 to year 33658, so a year-9999 "never" reads right
+/// in any of them and the magnitude alone identifies the unit. A millisecond or
+/// microsecond expiry before 2001 is long past anyway. shortcut: Chromium's
+/// 1601-epoch microseconds (about 1.3e16 today) would read as Unix
+/// milliseconds, so they are not supported.
 const SECS_LIMIT: f64 = 1e12;
-const MILLIS_LIMIT: f64 = 1e14;
-const MICROS_LIMIT: f64 = 1e17;
+const MILLIS_LIMIT: f64 = 1e15;
+const MICROS_LIMIT: f64 = 1e18;
 
 /// Expiry in whatever unit the exporter used -> Unix seconds, `None` = session.
 /// Zero and negatives are session markers (Netscape 0, Playwright -1).
@@ -512,24 +512,28 @@ mod tests {
             normalise_expiry(999_999_999_999.0),
             Ok(Some(999_999_999_999.0))
         );
-        // milliseconds: [1e12, 1e14)
+        // milliseconds: [1e12, 1e15), including a year-9999 "never"
         assert_eq!(normalise_expiry(1e12), Ok(Some(1e9)));
         assert_eq!(
             normalise_expiry(1_900_000_000_000.0),
             Ok(Some(1_900_000_000.0))
         );
         assert_eq!(
-            normalise_expiry(99_999_999_999_999.0),
-            Ok(Some(99_999_999_999.999))
+            normalise_expiry(253_402_300_799_000.0),
+            Ok(Some(253_402_300_799.0))
         );
-        // microseconds: [1e14, 1e17)
-        assert_eq!(normalise_expiry(1e14), Ok(Some(1e8)));
+        // microseconds: [1e15, 1e18), including a year-9999 "never"
+        assert_eq!(normalise_expiry(1e15), Ok(Some(1e9)));
         assert_eq!(
             normalise_expiry(1_900_000_000_000_000.0),
             Ok(Some(1_900_000_000.0))
         );
+        assert_eq!(
+            normalise_expiry(253_402_300_799_000_000.0),
+            Ok(Some(253_402_300_799.0))
+        );
         // out of range and non-finite
-        assert_eq!(normalise_expiry(1e17), Err("expiryOutOfRange"));
+        assert_eq!(normalise_expiry(1e18), Err("expiryOutOfRange"));
         assert_eq!(normalise_expiry(f64::NAN), Err("badExpiry"));
         assert_eq!(normalise_expiry(f64::INFINITY), Err("badExpiry"));
         // session markers
