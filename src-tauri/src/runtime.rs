@@ -697,6 +697,11 @@ pub async fn ensure_profiles_migrated() {
     let Some(target) = m.chromium_version.clone() else {
         return;
     };
+    // This launcher refuses to install that engine, so its profiles must keep
+    // describing the one they run on.
+    if engine_needs_newer_launcher(&m) {
+        return;
+    }
     let sig = migration_signature(&target, &m);
     let mut local = load_manifest();
     if local.applied_signature.as_deref() == Some(sig.as_str()) {

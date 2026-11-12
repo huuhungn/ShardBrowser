@@ -11,7 +11,7 @@ import { Readable } from "node:stream";
 import { spawnSync } from "node:child_process";
 
 export const PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-export const CHROMIUM_VERSION = "156.0.8078.48";
+export const CHROMIUM_VERSION = "157.0.8103.50";
 /** This SDK's own version, compared against the manifest's `min_sdk_version`. */
 export const SDK_VERSION = "2.1.0";
 // Version manifest (GitHub raw) — one tiny GET yields every archive's current
