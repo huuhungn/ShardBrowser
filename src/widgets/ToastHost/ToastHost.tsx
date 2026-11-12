@@ -20,6 +20,15 @@ export function ToastHost() {
             onClose={() => dismiss(t.id)}
           >
             {t.text}
+            {t.action && (
+              <button
+                type="button"
+                className="ml-2 font-medium underline underline-offset-2"
+                onClick={() => { dismiss(t.id); t.action?.onClick(); }}
+              >
+                {t.action.label}
+              </button>
+            )}
           </Alert>
         </div>
       ))}

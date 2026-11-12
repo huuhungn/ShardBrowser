@@ -12,7 +12,8 @@ export type Section =
   | "team"
   | "settings";
 
-export type ToastItem = { id: number; kind: "ok" | "err" | "info"; text: string };
+export type ToastAction = { label: string; onClick: () => void };
+export type ToastItem = { id: number; kind: "ok" | "err" | "info"; text: string; action?: ToastAction };
 
 export type ConfirmButton = { label: string; value: any; danger?: boolean; primary?: boolean };
 export type ConfirmReq = {

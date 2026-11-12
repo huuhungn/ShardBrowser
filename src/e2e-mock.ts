@@ -148,6 +148,15 @@ const mismatch = (profile_renderer: string) =>
   ({ compatible: false, missing_webgl1: ["WEBGL_compressed_texture_astc"], missing_webgl2: [], missing_webgpu: [], profile_renderer });
 
 // The E2E suite runs the production build, so each one-shot fixture fails once.
+// "bookmarks": a stored list the page can save back to and delete from, as the launcher's is.
+type Bookmark = { id: string; title: string; url: string; folder: string };
+const bookmarks: Bookmark[] = scenario === "bookmarks" ? [
+  { id: "bm-1", title: "Ads Manager", url: "https://ads.example.com", folder: "" },
+  { id: "bm-2", title: "Shop one", url: "https://shop-one.example.com", folder: "QA" },
+  { id: "bm-3", title: "Shop two", url: "https://shop-two.example.com", folder: "QA" },
+  { id: "bm-4", title: "Docs", url: "https://docs.example.com", folder: "" },
+] : [];
+
 let runtimeFailures = scenario === "runtime-error-once" ? 1 : 0;
 let runtimeInstallFailures = scenario === "runtime-install-error-once" ? 1 : 0;
 let runtimeNeedsInstall = scenario === "runtime-install-error-once";
@@ -1235,8 +1244,22 @@ mockIPC(async (cmd: string, payload?: InvokeArgs) => {
       return "";
 
     // v2 list endpoints: empty is a valid, uninteresting fixture state.
-    case "automation_list":
     case "bookmark_list":
+      return [...bookmarks];
+    case "bookmark_delete": {
+      count("BookmarkDeletes");
+      const at = bookmarks.findIndex((b) => b.id === (payload as { id?: string } | undefined)?.id);
+      if (at >= 0) bookmarks.splice(at, 1);
+      return null;
+    }
+    case "bookmark_save": {
+      count("BookmarkSaves");
+      const entry = (payload as { entry: Bookmark }).entry;
+      const at = bookmarks.findIndex((b) => b.id === entry.id);
+      if (at >= 0) bookmarks[at] = entry; else bookmarks.push(entry);
+      return entry;
+    }
+    case "automation_list":
     case "extension_list":
     case "trash_list":
     case "patch_log_list":
