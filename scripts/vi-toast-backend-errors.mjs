@@ -138,7 +138,7 @@ await page.addInitScript(() => {
     invoke: (cmd) => {
       if (window.__SHARDX_NEXT_ERROR__ && cmd === "api_regenerate_token")
         return Promise.reject(window.__SHARDX_NEXT_ERROR__);
-      if (/list|all/i.test(cmd)) return Promise.resolve([]);
+      if (/list|all/i.test(cmd) || cmd === "open_link_take") return Promise.resolve([]);
       return Promise.resolve({});
     },
     transformCallback: (cb) => cb,
