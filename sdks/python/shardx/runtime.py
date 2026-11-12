@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -97,6 +98,7 @@ def apply_engine_version(
     grease_brand: Optional[str] = None,
     grease_version: Optional[str] = None,
     tls: Optional[dict] = None,
+    android_version: Optional[str] = None,
 ) -> None:
     """Normalise a profile config's spoofed Chrome version to `chromium_version`
     (e.g. "156.0.8078.48") so it always matches the running engine — bumps
@@ -115,11 +117,18 @@ def apply_engine_version(
     profile keeps the previous release's signature_algorithms while the engine
     advertises the new ones, and the JA4 hash no longer matches the Chrome
     version the profile claims: 152 added the ML-DSA schemes 0x0904-0x0906, so
-    a 149-era profile is eleven entries short and reads as a mismatch."""
+    a 149-era profile is eleven entries short and reads as a mismatch.
+
+    `android_version` is the Chrome for Android build of the same major, passed
+    for phone profiles: Android ships its own build numbers, and a phone
+    reporting a desktop one claims a build no phone has."""
     parts = chromium_version.split(".")
     if len(parts) != 4:
         return
     major = parts[0]
+    if android_version and len(android_version.split(".")) == 4 and android_version.split(".")[0] == major:
+        chromium_version = android_version
+        parts = chromium_version.split(".")
     try:
         build = int(parts[2])
         patch = int(parts[3])
@@ -155,6 +164,52 @@ def apply_engine_version(
         cfg_tls.update(tls)
 
 
+# The brand Chrome lists in `userAgentData.brands` and `Sec-CH-UA`, Android included.
+_CHROME_BRAND = "Google Chrome"
+
+
+def apply_chrome_brand(config: dict) -> None:
+    """Name the brand on a profile that names none, so the brand list is
+    Chrome's and not only "Chromium" and GREASE; a brand the profile names
+    stays. Launch calls it for phone profiles, whose library templates lacked
+    the field. Mutates `config` in place."""
+    ch = config.get("client_hints")
+    if not isinstance(ch, dict):
+        return
+    if isinstance(ch.get("brand"), str) and ch["brand"]:
+        return
+    ch["brand"] = _CHROME_BRAND
+
+
+# WebGPU features Chrome 156 reports on Apple M-series that older templates lack.
+_APPLE_WEBGPU_ADDED = ("texture-compression-unaligned",)
+# Chrome 157 adds these from M2 on (Dawn: Apple8 with Mac2, or Apple9); M1 has none.
+_APPLE_M2_WEBGPU_ADDED = ("atomic-vec2u-min-max",)
+
+
+def apply_apple_webgpu_features(config: dict) -> None:
+    """Add the Apple M-series WebGPU features to a profile's `webgpu.features`,
+    in sorted place; touches nothing else. An absent or empty list means "the
+    host's own" and stays as it is. Mutates `config` in place."""
+    webgl = config.get("webgl")
+    webgpu = config.get("webgpu")
+    renderer = webgl.get("renderer") if isinstance(webgl, dict) else None
+    if not isinstance(renderer, str) or not isinstance(webgpu, dict) or webgpu.get("vendor") != "apple":
+        return
+    gen = re.search(r"Apple M(\d+)", renderer)
+    if not gen:
+        return
+    features = webgpu.get("features")
+    if not isinstance(features, list) or not features:
+        return
+    m2 = _APPLE_M2_WEBGPU_ADDED if int(gen.group(1)) >= 2 else ()
+    for feat in _APPLE_WEBGPU_ADDED + m2:
+        if feat in features:
+            continue
+        i = next((k for k, v in enumerate(features) if isinstance(v, str) and v > feat), len(features))
+        features.insert(i, feat)
+
+
 class Runtime:
     """Owns the cache dir and the install/update lifecycle."""
 
@@ -180,6 +235,8 @@ class Runtime:
         # derived from the version number). Applied to profiles on launch.
         self._grease_brand: Optional[str] = None
         self._grease_version: Optional[str] = None
+        # Chrome for Android build of the engine's major, for phone profiles.
+        self._android_version: Optional[str] = None
         # TLS block from the manifest (signature_algorithms / cipher_suites).
         # Applied to profiles on launch so the JA4 hash keeps matching the
         # Chrome version the profile claims.
@@ -229,6 +286,11 @@ class Runtime:
     def grease_version(self) -> Optional[str]:
         """GREASE version from the manifest (e.g. "24"); set on install()."""
         return self._grease_version
+
+    @property
+    def android_chromium_version(self) -> Optional[str]:
+        """Chrome for Android build phone profiles report; set on install()."""
+        return self._android_version
 
     @property
     def tls(self) -> Optional[dict]:
@@ -333,6 +395,8 @@ class Runtime:
         self._chromium_version = manifest.get("chromium_version") or CHROMIUM_VERSION
         self._grease_brand = manifest.get("grease_brand") or None
         self._grease_version = manifest.get("grease_version") or None
+        self._android_version = (manifest.get("android_chromium_version")
+                                 or local.get("installed_android_chromium_version") or None)
         remote_tls = manifest.get("tls")
         self._tls = remote_tls if isinstance(remote_tls, dict) else None
         # Refused rather than installed: this SDK could not configure it.
@@ -374,6 +438,8 @@ class Runtime:
         # Authoritative: we just extracted exactly this version (old tree wiped
         # first). Recording the known value beats re-reading it off disk.
         local["installed_chromium_version"] = self._chromium_version
+        if manifest.get("android_chromium_version"):
+            local["installed_android_chromium_version"] = manifest["android_chromium_version"]
         self._save_manifest(local)
         # Linux/mac archives produced on Windows lose every Unix exec bit;
         # restore +x on every ELF/Mach-O file under the engine tree (not

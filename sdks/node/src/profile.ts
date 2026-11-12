@@ -157,6 +157,10 @@ export class FingerprintLibrary {
  * advertises the new ones, and the JA4 hash no longer matches the Chrome
  * version the profile claims: 152 added the ML-DSA schemes 0x0904-0x0906, so a
  * 149-era profile is eleven entries short and reads as a mismatch.
+ *
+ * `androidVersion` is the Chrome for Android build of the same major, passed
+ * for phone profiles: Android ships its own build numbers, and a phone
+ * reporting a desktop one claims a build no phone has.
  */
 export function applyEngineVersion(
   config: Record<string, unknown>,
@@ -164,10 +168,15 @@ export function applyEngineVersion(
   greaseBrand?: string,
   greaseVersion?: string,
   tls?: Record<string, unknown>,
+  androidVersion?: string,
 ): void {
-  const parts = chromiumVersion.split(".");
+  let parts = chromiumVersion.split(".");
   if (parts.length !== 4) return;
   const major = parts[0];
+  if (androidVersion && androidVersion.split(".").length === 4 && androidVersion.split(".")[0] === major) {
+    chromiumVersion = androidVersion;
+    parts = chromiumVersion.split(".");
+  }
   const build = parseInt(parts[2], 10);
   const patch = parseInt(parts[3], 10);
 
@@ -199,6 +208,48 @@ export function applyEngineVersion(
   const cfgTls = config["tls"] as Record<string, unknown> | undefined;
   if (tls && cfgTls && typeof cfgTls === "object") {
     for (const [k, v] of Object.entries(tls)) cfgTls[k] = v;
+  }
+}
+
+/** The brand Chrome lists in `userAgentData.brands` and `Sec-CH-UA`, Android included. */
+const CHROME_BRAND = "Google Chrome";
+
+/**
+ * Name the brand on a profile that names none, so the brand list is Chrome's and
+ * not only "Chromium" and GREASE; a brand the profile names stays. Launch calls
+ * it for phone profiles, whose library templates lacked the field. Mutates
+ * `config` in place.
+ */
+export function applyChromeBrand(config: Record<string, unknown>): void {
+  const ch = config["client_hints"] as Record<string, unknown> | undefined;
+  if (!ch || typeof ch !== "object") return;
+  if (typeof ch["brand"] === "string" && ch["brand"] !== "") return;
+  ch["brand"] = CHROME_BRAND;
+}
+
+/** WebGPU features Chrome 156 reports on Apple M-series that older templates lack. */
+const APPLE_WEBGPU_ADDED = ["texture-compression-unaligned"];
+/** Chrome 157 adds these from M2 on (Dawn: Apple8 with Mac2, or Apple9); M1 has none. */
+const APPLE_M2_WEBGPU_ADDED = ["atomic-vec2u-min-max"];
+
+/**
+ * Add the Apple M-series WebGPU features to a profile's `webgpu.features`, in
+ * sorted place; touches nothing else. An absent or empty list means "the host's
+ * own" and stays as it is. Mutates `config` in place.
+ */
+export function applyAppleWebGpuFeatures(config: Record<string, unknown>): void {
+  const renderer = (config["webgl"] as Record<string, unknown> | undefined)?.["renderer"];
+  const webgpu = config["webgpu"] as Record<string, unknown> | undefined;
+  if (typeof renderer !== "string" || webgpu?.["vendor"] !== "apple") return;
+  const gen = /Apple M(\d+)/.exec(renderer);
+  if (!gen) return;
+  const list = webgpu["features"];
+  if (!Array.isArray(list) || list.length === 0) return;
+  const m2 = Number(gen[1]) >= 2 ? APPLE_M2_WEBGPU_ADDED : [];
+  for (const feat of [...APPLE_WEBGPU_ADDED, ...m2]) {
+    if (list.includes(feat)) continue;
+    const i = list.findIndex((v) => typeof v === "string" && v > feat);
+    list.splice(i < 0 ? list.length : i, 0, feat);
   }
 }
 

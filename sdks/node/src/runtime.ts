@@ -123,6 +123,8 @@ interface Manifest {
    *  is detected by comparing this (or the on-disk version) to the manifest's
    *  chromium version — robust where the etag check failed. */
   installed_chromium_version?: string;
+  /** Chrome for Android build of the engine's major, for phone profiles. */
+  installed_android_chromium_version?: string;
   /** Build stamp of the archive last extracted; fallback when it ships none. */
   installed_engine_build?: string;
 }
@@ -143,6 +145,8 @@ export class Runtime {
    *  derived from the version number). Applied to profiles on launch. */
   private _greaseBrand?: string;
   private _greaseVersion?: string;
+  /** Chrome for Android build of the engine's major, for phone profiles. */
+  private _androidVersion?: string;
   /** TLS block from the manifest (signature_algorithms / cipher_suites).
    *  Applied to profiles on launch so the JA4 hash keeps matching the Chrome
    *  version the profile claims — 152 added the ML-DSA signature schemes, and
@@ -179,6 +183,8 @@ export class Runtime {
   get greaseBrand(): string | undefined { return this._greaseBrand; }
   /** GREASE version from the manifest (e.g. "24"); set on install(). */
   get greaseVersion(): string | undefined { return this._greaseVersion; }
+  /** Chrome for Android build phone profiles report; set on install(). */
+  get androidChromiumVersion(): string | undefined { return this._androidVersion; }
   /** TLS overrides from the manifest; set on install(). */
   get tls(): Record<string, unknown> | undefined { return this._tls; }
 
@@ -273,6 +279,7 @@ export class Runtime {
     this._chromiumVersion = remote.chromiumVersion ?? CHROMIUM_VERSION;
     this._greaseBrand = remote.greaseBrand;
     this._greaseVersion = remote.greaseVersion;
+    this._androidVersion = remote.androidChromiumVersion ?? local.installed_android_chromium_version;
     this._tls = remote.tls;
 
     // Refused rather than installed: this SDK could not configure it.
@@ -310,6 +317,7 @@ export class Runtime {
     // Authoritative: we just extracted exactly this version (old tree wiped
     // first). Recording the known value beats re-reading it off disk.
     local.installed_chromium_version = this._chromiumVersion;
+    if (remote.androidChromiumVersion) local.installed_android_chromium_version = remote.androidChromiumVersion;
     this.saveManifest(local);
 
     // Linux/mac archives produced on Windows lose every Unix exec bit;
@@ -327,11 +335,11 @@ export class Runtime {
   /** Fetch the version manifest (GitHub raw) — one request that yields every
    *  archive's current etag + the chromium version, replacing per-archive HEADs
    *  against R2/S3. Empty archives / undefined version when unreachable. */
-  private async fetchManifest(): Promise<{ archives: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; tls?: Record<string, unknown> }> {
+  private async fetchManifest(): Promise<{ archives: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; androidChromiumVersion?: string; tls?: Record<string, unknown> }> {
     try {
       const r = await fetch(MANIFEST_URL);
       if (!r.ok) return { archives: {} };
-      const data = await r.json() as { archives?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; tls?: Record<string, unknown> };
+      const data = await r.json() as { archives?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; android_chromium_version?: string; tls?: Record<string, unknown> };
       const str = (v: unknown) => (typeof v === "string" ? v : undefined);
       return {
         archives: (data && typeof data.archives === "object" && data.archives) || {},
@@ -343,6 +351,7 @@ export class Runtime {
         minSdkVersion: str(data?.min_sdk_version),
         greaseBrand: str(data?.grease_brand),
         greaseVersion: str(data?.grease_version),
+        androidChromiumVersion: str(data?.android_chromium_version),
         tls: (data?.tls && typeof data.tls === "object" && !Array.isArray(data.tls))
           ? data.tls as Record<string, unknown>
           : undefined,

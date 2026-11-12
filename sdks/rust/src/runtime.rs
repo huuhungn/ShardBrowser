@@ -144,6 +144,9 @@ struct Manifest {
     /// Build stamp of the archive last extracted; fallback when it ships none.
     #[serde(default)]
     installed_engine_build: Option<String>,
+    /// Chrome for Android build of the engine's major, for phone profiles.
+    #[serde(default)]
+    installed_android_chromium_version: Option<String>,
 }
 
 pub struct Runtime {
@@ -161,6 +164,8 @@ pub struct Runtime {
     /// applied to profiles on launch so the JA4 hash keeps matching the Chrome
     /// version the profile claims. Set on install().
     tls: std::sync::Mutex<Option<serde_json::Value>>,
+    /// Chrome for Android build of the engine's major, for phone profiles.
+    android_version: std::sync::Mutex<Option<String>>,
 }
 
 impl Runtime {
@@ -180,12 +185,18 @@ impl Runtime {
             engine_version: std::sync::Mutex::new(CHROMIUM_VERSION.to_string()),
             grease: std::sync::Mutex::new((None, None)),
             tls: std::sync::Mutex::new(None),
+            android_version: std::sync::Mutex::new(None),
         })
     }
 
     /// GREASE `(brand, version)` from the manifest (set on install()).
     pub fn grease(&self) -> (Option<String>, Option<String>) {
         self.grease.lock().unwrap().clone()
+    }
+
+    /// Chrome for Android build phone profiles report (set on install()).
+    pub fn android_chromium_version(&self) -> Option<String> {
+        self.android_version.lock().unwrap().clone()
     }
 
     /// TLS overrides from the manifest (set on install()).
@@ -353,6 +364,10 @@ impl Runtime {
             .unwrap_or_else(|| CHROMIUM_VERSION.to_string());
         *self.grease.lock().unwrap() = (remote.grease_brand.clone(), remote.grease_version.clone());
         *self.tls.lock().unwrap() = remote.tls.clone();
+        *self.android_version.lock().unwrap() = remote
+            .android_chromium_version
+            .clone()
+            .or_else(|| local.installed_android_chromium_version.clone());
 
         // Refused rather than installed: this SDK could not configure it.
         if let Some(min) = remote.min_sdk_version.as_deref() {
@@ -420,6 +435,9 @@ impl Runtime {
         // Authoritative: we just extracted exactly this version (old tree wiped
         // first). Recording the known value beats re-reading it off disk.
         local.installed_chromium_version = Some(self.chromium_version());
+        if remote.android_chromium_version.is_some() {
+            local.installed_android_chromium_version = remote.android_chromium_version.clone();
+        }
 
         self.save_manifest(&local)?;
 
@@ -531,6 +549,8 @@ struct RemoteManifest {
     grease_version: Option<String>,
     /// TLS overrides; only the keys present here are applied to a profile.
     tls: Option<serde_json::Value>,
+    /// The Chrome for Android build of the same major, for phone profiles.
+    android_chromium_version: Option<String>,
     /// Which build of the engine archive this is, apart from its Chromium
     /// version. Not the manifest-wide `revision`, which also moves for a TLS
     /// or GREASE edit.
@@ -584,6 +604,7 @@ async fn fetch_manifest() -> RemoteManifest {
             chromium_version: str_field("chromium_version"),
             grease_brand: str_field("grease_brand"),
             grease_version: str_field("grease_version"),
+            android_chromium_version: str_field("android_chromium_version"),
             tls: v.get("tls").filter(|t| t.is_object()).cloned(),
             // Written as a number or a string; both mean the same thing.
             engine_build: v.get("engine_build").and_then(|b| match b {
