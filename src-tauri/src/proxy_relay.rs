@@ -634,6 +634,31 @@ mod tests {
         assert!(!needs_relay(&e));
     }
 
+    /// The engine is spawned while relays run; an inheritable socket would keep a
+    /// relay's port open in the browser after the relay stops. Mio before 1.2.1
+    /// created inheritable sockets on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn relay_sockets_are_not_inherited_by_child_processes() {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, outbound) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+        let (accepted, _) = accepted.unwrap();
+        let outbound = outbound.unwrap();
+        for (kind, socket) in [
+            ("listener", listener.as_raw_socket()),
+            ("accepted", accepted.as_raw_socket()),
+            ("outbound", outbound.as_raw_socket()),
+        ] {
+            let mut flags = 0;
+            assert_ne!(unsafe { GetHandleInformation(socket as _, &mut flags) }, 0);
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{kind} socket is inheritable");
+        }
+    }
+
     #[tokio::test]
     async fn http_request_gets_raw_upstream_credentials_and_one_request_per_connection() {
         let (port, seen, _up) = http_upstream().await;
