@@ -1140,9 +1140,12 @@ async fn export_cookies(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "cookies": cookies })))
 }
 
+/// `cookies` is a JSON array in any supported export shape; `text` is the raw
+/// content of a cookies.txt or JSON export. One of the two is required.
 #[derive(Deserialize)]
 struct ImportCookiesReq {
-    cookies: Vec<crate::cookies::Cookie>,
+    cookies: Option<Value>,
+    text: Option<String>,
 }
 
 async fn import_cookies(Path(id): Path<String>, Json(body): Json<ImportCookiesReq>) -> ApiResult {
@@ -1151,9 +1154,20 @@ async fn import_cookies(Path(id): Path<String>, Json(body): Json<ImportCookiesRe
         &crate::errcode::code("profile.actionImportCookies"),
     )
     .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
-    let n = crate::cookies::import(&id, &body.cookies)
+    let parsed = match (&body.cookies, &body.text) {
+        (Some(cookies), None) => crate::cookie_import::parse_value(cookies),
+        (None, Some(text)) => crate::cookie_import::parse(text),
+        _ => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "send exactly one of `cookies` or `text`",
+            ))
+        }
+    }
+    .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let n = crate::cookies::import(&id, &parsed.cookies)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(json!({ "imported": n })))
+    Ok(Json(json!(parsed.into_report(n))))
 }
 
 async fn list_running() -> Json<Value> {

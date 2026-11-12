@@ -27,6 +27,7 @@ export const defaultForm = (): ProfileForm => ({
   do_not_track: false,
   // Matches the browser's own default and the Rust side's absent-key default.
   restore_session: true,
+  maximized: false,
 
   noise_canvas: "real",
   noise_webgl: "real",
@@ -77,6 +78,7 @@ export function fromStored(stored: any): ProfileForm {
   f.do_not_track = !!stored?.navigator?.do_not_track;
   // Absent means "restore", matching the Rust parser and pre-existing profiles.
   f.restore_session = stored?.launch?.restore_session !== false;
+  f.maximized = stored?.window?.maximized === true;
 
   const noise = stored?.noise ?? {};
   const noiseMode = (n: any): NoiseMode => (n?.enabled ? "auto" : "real");
@@ -103,6 +105,17 @@ export function fromStored(stored: any): ProfileForm {
   f.media_video_in = md.video_input_count ?? 1;
 
   return f;
+}
+
+/// Whether the profile claims a phone, by the same signals as the engine and
+/// `claims_mobile` in runtime.rs. A phone has no window to maximize.
+export function claimsMobile(f: ProfileForm): boolean {
+  const ch = f._stored?.client_hints;
+  return (
+    ch?.mobile === true ||
+    /^android/i.test(ch?.platform ?? "") ||
+    /android/i.test(f.user_agent)
+  );
 }
 
 /// Build on-disk FingerprintConfig from library payload + user-edited fields.
@@ -182,6 +195,12 @@ export function toStored(f: ProfileForm, lib: FingerprintEntry | null): any {
     fonts:        { enabled: f.noise_fonts === "auto",        seed: 0 },
   };
   base.blocked_ports = [...f.blocked_ports].sort((a, b) => a - b);
+
+  // One flag inside the window block, written only while on, so a profile that
+  // never asked keeps its window as it was. After the library merge on purpose:
+  // a preset's own window block replaces the stored one and would drop it.
+  if (f.maximized && !claimsMobile(f)) base.window = { ...(base.window || {}), maximized: true };
+  else if (base.window) delete base.window.maximized;
 
   return base;
 }

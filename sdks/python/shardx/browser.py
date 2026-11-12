@@ -11,12 +11,15 @@ spoofing flags the desktop launcher uses, plus pre-launch:
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +29,7 @@ from .auto_resolve import has_auto_fields, resolve_auto_fields
 from .geo import GeoInfo, geo_check_via
 from .profile import Profile, user_data_dir as _user_data_dir
 from .proxy import ParsedProxy, parse_proxy, probe_udp
-from .runtime import Runtime, apply_engine_version
+from .runtime import Runtime, apply_apple_webgpu_features, apply_chrome_brand, apply_engine_version
 from .screen import apply_screen_strategy, default_mode_for
 
 _NOISE_DEFAULT = {
@@ -60,6 +63,29 @@ def apply_noise_seeds(config: dict, profile_id: str) -> None:
             block["seed"] = _noise_seed(profile_id, slot)
 
 
+def _close_over_cdp(ws_url: str, timeout: float = 2.0) -> bool:
+    """Ask the browser to quit with CDP `Browser.close`: it writes out what
+    pages saved and exits, where a signal on Windows ends it on the spot. One
+    masked text frame over a plain socket, so no WebSocket package is needed.
+    True when the request went out."""
+    u = urllib.parse.urlparse(ws_url)
+    try:
+        with socket.create_connection((u.hostname, u.port), timeout=timeout) as s:
+            key = base64.b64encode(os.urandom(16)).decode()
+            s.sendall(
+                f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+            )
+            if not s.recv(1024).startswith(b"HTTP/1.1 101"):
+                return False
+            payload = b'{"id":1,"method":"Browser.close"}'
+            mask = os.urandom(4)
+            s.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+            return True
+    except OSError:
+        return False
+
+
 @dataclass
 class BrowserSession:
     pid: int
@@ -77,6 +103,14 @@ class BrowserSession:
             return
         self._stopped = True
         try:
+            # A session with CDP is closed the way the launcher closes it; the
+            # signals below are what is left when that is not possible.
+            if self.cdp_url and _close_over_cdp(self.cdp_url):
+                try:
+                    self.process.wait(timeout=timeout)
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
             if sys.platform == "win32":
                 self.process.terminate()
             else:
@@ -154,7 +188,11 @@ class Browser:
             self.runtime.grease_brand,
             self.runtime.grease_version,
             self.runtime.tls,
+            self.runtime.android_chromium_version if profile.claims_mobile else None,
         )
+        apply_apple_webgpu_features(profile.config)
+        if profile.claims_mobile:
+            apply_chrome_brand(profile.config)
         apply_noise_seeds(profile.config, profile.id)
         fp_file = udd / "fingerprint.json"
         fp_file.write_text(json.dumps(profile.config), encoding="utf-8")

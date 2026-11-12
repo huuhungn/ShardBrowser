@@ -50,7 +50,8 @@ fn now() -> u64 {
 }
 
 fn paths_for(id: &str) -> Result<(PathBuf, PathBuf)> {
-    if id.is_empty() || id.contains(['/', '\\']) {
+    // `.` and `..` name no profile; joined onto a folder they reach its parent.
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
         anyhow::bail!(crate::errcode::code("trash.invalidProfileId"));
     }
     let dir = store::trash_dir()?;
@@ -238,11 +239,15 @@ pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
 /// not restored; a refused unbind keeps the archive.
 pub fn purge(id: &str) -> Result<()> {
     let (zip_path, meta_path) = paths_for(id)?;
-    if !profile::path_for(id).is_ok_and(|record| record.exists()) {
+    let live = profile::path_for(id).is_ok_and(|record| record.exists());
+    if !live {
         crate::team::sync::unbind_removed(id)?;
     }
     let _ = fs::remove_file(zip_path);
     let _ = fs::remove_file(meta_path);
+    if !live {
+        store::remove_browser_cache(&store::user_data_root()?.join(id));
+    }
     Ok(())
 }
 
@@ -260,4 +265,14 @@ pub fn purge_expired() -> Result<usize> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_id_that_names_a_folder_and_not_a_profile_is_refused() {
+        for bad in ["", ".", "..", "a/b", r"a\b"] {
+            assert!(super::paths_for(bad).is_err(), "{bad:?}");
+        }
+    }
 }

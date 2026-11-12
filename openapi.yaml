@@ -611,6 +611,18 @@ paths:
         Writes cookies into the profile's cookie store (re-encrypting to
         Chromium's v10 scheme). The profile **must be stopped** — a running
         browser rewrites the store on exit and would clobber the import.
+
+        Send exactly one of `cookies` (a JSON array) or `text` (the raw
+        content of a file). The format is detected: Netscape `cookies.txt`
+        (including `#HttpOnly_` lines), Cookie-Editor / EditThisCookie JSON,
+        Playwright / Puppeteer cookie arrays or `storageState`, and the
+        `Cookie` schema below. Expiry may be in seconds, milliseconds or
+        microseconds (told apart by magnitude); 0 or a negative value is a
+        session cookie.
+
+        An entry that cannot be converted does not fail the request: it is
+        listed in `skipped` with its position and a reason code. The response
+        never echoes cookie names or values.
       parameters:
         - $ref: "#/components/parameters/ProfileId"
       requestBody:
@@ -619,11 +631,15 @@ paths:
           application/json:
             schema:
               type: object
-              required: [cookies]
+              minProperties: 1
               properties:
                 cookies:
                   type: array
-                  items: { $ref: "#/components/schemas/Cookie" }
+                  description: Cookies in any supported JSON export shape.
+                  items: { type: object }
+                text:
+                  type: string
+                  description: Raw cookies.txt or JSON export content.
       responses:
         "200":
           description: Imported.
@@ -633,6 +649,27 @@ paths:
                 type: object
                 properties:
                   imported: { type: integer, description: Number of cookies written. }
+                  format:
+                    type: string
+                    enum: [netscape, cookie-editor, playwright, shardx]
+                    description: Detected export format.
+                  skipped:
+                    type: array
+                    description: Entries that were not imported.
+                    items:
+                      type: object
+                      properties:
+                        position:
+                          type: integer
+                          description: 1-based line number (`netscape`) or array index (JSON formats).
+                        reason:
+                          type: string
+                          enum: [tooFewFields, badFlag, badExpiry, expiryOutOfRange, missingName, missingValue, missingDomain, notObject]
+        "400":
+          description: Neither or both of `cookies` and `text` were sent, the text is not valid JSON, or its format is not recognised.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409":
           description: Profile is running — stop it first.

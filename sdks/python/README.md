@@ -295,6 +295,18 @@ Override the cache root:
 sdk = ShardX(cache_dir="/data/shardx")
 ```
 
+## Install the engine ahead of time
+
+The first launch downloads the engine, the protected-video module and the
+fingerprint library. To do it beforehand, for example while building a Docker
+image:
+
+```bash
+shardx install             # or: python -m shardx install
+shardx install --force     # download again even when up to date
+shardx install --cache-dir /opt/shardx
+```
+
 ## Update the runtime
 
 The SDK auto-checks remote etags on the first `session`/`launch`/`list_profiles`

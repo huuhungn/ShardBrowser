@@ -9,12 +9,14 @@
 //   • probeUdp             — decide QUIC + WebRTC policy from a live
 //     SOCKS5 UDP_ASSOCIATE probe.
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { connect } from "node:net";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { hasAutoFields, resolveAutoFields } from "./autoResolve.js";
 import { geoCheckVia, type GeoInfo } from "./geo.js";
-import { Profile, userDataDir, applyEngineVersion } from "./profile.js";
+import { Profile, userDataDir, applyAppleWebGpuFeatures, applyChromeBrand, applyEngineVersion } from "./profile.js";
 import { parseProxy, probeUdp, proxyToArg, type ParsedProxy } from "./proxy.js";
 import type { Runtime } from "./runtime.js";
 import { applyScreenStrategy, defaultScreenModeFor, type ScreenStrategy } from "./screen.js";
@@ -87,6 +89,42 @@ export interface LaunchOptions {
   userDataDir?: string;
 }
 
+/**
+ * Ask the browser to quit with CDP `Browser.close`: it writes out what pages
+ * saved and exits, where a signal on Windows ends it on the spot. One masked
+ * text frame over a plain socket: Node has no WebSocket before 22. Resolves
+ * true when the request went out.
+ */
+export function closeOverCdp(wsUrl: string, timeoutMs = 2000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const u = new URL(wsUrl);
+    const sock = connect(Number(u.port), u.hostname);
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    sock.once("error", () => done(false));
+    sock.once("connect", () => {
+      const key = randomBytes(16).toString("base64");
+      sock.write(`GET ${u.pathname} HTTP/1.1\r\nHost: ${u.host}\r\nUpgrade: websocket\r\n` +
+        `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    sock.once("data", (buf) => {
+      if (!buf.toString("latin1").startsWith("HTTP/1.1 101")) return done(false);
+      const payload = Buffer.from('{"id":1,"method":"Browser.close"}');
+      const mask = randomBytes(4);
+      const frame = Buffer.alloc(6 + payload.length);
+      frame[0] = 0x81;
+      frame[1] = 0x80 | payload.length;
+      mask.copy(frame, 2);
+      for (let i = 0; i < payload.length; i++) frame[6 + i] = payload[i] ^ mask[i % 4];
+      sock.write(frame, () => done(true));
+    });
+  });
+}
+
 export class BrowserSession {
   private _stopped = false;
 
@@ -104,15 +142,18 @@ export class BrowserSession {
   async stop(timeoutMs = 5000): Promise<void> {
     if (this._stopped) return;
     this._stopped = true;
-    if (!this.process.pid) return;
-    try { this.process.kill("SIGTERM"); } catch { /* already gone */ }
-    const exited = await new Promise<boolean>((resolve) => {
-      const t = setTimeout(() => resolve(false), timeoutMs);
-      this.process.once("exit", () => { clearTimeout(t); resolve(true); });
+    if (!this.process.pid || this.process.exitCode !== null || this.process.signalCode !== null) return;
+    const gone = new Promise<void>((resolve) => this.process.once("exit", () => resolve()));
+    const exitsWithin = (ms: number) => new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), ms);
+      void gone.then(() => { clearTimeout(t); resolve(true); });
     });
-    if (!exited) {
-      try { this.process.kill("SIGKILL"); } catch { /* ignore */ }
-    }
+    // A session with CDP is closed the way the launcher closes it; the signals
+    // below are what is left when that is not possible.
+    if (this.cdpUrl && await closeOverCdp(this.cdpUrl) && await exitsWithin(timeoutMs)) return;
+    try { this.process.kill("SIGTERM"); } catch { /* already gone */ }
+    if (await exitsWithin(timeoutMs)) return;
+    try { this.process.kill("SIGKILL"); } catch { /* ignore */ }
   }
 }
 
@@ -151,7 +192,10 @@ export class Browser {
     // Keep the spoofed Chrome version coherent with the installed engine,
     // regardless of where the profile config came from (library / file / dict).
     applyEngineVersion(profile.config, this.runtime.chromiumVersion, this.runtime.greaseBrand,
-                       this.runtime.greaseVersion, this.runtime.tls);
+                       this.runtime.greaseVersion, this.runtime.tls,
+                       profile.claimsMobile ? this.runtime.androidChromiumVersion : undefined);
+    applyAppleWebGpuFeatures(profile.config);
+    if (profile.claimsMobile) applyChromeBrand(profile.config);
     applyNoiseSeeds(profile.config, profile.id);
     const fpFile = join(udd, "fingerprint.json");
     writeFileSync(fpFile, JSON.stringify(profile.config));

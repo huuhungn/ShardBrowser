@@ -234,9 +234,20 @@ async fn probe_inner(entry: &ProxyEntry) -> Result<u128> {
 
     let started = Instant::now();
     let addr = format!("{}:{}", entry.host, entry.port);
-    let mut stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
-        .await
-        .context(errcode::code("proxy.connectTimeout"))??;
+    // Resolve apart from connecting so a name that does not resolve is told
+    // from a host that refuses.
+    let mut stream = timeout(Duration::from_secs(8), async {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr.as_str())
+            .await
+            .context(errcode::code("proxy.dnsFailed"))?
+            .collect();
+        if addrs.is_empty() {
+            anyhow::bail!("{}", errcode::code("proxy.dnsFailed"));
+        }
+        Ok(TcpStream::connect(&addrs[..]).await?)
+    })
+    .await
+    .context(errcode::code("proxy.connectTimeout"))??;
 
     match entry.kind {
         ProxyKind::Socks5 => {
@@ -801,6 +812,130 @@ pub struct TestSnapshot {
     pub udp_ms: Option<u128>,
     pub udp_error: Option<String>,
     pub provider: String,
+    /// `None` for snapshots written before retries existed.
+    #[serde(default)]
+    pub status: Option<TestStatus>,
+    #[serde(default)]
+    pub failure_reason: Option<FailureReason>,
+    /// TCP attempts made; 0 for snapshots written before retries existed.
+    #[serde(default)]
+    pub attempts: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Working,
+    /// Connected, but only after at least one failed attempt.
+    Unstable,
+    Failed,
+}
+
+// `proxy_bypassed` (exit IP equals this machine's direct IP) is not a reason
+// yet: a test never looks up the direct IP, and a second geo call per test is
+// not cheap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureReason {
+    AuthenticationFailed,
+    Timeout,
+    DnsFailed,
+    Unreachable,
+    ProtocolError,
+}
+
+/// Derive why an attempt failed from the error kinds it carried.
+fn classify_failure(err: &anyhow::Error) -> FailureReason {
+    use std::io::ErrorKind::{ConnectionRefused, HostUnreachable, NetworkUnreachable, TimedOut};
+    let text = format!("{err:#}");
+    if errcode::has_code(&text, "proxy.authRefused")
+        || ["1.0", "1.1"]
+            .iter()
+            .any(|v| text.contains(&format!("proxy.connectFailed|first_line=HTTP/{v} 407")))
+    {
+        return FailureReason::AuthenticationFailed;
+    }
+    if errcode::has_code(&text, "proxy.dnsFailed") {
+        return FailureReason::DnsFailed;
+    }
+    if errcode::has_code(&text, "proxy.connectTimeout")
+        || errcode::has_code(&text, "proxy.readTimeout")
+    {
+        return FailureReason::Timeout;
+    }
+    // SOCKS5 replies 3, 4, 5: network unreachable, host unreachable, refused.
+    if ["3", "4", "5"]
+        .iter()
+        .any(|c| text.contains(&format!("proxy.socksRefused|code={c}]]")))
+    {
+        return FailureReason::Unreachable;
+    }
+    match err
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+        .map(|e| e.kind())
+    {
+        Some(ConnectionRefused | HostUnreachable | NetworkUnreachable) => {
+            FailureReason::Unreachable
+        }
+        Some(TimedOut) => FailureReason::Timeout,
+        _ => FailureReason::ProtocolError,
+    }
+}
+
+struct TcpOutcome {
+    ms: Option<u128>,
+    attempts: u8,
+    status: TestStatus,
+    reason: Option<FailureReason>,
+}
+
+const MAX_ATTEMPTS: u8 = 3;
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Up to `MAX_ATTEMPTS` TCP probes, stopping at the first success or at an
+/// authentication failure (retrying a wrong password only risks a lockout).
+/// All attempts share `budget`, so a dead proxy is no slower than one probe.
+async fn probe_with_retries(entry: &ProxyEntry, budget: std::time::Duration) -> TcpOutcome {
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0u8;
+    loop {
+        attempts += 1;
+        let remaining = budget.saturating_sub(started.elapsed());
+        let res = tokio::time::timeout(remaining, probe_inner(entry))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(errcode::code("proxy.readTimeout"))));
+        let err = match res {
+            Ok(ms) => {
+                let status = if attempts == 1 {
+                    TestStatus::Working
+                } else {
+                    TestStatus::Unstable
+                };
+                return TcpOutcome {
+                    ms: Some(ms),
+                    attempts,
+                    status,
+                    reason: None,
+                };
+            }
+            Err(e) => e,
+        };
+        let reason = classify_failure(&err);
+        let backoff = RETRY_BACKOFF * u32::from(attempts);
+        if attempts == MAX_ATTEMPTS
+            || reason == FailureReason::AuthenticationFailed
+            || started.elapsed() + backoff >= budget
+        {
+            return TcpOutcome {
+                ms: None,
+                attempts,
+                status: TestStatus::Failed,
+                reason: Some(reason),
+            };
+        }
+        tokio::time::sleep(backoff).await;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -844,6 +979,9 @@ fn record_test(proxy_id: &str, mut snap: TestSnapshot) -> Result<TestSnapshot> {
             last.tcp_ms = snap.tcp_ms;
             last.udp_ms = snap.udp_ms;
             last.udp_error = snap.udp_error.clone();
+            last.status = snap.status;
+            last.failure_reason = snap.failure_reason;
+            last.attempts = snap.attempts;
             let out = last.clone();
             save_history(&hs)?;
             return Ok(out);
@@ -885,7 +1023,7 @@ fn unix_now() -> String {
 pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     let now = unix_now();
 
-    let tcp_res = probe(entry).await;
+    let tcp = probe_with_retries(entry, TEST_DEADLINE).await;
     let udp_res = if matches!(entry.kind, ProxyKind::Socks5) {
         Some(probe_udp(entry).await)
     } else {
@@ -894,7 +1032,7 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     let geo_res = geo_check(entry, None).await;
 
     // TCP failure → zero geo so snapshot reads "Failed, no IP".
-    let tcp_failed = tcp_res.is_err();
+    let tcp_failed = tcp.ms.is_none();
     let (ip, country_code, country, region, city, isp, tz, lat, lng, provider) =
         match (&geo_res, tcp_failed) {
             (Ok(g), false) => (
@@ -935,12 +1073,15 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
         timezone: tz,
         latitude: lat,
         longitude: lng,
-        tcp_ms: tcp_res.ok(),
+        tcp_ms: tcp.ms,
         udp_ms: udp_res.as_ref().and_then(|r| r.as_ref().ok().copied()),
         udp_error: udp_res
             .as_ref()
             .and_then(|r| r.as_ref().err().map(|e| e.to_string())),
         provider,
+        status: Some(tcp.status),
+        failure_reason: tcp.reason,
+        attempts: tcp.attempts,
     };
 
     let recorded = record_test(&entry.id, snap)?;
@@ -1080,6 +1221,191 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(probe(&p).await.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[derive(Clone, Copy)]
+    enum Conn {
+        Ok,
+        /// SOCKS5 "no acceptable method" reply.
+        AuthRefused,
+        /// Hang up straight after the greeting.
+        Close,
+        /// Never answer the CONNECT.
+        Hang,
+    }
+
+    /// A SOCKS5 server on loopback whose n-th connection behaves as `script[n]`
+    /// (the last entry repeats).
+    async fn scripted_socks5(script: Vec<Conn>) -> ProxyEntry {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let conn = script[n.min(script.len() - 1)];
+                tokio::spawn(async move {
+                    let mut greet = [0u8; 3];
+                    let _ = s.read_exact(&mut greet).await;
+                    match conn {
+                        Conn::AuthRefused => {
+                            let _ = s.write_all(&[0x05, 0xFF]).await;
+                        }
+                        Conn::Close => {}
+                        Conn::Ok | Conn::Hang => {
+                            let _ = s.write_all(&[0x05, 0x00]).await;
+                            let mut req = [0u8; 256];
+                            let _ = s.read(&mut req).await;
+                            if matches!(conn, Conn::Ok) {
+                                let _ = s
+                                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                                    .await;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                });
+            }
+        });
+        ProxyEntry {
+            host: "127.0.0.1".into(),
+            port,
+            ..entry("", "")
+        }
+    }
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn a_first_try_success_is_working() {
+        let p = scripted_socks5(vec![Conn::Ok]).await;
+        let o = probe_with_retries(&p, BUDGET).await;
+        assert_eq!(
+            (o.status, o.attempts, o.reason),
+            (TestStatus::Working, 1, None)
+        );
+        assert!(o.ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_success_after_a_failed_attempt_is_unstable() {
+        let p = scripted_socks5(vec![Conn::Close, Conn::Ok]).await;
+        let o = probe_with_retries(&p, BUDGET).await;
+        assert_eq!(
+            (o.status, o.attempts, o.reason),
+            (TestStatus::Unstable, 2, None)
+        );
+        assert!(o.ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn every_attempt_failing_is_failed_with_a_reason() {
+        let p = scripted_socks5(vec![Conn::Close]).await;
+        let o = probe_with_retries(&p, BUDGET).await;
+        assert_eq!(o.status, TestStatus::Failed);
+        assert_eq!(o.attempts, MAX_ATTEMPTS);
+        assert_eq!(o.reason, Some(FailureReason::ProtocolError));
+        assert!(o.ms.is_none());
+    }
+
+    /// A wrong password is not retried: it only risks a lockout.
+    #[tokio::test]
+    async fn an_authentication_failure_stops_after_one_attempt() {
+        let p = scripted_socks5(vec![Conn::AuthRefused, Conn::Ok]).await;
+        let o = probe_with_retries(&p, BUDGET).await;
+        assert_eq!(o.status, TestStatus::Failed);
+        assert_eq!(o.attempts, 1);
+        assert_eq!(o.reason, Some(FailureReason::AuthenticationFailed));
+    }
+
+    /// A proxy that goes quiet spends the budget once, not once per attempt.
+    #[tokio::test]
+    async fn a_silent_proxy_times_out_within_the_budget() {
+        let p = scripted_socks5(vec![Conn::Hang]).await;
+        let started = std::time::Instant::now();
+        let o = probe_with_retries(&p, std::time::Duration::from_secs(1)).await;
+        assert_eq!(o.reason, Some(FailureReason::Timeout));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+    }
+
+    #[tokio::test]
+    async fn an_http_407_is_an_authentication_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req).await;
+            let _ = s
+                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .await;
+        });
+        let p = ProxyEntry {
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port,
+            ..entry("u", "wrong")
+        };
+        let o = probe_with_retries(&p, BUDGET).await;
+        assert_eq!(o.reason, Some(FailureReason::AuthenticationFailed));
+        assert_eq!(o.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_port_is_unreachable() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let p = ProxyEntry {
+            host: "127.0.0.1".into(),
+            port,
+            ..entry("", "")
+        };
+        let err = probe_inner(&p).await.expect_err("nothing listens there");
+        assert_eq!(classify_failure(&err), FailureReason::Unreachable);
+    }
+
+    /// `.invalid` is reserved (RFC 6761) and never resolves.
+    #[tokio::test]
+    async fn an_unresolvable_host_is_a_dns_failure() {
+        let p = ProxyEntry {
+            host: "proxy.invalid".into(),
+            ..entry("", "")
+        };
+        let err = probe_inner(&p).await.expect_err("cannot resolve");
+        assert_eq!(classify_failure(&err), FailureReason::DnsFailed);
+    }
+
+    #[test]
+    fn a_socks_refusal_splits_into_unreachable_and_protocol_error() {
+        let refusal = |code: &str| {
+            anyhow::anyhow!(errcode::code_with("proxy.socksRefused", &[("code", code)]))
+        };
+        assert_eq!(classify_failure(&refusal("5")), FailureReason::Unreachable);
+        assert_eq!(
+            classify_failure(&refusal("1")),
+            FailureReason::ProtocolError
+        );
+    }
+
+    /// `proxies-history.json` written before retries existed has none of the
+    /// new fields and must still load.
+    #[test]
+    fn an_old_snapshot_still_loads() {
+        let old = r#"{"by_proxy":{"p1":[{"first_seen":"@1","last_seen":"@2","ip":"1.2.3.4",
+            "country_code":"PL","country":"Poland","region":"","city":"","isp":"",
+            "timezone":"UTC","latitude":0.0,"longitude":0.0,"tcp_ms":42,"udp_ms":null,
+            "udp_error":null,"provider":"ip-api.com"}]}}"#;
+        let hs: HistoryStore = serde_json::from_str(old).unwrap();
+        let snap = &hs.by_proxy["p1"][0];
+        assert_eq!(snap.tcp_ms, Some(42));
+        assert_eq!(
+            (snap.status, snap.failure_reason, snap.attempts),
+            (None, None, 0)
+        );
     }
 
     /// #72: the password carries the session with some providers, so two

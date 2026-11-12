@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Button, SegmentControl, Textarea } from "@proxyshard/shardx-ui-kit";
+import { Button, SegmentControl, Switch, Textarea } from "@proxyshard/shardx-ui-kit";
 import { Field } from "../../../shared/ui/Field";
 import { NumField } from "../../../shared/ui/NumField";
 import { Pair } from "../../../shared/ui/Pair";
@@ -17,7 +17,7 @@ import {
 import type { ProfileForm, GeoMode, WebRtcMode } from "../../../entities/profile";
 import type { FingerprintEntry } from "../../../entities/fingerprint";
 import type { ProxyEntry } from "../../../entities/proxy";
-import { enrichPicksForPreset } from "../../../entities/profile";
+import { claimsMobile, enrichPicksForPreset } from "../../../entities/profile";
 import { useGpuCompat } from "../../../shared/model/gpuCompat";
 import { IncompatibleWarningModal } from "../../gpu-compat";
 import { useT } from "../../../shared/i18n";
@@ -230,6 +230,20 @@ export function InlineEditor({
             value={f.blocked_ports}
             onChange={(v) => u("blocked_ports", v)}
           />
+
+          {/* A phone has no window to maximize. */}
+          {!claimsMobile(f) && (
+            <>
+              <Switch
+                label={t("profile.maximizedLabel")}
+                checked={f.maximized}
+                onChange={(checked) => u("maximized", checked)}
+              />
+              <p className="m-0 -mt-3 text-paragraph-xs text-text-soft-400">
+                {t("profile.maximizedHelp")}
+              </p>
+            </>
+          )}
         </div>
 
         {/* ----- col 3: privacy + media + notes ----- */}

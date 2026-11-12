@@ -324,6 +324,88 @@ pub fn apply_engine_version(
     }
 }
 
+/// The build a profile reports: `android` (the Chrome for Android build of the same
+/// major) for a phone, since Android ships its own build numbers and a phone reporting a
+/// desktop one claims a build no phone has; otherwise the engine's `chromium` build.
+pub(crate) fn reported_build<'a>(chromium: &'a str, android: Option<&'a str>) -> &'a str {
+    let major = chromium.split('.').next();
+    android
+        .filter(|v| v.split('.').count() == 4 && v.split('.').next() == major)
+        .unwrap_or(chromium)
+}
+
+/// The brand Chrome lists in `userAgentData.brands` and `Sec-CH-UA`, Android included.
+const CHROME_BRAND: &str = "Google Chrome";
+
+/// Names the brand on a profile that names none, so the brand list is Chrome's and
+/// not only "Chromium" and GREASE; a brand the profile names stays. Launch calls it
+/// for phone profiles, whose library templates lacked the field.
+pub(crate) fn apply_chrome_brand(config: &mut Value) {
+    let Some(ch) = config
+        .get_mut("client_hints")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    if ch
+        .get("brand")
+        .and_then(|v| v.as_str())
+        .is_some_and(|b| !b.is_empty())
+    {
+        return;
+    }
+    ch.insert("brand".into(), Value::String(CHROME_BRAND.into()));
+}
+
+/// WebGPU features Chrome 156 reports on Apple M-series that older templates lack.
+const APPLE_WEBGPU_ADDED: &[&str] = &["texture-compression-unaligned"];
+/// Chrome 157 adds these from M2 on (Dawn: Apple8 with Mac2, or Apple9); M1 has none.
+const APPLE_M2_WEBGPU_ADDED: &[&str] = &["atomic-vec2u-min-max"];
+
+/// Adds the Apple M-series WebGPU features to a profile's `webgpu.features`, in sorted
+/// place; touches nothing else. An absent or empty list means "the host's own" and
+/// stays as it is.
+pub(crate) fn apply_apple_webgpu_features(config: &mut Value) {
+    let generation: Option<u32> = config
+        .pointer("/webgl/renderer")
+        .and_then(|v| v.as_str())
+        .and_then(|r| r.find("Apple M").map(|i| &r[i + 7..]))
+        .and_then(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        });
+    let apple_adapter = config.pointer("/webgpu/vendor").and_then(|v| v.as_str()) == Some("apple");
+    let Some(generation) = generation.filter(|_| apple_adapter) else {
+        return;
+    };
+    let Some(list) = config
+        .pointer_mut("/webgpu/features")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+    if list.is_empty() {
+        return;
+    }
+    let m2: &[&str] = if generation >= 2 {
+        APPLE_M2_WEBGPU_ADDED
+    } else {
+        &[]
+    };
+    for &feat in APPLE_WEBGPU_ADDED.iter().chain(m2) {
+        if list.iter().any(|v| v.as_str() == Some(feat)) {
+            continue;
+        }
+        let at = list
+            .iter()
+            .position(|v| v.as_str().is_some_and(|s| s > feat))
+            .unwrap_or(list.len());
+        list.insert(at, Value::String(feat.to_string()));
+    }
+}
+
 /// Per-profile state dir (cookies / IndexedDB / cache), preserved across
 /// launches. Defaults to `<profiles_root>/<id>/`.
 pub fn user_data_dir(runtime: &Runtime, profile_id: &str, base: Option<&Path>) -> Result<PathBuf> {
@@ -337,7 +419,10 @@ pub fn user_data_dir(runtime: &Runtime, profile_id: &str, base: Option<&Path>) -
 
 #[cfg(test)]
 mod tests {
-    use super::Profile;
+    use super::{
+        apply_apple_webgpu_features, apply_chrome_brand, apply_engine_version, reported_build,
+        Profile,
+    };
     use serde_json::json;
 
     fn profile(config: serde_json::Value) -> Profile {
@@ -363,6 +448,127 @@ mod tests {
             let p = profile(cfg);
             assert!(p.claims_mobile());
             assert!(!p.claims_linux_desktop());
+        }
+    }
+
+    fn phone() -> serde_json::Value {
+        json!({
+            "navigator": { "user_agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36" },
+            "client_hints": { "mobile": true, "brand_full_version": "156.0.8078.48" }
+        })
+    }
+
+    #[test]
+    fn a_phone_gets_the_android_build_with_build_and_patch_from_it() {
+        let mut cfg = phone();
+        let build = reported_build("157.0.8103.39", Some("157.0.8103.38"));
+        apply_engine_version(&mut cfg, build, None, None, None);
+        let ch = &cfg["client_hints"];
+        assert_eq!(ch["brand_version"], "157");
+        assert_eq!(ch["brand_full_version"], "157.0.8103.38");
+        assert_eq!(ch["chrome_patch"], 38);
+        assert!(cfg["navigator"]["user_agent"]
+            .as_str()
+            .unwrap()
+            .contains("Chrome/157.0.0.0 Mobile"));
+    }
+
+    #[test]
+    fn no_android_build_or_one_of_another_major_keeps_the_engines() {
+        for android in [None, Some("156.0.8078.81"), Some("157.0.8103"), Some("")] {
+            assert_eq!(
+                reported_build("157.0.8103.39", android),
+                "157.0.8103.39",
+                "{android:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_brand_becomes_google_chrome_and_a_named_one_stays() {
+        let mut bare = phone();
+        apply_chrome_brand(&mut bare);
+        assert_eq!(bare["client_hints"]["brand"], "Google Chrome");
+        let mut named = json!({ "client_hints": { "brand": "Chromium" } });
+        apply_chrome_brand(&mut named);
+        assert_eq!(named["client_hints"]["brand"], "Chromium");
+        let mut none = json!({});
+        apply_chrome_brand(&mut none);
+        assert_eq!(none, json!({}));
+    }
+
+    const M1: &str = "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)";
+
+    fn mac(renderer: &str, vendor: &str, features: serde_json::Value) -> serde_json::Value {
+        json!({ "webgl": { "renderer": renderer }, "webgpu": { "vendor": vendor, "features": features } })
+    }
+
+    #[test]
+    fn an_apple_m_list_gains_the_feature_in_sorted_place_once() {
+        let mut cfg = mac(
+            M1,
+            "apple",
+            json!([
+                "shader-f16",
+                "texture-compression-etc2",
+                "texture-formats-tier1"
+            ]),
+        );
+        apply_apple_webgpu_features(&mut cfg);
+        apply_apple_webgpu_features(&mut cfg);
+        assert_eq!(
+            cfg["webgpu"]["features"],
+            json!([
+                "shader-f16",
+                "texture-compression-etc2",
+                "texture-compression-unaligned",
+                "texture-formats-tier1"
+            ])
+        );
+    }
+
+    #[test]
+    fn m2_and_later_also_gain_the_chrome_157_feature_m1_does_not() {
+        let mut m3 = mac(
+            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Max, Unspecified Version)",
+            "apple",
+            json!(["shader-f16", "texture-compression-unaligned"]),
+        );
+        apply_apple_webgpu_features(&mut m3);
+        assert_eq!(
+            m3["webgpu"]["features"],
+            json!([
+                "atomic-vec2u-min-max",
+                "shader-f16",
+                "texture-compression-unaligned"
+            ])
+        );
+        let mut m1 = mac(
+            M1,
+            "apple",
+            json!(["shader-f16", "texture-compression-unaligned"]),
+        );
+        apply_apple_webgpu_features(&mut m1);
+        assert_eq!(
+            m1["webgpu"]["features"],
+            json!(["shader-f16", "texture-compression-unaligned"])
+        );
+    }
+
+    #[test]
+    fn other_gpus_and_an_empty_list_are_left_alone() {
+        for mut cfg in [
+            mac(
+                "ANGLE (Intel, Intel(R) Iris(TM) Plus Graphics)",
+                "intel",
+                json!(["shader-f16"]),
+            ),
+            mac(M1, "intel", json!(["shader-f16"])),
+            mac(M1, "apple", json!([])),
+        ] {
+            let before = cfg.clone();
+            apply_apple_webgpu_features(&mut cfg);
+            assert_eq!(cfg, before);
         }
     }
 }

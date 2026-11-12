@@ -10,6 +10,14 @@ export type ProxyEntry = {
   notes: string;
 };
 
+export type ProxyTestStatus = "working" | "unstable" | "failed";
+export type ProxyFailureReason =
+  | "authentication_failed"
+  | "timeout"
+  | "dns_failed"
+  | "unreachable"
+  | "protocol_error";
+
 export type ProxyTestSnapshot = {
   first_seen: string;
   last_seen: string;
@@ -26,6 +34,10 @@ export type ProxyTestSnapshot = {
   udp_ms: number | null;
   udp_error: string | null;
   provider: string;
+  /** Absent on snapshots saved before retries existed. */
+  status?: ProxyTestStatus | null;
+  failure_reason?: ProxyFailureReason | null;
+  attempts?: number;
 };
 
 export type BulkRowState = {

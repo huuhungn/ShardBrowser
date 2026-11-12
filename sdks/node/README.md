@@ -310,6 +310,18 @@ Override:
 const sdk = new ShardX({ cacheDir: "/data/shardx" });
 ```
 
+## Install the engine ahead of time
+
+The first launch downloads the engine, the protected-video module and the
+fingerprint library. To do it beforehand, for example while building a Docker
+image:
+
+```bash
+npx shardx install             # once the package is installed
+npx shardx install --force     # download again even when up to date
+npx shardx install --cache-dir /opt/shardx
+```
+
 ## Update the runtime
 
 The SDK auto-checks remote etags on the first `session`/`launch`/`listProfiles`

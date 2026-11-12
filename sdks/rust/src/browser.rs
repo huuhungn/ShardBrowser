@@ -106,22 +106,83 @@ pub struct BrowserSession {
 }
 
 impl BrowserSession {
-    /// Terminate the engine process. Idempotent.
+    /// Close the engine. Idempotent. A session with CDP is closed the way the launcher
+    /// closes it, with `Browser.close`, which lets the browser write out what pages saved;
+    /// a kill follows only when it has not exited within five seconds, or there is no CDP.
     pub async fn stop(&mut self) -> Result<()> {
         if self.stopped {
             return Ok(());
         }
         self.stopped = true;
-        if let Some(mut child) = self.child.take() {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let gone = match &self.cdp_url {
+            Some(ws) => {
+                close_over_cdp(ws).await && exits_within(&mut child, Duration::from_secs(5)).await
+            }
+            None => false,
+        };
+        if !gone {
             let _ = child.kill();
-            // Reap so we don't leave a zombie.
-            tokio::task::spawn_blocking(move || {
-                let _ = child.wait();
-            })
-            .await
-            .ok();
         }
+        // Reap so we don't leave a zombie.
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+        })
+        .await
+        .ok();
         Ok(())
+    }
+}
+
+/// Asks the browser to quit with CDP `Browser.close`: it writes out what pages saved and
+/// exits, where a kill can lose the last of it. One masked text frame over a plain
+/// socket. True when the request went out.
+pub(crate) async fn close_over_cdp(ws_url: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(rest) = ws_url.strip_prefix("ws://") else {
+        return false;
+    };
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let talk = async {
+        let mut sock = tokio::net::TcpStream::connect(host).await.ok()?;
+        // A fixed handshake nonce (RFC 6455 only asks for 16 base64 bytes), not a secret.
+        let nonce = "c2hhcmR4LXNkay1jbG9zZQ=="; // gitleaks:allow
+        let hello = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        sock.write_all(hello.as_bytes()).await.ok()?;
+        let mut buf = [0u8; 1024];
+        let n = sock.read(&mut buf).await.ok()?;
+        if !buf[..n].starts_with(b"HTTP/1.1 101") {
+            return None;
+        }
+        let payload = br#"{"id":1,"method":"Browser.close"}"#;
+        let mask = [0x5a, 0x17, 0xc3, 0x8e];
+        let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        sock.write_all(&frame).await.ok()
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), talk).await,
+        Ok(Some(()))
+    )
+}
+
+/// Whether `child` exits within `limit`, polled rather than waited on, so it is still ours.
+async fn exits_within(child: &mut Child, limit: Duration) -> bool {
+    let until = std::time::Instant::now() + limit;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -188,13 +249,22 @@ impl Browser {
         // Keep the spoofed Chrome version coherent with the installed engine,
         // regardless of where the profile config came from (library / file / value).
         let (grease_brand, grease_version) = self.runtime.grease();
+        let engine = self.runtime.chromium_version();
+        let android = profile
+            .claims_mobile()
+            .then(|| self.runtime.android_chromium_version())
+            .flatten();
         crate::profile::apply_engine_version(
             &mut profile.config,
-            &self.runtime.chromium_version(),
+            crate::profile::reported_build(&engine, android.as_deref()),
             grease_brand.as_deref(),
             grease_version.as_deref(),
             self.runtime.tls().as_ref(),
         );
+        crate::profile::apply_apple_webgpu_features(&mut profile.config);
+        if profile.claims_mobile() {
+            crate::profile::apply_chrome_brand(&mut profile.config);
+        }
         apply_noise_seeds(&mut profile.config, &profile.id);
         let fp_file = udd.join("fingerprint.json");
         std::fs::write(&fp_file, serde_json::to_string(&profile.config)?)?;
@@ -334,4 +404,56 @@ async fn read_cdp_endpoint(udd: &std::path::Path, timeout_ms: u64) -> Option<Str
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
+}
+
+#[cfg(test)]
+mod close_over_cdp_tests {
+    use super::{close_over_cdp, exits_within};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A CDP session is stopped with Browser.close, the way the launcher closes a profile.
+    #[tokio::test]
+    async fn browser_close_goes_out_as_one_masked_frame_after_the_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut c, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = c.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET /devtools/browser/x HTTP/1.1\r\n"));
+            c.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").await.unwrap();
+            let n = c.read(&mut buf).await.unwrap();
+            let (len, mask) = ((buf[1] & 0x7f) as usize, [buf[2], buf[3], buf[4], buf[5]]);
+            assert_eq!(n, 6 + len);
+            buf[6..6 + len]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % 4])
+                .collect::<Vec<u8>>()
+        });
+        assert!(close_over_cdp(&format!("ws://127.0.0.1:{port}/devtools/browser/x")).await);
+        let payload: serde_json::Value = serde_json::from_slice(&server.await.unwrap()).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "id": 1, "method": "Browser.close" })
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_listening_is_a_no() {
+        assert!(!close_over_cdp("ws://127.0.0.1:1/devtools/browser/x").await);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_an_exit_is_bounded() {
+        let (prog, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "ping -n 30 127.0.0.1 > NUL"])
+        } else {
+            ("sleep", &["30"])
+        };
+        let mut child = std::process::Command::new(prog).args(args).spawn().unwrap();
+        assert!(!exits_within(&mut child, std::time::Duration::from_millis(300)).await);
+        child.kill().unwrap();
+        assert!(exits_within(&mut child, std::time::Duration::from_secs(5)).await);
+    }
 }

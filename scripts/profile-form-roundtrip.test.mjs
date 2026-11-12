@@ -165,3 +165,50 @@ test("a profile that never had an OS version still inherits the preset's", async
     await cleanup();
   }
 });
+
+test("the maximized flag is off by default and writes nothing", async () => {
+  const { mod, cleanup } = await loadFormModule();
+  try {
+    const form = mod.fromStored(storedProfile({ platformVersion: "14.7" }));
+    assert.equal(form.maximized, false);
+    assert.equal(mod.toStored(form, PRESET).window, undefined);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("the maximized flag survives a save and load, beside the window the profile has", async () => {
+  const { mod, cleanup } = await loadFormModule();
+  try {
+    const stored = storedProfile({ platformVersion: "14.7" });
+    stored.window = { outer_width: 1280, outer_height: 800 };
+
+    const on = mod.toStored({ ...mod.fromStored(stored), maximized: true }, null);
+    assert.deepEqual(on.window, { outer_width: 1280, outer_height: 800, maximized: true });
+
+    const form = mod.fromStored(on);
+    assert.equal(form.maximized, true, "the editor must load the flag the profile has");
+    // The preset brings a window of its own, which replaces the stored one.
+    const withPreset = { ...PRESET, payload: { ...PRESET.payload, window: { outer_width: 1920, outer_height: 1031 } } };
+    assert.equal(mod.toStored(form, withPreset).window.maximized, true);
+
+    const off = mod.toStored({ ...form, maximized: false }, null);
+    assert.deepEqual(off.window, { outer_width: 1280, outer_height: 800 });
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a phone profile never keeps the maximized flag", async () => {
+  const { mod, cleanup } = await loadFormModule();
+  try {
+    const stored = storedProfile({ platformVersion: "14.7" });
+    stored.navigator.user_agent = "Mozilla/5.0 (Linux; Android 10; K) Mobile Safari/537.36";
+    stored.window = { maximized: true };
+    const form = mod.fromStored(stored);
+    assert.equal(mod.claimsMobile(form), true);
+    assert.equal(mod.toStored(form, null).window.maximized, undefined);
+  } finally {
+    await cleanup();
+  }
+});

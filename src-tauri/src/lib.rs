@@ -6,6 +6,7 @@ mod backup_cmd;
 mod bookmarks;
 pub mod cdp;
 mod codex_mcp;
+mod cookie_import;
 mod cookies;
 #[cfg(test)]
 mod crash_harness;
@@ -55,6 +56,7 @@ pub fn cdp_launch_args_for_tests() -> &'static [&'static str] {
 
 mod mcp_setup;
 mod migrate;
+mod open_link;
 mod process;
 mod profile;
 mod proxy;
@@ -1826,14 +1828,18 @@ fn cookies_export_to_file(profile_id: String, path: String) -> Result<usize, Str
     Ok(cookies.len())
 }
 
+/// Import cookies from the raw text of a cookies.txt or JSON export; the
+/// format is detected and malformed entries come back in the report.
 #[tauri::command]
-fn cookies_import(profile_id: String, cookies: Vec<cookies::Cookie>) -> Result<usize, String> {
+fn cookies_import(profile_id: String, text: String) -> Result<cookie_import::ImportReport, String> {
     let _claim = profile::begin_user_mutation(
         [&profile_id],
         &crate::errcode::code("profile.actionImportCookies"),
     )
     .map_err(|error| error.to_string())?;
-    cookies::import(&profile_id, &cookies).map_err(|e| e.to_string())
+    let parsed = cookie_import::parse(&text).map_err(|e| e.to_string())?;
+    let imported = cookies::import(&profile_id, &parsed.cookies).map_err(|e| e.to_string())?;
+    Ok(parsed.into_report(imported))
 }
 
 // ---- Settings ----
@@ -9267,7 +9273,7 @@ mod profile_mutation_boundary_tests {
             profile_id.to_string(),
             vec!["tag".to_string()],
         ));
-        assert_running_blocked(cookies_import(profile_id.to_string(), Vec::new()));
+        assert_running_blocked(cookies_import(profile_id.to_string(), "[]".to_string()));
 
         // Sync reads and writes the profile directory exactly as backup and
         // restore do, so it must refuse a running profile for the same reason:
@@ -9316,6 +9322,8 @@ pub fn run() {
                 show_main_window(app);
             }
         }))
+        // After single-instance: a link a second launch carries reaches this one.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![startup::AUTOSTART_ARG]),
@@ -9500,9 +9508,25 @@ pub fn run() {
             updater::launcher_update_download,
             updater::launcher_update_install,
             updater::launcher_update_restart,
+            open_link::open_link_take,
         ])
         .setup(|app| {
             let _ = APP_HANDLE.set(app.handle().clone());
+
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                // Installers register the scheme; an AppImage and a dev run have none.
+                #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("[launcher] shardbrowser:// links not registered: {e}");
+                }
+                app.deep_link().on_open_url(|event| {
+                    open_link::handle(event.urls().iter().map(|u| u.as_str()))
+                });
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    open_link::handle(urls.iter().map(|u| u.as_str()));
+                }
+            }
 
             // Point the heavy directories wherever the operator moved them,
             // before anything reads a profile.
@@ -9624,6 +9648,11 @@ pub fn run() {
                 Ok(_) => {}
                 Err(e) => eprintln!("[launcher] temporary purge failed: {e}"),
             }
+            // Browser caches deleted profiles left in the OS cache folder, once.
+            tauri::async_runtime::spawn_blocking(|| match store::sweep_orphan_caches() {
+                0 => {}
+                n => eprintln!("[launcher] removed {n} cache folder(s) of deleted profiles"),
+            });
 
             // API task on the shared tokio runtime.
             match settings::ensure_secret() {

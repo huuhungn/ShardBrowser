@@ -179,6 +179,21 @@ use shardx::{Runtime, FingerprintLibrary, parse_proxy, probe_udp, geo_check_via,
 `randomize_hardware` / `randomize_platform_version`, `host_*` probes, and the
 `screen` / `auto_resolve` helpers.
 
+## Install the engine ahead of time
+
+The first launch downloads the engine, the protected-video module and the
+fingerprint library. To do it beforehand, for example while building a Docker
+image, call `Runtime::install` (it is public, and `ShardX::runtime` exposes it):
+
+```rust
+let sdk = shardx::ShardX::new(shardx::ShardXOptions {
+    cache_dir: Some("/opt/shardx".into()),
+    ..Default::default()
+})?;
+sdk.runtime.install(false).await?; // `true` downloads again even when up to date
+println!("engine {} at {}", sdk.runtime.chromium_version(), sdk.runtime.binary_path().display());
+```
+
 ## Links
 
 * **Site:**  [https://proxyshard.com](https://proxyshard.com?utm_source=shardx&utm_medium=referral&utm_campaign=shardx-launcher)
