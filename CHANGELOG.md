@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Cookie import: a far-future expiry written in milliseconds or microseconds
+  (a year-9999 "never") is read in its own unit instead of as an already
+  expired 1978 date or an out-of-range value.
+
 ## v2.12.0
 
 Ports the browser engine and the launcher-side fixes of upstream ProxyShard
