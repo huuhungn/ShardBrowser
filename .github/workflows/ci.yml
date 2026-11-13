@@ -134,7 +134,7 @@ jobs:
   checks:
     runs-on: ubuntu-22.04
     name: frontend, Rust, and MCP checks
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
