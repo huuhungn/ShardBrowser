@@ -1,6 +1,25 @@
 {
   "releases": [
     {
+      "version": "2.12.1",
+      "date": "2026-11-13",
+      "entries": [
+        {
+          "id": "cookie-expiry-units",
+          "title": "Cookie không hết hạn được nhập nguyên vẹn",
+          "lead": "Nhập cookie đọc hạn dùng xa trong tương lai ghi bằng mili giây hoặc micro giây theo đúng đơn vị của nó.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Hạn dùng \"không bao giờ\" năm 9999 ghi bằng mili giây bị đọc thành ngày năm 1978 đã hết hạn, còn ghi bằng micro giây thì bị từ chối vì ngoài phạm vi. Giờ mỗi đơn vị đều được nhận ra với mọi ngày từ năm 2001 trở đi."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.12.0",
       "date": "2026-11-12",
       "entries": [
