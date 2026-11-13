@@ -2,12 +2,16 @@
 
 ## v2.12.1
 
-A fix release for the cookie import added in v2.12.0. The browser engine is
-unchanged (Chromium 157.0.8103.50).
+A fix release for the cookie import added in v2.12.0 and for the MCP runtime's
+web server dependencies. The browser engine is unchanged (Chromium
+157.0.8103.50).
 
 - Cookie import: a far-future expiry written in milliseconds or microseconds
   (a year-9999 "never") is read in its own unit instead of as an already
   expired 1978 date or an out-of-range value.
+- MCP runtime: hono 4.13.18 and @hono/node-server 2.1.8, past the moderate
+  advisories published for their earlier releases (among them
+  GHSA-jpvv-r467-5p4w and GHSA-qv5m-9pm6-hqp3).
 
 ## v2.12.0
 
