@@ -3,6 +3,25 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.12.1",
+      "date": "2026-11-13",
+      "entries": [
+        {
+          "id": "cookie-expiry-units",
+          "title": "Never-expiring cookies import intact",
+          "lead": "Cookie import reads a far-future expiry written in milliseconds or microseconds in its own unit.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "A year-9999 \"never\" expiry written in milliseconds was read as an already expired 1978 date, and one written in microseconds was refused as out of range. Each unit is now recognised for any date from 2001 on."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.12.0",
       "date": "2026-11-12",
       "entries": [

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v2.12.1
+
+A fix release for the cookie import added in v2.12.0. The browser engine is
+unchanged (Chromium 157.0.8103.50).
 
 - Cookie import: a far-future expiry written in milliseconds or microseconds
   (a year-9999 "never") is read in its own unit instead of as an already
