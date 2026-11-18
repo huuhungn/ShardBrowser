@@ -31,6 +31,19 @@
           ]
         },
         {
+          "id": "text-contrast",
+          "title": "Chữ phụ dễ đọc hơn",
+          "lead": "Chữ phụ, và chữ màu xanh trong giao diện tối, giờ đạt mức tương phản WCAG AA.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Chữ phụ đậm hơn một chút trong giao diện sáng và sáng hơn một chút trong giao diện tối. Trong giao diện tối, chữ xanh và nhãn trên các thẻ xanh dùng sắc nhạt hơn của cùng màu xanh; các nút giữ nguyên màu."
+            }
+          ]
+        },
+        {
           "id": "updater-zip",
           "title": "Trình cập nhật gọn hơn",
           "lead": "Trình cập nhật trong ứng dụng không còn mang theo thư viện zip cũ có hai cảnh báo bảo mật đã công bố.",

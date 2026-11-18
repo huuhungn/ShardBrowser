@@ -33,6 +33,19 @@
           ]
         },
         {
+          "id": "text-contrast",
+          "title": "Easier-to-read secondary text",
+          "lead": "Secondary text, and blue text in the dark theme, now meet the WCAG AA contrast level.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Secondary text is a shade darker in the light theme and a shade lighter in the dark theme. In the dark theme, blue text and labels on blue chips use a lighter tint of the same blue; buttons keep their colour."
+            }
+          ]
+        },
+        {
           "id": "updater-zip",
           "title": "A leaner updater",
           "lead": "The in-app updater no longer carries an old zip library with two published security advisories.",
