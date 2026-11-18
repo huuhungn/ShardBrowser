@@ -1,6 +1,51 @@
 {
   "releases": [
     {
+      "version": "2.12.2",
+      "date": "2026-11-18",
+      "entries": [
+        {
+          "id": "partitioned-cookies",
+          "title": "Cookie phân vùng giữ đúng phân vùng của nó",
+          "lead": "Xuất và nhập cookie giữ cookie phân vùng (CHIPS) dưới đúng trang web mà nó thuộc về.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Trước đây phân vùng bị bỏ mất, nên một cookie được lưu dưới hai trang web khác nhau quay về thành một cookie dùng chung ở mọi nơi. Nhập cookie giờ cũng đọc phân vùng từ tệp xuất của Playwright và Cookie-Editor, và liệt kê mục có phân vùng không đọc được thay vì nhập nó."
+            }
+          ]
+        },
+        {
+          "id": "reduced-motion",
+          "title": "Theo cài đặt giảm chuyển động của hệ thống",
+          "lead": "Khi bật giảm chuyển động trong hệ thống, các hiệu ứng trượt, mờ dần và chuyển tiếp của launcher kết thúc ngay lập tức.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Biểu tượng đang tải vẫn quay để việc đang chạy không trông như bị treo, và trình chỉnh sửa hồ sơ hiện ra tại chỗ thay vì cuộn mượt vào tầm nhìn."
+            }
+          ]
+        },
+        {
+          "id": "updater-zip",
+          "title": "Trình cập nhật gọn hơn",
+          "lead": "Trình cập nhật trong ứng dụng không còn mang theo thư viện zip cũ có hai cảnh báo bảo mật đã công bố.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Thư viện đó chỉ dùng để giải nén một định dạng bản cập nhật mà các bản phát hành này không bao giờ dùng, nên việc cập nhật vẫn chạy như trước."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.12.1",
       "date": "2026-11-13",
       "entries": [

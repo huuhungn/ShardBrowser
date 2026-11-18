@@ -3,6 +3,51 @@
   "repoUrl": "https://github.com/ProxyShard/ShardBrowser",
   "releases": [
     {
+      "version": "2.12.2",
+      "date": "2026-11-18",
+      "entries": [
+        {
+          "id": "partitioned-cookies",
+          "title": "Partitioned cookies stay in their partition",
+          "lead": "Cookie export and import keep a partitioned (CHIPS) cookie under the site it belongs to.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "The partition used to be dropped, so one cookie stored under two different sites came back as a single cookie shared everywhere. Import also reads the partition from Playwright and Cookie-Editor exports, and lists an entry whose partition cannot be read instead of importing it."
+            }
+          ]
+        },
+        {
+          "id": "reduced-motion",
+          "title": "Follows the system's reduce-motion setting",
+          "lead": "With reduce motion turned on in the system, the launcher's slides, fades and transitions finish at once.",
+          "tag": "new",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "Spinners keep turning, so work in progress never looks frozen, and the profile editor appears in place instead of scrolling smoothly into view."
+            }
+          ]
+        },
+        {
+          "id": "updater-zip",
+          "title": "A leaner updater",
+          "lead": "The in-app updater no longer carries an old zip library with two published security advisories.",
+          "tag": "fix",
+          "scope": "launcher",
+          "blocks": [
+            {
+              "type": "p",
+              "text": "That library only unpacked an update format these releases never publish, so updates work exactly as before."
+            }
+          ]
+        }
+      ]
+    },
+    {
       "version": "2.12.1",
       "date": "2026-11-13",
       "entries": [
