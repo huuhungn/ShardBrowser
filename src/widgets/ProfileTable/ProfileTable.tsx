@@ -57,7 +57,8 @@ export function ProfileTable() {
     if (!expanded || expanded === "__new__") return;
     const t = setTimeout(() => {
       const el = document.querySelector<HTMLElement>(".row-wrap.row-expanded .inline-editor");
-      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      el?.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" });
     }, 60);
     return () => clearTimeout(t);
   }, [expanded]);
