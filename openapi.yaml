@@ -1702,6 +1702,18 @@ components:
           type: string
           enum: [Strict, Lax, None, unspecified]
           description: Case-insensitive on import.
+        top_frame_site_key:
+          type: string
+          description: |
+            Partitioned (CHIPS) cookies only: the top-level site the cookie is
+            keyed to, e.g. "https://example.com". Absent for an unpartitioned
+            cookie. Import also reads Playwright's `partitionKey` string and the
+            `{topLevelSite, hasCrossSiteAncestor}` object of `chrome.cookies`.
+        has_cross_site_ancestor:
+          type: boolean
+          description: |
+            Partitioned cookies only: set under a cross-site frame. Absent means
+            true.
 
     ProxyEntry:
       type: object

@@ -2,6 +2,12 @@
 
 ## v2.12.2
 
+- Cookies: export and import keep a partitioned (CHIPS) cookie in its
+  partition. The partition used to be dropped, so one cookie stored under two
+  sites came back as a single unpartitioned cookie. Import also reads the
+  partition from Playwright (`partitionKey`) and from `chrome.cookies` or
+  Cookie-Editor exports, and lists an entry whose partition Chromium could not
+  read instead of importing it.
 - Security: the in-app updater is built without its `zip` feature, which
   pulled in `zip` 4.6.1 (RUSTSEC-2026-0545, RUSTSEC-2026-0548). That feature
   only unpacks Tauri v1 `.zip` update bundles; these releases publish the
