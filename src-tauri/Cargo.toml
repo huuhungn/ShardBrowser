@@ -94,7 +94,9 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2"
-tauri-plugin-updater = "2.10.1"
+# No `zip`: it only unpacks Tauri v1 `.zip` update bundles, and this app
+# publishes the installers themselves (`createUpdaterArtifacts: true`).
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
 
 [dev-dependencies]
 minisign-verify = "0.2.5"

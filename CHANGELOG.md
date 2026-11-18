@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.12.2
+
+- Security: the in-app updater is built without its `zip` feature, which
+  pulled in `zip` 4.6.1 (RUSTSEC-2026-0545, RUSTSEC-2026-0548). That feature
+  only unpacks Tauri v1 `.zip` update bundles; these releases publish the
+  installers themselves.
+
 ## v2.12.1
 
 A fix release for the cookie import added in v2.12.0 and for the MCP runtime's
