@@ -32,6 +32,31 @@
   }
 }
 
+/* ===== Reduced motion ===== */
+
+/* The OS "reduce motion" setting turns slides, fades and hover transitions
+   into instant changes. Spinners keep turning: a frozen one reads as a hang. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .animate-spin,
+  .spin-icon svg {
+    animation-iteration-count: infinite !important;
+  }
+  .animate-spin {
+    animation-duration: 1s !important;
+  }
+  .spin-icon svg {
+    animation-duration: 0.9s !important;
+  }
+}
+
 /* ===== Pseudo-elements ===== */
 
 /* Diagonal-slash overlay on "no UDP" status pill */
