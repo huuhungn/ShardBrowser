@@ -190,6 +190,10 @@
   --color-text-soft-400: var(--text-soft-400);
   --color-text-disabled-300: var(--text-disabled-300);
   --color-text-white-0: var(--text-white-0);
+  /* `text-*` reads --text-color-* before --color-*: primary text can take a
+     lighter tint on dark surfaces while bg-primary-base keeps the brand
+     colour under white labels. */
+  --text-color-primary-base: var(--text-primary);
 
   --color-stroke-strong-950: var(--stroke-strong-950);
   --color-stroke-sub-300: var(--stroke-sub-300);
@@ -206,9 +210,11 @@
 
   --text-strong-950: #171717;
   --text-sub-600: #5c5c5c;
-  --text-soft-400: #a3a3a3;
+  /* AA (4.5:1) on bg-white-0 and bg-weak-50; scripts/contrast-tokens.test.mjs */
+  --text-soft-400: #717171;
   --text-disabled-300: #d1d1d1;
   --text-white-0: #ffffff;
+  --text-primary: #535efd;
 
   --stroke-strong-950: #171717;
   --stroke-sub-300: #d1d1d1;
@@ -238,9 +244,11 @@
 
   --text-strong-950: #ffffff;
   --text-sub-600: #a3a3a3;
-  --text-soft-400: #7b7b7b;
+  --text-soft-400: #848484;
   --text-disabled-300: #5c5c5c;
   --text-white-0: #171717;
+  /* #535efd mixed 30% toward white: same hue, AA on dark surfaces and chips */
+  --text-primary: #878efe;
 
   --stroke-strong-950: #ffffff;
   --stroke-sub-300: #333333;

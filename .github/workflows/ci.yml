@@ -260,6 +260,9 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Text contrast tests
+        run: npm run test:contrast
+
       # The release workflow gates on these, but only inside the release job.
       # Running them here keeps zip-extraction regressions from reaching a tag.
       - name: Node SDK tests
