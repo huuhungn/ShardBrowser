@@ -229,6 +229,13 @@ jobs:
       - name: Updater signature verification tests
         run: npm run test:updater-signatures
 
+      # Owner-approved npm audit exceptions are time-boxed; an expired one
+      # fails here on every push until it is removed or re-approved.
+      - name: npm audit gate tests and exception expiry
+        run: |
+          npm run test:audit-gate
+          node scripts/npm-audit-gate.mjs --check-expiry
+
       - name: Interface language tests
         run: |
           npm run test:i18n
