@@ -40,6 +40,14 @@ pub struct Cookie {
     /// "Strict" | "Lax" | "None" | "unspecified" (case-insensitive).
     #[serde(default, alias = "sameSite")]
     pub same_site: Option<String>,
+    /// CHIPS partition: the top-level site (`https://example.com`) a
+    /// partitioned cookie is keyed to; empty for an unpartitioned cookie. It is
+    /// part of Chromium's unique index, so dropping it merges partitions.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub top_frame_site_key: String,
+    /// Partitioned cookies only: set under a cross-site frame. `None` = true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_cross_site_ancestor: Option<bool>,
 }
 
 fn default_path() -> String {
@@ -304,7 +312,8 @@ pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
 
     let mut stmt = conn.prepare(
         "SELECT host_key, name, value, encrypted_value, path, expires_utc, \
-         is_secure, is_httponly, has_expires, samesite FROM cookies",
+         is_secure, is_httponly, has_expires, samesite, top_frame_site_key, \
+         has_cross_site_ancestor FROM cookies",
     )?;
     let rows = stmt.query_map([], |r| {
         let host: String = r.get(0)?;
@@ -317,6 +326,8 @@ pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
         let is_httponly: i64 = r.get(7)?;
         let has_expires: i64 = r.get(8)?;
         let samesite: i64 = r.get(9)?;
+        let top_frame_site_key: String = r.get(10)?;
+        let has_cross_site_ancestor: i64 = r.get(11)?;
         Ok(Cookie {
             value: crypt.decrypt(&enc, &plain),
             domain: host,
@@ -330,6 +341,9 @@ pub fn export(profile_id: &str) -> Result<Vec<Cookie>> {
             secure: is_secure != 0,
             http_only: is_httponly != 0,
             same_site: Some(samesite_to_str(samesite).to_string()),
+            has_cross_site_ancestor: (!top_frame_site_key.is_empty())
+                .then_some(has_cross_site_ancestor != 0),
+            top_frame_site_key,
         })
     })?;
     let mut out = Vec::new();
@@ -361,7 +375,7 @@ pub fn import(profile_id: &str, cookies: &[Cookie]) -> Result<usize> {
              path, expires_utc, is_secure, is_httponly, last_access_utc, has_expires, \
              is_persistent, priority, samesite, source_scheme, source_port, \
              last_update_utc, source_type, has_cross_site_ancestor) \
-             VALUES (?1, ?2, '', ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, 0, 1)",
+             VALUES (?1, ?2, ?16, ?3, '', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, 0, ?17)",
         )?;
         for c in cookies {
             let enc = crypt.encrypt(&c.domain, &c.value);
@@ -369,6 +383,9 @@ pub fn import(profile_id: &str, cookies: &[Cookie]) -> Result<usize> {
             let expires_utc = c.expires.map(unix_to_chromium).unwrap_or(0);
             let source_scheme = if c.secure { 2 } else { 1 };
             let source_port = if c.secure { 443 } else { 80 };
+            // Chromium stores true for every unpartitioned cookie.
+            let has_cross_site_ancestor =
+                c.top_frame_site_key.is_empty() || c.has_cross_site_ancestor.unwrap_or(true);
             stmt.execute(rusqlite::params![
                 now,
                 c.domain,
@@ -385,6 +402,8 @@ pub fn import(profile_id: &str, cookies: &[Cookie]) -> Result<usize> {
                 source_scheme,
                 source_port,
                 now,
+                c.top_frame_site_key,
+                has_cross_site_ancestor as i64,
             ])?;
         }
     }
@@ -411,4 +430,101 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
             host_key, top_frame_site_key, has_cross_site_ancestor, name, path, source_scheme, source_port);",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookie(site: &str, cross: Option<bool>) -> Cookie {
+        Cookie {
+            domain: ".embed.example".into(),
+            name: "sid".into(),
+            value: format!("synthetic-{site}"),
+            path: "/".into(),
+            expires: None,
+            secure: true,
+            http_only: false,
+            same_site: Some("None".into()),
+            top_frame_site_key: site.into(),
+            has_cross_site_ancestor: cross,
+        }
+    }
+
+    /// One cookie in two partitions plus its unpartitioned twin are three
+    /// Chromium rows; without the partition key they merged into one.
+    #[test]
+    fn partitioned_cookies_keep_their_partition_through_import_and_export() {
+        let _lock = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(root.path().to_path_buf()));
+        let id = "cookie-partitions";
+        let written = import(
+            id,
+            &[
+                cookie("", None),
+                cookie("https://a.example", Some(false)),
+                cookie("https://b.example", None),
+            ],
+        );
+        let read = export(id);
+        crate::store::set_config_root(None);
+        assert_eq!(written.unwrap(), 3);
+        let mut read = read.unwrap();
+        read.sort_by(|a, b| a.top_frame_site_key.cmp(&b.top_frame_site_key));
+        let rows: Vec<(&str, Option<bool>, &str)> = read
+            .iter()
+            .map(|c| {
+                (
+                    c.top_frame_site_key.as_str(),
+                    c.has_cross_site_ancestor,
+                    c.value.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("", None, "synthetic-"),
+                (
+                    "https://a.example",
+                    Some(false),
+                    "synthetic-https://a.example"
+                ),
+                (
+                    "https://b.example",
+                    Some(true),
+                    "synthetic-https://b.example"
+                ),
+            ]
+        );
+    }
+
+    /// An unpartitioned cookie exports exactly the keys it always had.
+    #[test]
+    fn unpartitioned_cookie_json_is_unchanged() {
+        let json = serde_json::to_value(cookie("", None)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "domain",
+                "expires",
+                "http_only",
+                "name",
+                "path",
+                "same_site",
+                "secure",
+                "value"
+            ]
+        );
+    }
 }

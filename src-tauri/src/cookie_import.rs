@@ -199,6 +199,7 @@ fn cookie_from_json(entry: &Value) -> Result<Cookie, &'static str> {
         Some(host_only) => host_key(domain, !host_only),
         None => domain.to_string(),
     };
+    let (top_frame_site_key, has_cross_site_ancestor) = partition(o)?;
 
     Ok(Cookie {
         domain,
@@ -215,7 +216,51 @@ fn cookie_from_json(entry: &Value) -> Result<Cookie, &'static str> {
             .iter()
             .find_map(|k| string(k))
             .map(|s| normalise_same_site(s).to_string()),
+        top_frame_site_key,
+        has_cross_site_ancestor,
     })
+}
+
+/// CHIPS partition from the launcher's own keys, Playwright's `partitionKey`
+/// string, or the `{topLevelSite, hasCrossSiteAncestor}` object that
+/// `chrome.cookies` (Cookie-Editor) and CDP write. Empty = unpartitioned.
+fn partition(o: &serde_json::Map<String, Value>) -> Result<(String, Option<bool>), &'static str> {
+    let flag = |keys: &[&str]| keys.iter().find_map(|k| o.get(*k)).and_then(Value::as_bool);
+    let (site, cross) = match o
+        .get("top_frame_site_key")
+        .or_else(|| o.get("partitionKey"))
+    {
+        None | Some(Value::Null) => return Ok((String::new(), None)),
+        Some(Value::String(site)) => (
+            site.as_str(),
+            flag(&["has_cross_site_ancestor", "_crHasCrossSiteAncestor"]),
+        ),
+        Some(Value::Object(key)) => (
+            key.get("topLevelSite")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            key.get("hasCrossSiteAncestor").and_then(Value::as_bool),
+        ),
+        Some(_) => return Err("badPartitionKey"),
+    };
+    if site.is_empty() {
+        return Ok((String::new(), None));
+    }
+    // Chromium keeps a site as `scheme://host` and drops a cookie whose key it
+    // cannot read, so a malformed key is reported instead of imported.
+    let host = site
+        .strip_prefix("https://")
+        .or_else(|| site.strip_prefix("http://"))
+        .ok_or("badPartitionKey")?;
+    let ipv6 = host.starts_with('[') && host.ends_with(']');
+    if host.is_empty()
+        || host.contains(['/', '?', '#', '@'])
+        || (host.contains(':') && !ipv6)
+        || host.chars().any(char::is_whitespace)
+    {
+        return Err("badPartitionKey");
+    }
+    Ok((site.to_string(), cross))
 }
 
 fn parse_netscape(text: &str) -> Result<Parsed> {
@@ -282,6 +327,8 @@ fn netscape_line(line: &str, http_only: bool) -> Result<Cookie, &'static str> {
         secure,
         http_only,
         same_site: None,
+        top_frame_site_key: String::new(),
+        has_cross_site_ancestor: None,
     })
 }
 
@@ -557,5 +604,60 @@ mod tests {
         let text = format!("\u{feff}.a.com\tTRUE\t/\tFALSE\t0\tn\t{FAKE}");
         assert_eq!(parse(&text).unwrap().cookies.len(), 1);
         assert_eq!(parse("\u{feff}[]").unwrap().cookies.len(), 0);
+    }
+
+    #[test]
+    fn partition_keys_are_read_from_every_json_flavour() {
+        let text = format!(
+            r#"[{{"domain":"e.com","name":"a","value":"{FAKE}","same_site":"None",
+                 "top_frame_site_key":"https://a.com","has_cross_site_ancestor":false}},
+                {{"domain":"e.com","name":"b","value":"{FAKE}","sameSite":"None",
+                 "partitionKey":"https://b.com","_crHasCrossSiteAncestor":false}},
+                {{"domain":"e.com","name":"c","value":"{FAKE}","hostOnly":true,"session":true,
+                 "partitionKey":{{"topLevelSite":"https://c.com","hasCrossSiteAncestor":true}}}},
+                {{"domain":"e.com","name":"d","value":"{FAKE}","partitionKey":"http://[::1]"}},
+                {{"domain":"e.com","name":"e","value":"{FAKE}","partitionKey":{{}}}},
+                {{"domain":"e.com","name":"f","value":"{FAKE}"}}]"#
+        );
+        let p = parse(&text).unwrap();
+        assert!(p.skipped.is_empty(), "{:?}", p.skipped);
+        let keys: Vec<(&str, Option<bool>)> = p
+            .cookies
+            .iter()
+            .map(|c| (c.top_frame_site_key.as_str(), c.has_cross_site_ancestor))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("https://a.com", Some(false)),
+                ("https://b.com", Some(false)),
+                ("https://c.com", Some(true)),
+                ("http://[::1]", None),
+                ("", None),
+                ("", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_partition_key_chromium_cannot_read_is_reported() {
+        let text = format!(
+            r#"[{{"domain":"e.com","name":"a","value":"{FAKE}","partitionKey":"a.com"}},
+                {{"domain":"e.com","name":"b","value":"{FAKE}","partitionKey":"https://a.com/x"}},
+                {{"domain":"e.com","name":"c","value":"{FAKE}","partitionKey":"https://a.com:8443"}},
+                {{"domain":"e.com","name":"d","value":"{FAKE}","partitionKey":7}},
+                {{"domain":"e.com","name":"e","value":"{FAKE}","partitionKey":"https://a.com"}}]"#
+        );
+        let p = parse(&text).unwrap();
+        assert_eq!(p.cookies.len(), 1);
+        assert_eq!(
+            skipped(&p),
+            [
+                (1, "badPartitionKey"),
+                (2, "badPartitionKey"),
+                (3, "badPartitionKey"),
+                (4, "badPartitionKey"),
+            ]
+        );
     }
 }
