@@ -16,6 +16,7 @@
     "test:updater-signatures": "node --test scripts/verify-updater-signatures.test.mjs",
     "test:i18n": "node --test scripts/i18n-locale-parity.test.mjs",
     "test:rust-strings": "node --test scripts/rust-user-strings.test.mjs",
+    "test:contrast": "node --test scripts/contrast-tokens.test.mjs",
     "test:backend-locale": "node --test scripts/backend-error-locale.test.mjs",
     "test:raw-error-toast": "node --test scripts/raw-error-toast.test.mjs",
     "vi:toasts": "node scripts/vi-toast-backend-errors.mjs",

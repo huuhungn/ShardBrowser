@@ -20,7 +20,7 @@ const soft: Record<BadgeColor, string> = {
   success: "text-[var(--color-success)] bg-[var(--color-success-background)]",
   error: "text-[var(--color-error)] bg-[var(--color-error-background)]",
   warning: "text-[var(--color-warning)] bg-[var(--color-warning-background)]",
-  primary: "text-[var(--color-primary-base)] bg-[var(--color-primary-alpha-16)]",
+  primary: "text-primary-base bg-[var(--color-primary-alpha-16)]",
   information: "text-[var(--color-information-base)] bg-[var(--color-information-weak)]",
   gray: "text-[var(--color-text-sub-600)] bg-[var(--color-bg-weak-50)]",
 };
@@ -29,7 +29,7 @@ const stroke: Record<BadgeColor, string> = {
   success: "text-[var(--color-success)] border-[var(--color-success)]",
   error: "text-[var(--color-error)] border-[var(--color-error)]",
   warning: "text-[var(--color-warning)] border-[var(--color-warning)]",
-  primary: "text-[var(--color-primary-base)] border-[var(--color-primary-base)]",
+  primary: "text-primary-base border-[var(--color-primary-base)]",
   information: "text-[var(--color-information-base)] border-[var(--color-information-base)]",
   gray: "text-[var(--color-text-sub-600)] border-[var(--color-stroke-soft-200)]",
 };
