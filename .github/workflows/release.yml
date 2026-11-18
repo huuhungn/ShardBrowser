@@ -53,20 +53,27 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # `npm audit --audit-level=moderate` for each package, through
+      # scripts/npm-audit-gate.mjs: it allows only the owner-approved exceptions
+      # listed there (today GHSA-fc5q-39xc-vjpf, picomatch, build tooling only,
+      # https://github.com/advisories/GHSA-fc5q-39xc-vjpf, expires 2026-12-02).
+      # Any other advisory fails, an expired exception fails, and an exception
+      # nothing reports any more is unused.
       - name: Verify JavaScript dependency and SDK gates
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
           PATCHRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
         run: |
-          npm audit --audit-level=moderate
+          npm run test:audit-gate
+          node scripts/npm-audit-gate.mjs --prefix .
           npm ci --prefix mcp
-          npm audit --prefix mcp --audit-level=moderate
+          node scripts/npm-audit-gate.mjs --prefix mcp
           npm test --prefix mcp
           npm ci --prefix sdks/node
-          npm audit --prefix sdks/node --audit-level=moderate
+          node scripts/npm-audit-gate.mjs --prefix sdks/node
           npm test --prefix sdks/node
           npm ci --prefix ui-kit
-          npm audit --prefix ui-kit --audit-level=moderate
+          node scripts/npm-audit-gate.mjs --prefix ui-kit
 
       - name: Verify Rust SDK stable gates
         run: |
