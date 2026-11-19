@@ -2,7 +2,7 @@
   "releases": [
     {
       "version": "2.12.2",
-      "date": "2026-11-18",
+      "date": "2026-11-19",
       "entries": [
         {
           "id": "partitioned-cookies",
