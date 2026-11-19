@@ -14,19 +14,7 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const EXCEPTIONS = [
-  {
-    // picomatch ReDoS through single-branch repeated extglobs. Since 2026-11-17
-    // the advisory covers every release (<= 4.0.7) and no patched one exists.
-    // picomatch is reached only through build tooling (vite, tinyglobby, fdir,
-    // @rollup/pluginutils, @typescript-eslint, @tailwindcss/cli); the shipped
-    // app, mcp/ and sdks/node do not contain it. Approved by the owner on
-    // 2026-11-18 for 14 days.
-    id: "GHSA-fc5q-39xc-vjpf",
-    url: "https://github.com/advisories/GHSA-fc5q-39xc-vjpf",
-    expires: "2026-12-02",
-  },
-];
+export const EXCEPTIONS = [];
 
 const BLOCKING = new Set(["moderate", "high", "critical"]);
 const GHSA = /GHSA(?:-[0-9a-z]{4}){3}/i;

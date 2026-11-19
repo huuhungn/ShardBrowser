@@ -55,10 +55,8 @@ jobs:
 
       # `npm audit --audit-level=moderate` for each package, through
       # scripts/npm-audit-gate.mjs: it allows only the owner-approved exceptions
-      # listed there (today GHSA-fc5q-39xc-vjpf, picomatch, build tooling only,
-      # https://github.com/advisories/GHSA-fc5q-39xc-vjpf, expires 2026-12-02).
-      # Any other advisory fails, an expired exception fails, and an exception
-      # nothing reports any more is unused.
+      # listed there (none today). Any other advisory fails, an expired exception
+      # fails, and an exception nothing reports any more is unused.
       - name: Verify JavaScript dependency and SDK gates
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
