@@ -2,16 +2,34 @@
 
 ## v2.12.2
 
+A fix release: partitioned cookies survive export and import, the launcher
+follows the system's reduce-motion setting and its secondary text meets WCAG
+AA contrast, and the in-app updater drops a zip library with two published
+advisories. The browser engine is unchanged (Chromium 157.0.8103.50).
+
 - Cookies: export and import keep a partitioned (CHIPS) cookie in its
   partition. The partition used to be dropped, so one cookie stored under two
   sites came back as a single unpartitioned cookie. Import also reads the
   partition from Playwright (`partitionKey`) and from `chrome.cookies` or
   Cookie-Editor exports, and lists an entry whose partition Chromium could not
   read instead of importing it.
+- Accessibility: with the system's reduce-motion setting on, the launcher's
+  slides, fades and hover transitions finish at once and the profile editor
+  no longer scrolls into view smoothly. Spinners keep turning, so work in
+  progress never looks frozen.
+- Accessibility: secondary text, and blue text in the dark theme, reach WCAG
+  AA contrast (4.5:1). Secondary text is a shade darker in the light theme and
+  a shade lighter in the dark theme. Blue text on dark surfaces and chips
+  uses a lighter tint of the same blue; buttons keep their colour.
 - Security: the in-app updater is built without its `zip` feature, which
   pulled in `zip` 4.6.1 (RUSTSEC-2026-0545, RUSTSEC-2026-0548). That feature
   only unpacks Tauri v1 `.zip` update bundles; these releases publish the
   installers themselves.
+- Release checks: the release gate's `npm audit` excuses one advisory,
+  GHSA-fc5q-39xc-vjpf (picomatch, reached only through build tooling, no
+  patched release yet), until 2026-12-02, as an owner-approved exception.
+  Any other advisory still blocks a release, and CI fails once the exception
+  expires.
 
 ## v2.12.1
 
