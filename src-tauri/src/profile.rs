@@ -1732,8 +1732,10 @@ mod tests {
 
     #[test]
     fn a_data_root_move_and_a_launch_or_change_never_overlap() {
-        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let (dir, _config, _lifecycle) = scratch_profiles();
         let id = new_profile("Moving", &[]);
+        let trashed = new_profile("Trashed", &[]);
+        crate::trash::move_to_trash(&trashed).unwrap();
         // A launch on its way holds the move off.
         let launch = begin_profile_launch(&id).unwrap();
         let error = crate::migrate::guarded(|| Ok(())).unwrap_err();
@@ -1750,10 +1752,18 @@ mod tests {
             assert!(begin_profile_launch(&id).is_err());
             assert!(begin_user_mutation([&id], "edit this profile").is_err());
             assert!(begin_profile_creation("create a profile").is_err());
+            // Nor do the writes that take no claim, from the interface either.
+            let moving = |e: anyhow::Error| {
+                crate::errcode::has_code(&format!("{e:#}"), "profile.beingMovedRetry")
+            };
+            assert!(moving(crate::trash::restore(&trashed).unwrap_err()));
+            let crx = dir.path().join("never-read.crx");
+            assert!(moving(crate::extensions::import(&crx).unwrap_err()));
             Ok(())
         })
         .unwrap();
         begin_profile_launch(&id).unwrap();
+        crate::trash::restore(&trashed).unwrap();
     }
 
     #[test]

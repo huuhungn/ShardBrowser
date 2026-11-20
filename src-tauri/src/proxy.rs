@@ -216,6 +216,22 @@ pub fn get(id: &str) -> Result<Option<ProxyEntry>> {
     Ok(load()?.proxies.into_iter().find(|p| p.id == id))
 }
 
+/// The proxy a profile goes out through: its stored proxy by id, else the
+/// inline one a temporary profile carries. A profile bound to a proxy that is
+/// gone (deleted, or `proxies.json` unreadable) is refused, since going on
+/// would use this machine's own IP. An empty id means no proxy, as the API
+/// writes it.
+pub fn bound_to(meta: &crate::profile::StoredMeta) -> Result<Option<ProxyEntry>> {
+    let id = meta.proxy_id.as_deref().filter(|id| !id.is_empty());
+    match id
+        .and_then(|id| get(id).ok().flatten())
+        .or_else(|| meta.inline_proxy.clone())
+    {
+        None if id.is_some() => anyhow::bail!(errcode::code("proxy.boundProxyMissing")),
+        bound => Ok(bound),
+    }
+}
+
 /// SOCKS5/HTTP CONNECT probe; returns RTT in ms on success.
 /// The whole test, greeting to reply: a proxy that accepts and then stalls must
 /// fail rather than hold the Test button forever.
@@ -1165,6 +1181,37 @@ mod tests {
             country: String::new(),
             notes: String::new(),
         }
+    }
+
+    #[test]
+    fn a_profile_proxy_that_is_gone_is_refused_and_an_empty_id_means_none() {
+        let _config = store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        store::set_config_root(Some(dir.path().to_path_buf()));
+        let kept = upsert(entry("kept", "secret")).unwrap();
+        let meta = |id: &str| crate::profile::StoredMeta {
+            proxy_id: Some(id.into()),
+            ..Default::default()
+        };
+        let gone = bound_to(&meta("deleted"));
+        let empty = bound_to(&meta(""));
+        let found = bound_to(&meta(&kept.id));
+        let inline = bound_to(&crate::profile::StoredMeta {
+            inline_proxy: Some(entry("inline", "secret")),
+            ..meta("deleted")
+        });
+        store::set_config_root(None);
+
+        let gone = format!("{:#}", gone.unwrap_err());
+        assert!(
+            errcode::has_code(&gone, "proxy.boundProxyMissing"),
+            "{gone}"
+        );
+        assert!(empty.unwrap().is_none(), "an empty id is no proxy");
+        assert_eq!(found.unwrap().unwrap().id, kept.id);
+        assert_eq!(inline.unwrap().unwrap().username, "inline");
     }
 
     /// A one-connection SOCKS5 server on loopback: no-auth greeting, then

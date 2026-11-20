@@ -173,7 +173,8 @@ test("install extracts only archives whose SHA-256 the manifest names", async (t
   const realFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = realFetch; });
 
-  // The manifest names `hash` (or nothing) for every archive; the bucket serves `zip`.
+  // The manifest names `hash` (or nothing) for every archive; the bucket serves
+  // `zip`. A forced reinstall over an engine already on disk.
   const install = async (hash) => {
     const archives = Object.fromEntries(keys.map((key) => [key, "etag"]));
     const sha256 = hash ? Object.fromEntries(keys.map((key) => [key, hash])) : undefined;
@@ -182,19 +183,25 @@ test("install extracts only archives whose SHA-256 the manifest names", async (t
       : new Response(zip, { headers: { etag: '"etag"' } });
     const root = scratch();
     t.after(() => rmSync(root, { recursive: true, force: true }));
-    const result = await new Runtime({ cacheDir: root }).install().then(() => null, (e) => e);
-    return { error: result, extracted: existsSync(join(root, "marker.txt")) };
+    const oldEngine = join(root, spec.binarySubpath[0], "old-engine");
+    mkdirSync(join(root, spec.binarySubpath[0]), { recursive: true });
+    writeFileSync(oldEngine, "working engine");
+    const result = await new Runtime({ cacheDir: root }).install({ force: true }).then(() => null, (e) => e);
+    return { error: result, extracted: existsSync(join(root, "marker.txt")), kept: existsSync(oldEngine) };
   };
 
   const missing = await install(undefined);
   assert.match(String(missing.error), /no SHA-256/);
   assert.equal(missing.extracted, false, "an unverified archive must not be extracted");
+  assert.equal(missing.kept, true, "a refused archive must not cost the engine already installed");
 
   const wrong = await install("0".repeat(64));
   assert.match(String(wrong.error), /does not match the SHA-256/);
   assert.equal(wrong.extracted, false);
+  assert.equal(wrong.kept, true);
 
   const right = await install(good.toUpperCase());
   assert.equal(right.error, null);
   assert.equal(right.extracted, true);
+  assert.equal(right.kept, false, "a verified engine replaces the old tree");
 });

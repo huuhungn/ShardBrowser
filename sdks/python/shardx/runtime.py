@@ -392,7 +392,8 @@ class Runtime:
         local = self._load_manifest()
         manifest = self._fetch_manifest()
         remote = manifest.get("archives") if isinstance(manifest.get("archives"), dict) else {}
-        hashes = manifest.get("sha256") if isinstance(manifest.get("sha256"), dict) else {}
+        hashes = manifest.get("sha256")
+        hashes = hashes if isinstance(hashes, dict) else {}
         # Remember the engine version so launch can normalise profiles to it.
         self._chromium_version = manifest.get("chromium_version") or CHROMIUM_VERSION
         self._grease_brand = manifest.get("grease_brand") or None
@@ -416,12 +417,14 @@ class Runtime:
         # A None manifest (unreachable) must NOT force a re-download.
         need_browser = force or not self.installed or self._engine_outdated(local, manifest)
         if need_browser:
-            # Wipe the old engine tree first so a leftover `<old>.manifest` /
-            # stale libs can't linger beside the new ones (that pinned the
-            # detected version → endless re-download). binary_subpath[0] is the
+            # Wipe the old engine tree before extracting so a leftover
+            # `<old>.manifest` / stale libs can't linger beside the new ones
+            # (that pinned the detected version → endless re-download), but only
+            # once the new archive passed its checksum. binary_subpath[0] is the
             # engine root dir.
-            shutil.rmtree(self.root / self._spec.binary_subpath[0], ignore_errors=True)
-            local["browser_etag"] = self._download_and_extract(self._spec.browser, self.root, hashes)
+            local["browser_etag"] = self._download_and_extract(
+                self._spec.browser, self.root, hashes,
+                replaces=self.root / self._spec.binary_subpath[0])
             if manifest.get("engine_build"):
                 local["installed_engine_build"] = manifest["engine_build"]
         # Widevine — only re-pull when browser changed (versions must match).
@@ -466,7 +469,9 @@ class Runtime:
         except Exception:
             return {}
 
-    def _download_and_extract(self, arch: Archive, dest: Path, hashes: dict) -> str:
+    def _download_and_extract(self, arch: Archive, dest: Path, hashes: dict,
+                              replaces: Optional[Path] = None) -> str:
+        """`replaces`: a tree the archive supersedes, removed once the archive is verified."""
         url = f"{PUB_BASE}/{arch.key}"
         tmp = dest / f".{arch.key}.tmp"
         tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -485,6 +490,8 @@ class Runtime:
                     if self._progress:
                         self._progress(arch.label, received, total)
         _check_sha256(arch.key, hashes.get(arch.key), digest.hexdigest(), tmp)
+        if replaces:
+            shutil.rmtree(replaces, ignore_errors=True)
         # Extract.  IMPORTANT: on macOS/Linux we shell out to the system
         # `unzip` instead of Python's `zipfile` because zipfile cannot
         # restore symlinks (every `Versions/Current/...` link in a `.app`

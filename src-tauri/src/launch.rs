@@ -163,17 +163,7 @@ pub async fn launch_profile_synced(
     }
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
-    let bound_proxy: Option<proxy::ProxyEntry> = stored
-        .meta
-        .proxy_id
-        .as_deref()
-        .and_then(|pid| proxy::get(pid).ok().flatten())
-        .or_else(|| stored.meta.inline_proxy.clone());
-    // Bound to a proxy that is gone (deleted, or `proxies.json` unreadable):
-    // going on would start the profile on this machine's own IP.
-    if bound_proxy.is_none() && stored.meta.proxy_id.is_some() {
-        anyhow::bail!(crate::errcode::code("launch.proxyMissing"));
-    }
+    let bound_proxy = proxy::bound_to(&stored.meta)?;
 
     // Live UDP probe; QUIC/WebRTC gating uses current capability not stale cache.
     let proxy_udp_ok = if let Some(p) = bound_proxy.as_ref() {
@@ -1132,7 +1122,7 @@ mod missing_proxy_tests {
         crate::store::set_config_root(None);
         let err = format!("{:#}", result.err().expect("the launch must be refused"));
         assert!(
-            crate::errcode::has_code(&err, "launch.proxyMissing"),
+            crate::errcode::has_code(&err, "proxy.boundProxyMissing"),
             "{err}"
         );
     }

@@ -389,15 +389,19 @@ impl Runtime {
         // A None manifest (unreachable) forces nothing.
         let need_browser = force || !self.installed() || self.engine_outdated(&local, &remote);
         if need_browser {
-            // Wipe the old engine tree first so a leftover `<old>.manifest` /
-            // stale libs can't linger beside the new ones (that pinned the
-            // detected version → endless re-download). binary_subpath[0] is the
-            // engine root dir.
-            if let Some(engine_dir) = self.spec.binary_subpath.first() {
-                let _ = fs::remove_dir_all(self.root.join(engine_dir));
-            }
+            // Wipe the old engine tree before extracting so a leftover
+            // `<old>.manifest` / stale libs can't linger beside the new ones
+            // (that pinned the detected version → endless re-download), but
+            // only once the new archive passed its checksum. binary_subpath[0]
+            // is the engine root dir.
+            let engine_dir = self.spec.binary_subpath.first().map(|d| self.root.join(d));
             let etag = self
-                .download_and_extract(&self.spec.browser, &self.root, &remote.sha256)
+                .download_and_extract(
+                    &self.spec.browser,
+                    &self.root,
+                    &remote.sha256,
+                    engine_dir.as_deref(),
+                )
                 .await?;
             local.browser_etag = Some(etag);
             if remote.engine_build.is_some() {
@@ -408,7 +412,7 @@ impl Runtime {
         if let Some(wv) = self.spec.widevine.clone() {
             if need_browser || local.widevine_etag.is_none() {
                 let etag = self
-                    .download_and_extract(&wv, &self.root, &remote.sha256)
+                    .download_and_extract(&wv, &self.root, &remote.sha256, None)
                     .await?;
                 self.place_widevine();
                 local.widevine_etag = Some(etag);
@@ -450,11 +454,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// `replaces`: a tree the archive supersedes, removed once it is verified.
     async fn download_and_extract(
         &self,
         archive: &Archive,
         dest: &Path,
         hashes: &std::collections::HashMap<String, String>,
+        replaces: Option<&Path>,
     ) -> Result<String> {
         use sha2::Digest;
         let url = format!("{PUB_BASE}/{}", archive.key);
@@ -494,6 +500,9 @@ impl Runtime {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
+        if let Some(dir) = replaces {
+            let _ = fs::remove_dir_all(dir);
+        }
 
         let zip_path = tmp.clone();
         let dest = dest.to_path_buf();
@@ -514,7 +523,7 @@ impl Runtime {
             key: FINGERPRINTS_KEY.into(),
             label: "Fingerprint library".into(),
         };
-        self.download_and_extract(&archive, &staging, hashes)
+        self.download_and_extract(&archive, &staging, hashes, None)
             .await?;
 
         let src = staging.join(FINGERPRINTS_TOP_DIR);

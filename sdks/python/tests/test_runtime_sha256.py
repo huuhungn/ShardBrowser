@@ -77,31 +77,38 @@ class InstallChecksSha256(unittest.TestCase):
         keys = [a.key for a in (spec.browser, spec.widevine, rt.FINGERPRINTS_ARCHIVE) if a]
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
+        # A forced reinstall over an engine already on disk.
+        old_engine = root / spec.binary_subpath[0] / "old-engine"
+        old_engine.parent.mkdir(parents=True)
+        old_engine.write_text("working engine")
         real = rt.httpx
         rt.httpx = FakeHttpx(body, keys, hash_)
         try:
-            rt.Runtime(cache_dir=root).install()
+            rt.Runtime(cache_dir=root).install(force=True)
             error = None
         except RuntimeError as e:
             error = str(e)
         finally:
             rt.httpx = real
-        return error, (root / "marker.txt").exists()
+        return error, (root / "marker.txt").exists(), old_engine.exists()
 
     def test_an_archive_with_no_checksum_is_not_extracted(self):
-        error, extracted = self.install(None)
+        error, extracted, kept = self.install(None)
         self.assertIn("no SHA-256", error or "")
         self.assertFalse(extracted)
+        self.assertTrue(kept, "a refused archive must not cost the engine already installed")
 
     def test_an_archive_that_does_not_match_is_not_extracted(self):
-        error, extracted = self.install("0" * 64)
+        error, extracted, kept = self.install("0" * 64)
         self.assertIn("does not match the SHA-256", error or "")
         self.assertFalse(extracted)
+        self.assertTrue(kept)
 
     def test_the_named_archive_is_extracted(self):
-        error, extracted = self.install(hashlib.sha256(zip_bytes()).hexdigest().upper())
+        error, extracted, kept = self.install(hashlib.sha256(zip_bytes()).hexdigest().upper())
         self.assertIsNone(error)
         self.assertTrue(extracted)
+        self.assertFalse(kept, "a verified engine replaces the old tree")
 
 
 if __name__ == "__main__":

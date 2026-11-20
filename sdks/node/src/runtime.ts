@@ -298,11 +298,13 @@ export class Runtime {
     // Manifest unreachable → don't force a re-download.
     const needBrowser = force || !this.installed || this.engineOutdated(local, remote);
     if (needBrowser) {
-      // Wipe the old engine tree first so a leftover `<old>.manifest` / stale
-      // libs can't linger beside the new ones (that pinned the detected version
-      // → endless re-download). binarySubpath[0] is the engine root dir.
-      rmSync(join(this.root, this.spec.binarySubpath[0]), { recursive: true, force: true });
-      local.browser_etag = await this.downloadAndExtract(this.spec.browser, this.root, remote.sha256);
+      // Wipe the old engine tree before extracting so a leftover `<old>.manifest`
+      // / stale libs can't linger beside the new ones (that pinned the detected
+      // version → endless re-download), but only once the new archive passed its
+      // checksum. binarySubpath[0] is the engine root dir.
+      local.browser_etag = await this.downloadAndExtract(
+        this.spec.browser, this.root, remote.sha256, join(this.root, this.spec.binarySubpath[0]),
+      );
       if (remote.engineBuild) local.installed_engine_build = remote.engineBuild;
     }
     if (this.spec.widevine && (needBrowser || !local.widevine_etag)) {
@@ -361,7 +363,10 @@ export class Runtime {
     } catch { return { archives: {}, sha256: {} }; }
   }
 
-  private async downloadAndExtract(arch: Archive, dest: string, sha256: Record<string, string>): Promise<string> {
+  /** `replaces`: a tree the archive supersedes, removed once the archive is verified. */
+  private async downloadAndExtract(
+    arch: Archive, dest: string, sha256: Record<string, string>, replaces?: string,
+  ): Promise<string> {
     const url = `${PUB_BASE}/${arch.key}`;
     mkdirSync(dest, { recursive: true });
     const tmp = join(dest, `.${arch.key}.tmp`);
@@ -391,6 +396,7 @@ export class Runtime {
     }
     await pipeline(stream, out);
     checkSha256(arch.key, sha256[arch.key], hash.digest("hex"), tmp);
+    if (replaces) rmSync(replaces, { recursive: true, force: true });
 
     // Extract.  IMPORTANT: on macOS/Linux shell out to the system
     // `unzip`, which preserves the symlinks (every `Versions/Current/...`
