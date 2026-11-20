@@ -64,20 +64,14 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
 
 /// Build a client that goes out on the same proxy the profile browses through.
 ///
-/// Resolution mirrors `launch`: stored proxy by id first, then the inline
-/// proxy a temporary profile carries. A profile with no proxy at all browses
-/// direct, so calling direct matches it.
+/// Resolved as `launch` resolves it (`proxy::bound_to`), refusal included. A
+/// profile with no proxy at all browses direct, so calling direct matches it.
 fn client_for(profile_id: &str) -> Result<reqwest::Client> {
     let stored = profile::load_raw(profile_id).with_context(|| {
         crate::errcode::code_with("http.profileUnreadable", &[("profile", profile_id)])
     })?;
 
-    let bound: Option<proxy::ProxyEntry> = stored
-        .meta
-        .proxy_id
-        .as_deref()
-        .and_then(|pid| proxy::get(pid).ok().flatten())
-        .or_else(|| stored.meta.inline_proxy.clone());
+    let bound = proxy::bound_to(&stored.meta)?;
 
     let mut builder = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -218,5 +212,26 @@ mod tests {
         // Rather than falling back to a direct client, which would put the
         // host's own IP behind a profile's name.
         assert!(open("no-such-profile-at-all").is_err());
+    }
+
+    #[test]
+    fn a_profile_whose_proxy_is_gone_cannot_open_a_session() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        let mut stored = profile::StoredProfile::default();
+        stored.meta.proxy_id = Some("deleted-proxy".into());
+        profile::save_raw(&mut stored).unwrap();
+        let opened = open(&stored.meta.id);
+        crate::store::set_config_root(None);
+        close(&stored.meta.id);
+
+        let e = format!("{:#}", opened.unwrap_err());
+        assert!(
+            crate::errcode::has_code(&e, "proxy.boundProxyMissing"),
+            "{e}"
+        );
     }
 }

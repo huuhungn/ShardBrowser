@@ -222,6 +222,17 @@ jobs:
             exit 1
           fi
 
+      # The launcher and SDKs refuse an archive runtime.json gives no SHA-256
+      # for, and they read runtime.json from main: a release while one is
+      # missing ships a launcher that cannot install its engine.
+      - name: Verify runtime.json has a SHA-256 for every archive
+        run: |
+          node -e '
+            const m = require("./runtime.json");
+            const missing = Object.keys(m.archives || {}).filter((k) => !/^[0-9a-f]{64}$/i.test((m.sha256 || {})[k] || ""));
+            if (missing.length) { console.error("runtime.json has no sha256 for: " + missing.join(", ")); process.exit(1); }
+          '
+
   build:
     needs: validate
     strategy:

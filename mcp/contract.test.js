@@ -125,3 +125,60 @@ test("safe_open_url cleanup uses the launch-instance guard and never falls back 
   assert.doesNotMatch(source, /globalThis\.process\.kill/);
   assert.match(source, /redactLaunchInstanceToken\(started\)/);
 });
+
+test("HTTP mode answers only a Bearer SHARDX_TOKEN on a loopback Host", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const http = await import("node:http");
+  const net = await import("node:net");
+  const port = await new Promise((resolve) => {
+    const probe = net.createServer().listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const token = "test-token-not-a-real-one";
+  const child = spawn(process.execPath, [path.join(dir, "index.js")], {
+    cwd: dir,
+    env: { ...process.env, MCP_HTTP_PORT: String(port), SHARDX_TOKEN: token, SHARDX_API: "http://127.0.0.1:9" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  t.after(() => child.kill());
+  await new Promise((resolve, reject) => {
+    child.stderr.on("data", (d) => String(d).includes("HTTP transport on") && resolve());
+    child.once("exit", (code) => reject(new Error(`server exited ${code}`)));
+  });
+
+  const initialize = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+  });
+  const post = (headers) => new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: "/mcp",
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        ...headers,
+      },
+    }, (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on("error", reject);
+    req.end(initialize);
+  });
+
+  assert.equal(await post({}), 401, "no token");
+  assert.equal(await post({ authorization: "Bearer wrong" }), 401, "wrong token");
+  assert.equal(
+    await post({ authorization: `Bearer ${token}`, host: `rebind.example:${port}` }),
+    403,
+    "a Host that is not the loopback port",
+  );
+  assert.equal(await post({ authorization: `Bearer ${token}` }), 200, "the token on 127.0.0.1");
+});

@@ -163,12 +163,7 @@ pub async fn launch_profile_synced(
     }
 
     // Stored proxy by id, else ephemeral inline (quick profiles, not in store).
-    let bound_proxy: Option<proxy::ProxyEntry> = stored
-        .meta
-        .proxy_id
-        .as_deref()
-        .and_then(|pid| proxy::get(pid).ok().flatten())
-        .or_else(|| stored.meta.inline_proxy.clone());
+    let bound_proxy = proxy::bound_to(&stored.meta)?;
 
     // Live UDP probe; QUIC/WebRTC gating uses current capability not stale cache.
     let proxy_udp_ok = if let Some(p) = bound_proxy.as_ref() {
@@ -1097,6 +1092,39 @@ mod cancel_tests {
         cancel(id);
         let _next = CancelScope::start(id);
         assert!(check_cancel(id).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod missing_proxy_tests {
+    #[test]
+    fn a_profile_whose_proxy_is_gone_refuses_to_start() {
+        let _config = crate::store::config_root_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _lifecycle = crate::profile::lifecycle_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        crate::store::set_config_root(Some(dir.path().to_path_buf()));
+        // Not an engine: a launch that got past the proxy fails to spawn it.
+        let engine = dir.path().join("not-an-engine.txt");
+        std::fs::write(&engine, b"").unwrap();
+        let mut settings = crate::settings::load().unwrap();
+        settings.browser_path = Some(engine.display().to_string());
+        crate::settings::save(&settings).unwrap();
+        let mut stored = crate::profile::StoredProfile::default();
+        stored.meta.proxy_id = Some("deleted-proxy".into());
+        crate::profile::save_raw(&mut stored).unwrap();
+
+        // Blocking, so the store locks are not held across an await.
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(super::launch_profile(&stored.meta.id, false, true));
+        crate::store::set_config_root(None);
+        let err = format!("{:#}", result.err().expect("the launch must be refused"));
+        assert!(
+            crate::errcode::has_code(&err, "proxy.boundProxyMissing"),
+            "{err}"
+        );
     }
 }
 

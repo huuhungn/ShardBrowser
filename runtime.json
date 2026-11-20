@@ -8,6 +8,11 @@
     "ShardX-Widevine-Win.zip": "8852779330edb7ac2096e0d21dc3afb5",
     "ShardX-Windows.zip": "57a2ea084a8bb5c4199a5b436a678d1c-26"
   },
+  "sha256": {
+    "ShardX-Widevine-Linux.zip": "44fb1a3afd884d650904b88637eef8cede162ea5d302292a7b8813deafb751dc",
+    "ShardX-Widevine-Mac-arm64.zip": "5c2f78dd705e8f842455136eeeb358805cc721288cd268e079676a557eeabf92",
+    "ShardX-Widevine-Win.zip": "8b32e3627b998964aa53670f85756c7bc2127780c2aa5cc06fbf4fd0bcb07862"
+  },
   "chromium_version": "157.0.8103.50",
   "android_chromium_version": "157.0.8103.50",
   "engine_build": "1",

@@ -198,6 +198,10 @@ fn dir_size(dir: &Path) -> u64 {
 
 /// Import a .crx, a .zip or an already-unpacked folder. Returns the new entry.
 pub fn import(src: &Path) -> Result<ExtensionEntry> {
+    // A move of the data root would delete what this writes into the old one.
+    if crate::migrate::in_progress() {
+        anyhow::bail!("{}", errcode::code("profile.beingMovedRetry"));
+    }
     let id = uuid::Uuid::new_v4().simple().to_string();
     let dst = dir_for(&id)?;
     fs::create_dir_all(&dst)?;

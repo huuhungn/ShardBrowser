@@ -14,7 +14,8 @@ const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
 /// Pinned to this fork, not upstream: the manifest carries the engine version,
 /// the grease brand and the TLS/JA4 parameters, so an upstream push would
 /// otherwise re-target every installed custom Launcher without review. Our
-/// runtime.json is updated deliberately, after the launcher can honour it.
+/// runtime.json is updated deliberately, after the launcher can honour it, and
+/// names the SHA-256 of each archive under `sha256`: one without is refused.
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
@@ -276,6 +277,9 @@ pub struct RuntimeStatus {
 #[derive(Default)]
 struct RemoteManifest {
     archives: std::collections::HashMap<String, String>,
+    /// SHA-256 of each archive, hex. The archives sit in a bucket this fork
+    /// does not control; this is what says which bytes are the engine.
+    sha256: std::collections::HashMap<String, String>,
     chromium_version: Option<String>,
     /// GREASE brand/version the engine emits in `sec-ch-ua`. Not derivable from
     /// the version number (it rotates per major release), so it travels in the
@@ -327,18 +331,20 @@ async fn fetch_manifest_from(url: &str) -> RemoteManifest {
             return None;
         }
         let v: serde_json::Value = resp.json().await.ok()?;
-        let archives = v
-            .get("archives")
-            .and_then(|a| a.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let str_map = |k: &str| {
+            v.get(k)
+                .and_then(|a| a.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let str_field = |k: &str| v.get(k).and_then(|s| s.as_str()).map(String::from);
         Some(RemoteManifest {
-            archives,
+            archives: str_map("archives"),
+            sha256: str_map("sha256"),
             chromium_version: str_field("chromium_version"),
             grease_brand: str_field("grease_brand"),
             grease_version: str_field("grease_version"),
@@ -926,7 +932,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         // which poisons version detection into an endless re-download. The new
         // tree is built in staging and swapped in, so the old engine survives a
         // download or extract that fails.
-        install_engine(&window, &spec.browser, &base)
+        install_engine(&window, &spec.browser, &base, &manifest.sha256)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -936,7 +942,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
     let widevine_etag = if let Some(wv) = &spec.widevine {
         // Re-download Widevine only when browser changed or manifest lacks a stamp.
         if need_browser || local.widevine_etag.is_none() {
-            let etag = download_and_extract(&window, wv, &base)
+            let etag = download_and_extract(&window, wv, &base, &manifest.sha256)
                 .await
                 .map_err(|e| e.to_string())?;
             place_widevine(&base).map_err(|e| e.to_string())?;
@@ -959,6 +965,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         force,
         local.fingerprints_etag.as_deref(),
         fp_remote,
+        &manifest.sha256,
     )
     .await
     .map_err(|e| e.to_string())?
@@ -1026,6 +1033,7 @@ async fn install_fingerprints(
     force: bool,
     local_etag: Option<&str>,
     remote_etag: Option<&str>,
+    hashes: &std::collections::HashMap<String, String>,
 ) -> Result<Option<String>> {
     if !force {
         if let (Some(local), Some(remote)) = (local_etag, remote_etag) {
@@ -1044,7 +1052,7 @@ async fn install_fingerprints(
     let staging = dir.join(".staging");
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    let etag = download_and_extract(window, &spec, &staging).await?;
+    let etag = download_and_extract(window, &spec, &staging, hashes).await?;
 
     let src = staging.join(FINGERPRINTS_TOP_DIR);
     let walk = if src.exists() { src } else { staging.clone() };
@@ -1074,11 +1082,16 @@ async fn install_fingerprints(
 }
 
 /// Download and extract the engine into staging, then swap it in.
-async fn install_engine(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
+async fn install_engine(
+    window: &Window,
+    spec: &ArchiveSpec,
+    base: &Path,
+    hashes: &std::collections::HashMap<String, String>,
+) -> Result<String> {
     let staging = base.join(ENGINE_STAGING);
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    let result = match download_and_extract(window, spec, &staging).await {
+    let result = match download_and_extract(window, spec, &staging, hashes).await {
         Ok(etag) => swap_engine(base, &staging).map(|()| etag),
         Err(e) => Err(e),
     };
@@ -1138,8 +1151,15 @@ fn recover_interrupted_swap(base: &Path) {
     }
 }
 
-/// Stream archive → temp file → extract; emits `runtime:progress` events.
-async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) -> Result<String> {
+/// Stream archive → temp file → check its SHA-256 → extract; emits
+/// `runtime:progress` events.
+async fn download_and_extract(
+    window: &Window,
+    spec: &ArchiveSpec,
+    base: &Path,
+    hashes: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    use sha2::Digest;
     let url = format!("{PUB_BASE}/{}", spec.key);
     // No total timeout -- the archive is hundreds of megabytes on any link --
     // but a stalled connection fails instead of hanging the setup screen.
@@ -1160,12 +1180,14 @@ async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) 
         .unwrap_or_default();
 
     let tmp = base.join(format!("{}.tmp", spec.key));
+    let mut hasher = sha2::Sha256::new();
     {
         let mut out = tokio::fs::File::create(&tmp).await?;
         let mut received: u64 = 0;
         let mut last_pct: u64 = u64::MAX;
         while let Some(chunk) = resp.chunk().await? {
             out.write_all(&chunk).await?;
+            hasher.update(&chunk);
             received += chunk.len() as u64;
             // Emit once per integer percent.
             let pct = received.saturating_mul(100).checked_div(total).unwrap_or(0);
@@ -1184,6 +1206,15 @@ async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) 
             }
         }
         out.flush().await?;
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if let Err(e) = check_sha256(
+        &spec.key,
+        hashes.get(&spec.key).map(String::as_str),
+        &actual,
+    ) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
 
     let _ = window.emit(
@@ -1264,6 +1295,25 @@ async fn download_and_extract(window: &Window, spec: &ArchiveSpec, base: &Path) 
     }
 
     Ok(etag)
+}
+
+/// Only the bytes the manifest names are extracted. An archive the manifest
+/// has no hash for (or no manifest at all) is refused too: the bucket is not
+/// this fork's, and the engine runs with every profile's cookies.
+fn check_sha256(key: &str, expected: Option<&str>, actual: &str) -> Result<()> {
+    let Some(expected) = expected else {
+        anyhow::bail!(crate::errcode::code_with(
+            "runtime.archiveUnverified",
+            &[("archive", key)]
+        ));
+    };
+    if !expected.eq_ignore_ascii_case(actual) {
+        anyhow::bail!(crate::errcode::code_with(
+            "runtime.archiveChecksumMismatch",
+            &[("archive", key)]
+        ));
+    }
+    Ok(())
 }
 
 /// First-4-bytes magic check; matches ELF + every Mach-O flavour.
@@ -1721,6 +1771,50 @@ mod tests {
 
         assert!(got.archives.is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn an_archive_is_extracted_only_with_the_checksum_the_manifest_names() {
+        use crate::errcode::has_code;
+        let hash = "44fb1a3afd884d650904b88637eef8cede162ea5d302292a7b8813deafb751dc";
+        check_sha256("a.zip", Some(hash), hash).unwrap();
+        check_sha256("a.zip", Some(&hash.to_uppercase()), hash).unwrap();
+        let wrong = check_sha256("a.zip", Some(hash), &"0".repeat(64)).unwrap_err();
+        assert!(has_code(
+            &wrong.to_string(),
+            "runtime.archiveChecksumMismatch"
+        ));
+        let none = check_sha256("a.zip", None, hash).unwrap_err();
+        assert!(has_code(&none.to_string(), "runtime.archiveUnverified"));
+    }
+
+    /// The manifest this fork publishes: each checksum names an archive and is
+    /// a SHA-256, so a typo refuses installs here rather than on a user's machine.
+    #[tokio::test]
+    async fn the_published_manifest_carries_archive_checksums() {
+        use std::io::{Read, Write};
+        let body = include_str!("../../runtime.json");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/runtime.json", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let _ = s.read(&mut [0u8; 4096]);
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+
+        let got = fetch_manifest_from(&url).await;
+        assert!(!got.sha256.is_empty());
+        for (key, hash) in &got.sha256 {
+            assert!(got.archives.contains_key(key), "{key} is not an archive");
+            assert!(
+                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{key}: {hash}"
+            );
+        }
     }
 
     #[test]

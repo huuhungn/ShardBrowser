@@ -117,13 +117,18 @@ If you'd rather host it yourself and connect by URL, run it with
 MCP_HTTP_PORT=40326 SHARDX_API=http://127.0.0.1:40325 SHARDX_TOKEN=… node index.js
 ```
 
+Clients must send the same token as `Authorization: Bearer <SHARDX_TOKEN>`
+and connect through `127.0.0.1:<port>` or `localhost:<port>`; anything else is
+refused (401 without the token, 403 for another `Host`). The server does not
+start in this mode without `SHARDX_TOKEN`.
+
 ## Environment
 
 | Var             | Default                  | Notes                                               |
 | --------------- | ------------------------ | --------------------------------------------------- |
 | `SHARDX_API`    | `http://127.0.0.1:40325` | Launcher API base URL.                              |
 | `SHARDX_TOKEN`  | —                        | Bearer token (Settings). Required.                  |
-| `MCP_HTTP_PORT` | — (stdio)                | When set, serve HTTP at `127.0.0.1:<port>/mcp`.     |
+| `MCP_HTTP_PORT` | — (stdio)                | When set, serve HTTP at `127.0.0.1:<port>/mcp` (Bearer `SHARDX_TOKEN`). |
 
 ## Tools
 

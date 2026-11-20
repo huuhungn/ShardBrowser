@@ -9,6 +9,7 @@ import { join, dirname, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 export const PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
 export const CHROMIUM_VERSION = "157.0.8103.50";
@@ -297,21 +298,23 @@ export class Runtime {
     // Manifest unreachable → don't force a re-download.
     const needBrowser = force || !this.installed || this.engineOutdated(local, remote);
     if (needBrowser) {
-      // Wipe the old engine tree first so a leftover `<old>.manifest` / stale
-      // libs can't linger beside the new ones (that pinned the detected version
-      // → endless re-download). binarySubpath[0] is the engine root dir.
-      rmSync(join(this.root, this.spec.binarySubpath[0]), { recursive: true, force: true });
-      local.browser_etag = await this.downloadAndExtract(this.spec.browser, this.root);
+      // Wipe the old engine tree before extracting so a leftover `<old>.manifest`
+      // / stale libs can't linger beside the new ones (that pinned the detected
+      // version → endless re-download), but only once the new archive passed its
+      // checksum. binarySubpath[0] is the engine root dir.
+      local.browser_etag = await this.downloadAndExtract(
+        this.spec.browser, this.root, remote.sha256, join(this.root, this.spec.binarySubpath[0]),
+      );
       if (remote.engineBuild) local.installed_engine_build = remote.engineBuild;
     }
     if (this.spec.widevine && (needBrowser || !local.widevine_etag)) {
-      local.widevine_etag = await this.downloadAndExtract(this.spec.widevine, this.root);
+      local.widevine_etag = await this.downloadAndExtract(this.spec.widevine, this.root, remote.sha256);
       this.placeWidevine();
     }
     const remoteFp = remote.archives[FINGERPRINTS_ARCHIVE.key];
     const fpDirHasJson = readdirSync(this.fingerprintsDir).some((f) => f.endsWith(".json"));
     if (force || !fpDirHasJson || (remoteFp !== undefined && local.fingerprints_etag !== remoteFp)) {
-      await this.installFingerprints();
+      await this.installFingerprints(remote.sha256);
       if (remoteFp !== undefined) local.fingerprints_etag = remoteFp;
     }
     // Authoritative: we just extracted exactly this version (old tree wiped
@@ -335,14 +338,15 @@ export class Runtime {
   /** Fetch the version manifest (GitHub raw) — one request that yields every
    *  archive's current etag + the chromium version, replacing per-archive HEADs
    *  against R2/S3. Empty archives / undefined version when unreachable. */
-  private async fetchManifest(): Promise<{ archives: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; androidChromiumVersion?: string; tls?: Record<string, unknown> }> {
+  private async fetchManifest(): Promise<{ archives: Record<string, string>; sha256: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; androidChromiumVersion?: string; tls?: Record<string, unknown> }> {
     try {
       const r = await fetch(MANIFEST_URL);
-      if (!r.ok) return { archives: {} };
-      const data = await r.json() as { archives?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; android_chromium_version?: string; tls?: Record<string, unknown> };
+      if (!r.ok) return { archives: {}, sha256: {} };
+      const data = await r.json() as { archives?: Record<string, string>; sha256?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; android_chromium_version?: string; tls?: Record<string, unknown> };
       const str = (v: unknown) => (typeof v === "string" ? v : undefined);
       return {
         archives: (data && typeof data.archives === "object" && data.archives) || {},
+        sha256: (data && typeof data.sha256 === "object" && data.sha256) || {},
         chromiumVersion: str(data?.chromium_version),
         // Written as a number or a string; both mean the same thing.
         engineBuild: typeof data?.engine_build === "number"
@@ -356,10 +360,13 @@ export class Runtime {
           ? data.tls as Record<string, unknown>
           : undefined,
       };
-    } catch { return { archives: {} }; }
+    } catch { return { archives: {}, sha256: {} }; }
   }
 
-  private async downloadAndExtract(arch: Archive, dest: string): Promise<string> {
+  /** `replaces`: a tree the archive supersedes, removed once the archive is verified. */
+  private async downloadAndExtract(
+    arch: Archive, dest: string, sha256: Record<string, string>, replaces?: string,
+  ): Promise<string> {
     const url = `${PUB_BASE}/${arch.key}`;
     mkdirSync(dest, { recursive: true });
     const tmp = join(dest, `.${arch.key}.tmp`);
@@ -370,6 +377,7 @@ export class Runtime {
     const total = Number(r.headers.get("content-length") ?? 0);
 
     let received = 0;
+    const hash = createHash("sha256");
     const reader = r.body.getReader();
     const out = createWriteStream(tmp);
     const stream = new Readable({
@@ -377,6 +385,7 @@ export class Runtime {
         const { value, done } = await reader.read();
         if (done) { this.push(null); return; }
         received += value.byteLength;
+        hash.update(value);
         if (arch.label) {/* throttle: rounded percent */}
         this.push(Buffer.from(value));
       },
@@ -386,6 +395,8 @@ export class Runtime {
       stream.on("data", () => this.progress!(arch.label, received, total));
     }
     await pipeline(stream, out);
+    checkSha256(arch.key, sha256[arch.key], hash.digest("hex"), tmp);
+    if (replaces) rmSync(replaces, { recursive: true, force: true });
 
     // Extract.  IMPORTANT: on macOS/Linux shell out to the system
     // `unzip`, which preserves the symlinks (every `Versions/Current/...`
@@ -412,7 +423,7 @@ export class Runtime {
     rmSync(join(this.root, wrapper), { recursive: true, force: true });
   }
 
-  private async installFingerprints(): Promise<void> {
+  private async installFingerprints(sha256: Record<string, string>): Promise<void> {
     const url = `${PUB_BASE}/${FINGERPRINTS_ARCHIVE.key}`;
     const staging = join(this.fingerprintsDir, ".staging");
     if (existsSync(staging)) rmSync(staging, { recursive: true, force: true });
@@ -424,6 +435,7 @@ export class Runtime {
     const total = Number(r.headers.get("content-length") ?? 0);
 
     let received = 0;
+    const hash = createHash("sha256");
     const reader = r.body.getReader();
     const out = createWriteStream(tmp);
     const stream = new Readable({
@@ -431,6 +443,7 @@ export class Runtime {
         const { value, done } = await reader.read();
         if (done) { this.push(null); return; }
         received += value.byteLength;
+        hash.update(value);
         this.push(Buffer.from(value));
       },
     });
@@ -438,6 +451,7 @@ export class Runtime {
       stream.on("data", () => this.progress!(FINGERPRINTS_ARCHIVE.label, received, total));
     }
     await pipeline(stream, out);
+    checkSha256(FINGERPRINTS_ARCHIVE.key, sha256[FINGERPRINTS_ARCHIVE.key], hash.digest("hex"), tmp);
 
     // Fingerprints bundle is plain JSON files — no symlinks or exec bits
     // to preserve, so the plain zip path is fine on every platform.
@@ -454,6 +468,17 @@ export class Runtime {
     }
     rmSync(staging, { recursive: true, force: true });
   }
+}
+
+/** Only the bytes the manifest names are extracted. An archive the manifest
+ *  has no hash for (or no manifest at all) is refused too: the bucket is not
+ *  this fork's, and the engine runs with every profile's cookies. */
+function checkSha256(key: string, expected: string | undefined, actual: string, tmp: string): void {
+  if (expected && expected.toLowerCase() === actual) return;
+  rmSync(tmp, { force: true });
+  throw new Error(expected
+    ? `${key} does not match the SHA-256 in the engine manifest; not installed`
+    : `the engine manifest has no SHA-256 for ${key}; not installed`);
 }
 
 /** Extract via /usr/bin/unzip — preserves symlinks and permission

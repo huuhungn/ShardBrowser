@@ -443,6 +443,20 @@ pub fn begin_profile_launch(profile_id: &str) -> Result<ProfileClaimGuard> {
     )
 }
 
+/// Claim every profile for a move of the data root: refused while a launch or a
+/// change is on its way or a browser runs, and none starts until it drops. The
+/// move deletes the old root when it ends, so a write landing there meanwhile
+/// is lost.
+pub(crate) fn begin_data_root_move() -> Result<ProfileClaimGuard> {
+    begin_bulk_mutation(&crate::errcode::code("profile.actionMoveDataRoot"), || {
+        Ok(crate::process::Tracker::shared()
+            .running()
+            .into_iter()
+            .map(|r| r.profile_id)
+            .collect())
+    })
+}
+
 /// Claim every profile for a folder or tag change; `affected` is read under the claim.
 fn begin_bulk_mutation(
     action: &str,
@@ -1714,6 +1728,59 @@ mod tests {
         let restored = crate::trash::restore(&id).unwrap();
         assert_eq!(restored.tags, ["Keep me"]);
         assert_eq!(tags_of(&id), ["Keep me"]);
+    }
+
+    #[test]
+    fn a_data_root_move_and_a_launch_or_change_never_overlap() {
+        let (dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Moving", &[]);
+        let trashed = new_profile("Trashed", &[]);
+        crate::trash::move_to_trash(&trashed).unwrap();
+        // A launch on its way holds the move off.
+        let launch = begin_profile_launch(&id).unwrap();
+        let error = crate::migrate::guarded(|| Ok(())).unwrap_err();
+        assert_eq!(profile_error_kind(&error), Some(ProfileErrorKind::Busy));
+        drop(launch);
+        // So does a running browser.
+        let tracker = crate::process::Tracker::shared();
+        tracker.set_running_for_test(&id, true);
+        let error = crate::migrate::guarded(|| Ok(())).unwrap_err();
+        tracker.set_running_for_test(&id, false);
+        assert_eq!(profile_error_kind(&error), Some(ProfileErrorKind::Running));
+        // While the move runs, nothing launches or changes.
+        crate::migrate::guarded(|| {
+            assert!(begin_profile_launch(&id).is_err());
+            assert!(begin_user_mutation([&id], "edit this profile").is_err());
+            assert!(begin_profile_creation("create a profile").is_err());
+            // Nor do the writes that take no claim, from the interface either.
+            let moving = |e: anyhow::Error| {
+                crate::errcode::has_code(&format!("{e:#}"), "profile.beingMovedRetry")
+            };
+            assert!(moving(crate::trash::restore(&trashed).unwrap_err()));
+            let crx = dir.path().join("never-read.crx");
+            assert!(moving(crate::extensions::import(&crx).unwrap_err()));
+            Ok(())
+        })
+        .unwrap();
+        begin_profile_launch(&id).unwrap();
+        crate::trash::restore(&trashed).unwrap();
+    }
+
+    #[test]
+    fn a_profile_restored_from_the_trash_keeps_its_cookies() {
+        let (_dir, _config, _lifecycle) = scratch_profiles();
+        let id = new_profile("Signed in", &[]);
+        let network = store::user_data_root()
+            .unwrap()
+            .join(&id)
+            .join("Default/Network");
+        fs::create_dir_all(&network).unwrap();
+        fs::write(network.join("Cookies"), b"session").unwrap();
+        crate::trash::move_to_trash(&id).unwrap();
+        assert!(!network.exists(), "the original is deleted");
+
+        crate::trash::restore(&id).unwrap();
+        assert_eq!(fs::read(network.join("Cookies")).unwrap(), b"session");
     }
 
     /// A profile with a browser cache in `cache`, the stand-in for the OS cache folder.

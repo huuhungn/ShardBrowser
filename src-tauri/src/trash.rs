@@ -16,6 +16,9 @@ const RETENTION_SECS: u64 = RETENTION_DAYS * 24 * 60 * 60;
 const KEEP: &[&str] = &[
     "Local State",
     "Default/Cookies",
+    // Where Chromium 96 and later keep them.
+    "Default/Network/Cookies",
+    "Default/Network/Cookies-journal",
     "Default/Login Data",
     "Default/Login Data For Account",
     "Default/Web Data",
@@ -172,6 +175,10 @@ pub fn list() -> Result<Vec<TrashEntry>> {
 /// Unpack back into place. The profile keeps its old id, so anything that
 /// referenced it — a script, a bookmark folder — still points at it.
 pub fn restore(id: &str) -> Result<profile::ProfileMeta> {
+    // A move of the data root would delete what this writes into the old one.
+    if crate::migrate::in_progress() {
+        anyhow::bail!(crate::errcode::code("profile.beingMovedRetry"));
+    }
     let (zip_path, meta_path) = paths_for(id)?;
     let file = fs::File::open(&zip_path).with_context(|| format!("open {}", zip_path.display()))?;
     let mut zip = zip::ZipArchive::new(file)?;

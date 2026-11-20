@@ -2368,24 +2368,41 @@ server.tool(
 //     stdin/stdout.  Standard, works with any client.
 //   * HTTP (when MCP_HTTP_PORT is set) — listens on 127.0.0.1:<port>/mcp so
 //     the ShardX app can host it as a managed child and clients connect by
-//     URL.  Used by the launcher's "embed MCP" option.
+//     URL.  Used by the launcher's "embed MCP" option.  Every request must
+//     carry `Authorization: Bearer <SHARDX_TOKEN>`: this server spends that
+//     token on each call, so a client without it would get the API's access
+//     for free.  The Host header must name the loopback port (DNS rebinding).
 
 const httpPort = process.env.MCP_HTTP_PORT ? Number(process.env.MCP_HTTP_PORT) : 0;
 
 if (httpPort) {
+  if (!TOKEN) {
+    console.error("[shardx-mcp] HTTP mode needs SHARDX_TOKEN: clients send it as their Bearer token");
+    process.exit(1);
+  }
   const { StreamableHTTPServerTransport } = await import(
     "@modelcontextprotocol/sdk/server/streamableHttp.js"
   );
-  const { randomUUID } = await import("node:crypto");
+  const { createHash, randomUUID, timingSafeEqual } = await import("node:crypto");
   const http = await import("node:http");
+  // Hashed so the comparison is constant-time whatever the header's length.
+  const digest = (s) => createHash("sha256").update(s).digest();
+  const expected = digest(`Bearer ${TOKEN}`);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
+    enableDnsRebindingProtection: true,
+    allowedHosts: [`127.0.0.1:${httpPort}`, `localhost:${httpPort}`],
   });
   await server.connect(transport);
 
   http
     .createServer((req, res) => {
+      if (!timingSafeEqual(digest(req.headers.authorization ?? ""), expected)) {
+        res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": "Bearer" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
       const chunks = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", async () => {
