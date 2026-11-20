@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Proxies: a profile whose proxy was deleted, or whose proxy store cannot be
+  read, refuses to start instead of starting on this computer's own IP.
+- Trash: a deleted profile keeps its cookies. Chromium 96 and later keep them
+  in `Default/Network/Cookies`, which the archive left out, so a restored
+  profile came back signed out.
+- Data folder: while the data folder moves, no profile launches or changes and
+  the automation API refuses every write. Data written to the old folder
+  during the move used to be deleted with it.
+- Security: the launcher and the three SDKs check each engine, Widevine and
+  fingerprint archive against a SHA-256 in `runtime.json` before extracting
+  it, and refuse an archive the manifest has no checksum for.
+- Security: the MCP server's HTTP mode (`MCP_HTTP_PORT`) requires
+  `Authorization: Bearer <SHARDX_TOKEN>` and a loopback `Host`, and does not
+  start without `SHARDX_TOKEN`. The default stdio mode is unchanged.
+
 ## v2.12.2
 
 A fix release: partitioned cookies survive export and import, the launcher

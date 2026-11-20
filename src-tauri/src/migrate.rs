@@ -1,5 +1,6 @@
 //! Moving the data root. Copy, verify, then delete — a rename cannot cross
-//! disks. `launch` checks the lock, so the UI is not the only guard.
+//! disks. The move holds every profile's claim and the API refuses writes
+//! meanwhile, so the UI is not the only guard.
 
 use crate::{settings, store};
 use anyhow::{Context, Result};
@@ -54,13 +55,15 @@ pub fn run(app: &tauri::AppHandle, dst: &Path) -> Result<u64> {
 
 /// Runs `work` as the one move of the data root: the flag is up for all of it,
 /// no downgrade flow runs meanwhile (it holds their lock, and they refuse
-/// while the flag is up), and none is recorded, as checked under that lock.
+/// while the flag is up), none is recorded, as checked under that lock, and no
+/// profile launches or changes (it holds every profile's claim).
 pub(crate) fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     let _flag = Migrating::raise()?;
     let Some(_flow) = crate::team::downgrade::try_exclusive() else {
         anyhow::bail!(crate::errcode::code("migrate.downgradeRunning"));
     };
     refuse_while_journals()?;
+    let _profiles = crate::profile::begin_data_root_move()?;
     work()
 }
 

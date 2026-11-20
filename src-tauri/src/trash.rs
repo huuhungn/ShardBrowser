@@ -16,6 +16,9 @@ const RETENTION_SECS: u64 = RETENTION_DAYS * 24 * 60 * 60;
 const KEEP: &[&str] = &[
     "Local State",
     "Default/Cookies",
+    // Where Chromium 96 and later keep them.
+    "Default/Network/Cookies",
+    "Default/Network/Cookies-journal",
     "Default/Login Data",
     "Default/Login Data For Account",
     "Default/Web Data",

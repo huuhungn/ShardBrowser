@@ -11,8 +11,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { crc32 } from "node:zlib";
+import { createHash } from "node:crypto";
 
-import { extractZipArchive } from "../dist/runtime.js";
+import { extractZipArchive, FINGERPRINTS_ARCHIVE, hostSpec, MANIFEST_URL, Runtime } from "../dist/runtime.js";
 
 /** Minimal STORED-method zip writer: entries are `[name, contents]`. Names are
  *  written verbatim, which is what lets us emit a traversal path. */
@@ -162,4 +163,38 @@ test("reports a useful error when the archive is not a zip", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("install extracts only archives whose SHA-256 the manifest names", async (t) => {
+  const zip = buildZip([["marker.txt", "engine"]]);
+  const good = createHash("sha256").update(zip).digest("hex");
+  const spec = hostSpec();
+  const keys = [spec.browser.key, spec.widevine?.key, FINGERPRINTS_ARCHIVE.key].filter(Boolean);
+  const realFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = realFetch; });
+
+  // The manifest names `hash` (or nothing) for every archive; the bucket serves `zip`.
+  const install = async (hash) => {
+    const archives = Object.fromEntries(keys.map((key) => [key, "etag"]));
+    const sha256 = hash ? Object.fromEntries(keys.map((key) => [key, hash])) : undefined;
+    globalThis.fetch = async (url) => url === MANIFEST_URL
+      ? new Response(JSON.stringify({ archives, sha256 }))
+      : new Response(zip, { headers: { etag: '"etag"' } });
+    const root = scratch();
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const result = await new Runtime({ cacheDir: root }).install().then(() => null, (e) => e);
+    return { error: result, extracted: existsSync(join(root, "marker.txt")) };
+  };
+
+  const missing = await install(undefined);
+  assert.match(String(missing.error), /no SHA-256/);
+  assert.equal(missing.extracted, false, "an unverified archive must not be extracted");
+
+  const wrong = await install("0".repeat(64));
+  assert.match(String(wrong.error), /does not match the SHA-256/);
+  assert.equal(wrong.extracted, false);
+
+  const right = await install(good.toUpperCase());
+  assert.equal(right.error, null);
+  assert.equal(right.extracted, true);
 });

@@ -4,6 +4,7 @@ inside the engine bundle, and remember etags so subsequent runs are
 zero-network. Mirrors src-tauri/src/runtime.rs in the launcher."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -391,6 +392,7 @@ class Runtime:
         local = self._load_manifest()
         manifest = self._fetch_manifest()
         remote = manifest.get("archives") if isinstance(manifest.get("archives"), dict) else {}
+        hashes = manifest.get("sha256") if isinstance(manifest.get("sha256"), dict) else {}
         # Remember the engine version so launch can normalise profiles to it.
         self._chromium_version = manifest.get("chromium_version") or CHROMIUM_VERSION
         self._grease_brand = manifest.get("grease_brand") or None
@@ -419,12 +421,12 @@ class Runtime:
             # detected version → endless re-download). binary_subpath[0] is the
             # engine root dir.
             shutil.rmtree(self.root / self._spec.binary_subpath[0], ignore_errors=True)
-            local["browser_etag"] = self._download_and_extract(self._spec.browser, self.root)
+            local["browser_etag"] = self._download_and_extract(self._spec.browser, self.root, hashes)
             if manifest.get("engine_build"):
                 local["installed_engine_build"] = manifest["engine_build"]
         # Widevine — only re-pull when browser changed (versions must match).
         if self._spec.widevine and (need_browser or not local.get("widevine_etag")):
-            local["widevine_etag"] = self._download_and_extract(self._spec.widevine, self.root)
+            local["widevine_etag"] = self._download_and_extract(self._spec.widevine, self.root, hashes)
             self._place_widevine()
         # Fingerprints — additive seed (etag changed → re-extract, never
         # overwrites user-renamed files).
@@ -432,7 +434,7 @@ class Runtime:
         need_fp = force or not any(self.fingerprints_dir.glob("*.json")) or \
             (fp_remote is not None and local.get("fingerprints_etag") != fp_remote)
         if need_fp:
-            self._install_fingerprints()
+            self._install_fingerprints(hashes)
             if fp_remote is not None:
                 local["fingerprints_etag"] = fp_remote
         # Authoritative: we just extracted exactly this version (old tree wiped
@@ -464,11 +466,12 @@ class Runtime:
         except Exception:
             return {}
 
-    def _download_and_extract(self, arch: Archive, dest: Path) -> str:
+    def _download_and_extract(self, arch: Archive, dest: Path, hashes: dict) -> str:
         url = f"{PUB_BASE}/{arch.key}"
         tmp = dest / f".{arch.key}.tmp"
         tmp.parent.mkdir(parents=True, exist_ok=True)
         etag = ""
+        digest = hashlib.sha256()
         with httpx.stream("GET", url, timeout=None, follow_redirects=True) as r:
             r.raise_for_status()
             etag = r.headers.get("etag", "").strip('"')
@@ -477,9 +480,11 @@ class Runtime:
             with tmp.open("wb") as f:
                 for chunk in r.iter_bytes(chunk_size=1 << 16):
                     f.write(chunk)
+                    digest.update(chunk)
                     received += len(chunk)
                     if self._progress:
                         self._progress(arch.label, received, total)
+        _check_sha256(arch.key, hashes.get(arch.key), digest.hexdigest(), tmp)
         # Extract.  IMPORTANT: on macOS/Linux we shell out to the system
         # `unzip` instead of Python's `zipfile` because zipfile cannot
         # restore symlinks (every `Versions/Current/...` link in a `.app`
@@ -511,13 +516,14 @@ class Runtime:
         shutil.move(str(src), str(dst))
         shutil.rmtree(self.root / wrapper_name, ignore_errors=True)
 
-    def _install_fingerprints(self) -> None:
+    def _install_fingerprints(self, hashes: dict) -> None:
         url = f"{PUB_BASE}/{FINGERPRINTS_ARCHIVE.key}"
         staging = self.fingerprints_dir / ".staging"
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True, exist_ok=True)
         tmp = staging / "bundle.zip"
+        digest = hashlib.sha256()
         with httpx.stream("GET", url, timeout=None, follow_redirects=True) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
@@ -525,9 +531,12 @@ class Runtime:
             with tmp.open("wb") as f:
                 for chunk in r.iter_bytes(chunk_size=1 << 16):
                     f.write(chunk)
+                    digest.update(chunk)
                     received += len(chunk)
                     if self._progress:
                         self._progress(FINGERPRINTS_ARCHIVE.label, received, total)
+        _check_sha256(FINGERPRINTS_ARCHIVE.key, hashes.get(FINGERPRINTS_ARCHIVE.key),
+                      digest.hexdigest(), tmp)
         # Fingerprints bundle is plain JSON files — `zipfile` is fine
         # everywhere (no symlinks / exec bits to preserve).
         with zipfile.ZipFile(tmp) as z:
@@ -541,6 +550,18 @@ class Runtime:
             if p.suffix == ".json":
                 shutil.copy(p, self.fingerprints_dir / p.name)
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _check_sha256(key: str, expected: Optional[str], actual: str, tmp: Path) -> None:
+    """Only the bytes the manifest names are extracted. An archive the manifest
+    has no hash for (or no manifest at all) is refused too: the bucket is not
+    this fork's, and the engine runs with every profile's cookies."""
+    if isinstance(expected, str) and expected.lower() == actual:
+        return
+    tmp.unlink(missing_ok=True)
+    if expected:
+        raise RuntimeError(f"{key} does not match the SHA-256 in the engine manifest; not installed")
+    raise RuntimeError(f"the engine manifest has no SHA-256 for {key}; not installed")
 
 
 _NATIVE_MAGIC = (

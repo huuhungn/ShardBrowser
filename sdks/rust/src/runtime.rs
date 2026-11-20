@@ -397,7 +397,7 @@ impl Runtime {
                 let _ = fs::remove_dir_all(self.root.join(engine_dir));
             }
             let etag = self
-                .download_and_extract(&self.spec.browser, &self.root)
+                .download_and_extract(&self.spec.browser, &self.root, &remote.sha256)
                 .await?;
             local.browser_etag = Some(etag);
             if remote.engine_build.is_some() {
@@ -407,7 +407,9 @@ impl Runtime {
 
         if let Some(wv) = self.spec.widevine.clone() {
             if need_browser || local.widevine_etag.is_none() {
-                let etag = self.download_and_extract(&wv, &self.root).await?;
+                let etag = self
+                    .download_and_extract(&wv, &self.root, &remote.sha256)
+                    .await?;
                 self.place_widevine();
                 local.widevine_etag = Some(etag);
             }
@@ -426,7 +428,7 @@ impl Runtime {
                 .map(|rf| local.fingerprints_etag.as_deref() != Some(rf.as_str()))
                 .unwrap_or(false);
         if need_fp {
-            self.install_fingerprints().await?;
+            self.install_fingerprints(&remote.sha256).await?;
             if let Some(rf) = remote_fp {
                 local.fingerprints_etag = Some(rf.clone());
             }
@@ -448,7 +450,13 @@ impl Runtime {
         Ok(())
     }
 
-    async fn download_and_extract(&self, archive: &Archive, dest: &Path) -> Result<String> {
+    async fn download_and_extract(
+        &self,
+        archive: &Archive,
+        dest: &Path,
+        hashes: &std::collections::HashMap<String, String>,
+    ) -> Result<String> {
+        use sha2::Digest;
         let url = format!("{PUB_BASE}/{}", archive.key);
         fs::create_dir_all(dest)?;
         let tmp = dest.join(format!(".{}.tmp", archive.key));
@@ -467,17 +475,24 @@ impl Runtime {
             .map(|s| s.trim_matches('"').to_string())
             .unwrap_or_default();
 
+        let mut hasher = sha2::Sha256::new();
         {
             let mut out = tokio::fs::File::create(&tmp).await?;
             let mut received: u64 = 0;
             while let Some(chunk) = resp.chunk().await? {
                 out.write_all(&chunk).await?;
+                hasher.update(&chunk);
                 received += chunk.len() as u64;
                 if let Some(cb) = &self.progress {
                     cb(&archive.label, received, total);
                 }
             }
             out.flush().await?;
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if let Err(e) = check_sha256(&archive.key, hashes.get(&archive.key), &actual) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
 
         let zip_path = tmp.clone();
@@ -487,7 +502,10 @@ impl Runtime {
         Ok(etag)
     }
 
-    async fn install_fingerprints(&self) -> Result<()> {
+    async fn install_fingerprints(
+        &self,
+        hashes: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
         let dir = self.fingerprints_dir();
         let staging = dir.join(".staging");
         let _ = fs::remove_dir_all(&staging);
@@ -496,7 +514,8 @@ impl Runtime {
             key: FINGERPRINTS_KEY.into(),
             label: "Fingerprint library".into(),
         };
-        self.download_and_extract(&archive, &staging).await?;
+        self.download_and_extract(&archive, &staging, hashes)
+            .await?;
 
         let src = staging.join(FINGERPRINTS_TOP_DIR);
         let walk = if src.exists() { src } else { staging.clone() };
@@ -542,6 +561,9 @@ impl Runtime {
 #[derive(Default)]
 struct RemoteManifest {
     archives: std::collections::HashMap<String, String>,
+    /// SHA-256 of each archive, hex: the archives sit in a bucket the manifest's
+    /// owner does not control.
+    sha256: std::collections::HashMap<String, String>,
     chromium_version: Option<String>,
     /// GREASE brand/version (rotates per release; travels in the manifest as
     /// data since it can't be derived from the version number).
@@ -557,6 +579,19 @@ struct RemoteManifest {
     engine_build: Option<String>,
     /// Lowest SDK version this engine build can be driven by.
     min_sdk_version: Option<String>,
+}
+
+/// Only the bytes the manifest names are extracted. An archive the manifest has
+/// no hash for (or no manifest at all) is refused too: the bucket is not the
+/// manifest owner's, and the engine runs with every profile's cookies.
+fn check_sha256(key: &str, expected: Option<&String>, actual: &str) -> Result<()> {
+    match expected {
+        Some(e) if e.eq_ignore_ascii_case(actual) => Ok(()),
+        Some(_) => {
+            anyhow::bail!("{key} does not match the SHA-256 in the engine manifest; not installed")
+        }
+        None => anyhow::bail!("the engine manifest has no SHA-256 for {key}; not installed"),
+    }
 }
 
 /// Dotted-numeric compare; non-numeric parts count as 0.
@@ -589,18 +624,20 @@ async fn fetch_manifest() -> RemoteManifest {
             return None;
         }
         let v: serde_json::Value = resp.json().await.ok()?;
-        let archives = v
-            .get("archives")
-            .and_then(|a| a.as_object())
-            .map(|o| {
-                o.iter()
-                    .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let str_map = |k: &str| {
+            v.get(k)
+                .and_then(|a| a.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let str_field = |k: &str| v.get(k).and_then(|s| s.as_str()).map(String::from);
         Some(RemoteManifest {
-            archives,
+            archives: str_map("archives"),
+            sha256: str_map("sha256"),
             chromium_version: str_field("chromium_version"),
             grease_brand: str_field("grease_brand"),
             grease_version: str_field("grease_version"),
@@ -711,6 +748,17 @@ fn fix_unix_exec_bits(root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_archive_is_extracted_only_with_the_checksum_the_manifest_names() {
+        let hash = "44fb1a3afd884d650904b88637eef8cede162ea5d302292a7b8813deafb751dc".to_string();
+        check_sha256("a.zip", Some(&hash), &hash).unwrap();
+        check_sha256("a.zip", Some(&hash.to_uppercase()), &hash).unwrap();
+        let wrong = check_sha256("a.zip", Some(&hash), &"0".repeat(64)).unwrap_err();
+        assert!(wrong.to_string().contains("does not match"), "{wrong}");
+        let none = check_sha256("a.zip", None, &hash).unwrap_err();
+        assert!(none.to_string().contains("no SHA-256"), "{none}");
+    }
 
     // host_spec() is the per-platform archive/layout table. Each runner must
     // get its own entry, so assert the contract that holds for the host we

@@ -167,6 +167,15 @@ async fn auth(req: Request, next: Next) -> Result<Response, StatusCode> {
         .map(|t| verify(&secret, t.trim()))
         .unwrap_or(false);
     if ok {
+        // A move of the data root deletes the old root when it ends, so a
+        // write landing there meanwhile is lost.
+        if !req.method().is_safe() && crate::migrate::in_progress() {
+            return Ok(err(
+                StatusCode::CONFLICT,
+                crate::errcode::code("profile.beingMovedRetry"),
+            )
+            .into_response());
+        }
         Ok(next.run(req).await)
     } else {
         Err(StatusCode::UNAUTHORIZED)
@@ -2002,6 +2011,38 @@ mod automation_endpoint_tests {
             !message.contains("[[shardx:"),
             "a marker leaked to a script author: {message}"
         );
+    }
+
+    /// A restore takes no profile claim, so only the API's own check keeps it
+    /// out of a data root that is being moved.
+    #[test]
+    fn api_writes_wait_for_a_data_root_move() {
+        let (_store, token, _lock) = scratch_store();
+        let mut profile = crate::profile::StoredProfile::default();
+        crate::profile::save_raw(&mut profile).unwrap();
+        let id = profile.meta.id;
+        crate::trash::move_to_trash(&id).unwrap();
+
+        let (status, body) = crate::migrate::guarded(|| {
+            Ok(tokio::runtime::Runtime::new()?.block_on(send(authed(
+                "POST",
+                &format!("/trash/{id}/restore"),
+                &token,
+                Value::Null,
+            ))))
+        })
+        .unwrap();
+        let still_trashed = crate::profile::load_raw(&id).is_err();
+        crate::store::set_config_root(None);
+        assert_eq!(status, StatusCode::CONFLICT, "body was {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("being moved"),
+            "{body}"
+        );
+        assert!(still_trashed, "the restore did not run");
     }
 }
 
