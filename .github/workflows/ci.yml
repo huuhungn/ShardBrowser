@@ -1,10 +1,18 @@
 name: CI
 
+# Docs-only changes skip CI. Only root *.md and docs/ are ignored: the MCP
+# release smoke below copies mcp/README.md, so nested READMEs still run it.
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
 
 permissions:
   contents: read
@@ -33,6 +41,12 @@ jobs:
       - name: Set up Rust SDK MSRV
         uses: dtolnay/rust-toolchain@1.88.0
 
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: sdks/rust -> target
+          key: msrv-1.88.0
+
       - name: Rust SDK stable checks
         run: |
           cargo +stable test --manifest-path sdks/rust/Cargo.toml --all-features
@@ -40,9 +54,13 @@ jobs:
           cargo +stable clippy --manifest-path sdks/rust/Cargo.toml --all-targets --all-features -- -D warnings
           cargo +stable clippy --manifest-path sdks/rust/Cargo.toml --all-targets --no-default-features -- -D warnings
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: cargo-audit@0.22.2
+
       - name: Rust SDK RustSec audit
         run: |
-          cargo +stable install cargo-audit --locked --version 0.22.2
           cargo +stable audit --file sdks/rust/Cargo.lock
 
       # Each ignore is a reviewed disposition in docs/dependency-review.md; a
@@ -86,16 +104,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            shared/target
-            server/target
-            src-tauri/target
-            sdks/rust/target
-          key: windows-rust-${{ hashFiles('shared/Cargo.lock', 'server/Cargo.lock', 'src-tauri/Cargo.lock', 'sdks/rust/Cargo.lock') }}
+          workspaces: |
+            shared -> target
+            server -> target
+            src-tauri -> target
+            sdks/rust -> target
+          key: windows-stable
 
       # The supported-filesystem gate (ADR 0002 Q-30) must refuse an SMB
       # share. The runner is elevated, so it shares an empty directory; the
@@ -150,6 +166,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            src-tauri -> target
+            shared -> target
+            server -> target
 
       # Cheap and first: a formatting slip is reported in seconds rather than
       # after the Tauri dependencies, the build, and the browser download.
@@ -329,6 +353,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # The crates' rust-version values are hashed in through their manifests,
+      # so an MSRV bump starts a fresh cache.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            shared -> target
+            server -> target
+            src-tauri -> target
+          key: msrv
 
       - name: Install Tauri build dependencies
         run: |
