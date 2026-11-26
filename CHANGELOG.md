@@ -21,6 +21,10 @@
 - Security: the MCP server's HTTP mode (`MCP_HTTP_PORT`) requires
   `Authorization: Bearer <SHARDX_TOKEN>` and a loopback `Host`, and does not
   start without `SHARDX_TOKEN`. The default stdio mode is unchanged.
+- Security: the launcher and the team server move to `url` 2.5.9 (stack overflow
+  in `Url::origin()` on nested `blob:` URLs, RUSTSEC-2026-0592), and the launcher
+  to `cookie` 0.18.3 (repeating private-cookie nonces after a fork,
+  RUSTSEC-2026-0594).
 
 ## v2.12.2
 
