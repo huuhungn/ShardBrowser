@@ -15,11 +15,13 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from .host import host_screen_size
+from .profile import config_claims_mobile
 
 
 def apply_screen_strategy(config: dict, mode: str) -> None:
-    """Mutate `config` in place per `mode`. Unknown modes are no-ops."""
-    if mode == "profile":
+    """Mutate `config` in place per `mode`. Unknown modes are no-ops. A phone keeps
+    the handset's screen in every mode, as in the launcher."""
+    if mode == "profile" or config_claims_mobile(config):
         return
     host = host_screen_size()
     if host is None:

@@ -10,11 +10,13 @@
 // All modes leave DPR / color_depth / orientation / etc. untouched.
 import { platform as osPlatform } from "node:os";
 import { hostScreenSize } from "./host.js";
+import { configClaimsMobile } from "./profile.js";
 
 export type ScreenStrategy = "profile" | "cap_to_host" | "use_host";
 
 export function applyScreenStrategy(cfg: Record<string, unknown>, mode: ScreenStrategy | string): void {
-  if (mode === "profile") return;
+  // A phone keeps the handset's screen in every mode, as in the launcher.
+  if (mode === "profile" || configClaimsMobile(cfg)) return;
   const host = hostScreenSize();
   if (!host) return;
   const [hw, hh] = host;

@@ -557,7 +557,7 @@ fn migrate_value(
 /// Mirrors the engine's fingerprint::ProfileClaimsMobile(): the same three
 /// signals, so launcher and engine agree on what a phone is. navigator.platform
 /// is not one of them: Chrome for Android says "Linux armv8l" there.
-fn claims_mobile(config: &serde_json::Map<String, serde_json::Value>) -> bool {
+pub(crate) fn claims_mobile(config: &serde_json::Map<String, serde_json::Value>) -> bool {
     let ch = config.get("client_hints");
     let lower = |v: Option<&serde_json::Value>| {
         v.and_then(|v| v.as_str())
