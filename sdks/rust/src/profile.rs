@@ -324,12 +324,13 @@ pub fn apply_engine_version(
     }
 }
 
-/// The build a profile reports: `android` (the Chrome for Android build of the same
-/// major) for a phone, since Android ships its own build numbers and a phone reporting a
-/// desktop one claims a build no phone has; otherwise the engine's `chromium` build.
-pub(crate) fn reported_build<'a>(chromium: &'a str, android: Option<&'a str>) -> &'a str {
+/// The build a profile reports: `claimed` (the build its OS is shipped) when the manifest names
+/// one of the engine's major: the Chrome for Android build for a phone, since a phone reporting a
+/// desktop one claims a build no phone has, or the desktop OS's build (158 went out as .37 for
+/// macOS and Windows and .36 for Linux); otherwise the engine's `chromium` build.
+pub(crate) fn reported_build<'a>(chromium: &'a str, claimed: Option<&'a str>) -> &'a str {
     let major = chromium.split('.').next();
-    android
+    claimed
         .filter(|v| v.split('.').count() == 4 && v.split('.').next() == major)
         .unwrap_or(chromium)
 }

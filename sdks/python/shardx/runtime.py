@@ -21,7 +21,7 @@ from typing import Callable, Optional
 import httpx
 
 PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev"
-CHROMIUM_VERSION = "157.0.8103.50"
+CHROMIUM_VERSION = "158.0.8127.36"
 # This SDK's own version, compared against the manifest's `min_sdk_version`.
 SDK_VERSION = "2.1.0"
 # Version manifest (GitHub raw) — one tiny GET tells us every archive's current
@@ -120,9 +120,11 @@ def apply_engine_version(
     version the profile claims: 152 added the ML-DSA schemes 0x0904-0x0906, so
     a 149-era profile is eleven entries short and reads as a mismatch.
 
-    `android_version` is the Chrome for Android build of the same major, passed
-    for phone profiles: Android ships its own build numbers, and a phone
-    reporting a desktop one claims a build no phone has."""
+    `android_version` is the build this profile's OS is shipped, when it is not
+    `chromium_version`: the Chrome for Android build of the same major for a
+    phone (a phone reporting a desktop build claims one no phone has), or the
+    manifest's `desktop_chromium_versions` entry for a desktop profile (158
+    went out as .37 for macOS and Windows and .36 for Linux)."""
     parts = chromium_version.split(".")
     if len(parts) != 4:
         return
@@ -238,6 +240,10 @@ class Runtime:
         self._grease_version: Optional[str] = None
         # Chrome for Android build of the engine's major, for phone profiles.
         self._android_version: Optional[str] = None
+        # The build each desktop OS is shipped ({"macOS": ..., "Windows": ..., "Linux": ...}),
+        # when it is not the engine's own: 158 went out as .37 for macOS and Windows and .36
+        # for Linux.
+        self._desktop_versions: Optional[dict] = None
         # TLS block from the manifest (signature_algorithms / cipher_suites).
         # Applied to profiles on launch so the JA4 hash keeps matching the
         # Chrome version the profile claims.
@@ -292,6 +298,19 @@ class Runtime:
     def android_chromium_version(self) -> Optional[str]:
         """Chrome for Android build phone profiles report; set on install()."""
         return self._android_version
+
+    @property
+    def desktop_chromium_versions(self) -> Optional[dict]:
+        """The build each desktop OS reports, keyed as navigator.platform names it; set on
+        install()."""
+        return self._desktop_versions
+
+    def claimed_chromium_version(self, platform: str, mobile: bool) -> Optional[str]:
+        """The build a profile of this platform reports instead of `chromium_version`, if any."""
+        if mobile:
+            return self._android_version
+        v = (self._desktop_versions or {}).get(platform)
+        return v if isinstance(v, str) and v else None
 
     @property
     def tls(self) -> Optional[dict]:
@@ -400,6 +419,10 @@ class Runtime:
         self._grease_version = manifest.get("grease_version") or None
         self._android_version = (manifest.get("android_chromium_version")
                                  or local.get("installed_android_chromium_version") or None)
+        dv = manifest.get("desktop_chromium_versions")
+        if not isinstance(dv, dict) or not dv:
+            dv = local.get("installed_desktop_chromium_versions")
+        self._desktop_versions = dv if isinstance(dv, dict) and dv else None
         remote_tls = manifest.get("tls")
         self._tls = remote_tls if isinstance(remote_tls, dict) else None
         # Refused rather than installed: this SDK could not configure it.
@@ -445,6 +468,8 @@ class Runtime:
         local["installed_chromium_version"] = self._chromium_version
         if manifest.get("android_chromium_version"):
             local["installed_android_chromium_version"] = manifest["android_chromium_version"]
+        if isinstance(manifest.get("desktop_chromium_versions"), dict) and manifest["desktop_chromium_versions"]:
+            local["installed_desktop_chromium_versions"] = manifest["desktop_chromium_versions"]
         self._save_manifest(local)
         # Linux/mac archives produced on Windows lose every Unix exec bit;
         # restore +x on every ELF/Mach-O file under the engine tree (not

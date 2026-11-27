@@ -158,9 +158,11 @@ export class FingerprintLibrary {
  * version the profile claims: 152 added the ML-DSA schemes 0x0904-0x0906, so a
  * 149-era profile is eleven entries short and reads as a mismatch.
  *
- * `androidVersion` is the Chrome for Android build of the same major, passed
- * for phone profiles: Android ships its own build numbers, and a phone
- * reporting a desktop one claims a build no phone has.
+ * `androidVersion` is the build this profile's OS is shipped, when it is not
+ * `chromiumVersion`: the Chrome for Android build of the same major for a phone
+ * (a phone reporting a desktop build claims one no phone has), or the
+ * manifest's `desktop_chromium_versions` entry for a desktop profile (158 went
+ * out as .37 for macOS and Windows and .36 for Linux).
  */
 export function applyEngineVersion(
   config: Record<string, unknown>,

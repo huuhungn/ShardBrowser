@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 pub const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-pub const CHROMIUM_VERSION: &str = "157.0.8103.50";
+pub const CHROMIUM_VERSION: &str = "158.0.8127.36";
 /// This SDK's own version, compared against the manifest's `min_sdk_version`.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Version manifest (GitHub raw) — one tiny GET yields every archive's current
@@ -147,7 +147,14 @@ struct Manifest {
     /// Chrome for Android build of the engine's major, for phone profiles.
     #[serde(default)]
     installed_android_chromium_version: Option<String>,
+    #[serde(default)]
+    installed_desktop_chromium_versions: Option<DesktopVersions>,
 }
+
+/// The Chrome build each desktop OS is shipped, keyed as `navigator.platform` names it ("macOS",
+/// "Windows", "Linux"), when it is not the engine's own: 158 went out as 158.0.8127.37 for macOS
+/// and Windows and 158.0.8127.36 for Linux.
+pub type DesktopVersions = std::collections::BTreeMap<String, String>;
 
 pub struct Runtime {
     pub root: PathBuf,
@@ -166,6 +173,8 @@ pub struct Runtime {
     tls: std::sync::Mutex<Option<serde_json::Value>>,
     /// Chrome for Android build of the engine's major, for phone profiles.
     android_version: std::sync::Mutex<Option<String>>,
+    /// The build each desktop OS reports (see `DesktopVersions`).
+    desktop_versions: std::sync::Mutex<Option<DesktopVersions>>,
 }
 
 impl Runtime {
@@ -186,6 +195,7 @@ impl Runtime {
             grease: std::sync::Mutex::new((None, None)),
             tls: std::sync::Mutex::new(None),
             android_version: std::sync::Mutex::new(None),
+            desktop_versions: std::sync::Mutex::new(None),
         })
     }
 
@@ -197,6 +207,25 @@ impl Runtime {
     /// Chrome for Android build phone profiles report (set on install()).
     pub fn android_chromium_version(&self) -> Option<String> {
         self.android_version.lock().unwrap().clone()
+    }
+
+    /// The build each desktop OS reports, keyed as `navigator.platform` names it (set on install()).
+    pub fn desktop_chromium_versions(&self) -> Option<DesktopVersions> {
+        self.desktop_versions.lock().unwrap().clone()
+    }
+
+    /// The build a profile of this platform reports instead of `chromium_version()`, if any.
+    pub fn claimed_chromium_version(&self, platform: &str, mobile: bool) -> Option<String> {
+        if mobile {
+            return self.android_chromium_version();
+        }
+        self.desktop_versions
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(platform))
+            .filter(|v| !v.is_empty())
+            .cloned()
     }
 
     /// TLS overrides from the manifest (set on install()).
@@ -368,6 +397,10 @@ impl Runtime {
             .android_chromium_version
             .clone()
             .or_else(|| local.installed_android_chromium_version.clone());
+        *self.desktop_versions.lock().unwrap() = remote
+            .desktop_chromium_versions
+            .clone()
+            .or_else(|| local.installed_desktop_chromium_versions.clone());
 
         // Refused rather than installed: this SDK could not configure it.
         if let Some(min) = remote.min_sdk_version.as_deref() {
@@ -443,6 +476,9 @@ impl Runtime {
         local.installed_chromium_version = Some(self.chromium_version());
         if remote.android_chromium_version.is_some() {
             local.installed_android_chromium_version = remote.android_chromium_version.clone();
+        }
+        if remote.desktop_chromium_versions.is_some() {
+            local.installed_desktop_chromium_versions = remote.desktop_chromium_versions.clone();
         }
 
         self.save_manifest(&local)?;
@@ -582,6 +618,8 @@ struct RemoteManifest {
     tls: Option<serde_json::Value>,
     /// The Chrome for Android build of the same major, for phone profiles.
     android_chromium_version: Option<String>,
+    /// The build each desktop OS reports, when it is not `chromium_version`.
+    desktop_chromium_versions: Option<DesktopVersions>,
     /// Which build of the engine archive this is, apart from its Chromium
     /// version. Not the manifest-wide `revision`, which also moves for a TLS
     /// or GREASE edit.
@@ -651,6 +689,15 @@ async fn fetch_manifest() -> RemoteManifest {
             grease_brand: str_field("grease_brand"),
             grease_version: str_field("grease_version"),
             android_chromium_version: str_field("android_chromium_version"),
+            desktop_chromium_versions: v
+                .get("desktop_chromium_versions")
+                .and_then(|m| m.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect::<DesktopVersions>()
+                })
+                .filter(|m| !m.is_empty()),
             tls: v.get("tls").filter(|t| t.is_object()).cloned(),
             // Written as a number or a string; both mean the same thing.
             engine_build: v.get("engine_build").and_then(|b| match b {
@@ -848,5 +895,40 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         assert!(dir.to_string_lossy().contains("Application Support"));
+    }
+
+    #[test]
+    fn each_desktop_os_takes_the_build_it_is_shipped_and_a_phone_its_android_one() {
+        let dir = std::env::temp_dir().join(format!("shardx-dv-{}", std::process::id()));
+        let rt = Runtime::new(Some(dir.clone()), None, None).unwrap();
+        *rt.android_version.lock().unwrap() = Some("158.0.8127.42".into());
+        *rt.desktop_versions.lock().unwrap() = Some(
+            [
+                ("macOS", "158.0.8127.37"),
+                ("Windows", "158.0.8127.37"),
+                ("Linux", "158.0.8127.36"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        );
+        assert_eq!(
+            rt.claimed_chromium_version("macOS", false).as_deref(),
+            Some("158.0.8127.37")
+        );
+        assert_eq!(
+            rt.claimed_chromium_version("Windows", false).as_deref(),
+            Some("158.0.8127.37")
+        );
+        assert_eq!(
+            rt.claimed_chromium_version("Linux", false).as_deref(),
+            Some("158.0.8127.36")
+        );
+        assert_eq!(
+            rt.claimed_chromium_version("Android", true).as_deref(),
+            Some("158.0.8127.42")
+        );
+        assert_eq!(rt.claimed_chromium_version("ChromeOS", false), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
