@@ -128,8 +128,10 @@ jobs:
       - name: Shared core tests
         run: cargo test --manifest-path shared/Cargo.toml
 
-      - name: Team server tests
-        run: cargo test --manifest-path server/Cargo.toml
+      # The Team server's own tests are out of scope (owner, 2026-11-27). Only
+      # the binary is built: the launcher's enrollment tests spawn it.
+      - name: Build team server for integration tests
+        run: cargo build --manifest-path server/Cargo.toml
 
       # Holds the only Windows-gated test in the tree
       # (windows_resume_uses_the_autostart_argument), which no Linux runner
@@ -331,8 +333,7 @@ jobs:
       - name: Shared core tests
         run: cargo test --manifest-path shared/Cargo.toml
 
-      - name: Team server tests
-        run: cargo test --manifest-path server/Cargo.toml
+      # The Team server's own tests are out of scope (owner, 2026-11-27).
 
       # The launcher's enrollment test drives a real team-server process, so
       # the binary has to exist before the test run.
