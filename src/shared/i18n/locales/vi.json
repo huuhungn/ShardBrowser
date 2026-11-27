@@ -728,6 +728,7 @@
   "profile.selectedCount": "Đã chọn {n}",
   "profile.clearFilters": "Xoá bộ lọc",
   "profile.clientRects": "Client rects",
+  "profile.clientRectsNote": "Trang web nhận ra được nhiễu này, nên để tắt",
   "profile.alreadyExitedCleared": "Trình duyệt đó đã thoát từ trước; trạng thái của nó đã được xoá",
   "profile.clipboardIsEmpty": "Bộ nhớ tạm trống",
   "profile.cloneNameExhausted": "Không còn tên riêng nào cho hồ sơ nhân bản.",

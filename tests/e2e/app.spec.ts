@@ -2893,3 +2893,21 @@ test("the fingerprint library states a GPU mismatch once and keeps the cards qui
   await expect(remove).not.toHaveText("✕");
   await expect(page.getByRole("button", { name: /^Remove / })).toHaveCount(2);
 });
+
+test("client rects noise explains itself and warns only while it is on", async ({ page }) => {
+  await gotoMocked(page);
+
+  await page.getByRole("button", { name: "Edit profile VN Automation 001 - No Proxy" }).click();
+  // The kit names the first tab after its label ("Client rects Auto noise"); the second follows it.
+  const realTab = page.getByRole("tab", { name: /^Client rects/ });
+  const autoTab = realTab.locator("xpath=following-sibling::*[1]");
+  const note = page.getByText("Sites can detect this noise: best left off");
+  const icon = note.locator("xpath=..").locator("svg");
+  await expect(note).toBeVisible();
+  // Off: a plain line; on: the same line with the warning icon.
+  await expect(icon).toHaveCount(0);
+  await autoTab.click();
+  await expect(icon).toHaveCount(1);
+  await realTab.click();
+  await expect(icon).toHaveCount(0);
+});

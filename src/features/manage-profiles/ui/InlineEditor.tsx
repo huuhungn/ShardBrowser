@@ -220,7 +220,9 @@ export function InlineEditor({
             <Pair label={t("profile.canvas")}        value={f.noise_canvas}        on={(v) => u("noise_canvas", v)} />
             <Pair label={t("profile.webgl")}         value={f.noise_webgl}         on={(v) => u("noise_webgl", v)} />
             <Pair label={t("profile.audio")}         value={f.noise_audio}         on={(v) => u("noise_audio", v)} />
-            <Pair label={t("profile.clientRects")}  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)} />
+            {/* Noised DOM sizes are ones no real Chrome reports, so sites can tell. */}
+            <Pair label={t("profile.clientRects")}  value={f.noise_client_rects}  on={(v) => u("noise_client_rects", v)}
+              note={t("profile.clientRectsNote")} warn={f.noise_client_rects === "auto"} />
             <Pair label={t("profile.sensors")}       value={f.noise_sensors}       on={(v) => u("noise_sensors", v)} />
             <Pair label={t("profile.fonts")}         value={f.noise_fonts}         on={(v) => u("noise_fonts", v)} onText={t("profile.noise")} />
           </div>
