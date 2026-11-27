@@ -1058,6 +1058,35 @@ server.tool("list_fingerprints", "List the fingerprint library entries.", {}, as
   text(await api("/fingerprints")),
 );
 
+server.tool(
+  "list_tags",
+  "List tags (name, color, count of profiles), sorted by name. list_profiles shows each profile's tag names too.",
+  {},
+  async () => text(await api("/tags")),
+);
+
+server.tool(
+  "save_tag",
+  "Add a tag or recolor the one of that name (case aside). color is a palette id such as teal, required: a tag no profile carries is kept by its color alone.",
+  { name: z.string(), color: z.string() },
+  async (args) => text(await api("/tags", { method: "POST", body: args })),
+);
+
+server.tool(
+  "delete_tag",
+  "Delete a tag: it comes off every profile that carries it; the profiles stay.",
+  { name: z.string() },
+  async ({ name }) => text(await api(`/tags/${encodeURIComponent(name)}`, { method: "DELETE" })),
+);
+
+server.tool(
+  "set_profile_tags",
+  "Give a profile exactly these tags: names from list_tags. [] clears. An unknown tag changes nothing; make it with save_tag first.",
+  { id: z.string(), tags: z.array(z.string()) },
+  async ({ id, tags }) =>
+    text(await api(`/profiles/${encodeURIComponent(id)}/tags`, { method: "PUT", body: { tags } })),
+);
+
 server.tool("list_folders", "List folder tags.", {}, async () => text(await api("/folders")));
 
 server.tool(

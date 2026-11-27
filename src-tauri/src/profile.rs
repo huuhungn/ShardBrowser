@@ -1112,7 +1112,7 @@ fn take_tag_color(colors: &mut BTreeMap<String, String>, name: &str) -> Option<S
 }
 
 /// Lowercase palette id such as `teal`; the palette itself is the interface's.
-fn valid_tag_color(color: &str) -> bool {
+pub fn valid_tag_color(color: &str) -> bool {
     (1..=16).contains(&color.len())
         && color
             .bytes()

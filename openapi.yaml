@@ -682,6 +682,49 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /profiles/{id}/tags:
+    put:
+      tags: [Tags]
+      summary: Set a profile's tags
+      description: |
+        The profile carries exactly these tags afterwards; `[]` takes them all
+        off. Each entry is a tag's name (case aside) from `GET /tags`; the
+        tag keeps its own spelling. A name no tag has changes nothing and
+        answers 400: add it with `POST /tags` first.
+      parameters:
+        - $ref: "#/components/parameters/ProfileId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProfileTagsRequest" }
+      responses:
+        "200":
+          description: The profile's tags now.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+                  tags: { type: array, items: { type: string } }
+        "400":
+          description: An unknown tag, or more than 64 tags.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No profile with this id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: The profile is running or another profile lifecycle operation is in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
   /folders:
     get:
       tags: [Folders]
@@ -705,7 +748,7 @@ paths:
       description: |
         Every tag on a persistent profile or with a stored color, sorted by
         name, with how many profiles carry it. Tag names match
-        case-insensitively; rename, recolor and delete are in the launcher.
+        case-insensitively; rename is in the launcher.
       responses:
         "200":
           description: Tags.
@@ -715,6 +758,67 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/TagInfo" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Tags]
+      summary: Add a tag or recolor one
+      description: |
+        Adds the tag, or recolors the tag of that name (case aside). The name
+        is trimmed, inner whitespace collapsed and capped at 32 characters. A
+        tag no profile carries is kept by its color alone, so `color` is
+        required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TagRequest" }
+      responses:
+        "200":
+          description: The tag as `GET /tags` lists it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TagInfo" }
+        "400":
+          description: An empty name or a color that is not a palette id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /tags/{name}:
+    delete:
+      tags: [Tags]
+      summary: Delete a tag
+      description: |
+        Takes the tag off every profile that carries it and forgets its color.
+        The profiles stay.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: The tag's name, case aside (URL-encoded).
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: boolean, example: true }
+                  name: { type: string, description: The tag as it was spelled. }
+                  profiles: { type: integer, description: Profiles that carried it. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No tag with this name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: A profile that carries it is running or another profile lifecycle operation is in progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /folders/{folder}:
     patch:
@@ -1576,6 +1680,24 @@ components:
         count:
           type: integer
           description: Profiles carrying the tag; 0 for a tag that so far only has a color.
+
+    TagRequest:
+      type: object
+      required: [name, color]
+      properties:
+        name: { type: string }
+        color:
+          type: string
+          description: Palette id such as `teal`; 1 to 16 lowercase letters, digits or `-`.
+
+    ProfileTagsRequest:
+      type: object
+      required: [tags]
+      properties:
+        tags:
+          type: array
+          items: { type: string }
+          description: Tag names; `[]` takes them all off.
 
     ProfileListItem:
       allOf:

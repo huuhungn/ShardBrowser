@@ -190,6 +190,8 @@ start in this mode without `SHARDX_TOKEN`.
 - `list_trash`, `restore_profile(id)`, `purge_profile(id)` — `delete_profile`
   moves a profile here, restorable for 7 days
 - `list_fingerprints`, `list_folders`, `rename_folder`, `delete_folder`
+- `list_tags`, `save_tag(name, color)`, `delete_tag`, `set_profile_tags(id, tags)` —
+  tags are names; make one with `save_tag` before assigning it, and `[]` clears
 - `export_cookies`, `import_cookies(cookies | text)` — accepts Netscape
   `cookies.txt`, Cookie-Editor / EditThisCookie, Playwright / Puppeteer and
   ShardX cookies; entries that cannot be converted come back in `skipped`
