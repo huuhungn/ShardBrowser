@@ -728,6 +728,7 @@
   "profile.selectedCount": "{n} selected",
   "profile.clearFilters": "Clear filters",
   "profile.clientRects": "Client rects",
+  "profile.clientRectsNote": "Sites can detect this noise: best left off",
   "profile.alreadyExitedCleared": "That browser had already exited; its status was cleared",
   "profile.clipboardIsEmpty": "Clipboard is empty",
   "profile.cloneNameExhausted": "No unique name is left for the cloned profile.",

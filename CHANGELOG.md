@@ -36,6 +36,9 @@
   and macOS, 158.0.8127.36 on Linux): migration and the three SDKs write that
   build into a profile of that OS, and phones keep the Chrome for Android
   build (158.0.8127.42).
+- Profile editor: Client rects noise says that sites can detect it and is best
+  left off, and the line turns into a warning while the noise is on (upstream
+  v2.1.6). Noised element sizes are ones no real Chrome reports.
 
 ## v2.12.2
 
