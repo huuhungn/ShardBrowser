@@ -8,7 +8,7 @@ use axum::{
     http::{header::AUTHORIZATION, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -1420,6 +1420,92 @@ async fn list_tags() -> ApiResult {
     Ok(Json(json!(tags)))
 }
 
+/// A tag as `GET /tags` lists it, by name (case aside).
+fn find_tag(name: &str) -> Result<Option<crate::profile::TagInfo>, ApiError> {
+    let name = crate::profile::normalize_tag(name)
+        .unwrap_or_default()
+        .to_lowercase();
+    let tags = crate::profile::list_tags()
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(tags.into_iter().find(|t| t.name.to_lowercase() == name))
+}
+
+#[derive(Deserialize)]
+struct TagReq {
+    name: String,
+    color: String,
+}
+
+/// Adds a tag, or recolors the one of that name (case aside); answers it as
+/// `GET /tags` lists it. A tag with no profile and no color is nothing on
+/// disk, so the color is required.
+async fn save_tag_ep(Json(body): Json<TagReq>) -> ApiResult {
+    if crate::profile::normalize_tag(&body.name).is_none() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            crate::errcode::code("profile.tagNameEmpty"),
+        ));
+    }
+    if !crate::profile::valid_tag_color(&body.color) {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            crate::errcode::code("profile.tagColorInvalid"),
+        ));
+    }
+    crate::profile::recolor_tag(&body.name, Some(&body.color))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::notify_store_changed("tags");
+    Ok(Json(json!(find_tag(&body.name)?)))
+}
+
+/// Takes the tag off every profile that carries it and forgets its color.
+async fn delete_tag_ep(Path(name): Path<String>) -> ApiResult {
+    let tag = find_tag(&name)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such tag: {name}")))?;
+    let n = crate::profile::delete_tag(&tag.name)
+        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    crate::notify_store_changed("tags");
+    Ok(Json(
+        json!({ "deleted": true, "name": tag.name, "profiles": n }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ProfileTagsReq {
+    /// Names from `GET /tags`, case aside; `[]` clears.
+    tags: Vec<String>,
+}
+
+/// Gives one profile exactly these tags. A name no tag has is refused with 400
+/// and nothing changes: `POST /tags` makes the tag first, so a typo makes none.
+async fn set_profile_tags_ep(
+    Path(id): Path<String>,
+    Json(body): Json<ProfileTagsReq>,
+) -> ApiResult {
+    crate::profile::load_raw(&id).map_err(|e| err(StatusCode::NOT_FOUND, e.to_string()))?;
+    let mut missing = Vec::new();
+    for name in &body.tags {
+        if crate::profile::normalize_tag(name).is_some() && find_tag(name)?.is_none() {
+            missing.push(name.trim().to_string());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("no such tag: {} (POST /tags makes one)", missing.join(", ")),
+        ));
+    }
+    let _claim = crate::profile::begin_user_mutation(
+        [&id],
+        &crate::errcode::code("profile.actionChangeTags"),
+    )
+    .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    let tags = crate::profile::set_tags(&id, &body.tags)
+        .map_err(|error| profile_api_error(error, StatusCode::INTERNAL_SERVER_ERROR))?;
+    crate::notify_store_changed("profiles");
+    Ok(Json(json!({ "id": id, "tags": tags })))
+}
+
 async fn list_folders() -> ApiResult {
     let metas = crate::profile::list_all()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1521,7 +1607,9 @@ fn router() -> Router {
             get(export_cookies).post(import_cookies),
         )
         .route("/folders", get(list_folders))
-        .route("/tags", get(list_tags))
+        .route("/tags", get(list_tags).post(save_tag_ep))
+        .route("/tags/:name", delete(delete_tag_ep))
+        .route("/profiles/:id/tags", put(set_profile_tags_ep))
         .route(
             "/folders/:folder",
             patch(rename_folder_ep).delete(delete_folder_ep),
@@ -2216,5 +2304,153 @@ mod profile_proxy_password_tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn tags_are_made_recolored_assigned_and_deleted_over_the_api() {
+        let (_store, token, _lock) = scratch_store();
+        let (_, created) = send(authed(
+            "POST",
+            "/profiles",
+            &token,
+            json!({ "name": "to tag", "fingerprint": {}, "tags": ["Old"] }),
+        ))
+        .await;
+        let id = created["id"].as_str().expect("a profile id").to_string();
+
+        // A tag nobody carries yet exists once it has a color.
+        let (status, made) = send(authed(
+            "POST",
+            "/tags",
+            &token,
+            json!({ "name": "  Client   A ", "color": "teal" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {made}");
+        assert_eq!(
+            made,
+            json!({ "name": "Client A", "color": "teal", "count": 0 })
+        );
+
+        // The same name, case aside, is that tag: recolored, not duplicated.
+        let (_, recolored) = send(authed(
+            "POST",
+            "/tags",
+            &token,
+            json!({ "name": "client a", "color": "red" }),
+        ))
+        .await;
+        assert_eq!(
+            recolored,
+            json!({ "name": "Client A", "color": "red", "count": 0 })
+        );
+
+        for bad in [
+            json!({ "name": "   ", "color": "red" }),
+            json!({ "name": "X", "color": "Not A Color" }),
+        ] {
+            let (status, body) = send(authed("POST", "/tags", &token, bad)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body was {body}");
+        }
+        // The color is required: a tag with neither profile nor color is nothing.
+        let (status, _) = send(authed("POST", "/tags", &token, json!({ "name": "X" }))).await;
+        assert!(status.is_client_error());
+
+        // Assigning replaces the profile's tags, in the spelling the tag has.
+        let (status, set) = send(authed(
+            "PUT",
+            &format!("/profiles/{id}/tags"),
+            &token,
+            json!({ "tags": ["CLIENT a", "old", "client A"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "body was {set}");
+        assert_eq!(set, json!({ "id": id, "tags": ["Client A", "Old"] }));
+
+        // An unknown tag changes nothing.
+        let (status, refused) = send(authed(
+            "PUT",
+            &format!("/profiles/{id}/tags"),
+            &token,
+            json!({ "tags": ["Client A", "Typo"] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body was {refused}");
+        assert!(refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Typo"));
+        let (_, unchanged) = send(authed(
+            "GET",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(unchanged["_meta"]["tags"], json!(["Client A", "Old"]));
+
+        let (status, _) = send(authed(
+            "PUT",
+            "/profiles/nope/tags",
+            &token,
+            json!({ "tags": [] }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Deleting takes the tag off the profile and forgets its color.
+        let (status, deleted) =
+            send(authed("DELETE", "/tags/client%20a", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::OK, "body was {deleted}");
+        assert_eq!(
+            deleted,
+            json!({ "deleted": true, "name": "Client A", "profiles": 1 })
+        );
+        let (_, after) = send(authed(
+            "GET",
+            &format!("/profiles/{id}"),
+            &token,
+            Value::Null,
+        ))
+        .await;
+        assert_eq!(after["_meta"]["tags"], json!(["Old"]));
+        let (_, listed) = send(authed("GET", "/tags", &token, Value::Null)).await;
+        assert_eq!(
+            listed,
+            json!([{ "name": "Old", "color": null, "count": 1 }])
+        );
+        let (status, _) = send(authed("DELETE", "/tags/client%20a", &token, Value::Null)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // [] takes every tag off.
+        let (_, cleared) = send(authed(
+            "PUT",
+            &format!("/profiles/{id}/tags"),
+            &token,
+            json!({ "tags": [] }),
+        ))
+        .await;
+        assert_eq!(cleared, json!({ "id": id, "tags": [] }));
+    }
+
+    #[tokio::test]
+    async fn the_tag_writes_need_the_token() {
+        let (_store, _token, _lock) = scratch_store();
+        for (method, uri) in [
+            ("POST", "/tags"),
+            ("DELETE", "/tags/x"),
+            ("PUT", "/profiles/x/tags"),
+        ] {
+            let (status, _) = send(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("build the request"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
     }
 }

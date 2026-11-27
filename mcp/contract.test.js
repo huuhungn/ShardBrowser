@@ -29,7 +29,7 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
     // bump fails this test for no reason, which trains people to edit it
     // without reading what it guards.
     assert.equal(version, pkg.version);
-    assert.equal(tools.length, 114);
+    assert.equal(tools.length, 118);
     for (const name of [
       "health_check",
       "startup_status",
@@ -54,6 +54,11 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
       "get_automation_project",
       "run_automation_project",
       "record_profile_traffic",
+      // Tags: the local profiles' tag names and colors.
+      "list_tags",
+      "save_tag",
+      "delete_tag",
+      "set_profile_tags",
     ]) {
       assert(names.has(name), `missing MCP tool: ${name}`);
     }
@@ -72,6 +77,14 @@ test("stdio server exposes the versioned ShardX tool contract", async () => {
     const traffic = tools.find((tool) => tool.name === "record_profile_traffic");
     assert(traffic.inputSchema.properties.keep_running, "record_profile_traffic.keep_running missing");
     assert(traffic.inputSchema.properties.url, "record_profile_traffic.url missing");
+
+    // A tag no profile carries exists only through its color, and assigning
+    // takes a whole list so a client cannot half-apply one.
+    const saveTag = tools.find((tool) => tool.name === "save_tag");
+    assert.deepEqual([...saveTag.inputSchema.required].sort(), ["color", "name"]);
+    const setTags = tools.find((tool) => tool.name === "set_profile_tags");
+    assert.equal(setTags.inputSchema.properties.tags.type, "array");
+    assert.deepEqual([...setTags.inputSchema.required].sort(), ["id", "tags"]);
   } finally {
     await client.close();
   }
@@ -113,6 +126,49 @@ test("every v0.1.28 tool keeps its arguments and gains no required ones", async 
     }
   } finally {
     await client.close();
+  }
+});
+
+test("the tag tools send the launcher the request its API documents", async () => {
+  const http = await import("node:http");
+  const seen = [];
+  const api = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body });
+      res.setHeader("content-type", "application/json");
+      res.end("{}");
+    });
+  });
+  await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(dir, "index.js")],
+    cwd: dir,
+    env: { ...process.env, SHARDX_API: `http://127.0.0.1:${api.address().port}`, SHARDX_TOKEN: "t" },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "shardx-contract-test", version: "1.0.0" });
+
+  try {
+    await client.connect(transport);
+    await client.callTool({ name: "list_tags", arguments: {} });
+    await client.callTool({ name: "save_tag", arguments: { name: "Client A", color: "teal" } });
+    await client.callTool({ name: "delete_tag", arguments: { name: "Client/A" } });
+    await client.callTool({ name: "set_profile_tags", arguments: { id: "p1", tags: ["Client A"] } });
+    assert.deepEqual(
+      seen.map(({ method, url, auth, body }) => [method, url, auth, body]),
+      [
+        ["GET", "/tags", "Bearer t", ""],
+        ["POST", "/tags", "Bearer t", JSON.stringify({ name: "Client A", color: "teal" })],
+        ["DELETE", "/tags/Client%2FA", "Bearer t", ""],
+        ["PUT", "/profiles/p1/tags", "Bearer t", JSON.stringify({ tags: ["Client A"] })],
+      ],
+    );
+  } finally {
+    await client.close();
+    api.close();
   }
 });
 

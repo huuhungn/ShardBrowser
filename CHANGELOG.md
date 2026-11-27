@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Automation API and MCP: tags can be made, recolored, deleted and assigned.
+  `POST /tags` (name and color), `DELETE /tags/{name}` and
+  `PUT /profiles/{id}/tags` join `GET /tags`, and the MCP server gains
+  `list_tags`, `save_tag`, `delete_tag` and `set_profile_tags` (118 tools). A
+  name no tag has is refused when assigning, so a typo makes no tag. Ported
+  from upstream's tags API for local profiles; the Team part is not.
 - Proxies: a profile whose proxy was deleted, or whose proxy store cannot be
   read, refuses to start, and its automation HTTP blocks refuse to send,
   instead of using this computer's own IP. An empty proxy id still means no
