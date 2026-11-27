@@ -193,7 +193,7 @@ export class Browser {
     // regardless of where the profile config came from (library / file / dict).
     applyEngineVersion(profile.config, this.runtime.chromiumVersion, this.runtime.greaseBrand,
                        this.runtime.greaseVersion, this.runtime.tls,
-                       profile.claimsMobile ? this.runtime.androidChromiumVersion : undefined);
+                       this.runtime.claimedChromiumVersion(profile.platform, profile.claimsMobile));
     applyAppleWebGpuFeatures(profile.config);
     if (profile.claimsMobile) applyChromeBrand(profile.config);
     applyNoiseSeeds(profile.config, profile.id);

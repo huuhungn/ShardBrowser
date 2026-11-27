@@ -250,13 +250,12 @@ impl Browser {
         // regardless of where the profile config came from (library / file / value).
         let (grease_brand, grease_version) = self.runtime.grease();
         let engine = self.runtime.chromium_version();
-        let android = profile
-            .claims_mobile()
-            .then(|| self.runtime.android_chromium_version())
-            .flatten();
+        let claimed = self
+            .runtime
+            .claimed_chromium_version(&profile.platform(), profile.claims_mobile());
         crate::profile::apply_engine_version(
             &mut profile.config,
-            crate::profile::reported_build(&engine, android.as_deref()),
+            crate::profile::reported_build(&engine, claimed.as_deref()),
             grease_brand.as_deref(),
             grease_version.as_deref(),
             self.runtime.tls().as_ref(),

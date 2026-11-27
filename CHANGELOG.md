@@ -25,6 +25,17 @@
   in `Url::origin()` on nested `blob:` URLs, RUSTSEC-2026-0592), and the launcher
   to `cookie` 0.18.3 (repeating private-cookie nonces after a fork,
   RUSTSEC-2026-0594).
+- Engine: **Chromium 158.0.8127.36 (upstream v2.1.6).** The shared engine
+  bucket has served this build since 2026-11-23 while `runtime.json` named 157,
+  so a fresh install got a 158 engine under a manifest naming 157. The
+  manifest now names the archives the bucket serves, with a SHA-256 for every
+  one (each downloaded and checked against the bucket's entity tag; the
+  engine, Linux, macOS and fingerprint archives had none, so the launcher and
+  the SDKs refused to install them). GREASE becomes `Not.A/Brand` 24, and the
+  manifest names the build each desktop OS reports (158.0.8127.37 on Windows
+  and macOS, 158.0.8127.36 on Linux): migration and the three SDKs write that
+  build into a profile of that OS, and phones keep the Chrome for Android
+  build (158.0.8127.42).
 
 ## v2.12.2
 

@@ -12,7 +12,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 export const PUB_BASE = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
-export const CHROMIUM_VERSION = "157.0.8103.50";
+export const CHROMIUM_VERSION = "158.0.8127.36";
 /** This SDK's own version, compared against the manifest's `min_sdk_version`. */
 export const SDK_VERSION = "2.1.0";
 // Version manifest (GitHub raw) — one tiny GET yields every archive's current
@@ -126,6 +126,8 @@ interface Manifest {
   installed_chromium_version?: string;
   /** Chrome for Android build of the engine's major, for phone profiles. */
   installed_android_chromium_version?: string;
+  /** The build each desktop OS is shipped, by navigator.platform ("macOS", "Windows", "Linux"). */
+  installed_desktop_chromium_versions?: Record<string, string>;
   /** Build stamp of the archive last extracted; fallback when it ships none. */
   installed_engine_build?: string;
 }
@@ -148,6 +150,10 @@ export class Runtime {
   private _greaseVersion?: string;
   /** Chrome for Android build of the engine's major, for phone profiles. */
   private _androidVersion?: string;
+  /** The build each desktop OS is shipped, keyed as navigator.platform names it ("macOS",
+   *  "Windows", "Linux"), when it is not the engine's own: 158 went out as .37 for macOS and
+   *  Windows and .36 for Linux. */
+  private _desktopVersions?: Record<string, string>;
   /** TLS block from the manifest (signature_algorithms / cipher_suites).
    *  Applied to profiles on launch so the JA4 hash keeps matching the Chrome
    *  version the profile claims — 152 added the ML-DSA signature schemes, and
@@ -186,6 +192,14 @@ export class Runtime {
   get greaseVersion(): string | undefined { return this._greaseVersion; }
   /** Chrome for Android build phone profiles report; set on install(). */
   get androidChromiumVersion(): string | undefined { return this._androidVersion; }
+  /** The build each desktop OS reports, keyed as navigator.platform names it; set on install(). */
+  get desktopChromiumVersions(): Record<string, string> | undefined { return this._desktopVersions; }
+  /** The build a profile of this platform reports instead of `chromiumVersion`, if any. */
+  claimedChromiumVersion(platform: string, mobile: boolean): string | undefined {
+    if (mobile) return this._androidVersion;
+    const v = this._desktopVersions?.[platform];
+    return typeof v === "string" && v ? v : undefined;
+  }
   /** TLS overrides from the manifest; set on install(). */
   get tls(): Record<string, unknown> | undefined { return this._tls; }
 
@@ -281,6 +295,7 @@ export class Runtime {
     this._greaseBrand = remote.greaseBrand;
     this._greaseVersion = remote.greaseVersion;
     this._androidVersion = remote.androidChromiumVersion ?? local.installed_android_chromium_version;
+    this._desktopVersions = remote.desktopChromiumVersions ?? local.installed_desktop_chromium_versions;
     this._tls = remote.tls;
 
     // Refused rather than installed: this SDK could not configure it.
@@ -321,6 +336,7 @@ export class Runtime {
     // first). Recording the known value beats re-reading it off disk.
     local.installed_chromium_version = this._chromiumVersion;
     if (remote.androidChromiumVersion) local.installed_android_chromium_version = remote.androidChromiumVersion;
+    if (remote.desktopChromiumVersions) local.installed_desktop_chromium_versions = remote.desktopChromiumVersions;
     this.saveManifest(local);
 
     // Linux/mac archives produced on Windows lose every Unix exec bit;
@@ -338,12 +354,17 @@ export class Runtime {
   /** Fetch the version manifest (GitHub raw) — one request that yields every
    *  archive's current etag + the chromium version, replacing per-archive HEADs
    *  against R2/S3. Empty archives / undefined version when unreachable. */
-  private async fetchManifest(): Promise<{ archives: Record<string, string>; sha256: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; androidChromiumVersion?: string; tls?: Record<string, unknown> }> {
+  private async fetchManifest(): Promise<{ archives: Record<string, string>; sha256: Record<string, string>; chromiumVersion?: string; engineBuild?: string; minSdkVersion?: string; greaseBrand?: string; greaseVersion?: string; androidChromiumVersion?: string; desktopChromiumVersions?: Record<string, string>; tls?: Record<string, unknown> }> {
     try {
       const r = await fetch(MANIFEST_URL);
       if (!r.ok) return { archives: {}, sha256: {} };
-      const data = await r.json() as { archives?: Record<string, string>; sha256?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; android_chromium_version?: string; tls?: Record<string, unknown> };
+      const data = await r.json() as { archives?: Record<string, string>; sha256?: Record<string, string>; chromium_version?: string; engine_build?: string | number; min_sdk_version?: string; grease_brand?: string; grease_version?: string; android_chromium_version?: string; desktop_chromium_versions?: Record<string, unknown>; tls?: Record<string, unknown> };
       const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+      const desktopVersions = (v: unknown): Record<string, string> | undefined => {
+        if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+        const out = Object.fromEntries(Object.entries(v).filter(([, b]) => typeof b === "string" && b)) as Record<string, string>;
+        return Object.keys(out).length ? out : undefined;
+      };
       return {
         archives: (data && typeof data.archives === "object" && data.archives) || {},
         sha256: (data && typeof data.sha256 === "object" && data.sha256) || {},
@@ -356,6 +377,7 @@ export class Runtime {
         greaseBrand: str(data?.grease_brand),
         greaseVersion: str(data?.grease_version),
         androidChromiumVersion: str(data?.android_chromium_version),
+        desktopChromiumVersions: desktopVersions(data?.desktop_chromium_versions),
         tls: (data?.tls && typeof data.tls === "object" && !Array.isArray(data.tls))
           ? data.tls as Record<string, unknown>
           : undefined,

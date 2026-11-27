@@ -188,7 +188,7 @@ class Browser:
             self.runtime.grease_brand,
             self.runtime.grease_version,
             self.runtime.tls,
-            self.runtime.android_chromium_version if profile.claims_mobile else None,
+            self.runtime.claimed_chromium_version(profile.platform, profile.claims_mobile),
         )
         apply_apple_webgpu_features(profile.config)
         if profile.claims_mobile:

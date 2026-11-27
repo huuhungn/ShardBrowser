@@ -19,7 +19,7 @@ const PUB_BASE: &str = "https://pub-e57a7c60f6934eb09a6600bf2fc59cdc.r2.dev";
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/huuhungn/ShardBrowser/main/runtime.json";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
-pub const CHROMIUM_VERSION: &str = "157.0.8103.50";
+pub const CHROMIUM_VERSION: &str = "158.0.8127.36";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ArchiveSpec {
@@ -274,6 +274,11 @@ pub struct RuntimeStatus {
     pub launcher_version: String,
 }
 
+/// The Chrome build each desktop OS is being shipped, keyed as `navigator.platform` names it
+/// ("macOS", "Windows", "Linux"). Google can ship one major under several builds: 158 went
+/// out as 158.0.8127.37 for macOS and Windows and 158.0.8127.36 for Linux.
+type DesktopVersions = std::collections::BTreeMap<String, String>;
+
 #[derive(Default)]
 struct RemoteManifest {
     archives: std::collections::HashMap<String, String>,
@@ -305,6 +310,9 @@ struct RemoteManifest {
     /// report: Android ships its own build numbers, and a phone with a desktop
     /// one is a build no phone has.
     android_chromium_version: Option<String>,
+    /// The build each desktop OS reports, when it is not `chromium_version`, which stays the
+    /// engine's own version: it is what an installed engine is compared to.
+    desktop_chromium_versions: Option<DesktopVersions>,
 }
 
 /// Fetch the version manifest (GitHub raw) — one request yielding every
@@ -357,6 +365,15 @@ async fn fetch_manifest_from(url: &str) -> RemoteManifest {
             }),
             min_launcher_version: str_field("min_launcher_version"),
             android_chromium_version: str_field("android_chromium_version"),
+            desktop_chromium_versions: v
+                .get("desktop_chromium_versions")
+                .and_then(|m| m.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect::<DesktopVersions>()
+                })
+                .filter(|m| !m.is_empty()),
         })
     }
     inner(url).await.unwrap_or_default()
@@ -378,6 +395,7 @@ fn migrate_dir_to(
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
     android_version: Option<&str>,
+    desktop_versions: Option<&DesktopVersions>,
 ) -> Result<usize> {
     let mut n = 0usize;
     for ent in fs::read_dir(dir)?.flatten() {
@@ -405,6 +423,7 @@ fn migrate_dir_to(
             grease_version,
             tls,
             android_version,
+            desktop_versions,
         ) {
             if wrapped {
                 if let Some(v) = file.pointer("/payload/client_hints/brand_version").cloned() {
@@ -426,17 +445,32 @@ fn migrate_value(
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
     android_version: Option<&str>,
+    desktop_versions: Option<&DesktopVersions>,
 ) -> bool {
     let parts: Vec<&str> = chromium_version.split('.').collect();
     if parts.len() != 4 {
         return false;
     }
     let major = parts[0];
-    // A phone reports the Android build of this major, when the manifest names one.
-    let chromium_version = android_version
-        .filter(|v| v.split('.').count() == 4 && v.split('.').next() == Some(major))
-        .filter(|_| cfg.as_object().is_some_and(claims_mobile))
-        .unwrap_or(chromium_version);
+    let same_major = |v: &&str| v.split('.').count() == 4 && v.split('.').next() == Some(major);
+    // A phone reports the Android build of this major, and a desktop profile the build its OS
+    // is shipped, when the manifest names one.
+    let chromium_version = if cfg.as_object().is_some_and(claims_mobile) {
+        android_version
+            .filter(same_major)
+            .unwrap_or(chromium_version)
+    } else {
+        let platform = cfg
+            .pointer("/navigator/platform")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        desktop_versions
+            .and_then(|m| m.get(&platform))
+            .map(String::as_str)
+            .filter(same_major)
+            .unwrap_or(chromium_version)
+    };
     let parts: Vec<&str> = chromium_version.split('.').collect();
     let build: i64 = parts[2].parse().unwrap_or(0);
     let patch: i64 = parts[3].parse().unwrap_or(0);
@@ -621,6 +655,7 @@ fn migrate_all_to(
     grease_version: Option<&str>,
     tls: Option<&serde_json::Value>,
     android_version: Option<&str>,
+    desktop_versions: Option<&DesktopVersions>,
 ) -> usize {
     // Profile files are rewritten here without a claim; a downgrade in flight
     // is moving them, so the two take turns.
@@ -634,6 +669,7 @@ fn migrate_all_to(
             grease_version,
             tls,
             android_version,
+            desktop_versions,
         )
         .unwrap_or(0);
     }
@@ -645,6 +681,7 @@ fn migrate_all_to(
             grease_version,
             tls,
             android_version,
+            desktop_versions,
         )
         .unwrap_or(0);
     }
@@ -661,6 +698,7 @@ async fn migrate_all_blocking(
     grease_version: Option<String>,
     tls: Option<serde_json::Value>,
     android_version: Option<String>,
+    desktop_versions: Option<DesktopVersions>,
 ) -> Option<usize> {
     blocking(move || {
         migrate_all_to(
@@ -669,6 +707,7 @@ async fn migrate_all_blocking(
             grease_version.as_deref(),
             tls.as_ref(),
             android_version.as_deref(),
+            desktop_versions.as_ref(),
         )
     })
     .await
@@ -697,8 +736,16 @@ const MIGRATION_REV: u32 = 1;
 /// shape would be a no-op for anyone already on this version, and their
 /// profiles would keep the previous release's JA4.
 fn migration_signature(target: &str, m: &RemoteManifest) -> String {
+    let desktop = m
+        .desktop_chromium_versions
+        .as_ref()
+        .map(|d| {
+            let joined: Vec<String> = d.iter().map(|(os, v)| format!("{os}={v}")).collect();
+            format!("|d{}", joined.join(","))
+        })
+        .unwrap_or_default();
     format!(
-        "{target}|{}|{}|{}|{}|m{MIGRATION_REV}",
+        "{target}|{}|{}|{}|{}{desktop}|m{MIGRATION_REV}",
         m.grease_brand.as_deref().unwrap_or(""),
         m.grease_version.as_deref().unwrap_or(""),
         m.tls.as_ref().map(|t| t.to_string()).unwrap_or_default(),
@@ -737,6 +784,7 @@ pub async fn ensure_profiles_migrated() {
         m.grease_version.clone(),
         m.tls.clone(),
         m.android_chromium_version.clone(),
+        m.desktop_chromium_versions.clone(),
     )
     .await
     else {
@@ -987,6 +1035,7 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
             manifest.grease_version.clone(),
             manifest.tls.clone(),
             manifest.android_chromium_version.clone(),
+            manifest.desktop_chromium_versions.clone(),
         )
         .await
         {
@@ -1543,7 +1592,8 @@ mod tests {
             None,
             None,
             None,
-            Some("157.0.8103.38")
+            Some("157.0.8103.38"),
+            None
         ));
         let ch = &p["client_hints"];
         assert_eq!(ch["brand_full_version"], "157.0.8103.38");
@@ -1563,7 +1613,8 @@ mod tests {
                 None,
                 None,
                 None,
-                Some("157.0.8103.38")
+                Some("157.0.8103.38"),
+                None
             ),
             "once"
         );
@@ -1576,7 +1627,8 @@ mod tests {
             None,
             None,
             None,
-            Some("156.0.1.1")
+            Some("156.0.1.1"),
+            None
         ));
         assert_eq!(q["client_hints"]["brand_full_version"], "157.0.8103.50");
     }
@@ -1592,10 +1644,97 @@ mod tests {
             None,
             None,
             None,
-            Some("157.0.8103.38")
+            Some("157.0.8103.38"),
+            None
         ));
         assert_eq!(d["client_hints"]["brand_full_version"], "157.0.8103.50");
         assert_eq!(d["client_hints"]["brand"], "Microsoft Edge");
+    }
+
+    #[test]
+    fn each_desktop_os_reports_the_build_it_is_shipped() {
+        let versions: DesktopVersions = [
+            ("macOS", "158.0.8127.37"),
+            ("Windows", "158.0.8127.37"),
+            ("Linux", "158.0.8127.36"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        for (platform, want) in [
+            ("macOS", "158.0.8127.37"),
+            ("Windows", "158.0.8127.37"),
+            ("Linux", "158.0.8127.36"),
+        ] {
+            let mut p = json!({ "navigator": { "platform": platform, "user_agent": "Mozilla/5.0 Chrome/157.0.0.0 Safari/537.36" },
+                "client_hints": { "mobile": false, "brand_full_version": "157.0.8103.50" } });
+            assert!(migrate_value(
+                &mut p,
+                "158.0.8127.36",
+                None,
+                None,
+                None,
+                None,
+                Some(&versions)
+            ));
+            assert_eq!(p["client_hints"]["brand_full_version"], want, "{platform}");
+            assert_eq!(
+                p["client_hints"]["chrome_patch"].as_i64(),
+                want.rsplit('.').next().unwrap().parse().ok(),
+                "{platform}"
+            );
+            assert!(
+                !migrate_value(
+                    &mut p,
+                    "158.0.8127.36",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&versions)
+                ),
+                "once: {platform}"
+            );
+        }
+        // A phone keeps the Android build; another major and an unnamed OS take the engine's.
+        let mut p = phone();
+        migrate_value(
+            &mut p,
+            "158.0.8127.36",
+            None,
+            None,
+            None,
+            Some("158.0.8127.42"),
+            Some(&versions),
+        );
+        assert_eq!(p["client_hints"]["brand_full_version"], "158.0.8127.42");
+        let other: DesktopVersions = [("Windows".to_string(), "157.0.8103.50".to_string())]
+            .into_iter()
+            .collect();
+        let mut w =
+            json!({ "navigator": { "platform": "Windows" }, "client_hints": { "mobile": false } });
+        migrate_value(
+            &mut w,
+            "158.0.8127.36",
+            None,
+            None,
+            None,
+            None,
+            Some(&other),
+        );
+        assert_eq!(w["client_hints"]["brand_full_version"], "158.0.8127.36");
+        let mut l =
+            json!({ "navigator": { "platform": "Linux" }, "client_hints": { "mobile": false } });
+        migrate_value(
+            &mut l,
+            "158.0.8127.36",
+            None,
+            None,
+            None,
+            None,
+            Some(&other),
+        );
+        assert_eq!(l["client_hints"]["brand_full_version"], "158.0.8127.36");
     }
 
     #[test]
@@ -1609,12 +1748,13 @@ mod tests {
             None,
             None,
             None,
+            None,
             None
         ));
         assert_eq!(p["navigator"]["platform_version"], "19.0.0");
         assert_eq!(p["client_hints"]["platform_version"], "19.0.0");
         assert!(
-            !migrate_value(&mut p, "157.0.8103.50", None, None, None, None),
+            !migrate_value(&mut p, "157.0.8103.50", None, None, None, None, None),
             "once"
         );
     }
@@ -1634,7 +1774,7 @@ mod tests {
         std::fs::write(&file, entry.to_string()).unwrap();
 
         assert_eq!(
-            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None).unwrap(),
+            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None, None).unwrap(),
             1
         );
         let got: serde_json::Value =
@@ -1649,7 +1789,7 @@ mod tests {
             "nothing written beside the payload"
         );
         assert_eq!(
-            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None).unwrap(),
+            migrate_dir_to(&dir, "157.0.8103.50", None, None, None, None, None).unwrap(),
             0
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1685,6 +1825,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_migration_signature_moves_with_the_desktop_builds() {
+        let with = |v: &str| RemoteManifest {
+            desktop_chromium_versions: Some(
+                [("Windows".to_string(), v.to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let a = migration_signature("158.0.8127.36", &with("158.0.8127.37"));
+        assert!(a.contains("|dWindows=158.0.8127.37|m"), "{a}");
+        assert_ne!(
+            a,
+            migration_signature("158.0.8127.36", &with("158.0.8127.38"))
+        );
+        assert_ne!(
+            a,
+            migration_signature("158.0.8127.36", &RemoteManifest::default())
+        );
+    }
+
     /// NEW-F: a migration that panics is not "applied": the caller gets `None`
     /// and records nothing new, so the next start runs it again.
     #[test]
@@ -1715,7 +1877,14 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let worker = tokio::spawn(migrate_all_blocking("1.0.0".into(), None, None, None, None));
+            let worker = tokio::spawn(migrate_all_blocking(
+                "1.0.0".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
             // The only async thread is free to run other work meanwhile.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert!(!worker.is_finished());
@@ -1738,7 +1907,7 @@ mod tests {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen = finished.clone();
         let worker = std::thread::spawn(move || {
-            migrate_all_to("1.0.0", None, None, None, None);
+            migrate_all_to("1.0.0", None, None, None, None, None);
             seen.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -1808,6 +1977,16 @@ mod tests {
 
         let got = fetch_manifest_from(&url).await;
         assert!(!got.sha256.is_empty());
+        // Every archive the launcher may download is named: one without is refused at install.
+        for key in got.archives.keys() {
+            assert!(got.sha256.contains_key(key), "{key} has no sha256");
+        }
+        // Each desktop OS names a build of the engine's major.
+        let engine = got.chromium_version.as_deref().unwrap();
+        let desktop = got.desktop_chromium_versions.as_ref().unwrap();
+        for (os, v) in desktop {
+            assert_eq!(v.split('.').next(), engine.split('.').next(), "{os}: {v}");
+        }
         for (key, hash) in &got.sha256 {
             assert!(got.archives.contains_key(key), "{key} is not an archive");
             assert!(

@@ -4,6 +4,7 @@ profiles gain the WebGPU features Chrome 156 and 157 report there.
 Run: python -m unittest discover -s sdks/python/tests (or pytest)."""
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -47,6 +48,27 @@ class AndroidVersionTest(unittest.TestCase):
             cfg = phone()
             rt.apply_engine_version(cfg, "157.0.8103.39", android_version=android)
             self.assertEqual(cfg["client_hints"]["brand_full_version"], "157.0.8103.39", android)
+
+
+class DesktopVersionTest(unittest.TestCase):
+    def test_a_desktop_profile_gets_the_build_its_os_is_shipped(self):
+        for platform, want, patch in (("Windows", "158.0.8127.37", 37), ("Linux", "158.0.8127.36", 36)):
+            cfg = {"navigator": {"platform": platform, "user_agent": "Mozilla/5.0 Chrome/157.0.0.0 Safari/537.36"},
+                   "client_hints": {"mobile": False, "brand_full_version": "157.0.8103.50"}}
+            rt.apply_engine_version(cfg, "158.0.8127.36", android_version=want)
+            self.assertEqual(cfg["client_hints"]["brand_full_version"], want, platform)
+            self.assertEqual(cfg["client_hints"]["chrome_patch"], patch, platform)
+            self.assertIn("Chrome/158.0.0.0 ", cfg["navigator"]["user_agent"])
+
+    def test_a_runtime_names_the_build_per_platform_and_none_for_an_unlisted_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            runtime = rt.Runtime(cache_dir=d)
+            self.assertIsNone(runtime.claimed_chromium_version("Windows", False))
+            runtime._desktop_versions = {"Windows": "158.0.8127.37"}
+            runtime._android_version = "158.0.8127.42"
+            self.assertEqual(runtime.claimed_chromium_version("Windows", False), "158.0.8127.37")
+            self.assertIsNone(runtime.claimed_chromium_version("Linux", False))
+            self.assertEqual(runtime.claimed_chromium_version("Android", True), "158.0.8127.42")
 
 
 class ChromeBrandTest(unittest.TestCase):
