@@ -136,8 +136,10 @@ jobs:
       # Holds the only Windows-gated test in the tree
       # (windows_resume_uses_the_autostart_argument), which no Linux runner
       # can execute.
+      # Team tests (custodian_it, custody_tests, team::) are skipped: Team is out
+      # of scope (owner, 2026-11-27) and custodian_it alone took most of this step.
       - name: Launcher tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: 'cargo test --manifest-path src-tauri/Cargo.toml -- --skip custodian_it:: --skip custody_tests:: --skip team::'
 
       # The SDK's Windows-gated branches (host paths, runtime process control)
       # are otherwise compiled only on Linux.
@@ -340,8 +342,9 @@ jobs:
       - name: Build team server for integration tests
         run: cargo build --manifest-path server/Cargo.toml
 
+      # Team tests are skipped here too, as in the Windows job.
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: 'cargo test --manifest-path src-tauri/Cargo.toml -- --skip custodian_it:: --skip custody_tests:: --skip team::'
 
   # G2-62: shared, server and src-tauri each build on the `rust-version` their
   # Cargo.toml declares, read from the manifest so the two cannot drift. A
