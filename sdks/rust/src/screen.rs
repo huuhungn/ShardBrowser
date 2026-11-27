@@ -35,7 +35,8 @@ fn as_int(v: Option<&Value>) -> i64 {
 /// Apply `mode` to `cfg` in place. No-op for `Profile` or when the host size
 /// can't be probed.
 pub fn apply_screen_strategy(cfg: &mut Value, mode: ScreenStrategy) {
-    if mode == ScreenStrategy::Profile {
+    // A phone keeps the handset's screen in every mode, as in the launcher.
+    if mode == ScreenStrategy::Profile || crate::profile::config_claims_mobile(cfg) {
         return;
     }
     let Some((hw, hh)) = host_screen_size() else {
@@ -118,4 +119,27 @@ fn use_host(cfg: &mut Value, hw: i64, hh: i64) {
     win.insert("outer_height".into(), json!((avail_h - 1).max(1)));
     win.insert("inner_width".into(), json!(avail_w));
     win.insert("inner_height".into(), json!((avail_h - 88).max(1)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_screen_mode_leaves_a_phones_screen_alone() {
+        let phone = json!({
+            "client_hints": { "mobile": true },
+            "screen": { "width": 412, "height": 915, "avail_width": 412, "avail_height": 915 },
+            "window": { "outer_width": 412, "outer_height": 915, "inner_width": 412, "inner_height": 800 },
+        });
+        for mode in [
+            ScreenStrategy::Profile,
+            ScreenStrategy::CapToHost,
+            ScreenStrategy::UseHost,
+        ] {
+            let mut cfg = phone.clone();
+            apply_screen_strategy(&mut cfg, mode);
+            assert_eq!(cfg, phone, "{mode:?}");
+        }
+    }
 }

@@ -83,12 +83,7 @@ export class Profile {
 
   /** A device whose primary input is a finger. */
   get claimsMobile(): boolean {
-    const ch = this.config["client_hints"] as Record<string, unknown> | undefined;
-    if (ch?.["mobile"] === true) return true;
-    const chPlatform = String(ch?.["platform"] ?? "").toLowerCase();
-    if (chPlatform.startsWith("android")) return true;
-    const nav = this.config["navigator"] as Record<string, unknown> | undefined;
-    return String(nav?.["user_agent"] ?? "").toLowerCase().includes("android");
+    return configClaimsMobile(this.config);
   }
 
   /** Desktop Linux. Android is excluded: its platform is Linux too, and a phone has WebGPU. */
@@ -104,6 +99,16 @@ export class Profile {
     const limits = wgp["limits"];
     return !!(limits && typeof limits === "object" && Object.keys(limits as object).length > 0);
   }
+}
+
+/** Whether a config claims a phone: the engine's three signals, in its order. */
+export function configClaimsMobile(config: Record<string, unknown>): boolean {
+  const ch = config["client_hints"] as Record<string, unknown> | undefined;
+  if (ch?.["mobile"] === true) return true;
+  const chPlatform = String(ch?.["platform"] ?? "").toLowerCase();
+  if (chPlatform.startsWith("android")) return true;
+  const nav = config["navigator"] as Record<string, unknown> | undefined;
+  return String(nav?.["user_agent"] ?? "").toLowerCase().includes("android");
 }
 
 export class FingerprintLibrary {

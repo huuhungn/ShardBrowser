@@ -72,6 +72,15 @@ pub(crate) const CDP_ARGS: [&str; 3] = [
     "--shardx-automation",
 ];
 
+/// Whether the global "Real screen" mode applies to a profile: never to a phone, which keeps
+/// the handset's screen, since a phone reporting this computer's monitor claims one no phone has.
+fn wants_real_screen(
+    mode: Option<&str>,
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    mode == Some("real") && !crate::runtime::claims_mobile(config)
+}
+
 /// A window to go with the claimed screen (#67). Without one the engine passes
 /// no --window-size and Chromium uses the REAL monitor's work area, so a
 /// profile claiming 1920x1080 opened in a window sized for the host and sitting
@@ -211,7 +220,7 @@ pub async fn launch_profile_synced(
     // leaves it untouched. "Real screen" mode hands the host's screen to the
     // engine instead, so there is nothing to fit.
     let real_screen = settings::load()
-        .map(|s| s.screen_resolution_mode.as_deref() == Some("real"))
+        .map(|s| wants_real_screen(s.screen_resolution_mode.as_deref(), &raw))
         .unwrap_or(false);
     if !real_screen {
         if let Some(w) = crate::main_window() {
@@ -416,7 +425,7 @@ pub async fn launch_profile_synced(
 
     // Screen resolution mode: presence-only switch to use host monitor.
     let s = settings::load()?;
-    if s.screen_resolution_mode.as_deref() == Some("real") {
+    if wants_real_screen(s.screen_resolution_mode.as_deref(), &raw) {
         cmd.arg("--shardx-real-screen");
     }
 
@@ -994,7 +1003,7 @@ fn install_widevine(udd: &Path) -> Result<()> {
     let widevine_root = udd.join("WidevineCdm");
     let versioned = widevine_root.join(version);
     if versioned.exists() {
-        return Ok(());
+        return write_widevine_hint(&widevine_root, &versioned);
     }
     // Clean up any stale flat layout from older launcher versions.
     let flat_manifest = widevine_root.join("manifest.json");
@@ -1015,7 +1024,21 @@ fn install_widevine(udd: &Path) -> Result<()> {
         widevine_root.join("latest-component-updated-version"),
         version,
     )?;
+    write_widevine_hint(&widevine_root, &versioned)?;
     eprintln!("[launcher] widevine pre-warmed: {}", versioned.display());
+    Ok(())
+}
+
+/// The hint Chrome on Linux loads its component CDM from at start, before the sandbox closes
+/// (component_widevine_cdm_hint_file_linux.cc): without it a CDM put in place here is found
+/// only by the next start. Other platforms find the version folder themselves; the file is
+/// harmless there.
+fn write_widevine_hint(root: &Path, versioned: &Path) -> Result<()> {
+    let hint = root.join("latest-component-updated-widevine-cdm");
+    let body = serde_json::json!({ "Path": versioned.to_string_lossy() }).to_string();
+    if std::fs::read_to_string(&hint).ok().as_deref() != Some(body.as_str()) {
+        std::fs::write(&hint, body)?;
+    }
     Ok(())
 }
 
@@ -1316,5 +1339,58 @@ mod launch_option_tests {
         assert!(remove_unavailable_custom_fonts(&mut raw));
         assert!(!raw.contains_key("custom_fonts"));
         assert_eq!(raw["navigator"]["platform"], "Win32");
+    }
+}
+
+#[cfg(test)]
+mod real_screen_and_widevine_hint_tests {
+    use super::{wants_real_screen, write_widevine_hint};
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn real_screen_mode_applies_to_a_desktop_and_never_to_a_phone() {
+        let desktop = obj(
+            json!({ "navigator": { "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } }),
+        );
+        let phone = obj(json!({ "client_hints": { "mobile": true } }));
+        let tablet = obj(
+            json!({ "navigator": { "user_agent": "Mozilla/5.0 (Linux; Android 10; K)" },
+            "client_hints": { "mobile": false, "platform": "Android" } }),
+        );
+        assert!(wants_real_screen(Some("real"), &desktop));
+        assert!(!wants_real_screen(Some("real"), &phone));
+        assert!(
+            !wants_real_screen(Some("real"), &tablet),
+            "a tablet is a handset too"
+        );
+        assert!(!wants_real_screen(Some("fingerprint"), &desktop));
+        assert!(!wants_real_screen(None, &desktop));
+    }
+
+    #[test]
+    fn the_widevine_hint_names_the_version_folder_and_is_not_rewritten_when_current() {
+        let root = std::env::temp_dir().join(format!("shardx-wv-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let versioned = root.join("4.10.2891.0");
+        write_widevine_hint(&root, &versioned).unwrap();
+        let hint = root.join("latest-component-updated-widevine-cdm");
+        let got: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hint).unwrap()).unwrap();
+        assert_eq!(got["Path"], versioned.to_string_lossy().as_ref());
+        let first = std::fs::metadata(&hint).unwrap().modified().unwrap();
+        write_widevine_hint(&root, &versioned).unwrap();
+        assert_eq!(std::fs::metadata(&hint).unwrap().modified().unwrap(), first);
+        // A newer CDM replaces the path.
+        let newer = root.join("4.10.2900.0");
+        write_widevine_hint(&root, &newer).unwrap();
+        let got: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hint).unwrap()).unwrap();
+        assert_eq!(got["Path"], newer.to_string_lossy().as_ref());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

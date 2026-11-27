@@ -17,6 +17,28 @@ pub struct Profile {
     pub config: Value,
 }
 
+/// Whether a config claims a phone: the engine's three signals, in its order.
+pub(crate) fn config_claims_mobile(config: &Value) -> bool {
+    let s = |path: [&str; 2]| {
+        config
+            .get(path[0])
+            .and_then(|v| v.get(path[1]))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    if config
+        .get("client_hints")
+        .and_then(|c| c.get("mobile"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    s(["client_hints", "platform"]).starts_with("android")
+        || s(["navigator", "user_agent"]).contains("android")
+}
+
 impl Profile {
     /// Wrap a config object. `id` defaults to `config.name` or `"anonymous"`.
     pub fn new(config: Value, id: Option<String>) -> Self {
@@ -136,25 +158,7 @@ impl Profile {
 
     /// Whether the profile claims a device whose primary input is a finger.
     pub fn claims_mobile(&self) -> bool {
-        let s = |path: [&str; 2]| {
-            self.config
-                .get(path[0])
-                .and_then(|v| v.get(path[1]))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase()
-        };
-        if self
-            .config
-            .get("client_hints")
-            .and_then(|c| c.get("mobile"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        s(["client_hints", "platform"]).starts_with("android")
-            || s(["navigator", "user_agent"]).contains("android")
+        config_claims_mobile(&self.config)
     }
 
     /// Whether the profile claims a DESKTOP Linux machine. Android is excluded:

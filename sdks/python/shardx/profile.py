@@ -16,6 +16,17 @@ _NOISE_VECTORS = ("canvas", "webgl", "audio", "client_rects", "sensors", "fonts"
 _NOISE_KNOB = {"webgl": ("intensity", 0.0005), "client_rects": ("max_offset", 1)}
 
 
+def config_claims_mobile(config: dict) -> bool:
+    """Whether a config claims a phone: the engine's three signals, in its order."""
+    ch = config.get("client_hints") or {}
+    if ch.get("mobile") is True:
+        return True
+    if str(ch.get("platform") or "").lower().startswith("android"):
+        return True
+    nav = config.get("navigator") or {}
+    return "android" in str(nav.get("user_agent") or "").lower()
+
+
 class Profile:
     """A fingerprint config + optional per-profile state. Mutable until launched."""
 
@@ -86,13 +97,7 @@ class Profile:
     @property
     def claims_mobile(self) -> bool:
         """A device whose primary input is a finger."""
-        ch = self.config.get("client_hints") or {}
-        if ch.get("mobile") is True:
-            return True
-        if str(ch.get("platform") or "").lower().startswith("android"):
-            return True
-        nav = self.config.get("navigator") or {}
-        return "android" in str(nav.get("user_agent") or "").lower()
+        return config_claims_mobile(self.config)
 
     @property
     def claims_linux_desktop(self) -> bool:
